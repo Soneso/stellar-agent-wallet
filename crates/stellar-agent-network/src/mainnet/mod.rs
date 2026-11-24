@@ -1,0 +1,57 @@
+//! Mainnet write authorization: the proofs network produces, the shared
+//! digests, the one clock, and the authorization types that compose the
+//! proofs into signing authority.
+//!
+//! - [`audit_readiness`]: the audit readiness proof and its producer.
+//! - [`authority`]: the authority an action proceeds under, an operator
+//!   approval or the verified policy's own decision.
+//! - [`authorization`]: the five mainnet authorization types and their
+//!   checks.
+//! - [`canonical`]: the match of a rebuilt classic envelope against its
+//!   stored canonical intent.
+//! - [`clock`]: the clock the ledger, the signing points, and the submit gate
+//!   share.
+//! - [`consumed`]: the proof a mainnet send depends on, that the submission
+//!   consumed its authorization.
+//! - [`digest`]: the content, entries, and bindings digests, and the shared
+//!   subjects and labels by the names their consumers use.
+//! - [`message`]: the SEP-10 message facts, the message use receipt, and the
+//!   check of a challenge against the receipt before the ephemeral key signs.
+//! - [`restriction`]: the live toolset grant evidence a restricted classic
+//!   payment binds.
+//! - [`soroban`]: the check of a Soroban authorization preimage against an
+//!   intent authorization.
+//!
+//! The authorization ledger lives in the window-state store,
+//! [`crate::policy_state::ledger`]. The proofs core owns are in
+//! `stellar_agent_core::mainnet` and `stellar_agent_core::approval::witness`.
+
+pub mod audit_readiness;
+pub mod authority;
+pub mod authorization;
+pub mod canonical;
+pub mod clock;
+pub mod consumed;
+pub mod digest;
+#[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
+pub(crate) mod fixtures;
+pub mod holds;
+pub mod message;
+#[cfg(feature = "mainnet-write")]
+pub(crate) mod mint;
+pub(crate) mod refusal;
+pub mod resolve;
+pub mod restriction;
+pub mod soroban;
+#[cfg(all(feature = "mainnet-write", feature = "test-helpers"))]
+#[doc(hidden)]
+pub mod test_support;
+pub(crate) mod types;
+
+pub use refusal::{
+    AccountingRefusal, MainnetAuthorizationError, MainnetPrecondition, TotalEpochRefusal,
+};
+pub use types::{
+    AuditFacts, AuthorizationDomain, AuthorizationId, ConsumeBindingKind, HoldOwner,
+    MainnetConsumer, MessageDomain, RecomputedFacts, SignerRole,
+};

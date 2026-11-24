@@ -30,29 +30,22 @@
 //! evaluates, and — on a confirmed commit — records and exits. There is
 //! nothing to go stale within that lifetime.
 //!
-//! The MCP server is a LONG-LIVED process: a single `PolicyEngineV1` instance
-//! serves every dispatch for the life of the server. Hydrating it once at
-//! construction and never again would mean a CLI-written (or a sibling MCP
-//! request's) accumulated entry never becomes visible to this process's
-//! evaluations — the server would silently evaluate stateful criteria against
-//! a startup-frozen snapshot. `dispatch_gate_inner`
-//! (`stellar-agent-mcp::tools::common`) closes this: before every evaluation,
-//! it calls [`stellar_agent_core::policy::PolicyEngine::window_state_store`]
-//! to reach the engine's in-memory store, `clear()`s it, and re-populates it
-//! via `load_into` from the CURRENT on-disk file. This is a REPLACE, not a
-//! merge: clearing before re-loading is what prevents an entry a concurrent
-//! process has already pruned or a reset has cleared from lingering in this
-//! process's view. Construction-time hydration is kept in addition (not
-//! replaced by the per-dispatch refresh): it makes the server refuse to
-//! start at all on a tampered/unparseable store file, rather than deferring
-//! that discovery to first dispatch.
+//! MCP gates hydrate a private image through
+//! [`PersistedWindowStore::load_into_at`] at their policy instant. Paired
+//! checks reuse that image without clearing or repopulating the shared engine.
+//! A later gate sees newly committed history. Startup hydration remains a
+//! separate integrity check, so a corrupt store also refuses server startup.
+//! Hydration can perform earlier-version retirement and must propagate errors.
+//! The gate evaluates its captured frame, final resolution reads the shared
+//! store refreshed at each gate, and mint rechecks durable headroom under the
+//! window lock.
 //!
 //! # Admission
 //!
 //! A call passes through the window in three steps.
 //!
 //! 1. **Evaluation at dispatch.** The policy gate reads this store into the
-//!    engine's in-memory view and evaluates the call against it, before the
+//!    evaluation's private image and evaluates the call against it, before the
 //!    transaction is built and signed.
 //! 2. **Reservation under the lock.** Immediately before the send,
 //!    [`PersistedWindowStore::record_pending`] takes the store's exclusive
@@ -75,26 +68,35 @@
 //! against each other, so a single call cannot overshoot a bucket by spreading
 //! its spend across legs.
 //!
+//! Evaluations of the same payment can compose their holds through
+//! [`crate::mainnet::holds::size_evaluated_holds`]. Each descriptor uses its own
+//! evaluated recipient class. Explicit composition retains one debit per
+//! complete key and epoch, with the tighter compatible limit. Singleton calls
+//! retain repeated criteria. Mint admits the entire vector under its existing
+//! window lock; snapshots alone reserve no capacity.
+//!
 //! # Reservation settlement
 //!
-//! Pending records count regardless of age. Confirmation requires the applying
-//! transaction's `created_at` ledger close time; missing time leaves the hold
-//! pending. Confirmed records age from that close time.
+//! Exposure counts through the signed execution deadline and each admitted
+//! window duration. A reported success uses the later of first local observation
+//! and the deadline. Reported chain time remains a report. Missing deadlines
+//! retain capacity indefinitely; repeat reports preserve the first observation.
 //!
-//! A NOT_FOUND releases only within retention after observing a consumed
-//! sequence or a ledger close time strictly past a nonzero maxTime, followed
-//! by a fresh NOT_FOUND. That release records its evidence on the receipt as
-//! `release_code` and is reported as settled, so the caller writes the
-//! settled audit row under it. A fresh SUCCESS or FAILED settles that chain
-//! outcome. A release drops only the pending records of a reservation; a
-//! confirmed record under the same id keeps counting. A reservation id is
-//! the envelope hash of one signed envelope, so a second reservation for an
-//! id the file already holds is refused as
-//! [`WindowStoreError::DuplicateReservation`].
-//! The pass shares one bounded getLedgers observation; unavailable or invalid
-//! chain time closes the time arm. The host clock only controls minimum age.
-//! Receiptless holds beyond retention carry an authenticated operator marker,
-//! retain their debit, and are excluded from automatic selection.
+//! Endpoint failure, absence, consumed sequence, and time claims release no
+//! capacity and create no definitive failed row. A checked accounting decision
+//! binds chain, reservation, generation, and evidence. Conservative expiry
+//! records `submission.accounting_expired` with the chain outcome unknown.
+//! Accounting expiry creates a durable audit obligation in the same
+//! authenticated successor. Delivery verifies retained history, appends at
+//! most one event per decision identifier in that history, and commits
+//! acknowledgement.
+//! An explicit operator clear records its acknowledgement before releasing
+//! untimed exposure. Bounded clears preserve the accounting horizon.
+//!
+//! A reservation id names one signed envelope. Duplicate admission refuses
+//! under the store lock. Independent witness anchors bind the subject, chain,
+//! oracle ledger, authority, digest, and local acquisition time. Legacy bare
+//! ledgers remain unanchored observations.
 //!
 //! # Wire format
 //!
@@ -106,9 +108,20 @@
 //! serialise as decimal strings (the `wire_stroops::i128` / audit
 //! `i128_decimal_str` convention), never a bare JSON number, so no value is
 //! silently truncated by a JSON-number-as-f64 reader. The body also carries a
-//! `generation: u64` field; see "Anti-rollback" below. Version 3 includes the
-//! operator marker and optional prepared settlement. Versions 1 and 2 remain readable; absent status means
-//! confirmed spend and an absent operator marker means automatic selection.
+//! `generation: u64` field; see "Anti-rollback" below.
+//!
+//! Version 5 authenticates a [`ChainScope`] on the snapshot, each pending
+//! debit, and each transaction consumption binding. Its canonical chain and
+//! passphrase hash identify one accounting authority, including both sides of
+//! a prepared commit. Pruning retains that authority even with no live debits.
+//!
+//! Versions 1 through 4 decode for integrity checks. An existing snapshot is
+//! usable only with complete authenticated scope for all retained history and
+//! any prepared successor. A missing scope refuses automatic migration,
+//! including an empty snapshot with a committed generation. Profile TOML and
+//! receipts cannot establish provenance. Only an absent file and absent
+//! protected generation establish a new authority.
+//! No verb recovers such state; create a profile under a new name.
 //!
 //! # Integrity
 //!
@@ -136,22 +149,31 @@
 //! suffixing `-generation` onto its `account` field, same `service` — holds a
 //! monotonic generation and a SHA-256 commitment to its canonical body, updated
 //! together. Numeric counters remain readable for version 1 and 2 files.
-//! Appending a debit commits the trusted state before replacing the file, so
-//! failure cannot expose a smaller total. Settlement writes both the current
-//! and candidate snapshots before committing the candidate's generation and
-//! digest; either crash checkpoint retains an authenticated, readable state.
-//! An abandoned candidate cannot substitute for a different committed body
-//! sharing its generation. Readers reject missing, rolled-back, or substituted
-//! state. Initialisation and reset also commit the counter first and fail closed
-//! if their file write fails. Key rotation re-signs the existing body while
+//! A settled debit, recorded by
+//! [`record_and_persist`](PersistedWindowStore::record_and_persist) or
+//! [`record_authorized`](PersistedWindowStore::record_authorized), commits the
+//! trusted state before replacing the file, so a failed write refuses later
+//! spends. A pending record, the settlement of a reservation and a verified
+//! reset commit through the prepared image: they write both the current and
+//! candidate snapshots before committing the candidate's generation and digest,
+//! so a failed write leaves an authenticated, readable store at either crash
+//! checkpoint. An abandoned candidate cannot substitute for a different committed
+//! body sharing its generation. Readers reject missing, rolled-back, or
+//! substituted state. Initialisation also commits the counter first and fails
+//! closed if its file write fails. Key rotation re-signs the existing body while
 //! preserving its trusted commitment.
 //!
 //! # Concurrency
 //!
-//! [`lock::WindowStoreLock`] — an OFD-advisory exclusive flock at
-//! `<store-file>.lock`, mirroring [`crate::counterparty::lock::CacheLock`] —
-//! serialises every read-modify-write against the file (record, reset,
-//! resign). [`load_into`](PersistedWindowStore::load_into) does not take the
+//! [`lock::WindowStoreLock`] is an OFD-advisory exclusive lock on a file in the
+//! policy-state directory named by the window-state keyring entry, because the
+//! HMAC key, the generation commitment, and the policy pin are named by that
+//! entry. It serialises every read-modify-write (record, reset, resign, and
+//! every authorization transition) across every store handle over the entry,
+//! whatever store path a handle names. It lives in
+//! [`stellar_agent_core::policy::state_lock`] and is re-exported here, so the
+//! policy pin of [`stellar_agent_core::policy::pin`] is read, written, and
+//! compared under the same guard. [`load_into`](PersistedWindowStore::load_into) does not take the
 //! lock: the file is only ever replaced via atomic rename (temp file +
 //! `sync_data` + rename + parent-directory fsync, mirroring
 //! [`stellar_agent_core::audit_log`]'s rotation `write_sidecar_atomic`
@@ -161,14 +183,98 @@
 //!
 //! Entries older than the largest supported criterion window (`1w` =
 //! 604,800 s) are pruned on every write once confirmed. Pending records are retained.
+//! Accounting-expiry records are retained until audit acknowledgement and
+//! receipt projection both complete. Settled authorization records stay while
+//! their approval can still be presented, and a window state reset keeps them.
+//!
+//! A signed intent counts from its admission before the first signature.
+//! Envelope cancellation, unwinding and reconciliation never release it.
+//!
+//! Operation records follow [`operations`]: a terminal record keeps its full
+//! form for seven days, at most 256 such records stay, and older ones become
+//! tombstones kept for 30 days, at most 1,024. A record whose authorization
+//! has no release row stays whatever its age, and so does that authorization.
+//! Removing an authorization with a ledger or close-time release bound raises
+//! the window's admissible floors in the same commit.
+//!
+//! Approval records retain consent payloads until the operation ends or execution expires.
+//! Identity, disposition, clocks and receipt digests remain for seven days after both windows end.
+//! At most 256 closed records stay; records inside either window remain protected.
+//! Reset refuses pending approvals inside their waiting windows and preserves every other approval record.
 
+mod accounting;
+#[cfg(feature = "mainnet-write")]
+pub(crate) use accounting::uncovered_floor_use;
+pub use accounting::{
+    CheckedFloor, FloorSource, FloorSourceError, PayerView, floor_rule_matches, floor_rule_minimum,
+    refuse_uncovered_floor, reserve_rule_matches,
+};
+pub mod approvals;
+pub mod budget;
+pub mod ledger;
 pub mod lock;
+pub mod notices;
+pub mod operations;
+pub mod recovery;
+mod recovery_run;
+mod recovery_scan;
+mod reset_consent;
 pub mod store;
 
+use lock::StateLockError;
+
+pub use approvals::{
+    APPROVAL_CLOSED_MAX, APPROVAL_EXECUTION_MAX_MS, APPROVAL_RECORD_MAX, APPROVAL_RULE_TTL_MAX_MS,
+    ApprovalRecorder, ApprovalState, ApprovalStatus, ApprovalView, Consent, ConsentPayload,
+    ConsentRow, PendingApprovalFacts, RowProvenance, WireApproval,
+};
+pub use budget::{
+    AuthorizationView, BucketProjection, BucketUsage, BudgetError, BudgetProjection,
+    InformationalBound, NativeClass, NativeObligation, NativeTotal, RuleBudget,
+    SnapshotUnavailable, Undecided, UsageUnavailable,
+};
+pub use ledger::{
+    AuthorizationState, ClaimExpect, ConsumeExpect, ConsumeReceipt, ConsumptionBinding,
+    DomainBinding, FeeBumpFacts, MAX_OPEN_AUTHORIZATIONS, MintAuthority, MintRequest, MintedRecord,
+    NativeReservation, OpenAuthorization, PolicyAuthorityBinding, SubmissionBinding,
+    WindowReservation,
+};
+pub use notices::{CommittedBatch, CommittedTransition, WatchClass, WatchedOperation};
+pub use operations::{
+    AdmissibleFloors, AgreedOutcome, ApprovalLineage, AttemptAuthorization, AttemptEnvelope,
+    AttemptRequest, AttemptStarted, BoundedText, BusinessId, CapacityDetail, ClearForm,
+    CommitBinding, CommitId, CommitTarget, CommittedDecision, ConsumptionExposure, Disposition,
+    EndpointCoverage, EvidenceAnswer, EvidenceAuditFacts, EvidenceClassification, EvidenceEndpoint,
+    EvidenceInput, EvidenceRowInput, EvidenceSequenceClass, EvidenceVerdict, ExposureIdentity,
+    IntentSlot, LookupOutcome, NotIncludedProof, ObligationKind, OpenOutcome, OpenRequest,
+    OperationAudit, OperationAuthority, OperationHandle, OperationId, OperationKind, OperationLink,
+    OperationProjection, OperationRecorder, OperationResult, OperationState, OperationStatus,
+    OperationTool, OperationView, RecoveryUpdate, ReleaseObligation, SequenceReleaseInput,
+    SlotKind, StatusSelectors, StatusTarget, TransitionEvidence, WindowObservation, X402Intent,
+};
+pub use recovery::{
+    AccountAnswer, CheckedRecoveryDecision, DecidedTransition, EndpointPair, LedgerAnswer,
+    OutcomeAnswer, RecoveryAction, RecoveryAttemptResult, RecoveryError, RecoveryInclusion,
+    RecoveryRefusal, RecoveryReport, RecoveryRequests, RecoveryResult, SubmissionObservation,
+    recover_outcomes, recover_sequences, submission_observation,
+};
+pub use recovery_run::{
+    RECOVERY_RUN_MAX, RecoveryClass, RecoveryRole, RecoveryRunMethod, RecoveryRunPhase,
+    RecoveryRunSnapshot, RecoveryRunState, RecoveryRunView, RecoveryStage, RecoveryStop,
+    RecoveryStopReason, WireRecoveryRun, classify_recovery_stop, normalize_recovery_run,
+    recovery_backoff, recovery_deadline, recovery_expiry, recovery_exposure_digest,
+    recovery_retry_time,
+};
+pub(crate) use store::UnsentReservation;
 pub use store::{
-    MintOutcome, POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET,
-    RECONCILE_MIN_AGE_MS, ReconcileFailure, ReconcileReport, ResetError, ResetOutcome,
-    SettledSubmission, WindowReservation,
+    AccountingDecision, ChainScope, DeliveryReport, MintOutcome, OwedAccountingExpiries,
+    OwnerResetSignature, POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET,
+    RECONCILE_MIN_AGE_MS, REPORTED_SUCCESS_CODE, RETENTION_EXPIRED_CODE, ReconcileFailure,
+    ReconcileFailureKind, ReconcileReport, ReportedAnswer, ResetConsent, ResetError, ResetOutcome,
+    ResetRecord, ScheduleTerminal, SettledSubmission, SignedIntentLegView, SignedIntentView,
+    StateDefect, SubmissionAnchor, SubmissionHold, TotalUsage, TotalUsageError, UnrecordedAnswer,
+    deliver_accounting_expiries, deliver_accounting_expiry, drain_accounting_obligations,
+    project_accounting_expiries,
 };
 
 /// Records a confirmed call's contribution into `engine`'s window state and
@@ -178,13 +284,11 @@ pub use store::{
 /// applied on-chain. Authorized external settlement records through
 /// [`record_authorized_window_state`] instead. `value`
 /// MUST be the SAME [`stellar_agent_core::policy::v1::ValueClass`] the
-/// original gate evaluated — the single-derivation invariant, matching the
-/// audit-row `value_action_submitted` emission this call is always paired
-/// with.
+/// original gate evaluated (the single-derivation invariant).
 ///
-/// Non-fatal by design, mirroring the audit-row emission discipline: the
-/// on-chain action already committed and is irreversible, so a recording
-/// failure here is surfaced via `tracing::warn!` rather than propagated. A
+/// Non-fatal by design: the on-chain action already committed and is
+/// irreversible, so a recording failure here is surfaced via `tracing::warn!`
+/// rather than propagated. A
 /// failed record means the NEXT call under-counts against the accumulated
 /// window — that is loud in the log, not silent.
 pub fn record_confirmed_window_state(
@@ -207,6 +311,18 @@ pub fn record_confirmed_window_state(
             return;
         }
     };
+    // A total-budget debit is admitted before its exposure and never
+    // recorded after a confirmation, so every entry that touches a total
+    // limit or a total key stays out of this write.
+    let recorded: Vec<_> = recorded
+        .into_iter()
+        .filter(|entry| {
+            !matches!(
+                entry.limit(),
+                stellar_agent_core::policy::v1::criteria::state_store::WindowLimit::Total { .. }
+            ) && !(entry.key().window_secs() == 0 && entry.key().bucket().starts_with("total:"))
+        })
+        .collect();
     if recorded.is_empty() {
         return;
     }
@@ -252,10 +368,76 @@ pub fn record_authorized_window_state(
         .map(|_outcome| ())
 }
 
+/// Prepares ordered policy accounting and admits every item in one durable batch.
+///
+/// A preparation failure can leave in-memory entries. Refresh the engine's
+/// window state from the durable store before the next dispatch.
+///
+/// # Errors
+/// Returns a typed store error for preparation, admission, or persistence failure.
+/// A refused batch persists no new usage.
+pub fn record_authorized_window_states(
+    engine: &dyn stellar_agent_core::policy::PolicyEngine,
+    items: &[(
+        stellar_agent_core::policy::ToolDescriptor,
+        stellar_agent_core::policy::v1::ValueClass,
+    )],
+    profile: &stellar_agent_core::profile::schema::Profile,
+    profile_name: &str,
+) -> Result<(), WindowStoreError> {
+    let mut recorded = Vec::new();
+    for (tool, value) in items {
+        recorded.extend(
+            engine
+                .record_confirmed(tool, profile, value)
+                .map_err(|error| WindowStoreError::Invalid {
+                    detail: format!("policy authorization accounting failed: {error}"),
+                })?,
+        );
+    }
+    if recorded.is_empty() {
+        return Ok(());
+    }
+    PersistedWindowStore::for_profile(profile_name)
+        .record_authorized(profile, &recorded)
+        .map(|_outcome| ())
+}
+
 /// Error variants for [`PersistedWindowStore`] operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum WindowStoreError {
+    /// A signing or binding differs from the admitted authority.
+    #[error("the signed intent differs at {field}")]
+    IntentBindingMismatch {
+        /// The fixed mismatching field.
+        field: &'static str,
+    },
+    /// The window holds signed authority that cannot be reset.
+    #[error(
+        "the spending window holds signed intents (authorization exposed, submission unknown: {exposed}; bound: {bound}); the reset refuses while any stands.{separator}{explanation}",
+        separator = if .explanation.is_empty() { "" } else { " " }
+    )]
+    SignedIntentLive {
+        /// Applicable purpose and endpoint explanations.
+        explanation: String,
+        /// The number of intents without a bound submission.
+        exposed: usize,
+        /// The number of intents with a bound submission.
+        bound: usize,
+    },
+    /// The selected network disagrees with authenticated spending state.
+    #[error(
+        "the profile network disagrees with authenticated spending state. Restore the profile's network, or create a profile under a new name."
+    )]
+    ChainMismatch,
+
+    /// Retained state has no complete authenticated network provenance.
+    #[error(
+        "spending state has no complete authenticated network provenance. No verb recovers such state; create a profile under a new name."
+    )]
+    ChainUnverifiable,
+
     /// Another process or task holds the exclusive write lock.
     #[error("policy window-state store writer is locked by another process")]
     WriterLocked,
@@ -275,6 +457,13 @@ pub enum WindowStoreError {
         detail: String,
     },
 
+    /// The authenticated file was written by a newer build.
+    #[error(
+        "policy window-state version must be supported by this build; use the build that wrote \
+         the file"
+    )]
+    UnsupportedVersion,
+
     /// The store file's HMAC tag does not match the recomputed value —
     /// tampering, corruption, or a stale key.
     #[error("policy window-state store HMAC mismatch — possible tampering or rotation")]
@@ -284,9 +473,13 @@ pub enum WindowStoreError {
     /// generation counter, or one of the two is present without the other —
     /// a deleted-and-recreated file, a restored older snapshot, or a deleted
     /// generation counter. See the module docs' "Anti-rollback" section.
+    ///
+    /// For a mainnet profile in a build with mainnet writes, this condition,
+    /// like every other unverifiable state, refuses as
+    /// `MainnetStateUnverifiable` naming its defect instead.
     #[error(
-        "policy window-state store generation mismatch — possible deletion or rollback; \
-         run `profile reset-window-state` to recover"
+        "policy window-state store generation mismatch, possible deletion or rollback. \
+         No verb recovers such state; create a profile under a new name."
     )]
     GenerationMismatch,
 
@@ -305,6 +498,12 @@ pub enum WindowStoreError {
     )]
     KeyMatchesOwnerPublicKey,
 
+    /// The profile key coordinate names the reserved installation service.
+    #[error(
+        "`policy_window_state_key_id` names the reserved service `stellar-agent-toolsets` (validation.installation_key_coordinate)"
+    )]
+    InstallationKeyCoordinate,
+
     /// A window bucket cannot admit the reservation.
     ///
     /// Produced by [`PersistedWindowStore::record_pending`] when it re-applies
@@ -322,13 +521,405 @@ pub enum WindowStoreError {
         reason: Box<stellar_agent_core::policy::DenyReason>,
     },
 
+    /// The window state holds an accounting-expiry audit obligation that
+    /// delivery has not acknowledged.
+    ///
+    /// Produced by [`PersistedWindowStore::reset`] before either callback
+    /// runs. The successor would erase the obligation, so the reset refuses
+    /// until the owed `submission_accounting_expired` event is delivered. The
+    /// reset changes no window state.
+    #[error(
+        "the spending window owes an accounting audit event that is not delivered yet; the \
+         reset refuses until it is"
+    )]
+    AccountingAuditOwed,
+
+    /// The reset names a profile other than the one the profile's owner
+    /// coordinate names. The reset changes no window state.
+    #[error("the window state reset names a profile other than the one the profile file names")]
+    ResetProfileMismatch,
+
+    /// The reset requires the policy owner's signature and presents none.
+    #[error("the window state reset requires the policy owner's signature")]
+    ResetOwnerRequired,
+
+    /// The enrolled owner cannot be read or decoded under the reset guard.
+    #[error("the enrolled owner cannot be read for the window state reset: {0}")]
+    ResetOwnerUnreadable(
+        /// The classified owner entry failure.
+        stellar_agent_core::error::WalletError,
+    ),
+
+    /// The reset is signed by a key other than the selected policy owner. The
+    /// reset changes no window state.
+    #[error("the window state reset signature names an owner other than the selected policy owner")]
+    ResetOwnerMismatch {
+        /// The owner public key the presented signature names.
+        presented: [u8; 32],
+        /// The owner public key selected from the pin or enrollment.
+        pinned: [u8; 32],
+    },
+
+    /// The reset presents an owner signature and no policy pin names an owner.
+    /// The reset changes no window state.
+    #[error("no policy pin names an owner for this window state store")]
+    ResetPinAbsent,
+
+    /// The policy pin cannot be read under the reset's lock. The reset changes
+    /// no window state.
+    #[error("the policy pin cannot be read for the window state reset: {0}")]
+    ResetPinUnreadable(
+        /// The pin read failure.
+        stellar_agent_core::policy::pin::PinError,
+    ),
+
+    /// The mainnet enablement nonce cannot be read. The reset changes no
+    /// window state.
+    #[error("the mainnet enablement nonce cannot be read for the window state reset: {0}")]
+    ResetEnablementUnreadable(
+        /// The nonce read failure.
+        stellar_agent_core::error::ValidationError,
+    ),
+
+    /// The owner signature does not verify over this reset's statement. The
+    /// reset changes no window state.
+    #[error("the owner's signature does not verify over this window state reset")]
+    ResetSignatureInvalid,
+
+    /// The latest reset already consumes this request id.
+    #[error("{0}", stellar_agent_core::policy::PolicyError::ResetConsentReplayed)]
+    ResetConsentReplayed,
+
     /// The file already holds a record under the reservation's id.
     ///
-    /// Produced by [`PersistedWindowStore::record_pending`], under the
-    /// store's lock. The id is the envelope hash of the signed bytes, so the
-    /// window has already counted these bytes: the submission that wrote the
-    /// record settles them. The duplicate is refused before another reservation
-    /// can count that spend. Nothing is written.
+    /// Produced by [`PersistedWindowStore::record_pending`], and by
+    /// [`PersistedWindowStore::consume_authorizations`] for an envelope the
+    /// window holds, under the store's lock. The id is the envelope hash of the
+    /// signed bytes, so the window has already counted these bytes: the
+    /// submission that wrote the record settles them. The duplicate is refused
+    /// before another reservation can count that spend. Nothing is written.
     #[error("the spending window already holds a reservation for these signed bytes")]
     DuplicateReservation,
+
+    /// An earlier authorization consumed this transaction's envelope hash.
+    ///
+    /// Produced by [`PersistedWindowStore::consume_authorizations`] under the
+    /// store's lock, even when the earlier authorization had no holds.
+    /// Nothing is written.
+    #[error("the authorization ledger already consumed these signed bytes")]
+    DuplicateConsumption,
+
+    /// A mainnet authorization transition refused: a precondition of the mint,
+    /// the consumption, or the invalidation does not hold. The store file is not written.
+    #[error("the mainnet authorization ledger refused: {precondition}")]
+    AuthorizationRefused {
+        /// The broken precondition.
+        precondition: crate::mainnet::MainnetPrecondition,
+    },
+
+    /// The store of a mainnet profile cannot be verified, so neither its
+    /// spend history nor its authorizations are known.
+    ///
+    /// Produced in place of the generic integrity errors for a mainnet
+    /// profile in a build with mainnet writes. No verb recovers such state; create a profile under a new name.
+    #[cfg(feature = "mainnet-write")]
+    #[error(
+        "policy.window_state_unverifiable: the policy window-state of this mainnet profile \
+         cannot be verified ({defect}). No verb recovers such state; create a profile under a new name."
+    )]
+    MainnetStateUnverifiable {
+        /// The defect found.
+        defect: StateDefect,
+    },
+
+    /// The business id names a retained operation or tombstone with another
+    /// intent digest or slot kind, or an attempt presents an envelope other
+    /// than the one its record holds. Nothing is written.
+    #[error(
+        "operation.business_id_conflict: the business id names a retained operation with \
+         another intent"
+    )]
+    BusinessIdConflict,
+
+    /// A commit presents a business id other than the one its preparation
+    /// opened. Nothing is written.
+    #[error(
+        "operation.business_id_mismatch: the business id differs from the one the \
+         preparation opened"
+    )]
+    BusinessIdMismatch,
+
+    /// A new operation record, its intent or its envelope exceeds an
+    /// allowance of the spending window, or an attempt's envelope does.
+    /// Nothing is written.
+    #[error("operation.capacity: the spending window cannot hold the operation ({detail})")]
+    OperationCapacity {
+        /// The exceeded limit.
+        detail: operations::CapacityDetail,
+    },
+
+    /// The operation already has an attempt in progress. Nothing is written.
+    #[error("operation.attempt_open: the operation already has an attempt in progress")]
+    AttemptOpen,
+
+    /// The operation has made every attempt it may make. Nothing is written.
+    #[error("operation.attempt_limit: the operation has made all of its attempts")]
+    AttemptLimit,
+
+    /// The reset refuses because an operation has not reached a terminal
+    /// state. The reset changes no window state.
+    #[error(
+        "reset.operations_open: the spending window holds {open} open operation(s); the reset \
+         refuses until each ends"
+    )]
+    OperationsOpen {
+        /// The number of operations outside a terminal state.
+        open: usize,
+    },
+
+    /// Total-budget accounting cannot read the policy pin; the window may be
+    /// empty. The window file and its committed counter stay unchanged. A
+    /// first write may already have created the window key.
+    #[error("total-budget accounting requires a readable policy pin ({detail})")]
+    TotalEpochUnavailable {
+        /// Why the pin cannot be read.
+        detail: String,
+    },
+
+    /// A total-budget debit names a policy other than the pinned one. The
+    /// window file and its committed counter stay unchanged.
+    #[error("the total-budget debit was sized under a policy other than the pinned one")]
+    TotalEpochStale,
+
+    /// A total-budget debit names the digest an earlier build's state
+    /// retired. The writer's successor is not committed, so the window file
+    /// and its committed counter stay unchanged.
+    #[error(
+        "the spending window cannot account for total-budget debits recorded by an earlier \
+         build; sign and install a new policy"
+    )]
+    TotalEpochRetired,
+
+    /// A mint under policy authority finds the unlisted-recipient allowance
+    /// spent. Nothing is written; a per-payment approval covers the payment.
+    #[error("the unlisted-recipient allowance is spent; this payment needs a per-payment approval")]
+    UnlistedApprovalRequired,
+
+    /// An unlisted or native accounting sum exceeds its representation.
+    /// Nothing is written.
+    #[error("the policy accounting sum overflows; nothing was recorded")]
+    AccountingOverflow,
+
+    /// An accounting contributor or native fee is negative.
+    /// Nothing is written.
+    #[error("a policy accounting amount or fee is invalid")]
+    AccountingInvalid,
+
+    /// The reset refuses while approvals remain inside their waiting windows.
+    #[error("reset.approvals_pending: the spending window holds {pending} pending approval(s)")]
+    ApprovalsPending {
+        /// The number of pending approvals inside their waiting windows.
+        pending: usize,
+    },
+
+    /// The audit row of an operation step could not be appended. The step
+    /// is not committed.
+    #[error("audit.append_failed: the operation step's audit row was not appended ({detail})")]
+    AuditAppendFailed {
+        /// The writer's failure. MUST NOT include key material.
+        detail: String,
+    },
+
+    /// A successor attempt lacks its predecessor's committed non-inclusion
+    /// proof or the projection marker of that decision. Nothing is written.
+    #[error("recovery.retry_refused: the operation has no committed and projected non-inclusion")]
+    RetryRefused,
+
+    /// An operation record reached a state its rules exclude: an edge
+    /// outside the state table, or a commit identifier beyond the record's
+    /// allowance. Nothing is written.
+    #[error("internal.unexpected_state: {detail}")]
+    UnexpectedState {
+        /// The broken rule.
+        detail: String,
+    },
+
+    /// The reset of a mainnet profile's verifiable store refuses because a
+    /// mainnet authorization is still open. The reset changes no window state.
+    #[cfg(feature = "mainnet-write")]
+    #[error(
+        "the policy window-state holds {open} open mainnet authorization(s); the reset refuses \
+         until each is used or expires"
+    )]
+    OpenAuthorizations {
+        /// The number of effective open authorizations.
+        open: usize,
+    },
+}
+
+/// The sentence that ends a refusal of state no verb recovers.
+const NO_RECOVERY_NOTICE: &str = "No verb recovers such state; create a profile under a new name.";
+
+impl From<StateLockError> for WindowStoreError {
+    fn from(error: StateLockError) -> Self {
+        match error {
+            StateLockError::WriterLocked => Self::WriterLocked,
+            StateLockError::Io { kind } => Self::Io { kind },
+            _ => Self::Io {
+                kind: std::io::ErrorKind::Other,
+            },
+        }
+    }
+}
+
+impl WindowStoreError {
+    /// The value-free validation refusal for an authenticated scope failure.
+    #[must_use]
+    pub fn chain_validation_error(&self) -> Option<stellar_agent_core::error::ValidationError> {
+        use stellar_agent_core::error::ValidationError;
+        match self {
+            Self::ChainMismatch => Some(ValidationError::WindowChainMismatch),
+            Self::ChainUnverifiable => Some(ValidationError::WindowChainUnverifiable),
+            _ => None,
+        }
+    }
+
+    /// The validation refusal of a total-budget epoch failure, which every
+    /// adapter reports under its own `policy.total_epoch_*` code.
+    #[must_use]
+    pub fn total_epoch_error(&self) -> Option<stellar_agent_core::error::ValidationError> {
+        use stellar_agent_core::error::ValidationError;
+        match self {
+            Self::TotalEpochUnavailable { detail } => {
+                Some(ValidationError::TotalEpochUnavailable {
+                    detail: detail.clone(),
+                })
+            }
+            Self::TotalEpochStale => Some(ValidationError::TotalEpochStale),
+            Self::TotalEpochRetired => Some(ValidationError::TotalEpochRetired),
+            _ => None,
+        }
+    }
+
+    /// The wallet refusal an operation store failure names, when it names
+    /// one: the business id, capacity, attempt, retry, reset, audit and
+    /// state-rule refusals of the operation section, the total-budget epoch
+    /// refusals, and the unlisted-recipient accounting refusals.
+    #[must_use]
+    pub fn operation_error(&self) -> Option<stellar_agent_core::error::WalletError> {
+        use stellar_agent_core::error::{InternalError, SubmissionError, ValidationError};
+        Some(match self {
+            Self::BusinessIdConflict => ValidationError::OperationBusinessIdConflict.into(),
+            Self::BusinessIdMismatch => ValidationError::OperationBusinessIdMismatch.into(),
+            Self::OperationCapacity { detail } => SubmissionError::OperationCapacity {
+                detail: detail.label(),
+            }
+            .into(),
+            Self::AttemptOpen => SubmissionError::OperationAttemptOpen.into(),
+            Self::AttemptLimit => SubmissionError::OperationAttemptLimit.into(),
+            Self::RetryRefused => SubmissionError::RecoveryRetryRefused.into(),
+            Self::OperationsOpen { open } => {
+                ValidationError::ResetOperationsOpen { open: *open }.into()
+            }
+            Self::ApprovalsPending { pending } => {
+                ValidationError::ResetApprovalsPending { pending: *pending }.into()
+            }
+            Self::TotalEpochUnavailable { .. }
+            | Self::TotalEpochStale
+            | Self::TotalEpochRetired => self.total_epoch_error()?.into(),
+            Self::UnlistedApprovalRequired => ValidationError::UnlistedApprovalRequired.into(),
+            Self::AccountingOverflow => ValidationError::AccountingOverflow.into(),
+            Self::AccountingInvalid => ValidationError::AccountingInvalid.into(),
+            Self::PolicyDenied { reason }
+                if matches!(
+                    reason.as_ref(),
+                    stellar_agent_core::policy::DenyReason::AccountUnread
+                        | stellar_agent_core::policy::DenyReason::AccountStale { .. }
+                        | stellar_agent_core::policy::DenyReason::AccountFloorRefused { .. }
+                ) =>
+            {
+                stellar_agent_core::error::WalletError::PolicyDenied {
+                    reason: reason.clone(),
+                }
+            }
+            Self::AuditAppendFailed { detail } => ValidationError::AuditAppendFailed {
+                detail: detail.clone(),
+            }
+            .into(),
+            Self::UnexpectedState { detail } => InternalError::UnexpectedState {
+                detail: detail.clone(),
+            }
+            .into(),
+            _ => return None,
+        })
+    }
+
+    /// The business code for a state read or submission reservation refusal.
+    #[must_use]
+    pub fn submission_code(&self) -> &'static str {
+        if let Some(error) = self.chain_validation_error() {
+            return error.code();
+        }
+        self.operation_error()
+            .map_or("submission.record_unavailable", |error| error.code())
+    }
+
+    /// Ends `refusal` with the no-recovery sentence when the store failed its
+    /// integrity check. A backend failure can clear, and the other unverifiable
+    /// states carry the sentence in their own text.
+    #[must_use]
+    pub fn with_recovery_notice(&self, refusal: String) -> String {
+        if matches!(self, Self::HmacMismatch | Self::Invalid { .. }) {
+            format!("{refusal}. {NO_RECOVERY_NOTICE}")
+        } else {
+            refusal
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) mod reset_test {
+    use super::store::{OwnerResetSignature, ResetConsent, ResetRecord};
+
+    /// The owner public key for the fixture seed.
+    pub(super) fn owner_of(seed: u8) -> [u8; 32] {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes()
+    }
+
+    /// Signs the exact reset statement with the fixture seed.
+    pub(super) fn signed_by(seed: u8, row: &ResetRecord<'_>) -> ResetConsent {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        ResetConsent {
+            owner_signature: Some(OwnerResetSignature {
+                owner: owner_of(seed),
+                signature: stellar_agent_core::policy::v1::signature::sign(
+                    &row.statement_digest(),
+                    &key,
+                ),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::WindowStoreError;
+
+    #[test]
+    fn signed_intent_live_explanation_has_only_its_required_space() {
+        let base = "the spending window holds signed intents (authorization exposed, submission unknown: 1; bound: 2); the reset refuses while any stands.";
+        for (explanation, expected) in [
+            ("", base.to_owned()),
+            ("Retained intent.", format!("{base} Retained intent.")),
+        ] {
+            let error = WindowStoreError::SignedIntentLive {
+                explanation: explanation.into(),
+                exposed: 1,
+                bound: 2,
+            };
+            assert_eq!(error.to_string(), expected);
+        }
+    }
 }

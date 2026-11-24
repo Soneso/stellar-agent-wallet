@@ -26,6 +26,7 @@ pub(crate) struct RotateHmacKeyArgs {
     /// Profile name whose counterparty cache HMAC key should be rotated.
     ///
     /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    /// A mainnet profile must be named with this flag.
     #[arg(long = "profile", value_name = "NAME")]
     pub(crate) profile: Option<String>,
 }
@@ -83,8 +84,8 @@ where
     let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved_profile) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e, &profile_name));
+            tracing::debug!(error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e));
             return 1;
         }
     };
@@ -92,6 +93,11 @@ where
     // A coordinate in the owner key namespace refuses before the keyring
     // opens, so the rotation never writes over an owner entry.
     let entry_ref = &profile.counterparty_cache_key_id;
+    if let Err(e) = owner_key::refuse_installation_key_coordinate(entry_ref, COUNTERPARTY_KEY_FIELD)
+    {
+        render::render_json(&Envelope::err(&e));
+        return 1;
+    }
     if let Err(e) = owner_key::refuse_owner_key_coordinate(entry_ref, COUNTERPARTY_KEY_FIELD) {
         render::render_json(&Envelope::err(&e));
         return 1;
@@ -158,6 +164,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn an_owner_namespace_coordinate_refuses_the_rotation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::KeyringEntryRef;
 
         stellar_agent_test_support::keyring_mock::install().unwrap();
@@ -194,5 +203,21 @@ mod tests {
         );
         assert_eq!(init_calls.get(), 0, "the refusal precedes the keyring");
         assert_eq!(code, 1);
+    }
+
+    /// Installation coordinates refuse on testnet before the keyring opens.
+    #[tokio::test]
+    #[serial]
+    async fn installation_coordinate_refuses_without_writing() {
+        crate::common::installation_key_fixture::assert_installation_profile_refusal(
+            |profile| &mut profile.counterparty_cache_key_id,
+            async |fixture, profile, name| {
+                let args = RotateHmacKeyArgs {
+                    profile: Some(name.to_owned()),
+                };
+                run_with_dependencies(&args, |_| Ok(profile.clone()), || fixture.init()).await
+            },
+        )
+        .await;
     }
 }

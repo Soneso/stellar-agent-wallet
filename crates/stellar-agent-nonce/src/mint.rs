@@ -12,12 +12,15 @@
 //! bytes[16..48] = 32-byte HMAC-SHA256 tag
 //! ```
 //!
-//! The salt is NOT an HMAC input; it serves only as the HashMap key in the
-//! replay window and as nonce uniqueness across concurrent calls.
+//! The salt is an HMAC input.  It makes two nonces for one request distinct,
+//! and as part of the full 48-byte nonce it keys the replay window; because
+//! the tag covers it, every byte of that key is authenticated.
 //!
 //! # HMAC input order (canonical form)
 //!
 //! ```text
+//! mac.update(NONCE_TAG_DOMAIN)        // 27 bytes: "stellar-agent-nonce-tag:v2\0"
+//! mac.update(salt)                    // 16 bytes: bytes[0..16] of the nonce
 //! mac.update(boot_nonce)              // 16 bytes — process-scoped; zeroed on restart
 //! mac.update(envelope_hash)           // 32 bytes — SHA-256(envelope_xdr)
 //! mac.update(expiry_unix_ms BE)       // 8 bytes big-endian u64
@@ -153,6 +156,7 @@ pub struct NonceVerifyHmacOnlyRequest<'a> {
 ///
 /// Opaque value; inspect only via [`to_base64`] / [`from_base64`].
 /// The internal layout is stable and documented in the crate `//!` header.
+/// The tag covers the salt, so all 48 bytes are authenticated.
 ///
 /// Transmitted to the MCP agent as a URL-safe base64 string (no padding).
 ///
@@ -176,7 +180,8 @@ pub struct Nonce {
 impl Nonce {
     /// Returns the 16-byte random salt portion of this nonce.
     ///
-    /// Used as the HashMap key in the [`ReplayWindow`].
+    /// The salt is an input of the HMAC tag and, together with the tag, forms
+    /// the 48-byte key of the [`ReplayWindow`].
     ///
     /// # Panics
     ///
@@ -308,23 +313,16 @@ impl Nonce {
 }
 
 impl std::fmt::Debug for Nonce {
-    /// Shows the first 4 bytes of the 16-byte salt as hex for tracing
-    /// correlation (`salt=aabbccdd...`).
+    /// Renders the fixed text `Nonce([REDACTED])`.
     ///
-    /// The full 32-byte HMAC-SHA256 tag is **redacted entirely**.  Rationale:
-    /// although the tag alone does not reveal the key, logging it creates an
-    /// oracle for offline pre-image attacks; a 4-byte salt prefix is
-    /// sufficient to correlate log lines across mint and verify calls.
+    /// A nonce reaches this path from a caller's input, and verification may
+    /// have refused it, so neither the salt nor the HMAC-SHA256 tag appears.
     ///
     /// # Panics
     ///
     /// Never panics.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Nonce(salt={:02x}{:02x}{:02x}{:02x}..., tag=[REDACTED])",
-            self.inner[0], self.inner[1], self.inner[2], self.inner[3]
-        )
+        f.write_str("Nonce([REDACTED])")
     }
 }
 
@@ -485,8 +483,9 @@ impl NonceMint {
     ///    `[MIN_TTL_MS, max_ttl_ms]` (`TtlTooShort` / `TtlExceeded`).
     /// 5. Load the HMAC key from the keyring (lazy).
     /// 6. Compute `SHA-256(envelope_xdr)`.
-    /// 7. Generate 16-byte `OsRng` salt.
-    /// 8. Compute HMAC-SHA256 tag (with length-prefix separators).
+    /// 7. Generate the 16-byte `OsRng` salt.
+    /// 8. Compute the HMAC-SHA256 tag over the salt and the request (with
+    ///    length-prefix separators).
     /// 9. Zeroise the key.
     /// 10. Return `Nonce(salt || tag)`.
     ///
@@ -530,9 +529,7 @@ impl NonceMint {
     ) -> Result<Nonce, NonceError> {
         // 1. Validate tool BEFORE any key state.
         if !registered_tools.is_registered(tool_name) {
-            return Err(NonceError::InvalidTool {
-                tool: tool_name.to_owned(),
-            });
+            return Err(NonceError::InvalidTool);
         }
 
         // 2. Envelope non-empty check.
@@ -544,7 +541,6 @@ impl NonceMint {
         if chain_id != self.chain_id {
             return Err(NonceError::ChainMismatch {
                 expected: self.chain_id.clone(),
-                got: chain_id.to_owned(),
             });
         }
 
@@ -568,19 +564,21 @@ impl NonceMint {
         // 5. Load key — zeroised on all exit paths by Zeroizing<T> Drop.
         let key = self.load_key()?;
 
-        // 6-8. Generate tag with length-prefix separators (boundary-collision defence).
+        // 6. `compute_tag` hashes the envelope.
+        // 7. Generate the 16-byte random salt.
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+
+        // 8. Generate the tag over the salt and the request.
         let tag = compute_tag(
             &key,
             process_boot_nonce(),
+            &salt,
             envelope_xdr,
             expiry_unix_ms,
             tool_name,
             chain_id,
         )?;
-
-        // 7. Generate 16-byte random salt (uniqueness + replay window key).
-        let mut salt = [0u8; 16];
-        OsRng.fill_bytes(&mut salt);
 
         let mut inner = [0u8; 48];
         inner[..16].copy_from_slice(&salt);
@@ -602,8 +600,9 @@ impl NonceMint {
     ///
     /// 1. Not expired (`expiry_unix_ms > now_unix_ms`).
     /// 2. `chain_id` matches the profile's chain.
-    /// 3. Salt not in `replay_window` (not yet consumed).
-    /// 4. HMAC tag matches (constant-time comparison via `subtle::ConstantTimeEq`).
+    /// 3. Nonce (full 48 bytes) not in `replay_window` (not yet consumed).
+    /// 4. HMAC tag over the nonce's salt and the request matches
+    ///    (constant-time comparison via `subtle::ConstantTimeEq`).
     /// 5. Records the nonce (full 48 bytes) in `replay_window`.
     ///
     /// The replay window MUST be checked and MUST record the nonce on success.
@@ -685,22 +684,25 @@ impl NonceMint {
         if chain_id != self.chain_id {
             return Err(NonceError::ChainMismatch {
                 expected: self.chain_id.clone(),
-                got: chain_id.to_owned(),
             });
         }
 
         // 3. Replay check (before key load; lookup is cheap).
-        //    Key is the full 48-byte nonce (salt + tag) for defence-in-depth.
+        //    Key is the full 48-byte nonce (salt + tag); the tag check in
+        //    step 6 authenticates every byte of it.
         let full_nonce: [u8; 48] = nonce.inner;
         replay_window.check_not_replayed(&full_nonce)?;
 
         // 4. Load key — zeroised on all exit paths.
         let key = self.load_key()?;
 
-        // 5. Recompute HMAC tag.
+        // 5. Recompute the HMAC tag over the nonce's own salt and the request.
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(&nonce.inner[..16]);
         let recomputed = compute_tag(
             &key,
             process_boot_nonce(),
+            &salt,
             envelope_xdr,
             expiry_unix_ms,
             tool_name,
@@ -749,6 +751,8 @@ impl NonceMint {
     /// concurrent request would also pass `verify_hmac_only` but fail `record`
     /// with `Replayed`.  The overall nonce correctness guarantee is maintained
     /// because a replayed nonce never produces two committed transactions.
+    /// The tag covers the salt, so a copy of a consumed nonce with any byte
+    /// changed fails here with `HmacMismatch` and never reaches `record`.
     ///
     /// # Security
     ///
@@ -800,17 +804,19 @@ impl NonceMint {
         if chain_id != self.chain_id {
             return Err(NonceError::ChainMismatch {
                 expected: self.chain_id.clone(),
-                got: chain_id.to_owned(),
             });
         }
 
         // 3. Load key (this is the blocking keyring IPC call).
         let key = self.load_key()?;
 
-        // 4. Recompute HMAC tag.
+        // 4. Recompute the HMAC tag over the nonce's own salt and the request.
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(&nonce.inner[..16]);
         let recomputed = compute_tag(
             &key,
             process_boot_nonce(),
+            &salt,
             envelope_xdr,
             expiry_unix_ms,
             tool_name,
@@ -946,9 +952,8 @@ impl NonceMint {
             },
         )?;
 
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&decoded);
-        let key_z: Zeroizing<[u8; 32]> = Zeroizing::new(key);
+        let mut key_z = Zeroizing::new([0u8; 32]);
+        key_z.copy_from_slice(&decoded);
 
         // Panic-injection hook — only compiled when `test-hooks` feature is enabled.
         // Placed AFTER the secret-bearing `Zeroizing<T>` wrappers (raw, decoded,
@@ -1001,11 +1006,20 @@ pub static DROP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Domain-separation prefix and version of the nonce tag preimage.
+///
+/// The tag preimage starts with these bytes, so a tag computed over any other
+/// preimage layout never verifies.  A change to the preimage layout changes
+/// the version suffix.
+const NONCE_TAG_DOMAIN: &[u8] = b"stellar-agent-nonce-tag:v2\0";
+
 /// Computes the HMAC-SHA256 tag for the canonical input domain.
 ///
 /// Input order with length-prefix boundary separators:
 ///
 /// ```text
+/// NONCE_TAG_DOMAIN  (27 bytes, fixed: "stellar-agent-nonce-tag:v2\0")
+/// salt              (16 bytes, fixed; bytes[0..16] of the nonce)
 /// boot_nonce        (16 bytes, fixed)
 /// SHA-256(envelope) (32 bytes, fixed)
 /// expiry_unix_ms    (8 bytes, big-endian u64)
@@ -1018,6 +1032,10 @@ pub static DROP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// Length prefixes prevent boundary-collision attacks: without them,
 /// `(tool="ab", chain="cd")` and `(tool="abc", chain="d")` both yield the
 /// concatenation `"abcd"` and produce identical HMAC tags.
+///
+/// The salt is an HMAC input, so every byte of the 48-byte nonce is
+/// authenticated: a nonce whose salt changed after minting fails verification
+/// with [`NonceError::HmacMismatch`] before it is recorded in the replay window.
 ///
 /// Returns a 32-byte `Zeroizing<[u8; 32]>` that is zeroed on drop.
 ///
@@ -1038,6 +1056,7 @@ pub static DROP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 fn compute_tag(
     key: &[u8; 32],
     boot_nonce: &[u8; 16],
+    salt: &[u8; 16],
     envelope_xdr: &[u8],
     expiry_unix_ms: u64,
     tool_name: &str,
@@ -1051,6 +1070,8 @@ fn compute_tag(
     let mut mac = HmacSha256::new_from_slice(key.as_ref())
         .map_err(|_| NonceError::KeyTooShort { actual: key.len() })?;
 
+    mac.update(NONCE_TAG_DOMAIN);
+    mac.update(salt);
     mac.update(boot_nonce);
     mac.update(&envelope_hash);
     mac.update(&expiry_unix_ms.to_be_bytes());
@@ -1142,9 +1163,11 @@ mod tests {
     fn compute_tag_is_deterministic() {
         let key = [1u8; 32];
         let boot = [2u8; 16];
+        let salt = [3u8; 16];
         let tag1 = compute_tag(
             &key,
             &boot,
+            &salt,
             b"xdr",
             99_000,
             "stellar_pay",
@@ -1154,6 +1177,7 @@ mod tests {
         let tag2 = compute_tag(
             &key,
             &boot,
+            &salt,
             b"xdr",
             99_000,
             "stellar_pay",
@@ -1167,9 +1191,11 @@ mod tests {
     fn compute_tag_differs_on_envelope() {
         let key = [1u8; 32];
         let boot = [2u8; 16];
+        let salt = [3u8; 16];
         let tag1 = compute_tag(
             &key,
             &boot,
+            &salt,
             b"xdr1",
             99_000,
             "stellar_pay",
@@ -1179,6 +1205,7 @@ mod tests {
         let tag2 = compute_tag(
             &key,
             &boot,
+            &salt,
             b"xdr2",
             99_000,
             "stellar_pay",
@@ -1192,9 +1219,11 @@ mod tests {
     fn compute_tag_differs_on_tool() {
         let key = [1u8; 32];
         let boot = [2u8; 16];
+        let salt = [3u8; 16];
         let tag1 = compute_tag(
             &key,
             &boot,
+            &salt,
             b"xdr",
             99_000,
             "stellar_pay",
@@ -1204,6 +1233,7 @@ mod tests {
         let tag2 = compute_tag(
             &key,
             &boot,
+            &salt,
             b"xdr",
             99_000,
             "stellar_balances",
@@ -1217,9 +1247,11 @@ mod tests {
     fn compute_tag_differs_on_chain() {
         let key = [1u8; 32];
         let boot = [2u8; 16];
+        let salt = [3u8; 16];
         let tag1 = compute_tag(
             &key,
             &boot,
+            &salt,
             b"xdr",
             99_000,
             "stellar_pay",
@@ -1229,6 +1261,7 @@ mod tests {
         let tag2 = compute_tag(
             &key,
             &boot,
+            &salt,
             b"xdr",
             99_000,
             "stellar_pay",
@@ -1241,8 +1274,9 @@ mod tests {
     #[test]
     fn compute_tag_differs_on_boot_nonce() {
         let key = [1u8; 32];
-        let tag1 = compute_tag(&key, &[0u8; 16], b"xdr", 99_000, "t", "c").unwrap();
-        let tag2 = compute_tag(&key, &[1u8; 16], b"xdr", 99_000, "t", "c").unwrap();
+        let salt = [3u8; 16];
+        let tag1 = compute_tag(&key, &[0u8; 16], &salt, b"xdr", 99_000, "t", "c").unwrap();
+        let tag2 = compute_tag(&key, &[1u8; 16], &salt, b"xdr", 99_000, "t", "c").unwrap();
         assert_ne!(*tag1, *tag2);
     }
 
@@ -1251,14 +1285,84 @@ mod tests {
     fn compute_tag_no_boundary_collision() {
         let key = [1u8; 32];
         let boot = [2u8; 16];
+        let salt = [3u8; 16];
         // Without length prefixes, both produce the concatenation "abcd" and
         // would yield the same HMAC.  With length prefixes they are distinct.
-        let tag_ab_cd = compute_tag(&key, &boot, b"xdr", 99_000, "ab", "cd").unwrap();
-        let tag_abc_d = compute_tag(&key, &boot, b"xdr", 99_000, "abc", "d").unwrap();
+        let tag_ab_cd = compute_tag(&key, &boot, &salt, b"xdr", 99_000, "ab", "cd").unwrap();
+        let tag_abc_d = compute_tag(&key, &boot, &salt, b"xdr", 99_000, "abc", "d").unwrap();
         assert_ne!(
             *tag_ab_cd, *tag_abc_d,
             "length-prefix separators must prevent boundary collision \
              between (tool='ab', chain='cd') and (tool='abc', chain='d')"
+        );
+    }
+
+    // Tag must differ when only the salt changes: the salt is an HMAC input.
+    #[test]
+    fn compute_tag_differs_on_salt() {
+        let key = [1u8; 32];
+        let boot = [2u8; 16];
+        let tag1 = compute_tag(
+            &key,
+            &boot,
+            &[3u8; 16],
+            b"xdr",
+            99_000,
+            "stellar_pay",
+            "stellar:testnet",
+        )
+        .unwrap();
+        let tag2 = compute_tag(
+            &key,
+            &boot,
+            &[4u8; 16],
+            b"xdr",
+            99_000,
+            "stellar_pay",
+            "stellar:testnet",
+        )
+        .unwrap();
+        assert_ne!(*tag1, *tag2, "different salt must produce different tag");
+    }
+
+    /// The tag is HMAC-SHA256 over the documented preimage: the domain
+    /// constant, the salt, the boot nonce, SHA-256 of the envelope, the expiry
+    /// as big-endian u64, then the length-prefixed tool name and chain id.
+    #[test]
+    fn compute_tag_matches_the_documented_preimage() {
+        let key = [0x11u8; 32];
+        let boot = [0x22u8; 16];
+        let salt = [0x33u8; 16];
+        let envelope: &[u8] = b"envelope-xdr";
+        let expiry: u64 = 1_893_456_300_000;
+        let tool = "stellar_pay";
+        let chain = "stellar:testnet";
+
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(b"stellar-agent-nonce-tag:v2\0");
+        preimage.extend_from_slice(&salt);
+        preimage.extend_from_slice(&boot);
+        preimage.extend_from_slice(&Sha256::digest(envelope));
+        preimage.extend_from_slice(&expiry.to_be_bytes());
+        preimage.extend_from_slice(&11u32.to_be_bytes());
+        preimage.extend_from_slice(b"stellar_pay");
+        preimage.extend_from_slice(&15u32.to_be_bytes());
+        preimage.extend_from_slice(b"stellar:testnet");
+
+        let mut mac = HmacSha256::new_from_slice(&key).unwrap();
+        mac.update(&preimage);
+        let expected: [u8; 32] = mac.finalize().into_bytes().into();
+
+        let tag = compute_tag(&key, &boot, &salt, envelope, expiry, tool, chain).unwrap();
+        assert_eq!(
+            *tag, expected,
+            "tag must be the HMAC of the documented preimage"
+        );
+
+        let hex: String = tag.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex, "6e49674e24ae9920376676f6cfd49d887a17edb6ffa5b8ae634008cffcd243f9",
+            "tag of the fixed inputs, computed independently of this crate"
         );
     }
 
@@ -1280,9 +1384,11 @@ mod tests {
     fn compute_tag_differs_on_expiry() {
         let key = [1u8; 32];
         let boot = [2u8; 16];
+        let salt = [3u8; 16];
         let tag1 = compute_tag(
             &key,
             &boot,
+            &salt,
             b"xdr",
             99_000,
             "stellar_pay",
@@ -1292,6 +1398,7 @@ mod tests {
         let tag2 = compute_tag(
             &key,
             &boot,
+            &salt,
             b"xdr",
             99_001,
             "stellar_pay",
@@ -1320,10 +1427,7 @@ mod tests {
 
         let n = Nonce::from_raw(raw);
         let debug = format!("{n:?}");
-        assert!(debug.contains("Nonce(salt=01020304..."));
-        assert!(debug.contains("tag=[REDACTED]"));
-        assert!(!debug.contains("05060708090a0b0c0d0e0f10"));
-        assert!(!debug.contains("abababababababab"));
+        assert_eq!(debug, "Nonce([REDACTED])");
     }
 
     /// `inner_bytes` returns the full 48-byte `[salt || tag]` array, preserving
@@ -1380,7 +1484,11 @@ mod tests {
     ///
     /// Key state is never engaged, so no keyring setup is required.
     #[test]
+    #[serial_test::serial]
     fn mint_rejects_empty_envelope_xdr() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
             "stellar-agent-signer",
             "empty-env-inline",

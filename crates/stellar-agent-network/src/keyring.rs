@@ -100,19 +100,23 @@ use keyring_core::Entry as KeyringEntry;
 use rand_core::{OsRng, RngCore};
 use stellar_agent_core::profile::owner_key;
 use stellar_agent_core::{
-    audit_log::binding::{AuditBinding, BindingCheck, RecordedBinding},
+    audit_log::binding::{AuditBinding, BindingCheck, BindingHistory, RecordedBinding},
     audit_log::tip_anchor::{
-        KeyedAuditAccess, TipAnchor, TipAnchorStore, TipAnchorStoreError,
-        reanchor_count_account_for_digest, tip_anchor_account_for_digest,
+        AuditKeyringEntries, KeyedAuditAccess, TipAnchor, TipAnchorStore, TipAnchorStoreError,
     },
-    error::{AuthError, InternalError, NetworkError, ValidationError, WalletError},
+    error::{
+        AuthError, InternalError, KeyringMissingCause, NetworkError, ValidationError, WalletError,
+    },
     observability::redact_strkey_first5_last5,
     profile::schema::{KeyringEntryRef, Profile, check_rpc_credential_value},
 };
 use zeroize::Zeroizing;
 
 use crate::signing::source::{SecretStrkeySource, signer_from_s_strkey};
-use crate::signing::{Signer, WebAuthnAssertion, software::SoftwareSigningKey};
+use crate::signing::{
+    MessagePayload, Signer, SmartAccountAuthDigest, SorobanAuthPayload, TxSigningPayload,
+    WebAuthnAssertion, software::SoftwareSigningKey,
+};
 
 #[allow(deprecated)]
 pub use stellar_agent_core::keyring_errors::classify_keyring_error;
@@ -178,7 +182,10 @@ pub fn map_keyring_operation_error(
 ///
 /// # Errors
 ///
-/// Returns [`WalletError::Auth`] wrapping [`AuthError::KeyringConfigInvalid`]
+/// In isolated builds, an existing store remains registered.
+/// Otherwise, only recognized headless backends initialize; all other selectors return an isolation error before native construction.
+///
+/// In production, returns [`WalletError::Auth`] wrapping [`AuthError::KeyringConfigInvalid`]
 /// if `STELLAR_AGENT_KEYRING_BACKEND` selects a headless backend that cannot
 /// be set up. The causes are an unrecognized backend value, a missing or
 /// malformed `STELLAR_AGENT_HEADLESS_KEYRING_KEY`, a backend the platform does
@@ -201,18 +208,65 @@ pub fn map_keyring_operation_error(
 /// init_platform_keyring_store().expect("platform keyring unavailable");
 /// ```
 pub fn init_platform_keyring_store() -> Result<(), WalletError> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    {
+        if keyring_core::get_default_store().is_some() {
+            return Ok(());
+        }
+        if let Some(backend) = stellar_agent_headless_keyring::requested_backend()
+            && matches!(backend.as_str(), "headless-env" | "headless-dpapi")
+        {
+            return stellar_agent_headless_keyring::init_headless_store(&backend).map_err(
+                |error| {
+                    WalletError::Auth(AuthError::KeyringConfigInvalid {
+                        detail: error.to_string(),
+                    })
+                },
+            );
+        }
+        Err(platform_store_init_failure(
+            "STELLAR_AGENT_TEST_STORAGE_ISOLATED: STELLAR_AGENT_KEYRING_BACKEND requires an isolated store",
+        ))
+    }
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    init_production_store()
+}
+
+#[cfg(not(any(test, feature = "test-helpers")))]
+fn init_production_store() -> Result<(), WalletError> {
+    dispatch_production_store(
+        stellar_agent_headless_keyring::requested_backend().as_deref(),
+        stellar_agent_headless_keyring::init_headless_store,
+        construct_native_store,
+    )
+}
+
+#[cfg(any(test, not(feature = "test-helpers")))]
+fn dispatch_production_store(
+    backend: Option<&str>,
+    headless: impl FnOnce(&str) -> Result<(), stellar_agent_headless_keyring::HeadlessKeyringInitError>,
+    native: impl FnOnce() -> Result<(), WalletError>,
+) -> Result<(), WalletError> {
     // A headless backend that cannot be set up is a configuration fault the
     // operator fixes in the environment, so it reports the configuration
     // code, with the variable or condition at fault, and no keyring entry.
-    if let Some(backend) = stellar_agent_headless_keyring::requested_backend() {
-        return stellar_agent_headless_keyring::init_headless_store(&backend).map_err(|e| {
-            tracing::debug!(error = %e, backend = %backend, "headless keyring store init failure");
+    if let Some(backend) = backend {
+        return headless(backend).map_err(|e| {
+            tracing::debug!(error = %e, "headless keyring store init failure");
             WalletError::Auth(AuthError::KeyringConfigInvalid {
                 detail: e.to_string(),
             })
         });
     }
 
+    native()
+}
+
+#[cfg(any(
+    not(any(test, feature = "test-helpers")),
+    feature = "live-platform-keyring"
+))]
+fn construct_native_store() -> Result<(), WalletError> {
     #[cfg(target_os = "macos")]
     {
         use apple_native_keyring_store::keychain::Store;
@@ -240,6 +294,113 @@ pub fn init_platform_keyring_store() -> Result<(), WalletError> {
     ))
 }
 
+/// Counts forbidden native factory requests in isolated builds.
+#[cfg(all(
+    any(test, feature = "test-helpers"),
+    not(feature = "live-platform-keyring")
+))]
+static NATIVE_STORE_REQUESTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(
+    any(test, feature = "test-helpers"),
+    not(feature = "live-platform-keyring")
+))]
+#[allow(
+    dead_code,
+    reason = "isolated builds compile the factory name without a native constructor"
+)]
+fn construct_native_store() -> Result<(), WalletError> {
+    NATIVE_STORE_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Err(platform_store_init_failure(
+        "STELLAR_AGENT_TEST_STORAGE_ISOLATED",
+    ))
+}
+
+/// Explicit access to real platform storage for live acceptance suites.
+#[cfg(feature = "live-platform-keyring")]
+pub mod live {
+    /// Acknowledges real platform keyring access.
+    pub struct LivePlatformKeyring(());
+
+    impl LivePlatformKeyring {
+        /// Grants real platform keyring access to a live acceptance suite.
+        #[must_use]
+        pub fn acknowledge_real_platform_keyring() -> Self {
+            Self(())
+        }
+    }
+
+    /// Installs the real native store.
+    ///
+    /// # Errors
+    /// Returns the platform initialization error when the store is unavailable.
+    pub fn init_platform_keyring_store_live(
+        _: LivePlatformKeyring,
+    ) -> Result<(), super::WalletError> {
+        super::construct_native_store()
+    }
+}
+
+/// The keyring backend a process stores its entries in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyringBackend {
+    /// The platform keyring: the macOS Keychain, the Secret Service, or the
+    /// Windows Credential Manager.
+    Platform,
+    /// The headless file store sealed under the key in
+    /// `STELLAR_AGENT_HEADLESS_KEYRING_KEY`.
+    HeadlessEnv,
+    /// The headless file store sealed under Windows DPAPI.
+    HeadlessDpapi,
+    /// `STELLAR_AGENT_KEYRING_BACKEND` names no known backend, so
+    /// [`init_platform_keyring_store`] refuses to register a store.
+    Unrecognized,
+}
+
+impl KeyringBackend {
+    /// The backend's label: `platform`, `headless-env`, `headless-dpapi`, or
+    /// `unrecognized`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Platform => "platform",
+            Self::HeadlessEnv => "headless-env",
+            Self::HeadlessDpapi => "headless-dpapi",
+            Self::Unrecognized => "unrecognized",
+        }
+    }
+
+    fn from_label(label: &str) -> Self {
+        match label {
+            "headless-env" => Self::HeadlessEnv,
+            "headless-dpapi" => Self::HeadlessDpapi,
+            _ => Self::Unrecognized,
+        }
+    }
+}
+
+/// The keyring backend this process uses.
+///
+/// A registered headless store answers first, then
+/// `STELLAR_AGENT_KEYRING_BACKEND`, the input [`init_platform_keyring_store`]
+/// selects the backend from. Either one naming a headless backend makes the
+/// answer headless, so a check made before the store is registered and one
+/// made after agree. With no headless store registered and the variable
+/// unset the answer is [`KeyringBackend::Platform`]; a set value naming no
+/// known backend is [`KeyringBackend::Unrecognized`].
+#[must_use]
+pub fn active_keyring_backend() -> KeyringBackend {
+    if let Some(label) = stellar_agent_headless_keyring::registered_backend() {
+        return KeyringBackend::from_label(label);
+    }
+    stellar_agent_headless_keyring::requested_backend()
+        .map_or(KeyringBackend::Platform, |requested| {
+            KeyringBackend::from_label(&requested)
+        })
+}
+
 /// Registers the platform keyring store, as [`init_platform_keyring_store`]
 /// does, only when no default store is registered yet.
 ///
@@ -250,10 +411,16 @@ pub fn init_platform_keyring_store() -> Result<(), WalletError> {
 ///
 /// The errors of [`init_platform_keyring_store`], when it runs.
 pub(crate) fn ensure_platform_keyring_store() -> Result<(), WalletError> {
+    ensure_store_with(init_platform_keyring_store)
+}
+
+fn ensure_store_with(
+    initialize: impl FnOnce() -> Result<(), WalletError>,
+) -> Result<(), WalletError> {
     if keyring_core::get_default_store().is_some() {
         return Ok(());
     }
-    init_platform_keyring_store()
+    initialize()
 }
 
 /// The diagnostic label of an RPC credential entry: `service/account`.
@@ -284,8 +451,8 @@ fn open_rpc_credential_entry(entry: &KeyringEntryRef) -> Result<KeyringEntry, Wa
 ///
 /// # Errors
 ///
-/// - [`AuthError::KeyringNotFound`] naming `service/account` when the entry
-///   does not exist; the other keyring codes for store failures.
+/// - [`AuthError::KeyringNotFound`] when the entry does not exist; the other
+///   keyring codes for store failures.
 /// - [`NetworkError::RpcCredentialInvalid`] when the stored value is empty,
 ///   longer than 1024 bytes, or holds a control character.
 pub fn read_rpc_credential(entry: &KeyringEntryRef) -> Result<Zeroizing<String>, WalletError> {
@@ -313,6 +480,8 @@ pub fn read_rpc_credential(entry: &KeyringEntryRef) -> Result<Zeroizing<String>,
 ///
 /// # Errors
 ///
+/// - [`ValidationError::PolicyPinCoordinate`] for a policy pin coordinate.
+/// - [`ValidationError::InstallationKeyCoordinate`] for the reserved service.
 /// - [`NetworkError::RpcCredentialInvalid`] when the value breaks the value
 ///   rules; nothing is written.
 /// - The keyring codes of a failed write.
@@ -320,6 +489,8 @@ pub fn write_rpc_credential(
     entry: &KeyringEntryRef,
     value: &Zeroizing<String>,
 ) -> Result<(), WalletError> {
+    owner_key::refuse_policy_pin_coordinate(entry, "rpc_credential")?;
+    owner_key::refuse_installation_key_coordinate(entry, "rpc_credential")?;
     let label = rpc_credential_label(entry);
     check_rpc_credential_value(value).map_err(|reason| {
         WalletError::Network(NetworkError::RpcCredentialInvalid {
@@ -362,6 +533,7 @@ fn platform_store_init_failure(label: &str) -> WalletError {
     })
 }
 
+#[cfg(any(test, not(feature = "test-helpers"), feature = "live-platform-keyring"))]
 fn install_platform_store(
     store: keyring_core::Result<Arc<keyring_core::CredentialStore>>,
 ) -> Result<(), WalletError> {
@@ -404,16 +576,20 @@ fn install_platform_store(
 ///
 /// # Errors
 ///
+/// Returns [`ValidationError::PolicyPinCoordinate`] for a policy pin coordinate.
+/// Returns [`ValidationError::InstallationKeyCoordinate`] for the reserved service.
 /// Returns [`WalletError`] when the keyring entry cannot be opened or updated.
 /// Operator-visible errors are mapped through the same secret-safe keyring
 /// error discipline as signing-key lookups.
 pub fn rotate_keyring_secret_32(service: &str, entry_name: &str) -> Result<(), WalletError> {
+    let entry_ref = KeyringEntryRef::new(service, entry_name);
+    owner_key::refuse_policy_pin_coordinate(&entry_ref, "keyring_coordinate")?;
+    owner_key::refuse_installation_key_coordinate(&entry_ref, "keyring_coordinate")?;
     let mut raw = Zeroizing::new([0u8; 32]);
     OsRng.fill_bytes(raw.as_mut());
 
     let encoded: Zeroizing<String> = Zeroizing::new(URL_SAFE_NO_PAD.encode(raw.as_ref()));
 
-    let entry_ref = KeyringEntryRef::new(service, entry_name);
     let entry = open_entry(&entry_ref)?;
     entry
         .set_password(&encoded)
@@ -453,10 +629,75 @@ pub fn load_hmac_key_32(entry_ref: &KeyringEntryRef) -> Result<Zeroizing<[u8; 32
     let secret_b64 = Zeroizing::new(entry.get_password().map_err(|e| {
         map_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service)
     })?);
+    decode_secret_32(&secret_b64)
+}
 
-    let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {
-        // Upstream Display strings are not forwarded to typed errors; debug only.
-        tracing::debug!(error = %e, "chain-root HMAC key base64 decode failed");
+/// Reads a 32-byte secret stored in the [`rotate_keyring_secret_32`] form,
+/// reporting a never-written entry as `Ok(None)`.
+///
+/// The absent-tolerant counterpart of [`load_hmac_key_32`] for an
+/// installation-wide secret that a later operation mints, such as the toolset
+/// pin key: a reader without the secret refuses what the secret would
+/// authenticate, rather than failing on the keyring read.
+///
+/// # Errors
+///
+/// - [`WalletError`] when the keyring entry cannot be opened or read for any
+///   reason other than its absence, mapped through the secret-safe keyring
+///   error discipline.
+/// - [`WalletError::Internal`] if the stored value is not valid base64 or does
+///   not decode to exactly 32 bytes.
+pub fn read_secret_32(
+    entry_ref: &KeyringEntryRef,
+) -> Result<Option<Zeroizing<[u8; 32]>>, WalletError> {
+    let entry = open_entry(entry_ref)?;
+    match entry.get_password() {
+        Ok(value) => decode_secret_32(&Zeroizing::new(value)).map(Some),
+        Err(keyring_core::Error::NoEntry) => Ok(None),
+        Err(e) => Err(map_keyring_operation_error(
+            &e,
+            KeyringOperation::Read,
+            &entry_ref.service,
+        )),
+    }
+}
+
+/// Returns the 32-byte secret at `entry_ref`, minting and storing a fresh one
+/// only when the entry has never been written.
+///
+/// The minted secret is 32 bytes from the operating system's CSPRNG, stored
+/// in the [`rotate_keyring_secret_32`] form. Any read failure other than the
+/// entry's absence refuses and mints nothing, so a locked or unavailable
+/// keyring never replaces an existing secret. The read and the mint are not
+/// atomic against another process. Toolset installation serializes them with
+/// the installation pin-key lock in [`stellar_agent_core::profile::schema::canonical_data_root`],
+/// named by [`stellar_agent_core::profile::schema::TOOLSET_PIN_KEY_LOCK_FILE_NAME`].
+///
+/// # Errors
+///
+/// - [`ValidationError::PolicyPinCoordinate`] for a policy pin coordinate.
+/// - Any error of [`read_secret_32`].
+/// - [`WalletError`] when the minted secret cannot be written.
+pub fn load_or_mint_secret_32(
+    entry_ref: &KeyringEntryRef,
+) -> Result<Zeroizing<[u8; 32]>, WalletError> {
+    owner_key::refuse_policy_pin_coordinate(entry_ref, "keyring_coordinate")?;
+    if let Some(secret) = read_secret_32(entry_ref)? {
+        return Ok(secret);
+    }
+    let mut raw = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(raw.as_mut());
+    let encoded: Zeroizing<String> = Zeroizing::new(URL_SAFE_NO_PAD.encode(raw.as_ref()));
+    open_entry(entry_ref)?.set_password(&encoded).map_err(|e| {
+        map_keyring_operation_error(&e, KeyringOperation::Write, &entry_ref.service)
+    })?;
+    Ok(raw)
+}
+
+/// Decodes a `URL_SAFE_NO_PAD` secret and checks its 32-byte length.
+fn decode_secret_32(secret_b64: &str) -> Result<Zeroizing<[u8; 32]>, WalletError> {
+    let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|_| {
+        tracing::debug!("chain-root HMAC key base64 decode failed");
         WalletError::Internal(InternalError::UnexpectedState {
             detail: "audit.key_decode_failed: keyring HMAC key is not valid base64".to_owned(),
         })
@@ -498,10 +739,14 @@ pub fn load_hmac_key_32(entry_ref: &KeyringEntryRef) -> Result<Zeroizing<[u8; 32
 ///
 /// # Errors
 ///
+/// Returns [`ValidationError::PolicyPinCoordinate`] for a policy pin coordinate.
+/// Returns [`ValidationError::InstallationKeyCoordinate`] for the reserved service.
 /// Returns [`WalletError`] when the keyring entry cannot be opened or written,
 /// mapped through the same secret-safe keyring error discipline as signing-key
 /// lookups.
 pub fn write_keyring_string(entry_ref: &KeyringEntryRef, value: &str) -> Result<(), WalletError> {
+    owner_key::refuse_policy_pin_coordinate(entry_ref, "keyring_coordinate")?;
+    owner_key::refuse_installation_key_coordinate(entry_ref, "keyring_coordinate")?;
     let entry = open_entry(entry_ref)?;
     entry
         .set_password(value)
@@ -530,6 +775,38 @@ pub fn read_keyring_string(entry_ref: &KeyringEntryRef) -> Result<Option<String>
     }
 }
 
+/// Platform-keyring record of spent rule approvals beside the attestation key.
+#[derive(Debug, Clone)]
+pub struct KeyringRuleApprovalSpentStore {
+    entry: KeyringEntryRef,
+}
+
+impl KeyringRuleApprovalSpentStore {
+    /// Derives the spent coordinate from the profile's attestation key.
+    #[must_use]
+    pub fn new(attestation_key: &KeyringEntryRef) -> Self {
+        Self {
+            entry: stellar_agent_core::profile::schema::rule_approval_spent_entry_ref(
+                attestation_key,
+            ),
+        }
+    }
+}
+
+impl stellar_agent_core::approval::RuleApprovalSpentStore for KeyringRuleApprovalSpentStore {
+    fn load(&self) -> Result<Option<String>, stellar_agent_core::approval::SpentSetError> {
+        read_keyring_string(&self.entry).map_err(|e| {
+            stellar_agent_core::approval::SpentSetError::Unavailable { code: e.code() }
+        })
+    }
+
+    fn store(&self, value: &str) -> Result<(), stellar_agent_core::approval::SpentSetError> {
+        write_keyring_string(&self.entry, value).map_err(|e| {
+            stellar_agent_core::approval::SpentSetError::Unavailable { code: e.code() }
+        })
+    }
+}
+
 /// Checks the profile's audit binding, then loads its audit chain-root key and
 /// pairs it with the anchor store for that profile's log path.
 ///
@@ -543,9 +820,16 @@ pub fn read_keyring_string(entry_ref: &KeyringEntryRef) -> Result<Option<String>
 /// `profile_name` is the selected, reconciled profile name; the binding
 /// coordinate derives from it alone. The key's coordinate is refused first
 /// when it sits in the owner key namespace, so no binding records an owner
-/// coordinate. [`check_audit_binding`] then runs under `binding` before the
-/// key loads, so a changed binding refuses without a key read. The loaded key
-/// is refused when it equals the profile's owner public key.
+/// coordinate. The recorded binding is then compared before the key loads, so
+/// a changed binding refuses without a key read. The loaded key is refused
+/// when it equals the profile's owner public key. Under
+/// [`BindingCheck::Enforce`] an absent binding is recorded only after the key
+/// has loaded and passed that check: a recorded binding says a keyed use
+/// reached the log, and a profile with no audit key has had none.
+///
+/// The returned access carries the binding's [`BindingHistory`] from before
+/// this call. A writer opened with it refuses to adopt a log whose anchor is
+/// missing when the binding was already recorded (`audit.tip_anchor_missing`).
 ///
 /// # Errors
 ///
@@ -565,18 +849,21 @@ pub fn keyed_audit_access(
     binding: BindingCheck,
 ) -> Result<KeyedAuditAccess, WalletError> {
     owner_key::refuse_owner_key_coordinate(&profile.audit_log_hash_chain_key_id, AUDIT_KEY_FIELD)?;
-    check_audit_binding(profile, profile_name, binding)?;
+    let classified = ClassifiedBinding::read(profile, profile_name)?;
     let hmac_key = load_hmac_key_32(&profile.audit_log_hash_chain_key_id)?;
     owner_key::refuse_owner_public_key(
         hmac_key.as_ref(),
         &owner_key::OwnerKeyContext::for_profile(profile_name, profile),
         AUDIT_KEY_FIELD,
     )?;
+    if binding == BindingCheck::Enforce {
+        classified.record_if_absent()?;
+    }
     let tip_anchor = KeyringTipAnchorStore::shared(
         &profile.audit_log_hash_chain_key_id,
         &profile.audit_log_path,
     );
-    Ok(KeyedAuditAccess::new(hmac_key, tip_anchor))
+    Ok(KeyedAuditAccess::new(hmac_key, tip_anchor).with_binding_history(classified.history))
 }
 
 /// The profile field an audit-key owner refusal names.
@@ -585,9 +872,10 @@ pub const AUDIT_KEY_FIELD: &str = "audit_log_hash_chain_key_id";
 /// Compares the profile's audit binding with the record at
 /// [`KeyringEntryRef::default_audit_binding`] for `profile_name`.
 ///
-/// - An equal record continues.
+/// - An equal record continues and returns [`BindingHistory::Recorded`].
 /// - An absent record is stored under [`BindingCheck::Enforce`] and left
-///   absent under [`BindingCheck::CheckOnly`].
+///   absent under [`BindingCheck::CheckOnly`]; either way the call returns
+///   [`BindingHistory::NotRecorded`], which describes the state before it.
 /// - A record that differs or does not parse refuses.
 ///
 /// # Errors
@@ -602,20 +890,60 @@ pub fn check_audit_binding(
     profile: &Profile,
     profile_name: &str,
     binding: BindingCheck,
-) -> Result<(), WalletError> {
-    let store = KeyringAuditBindingStore::for_profile(profile_name);
-    let expected = AuditBinding::for_profile(profile);
-    match store.classify(&expected)? {
-        RecordedBinding::Equal => Ok(()),
-        RecordedBinding::Absent => match binding {
-            BindingCheck::Enforce => store.store(&expected),
-            BindingCheck::CheckOnly => Ok(()),
-        },
-        RecordedBinding::Changed(_) | RecordedBinding::Unparseable => Err(WalletError::Validation(
-            ValidationError::AuditLogBindingChanged {
-                profile: profile_name.to_owned(),
-            },
-        )),
+) -> Result<BindingHistory, WalletError> {
+    let classified = ClassifiedBinding::read(profile, profile_name)?;
+    if binding == BindingCheck::Enforce {
+        classified.record_if_absent()?;
+    }
+    Ok(classified.history)
+}
+
+/// A profile's audit binding read and compared, not yet recorded.
+///
+/// Splits [`check_audit_binding`] so [`keyed_audit_access`] can refuse a
+/// changed binding before the key loads and record an absent one only after.
+struct ClassifiedBinding {
+    store: KeyringAuditBindingStore,
+    expected: AuditBinding,
+    history: BindingHistory,
+}
+
+impl ClassifiedBinding {
+    /// Reads the record for `profile_name` and compares it with `profile`'s
+    /// binding.
+    ///
+    /// # Errors
+    ///
+    /// [`ValidationError::AuditLogBindingChanged`] for a record that differs
+    /// or does not parse, and the keyring error when it cannot be read.
+    fn read(profile: &Profile, profile_name: &str) -> Result<Self, WalletError> {
+        let store = KeyringAuditBindingStore::for_profile(profile_name);
+        let expected = AuditBinding::for_profile(profile);
+        let recorded = store.classify(&expected)?;
+        if recorded.refuses() {
+            return Err(WalletError::Validation(
+                ValidationError::AuditLogBindingChanged {
+                    profile: profile_name.to_owned(),
+                },
+            ));
+        }
+        Ok(Self {
+            store,
+            expected,
+            history: recorded.history(),
+        })
+    }
+
+    /// Records the profile's binding when none was recorded.
+    ///
+    /// # Errors
+    ///
+    /// The keyring error when the write fails.
+    fn record_if_absent(&self) -> Result<(), WalletError> {
+        match self.history {
+            BindingHistory::NotRecorded => self.store.store(&self.expected),
+            BindingHistory::Recorded => Ok(()),
+        }
     }
 }
 
@@ -677,25 +1005,29 @@ impl KeyringAuditBindingStore {
 
 /// The platform-keyring implementation of the audit log's tip anchor.
 ///
-/// Holds the two keyring coordinates the anchor for one log PATH occupies: the
-/// anchor value itself, and the monotonic counter of operator-acknowledged
-/// re-anchors beside it. Both are derived from the profile's audit-key
-/// coordinate plus the lexically normalized log path, so a repointed
-/// `audit_log_path` has coordinates of its own and never carries the old
-/// file's tip onto a new file. The audit binding refuses the repointed path
-/// until the operator acknowledges it.
+/// Holds the anchor, reanchor counter, and outbox commitment for one log path.
+/// All derive from the profile's audit-key coordinate and the lexically
+/// normalized log path. A repointed `audit_log_path` has coordinates of its own.
+/// The audit binding refuses the repointed path until the operator acknowledges it.
 ///
-/// Neither value is secret: the anchor is a count, a public chain hash, and a
+/// These values are public: the anchor is a count, a public chain hash, and a
 /// byte offset. The anchor, the re-anchor counter, and the audit binding live
 /// in the keyring, outside the log file. Anyone who can restore the keyring's
 /// own storage together with the log can restore an older state. With a
 /// headless keyring backend these entries are kept in a file on the same host.
 /// Anyone who can write that file can restore older entries or delete one,
 /// which needs no key material.
+///
+/// The store also keeps the audit-key coordinate it was derived from, never
+/// the key. A keyed queue append can then read the current key again after
+/// a rotation publishes the queue's generation line under a new key.
 #[derive(Debug, Clone)]
 pub struct KeyringTipAnchorStore {
+    audit_key_ref: KeyringEntryRef,
     anchor_ref: KeyringEntryRef,
     counter_ref: KeyringEntryRef,
+    outbox_ref: KeyringEntryRef,
+    carriers_ref: KeyringEntryRef,
 }
 
 impl KeyringTipAnchorStore {
@@ -717,15 +1049,18 @@ impl KeyringTipAnchorStore {
     /// an [`AuditBinding`] records it.
     #[must_use]
     pub fn for_path_digest(audit_key_ref: &KeyringEntryRef, path_sha256: &[u8; 32]) -> Self {
+        let AuditKeyringEntries {
+            tip_anchor,
+            reanchor_counter,
+            outbox_state,
+            carrier_record,
+        } = AuditKeyringEntries::for_path_digest(audit_key_ref, path_sha256);
         Self {
-            anchor_ref: KeyringEntryRef::new(
-                audit_key_ref.service.clone(),
-                tip_anchor_account_for_digest(&audit_key_ref.account, path_sha256),
-            ),
-            counter_ref: KeyringEntryRef::new(
-                audit_key_ref.service.clone(),
-                reanchor_count_account_for_digest(&audit_key_ref.account, path_sha256),
-            ),
+            audit_key_ref: audit_key_ref.clone(),
+            anchor_ref: tip_anchor,
+            counter_ref: reanchor_counter,
+            outbox_ref: outbox_state,
+            carriers_ref: carrier_record,
         }
     }
 
@@ -747,12 +1082,109 @@ impl KeyringTipAnchorStore {
 ///
 /// The wallet error's `Display` already carries only non-secret coordinates and
 /// fixed labels, and the anchor itself is not secret, so the text is forwarded
-/// as the detail.
+/// as the detail. A typed [`AuthError`] is carried alongside it so callers can
+/// surface a keyring refusal under its own `auth.*` code.
 fn anchor_store_error(op: &str, e: &WalletError) -> TipAnchorStoreError {
-    TipAnchorStoreError::new(format!("{op}: {e}"))
+    let detail = format!("{op}: {e}");
+    match e {
+        WalletError::Auth(auth) => TipAnchorStoreError::from_auth(detail, auth.clone()),
+        _ => TipAnchorStoreError::new(detail),
+    }
+}
+
+impl KeyringTipAnchorStore {
+    fn generation_entry(&self, generation: u64) -> KeyringEntryRef {
+        if generation == 0 {
+            return self.outbox_ref.clone();
+        }
+        KeyringEntryRef::new(
+            &self.outbox_ref.service,
+            format!("{}-g{generation}", self.outbox_ref.account),
+        )
+    }
+
+    fn owner_entry(&self, carrier_generation: u64) -> KeyringEntryRef {
+        let entry = self.generation_entry(carrier_generation);
+        KeyringEntryRef::new(&entry.service, format!("{}-owner", entry.account))
+    }
 }
 
 impl TipAnchorStore for KeyringTipAnchorStore {
+    /// Reads the audit key at the coordinate this store was derived from.
+    ///
+    /// The read writes nothing: an absent key stays absent and is reported
+    /// as `None`.
+    fn reload_audit_key(&self) -> Result<Option<Zeroizing<[u8; 32]>>, TipAnchorStoreError> {
+        read_secret_32(&self.audit_key_ref)
+            .map_err(|e| anchor_store_error("audit key reload failed", &e))
+    }
+
+    /// Hashes the generation-zero outbox coordinate, which carries the log
+    /// path digest. It reads no secret and survives carrier and key changes.
+    fn outbox_evidence_scope(&self) -> Result<[u8; 32], TipAnchorStoreError> {
+        let entry = self.generation_entry(0);
+        Ok(stellar_agent_core::audit_log::evidence_scope(
+            &entry.service,
+            &entry.account,
+        ))
+    }
+
+    fn load_outbox_owner_state(
+        &self,
+        carrier_generation: u64,
+    ) -> Result<Option<String>, TipAnchorStoreError> {
+        read_keyring_string(&self.owner_entry(carrier_generation))
+            .map_err(|e| anchor_store_error("outbox owner state read failed", &e))
+    }
+
+    fn store_outbox_owner_state(
+        &self,
+        carrier_generation: u64,
+        value: &str,
+    ) -> Result<(), TipAnchorStoreError> {
+        write_keyring_string(&self.owner_entry(carrier_generation), value)
+            .map_err(|e| anchor_store_error("outbox owner state write failed", &e))
+    }
+
+    fn load_carrier_record(
+        &self,
+    ) -> Result<Option<stellar_agent_core::audit_log::tip_anchor::CarrierRecord>, TipAnchorStoreError>
+    {
+        read_keyring_string(&self.carriers_ref)
+            .map_err(|e| anchor_store_error("carrier record read failed", &e))?
+            .map(|raw| stellar_agent_core::audit_log::tip_anchor::CarrierRecord::parse(&raw))
+            .transpose()
+    }
+    fn store_carrier_record(
+        &self,
+        record: &stellar_agent_core::audit_log::tip_anchor::CarrierRecord,
+    ) -> Result<(), TipAnchorStoreError> {
+        write_keyring_string(&self.carriers_ref, &record.to_keyring_value()?)
+            .map_err(|e| anchor_store_error("carrier record write failed", &e))
+    }
+
+    fn load_outbox_state(
+        &self,
+        generation: u64,
+    ) -> Result<Option<stellar_agent_core::audit_log::OutboxState>, TipAnchorStoreError> {
+        read_keyring_string(&self.generation_entry(generation))
+            .map_err(|e| anchor_store_error("outbox state read failed", &e))?
+            .map(|raw| stellar_agent_core::audit_log::OutboxState::parse(&raw))
+            .transpose()
+    }
+
+    fn store_outbox_state(
+        &self,
+        generation: u64,
+        state: &stellar_agent_core::audit_log::OutboxState,
+    ) -> Result<(), TipAnchorStoreError> {
+        write_keyring_string(
+            &self.generation_entry(generation),
+            &state.to_keyring_value(),
+        )
+        .map_err(|e| anchor_store_error("outbox state write failed", &e))
+    }
+
     fn load_anchor(&self) -> Result<Option<TipAnchor>, TipAnchorStoreError> {
         let raw = read_keyring_string(&self.anchor_ref)
             .map_err(|e| anchor_store_error("anchor read failed", &e))?;
@@ -899,7 +1331,11 @@ impl KeyringSignHandle {
         &self.entry_ref
     }
 
-    /// Signs a 32-byte transaction hash payload.
+    /// Signs a SEP-23 transaction payload.
+    ///
+    /// A mainnet payload exists only under a mainnet transaction
+    /// authorization, so the handle signs a mainnet transaction only when its
+    /// caller holds one; see [`crate::signing::payload`].
     ///
     /// RE-LOADS the secret from the keyring on every call.  The secret exists
     /// only within this function's stack frame and is zeroised before the
@@ -949,6 +1385,10 @@ impl KeyringSignHandle {
     ///   public key derived from the freshly-loaded seed does not match the
     ///   cached public key from handle construction (host-swap defence).
     ///
+    /// - `network.mainnet_authorization_refused` for a mainnet binding to
+    ///   another key, or for a mainnet authorization that is not valid after
+    ///   the secret read, immediately before signing.
+    ///
     /// # Panics
     ///
     /// Never panics (all `unwrap`-free; panic-injection in tests uses a
@@ -963,13 +1403,22 @@ impl KeyringSignHandle {
     /// # async fn example() -> Result<(), stellar_agent_core::WalletError> {
     /// # stellar_agent_test_support::keyring_mock::install().ok();
     /// let entry_ref = KeyringEntryRef::new("stellar-agent-signer-test", "test");
+    /// # fn envelope() -> stellar_xdr::TransactionEnvelope { unimplemented!() }
+    /// use stellar_agent_network::signing::TxSigningPayload;
+    ///
     /// let handle = signer_from_keyring(&entry_ref, "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY").await?;
-    /// let sig = handle.sign_tx_payload(&[0u8; 32]).await?;
+    /// let payload = TxSigningPayload::for_envelope(&envelope(), "Test SDF Network ; September 2015")?;
+    /// let sig = handle.sign_tx_payload(&payload).await?;
     /// assert_eq!(sig.len(), 64);
     /// # Ok(()) }
     /// ```
-    pub async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
-        let result = self.sign_tx_payload_inner(payload).await;
+    pub async fn sign_tx_payload(
+        &self,
+        payload: &TxSigningPayload,
+    ) -> Result<[u8; 64], WalletError> {
+        payload.check_mainnet_binding(self).await?;
+        let result =
+            self.sign_bytes_checked(payload.as_bytes(), || payload.check_mainnet_interval());
         let service = redact_keyring_coord(&self.entry_ref.service);
         let public_key = redact_strkey_first5_last5(self.public_key().to_string().as_ref());
         match &result {
@@ -995,7 +1444,9 @@ impl KeyringSignHandle {
         result
     }
 
-    async fn sign_tx_payload_inner(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    /// Loads the seed and signs `payload` with it: the one keyring signing
+    /// path under every typed method.
+    async fn sign_bytes(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
         // Step 1: load the secret from the keyring into a Zeroizing<String>.
         // The String's heap allocation is zeroed when `s_strkey` drops.
         // The `KeyringEntry` is constructed fresh on every call (per-call
@@ -1009,72 +1460,84 @@ impl KeyringSignHandle {
         // public key against the cached bytes before signing. The panic-injection
         // hook (test-hooks feature) is placed there to verify that Zeroizing::Drop
         // fires during unwind.
-        sign_payload_verifying_pubkey(
-            s_strkey,
-            payload,
-            &self.cached_pubkey_bytes,
-            &self.entry_ref.service,
-        )
-        .await
+        sign_payload_verifying_pubkey(s_strkey, payload, &self.cached_pubkey_bytes).await
     }
 
-    /// Signs a 32-byte smart-account auth-digest using the keyring-stored seed.
-    ///
-    /// Cryptographically identical to [`KeyringSignHandle::sign_tx_payload`]
-    /// (same zeroise sequence, host-swap pubkey-verification, and ed25519
-    /// primitive). The split is a call-site-discipline guard: smart-account
-    /// auth-entry assembly invokes `sign_auth_digest`, classic transaction
-    /// signing invokes `sign_tx_payload`.
-    ///
-    /// # Errors
-    ///
-    /// Same variants as [`KeyringSignHandle::sign_tx_payload`].
-    pub async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
-        // Same zeroisation + host-swap check as sign_tx_payload. The two methods
-        // diverge only at the call site (which payload class is being signed).
-        let entry = open_entry(&self.entry_ref)?;
-        let s_strkey: Zeroizing<String> = Zeroizing::new(entry.get_password().map_err(|e| {
-            map_keyring_operation_error(&e, KeyringOperation::Read, &self.entry_ref.service)
-        })?);
-
-        sign_payload_verifying_pubkey(
-            s_strkey,
-            digest,
-            &self.cached_pubkey_bytes,
-            &self.entry_ref.service,
-        )
-        .await
-    }
-
-    /// Signs a 32-byte Soroban address-credentials auth-entry signature_payload
-    /// using the keyring-stored seed.
-    ///
-    /// Cryptographically identical to [`KeyringSignHandle::sign_tx_payload`]
-    /// and [`KeyringSignHandle::sign_auth_digest`] (same zeroise sequence,
-    /// host-swap pubkey-verification, and ed25519 primitive). Used exclusively
-    /// for the secondary "Delegated G-key" auth entry that OZ smart accounts
-    /// require. See [`Signer::sign_soroban_address_auth_payload`] for the
-    /// call-site-discipline rationale.
-    ///
-    /// # Errors
-    ///
-    /// Same variants as [`KeyringSignHandle::sign_tx_payload`].
-    pub async fn sign_soroban_address_auth_payload(
+    /// Loads the seed, verifies its public key, runs `check`, and signs
+    /// `payload` while the guard `check` returns lives.
+    fn sign_bytes_checked<G>(
         &self,
         payload: &[u8; 32],
+        check: impl FnOnce() -> Result<G, WalletError>,
     ) -> Result<[u8; 64], WalletError> {
         let entry = open_entry(&self.entry_ref)?;
-        let s_strkey: Zeroizing<String> = Zeroizing::new(entry.get_password().map_err(|e| {
-            map_keyring_operation_error(&e, KeyringOperation::Read, &self.entry_ref.service)
+        let secret = Zeroizing::new(entry.get_password().map_err(|error| {
+            map_keyring_operation_error(&error, KeyringOperation::Read, &self.entry_ref.service)
         })?);
+        sign_payload_verifying_pubkey_checked(secret, payload, &self.cached_pubkey_bytes, check)
+    }
 
-        sign_payload_verifying_pubkey(
-            s_strkey,
-            payload,
-            &self.cached_pubkey_bytes,
-            &self.entry_ref.service,
-        )
-        .await
+    /// Signs a smart-account auth digest using the keyring-stored seed.
+    ///
+    /// The same zeroise sequence, host-swap public-key verification, and
+    /// ed25519 primitive as [`KeyringSignHandle::sign_tx_payload`].
+    ///
+    /// # Errors
+    ///
+    /// Same variants as [`KeyringSignHandle::sign_tx_payload`].
+    pub async fn sign_auth_digest(
+        &self,
+        digest: &SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
+        self.sign_bytes(digest.as_bytes()).await
+    }
+
+    /// Signs a Soroban address-credentials auth-entry payload using the
+    /// keyring-stored seed.
+    ///
+    /// The same zeroise sequence, host-swap public-key verification, and
+    /// ed25519 primitive as [`KeyringSignHandle::sign_tx_payload`]. A mainnet
+    /// payload exists only under a mainnet Soroban intent authorization. See
+    /// [`Signer::sign_soroban_address_auth_payload`] for the call sites.
+    ///
+    /// # Errors
+    ///
+    /// Same variants as [`KeyringSignHandle::sign_tx_payload`], plus
+    /// `network.mainnet_authorization_refused` for a binding to another key.
+    pub async fn sign_soroban_address_auth_payload(
+        &self,
+        payload: &SorobanAuthPayload,
+    ) -> Result<[u8; 64], WalletError> {
+        payload.check_mainnet_binding(self).await?;
+        self.sign_bytes(payload.as_bytes()).await
+    }
+
+    /// Checks consent after loading the payer key, immediately before signing.
+    ///
+    /// The returned guard stays alive through the signing primitive.
+    ///
+    /// # Errors
+    ///
+    /// Returns payload binding, keyring, key mismatch, or caller check errors.
+    pub async fn sign_soroban_address_auth_payload_checked<G: Send>(
+        &self,
+        payload: &SorobanAuthPayload,
+        check: impl FnOnce() -> Result<G, WalletError> + Send,
+    ) -> Result<[u8; 64], WalletError> {
+        payload.check_mainnet_binding(self).await?;
+        self.sign_bytes_checked(payload.as_bytes(), check)
+    }
+
+    /// Signs a SEP-53 message digest using the keyring-stored seed.
+    ///
+    /// The same zeroise sequence, host-swap public-key verification, and
+    /// ed25519 primitive as [`KeyringSignHandle::sign_tx_payload`].
+    ///
+    /// # Errors
+    ///
+    /// Same variants as [`KeyringSignHandle::sign_tx_payload`].
+    pub async fn sign_message(&self, payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
+        self.sign_bytes(payload.as_bytes()).await
     }
 }
 
@@ -1085,27 +1548,33 @@ impl KeyringSignHandle {
 /// Allows `KeyringSignHandle` to be used at the single SEP-23 signing call site
 /// (`attach_signature`) which takes `&dyn Signer`.
 ///
-/// `sign_tx_payload` delegates to `sign_payload_verifying_pubkey` (the same
-/// code that `KeyringSignHandle::sign_tx_payload` calls), so the full
-/// zeroisation sequence and host-swap defence apply.
+/// Each signing method delegates to the inherent method of the same name, so
+/// the full zeroisation sequence and host-swap defence apply.
 ///
 /// `public_key` returns the cached public key without a keyring lookup,
 /// matching the Signer contract (fast, no I/O).
 #[async_trait]
 impl Signer for KeyringSignHandle {
-    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
         KeyringSignHandle::sign_tx_payload(self, payload).await
     }
 
-    async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_auth_digest(
+        &self,
+        digest: &SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
         KeyringSignHandle::sign_auth_digest(self, digest).await
     }
 
     async fn sign_soroban_address_auth_payload(
         &self,
-        payload: &[u8; 32],
+        payload: &SorobanAuthPayload,
     ) -> Result<[u8; 64], WalletError> {
         KeyringSignHandle::sign_soroban_address_auth_payload(self, payload).await
+    }
+
+    async fn sign_message(&self, payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
+        KeyringSignHandle::sign_message(self, payload).await
     }
 
     /// Keyring-stored ed25519 seeds cannot produce WebAuthn assertions;
@@ -1122,7 +1591,7 @@ impl Signer for KeyringSignHandle {
     ///   always, on every call.
     async fn sign_webauthn_assertion(
         &self,
-        _auth_digest: &[u8; 32],
+        _auth_digest: &SmartAccountAuthDigest,
         _credential_id: &[u8],
     ) -> Result<WebAuthnAssertion, WalletError> {
         Err(WalletError::Auth(AuthError::SignerKindMismatch {
@@ -1155,7 +1624,7 @@ pub fn lazy_signer_from_keyring(
         stellar_strkey::ed25519::PublicKey::from_string(expected_source_g).map_err(|_error| {
             WalletError::Auth(AuthError::SignerKeyMismatch {
                 what: "the keyring entry's account",
-                expected: redact_strkey_first5_last5(expected_source_g),
+                expected: "a G-strkey".to_owned(),
                 got: "invalid public account".to_owned(),
             })
         })?;
@@ -1230,7 +1699,7 @@ pub async fn signer_from_keyring(
     let signer = signer_from_s_strkey(
         s_strkey,
         expected_source_g,
-        SecretStrkeySource::KeyringEntry(&entry_ref.service),
+        SecretStrkeySource::KeyringEntry,
     )
     .await?;
 
@@ -1257,15 +1726,23 @@ pub async fn signer_from_keyring(
 
 /// The profile's enrolled keyring signer; on mainnet the pin must be valid and the stored key must derive to it.
 ///
+/// The identity record beside the seed must serve this profile and chain,
+/// and on mainnet the established `owner`, before the seed is read: see
+/// [`read_and_check_signer_binding`]. Testnet callers pass `None`.
+///
 /// # Errors
-/// Refuses invalid enrollment, a different stored key, or a keyring load failure.
+/// Refuses invalid enrollment, an identity record that is absent or serves
+/// another profile, chain or owner (`auth.enrolled_identity_unusable`), a
+/// different stored key, or a keyring load failure.
 pub async fn enrolled_keyring_signer(
     profile_name: &str,
     profile: &stellar_agent_core::profile::Profile,
     expected_source_g: &str,
+    owner: Option<&[u8; 32]>,
 ) -> Result<KeyringSignHandle, WalletError> {
     use stellar_agent_core::profile::enrolled_signer_pin;
     let pin = enrolled_signer_pin(profile_name, profile)?;
+    read_and_check_signer_binding(profile_name, profile, owner)?;
     let result = signer_from_keyring(&profile.mcp_signer_default, expected_source_g).await;
     if let Some(enrolled) = pin {
         let derived = match &result {
@@ -1285,6 +1762,342 @@ pub async fn enrolled_keyring_signer(
         }
     }
     result
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enrolled signer identity
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The role an [`EnrolledSigner`] is produced for.
+///
+/// Both roles name the profile's enrolled agent key: the fee payer of a fee
+/// bump is that key too. A SEP-10 session's ephemeral key is not enrolled and
+/// has no role here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrolledRole {
+    /// The agent signer of the profile's actions.
+    Agent,
+    /// The fee payer of a fee bump.
+    FeePayer,
+}
+
+impl EnrolledRole {
+    /// The role's one-byte tag in the signer fact digest.
+    #[must_use]
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::Agent => 1,
+            Self::FeePayer => 2,
+        }
+    }
+}
+
+/// Proof that a profile enrolled a signer key, read from the stored profile
+/// and the identity record beside the seed, never from the seed.
+///
+/// Only [`enrolled_signer`] produces one, and its fields are private:
+///
+/// ```compile_fail,E0451
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn forge(p: EnrolledSigner) -> EnrolledSigner { EnrolledSigner { ..p } }
+/// ```
+///
+/// The import alone resolves:
+///
+/// ```
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn need(_: Option<EnrolledSigner>) {}
+/// need(None);
+/// ```
+///
+/// It implements none of `Serialize`, `Deserialize`, or `Default`:
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn need<T: serde::Serialize>() {}
+/// need::<EnrolledSigner>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn need<T: serde::de::DeserializeOwned>() {}
+/// need::<EnrolledSigner>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn need<T: Default>() {}
+/// need::<EnrolledSigner>();
+/// ```
+/// The `public_key` field cannot be projected outside this crate.
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn inspect(p: &EnrolledSigner) { let _ = &p.public_key; }
+/// ```
+///
+/// ```
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn need(_: Option<EnrolledSigner>) {}
+/// need(None);
+/// ```
+///
+/// The `role` field cannot be projected outside this crate.
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn inspect(p: &EnrolledSigner) { let _ = &p.role; }
+/// ```
+///
+/// ```
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn need(_: Option<EnrolledSigner>) {}
+/// need(None);
+/// ```
+///
+/// The `seed_entry` field cannot be projected outside this crate.
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn inspect(p: &EnrolledSigner) { let _ = &p.seed_entry; }
+/// ```
+///
+/// ```
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn need(_: Option<EnrolledSigner>) {}
+/// need(None);
+/// ```
+///
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrolledSigner {
+    public_key: [u8; 32],
+    role: EnrolledRole,
+    seed_entry: KeyringEntryRef,
+}
+
+impl EnrolledSigner {
+    /// The enrolled public key.
+    #[must_use]
+    pub fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+
+    /// The role the signer was produced for.
+    #[must_use]
+    pub fn role(&self) -> EnrolledRole {
+        self.role
+    }
+
+    /// The keyring coordinate of the enrolled seed, as the stored profile
+    /// names it. A coordinate only: the producer never reads the seed, and
+    /// [`lazy_signer_from_keyring`] loads it at the signing call.
+    #[must_use]
+    pub fn seed_entry(&self) -> &KeyringEntryRef {
+        &self.seed_entry
+    }
+
+    /// The fact digest under `stellar-agent-authz-fact:signer:v1`.
+    ///
+    /// Fields, in order: the 32-byte public key, the role's one-byte tag,
+    /// `lp(seed service)`, and `lp(seed account)`.
+    #[must_use]
+    pub fn fact_digest(&self) -> [u8; 32] {
+        use stellar_agent_core::mainnet::fact::{FACT_LABEL_SIGNER, FactDigest};
+        let mut digest = FactDigest::new(FACT_LABEL_SIGNER);
+        digest
+            .fixed(&self.public_key)
+            .tag(self.role.tag())
+            .bytes(self.seed_entry.service.as_bytes())
+            .bytes(self.seed_entry.account.as_bytes());
+        digest.finish()
+    }
+}
+
+fn identity_unusable(profile: &str, reason: &'static str) -> WalletError {
+    WalletError::Auth(AuthError::EnrolledIdentityUnusable {
+        profile: profile.to_owned(),
+        reason,
+        enrolled: None,
+        source_flag: None,
+    })
+}
+
+/// Checks that an identity serves this profile, chain and established owner.
+///
+/// On mainnet the caller names the established owner; the record's own
+/// owner claim never stands in for it.
+///
+/// # Errors
+/// Returns `bound_elsewhere`, `unbound`, `owner_required`, `owner_mismatch`,
+/// or `binding_signature_invalid` for `auth.enrolled_identity_unusable`.
+pub fn check_signer_binding(
+    name: &str,
+    profile: &Profile,
+    record: &stellar_agent_core::profile::signer_identity::SignerIdentityRecord,
+    owner: Option<&[u8; 32]>,
+) -> Result<(), &'static str> {
+    if let Some(binding) = &record.binding
+        && (binding.profile != name || binding.chain != profile.chain_id)
+    {
+        return Err("bound_elsewhere");
+    }
+    if profile.chain_id.is_mainnet() {
+        let Some((bound_owner, _)) = record.binding.as_ref().and_then(|b| b.owner) else {
+            return Err("unbound");
+        };
+        let Some(owner) = owner else {
+            return Err("owner_required");
+        };
+        if *owner != bound_owner {
+            return Err("owner_mismatch");
+        }
+        record
+            .verify_owner_signature(&profile.mcp_signer_default)
+            .map_err(|_| "binding_signature_invalid")?;
+    } else if record.binding.is_none() {
+        tracing::warn!(target: "profile.signer_identity",
+            "the signer identity record of profile '{name}' names no profile; enroll the signer again to bind it");
+    }
+    Ok(())
+}
+
+/// The identity record stored beside the seed at `seed_ref`, parsed; `None`
+/// when no record is stored. The seed itself is never read.
+///
+/// # Errors
+/// Returns a classified keyring error, or `auth.enrolled_identity_unusable`
+/// with `unsupported_version`, `malformed_key`, `unsupported_role` or
+/// `malformed` for a record that does not parse.
+fn read_identity_record(
+    name: &str,
+    seed_ref: &KeyringEntryRef,
+) -> Result<Option<stellar_agent_core::profile::signer_identity::SignerIdentityRecord>, WalletError>
+{
+    use stellar_agent_core::profile::schema::signer_identity_entry_ref;
+    use stellar_agent_core::profile::signer_identity::{
+        SignerIdentityRecord, SignerIdentityRecordError,
+    };
+    let Some(raw) = read_keyring_string(&signer_identity_entry_ref(seed_ref))? else {
+        return Ok(None);
+    };
+    SignerIdentityRecord::parse(&raw)
+        .map(Some)
+        .map_err(|error| {
+            identity_unusable(
+                name,
+                match error {
+                    SignerIdentityRecordError::UnsupportedVersion(_) => "unsupported_version",
+                    SignerIdentityRecordError::MalformedKey => "malformed_key",
+                    SignerIdentityRecordError::UnsupportedRole => "unsupported_role",
+                    _ => "malformed",
+                },
+            )
+        })
+}
+
+/// Reads and checks the protected identity without reading the seed.
+///
+/// Every chain requires the record: a seed without one, as an interrupted
+/// enrollment leaves it, signs for no profile. `owner` is the established
+/// owner on mainnet and `None` on testnet.
+///
+/// # Errors
+/// Returns a classified keyring error or `auth.enrolled_identity_unusable`
+/// with `missing`, a parse reason, or a [`check_signer_binding`] reason.
+pub fn read_and_check_signer_binding(
+    name: &str,
+    profile: &Profile,
+    owner: Option<&[u8; 32]>,
+) -> Result<(), WalletError> {
+    let record = read_identity_record(name, &profile.mcp_signer_default)?
+        .ok_or_else(|| identity_unusable(name, "missing"))?;
+    check_signer_binding(name, profile, &record, owner)
+        .map_err(|reason| identity_unusable(name, reason))
+}
+
+/// Produces the enrolled signer of profile `name` for `role`, requiring its
+/// key to be `expected_key`.
+///
+/// Reads the `[mcp_signer_default]` reference from the stored profile in
+/// `profiles_dir`, with no overlay, and requires it to equal the reference
+/// of `merged_profile` exactly. Its account must be a G-strkey pin. Then
+/// reads the identity record at the signer's service, account
+/// `enrolled-identity`, and requires it to be an owner-signed agent record whose
+/// public key is the pin's and `expected_key`. The seed coordinate is
+/// returned, never read. For [`EnrolledRole::FeePayer`], `expected_key` is the
+/// fee source a fee bump names, so the fee payer is the enrolled agent key.
+///
+/// No refusal falls back to the seed or repairs anything.
+///
+/// # Errors
+///
+/// - `validation.profile_not_found` or `validation.config_invalid` when the
+///   stored profile cannot be read.
+/// - `auth.enrolled_signer_unpinned` for a placeholder or malformed pin.
+/// - `auth.enrolled_identity_unusable` naming the rule the identity breaks:
+///   `disk_disagreement`, `missing`, `malformed`, `unsupported_version`,
+///   `malformed_key`, `unsupported_role`, `pin_mismatch`,
+///   `public_key_mismatch`, `fee_source_mismatch`, `bound_elsewhere`,
+///   `unbound`, `owner_mismatch`, or `binding_signature_invalid`.
+/// - The classified keyring error when the record cannot be read.
+pub fn enrolled_signer(
+    name: &str,
+    profiles_dir: &Path,
+    merged_profile: &Profile,
+    role: EnrolledRole,
+    expected_key: &[u8; 32],
+    owner: &[u8; 32],
+) -> Result<EnrolledSigner, WalletError> {
+    use stellar_agent_core::profile::loader::{ProfileLoadError, read_signer_ref_on_disk};
+
+    let stored = read_signer_ref_on_disk(name, profiles_dir).map_err(|error| match error {
+        ProfileLoadError::NotFound => WalletError::Validation(ValidationError::ProfileNotFound),
+        other => WalletError::Validation(ValidationError::ConfigInvalid {
+            component: "profile",
+            reason: stellar_agent_core::observability::redact_path_in_message(&format!(
+                "the stored signer reference of profile '{name}' cannot be read: {other}"
+            )),
+        }),
+    })?;
+    if stored != merged_profile.mcp_signer_default {
+        return Err(identity_unusable(name, "disk_disagreement"));
+    }
+    if stored.is_signer_placeholder() {
+        return Err(AuthError::EnrolledSignerUnpinned {
+            profile: name.to_owned(),
+            reason: "placeholder",
+        }
+        .into());
+    }
+    let pin = stellar_strkey::ed25519::PublicKey::from_string(&stored.account).map_err(|_| {
+        WalletError::Auth(AuthError::EnrolledSignerUnpinned {
+            profile: name.to_owned(),
+            reason: "malformed",
+        })
+    })?;
+    let record =
+        read_identity_record(name, &stored)?.ok_or_else(|| identity_unusable(name, "missing"))?;
+    check_signer_binding(name, merged_profile, &record, Some(owner))
+        .map_err(|reason| identity_unusable(name, reason))?;
+    if record.public_key() != pin.0 {
+        return Err(identity_unusable(name, "pin_mismatch"));
+    }
+    if record.public_key() != *expected_key {
+        return Err(WalletError::Auth(AuthError::EnrolledIdentityUnusable {
+            profile: name.to_owned(),
+            reason: match role {
+                EnrolledRole::Agent => "public_key_mismatch",
+                EnrolledRole::FeePayer => "fee_source_mismatch",
+            },
+            enrolled: Some(record.public_key_strkey()),
+            source_flag: None,
+        }));
+    }
+    Ok(EnrolledSigner {
+        public_key: record.public_key(),
+        role,
+        seed_entry: stored,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1337,10 +2150,9 @@ fn wallet_error_kind(err: &WalletError) -> &'static str {
 
 /// Inner helper: parse, verify public key against cached bytes, then sign.
 ///
-/// Owns steps 2-6 of the zeroisation sequence from the module-level doc,
+/// Owns steps 2-6 of the zeroization sequence from the module-level doc,
 /// with an added host-swap check before constructing the per-call signer.
-/// Called from `KeyringSignHandle::sign_tx_payload` ONLY — that caller
-/// owns step 1 (loading the secret into `Zeroizing<String>`).
+/// Called from `KeyringSignHandle::sign_bytes`, which loads the secret into `Zeroizing<String>`.
 ///
 /// All `Zeroizing<T>` wrappers fire their `Drop` on every exit path including
 /// panic.
@@ -1348,15 +2160,23 @@ async fn sign_payload_verifying_pubkey(
     s_strkey: Zeroizing<String>,
     payload: &[u8; 32],
     expected_pubkey_bytes: &[u8; 32],
-    service: &str,
 ) -> Result<[u8; 64], WalletError> {
-    // Step 2: parse the S-strkey.  Parse-error message names the keyring
-    // service for operator diagnosis (service name is a non-secret alias, not
-    // the secret material).
+    sign_payload_verifying_pubkey_checked(s_strkey, payload, expected_pubkey_bytes, || Ok(()))
+}
+
+/// Verifies the key, runs the caller check, and signs while retaining its guard.
+/// Called from `sign_bytes` with an accepting check and from `sign_bytes_checked` with the caller's check.
+fn sign_payload_verifying_pubkey_checked<G>(
+    s_strkey: Zeroizing<String>,
+    payload: &[u8; 32],
+    expected_pubkey_bytes: &[u8; 32],
+    check: impl FnOnce() -> Result<G, WalletError>,
+) -> Result<[u8; 64], WalletError> {
+    // The seed and derived public key verify before the caller's final check.
     let mut private_key =
         stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).map_err(|_| {
             WalletError::Auth(AuthError::KeyringNotFound {
-                name: format!("keyring entry '{service}' contains an invalid S-strkey"),
+                cause: KeyringMissingCause::InvalidSecret,
             })
         })?;
     // Step 3: copy seed bytes into Zeroizing.
@@ -1411,7 +2231,8 @@ async fn sign_payload_verifying_pubkey(
     let signer = SoftwareSigningKey::new_from_zeroizing(seed_bytes);
 
     // Step 7: sign; `signer` drops at end of scope.
-    let sig = signer.sign_tx_payload(payload).await?;
+    let _guard = check()?;
+    let sig = signer.sign_raw(payload);
     // `signer` drops here; SecretBox::drop zeroes the heap allocation.
     Ok(sig)
 }
@@ -1463,6 +2284,154 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use stellar_agent_core::error::ErrorCategory;
     use stellar_agent_test_support::{CaptureWriter, keyring_mock};
+
+    #[test]
+    #[serial_test::serial]
+    fn isolated_init_refuses_and_requests_no_native_store() {
+        use stellar_agent_test_support::env_guard::ScopedEnvVar;
+        let _store = RestoreStore::new();
+        let _live = ScopedEnvVar::new(
+            "STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING",
+            Some(std::ffi::OsStr::new("real-platform-keyring")),
+        );
+        let mut selectors = vec![
+            None,
+            Some(std::ffi::OsString::new()),
+            Some("unknown".into()),
+        ];
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            selectors.push(Some(std::ffi::OsString::from_vec(vec![0xff])));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            selectors.push(Some(std::ffi::OsString::from_wide(&[0xd800])));
+        }
+        for selector in selectors {
+            let _env = ScopedEnvVar::new("STELLAR_AGENT_KEYRING_BACKEND", selector.as_deref());
+            assert!(
+                init_platform_keyring_store()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("STELLAR_AGENT_TEST_STORAGE_ISOLATED")
+            );
+            assert!(keyring_core::get_default_store().is_none());
+            #[cfg(not(feature = "live-platform-keyring"))]
+            assert_eq!(
+                NATIVE_STORE_REQUESTS.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn isolated_init_keeps_the_registered_store() {
+        let _backend = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+            "STELLAR_AGENT_KEYRING_BACKEND",
+            None,
+        );
+        let _store = RestoreStore::new();
+        keyring_mock::install().unwrap();
+        let original = keyring_core::get_default_store().unwrap();
+        let entry = rpc_entry();
+        store_raw(&entry, "kept");
+        assert!(init_platform_keyring_store().is_ok());
+        assert!(Arc::ptr_eq(
+            &original,
+            &keyring_core::get_default_store().unwrap()
+        ));
+        assert_eq!(read_rpc_credential(&entry).unwrap().as_str(), "kept");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn production_selector_dispatch_preserves_backend_contract() {
+        use std::ffi::OsString;
+        use stellar_agent_headless_keyring::HeadlessKeyringInitError;
+        use stellar_agent_test_support::env_guard::ScopedEnvVar;
+
+        let _restore = RestoreStore::new();
+        let mut selectors = vec![
+            None,
+            Some(OsString::new()),
+            Some(OsString::from("unknown")),
+            Some(OsString::from("headless-env")),
+            Some(OsString::from("headless-dpapi")),
+        ];
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            selectors.push(Some(OsString::from_vec(vec![0xff])));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            selectors.push(Some(OsString::from_wide(&[0xd800])));
+        }
+        for selector in selectors {
+            let _selector = ScopedEnvVar::new("STELLAR_AGENT_KEYRING_BACKEND", selector.as_deref());
+            let requested = stellar_agent_headless_keyring::requested_backend();
+            let expected = selector.as_deref().and_then(std::ffi::OsStr::to_str);
+            assert_eq!(requested.as_deref(), expected);
+            let mut native_calls = 0;
+            let mut headless_calls = Vec::new();
+            let result = dispatch_production_store(
+                requested.as_deref(),
+                |label| {
+                    headless_calls.push(label.to_owned());
+                    match label {
+                        "headless-env" | "headless-dpapi" => Ok(()),
+                        _ => stellar_agent_headless_keyring::init_headless_store(label),
+                    }
+                },
+                || {
+                    native_calls += 1;
+                    Ok(())
+                },
+            );
+            match expected {
+                None => {
+                    result.unwrap();
+                    assert_eq!(native_calls, 1);
+                    assert!(headless_calls.is_empty());
+                }
+                Some(label) => {
+                    assert_eq!(
+                        native_calls, 0,
+                        "Unicode selection never falls back to native"
+                    );
+                    assert_eq!(headless_calls, [label]);
+                    if matches!(label, "headless-env" | "headless-dpapi") {
+                        result.unwrap();
+                    } else {
+                        assert_eq!(result.unwrap_err().code(), "auth.keyring_config_invalid");
+                    }
+                }
+            }
+            assert!(keyring_core::get_default_store().is_none());
+        }
+
+        let mut native_calls = 0;
+        let error = dispatch_production_store(
+            Some("headless-env"),
+            |_| Err(HeadlessKeyringInitError::InvalidEnvKey("fixture refusal")),
+            || {
+                native_calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            native_calls, 0,
+            "headless failure never falls back to native"
+        );
+        assert_eq!(error.code(), "auth.keyring_config_invalid");
+        assert!(error.to_string().contains("fixture refusal"));
+        assert!(keyring_core::get_default_store().is_none());
+    }
 
     struct RestoreStore(Option<Arc<keyring_core::CredentialStore>>);
     impl RestoreStore {
@@ -1566,6 +2535,8 @@ mod tests {
     #[serial_test::serial]
     fn platform_store_initialization_failure_is_platform_error() {
         let _restore = RestoreStore::new();
+        #[cfg(not(feature = "live-platform-keyring"))]
+        let requests = NATIVE_STORE_REQUESTS.load(std::sync::atomic::Ordering::SeqCst);
         let expected = if cfg!(target_os = "macos") {
             "keyring operation failed: macOS Keychain store initialization failed"
         } else if cfg!(target_os = "linux") {
@@ -1586,18 +2557,39 @@ mod tests {
                 ))),
                 "credential store access denied (OS error 13)",
             ),
+            #[cfg(target_os = "linux")]
+            (
+                keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                    "service unavailable",
+                ))),
+                "credential store operation failed",
+            ),
+            #[cfg(target_os = "windows")]
+            (
+                keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::from_raw_os_error(
+                    1312,
+                ))),
+                "credential store requires an interactive logon session",
+            ),
         ] {
             let error = install_platform_store(Err(error)).unwrap_err();
             assert_eq!(error.code(), "auth.keyring_platform_error");
             assert_eq!(error.message(), format!("{expected}: {cause}"));
             assert!(!format!("{error:?}").contains("secret-sentinel"));
         }
+        #[cfg(not(feature = "live-platform-keyring"))]
+        assert_eq!(
+            NATIVE_STORE_REQUESTS.load(std::sync::atomic::Ordering::SeqCst),
+            requests
+        );
     }
 
     #[test]
     #[serial_test::serial]
     #[cfg(target_os = "windows")]
     fn dpapi_protect_failure_reaches_wallet_error() {
+        #[cfg(not(feature = "live-platform-keyring"))]
+        let requests = NATIVE_STORE_REQUESTS.load(std::sync::atomic::Ordering::SeqCst);
         use stellar_agent_headless_keyring::crypto::{
             DpapiError, ProtectionMode, with_dpapi_protect_result,
         };
@@ -1649,6 +2641,11 @@ mod tests {
                 "keyring operation failed: write headless-dpapi: headless-dpapi could not protect the value"
             );
         });
+        #[cfg(not(feature = "live-platform-keyring"))]
+        assert_eq!(
+            NATIVE_STORE_REQUESTS.load(std::sync::atomic::Ordering::SeqCst),
+            requests
+        );
     }
 
     #[test]
@@ -1666,16 +2663,52 @@ mod tests {
         );
     }
 
+    /// Stores the identity record of `profile`'s signer for the agent key of
+    /// `seed`: owner-signed on mainnet, owner-free on testnet.
+    fn bind_identity(profile: &stellar_agent_core::profile::Profile, seed: [u8; 32]) {
+        use stellar_agent_core::profile::{
+            schema::signer_identity_entry_ref, signer_identity::SignerIdentityRecord,
+        };
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let record = if profile.chain_id.is_mainnet() {
+            SignerIdentityRecord::signed_for_test(
+                key,
+                "enrolled",
+                profile,
+                &ed25519_dalek::SigningKey::from_bytes(&[11; 32]),
+            )
+        } else {
+            SignerIdentityRecord::agent(key, "enrolled", profile.chain_id)
+        };
+        write_keyring_string(
+            &signer_identity_entry_ref(&profile.mcp_signer_default),
+            &record.render().unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The owner [`bind_identity`] signs mainnet records with.
+    fn identity_owner() -> [u8; 32] {
+        ed25519_dalek::SigningKey::from_bytes(&[11; 32])
+            .verifying_key()
+            .to_bytes()
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_mainnet_placeholder_refuses_before_store_read() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, "default");
         let entry = &profile.mcp_signer_default;
         store_sstrkey(entry, &sstrkey_for_seed([1; 32]));
         keyring_mock::inject_error(&entry.service, &entry.account, keyring_core::Error::NoEntry)
             .unwrap();
-        let error = enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32]))
+        let error = enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32]), None)
             .await
             .err()
             .expect("refusal");
@@ -1690,13 +2723,16 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_mainnet_malformed_refuses_before_store_read() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, "malformed");
         let entry = &profile.mcp_signer_default;
         store_sstrkey(entry, &sstrkey_for_seed([1; 32]));
         keyring_mock::inject_error(&entry.service, &entry.account, keyring_core::Error::NoEntry)
             .unwrap();
-        let error = enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32]))
+        let error = enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32]), None)
             .await
             .err()
             .expect("refusal");
@@ -1711,11 +2747,20 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_stored_b_expected_a() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
+        bind_identity(&profile, [1; 32]);
         store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([2; 32]));
-        let result =
-            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32])).await;
+        let result = enrolled_keyring_signer(
+            "enrolled",
+            &profile,
+            &gstrkey_for_seed([1; 32]),
+            Some(&identity_owner()),
+        )
+        .await;
         assert_eq!(
             result.err().expect("refusal").code(),
             "auth.enrolled_signer_mismatch"
@@ -1725,11 +2770,20 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_stored_b_expected_b() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
+        bind_identity(&profile, [1; 32]);
         store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([2; 32]));
-        let result =
-            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([2; 32])).await;
+        let result = enrolled_keyring_signer(
+            "enrolled",
+            &profile,
+            &gstrkey_for_seed([2; 32]),
+            Some(&identity_owner()),
+        )
+        .await;
         assert_eq!(
             result.err().expect("refusal").code(),
             "auth.enrolled_signer_mismatch"
@@ -1739,11 +2793,20 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_stored_a_expected_b() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
+        bind_identity(&profile, [1; 32]);
         store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([1; 32]));
-        let result =
-            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([2; 32])).await;
+        let result = enrolled_keyring_signer(
+            "enrolled",
+            &profile,
+            &gstrkey_for_seed([2; 32]),
+            Some(&identity_owner()),
+        )
+        .await;
         assert_eq!(
             result.err().expect("refusal").code(),
             "auth.signer_key_mismatch"
@@ -1753,11 +2816,20 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_stored_a_expected_a() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
+        bind_identity(&profile, [1; 32]);
         store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([1; 32]));
-        let result =
-            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32])).await;
+        let result = enrolled_keyring_signer(
+            "enrolled",
+            &profile,
+            &gstrkey_for_seed([1; 32]),
+            Some(&identity_owner()),
+        )
+        .await;
         assert_eq!(
             result.expect("handle").public_key().to_string().to_string(),
             gstrkey_for_seed([1; 32])
@@ -1767,11 +2839,15 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_testnet_stored_a_expected_a() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(false, &gstrkey_for_seed([1; 32]));
+        bind_identity(&profile, [1; 32]);
         store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([1; 32]));
         let result =
-            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32])).await;
+            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32]), None).await;
         assert_eq!(
             result.expect("handle").public_key().to_string().to_string(),
             gstrkey_for_seed([1; 32])
@@ -1781,15 +2857,19 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_testnet_placeholder_preserves_keyring_errors() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(false, "default");
-        let result = enrolled_keyring_signer("enrolled", &profile, "default").await;
+        bind_identity(&profile, [1; 32]);
+        let result = enrolled_keyring_signer("enrolled", &profile, "default", None).await;
         assert_eq!(
             result.err().expect("absent key").code(),
             "auth.keyring_not_found"
         );
         store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([1; 32]));
-        let result = enrolled_keyring_signer("enrolled", &profile, "default").await;
+        let result = enrolled_keyring_signer("enrolled", &profile, "default", None).await;
         assert_eq!(
             result.err().expect("source mismatch").code(),
             "auth.signer_key_mismatch"
@@ -1843,6 +2923,69 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn load_or_mint_mints_once_and_refuses_other_errors() {
+        keyring_mock::install().expect("mock store");
+        let entry_ref = KeyringEntryRef::new("stellar-agent-network-mint-test", "pin-key");
+
+        let minted = load_or_mint_secret_32(&entry_ref).expect("first call mints");
+        let stored = read_secret_32(&entry_ref)
+            .expect("read ok")
+            .expect("the minted secret is stored");
+        assert!(*minted == *stored, "the stored secret is the minted one");
+        let again = load_or_mint_secret_32(&entry_ref).expect("second call reads");
+        assert!(*minted == *again, "a second call returns the same secret");
+
+        let absent = KeyringEntryRef::new("stellar-agent-network-mint-test", "locked");
+        keyring_mock::inject_error(
+            &absent.service,
+            &absent.account,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other("locked"))),
+        )
+        .unwrap();
+        let err = load_or_mint_secret_32(&absent).unwrap_err();
+        assert_ne!(err.category(), ErrorCategory::Internal, "{err:?}");
+        let entry = KeyringEntry::new(&absent.service, &absent.account).unwrap();
+        assert!(
+            matches!(entry.get_password(), Err(keyring_core::Error::NoEntry)),
+            "a refused read must mint nothing"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn read_secret_32_reports_absence_as_none() {
+        keyring_mock::install().expect("mock store");
+        let entry_ref = KeyringEntryRef::new("stellar-agent-network-read-secret", "pin-key");
+        assert!(read_secret_32(&entry_ref).expect("absence is ok").is_none());
+
+        rotate_keyring_secret_32(&entry_ref.service, &entry_ref.account).expect("rotation ok");
+        let read = read_secret_32(&entry_ref)
+            .expect("read ok")
+            .expect("present");
+        let loaded = load_hmac_key_32(&entry_ref).expect("load ok");
+        assert!(*read == *loaded, "both readers decode the same secret");
+
+        KeyringEntry::new(&entry_ref.service, &entry_ref.account)
+            .unwrap()
+            .set_password(&URL_SAFE_NO_PAD.encode([0u8; 16]))
+            .unwrap();
+        let err = read_secret_32(&entry_ref).unwrap_err();
+        assert_eq!(err.category(), ErrorCategory::Internal);
+
+        keyring_mock::inject_error(
+            &entry_ref.service,
+            &entry_ref.account,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other("locked"))),
+        )
+        .unwrap();
+        assert!(
+            read_secret_32(&entry_ref).is_err(),
+            "a read failure is not absence"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn load_hmac_key_32_rejects_non_32_byte_secret() {
         keyring_mock::install().expect("mock store");
         let entry_ref = KeyringEntryRef::new("stellar-agent-network-load-hmac-bad-len", "default");
@@ -1889,6 +3032,191 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn soroban_mainnet_binding_refuses_another_key() {
+        keyring_mock::install().expect("mock store");
+        let seed = [0xBC; 32];
+        let entry_ref = KeyringEntryRef::new("stellar-agent-keyring-soroban-binding", "default");
+        store_sstrkey(&entry_ref, &sstrkey_for_seed(seed));
+        let handle = signer_from_keyring(&entry_ref, &gstrkey_for_seed(seed))
+            .await
+            .unwrap();
+        let bytes = [0x3c; 32];
+        let wrong = SorobanAuthPayload::bound_for_test(bytes, [0; 32]);
+        let inert = stellar_agent_test_support::inert_dispatcher();
+        let writer = CaptureWriter::new();
+        let dispatch = tracing::Dispatch::new(json_capture_subscriber(writer.clone()));
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
+        let error = handle
+            .sign_soroban_address_auth_payload(&wrong)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "network.mainnet_authorization_refused");
+        drop(guard);
+        drop(inert);
+        assert!(writer.captured_str().contains("signer_key_mismatch"));
+        let key = SoftwareSigningKey::new_from_bytes(seed);
+        for payload in [
+            SorobanAuthPayload::from_bytes_for_test(bytes),
+            SorobanAuthPayload::bound_for_test(bytes, handle.public_key().0),
+        ] {
+            let signature = handle
+                .sign_soroban_address_auth_payload(&payload)
+                .await
+                .unwrap();
+            assert_eq!(signature, key.sign_raw(&bytes));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transaction_mainnet_binding_refuses_another_key() {
+        keyring_mock::install().expect("mock store");
+        let seed = [0xBC; 32];
+        let entry_ref =
+            KeyringEntryRef::new("stellar-agent-keyring-transaction-binding", "default");
+        store_sstrkey(&entry_ref, &sstrkey_for_seed(seed));
+        let handle = signer_from_keyring(&entry_ref, &gstrkey_for_seed(seed))
+            .await
+            .unwrap();
+        let bytes = [0x3c; 32];
+        let wrong = TxSigningPayload::bound_for_test(bytes, [0; 32]);
+        let inert = stellar_agent_test_support::inert_dispatcher();
+        let writer = CaptureWriter::new();
+        let dispatch = tracing::Dispatch::new(json_capture_subscriber(writer.clone()));
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
+        let error = handle.sign_tx_payload(&wrong).await.unwrap_err();
+        assert_eq!(error.code(), "network.mainnet_authorization_refused");
+        drop(guard);
+        drop(inert);
+        assert!(writer.captured_str().contains("signer_key_mismatch"));
+        let key = SoftwareSigningKey::new_from_bytes(seed);
+        for payload in [
+            TxSigningPayload::from_bytes_for_test(bytes),
+            TxSigningPayload::bound_for_test(bytes, handle.public_key().0),
+        ] {
+            let signature = handle.sign_tx_payload(&payload).await.unwrap();
+            assert_eq!(signature, key.sign_raw(&bytes));
+        }
+    }
+
+    /// The handle checks a mainnet transaction payload's authorization on the
+    /// mainnet clock after the secret read, immediately before it signs. A
+    /// clock that leaves the interval during the read yields no signature and
+    /// no success event.
+    #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    async fn transaction_signing_rechecks_the_authorization_after_the_secret_read() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let seed = [0xBE; 32];
+        let entry_ref = KeyringEntryRef::new("stellar-agent-keyring-interval", "default");
+        let clock = Arc::new(crate::mainnet::clock::set_now_ms_for_test(1_500));
+        let read_at_ms = Arc::new(AtomicU64::new(1_500));
+        // The installed store outlives the test; a weak reference lets the
+        // clock override end when the test drops `clock`.
+        let (hook_clock, hook_time) = (Arc::downgrade(&clock), Arc::clone(&read_at_ms));
+        keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+            &entry_ref.service,
+            &entry_ref.account,
+            Arc::new(move || {
+                if let Some(clock) = hook_clock.upgrade() {
+                    clock.set(hook_time.load(Ordering::SeqCst));
+                }
+            }),
+        )])
+        .unwrap();
+        store_sstrkey(&entry_ref, &sstrkey_for_seed(seed));
+        let handle = signer_from_keyring(&entry_ref, &gstrkey_for_seed(seed))
+            .await
+            .unwrap();
+        let bytes = [0x3c; 32];
+        let payload =
+            TxSigningPayload::bound_between_for_test(bytes, handle.public_key().0, 1_000, 2_000);
+        for (now_ms, label) in [(999, "not_yet_valid"), (2_000, "expired")] {
+            read_at_ms.store(now_ms, Ordering::SeqCst);
+            clock.set(1_500);
+            let inert = stellar_agent_test_support::inert_dispatcher();
+            let writer = CaptureWriter::new();
+            let dispatch = tracing::Dispatch::new(json_capture_subscriber(writer.clone()));
+            let guard = tracing::dispatcher::set_default(&dispatch);
+            tracing::callsite::rebuild_interest_cache();
+            let code = handle
+                .sign_tx_payload(&payload)
+                .await
+                .err()
+                .map(|e| e.code());
+            drop(guard);
+            drop(inert);
+            assert_eq!(
+                code,
+                Some("network.mainnet_authorization_refused"),
+                "read at {now_ms}"
+            );
+            let logs = writer.captured_str();
+            assert!(
+                logs.contains(&format!("\"precondition\":\"{label}\"")),
+                "{logs}"
+            );
+            assert!(logs.contains("keyring.sign.failure"), "{logs}");
+            assert!(!logs.contains("keyring.sign.success"), "{logs}");
+        }
+        read_at_ms.store(1_999, Ordering::SeqCst);
+        clock.set(1_500);
+        assert_eq!(
+            handle.sign_tx_payload(&payload).await.unwrap(),
+            SoftwareSigningKey::new_from_bytes(seed).sign_raw(&bytes)
+        );
+    }
+
+    /// Every typed method of the handle signs its payload's bytes with the
+    /// stored key, both as inherent methods and through the trait, and the
+    /// message signature verifies against the SEP-53 digest.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn every_typed_method_signs_with_the_stored_key() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        keyring_mock::install().expect("mock store");
+        let seed = [0xBC_u8; 32];
+        let entry_ref = KeyringEntryRef::new("stellar-agent-keyring-typed-methods", "default");
+        let expected_g = gstrkey_for_seed(seed);
+        store_sstrkey(&entry_ref, &sstrkey_for_seed(seed));
+        let handle = signer_from_keyring(&entry_ref, &expected_g).await.unwrap();
+        let key = SoftwareSigningKey::new_from_bytes(seed);
+        let bytes = [0x3C_u8; 32];
+
+        let tx = TxSigningPayload::from_bytes_for_test(bytes);
+        let digest = SmartAccountAuthDigest::from_bytes_for_test(bytes);
+        let soroban = SorobanAuthPayload::from_bytes_for_test(bytes);
+        let message = MessagePayload::sep53(b"keyring message");
+        assert_eq!(
+            handle.sign_tx_payload(&tx).await.unwrap(),
+            key.sign_raw(&bytes)
+        );
+        assert_eq!(
+            handle.sign_auth_digest(&digest).await.unwrap(),
+            key.sign_raw(&bytes)
+        );
+        assert_eq!(
+            handle
+                .sign_soroban_address_auth_payload(&soroban)
+                .await
+                .unwrap(),
+            key.sign_raw(&bytes)
+        );
+        let inherent = handle.sign_message(&message).await.unwrap();
+        let through_trait = Signer::sign_message(&handle, &message).await.unwrap();
+        assert_eq!(inherent, through_trait);
+        VerifyingKey::from_bytes(&handle.public_key().0)
+            .unwrap()
+            .verify(message.as_bytes(), &Signature::from_bytes(&inherent))
+            .expect("the message signature verifies against the SEP-53 digest");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn sign_tx_payload_emits_success_event() {
         keyring_mock::install().expect("mock store");
         let seed = [0xBB_u8; 32];
@@ -1903,7 +3231,10 @@ mod tests {
         let _guard = tracing::dispatcher::set_default(&dispatch);
         tracing::callsite::rebuild_interest_cache();
 
-        let sig = handle.sign_tx_payload(&[0x01_u8; 32]).await.unwrap();
+        let sig = handle
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test([0x01_u8; 32]))
+            .await
+            .unwrap();
         drop(_guard);
 
         assert_eq!(sig.len(), 64);
@@ -1939,7 +3270,10 @@ mod tests {
         let _guard = tracing::dispatcher::set_default(&dispatch);
         tracing::callsite::rebuild_interest_cache();
 
-        let err = handle.sign_tx_payload(&[0x02_u8; 32]).await.unwrap_err();
+        let err = handle
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test([0x02_u8; 32]))
+            .await
+            .unwrap_err();
         drop(_guard);
 
         assert_eq!(err.code(), "auth.signer_key_mismatch");
@@ -1990,7 +3324,7 @@ mod tests {
             entry_ref: KeyringEntryRef::new("test-service", "test-account"),
             cached_pubkey_bytes: [0u8; 32],
         };
-        let auth_digest = [0xAB_u8; 32];
+        let auth_digest = SmartAccountAuthDigest::from_bytes_for_test([0xAB_u8; 32]);
         let credential_id = b"test-credential-id";
 
         let err = (<KeyringSignHandle as Signer>::sign_webauthn_assertion(
@@ -2045,7 +3379,7 @@ mod tests {
         assert_eq!(handle.public_key().to_string(), expected_g.as_str());
 
         let error = handle
-            .sign_tx_payload(&[0x11; 32])
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test([0x11; 32]))
             .await
             .expect_err("first signature call must open the missing keyring");
         assert_eq!(error.code(), "auth.keyring_platform_error");
@@ -2055,14 +3389,347 @@ mod tests {
         assert_eq!(error.code(), "auth.signer_key_mismatch");
         assert_eq!(
             error.message(),
-            "signing key public key 'invalid public account' does not match the keyring entry's account 'not-a...trkey'"
+            "signing key public key 'invalid public account' does not match the keyring entry's account 'a G-strkey'"
         );
+    }
+
+    /// A malformed source account gets the fixed text, with no fragment of it.
+    #[test]
+    fn refused_source_account_stays_out_of_the_mismatch() {
+        let entry_ref = KeyringEntryRef::new("stellar-agent-lazy-signer-test", "default");
+        let refused = "credm-the-rest-of-a-malformed-account-mark7";
+        let error = lazy_signer_from_keyring(&entry_ref, refused)
+            .err()
+            .expect("a malformed source account must refuse");
+        assert_eq!(error.code(), "auth.signer_key_mismatch");
+        for fragment in ["credm", "mark7"] {
+            stellar_agent_test_support::rejected_value::assert_no_marker(&error, fragment);
+        }
+    }
+
+    /// A corrupt secret reaches the decode event in no form, and the event
+    /// fires.
+    #[test]
+    fn corrupt_hmac_secret_stays_out_of_the_decode_event() {
+        let writer = CaptureWriter::new();
+        let subscriber = json_capture_subscriber(writer.clone());
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            assert_eq!(
+                decode_secret_32("~").err().unwrap().code(),
+                "internal.unexpected_state"
+            );
+        });
+        let logs = writer.captured_str();
+        let events: Vec<serde_json::Value> = logs
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 1, "{logs}");
+        // The byte value of '~' is 126. Decoder byte and offset details must
+        // not enter the event, regardless of numeric tracing metadata. The
+        // flattened event holds only the formatter's metadata and the message.
+        let event = events[0].as_object().expect("event object");
+        assert_eq!(
+            event["message"], "chain-root HMAC key base64 decode failed",
+            "{logs}"
+        );
+        let mut keys: Vec<&str> = event.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["level", "message", "target", "timestamp"], "{logs}");
     }
 
     // ── Audit-log tip anchor ─────────────────────────────────────────────────
 
     fn audit_ref() -> KeyringEntryRef {
         KeyringEntryRef::new("stellar-agent-audit-anchor-test", "default")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn owner_keyring_coordinates_are_generation_scoped() {
+        use stellar_agent_core::audit_log::OutboxState;
+        keyring_mock::install().unwrap();
+        let store = KeyringTipAnchorStore::new(&audit_ref(), Path::new("owner.jsonl"));
+        for g in [0, 1, 2, u64::MAX] {
+            let suffix = if g == 0 {
+                "-owner".to_owned()
+            } else {
+                format!("-g{g}-owner")
+            };
+            let entry = store.owner_entry(g);
+            assert_eq!(entry.service, store.outbox_ref.service);
+            assert_eq!(
+                entry.account,
+                format!("{}{suffix}", store.outbox_ref.account)
+            );
+            assert_eq!(store.load_outbox_owner_state(g).unwrap(), None);
+            store
+                .store_outbox_state(g, &OutboxState::default())
+                .unwrap();
+            store
+                .store_outbox_owner_state(g, &format!("raw owner {g}"))
+                .unwrap();
+        }
+        for g in [0, 1, 2, u64::MAX] {
+            assert_eq!(
+                store.load_outbox_owner_state(g).unwrap(),
+                Some(format!("raw owner {g}"))
+            );
+            assert_eq!(
+                read_keyring_string(&store.generation_entry(g)).unwrap(),
+                Some(OutboxState::default().to_keyring_value())
+            );
+        }
+        let entry = store.owner_entry(2);
+        keyring_mock::inject_error(
+            &entry.service,
+            &entry.account,
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("unavailable"))),
+        )
+        .unwrap();
+        assert!(store.load_outbox_owner_state(2).is_err());
+        keyring_mock::inject_error(
+            &entry.service,
+            &entry.account,
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("unavailable"))),
+        )
+        .unwrap();
+        assert!(store.store_outbox_owner_state(2, "value").is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn audit_key_reload_uses_the_original_coordinate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use stellar_agent_core::audit_log::log_path_sha256;
+        let key = audit_ref();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&reads);
+        keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+            &key.service,
+            &key.account,
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        )])
+        .unwrap();
+        let path = Path::new("reload.jsonl");
+        let stores = [
+            KeyringTipAnchorStore::new(&key, path),
+            KeyringTipAnchorStore::for_path_digest(&key, &log_path_sha256(path)),
+        ];
+        let mutations = keyring_mock::record_mutations().unwrap();
+        for store in &stores {
+            assert!(store.reload_audit_key().unwrap().is_none());
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert!(
+            mutations.mutations().is_empty(),
+            "a reload mints no key: {:?}",
+            mutations.mutations()
+        );
+        let secret = [0x5a_u8; 32];
+        write_keyring_string(&key, &URL_SAFE_NO_PAD.encode(secret)).unwrap();
+        for (g, store) in stores.iter().enumerate() {
+            let owner = store.owner_entry(g as u64);
+            write_keyring_string(&owner, &URL_SAFE_NO_PAD.encode([0xa5_u8; 32])).unwrap();
+            write_keyring_string(&store.outbox_ref, &URL_SAFE_NO_PAD.encode([0x33_u8; 32]))
+                .unwrap();
+        }
+        let written = mutations.mutations().len();
+        for store in &stores {
+            let reloaded = store.reload_audit_key().unwrap().unwrap();
+            assert_eq!(*reloaded, secret);
+            let debug = format!("{store:?}");
+            assert!(debug.contains(&key.account), "{debug}");
+            assert!(!debug.contains(&URL_SAFE_NO_PAD.encode(secret)), "{debug}");
+            assert!(!debug.contains("90, 90"), "{debug}");
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            mutations.mutations().len(),
+            written,
+            "a reload writes nothing"
+        );
+        keyring_mock::install().unwrap();
+        keyring_mock::inject_error(
+            &key.service,
+            &key.account,
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("unavailable"))),
+        )
+        .unwrap();
+        let error = stores[0].reload_audit_key().unwrap_err();
+        assert!(
+            error.detail.starts_with("audit key reload failed"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn evidence_scope_uses_stable_owner_coordinate() {
+        use stellar_agent_core::audit_log::{evidence_scope, log_path_sha256};
+        let key = audit_ref();
+        let path = Path::new("evidence-scope.jsonl");
+        let store = KeyringTipAnchorStore::new(&key, path);
+        let scope = store.outbox_evidence_scope().unwrap();
+        let outbox = store.generation_entry(0);
+        assert_eq!(scope, evidence_scope(&outbox.service, &outbox.account));
+        assert_eq!(
+            KeyringTipAnchorStore::for_path_digest(&key, &log_path_sha256(path))
+                .outbox_evidence_scope()
+                .unwrap(),
+            scope,
+            "the recorded path digest yields the same scope"
+        );
+        assert!(store.owner_entry(3).account.starts_with(&outbox.account));
+        assert_ne!(
+            KeyringTipAnchorStore::new(&key, Path::new("other-evidence.jsonl"))
+                .outbox_evidence_scope()
+                .unwrap(),
+            scope,
+            "another log under the same audit key has its own scope"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn owner_keyring_round_trip_keeps_both_constructors() {
+        use stellar_agent_core::audit_log::{log_path_sha256, outbox::OutboxOwnerState};
+        keyring_mock::install().unwrap();
+        let key = audit_ref();
+        let path = Path::new("owner-round-trip.jsonl");
+        let digest = log_path_sha256(path);
+        let by_path = KeyringTipAnchorStore::new(&key, path);
+        let by_digest = KeyringTipAnchorStore::for_path_digest(&key, &digest);
+        let other = KeyringTipAnchorStore::new(&key, Path::new("other-owner.jsonl"));
+        let raw = " \n{\"recent\":[],\"legacy\":null,\"closed\":null,\"g\":99,\"v\":1}\t";
+        let expected = format!(
+            "{}-tip-{}-outbox-g3-owner",
+            key.account,
+            &stellar_agent_core::hex::encode(&digest)[..16]
+        );
+        assert_eq!(by_path.owner_entry(3).account, expected);
+        assert_eq!(by_digest.owner_entry(3).account, expected);
+        by_path.store_outbox_owner_state(3, raw).unwrap();
+        assert_eq!(
+            by_digest.load_outbox_owner_state(3).unwrap().as_deref(),
+            Some(raw)
+        );
+        assert_eq!(
+            OutboxOwnerState::parse(&by_digest.load_outbox_owner_state(3).unwrap().unwrap())
+                .unwrap_err()
+                .detail,
+            "outbox owner state is unusable"
+        );
+        assert_eq!(other.load_outbox_owner_state(3).unwrap(), None);
+        assert_eq!(by_path.load_outbox_state(3).unwrap(), None);
+        by_digest
+            .store_outbox_owner_state(3, "unvalidated owner bytes")
+            .unwrap();
+        assert_eq!(
+            by_path.load_outbox_owner_state(3).unwrap().as_deref(),
+            Some("unvalidated owner bytes")
+        );
+        assert_eq!(format!("{by_path:?}"), format!("{by_digest:?}"));
+        assert!(!format!("{by_path:?}").contains(raw));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn the_keyring_store_round_trips_the_carrier_record_and_generation_commitments() {
+        use stellar_agent_core::{
+            audit_log::{
+                OutboxState,
+                tip_anchor::{CarrierRecord, RetiredOutbox},
+            },
+            file_lock::FileIdentity,
+        };
+        keyring_mock::install().unwrap();
+        let store =
+            KeyringTipAnchorStore::new(&audit_ref(), Path::new("/data/audit/generations.jsonl"));
+        let identity = FileIdentity::Unix { dev: 12, ino: 34 };
+        let record = CarrierRecord {
+            generation: 2,
+            writer: identity.clone(),
+            drain: identity.clone(),
+            outbox_lock: identity,
+            retired: Some(RetiredOutbox {
+                generation: 1,
+                state: OutboxState::default().to_keyring_value(),
+                file: Some("generations.jsonl.outbox.retired-g1".to_owned()),
+            }),
+        };
+        store.store_carrier_record(&record).unwrap();
+        assert_eq!(store.load_carrier_record().unwrap(), Some(record));
+        for generation in 0..3 {
+            store
+                .store_outbox_state(
+                    generation,
+                    &OutboxState {
+                        pending: generation + 1,
+                        head: [generation as u8; 32],
+                    },
+                )
+                .unwrap();
+        }
+        for generation in 0..3 {
+            assert_eq!(
+                store
+                    .load_outbox_state(generation)
+                    .unwrap()
+                    .unwrap()
+                    .pending,
+                generation + 1
+            );
+        }
+        assert_eq!(
+            store.generation_entry(2).account,
+            format!("{}-g2", store.outbox_ref.account)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn the_keyring_store_round_trips_the_outbox_state() {
+        use stellar_agent_core::audit_log::{OutboxState, log_path_sha256};
+        keyring_mock::install().unwrap();
+        let key = audit_ref();
+        let path = Path::new("/data/audit/outbox.jsonl");
+        let store = KeyringTipAnchorStore::new(&key, path);
+        let digest = stellar_agent_core::hex::encode(&log_path_sha256(path));
+        assert_eq!(store.outbox_ref.service, key.service);
+        assert_eq!(
+            store.outbox_ref.account,
+            format!("{}-tip-{}-outbox", key.account, &digest[..16])
+        );
+        assert_eq!(store.load_outbox_state(0).unwrap(), None);
+        let state = OutboxState {
+            pending: 2,
+            head: [0x42; 32],
+        };
+        store.store_outbox_state(0, &state).unwrap();
+        assert_eq!(store.load_outbox_state(0).unwrap(), Some(state.clone()));
+        assert_eq!(
+            read_keyring_string(&store.outbox_ref).unwrap(),
+            Some(state.to_keyring_value())
+        );
+        for raw in [
+            "broken",
+            r#"{"v":2,"pending":0,"head":"sha256:00"}"#,
+            r#"{"v":1,"pending":1,"head":"no hash"}"#,
+        ] {
+            write_keyring_string(&store.outbox_ref, raw).unwrap();
+            assert!(store.load_outbox_state(0).is_err());
+        }
+        store
+            .store_outbox_state(0, &OutboxState::default())
+            .unwrap();
+        assert_eq!(
+            store.load_outbox_state(0).unwrap(),
+            Some(OutboxState::default())
+        );
     }
 
     #[test]
@@ -2190,6 +3857,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_absent_binding_is_recorded_under_enforce_and_a_changed_path_then_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let mut profile = bound_profile("bind-enforce", "/data/audit/one.jsonl");
         assert!(
@@ -2214,9 +3884,66 @@ mod tests {
         );
     }
 
+    /// A profile with no audit key records no binding: the key load refuses
+    /// first. A binding recorded for a keyless profile would later read as a
+    /// keyed use of its log and refuse the log's first adoption.
+    #[test]
+    #[serial_test::serial]
+    fn a_keyless_profile_records_no_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock keyring store");
+        let mut profile =
+            Profile::builder_testnet_named("bind-keyless", "s", "a", "n", "a").build();
+        profile.audit_log_path = std::path::PathBuf::from("/data/audit/keyless.jsonl");
+
+        let err = keyed_audit_access(&profile, "bind-keyless", BindingCheck::Enforce)
+            .expect_err("a profile with no audit key has no keyed access");
+        assert_ne!(err.code(), "audit.log_binding_changed", "{err}");
+        assert!(
+            recorded_binding("bind-keyless").is_none(),
+            "a failed key load records no binding"
+        );
+    }
+
+    /// The access carries the binding's state from before the call: the
+    /// first keyed use records the binding and reports it unrecorded, every
+    /// later one reports it recorded. `CheckOnly` reports without recording.
+    #[test]
+    #[serial_test::serial]
+    fn the_access_carries_the_binding_history_from_before_the_call() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock keyring store");
+        let profile = bound_profile("bind-history", "/data/audit/one.jsonl");
+
+        let check_only = keyed_audit_access(&profile, "bind-history", BindingCheck::CheckOnly)
+            .expect("an absent binding continues under CheckOnly");
+        assert_eq!(check_only.binding_history(), BindingHistory::NotRecorded);
+        let first = keyed_audit_access(&profile, "bind-history", BindingCheck::Enforce)
+            .expect("an absent binding is recorded");
+        assert_eq!(first.binding_history(), BindingHistory::NotRecorded);
+        assert!(recorded_binding("bind-history").is_some());
+        for check in [BindingCheck::Enforce, BindingCheck::CheckOnly] {
+            let later = keyed_audit_access(&profile, "bind-history", check)
+                .expect("an equal binding continues");
+            assert_eq!(later.binding_history(), BindingHistory::Recorded);
+        }
+        assert_eq!(
+            check_audit_binding(&profile, "bind-history", BindingCheck::CheckOnly)
+                .expect("an equal binding continues"),
+            BindingHistory::Recorded
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn check_only_records_nothing_and_refuses_a_changed_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let mut profile = bound_profile("bind-check", "/data/audit/one.jsonl");
 
@@ -2250,6 +3977,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_changed_path_refuses_before_the_hmac_key_load() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let mut profile = bound_profile("bind-order", "/data/audit/one.jsonl");
         keyed_audit_access(&profile, "bind-order", BindingCheck::Enforce).expect("record");
@@ -2275,6 +4005,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_changed_audit_key_coordinate_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let mut profile = bound_profile("bind-key", "/data/audit/one.jsonl");
         keyed_audit_access(&profile, "bind-key", BindingCheck::Enforce).expect("record");
@@ -2291,6 +4024,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_unparseable_record_refuses_under_both_checks() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let profile = bound_profile("bind-garbage", "/data/audit/one.jsonl");
         write_keyring_string(
@@ -2313,6 +4049,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_binding_write_error_fails_the_acquisition_with_the_keyring_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let coordinate = KeyringEntryRef::default_audit_binding("bind-write");
         keyring_mock::install_with_write_error(
             &coordinate.service,
@@ -2336,6 +4075,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_binding_read_error_fails_closed_and_writes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let profile = bound_profile("bind-read", "/data/audit/one.jsonl");
         let coordinate = KeyringEntryRef::default_audit_binding("bind-read");
@@ -2358,6 +4100,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn keyed_audit_access_refuses_the_owner_public_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let profile = bound_profile("owner-audit", "/data/audit/owner.jsonl");
         let older_form = URL_SAFE_NO_PAD.encode([0x4d; 32]);
@@ -2376,6 +4121,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn keyed_audit_access_refuses_a_g_strkey_owner_value() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let profile = bound_profile("owner-audit-strkey", "/data/audit/strkey.jsonl");
         write_keyring_string(
@@ -2394,6 +4142,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn keyed_audit_access_refuses_an_owner_coordinate_without_a_read() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let mut profile = bound_profile("owner-audit-coord", "/data/audit/coord.jsonl");
         profile.audit_log_hash_chain_key_id =
@@ -2521,23 +4272,57 @@ mod tests {
         }
     }
 
-    /// A missing entry reports `auth.keyring_not_found` naming both the
-    /// service and the account, which tell the three roles apart.
+    /// A missing entry reports `auth.keyring_not_found` with the fixed text
+    /// and neither keyring coordinate.
     #[test]
     #[serial_test::serial]
-    fn missing_rpc_credential_names_service_and_account() {
+    fn missing_rpc_credential_holds_no_coordinate() {
         let _restore = RestoreStore::new();
         keyring_mock::install().unwrap();
         let error = read_rpc_credential(&KeyringEntryRef::new("stellar-agent-rpc-unit", "oracle"))
             .err()
             .unwrap();
         assert_eq!(error.code(), "auth.keyring_not_found");
-        assert!(
-            error
-                .to_string()
-                .contains("'stellar-agent-rpc-unit/oracle'"),
-            "{error}"
+        assert_eq!(
+            error.to_string(),
+            "the configured keyring entry must exist; provision or select the required entry."
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn the_keyring_spent_store_reports_absence_as_none_and_errors_as_unavailable() {
+        use stellar_agent_core::approval::{RuleApprovalSpentStore, SpentSetError};
+        let _restore = RestoreStore::new();
+        keyring_mock::install().unwrap();
+        let key = KeyringEntryRef::default_attestation_key("unit");
+        let store = KeyringRuleApprovalSpentStore::new(&key);
+        let entry = stellar_agent_core::profile::schema::rule_approval_spent_entry_ref(&key);
+        assert_eq!(store.load().unwrap(), None);
+        store.store("v1.").unwrap();
+        assert_eq!(store.load().unwrap().as_deref(), Some("v1."));
+        for read in [true, false] {
+            keyring_mock::inject_error(
+                &entry.service,
+                &entry.account,
+                keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                    "rejected-value",
+                ))),
+            )
+            .unwrap();
+            let error = if read {
+                store.load().unwrap_err()
+            } else {
+                store.store("rejected-value").unwrap_err()
+            };
+            assert_eq!(
+                error,
+                SpentSetError::Unavailable {
+                    code: "auth.keyring_platform_error"
+                }
+            );
+            assert!(!format!("{error:?}: {error}").contains("rejected-value"));
+        }
     }
 
     #[test]
@@ -2587,8 +4372,33 @@ mod tests {
         keyring_mock::install().unwrap();
         let entry = rpc_entry();
         store_raw(&entry, "kept");
+        let mut calls = 0;
+        ensure_store_with(|| {
+            calls += 1;
+            init_platform_keyring_store()
+        })
+        .unwrap();
+        assert_eq!(calls, 0, "a registered store needs no initialization");
         ensure_platform_keyring_store().unwrap();
         assert_eq!(read_rpc_credential(&entry).unwrap().as_str(), "kept");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ensure_platform_keyring_store_initializes_once_and_propagates_failure() {
+        let _restore = RestoreStore::new();
+        let mut calls = 0;
+        let error = ensure_store_with(|| {
+            calls += 1;
+            Err(platform_store_init_failure(
+                "fixture initialization refused",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1, "an absent store needs exactly one initialization");
+        assert_eq!(error.code(), "auth.keyring_platform_error");
+        assert!(error.to_string().contains("fixture initialization refused"));
+        assert!(keyring_core::get_default_store().is_none());
     }
     #[test]
     #[serial_test::serial]
@@ -2624,10 +4434,16 @@ mod tests {
     #[serial_test::serial]
     fn key_scope_reserves_the_audit_writer_tip_anchor() {
         use stellar_agent_core::profile::key_scope::{
-            Coordinate, KeyScopeKind, SharedRecovery, key_scope_findings_in_dir,
+            KeyScopeKind, SharedRecovery, key_scope_findings_in_dir,
         };
         use stellar_agent_core::profile::loader::save_to_dir;
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let dir = home.path().join("profiles");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2661,12 +4477,771 @@ mod tests {
                 &finding.kind,
                 KeyScopeKind::SharedWithSibling {
                     field: "audit_log_hash_chain_key_id (tip anchor)",
-                    coordinate,
+                    sibling,
+                    sibling_field,
                     recovery: SharedRecovery::CorrectTheSiblingFile,
-                    ..
-                } if *coordinate == Coordinate::from(&anchor)
+                } if sibling == "bob" && sibling_field == "attestation_key_id"
             )),
             "{findings:?}"
         );
+    }
+
+    // ── enrolled signer identity ────────────────────────────────────────
+
+    mod enrolled {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use stellar_agent_core::profile::loader::save_to_dir;
+        use stellar_agent_core::profile::schema::signer_identity_entry_ref;
+        use stellar_agent_core::profile::signer_identity::SignerIdentityRecord;
+        use stellar_agent_test_support::keyring_mock::{self, ReadHook};
+        use tempfile::TempDir;
+
+        use super::super::*;
+
+        const SERVICE: &str = "stellar-agent-signer-enrolled";
+        const PUBLIC_KEY: [u8; 32] = [0x21; 32];
+
+        fn pin() -> String {
+            stellar_strkey::ed25519::PublicKey(PUBLIC_KEY)
+                .to_string()
+                .to_string()
+        }
+
+        fn profile_with(account: &str) -> Profile {
+            Profile::builder_mainnet_named(
+                "enrolled",
+                "https://rpc.example",
+                SERVICE,
+                account,
+                "n-svc",
+                "n-acct",
+            )
+            .build()
+        }
+
+        static SEED_READS: AtomicUsize = AtomicUsize::new(0);
+
+        /// A stored mainnet profile pinned to `account`, a mock keyring that
+        /// counts reads of the seed coordinate, and the identity record
+        /// `record` when given.
+        fn stored(account: &str, record: Option<&str>) -> (TempDir, Profile) {
+            SEED_READS.store(0, Ordering::SeqCst);
+            keyring_mock::install_with_read_hooks(vec![ReadHook::new(
+                SERVICE,
+                account,
+                std::sync::Arc::new(|| {
+                    SEED_READS.fetch_add(1, Ordering::SeqCst);
+                }),
+            )])
+            .unwrap();
+            let dir = TempDir::new().unwrap();
+            let profile = profile_with(account);
+            save_to_dir("enrolled", &profile, dir.path()).unwrap();
+            if let Some(record) = record {
+                write_keyring_string(
+                    &signer_identity_entry_ref(&profile.mcp_signer_default),
+                    record,
+                )
+                .unwrap();
+            }
+            (dir, profile)
+        }
+
+        fn produce(
+            dir: &TempDir,
+            profile: &Profile,
+            role: EnrolledRole,
+            expected: [u8; 32],
+        ) -> Result<EnrolledSigner, WalletError> {
+            enrolled_signer(
+                "enrolled",
+                dir.path(),
+                profile,
+                role,
+                &expected,
+                &owner().verifying_key().to_bytes(),
+            )
+        }
+
+        fn unusable(result: Result<EnrolledSigner, WalletError>) -> &'static str {
+            match result {
+                Err(WalletError::Auth(AuthError::EnrolledIdentityUnusable { reason, .. })) => {
+                    reason
+                }
+                other => panic!("expected an unusable identity, got {other:?}"),
+            }
+        }
+
+        fn owner() -> ed25519_dalek::SigningKey {
+            ed25519_dalek::SigningKey::from_bytes(&[11; 32])
+        }
+        #[test]
+        #[serial_test::serial]
+        fn a_transplanted_signer_refuses_before_seed_access() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let key = ed25519_dalek::SigningKey::from_bytes(&[21; 32])
+                .verifying_key()
+                .to_bytes();
+            let address = stellar_strkey::ed25519::PublicKey(key)
+                .to_string()
+                .to_string();
+            let victim = Profile::builder_mainnet_named(
+                "v",
+                "https://rpc.example.invalid",
+                "stellar-agent-signer-v",
+                &address,
+                "stellar-agent-nonce-v",
+                "default",
+            )
+            .build();
+            let evil = Profile::builder_mainnet_named(
+                "evil",
+                "https://rpc.example.invalid",
+                "stellar-agent-signer-v",
+                &address,
+                "stellar-agent-nonce-evil",
+                "default",
+            )
+            .build();
+            SEED_READS.store(0, Ordering::SeqCst);
+            keyring_mock::install_with_read_hooks(vec![ReadHook::new(
+                &victim.mcp_signer_default.service,
+                &address,
+                std::sync::Arc::new(|| {
+                    SEED_READS.fetch_add(1, Ordering::SeqCst);
+                }),
+            )])
+            .unwrap();
+            let dir = TempDir::new().unwrap();
+            let profiles = dir.path().join("profiles");
+            save_to_dir("v", &victim, &profiles).unwrap();
+            save_to_dir("evil", &evil, &profiles).unwrap();
+            std::fs::rename(profiles.join("v.toml"), dir.path().join("v.toml")).unwrap();
+            write_keyring_string(
+                &victim.mcp_signer_default,
+                &stellar_strkey::ed25519::PrivateKey([21; 32])
+                    .as_unredacted()
+                    .to_string(),
+            )
+            .unwrap();
+            let record = SignerIdentityRecord::signed_for_test(key, "v", &victim, &owner());
+            write_keyring_string(
+                &signer_identity_entry_ref(&victim.mcp_signer_default),
+                &record.render().unwrap(),
+            )
+            .unwrap();
+            assert!(!profiles.join("v.toml").exists());
+            let findings = stellar_agent_core::profile::key_scope::key_scope_findings_in_dir(
+                &evil, "evil", &profiles,
+            );
+            assert!(findings.is_empty(), "{findings:?}");
+            let result = enrolled_signer(
+                "evil",
+                &profiles,
+                &evil,
+                EnrolledRole::Agent,
+                &key,
+                &ed25519_dalek::SigningKey::from_bytes(&[12; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            );
+            assert_eq!(unusable(result), "bound_elsewhere");
+            assert_eq!(SEED_READS.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn an_unbound_record_refuses_on_mainnet() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let raw = format!(r#"{{"v":1,"public_key":"{}","role":"agent"}}"#, pin());
+            let (dir, profile) = stored(&pin(), Some(&raw));
+            assert_eq!(
+                unusable(produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY)),
+                "unbound"
+            );
+            let raw = SignerIdentityRecord::agent(PUBLIC_KEY, "enrolled", profile.chain_id)
+                .render()
+                .unwrap();
+            write_keyring_string(
+                &signer_identity_entry_ref(&profile.mcp_signer_default),
+                &raw,
+            )
+            .unwrap();
+            assert_eq!(
+                unusable(produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY)),
+                "unbound"
+            );
+            assert_eq!(SEED_READS.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn the_owner_must_match_and_sign() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let (dir, profile) = stored(&pin(), Some(&agent_record()));
+            assert_eq!(
+                unusable(enrolled_signer(
+                    "enrolled",
+                    dir.path(),
+                    &profile,
+                    EnrolledRole::Agent,
+                    &PUBLIC_KEY,
+                    &[12; 32]
+                )),
+                "owner_mismatch"
+            );
+            let mut record = SignerIdentityRecord::parse(&agent_record()).unwrap();
+            record.binding.as_mut().unwrap().owner.as_mut().unwrap().1[0] ^= 1;
+            write_keyring_string(
+                &signer_identity_entry_ref(&profile.mcp_signer_default),
+                &record.render().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                unusable(produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY)),
+                "binding_signature_invalid"
+            );
+            assert_eq!(SEED_READS.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_mainnet_check_needs_the_established_owner() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let profile = profile_with(&pin());
+            let record = SignerIdentityRecord::parse(&agent_record()).unwrap();
+            assert_eq!(
+                check_signer_binding("enrolled", &profile, &record, None),
+                Err("owner_required")
+            );
+            assert_eq!(
+                check_signer_binding(
+                    "enrolled",
+                    &profile,
+                    &record,
+                    Some(&owner().verifying_key().to_bytes())
+                ),
+                Ok(())
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn a_seed_without_its_record_signs_for_no_profile() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let profile =
+                Profile::builder_testnet_named("enrolled", SERVICE, &pin(), "n", "a").build();
+            SEED_READS.store(0, Ordering::SeqCst);
+            keyring_mock::install_with_read_hooks(vec![ReadHook::new(
+                SERVICE,
+                &pin(),
+                std::sync::Arc::new(|| {
+                    SEED_READS.fetch_add(1, Ordering::SeqCst);
+                }),
+            )])
+            .unwrap();
+            write_keyring_string(
+                &profile.mcp_signer_default,
+                &stellar_strkey::ed25519::PrivateKey([0x21; 32])
+                    .as_unredacted()
+                    .to_string(),
+            )
+            .unwrap();
+            let result = enrolled_keyring_signer("enrolled", &profile, &pin(), None).await;
+            let Err(error) = result else {
+                panic!("a seed without its record produced a signer");
+            };
+            assert!(
+                matches!(
+                    &error,
+                    WalletError::Auth(AuthError::EnrolledIdentityUnusable {
+                        reason: "missing",
+                        ..
+                    })
+                ),
+                "{error:?}"
+            );
+            assert_eq!(SEED_READS.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_testnet_v1_record_warns_and_passes() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let raw = format!(r#"{{"v":1,"public_key":"{}","role":"agent"}}"#, pin());
+            let record = SignerIdentityRecord::parse(&raw).unwrap();
+            let profile =
+                Profile::builder_testnet_named("enrolled", SERVICE, &pin(), "n", "a").build();
+            let logs = stellar_agent_test_support::with_captured_logs(|| {
+                assert_eq!(
+                    check_signer_binding("enrolled", &profile, &record, None),
+                    Ok(())
+                );
+            });
+            assert!(logs.contains("WARN"), "{logs}");
+            assert!(logs.contains("profile.signer_identity"), "{logs}");
+            assert!(
+                logs.contains("names no profile; enroll the signer again to bind it"),
+                "{logs}"
+            );
+        }
+
+        fn agent_record() -> String {
+            SignerIdentityRecord::signed_for_test(
+                PUBLIC_KEY,
+                "enrolled",
+                &profile_with(&pin()),
+                &owner(),
+            )
+            .render()
+            .unwrap()
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn the_enrolled_signer_comes_from_the_record_never_the_seed() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let (dir, profile) = stored(&pin(), Some(&agent_record()));
+            for role in [EnrolledRole::Agent, EnrolledRole::FeePayer] {
+                let signer = produce(&dir, &profile, role, PUBLIC_KEY).unwrap();
+                assert_eq!(signer.public_key(), PUBLIC_KEY);
+                assert_eq!(signer.role(), role);
+                assert_eq!(signer.seed_entry(), &profile.mcp_signer_default);
+            }
+            assert_eq!(
+                SEED_READS.load(Ordering::SeqCst),
+                0,
+                "the seed is never read"
+            );
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn each_broken_identity_refuses_beside_its_accepted_twin() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let other = stellar_strkey::ed25519::PublicKey([0x22; 32])
+                .to_string()
+                .to_string();
+            let records = [
+                ("missing", None),
+                ("malformed", Some("not json".to_owned())),
+                (
+                    "unsupported_version",
+                    Some(format!(
+                        "{{\"v\":3,\"public_key\":\"{}\",\"role\":\"agent\"}}",
+                        pin()
+                    )),
+                ),
+                (
+                    "malformed_key",
+                    Some("{\"v\":1,\"public_key\":\"GABC\",\"role\":\"agent\"}".to_owned()),
+                ),
+                (
+                    "unsupported_role",
+                    Some(format!(
+                        "{{\"v\":1,\"public_key\":\"{}\",\"role\":\"fee_payer\"}}",
+                        pin()
+                    )),
+                ),
+                (
+                    "pin_mismatch",
+                    Some(
+                        SignerIdentityRecord::signed_for_test(
+                            [0x22; 32],
+                            "enrolled",
+                            &profile_with(&pin()),
+                            &owner(),
+                        )
+                        .render()
+                        .unwrap(),
+                    ),
+                ),
+            ];
+            for (reason, record) in records {
+                let (dir, profile) = stored(&pin(), record.as_deref());
+                assert_eq!(
+                    unusable(produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY)),
+                    reason
+                );
+                write_keyring_string(
+                    &signer_identity_entry_ref(&profile.mcp_signer_default),
+                    &agent_record(),
+                )
+                .unwrap();
+                produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY).unwrap();
+                assert_eq!(SEED_READS.load(Ordering::SeqCst), 0, "{reason}");
+            }
+
+            let (dir, profile) = stored(&pin(), Some(&agent_record()));
+            assert_eq!(
+                unusable(produce(&dir, &profile, EnrolledRole::Agent, [0x22; 32])),
+                "public_key_mismatch"
+            );
+            assert_eq!(
+                unusable(produce(&dir, &profile, EnrolledRole::FeePayer, [0x22; 32])),
+                "fee_source_mismatch"
+            );
+
+            let mut overlaid = profile.clone();
+            overlaid.mcp_signer_default = KeyringEntryRef::new(SERVICE, other.clone());
+            assert_eq!(
+                unusable(produce(&dir, &overlaid, EnrolledRole::Agent, PUBLIC_KEY)),
+                "disk_disagreement"
+            );
+            overlaid.mcp_signer_default = KeyringEntryRef::new("another-service", pin());
+            assert_eq!(
+                unusable(produce(&dir, &overlaid, EnrolledRole::Agent, PUBLIC_KEY)),
+                "disk_disagreement"
+            );
+            produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY).unwrap();
+            assert_eq!(SEED_READS.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn mismatch_refusal_names_enrolled_signer_and_repair_commands_match_their_reasons() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let enrolled_address = pin();
+            let (dir, profile) = stored(&enrolled_address, Some(&agent_record()));
+
+            for (role, expected_reason) in [
+                (EnrolledRole::Agent, "public_key_mismatch"),
+                (EnrolledRole::FeePayer, "fee_source_mismatch"),
+            ] {
+                let err = produce(&dir, &profile, role, [0x22; 32]).unwrap_err();
+                assert_eq!(err.code(), "auth.enrolled_identity_unusable");
+                let msg = err.to_string();
+                assert!(msg.contains(expected_reason), "{msg}");
+                assert!(
+                    msg.contains(&enrolled_address),
+                    "must name enrolled signer {enrolled_address}: {msg}"
+                );
+                assert!(
+                    msg.ends_with("pass it as the source"),
+                    "must tell operator to pass enrolled signer as source and name no flag: {msg}"
+                );
+                assert!(!msg.contains("--repair-identity"), "{msg}");
+                assert!(!msg.contains("bind-signer"), "{msg}");
+            }
+
+            // Missing and malformed records still name `--repair-identity` and not `bind-signer`.
+            for (reason, record) in [
+                ("missing", None),
+                ("malformed", Some("not json")),
+                (
+                    "malformed_key",
+                    Some(r#"{"v":1,"public_key":"GABC","role":"agent"}"#),
+                ),
+            ] {
+                let (dir, profile) = stored(&enrolled_address, record);
+                let err = produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY).unwrap_err();
+                let msg = err.to_string();
+                assert!(msg.contains(reason), "{msg}");
+                assert!(msg.contains("--repair-identity"), "{reason}: {msg}");
+                assert!(!msg.contains("bind-signer"), "{reason}: {msg}");
+            }
+
+            // Unbound / owner mismatch / invalid binding signature name `bind-signer` only.
+            let unbound = SignerIdentityRecord::agent(PUBLIC_KEY, "enrolled", profile.chain_id)
+                .render()
+                .unwrap();
+            let (dir, profile) = stored(&enrolled_address, Some(&unbound));
+            let unbound_msg = produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY)
+                .unwrap_err()
+                .to_string();
+            assert!(unbound_msg.contains("unbound"), "{unbound_msg}");
+            assert!(unbound_msg.contains("bind-signer"), "{unbound_msg}");
+            assert!(!unbound_msg.contains("--repair-identity"), "{unbound_msg}");
+
+            let (dir, profile) = stored(&enrolled_address, Some(&agent_record()));
+            let owner_msg = enrolled_signer(
+                "enrolled",
+                dir.path(),
+                &profile,
+                EnrolledRole::Agent,
+                &PUBLIC_KEY,
+                &[12; 32],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(owner_msg.contains("owner_mismatch"), "{owner_msg}");
+            assert!(owner_msg.contains("bind-signer"), "{owner_msg}");
+            assert!(!owner_msg.contains("--repair-identity"), "{owner_msg}");
+
+            // Reasons neither command repairs omit both commands.
+            let mut overlaid = profile.clone();
+            overlaid.mcp_signer_default = KeyringEntryRef::new("another-service", enrolled_address);
+            let disk_msg = produce(&dir, &overlaid, EnrolledRole::Agent, PUBLIC_KEY)
+                .unwrap_err()
+                .to_string();
+            assert!(disk_msg.contains("disk_disagreement"), "{disk_msg}");
+            assert!(!disk_msg.contains("--repair-identity"), "{disk_msg}");
+            assert!(!disk_msg.contains("bind-signer"), "{disk_msg}");
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn an_unpinned_or_unstored_profile_refuses() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            for (account, reason) in [("default", "placeholder"), ("not-a-g-strkey", "malformed")] {
+                let (dir, profile) = stored(account, Some(&agent_record()));
+                match produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY) {
+                    Err(WalletError::Auth(AuthError::EnrolledSignerUnpinned {
+                        reason: found,
+                        ..
+                    })) => assert_eq!(found, reason),
+                    other => panic!("{account}: {other:?}"),
+                }
+            }
+            let (dir, profile) = stored(&pin(), Some(&agent_record()));
+            let missing = enrolled_signer(
+                "absent",
+                dir.path(),
+                &profile,
+                EnrolledRole::Agent,
+                &PUBLIC_KEY,
+                &owner().verifying_key().to_bytes(),
+            )
+            .unwrap_err();
+            assert_eq!(missing.code(), "validation.profile_not_found");
+            std::fs::write(dir.path().join("enrolled.toml"), "not toml [").unwrap();
+            let unreadable = produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY).unwrap_err();
+            assert_eq!(unreadable.code(), "validation.config_invalid");
+            assert_eq!(SEED_READS.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_keyring_failure_on_the_record_refuses() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            keyring_mock::install().unwrap();
+            let dir = TempDir::new().unwrap();
+            let profile = profile_with(&pin());
+            save_to_dir("enrolled", &profile, dir.path()).unwrap();
+            let identity = signer_identity_entry_ref(&profile.mcp_signer_default);
+            keyring_mock::inject_error(
+                &identity.service,
+                &identity.account,
+                keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked"))),
+            )
+            .unwrap();
+            let error = produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY).unwrap_err();
+            assert!(matches!(error, WalletError::Auth(_)), "{error:?}");
+            assert_ne!(error.code(), "auth.enrolled_identity_unusable");
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn the_signer_fact_digest_is_frozen() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let (dir, profile) = stored(&pin(), Some(&agent_record()));
+            let signer = produce(&dir, &profile, EnrolledRole::FeePayer, PUBLIC_KEY).unwrap();
+            assert_eq!(
+                stellar_agent_core::hex::encode(&signer.fact_digest()),
+                "327807a06a5d845937759fdf5b37e4cda3e5645414d24386163c4705836da4d9"
+            );
+        }
+    }
+
+    fn assert_policy_pin_write_refused(
+        field: &'static str,
+        write: impl Fn(&KeyringEntryRef) -> Result<(), WalletError>,
+    ) {
+        let window = KeyringEntryRef::default_policy_window_state_key("pin-refusal");
+        let pin = stellar_agent_core::profile::schema::policy_pin_entry_ref(&window);
+        let existing_pin = serde_json::json!({
+            "v": 1,
+            "sequence": 3,
+            "digest": "01".repeat(32),
+            "owner": stellar_strkey::ed25519::PublicKey([7; 32]).to_string().to_string(),
+        })
+        .to_string();
+        let existing_secret = URL_SAFE_NO_PAD.encode([9; 32]);
+        for service in [
+            pin.service.as_str(),
+            "custom.window",
+            "StElLaR-AgEnT-ToOlSeTs",
+        ] {
+            for account in [
+                "default-policy-pin",
+                "DEFAULT-POLICY-PIN",
+                "custom.PoLiCy-PiN-policy-pin",
+            ] {
+                let alias = format!("{account}.{service}");
+                for (split, _) in alias.match_indices('.') {
+                    let coordinate = KeyringEntryRef::new(&alias[split + 1..], &alias[..split]);
+                    for initial in [
+                        None,
+                        Some(existing_pin.as_str()),
+                        Some(existing_secret.as_str()),
+                    ] {
+                        keyring_mock::install().unwrap();
+                        let entry =
+                            keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+                                .unwrap();
+                        if let Some(value) = initial {
+                            entry.set_password(value).unwrap();
+                        }
+                        let error = write(&coordinate).unwrap_err();
+                        assert!(
+                            matches!(
+                                error,
+                                WalletError::Validation(ValidationError::PolicyPinCoordinate { field: found })
+                                    if found == field
+                            ),
+                            "{error:?}"
+                        );
+                        assert_eq!(entry.get_password().ok().as_deref(), initial);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_keyring_string_refuses_policy_pin_coordinate() {
+        assert_policy_pin_write_refused("keyring_coordinate", |entry| {
+            write_keyring_string(entry, "replacement")
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_rpc_credential_refuses_policy_pin_coordinate() {
+        for value in ["replacement", "", "invalid\ncredential"] {
+            assert_policy_pin_write_refused("rpc_credential", |entry| {
+                write_rpc_credential(entry, &Zeroizing::new(value.to_owned()))
+            });
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotate_keyring_secret_32_refuses_policy_pin_coordinate() {
+        assert_policy_pin_write_refused("keyring_coordinate", |entry| {
+            rotate_keyring_secret_32(&entry.service, &entry.account)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_or_mint_secret_32_refuses_policy_pin_coordinate() {
+        assert_policy_pin_write_refused("keyring_coordinate", |entry| {
+            load_or_mint_secret_32(entry).map(drop)
+        });
+    }
+
+    fn assert_installation_write_refused(
+        write: impl Fn(&KeyringEntryRef) -> Result<(), WalletError>,
+    ) {
+        for service in ["stellar-agent-toolsets", "StElLaR-AgEnT-ToOlSeTs"] {
+            for account in ["pin-key", "another-account"] {
+                for initial in [None, Some("untouched")] {
+                    keyring_mock::install().unwrap();
+                    let coordinate = KeyringEntryRef::new(service, account);
+                    let entry = keyring_core::Entry::new(service, account).unwrap();
+                    if let Some(value) = initial {
+                        entry.set_password(value).unwrap();
+                    }
+                    let error = write(&coordinate).unwrap_err();
+                    assert_eq!(error.code(), "validation.installation_key_coordinate");
+                    assert_eq!(entry.get_password().ok().as_deref(), initial);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotate_keyring_secret_32_refuses_installation_service() {
+        assert_installation_write_refused(|entry| {
+            rotate_keyring_secret_32(&entry.service, &entry.account)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_keyring_string_refuses_installation_service() {
+        assert_installation_write_refused(|entry| write_keyring_string(entry, "replacement"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_rpc_credential_refuses_installation_service() {
+        assert_installation_write_refused(|entry| {
+            write_rpc_credential(entry, &Zeroizing::new("replacement".to_owned()))
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn keyring_tip_anchor_store_preserves_auth_error_on_keyring_refusal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let audit_ref = KeyringEntryRef::new("stellar-agent-audit-g5", "default");
+        let log_path = storage_sandbox.path().join("audit/g5.jsonl");
+        let store = KeyringTipAnchorStore::new(&audit_ref, &log_path);
+        let anchor_ref = store.anchor_entry_ref().clone();
+
+        keyring_mock::install_with_write_error(
+            &anchor_ref.service,
+            &anchor_ref.account,
+            None,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                "credential store locked",
+            ))),
+        )
+        .unwrap();
+        let anchor = TipAnchor::new(1, format!("sha256:{}", "a".repeat(64)), 64);
+        let write_err = store.store_anchor(&anchor).unwrap_err();
+        let auth = write_err
+            .auth_error()
+            .expect("keyring platform refusal must preserve typed AuthError");
+        assert_eq!(auth.code(), "auth.keyring_platform_error");
+
+        // A corrupt stored anchor value is not a keyring access error, so
+        // `auth_error()` stays `None`.
+        keyring_mock::install().unwrap();
+        write_keyring_string(&anchor_ref, "corrupt-anchor").unwrap();
+        let parse_err = store.load_anchor().unwrap_err();
+        assert_eq!(parse_err.auth_error(), None);
+
+        // A non-Auth WalletError mapped through `anchor_store_error` keeps
+        // `auth_error()` as `None`.
+        let non_auth = anchor_store_error(
+            "carrier record write failed",
+            &WalletError::Validation(ValidationError::ConfigInvalid {
+                component: "audit",
+                reason: "bad".to_owned(),
+            }),
+        );
+        assert_eq!(non_auth.auth_error(), None);
     }
 }

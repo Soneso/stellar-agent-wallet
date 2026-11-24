@@ -6,38 +6,48 @@
 //! | `GET`  | `/inbox` | [`inbox_get`] | session cookie |
 //! | `GET`  | `/pending.json` | [`pending_json`] | session cookie |
 //! | `GET`  | `/approval/{nonce}` | [`approval_detail_get`] | session cookie |
-//! | `POST` | `/approval/{nonce}/approve` | [`approve_post`] | session + CSRF |
-//! | `POST` | `/approval/{nonce}/reject` | [`reject_post`] | session + CSRF |
+//! | `POST` | `/approval/{nonce}/approve` | [`approve_post`] | session + CSRF + proof |
+//! | `POST` | `/approval/{nonce}/reject` | [`reject_post`] | session + CSRF + proof |
+//! | `POST` | `/session/activity` | [`session_activity_post`] | session + CSRF + proof |
 //! | `GET`  | `/static/app-shared.js` | [`app_shared_js`] | session cookie |
 //! | `GET`  | `/static/app.js` | [`app_js`] | session cookie |
+//! | `GET`  | `/static/session-bootstrap.js` | [`session_bootstrap_js`] | none |
 //!
 //! The Host / Origin / security-header / body-limit / trace layers are applied
-//! at the router level in [`crate::start_serve`], not here. Session-cookie and
-//! CSRF checks happen at the top of each handler (the auth boundary), never
-//! inside [`apply_decision`].
+//! at the router level in [`crate::start_serve`], not here. Session-cookie,
+//! CSRF and session-proof checks happen at the top of each handler (the auth
+//! boundary), never inside [`apply_decision`]. The successful bootstrap
+//! response is the only response that carries the session proof; see
+//! [`crate::auth`] for the session model and its lifetime.
 
 use axum::{
     Router,
+    body::Bytes,
     extract::{Path, RawQuery, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::json;
 
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::{
-    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApprovalView, open_with_retry,
+    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApprovalView, approval_view_digest,
+    open_with_retry,
 };
 use stellar_agent_core::timefmt;
 
 use crate::ServeState;
-use crate::auth::{
-    CSRF_HEADER_NAME, SESSION_COOKIE_NAME, SessionState, session_cookie_value, verify_csrf,
+use crate::auth::{CSRF_HEADER_NAME, SessionState, require_session_proof, verify_csrf};
+use crate::decision::{Decision, Outcome, RequestIdentity, apply_decision, shown_view_digest};
+use crate::templates::{
+    render_detail_page, render_inbox_page, render_not_found_page, render_session_bootstrap_page,
 };
-use crate::decision::{Decision, Outcome, RequestIdentity, apply_decision};
-use crate::templates::{render_detail_page, render_inbox_page, render_not_found_page};
 use crate::web;
+
+/// The fixed CSRF nonce `POST /session/activity` binds to; the inbox and
+/// detail pages carry its CSRF value next to the per-approval one.
+pub(crate) const SESSION_ACTIVITY_NONCE: &str = "session-activity";
 
 /// Build the router (without the outer middleware stack, which is applied by
 /// [`crate::start_serve`]).
@@ -49,8 +59,13 @@ pub(crate) fn build_router() -> Router<ServeState> {
         .route("/approval/{nonce}", get(approval_detail_get))
         .route("/approval/{nonce}/approve", post(approve_post))
         .route("/approval/{nonce}/reject", post(reject_post))
+        .route("/approval/{nonce}/revoke", post(revoke_post))
+        .route("/session/activity", post(session_activity_post))
         .route("/static/app-shared.js", get(app_shared_js))
         .route("/static/app.js", get(app_js))
+        .route("/static/revoke.js", get(revoke_js))
+        .route("/static/revoke.css", get(revoke_css))
+        .route("/static/session-bootstrap.js", get(session_bootstrap_js))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -108,25 +123,53 @@ fn store_unavailable() -> Response {
         .into_response()
 }
 
-/// Recovers the [`SessionState`] iff the request carries a valid session cookie.
+/// Recovers the [`SessionState`] iff the request carries the cookie of a live,
+/// unexpired session.
 ///
 /// Returns the session on success (with its per-run CSRF key), or a `404`
-/// response on absent / malformed / mismatched cookie.
+/// response on an absent / malformed / mismatched cookie or an expired
+/// session. Never records activity.
 #[allow(
     clippy::result_large_err,
     reason = "the Err variant is the ready-to-return axum Response for the auth-boundary rejection; boxing would only add an allocation on the reject path"
 )]
-fn require_session(state: &ServeState, headers: &HeaderMap) -> Result<SessionState, Response> {
-    let guard = match state.auth.lock() {
+pub(crate) fn require_session(
+    auth: &std::sync::Mutex<crate::auth::AuthState>,
+    headers: &HeaderMap,
+) -> Result<SessionState, Response> {
+    let mut guard = match auth.lock() {
         Ok(g) => g,
         Err(poison) => poison.into_inner(),
     };
-    let session = guard.session.as_ref().ok_or_else(not_found)?;
+    let now = guard.now();
+    guard.require_session(headers, now).ok_or_else(not_found)
+}
 
-    let cookie = session_cookie_value(headers).ok_or_else(not_found)?;
-    let submitted = crate::auth::OpaqueToken::from_hex(&cookie).ok_or_else(not_found)?;
-    if session.session_id.ct_eq(&submitted) {
-        Ok(session.clone())
+/// Authorizes a state-changing request: the session cookie, then the CSRF
+/// value for `csrf_nonce`, then the session proof, then records the activity.
+///
+/// Each failure returns its own response: `404` for the session, `403`
+/// `csrf_rejected`, `403` `session_proof_invalid`. A session that expired
+/// between the cookie check and the activity record answers `404` as well.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err variant is the ready-to-return axum Response for the auth-boundary rejection; boxing would only add an allocation on the reject path"
+)]
+pub(crate) fn authorize_mutation(
+    auth: &std::sync::Mutex<crate::auth::AuthState>,
+    headers: &HeaderMap,
+    csrf_nonce: &str,
+) -> Result<(), Response> {
+    let session = require_session(auth, headers)?;
+    require_csrf(&session, headers, csrf_nonce)?;
+    require_session_proof(&session, headers)?;
+    let mut guard = match auth.lock() {
+        Ok(g) => g,
+        Err(poison) => poison.into_inner(),
+    };
+    let now = guard.now();
+    if guard.record_activity(&session.session_id, now) {
+        Ok(())
     } else {
         Err(not_found())
     }
@@ -200,33 +243,28 @@ fn take_snapshot(store_path: &std::path::Path, include_expired: bool) -> Snapsho
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `GET /bootstrap/{token}` — one-time exchange of the bootstrap token for a
-/// session cookie, then redirect to `/inbox`.
+/// session.
+///
+/// The success response sets the session cookie and returns the bootstrap
+/// page, which carries the session proof and navigates to `/inbox` once the
+/// proof is stored. This is the only response that ever carries the proof.
 async fn bootstrap_get(State(state): State<ServeState>, Path(token): Path<String>) -> Response {
     let mut guard = match state.auth.lock() {
         Ok(g) => g,
         Err(poison) => poison.into_inner(),
     };
-
-    let Some(submitted) = crate::auth::OpaqueToken::from_hex(&token) else {
+    let now = guard.now();
+    let Some(session) = guard.exchange_bootstrap(&token, now) else {
         return not_found();
     };
-    let matches = guard
-        .bootstrap
-        .as_ref()
-        .is_some_and(|stored| stored.ct_eq(&submitted));
-    if !matches {
-        return not_found();
-    }
-
-    // Consume the token immediately: any later request to this path 404s.
-    guard.bootstrap = None;
-    let session = SessionState::generate();
-    let cookie_value = session.session_id.to_hex();
-    guard.session = Some(session);
+    let cookie = guard.set_cookie_value(&session);
+    let purpose = guard.purpose();
     drop(guard);
 
-    let cookie = format!("{SESSION_COOKIE_NAME}={cookie_value}; HttpOnly; SameSite=Strict; Path=/");
-    let mut resp = Redirect::to("/inbox").into_response();
+    let Some(page) = render_session_bootstrap_page(&session.session_proof.to_hex(), purpose) else {
+        return not_found();
+    };
+    let mut resp = Html(page).into_response();
     if let Ok(hv) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, hv);
     }
@@ -239,9 +277,11 @@ async fn inbox_get(
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
-    if let Err(resp) = require_session(&state, &headers) {
-        return resp;
-    }
+    let session = match require_session(&state.auth, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let activity_csrf = crate::auth::compute_csrf(&session.csrf_key, SESSION_ACTIVITY_NONCE);
 
     let include_expired = include_expired_flag(raw_query.as_deref());
     match take_snapshot(&state.ctx.store_path, include_expired) {
@@ -252,14 +292,20 @@ async fn inbox_get(
             &pending,
             expired_count,
             include_expired,
+            &activity_csrf,
             &state.identity,
         ))
         .into_response(),
         // The shell still renders on a transient store failure; the client-side
         // poll of /pending.json recovers the rows once the lock clears.
-        SnapshotResult::Busy | SnapshotResult::Unavailable => {
-            Html(render_inbox_page(&[], 0, include_expired, &state.identity)).into_response()
-        }
+        SnapshotResult::Busy | SnapshotResult::Unavailable => Html(render_inbox_page(
+            &[],
+            0,
+            include_expired,
+            &activity_csrf,
+            &state.identity,
+        ))
+        .into_response(),
     }
 }
 
@@ -269,7 +315,7 @@ async fn pending_json(
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
-    if let Err(resp) = require_session(&state, &headers) {
+    if let Err(resp) = require_session(&state.auth, &headers) {
         return resp;
     }
     let include_expired = include_expired_flag(raw_query.as_deref());
@@ -280,7 +326,7 @@ async fn pending_json(
         } => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/json")],
-            json!({ "pending": pending, "expired_count": expired_count }).to_string(),
+            json!({ "pending": crate::templates::pending_json_value(&pending), "expired_count": expired_count }).to_string(),
         )
             .into_response(),
         SnapshotResult::Busy => store_busy(),
@@ -289,16 +335,23 @@ async fn pending_json(
 }
 
 /// `GET /approval/{nonce}` — the per-approval detail page.
+///
+/// The view and the [`approval_view_digest`] the page carries come from one
+/// store handle, so the digest an approve returns is the digest of the
+/// entry the page rendered.
 async fn approval_detail_get(
     State(state): State<ServeState>,
     headers: HeaderMap,
     Path(nonce): Path<String>,
 ) -> Response {
-    let session = match require_session(&state, &headers) {
+    let session = match require_session(&state.auth, &headers) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
 
+    if let Some(presence) = &state.presence {
+        return crate::presence::detail(presence, &session, &nonce);
+    }
     let store = match open_with_retry(
         &state.ctx.store_path,
         DEFAULT_RETRY_ATTEMPTS,
@@ -322,7 +375,7 @@ async fn approval_detail_get(
         .find(|v| v.approval_nonce == nonce);
 
     let Some(view) = view else {
-        return Html(render_not_found_page(&nonce, &state.identity)).into_response();
+        return Html(render_not_found_page(&state.identity)).into_response();
     };
 
     // For an already-attested payment-style entry, surface the stored blob so a
@@ -334,36 +387,118 @@ async fn approval_detail_get(
     } else {
         None
     };
+    let view_digest = store
+        .get(&nonce)
+        .and_then(|entry| approval_view_digest(entry, &state.ctx.context.binding()).ok())
+        .map(|digest| stellar_agent_core::hex::encode(&digest));
+    let revocation_identity = stellar_agent_core::approval::process_uid_for_attestation()
+        .is_ok_and(|uid| {
+            stellar_agent_core::approval::load_and_validate_entry(
+                &store,
+                &nonce,
+                &stellar_agent_core::approval::ApproverIdentity::OsUid(uid),
+                &[],
+            )
+            .is_ok()
+        });
     drop(store);
 
     let csrf = crate::auth::compute_csrf(&session.csrf_key, &nonce);
-    Html(render_detail_page(
+    let activity_csrf = crate::auth::compute_csrf(&session.csrf_key, SESSION_ACTIVITY_NONCE);
+    let page = render_detail_page(
         &view,
         &state.ctx.context,
         &csrf,
+        &activity_csrf,
         attestation_blob.as_deref(),
+        view_digest.as_deref(),
         &state.identity,
-    ))
-    .into_response()
+    );
+    let page = if revocation_identity
+        && !view.attested
+        && !view.expired
+        && !matches!(
+            view.summary,
+            stellar_agent_core::approval::ApprovalSummaryView::Consumed { .. }
+                | stellar_agent_core::approval::ApprovalSummaryView::Rejected { .. }
+        ) {
+        crate::templates::with_revocation_control(
+            page,
+            &state.ctx,
+            &nonce,
+            &json!({
+                "nonce": nonce, "csrf": csrf,
+                "storageKey": crate::auth::SessionPurpose::Inbox.proof_storage_key(),
+            }),
+        )
+    } else {
+        page
+    };
+    Html(page).into_response()
 }
 
-/// `POST /approval/{nonce}/approve` — attest / record consent for the approval.
-async fn approve_post(
+async fn revoke_post(
     State(state): State<ServeState>,
     headers: HeaderMap,
     Path(nonce): Path<String>,
 ) -> Response {
-    let session = match require_session(&state, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-    if let Err(resp) = require_csrf(&session, &headers, &nonce) {
+    if let Err(response) = authorize_mutation(&state.auth, &headers, &nonce) {
+        return response;
+    }
+    outcome_to_response(apply_decision(
+        &state.ctx,
+        Decision::Revoke { nonce },
+        RequestIdentity::Local,
+    ))
+}
+
+async fn revoke_js(State(state): State<ServeState>, headers: HeaderMap) -> Response {
+    session_asset(
+        &state,
+        &headers,
+        "application/javascript; charset=utf-8",
+        web::REVOKE_JS,
+    )
+}
+
+async fn revoke_css(State(state): State<ServeState>, headers: HeaderMap) -> Response {
+    session_asset(&state, &headers, "text/css; charset=utf-8", web::REVOKE_CSS)
+}
+
+/// Serves `body` with `content_type` to a request that holds a session.
+fn session_asset(
+    state: &ServeState,
+    headers: &HeaderMap,
+    content_type: &'static str,
+    body: &'static [u8],
+) -> Response {
+    if let Err(response) = require_session(&state.auth, headers) {
+        return response;
+    }
+    ([(header::CONTENT_TYPE, content_type)], body).into_response()
+}
+
+/// `POST /approval/{nonce}/approve` — attest / record consent for the approval.
+///
+/// The body is `{"view_digest":"<hex>"}`, the digest the detail page
+/// rendered. A missing, malformed or stale digest refuses with `409`
+/// `approval.presence_changed` and attests nothing.
+async fn approve_post(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(nonce): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = authorize_mutation(&state.auth, &headers, &nonce) {
         return resp;
     }
     let outcome = apply_decision(
         &state.ctx,
-        Decision::Approve { nonce },
-        &RequestIdentity::Local,
+        Decision::Approve {
+            nonce,
+            shown_view_digest: shown_view_digest(&body),
+        },
+        RequestIdentity::Local,
     );
     outcome_to_response(outcome)
 }
@@ -374,25 +509,55 @@ async fn reject_post(
     headers: HeaderMap,
     Path(nonce): Path<String>,
 ) -> Response {
-    let session = match require_session(&state, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-    if let Err(resp) = require_csrf(&session, &headers, &nonce) {
+    if let Err(resp) = authorize_mutation(&state.auth, &headers, &nonce) {
         return resp;
+    }
+    if let Some(presence) = &state.presence {
+        presence.discard(&nonce);
     }
     let outcome = apply_decision(
         &state.ctx,
         Decision::Reject { nonce },
-        &RequestIdentity::Local,
+        RequestIdentity::Local,
     );
     outcome_to_response(outcome)
+}
+
+/// `POST /session/activity`: records operator activity, extending the idle
+/// limit; never the absolute one.
+///
+/// Requires the cookie, the CSRF value for [`SESSION_ACTIVITY_NONCE`] and the
+/// session proof. Answers `204 No Content`. The browser sends it only on a
+/// trusted user interaction, throttled to once a minute; background polling
+/// never reaches it.
+async fn session_activity_post(State(state): State<ServeState>, headers: HeaderMap) -> Response {
+    match authorize_mutation(&state.auth, &headers, SESSION_ACTIVITY_NONCE) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `GET /static/session-bootstrap.js`: the bootstrap page's script.
+///
+/// Served without a session: the bootstrap page loads it in the same
+/// navigation that sets the cookie, and the bytes are fixed and carry no
+/// secret.
+async fn session_bootstrap_js() -> Response {
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        web::SESSION_BOOTSTRAP_JS,
+    )
+        .into_response()
 }
 
 /// `GET /static/app-shared.js` — the approval rendering both approval
 /// surfaces share (see [`crate::web::APP_SHARED_JS`]).
 async fn app_shared_js(State(state): State<ServeState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = require_session(&state, &headers) {
+    if let Err(resp) = require_session(&state.auth, &headers) {
         return resp;
     }
     (
@@ -408,7 +573,7 @@ async fn app_shared_js(State(state): State<ServeState>, headers: HeaderMap) -> R
 
 /// `GET /static/app.js` — the same-origin browser glue.
 async fn app_js(State(state): State<ServeState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = require_session(&state, &headers) {
+    if let Err(resp) = require_session(&state.auth, &headers) {
         return resp;
     }
     (
@@ -423,8 +588,16 @@ async fn app_js(State(state): State<ServeState>, headers: HeaderMap) -> Response
 }
 
 /// Maps an [`Outcome`] onto the wire JSON response.
-fn outcome_to_response(outcome: Outcome) -> Response {
+pub(crate) fn outcome_to_response(outcome: Outcome) -> Response {
     let (status, body) = match outcome {
+        Outcome::Revocation(view) => (
+            StatusCode::OK,
+            json!({"status": "revocation", "view": view}),
+        ),
+        Outcome::RevocationRefused(error) => (
+            StatusCode::CONFLICT,
+            json!({"error": error.code, "message": error.message}),
+        ),
         Outcome::Attested {
             attestation: Some(blob),
             expires_at_unix_ms,
@@ -459,7 +632,21 @@ fn outcome_to_response(outcome: Outcome) -> Response {
             }),
         ),
         Outcome::NotFound => (StatusCode::OK, json!({ "status": "not_found" })),
-        Outcome::WrongKind => (StatusCode::OK, json!({ "status": "wrong_kind" })),
+        Outcome::WrongKind => (
+            StatusCode::CONFLICT,
+            json!({"status": "wrong_kind", "error": "approval.wrong_kind"}),
+        ),
+        Outcome::Inconsistent => (
+            StatusCode::CONFLICT,
+            json!({
+                "status": "inconsistent",
+                "error": "approval.entry_inconsistent",
+                "message": crate::templates::INCONSISTENT_MESSAGE,
+            }),
+        ),
+        // The loopback inbox decides as the local operator, which needs no
+        // remote authorization; the arm keeps the mapping total.
+        Outcome::Unauthorized => (StatusCode::FORBIDDEN, json!({ "status": "unauthorized" })),
         Outcome::Busy => (
             StatusCode::SERVICE_UNAVAILABLE,
             json!({ "status": "busy", "retriable": true }),
@@ -467,6 +654,17 @@ fn outcome_to_response(outcome: Outcome) -> Response {
         Outcome::Unavailable => (
             StatusCode::SERVICE_UNAVAILABLE,
             json!({ "status": "unavailable", "retriable": false }),
+        ),
+        // A busy policy-state lock answers the retriable busy body of a busy
+        // credential store.
+        Outcome::PresenceRefused { code, .. }
+            if code == stellar_agent_core::ApprovalFailure::PresencePolicyBusy.code() =>
+        {
+            return store_busy();
+        }
+        Outcome::PresenceRefused { code, message } => (
+            crate::presence::refusal_status_of_code(code),
+            json!({ "error": code, "message": message }),
         ),
     };
     (
@@ -480,8 +678,33 @@ fn outcome_to_response(outcome: Outcome) -> Response {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, reason = "route test fixture assertions")]
+    #[tokio::test]
+    async fn wrong_kind_and_inconsistent_answer_conflict() {
+        use crate::decision::Outcome;
+        for (outcome, status, code) in [
+            (Outcome::WrongKind, "wrong_kind", "approval.wrong_kind"),
+            (
+                Outcome::Inconsistent,
+                "inconsistent",
+                "approval.entry_inconsistent",
+            ),
+        ] {
+            let response = super::outcome_to_response(outcome);
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["status"], status);
+            assert_eq!(value["error"], code);
+        }
+        assert_eq!(
+            super::outcome_to_response(Outcome::NotFound).status(),
+            axum::http::StatusCode::OK
+        );
+    }
     use axum::{
-        body::{Body, to_bytes},
+        body::to_bytes,
         http::{Request, StatusCode, header},
     };
     use stellar_agent_core::approval::PendingApprovalStore;
@@ -490,6 +713,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn approve_route_reports_binding_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let h = crate::tests::Harness::new("binding-mismatch-route");
         let definition = stellar_agent_core::approval::ContextRuleProposalSnapshot::new(
             stellar_agent_core::approval::RuleProposalContextType::Default,
@@ -509,7 +735,6 @@ mod tests {
             "Public Global Stellar Network ; September 2015".to_owned(),
             "stellar:mainnet".to_owned(),
             definition,
-            [1; 32],
             "rule".to_owned(),
             stellar_agent_core::approval::process_uid_for_attestation().unwrap(),
             stellar_agent_core::approval::DEFAULT_TTL_MS,
@@ -524,7 +749,8 @@ mod tests {
             .header(header::ORIGIN, "http://127.0.0.1:8080")
             .header(header::COOKIE, cookie)
             .header("x-stellar-approval-csrf", h.csrf_for(&nonce))
-            .body(Body::empty())
+            .header("x-session-proof", h.proof())
+            .body(h.view_digest_body(&nonce))
             .unwrap();
         let response = h.router().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);

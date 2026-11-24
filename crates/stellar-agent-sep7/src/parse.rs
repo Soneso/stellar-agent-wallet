@@ -34,6 +34,9 @@ const MSG_MAX_CHARS: usize = 300;
 /// Per `sep-0007.md`.
 const MAX_CHAIN_DEPTH: u8 = 7;
 
+/// The form every `origin_domain` refusal names, without the refused text.
+const ORIGIN_DOMAIN_FORM: &str = "must be a lowercase RFC 1035 LDH FQDN with at least two labels; IP addresses and numeric-only labels are not allowed";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public output types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -82,7 +85,8 @@ pub struct Sep7TxParams {
 /// The structured result of parsing a `web+stellar:pay?...` URI.
 #[derive(Debug, Clone)]
 pub struct Sep7PayParams {
-    /// Required payment destination — G-strkey or federated address.
+    /// Required payment destination: a G-strkey, an M-strkey with its mux ID,
+    /// or a federated address.
     pub destination: String,
 
     /// Optional amount.
@@ -153,6 +157,8 @@ pub enum Sep7Request {
 /// # Untrusted-input hardening
 ///
 /// - Duplicate parameters are rejected (not last-value-wins).
+/// - `signature` must be the last parameter, with its name spelled literally.
+///   A trailing empty pair after `signature` is rejected.
 /// - The `xdr` parameter is fully decoded to confirm it is a valid
 ///   `TransactionEnvelope` before the preview is assembled.
 /// - `msg` exceeding 300 characters is rejected.
@@ -203,9 +209,7 @@ pub fn parse_sep7_uri(uri: &str) -> Result<Sep7Request, Sep7Error> {
     match operation {
         "tx" => parse_tx_params(params).map(Sep7Request::Tx),
         "pay" => parse_pay_params(params).map(Sep7Request::Pay),
-        other => Err(Sep7Error::UnknownOperation {
-            operation: sanitize_operation(other),
-        }),
+        _ => Err(Sep7Error::UnknownOperation),
     }
 }
 
@@ -218,12 +222,20 @@ pub fn parse_sep7_uri(uri: &str) -> Result<Sep7Request, Sep7Error> {
 /// URL-decodes both keys and values using percent-decoding.
 fn parse_query_params(query: &str) -> Result<std::collections::HashMap<String, String>, Sep7Error> {
     let mut map = std::collections::HashMap::new();
+    let mut signature_seen = false;
 
     if query.is_empty() {
         return Ok(map);
     }
 
     for pair in query.split('&') {
+        // The signed payload ends where the signature pair begins, so no pair may follow it.
+        if signature_seen {
+            return Err(Sep7Error::InvalidParamValue {
+                param: "signature",
+                detail: "signature must be the last parameter".to_owned(),
+            });
+        }
         if pair.is_empty() {
             continue;
         }
@@ -235,15 +247,26 @@ fn parse_query_params(query: &str) -> Result<std::collections::HashMap<String, S
         let key = percent_decode(k).map_err(|_| Sep7Error::MalformedUri {
             detail: "query parameter key contains invalid percent-encoding".to_owned(),
         })?;
+        if key == "signature" {
+            // The payload cut matches the raw text `&signature=`, so the name must be literal.
+            if k != "signature" {
+                return Err(Sep7Error::InvalidParamValue {
+                    param: "signature",
+                    detail: "the signature parameter name must not be percent-encoded".to_owned(),
+                });
+            }
+            signature_seen = true;
+        }
         let value = percent_decode(v).map_err(|_| Sep7Error::MalformedUri {
             detail: "query parameter value contains invalid percent-encoding".to_owned(),
         })?;
 
         // Reject duplicate parameters — last-value-wins is a parameter injection vector.
+        // The refusal does not name the key, which is text of the refused URI.
         if map.contains_key(&key) {
             return Err(Sep7Error::InvalidParamValue {
                 param: "query",
-                detail: format!("duplicate parameter: {key:?}"),
+                detail: "a parameter name appears more than once".to_owned(),
             });
         }
 
@@ -368,11 +391,11 @@ fn parse_pay_params(
             param: "destination",
         })?;
 
-    // Validate destination: G-strkey or federation address (contains '*').
-    // Per sep-0007.md: destination must be a valid account ID or payment address.
+    // Validate destination: G-strkey, M-strkey or federation address
+    // (contains '*'). A payment destination is a MuxedAccount, so an M-strkey
+    // keeps its mux ID.
     if !destination.contains('*') {
-        // Not a federation address — validate as G-strkey.
-        validate_g_strkey_raw(&destination, "destination")?;
+        validate_payment_destination(&destination)?;
     }
 
     // amount — optional; validate as numeric if present.
@@ -387,7 +410,7 @@ fn parse_pay_params(
     // asset_issuer — optional; G-strkey; required if asset_code present and not XLM.
     let asset_issuer = params
         .remove("asset_issuer")
-        .map(|v| validate_g_strkey(v, "asset_issuer"))
+        .map(validate_plain_issuer)
         .transpose()?;
 
     // Validate asset_code + asset_issuer coherence.
@@ -579,6 +602,35 @@ fn validate_g_strkey(value: String, param: &'static str) -> Result<String, Sep7E
     Ok(value)
 }
 
+/// Validates a non-federated payment destination as a G-strkey or M-strkey.
+///
+/// The XDR `MuxedAccount` parser verifies the checksum and trailing bits.
+fn validate_payment_destination(value: &str) -> Result<(), Sep7Error> {
+    <stellar_xdr::MuxedAccount as std::str::FromStr>::from_str(value)
+        .map(|_| ())
+        .map_err(|_| Sep7Error::InvalidParamValue {
+            param: "destination",
+            detail: "must be a valid Stellar G-strkey or M-strkey account".to_owned(),
+        })
+}
+
+/// Validates `asset_issuer` as a plain G-strkey.
+///
+/// An asset issuer is an `AccountId`, so a valid M-strkey refuses with that
+/// reason.
+fn validate_plain_issuer(value: String) -> Result<String, Sep7Error> {
+    let muxed = <stellar_xdr::MuxedAccount as std::str::FromStr>::from_str(&value);
+    if matches!(muxed, Ok(stellar_xdr::MuxedAccount::MuxedEd25519(_))) {
+        return Err(Sep7Error::InvalidParamValue {
+            param: "asset_issuer",
+            detail: "issuer requires AccountId; a muxed ID cannot be encoded; an issuer is a base \
+                     account"
+                .to_owned(),
+        });
+    }
+    validate_g_strkey(value, "asset_issuer")
+}
+
 fn validate_g_strkey_raw(value: &str, param: &'static str) -> Result<(), Sep7Error> {
     stellar_strkey::ed25519::PublicKey::from_string(value)
         .map(|_| ())
@@ -672,7 +724,7 @@ fn validate_origin_domain_syntax(domain: String) -> Result<String, Sep7Error> {
     // must explicitly check for pure-numeric labels here.
     if domain.parse::<std::net::IpAddr>().is_ok() {
         return Err(Sep7Error::InvalidOriginDomain {
-            detail: format!("'{domain}' is an IP address, not a valid FQDN"),
+            detail: ORIGIN_DOMAIN_FORM.to_owned(),
         });
     }
 
@@ -683,7 +735,7 @@ fn validate_origin_domain_syntax(domain: String) -> Result<String, Sep7Error> {
         .all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()));
     if all_labels_numeric {
         return Err(Sep7Error::InvalidOriginDomain {
-            detail: format!("'{domain}' consists of numeric labels only; must be a valid FQDN"),
+            detail: ORIGIN_DOMAIN_FORM.to_owned(),
         });
     }
 
@@ -695,15 +747,13 @@ fn validate_origin_domain_syntax(domain: String) -> Result<String, Sep7Error> {
     let label_count = domain.split('.').filter(|l| !l.is_empty()).count();
     if label_count < 2 {
         return Err(Sep7Error::InvalidOriginDomain {
-            detail: format!(
-                "'{domain}' is a single-label hostname; a valid FQDN requires at least two labels"
-            ),
+            detail: ORIGIN_DOMAIN_FORM.to_owned(),
         });
     }
 
     if !is_valid_ldh_home_domain(&domain) {
         return Err(Sep7Error::InvalidOriginDomain {
-            detail: format!("'{domain}' is not a valid lowercase RFC 1035 LDH FQDN"),
+            detail: ORIGIN_DOMAIN_FORM.to_owned(),
         });
     }
     Ok(domain)
@@ -791,12 +841,9 @@ fn parse_memo_type(s: &str) -> Result<MemoType, Sep7Error> {
         "MEMO_ID" => Ok(MemoType::MemoId),
         "MEMO_HASH" => Ok(MemoType::MemoHash),
         "MEMO_RETURN" => Ok(MemoType::MemoReturn),
-        other => Err(Sep7Error::InvalidParamValue {
+        _ => Err(Sep7Error::InvalidParamValue {
             param: "memo_type",
-            detail: format!(
-                "unknown memo_type: {other:?}; must be one of \
-                 MEMO_TEXT, MEMO_ID, MEMO_HASH, MEMO_RETURN"
-            ),
+            detail: "must be one of MEMO_TEXT, MEMO_ID, MEMO_HASH, MEMO_RETURN".to_owned(),
         }),
     }
 }
@@ -819,17 +866,6 @@ fn validate_memo_coherence(
     }
 }
 
-/// Sanitises an operation token for inclusion in an error message.
-///
-/// Limits to 16 chars, ASCII-printable only; replaces control chars with `?`.
-fn sanitize_operation(op: &str) -> String {
-    const MAX: usize = 16;
-    op.chars()
-        .take(MAX)
-        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
-        .collect()
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Re-export: extract the original URI without the `&signature=...` parameter
 // ─────────────────────────────────────────────────────────────────────────────
@@ -837,10 +873,9 @@ fn sanitize_operation(op: &str) -> String {
 /// Strips the `&signature=<urlencoded-value>` suffix from a URI string to
 /// produce the payload URI for signature verification.
 ///
-/// The SEP-7 spec requires `signature` to be the LAST parameter.  Strips
-/// from `&signature=` (or `?signature=` when it is the first/only param) to
-/// the end of the string.  This matches the approach used by the Flutter and
-/// Python Stellar SDKs.
+/// The parser refuses a URI whose `signature` is not the last parameter.
+/// This helper strips from `&signature=` (or `?signature=` when it is the
+/// first parameter) to the end of the string.
 pub fn strip_signature_param(uri: &str) -> &str {
     // Prefer removing the `&signature=` form (signature is not the first param).
     if let Some(idx) = uri.find("&signature=") {
@@ -853,6 +888,34 @@ pub fn strip_signature_param(uri: &str) -> &str {
     uri
 }
 
+/// Returns the signed URI prefix, requiring a literal signature pair to be last.
+///
+/// The query starts at the first `?`, as in the parser, so a signature pair is
+/// a literal `&signature=` after that `?` or a `signature=` directly at it.
+/// A URI without such a pair returns whole, and its verification fails on the
+/// signature itself.
+///
+/// # Errors
+///
+/// Returns [`Sep7Error::SignatureVerificationFailed`] if a pair follows the signature.
+pub(crate) fn signed_prefix(uri: &str) -> Result<&str, Sep7Error> {
+    let Some(query_start) = uri.find('?') else {
+        return Ok(uri);
+    };
+    let query = &uri[query_start..];
+    let cut = match query.find("&signature=") {
+        Some(idx) => query_start + idx,
+        None if query.starts_with("?signature=") => query_start,
+        None => return Ok(uri),
+    };
+    if uri[cut + 1..].contains('&') {
+        return Err(Sep7Error::SignatureVerificationFailed {
+            detail: "signature must be the last parameter".to_owned(),
+        });
+    }
+    Ok(&uri[..cut])
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -863,6 +926,145 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn signature_followed_by_a_parameter_is_refused() {
+        let uri = "web+stellar:pay?\
+            destination=GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO\
+            &origin_domain=example.com&signature=SIG&amount=5000";
+        assert_signature_position_refused(uri);
+    }
+
+    #[test]
+    fn signature_first_followed_by_parameters_is_refused() {
+        let uri = "web+stellar:pay?signature=SIG\
+            &destination=GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO";
+        assert_signature_position_refused(uri);
+    }
+
+    #[test]
+    fn signature_followed_by_an_empty_pair_is_refused() {
+        let uri = "web+stellar:pay?\
+            destination=GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO\
+            &signature=SIG&";
+        assert_signature_position_refused(uri);
+    }
+
+    /// A percent-encoded minimal `TransactionEnvelope` for `tx` URIs.
+    fn signature_test_tx_xdr() -> String {
+        use stellar_xdr::{
+            Memo, MuxedAccount, Preconditions, SequenceNumber, Transaction, TransactionExt,
+            TransactionV1Envelope, Uint256,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([0u8; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![].try_into().unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: vec![].try_into().unwrap(),
+        });
+        envelope
+            .to_xdr_base64(Limits::none())
+            .unwrap()
+            .replace('+', "%2B")
+            .replace('/', "%2F")
+            .replace('=', "%3D")
+    }
+
+    #[test]
+    fn tx_signature_followed_by_a_parameter_is_refused() {
+        let xdr = signature_test_tx_xdr();
+        let uri = format!("web+stellar:tx?xdr={xdr}&signature=SIG&msg=hello");
+        assert_signature_position_refused(&uri);
+    }
+
+    #[test]
+    fn chain_signature_followed_by_a_parameter_is_refused() {
+        let xdr = signature_test_tx_xdr();
+        // The decoded chain value is
+        // `web+stellar:pay?destination=G...&signature=S&msg=x`.
+        let chain = "web%2Bstellar%3Apay%3Fdestination%3D\
+            GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO\
+            %26signature%3DS%26msg%3Dx";
+        let uri = format!("web+stellar:tx?xdr={xdr}&chain={chain}");
+        assert_signature_position_refused(&uri);
+    }
+
+    fn assert_signature_position_refused(uri: &str) {
+        let err = parse_sep7_uri(uri).unwrap_err();
+        assert!(
+            matches!(err, Sep7Error::InvalidParamValue { param: "signature", ref detail }
+                if detail == "signature must be the last parameter"),
+            "unexpected refusal: {err:?}"
+        );
+    }
+
+    #[test]
+    fn percent_encoded_signature_name_is_refused() {
+        let uri = "web+stellar:pay?\
+            destination=GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO\
+            &%73ignature=SIG";
+        let err = parse_sep7_uri(uri).unwrap_err();
+        assert!(
+            matches!(err, Sep7Error::InvalidParamValue { param: "signature", ref detail }
+                if detail == "the signature parameter name must not be percent-encoded"),
+            "unexpected refusal: {err:?}"
+        );
+    }
+
+    #[test]
+    fn signed_prefix_refuses_trailing_text() {
+        for uri in [
+            "web+stellar:pay?destination=G&signature=SIG&amount=5000",
+            "web+stellar:pay?signature=SIG&destination=G",
+            "web+stellar:pay?destination=G&signature=SIG&",
+        ] {
+            let err = signed_prefix(uri).unwrap_err();
+            assert!(
+                matches!(err, Sep7Error::SignatureVerificationFailed { ref detail }
+                    if detail == "signature must be the last parameter"),
+                "unexpected refusal: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_prefix_returns_the_unsigned_prefix() {
+        for (uri, prefix) in [
+            (
+                "web+stellar:pay?destination=G&signature=SIG",
+                "web+stellar:pay?destination=G",
+            ),
+            ("web+stellar:pay?signature=SIG", "web+stellar:pay"),
+            (
+                "web+stellar:pay?destination=G",
+                "web+stellar:pay?destination=G",
+            ),
+        ] {
+            assert_eq!(signed_prefix(uri).unwrap(), prefix);
+        }
+    }
+
+    #[test]
+    fn signed_prefix_ignores_a_signature_pattern_outside_the_query_start() {
+        // A `?signature=` inside a value and an `&signature=` before the first
+        // `?` are no signature pair, so the URI returns whole.
+        for uri in [
+            "web+stellar:pay?destination=G&msg=hi?signature=X",
+            "web+stellar:pay&signature=X?destination=G",
+        ] {
+            assert_eq!(signed_prefix(uri).unwrap(), uri);
+        }
+        assert_eq!(
+            signed_prefix("web+stellar:pay?signature=X").unwrap(),
+            "web+stellar:pay"
+        );
+    }
 
     #[test]
     fn parses_minimal_pay_uri() {
@@ -895,7 +1097,7 @@ mod tests {
     #[test]
     fn unknown_operation_fails() {
         let err = parse_sep7_uri("web+stellar:sign?foo=bar").unwrap_err();
-        assert!(matches!(err, Sep7Error::UnknownOperation { .. }));
+        assert!(matches!(err, Sep7Error::UnknownOperation));
     }
 
     #[test]
@@ -1481,21 +1683,41 @@ mod tests {
         );
     }
 
-    // sanitize_operation: long or non-ascii operation token is sanitised
+    /// An unknown operation, a duplicate parameter name and an unknown
+    /// memo_type are refused by the rule and the accepted values, and no
+    /// refusal repeats the text of the URI.
     #[test]
-    fn unknown_long_operation_is_sanitized_in_error() {
-        let long_op = "a".repeat(20);
-        let err = parse_sep7_uri(&format!("web+stellar:{long_op}?foo=bar")).unwrap_err();
-        assert!(
-            matches!(err, Sep7Error::UnknownOperation { .. }),
-            "long operation token must fail with UnknownOperation, got: {err:?}"
-        );
-        if let Sep7Error::UnknownOperation { ref operation } = err {
-            assert!(
-                operation.len() <= 16,
-                "sanitised operation must be ≤16 chars, got {len}: {operation}",
-                len = operation.len()
-            );
+    fn sep7_uri_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+
+        let destination = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let cases = [
+            (
+                format!("web+stellar:{CREDENTIAL_MARKER}?foo=bar"),
+                "unknown SEP-7 operation; expected 'tx' or 'pay'".to_owned(),
+            ),
+            (
+                format!(
+                    "web+stellar:pay?destination={destination}&{CREDENTIAL_MARKER}=1&\
+                     {CREDENTIAL_MARKER}=2"
+                ),
+                "SEP-7 invalid parameter value for 'query': a parameter name appears more \
+                 than once"
+                    .to_owned(),
+            ),
+            (
+                format!(
+                    "web+stellar:pay?destination={destination}&memo=1&memo_type={CREDENTIAL_MARKER}"
+                ),
+                "SEP-7 invalid parameter value for 'memo_type': must be one of MEMO_TEXT, \
+                 MEMO_ID, MEMO_HASH, MEMO_RETURN"
+                    .to_owned(),
+            ),
+        ];
+        for (uri, expected) in cases {
+            let err = parse_sep7_uri(&uri).unwrap_err();
+            assert_eq!(err.to_string(), expected);
+            assert_no_marker(&err, CREDENTIAL_MARKER);
         }
     }
 
@@ -1724,5 +1946,148 @@ mod tests {
             }
             Sep7Request::Tx(_) => panic!("expected Pay"),
         }
+    }
+
+    #[test]
+    fn origin_domain_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        for domain in [CREDENTIAL_MARKER, "CREDMARKER7.example", "127.0.0.1", "1.2"] {
+            let uri = format!(
+                "web+stellar:pay?destination=GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY&origin_domain={domain}"
+            );
+            let error = parse_sep7_uri(&uri).unwrap_err();
+            assert!(matches!(error, Sep7Error::InvalidOriginDomain { .. }));
+            assert_eq!(
+                error.to_string(),
+                "SEP-7 origin_domain is not a valid FQDN: must be a lowercase RFC 1035 LDH FQDN with at least two labels; IP addresses and numeric-only labels are not allowed"
+            );
+            assert_no_marker(&error, CREDENTIAL_MARKER);
+            assert_no_marker(&error, domain);
+        }
+    }
+
+    /// A payment URI keeps an M destination. M0 and M17 parse with the
+    /// original destination and an explicit memo, and the signature,
+    /// federation, memo-coherence and plain issuer rules stay.
+    #[test]
+    fn sep7_muxed_destination() {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+        let key = [0xB1; 32];
+        let m = |id: u64| {
+            stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+                .to_string()
+                .as_str()
+                .to_owned()
+        };
+        let pay = |uri: &str| match parse_sep7_uri(uri).unwrap() {
+            Sep7Request::Pay(params) => params,
+            Sep7Request::Tx(_) => panic!("expected pay"),
+        };
+        for id in [0, 17] {
+            let destination = m(id);
+            let plain = pay(&format!("web+stellar:pay?destination={destination}"));
+            assert_eq!(plain.destination, destination, "M{id} is kept");
+            let with_memo = pay(&format!(
+                "web+stellar:pay?destination={destination}&memo=88&memo_type=MEMO_ID"
+            ));
+            assert_eq!(with_memo.destination, destination);
+            assert_eq!(with_memo.memo.as_deref(), Some("88"));
+            assert_eq!(with_memo.memo_type, Some(MemoType::MemoId));
+            let text = pay(&format!(
+                "web+stellar:pay?destination={destination}&memo=hello&memo_type=MEMO_TEXT"
+            ));
+            assert_eq!(text.memo.as_deref(), Some("hello"));
+
+            let incoherent = parse_sep7_uri(&format!(
+                "web+stellar:pay?destination={destination}&memo_type=MEMO_TEXT"
+            ))
+            .unwrap_err();
+            assert!(matches!(
+                incoherent,
+                Sep7Error::InvalidParamValue { param: "memo", .. }
+            ));
+
+            let issuer = parse_sep7_uri(&format!(
+                "web+stellar:pay?destination={destination}&asset_code=USDC&asset_issuer={destination}"
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(
+                    &issuer,
+                    Sep7Error::InvalidParamValue { param: "asset_issuer", detail }
+                        if detail == "issuer requires AccountId; a muxed ID cannot be encoded; \
+                                      an issuer is a base account"
+                ),
+                "{issuer:?}"
+            );
+            assert!(!issuer.to_string().contains(&destination));
+        }
+        assert_eq!(
+            pay("web+stellar:pay?destination=user*example.com").destination,
+            "user*example.com"
+        );
+        // C, W, a checksum-corrupt M and a secret key refuse unechoed.
+        let mut corrupt = m(17);
+        let last = corrupt.pop().unwrap();
+        corrupt.push(if last == 'A' { 'B' } else { 'A' });
+        let secret = stellar_strkey::ed25519::PrivateKey([0xB1; 32])
+            .as_unredacted()
+            .to_string()
+            .as_str()
+            .to_owned();
+        for refused in [
+            stellar_strkey::Contract(key)
+                .to_string()
+                .as_str()
+                .to_owned(),
+            stellar_strkey::MuxedContract {
+                contract_id: key,
+                id: 17,
+            }
+            .to_string()
+            .as_str()
+            .to_owned(),
+            corrupt,
+            secret,
+        ] {
+            let error =
+                parse_sep7_uri(&format!("web+stellar:pay?destination={refused}")).unwrap_err();
+            assert!(matches!(
+                error,
+                Sep7Error::InvalidParamValue {
+                    param: "destination",
+                    ..
+                }
+            ));
+            assert!(!error.to_string().contains(&refused));
+        }
+
+        // The signature covers the full M destination: a changed ID fails.
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32]);
+        let signing_key = stellar_strkey::ed25519::PublicKey(signer.verifying_key().to_bytes())
+            .to_string()
+            .as_str()
+            .to_owned();
+        let toml = format!("URI_REQUEST_SIGNING_KEY = \"{signing_key}\"\n");
+        let unsigned = format!(
+            "web+stellar:pay?destination={}&origin_domain=example.com",
+            m(17)
+        );
+        let signature = base64::engine::general_purpose::STANDARD.encode(
+            signer
+                .sign(&crate::verify::build_signature_payload(&unsigned))
+                .to_bytes(),
+        );
+        let verify = |uri: &str| {
+            crate::verify::verify_against_toml_body(uri, "example.com", Some(&signature), &toml)
+                .unwrap()
+        };
+        assert_eq!(verify(&unsigned), crate::verify::SignatureStatus::Verified);
+        let moved = format!(
+            "web+stellar:pay?destination={}&origin_domain=example.com",
+            m(18)
+        );
+        assert_eq!(verify(&moved), crate::verify::SignatureStatus::Failed);
     }
 }

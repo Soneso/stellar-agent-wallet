@@ -1,0 +1,67 @@
+[[pending]]
+approval_nonce = "canonicalinbox00000000"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAAAAAAAAQAAAAAAAAABAAABAP//////////CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkAAAAAAAAAAAAAAAoAAAAAAAAAAA=="
+envelope_sha256_hex = "1fd329946ebaf758ea25fc8409f3056bc392a9031978d37af4fec3b8e037c459"
+summary_to = "MAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQT7777777777776PRW"
+summary_amount_stroops = 10
+summary_asset = "XLM"
+summary_simulated_fee_stroops = 100
+summary_simulated_seq_num = 7
+
+[[pending]]
+approval_nonce = "canonicalinbox00000001"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+
+[pending.toolset_first_invoke_gate]
+toolset_name = "my-toolset"
+install_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+package_version = "1.0.0"
+package_shasum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+capability = "sign-payment"
+destination = "GAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSH7S"
+asset = "XLM"
+amount_min_stroops = 0
+amount_max_stroops = 10000000
+
+[[pending]]
+approval_nonce = "canonicalinbox00000002"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+
+[pending.toolset_first_invoke_gate]
+toolset_name = "my-toolset"
+install_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+package_version = "1.0.0"
+package_shasum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+capability = "sign-payment"
+destination = "MAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSAAAAAAAAAAAAB7L2"
+asset = "XLM"
+amount_min_stroops = 0
+amount_max_stroops = 10000000
+
+[[pending]]
+approval_nonce = "canonicalinbox00000003"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+
+[pending.toolset_first_invoke_gate]
+toolset_name = "my-toolset"
+install_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+package_version = "1.0.0"
+package_shasum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+capability = "sign-payment"
+destination = "MAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQT7777777777776PRW"
+asset = "XLM"
+amount_min_stroops = 0
+amount_max_stroops = 10000000

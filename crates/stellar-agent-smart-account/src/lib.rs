@@ -9,6 +9,12 @@
 //! pinning, verifier migration,
 //! active-rule enumeration, multicall, and upgrade timelock (configurable on-chain execution delay).
 //!
+//! Every signed submission signs the caller's own host function as the root
+//! of the authorized invocation tree, with only the sub-invocations the caller
+//! declares under it (see [`submit::DeclaredSubInvocations`]). A simulated
+//! tree outside that is refused before anything is signed, so the RPC that
+//! answers the simulation cannot choose what the wallet authorizes.
+//!
 //! # What this crate does NOT do
 //!
 //! - Submit transactions or connect to a network (that is `stellar-agent-network`).
@@ -47,6 +53,9 @@ pub mod submit;
 // module so the builders never reach the public rustdoc of a release build.
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;
+// Typed signing payloads for the signer tests.
+#[cfg(test)]
+mod test_payloads;
 pub mod timelock;
 pub(crate) mod timelock_submit;
 pub mod verifier_allowlist;

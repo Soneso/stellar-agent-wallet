@@ -1,0 +1,11 @@
+{
+  "test_kind": "load_failure",
+  "name": "budget_window_30d_rejected",
+  "category": "extended_grammar",
+  "description": "An unlisted budget window outside 1m, 5m, 1h, 1d, and 1w refuses.",
+  "load_signing_strategy": "grammar_refused",
+  "expected_load_ok": false,
+  "expected_load_error": "policy_file_parse_failed",
+  "expected_load_wire_code": "policy.policy_file_parse_failed",
+  "expected_load_detail": "rule[0].criteria[0].unlisted: `window` is not accepted; valid values: 1m, 5m, 1h, 1d, 1w"
+}

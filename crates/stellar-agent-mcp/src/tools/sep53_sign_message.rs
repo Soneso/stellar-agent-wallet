@@ -107,7 +107,9 @@ pub struct Sep53SignMessageArgs {
 /// - `chain_id` does not match the profile.
 /// - `message` exceeds the maximum allowed size.
 /// - `message_encoding` is `"base64"` but `message` is not valid base64.
-/// - The keyring entry for the signer cannot be loaded.
+/// - The signer is overlaid, conflicts with local scope, or belongs to a mainnet sibling.
+/// - The profiles directory or a sibling cannot be read.
+/// - The audit writer or signer keyring entry cannot be loaded.
 ///
 /// # Examples
 ///
@@ -128,6 +130,7 @@ impl WalletServer {
         description = "Sign an arbitrary message using SEP-53 (SHA-256('Stellar Signed Message:\\n' + message) → ed25519). \
                        message_encoding: 'utf8' (default) or 'base64' for binary messages. \
                        Returns { signature: string (base64), signer_public_key: string (G-strkey), message_encoding: string }. \
+                       Testnet only. A mainnet profile refuses with network.mainnet_write_forbidden before signing. \
                        read_only_hint=false; destructive_hint=false. \
                        Produces the same SEP-53 signature bytes as stellar_sep43_sign_message; differs only in response field naming (signature/signer_public_key vs signedMessage/signerAddress) and accepts base64 binary input.",
         annotations(read_only_hint = false, destructive_hint = false)
@@ -166,25 +169,34 @@ impl WalletServer {
         }
 
         // Decode the message bytes. A bad encoding is a business refusal on
-        // caller-supplied input, not a JSON-RPC protocol fault.
+        // caller-supplied input, not a JSON-RPC protocol fault; it reports its own
+        // code before the pre-signing checks.
         let encoding = args.message_encoding.as_deref().unwrap_or("utf8");
         let message_bytes: Vec<u8> = match encoding {
             "base64" => match base64::engine::general_purpose::STANDARD.decode(&args.message) {
                 Ok(bytes) => bytes,
-                Err(e) => {
+                // The decoder's error quotes an offending byte of the
+                // message, so the refusal names the field and the form only.
+                Err(_) => {
                     return Ok(crate::tools::common::business_error_result(
                         "sep53.invalid_message_base64",
-                        format!("message base64 decode failed: {e}"),
+                        "message must be standard padded base64 when message_encoding is \
+                         'base64'",
                     ));
                 }
             },
             "utf8" => args.message.as_bytes().to_vec(),
-            other => {
+            _ => {
                 return Ok(crate::tools::common::business_error_result(
                     "sep53.invalid_encoding",
-                    format!("unsupported message_encoding: {other:?}; use 'utf8' or 'base64'"),
+                    "message_encoding must be 'utf8' or 'base64'",
                 ));
             }
+        };
+
+        let audit_writer = match self.message_signing_preflight() {
+            Ok(writer) => writer,
+            Err(refusal) => return Ok(refusal),
         };
 
         use std::sync::Arc;
@@ -195,6 +207,7 @@ impl WalletServer {
             &self.profile_name_for_approval(),
             &self.profile,
             account,
+            self.established_owner().as_ref(),
         )
         .await
         {
@@ -205,6 +218,7 @@ impl WalletServer {
                     stellar_agent_core::error::WalletError::Auth(
                         stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
                             | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
+                            | stellar_agent_core::error::AuthError::EnrolledIdentityUnusable { .. }
                     )
                 ) {
                     return Ok(crate::tools::common::business_error_result(
@@ -223,7 +237,13 @@ impl WalletServer {
         let signer: Arc<dyn stellar_agent_network::signing::Signer + Send + Sync> =
             Arc::new(signer_handle);
 
-        match stellar_agent_sep53::sign_message(&message_bytes, signer.as_ref()).await {
+        match stellar_agent_sep53::sign_message(
+            &message_bytes,
+            signer.as_ref(),
+            &self.profile.network_passphrase,
+        )
+        .await
+        {
             Ok(sig_bytes) => {
                 // Get the signer's public key for the response.
                 // The response MAY include the full public key (it is not secret).
@@ -263,6 +283,18 @@ impl WalletServer {
                     "sep53 message signed"
                 );
 
+                // The signature exists; audit append failures warn and preserve the result.
+                crate::tools::value_audit::emit_value_audit_row_with_writer(
+                    &audit_writer,
+                    &self.profile_name_for_approval(),
+                    crate::tools::message_signing::message_signed_row(
+                        "stellar_sep53_sign_message",
+                        args.chain_id.as_str(),
+                        &message_bytes,
+                        &signer_public_key,
+                    ),
+                );
+
                 let envelope = stellar_agent_core::envelope::Envelope::ok(json!({
                     "signature": signature_b64,
                     "signer_public_key": signer_public_key,
@@ -272,6 +304,9 @@ impl WalletServer {
                     .to_json_pretty()
                     .unwrap_or_else(|_| String::from("{}"));
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
+            }
+            Err(stellar_agent_sep53::Sep53Error::MainnetSigningForbidden { .. }) => {
+                Ok(crate::tools::common::sep53_mainnet_signing_forbidden_result())
             }
             Err(err) => Ok(crate::tools::common::business_error_result(
                 "sep53.sign_failed",
@@ -347,6 +382,7 @@ mod tests {
             _counterparty_cache: Option<&dyn CounterpartyCacheView>,
             _sep10_sessions: Option<&dyn Sep10SessionView>,
             _sep45_sessions: Option<&dyn Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             Ok(Decision::RequireApproval(ApprovalRequest::new(
                 "test-nonce".into(),
@@ -367,7 +403,10 @@ mod tests {
         server
     }
 
+    /// A Noop-engine mainnet server over a fresh mock keyring store; callers
+    /// hold the `keyring` serial key.
     fn make_mainnet_server() -> crate::server::WalletServer {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         crate::server::WalletServer::new(
             Profile::builder_mainnet(
                 "https://rpc.example.invalid",
@@ -392,7 +431,11 @@ mod tests {
     /// regressed guard that let signing proceed via a leaked key path fails here.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn mainnet_profile_refuses_before_signing_no_signature_produced() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_mainnet_server();
         let args = Sep53SignMessageArgs {
             chain_id: "stellar:mainnet".to_owned(),
@@ -427,7 +470,11 @@ mod tests {
     /// `policy.approval_required_unsupported` and MUST NOT produce a signature.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn require_approval_verdict_is_fail_closed_no_signature_produced() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let server = make_require_approval_server();
         let args = Sep53SignMessageArgs {
@@ -451,5 +498,290 @@ mod tests {
             !text.contains("\"signature\""),
             "fail-closed approval refusal must not produce a signature; got: {text}"
         );
+    }
+
+    /// The passphrase guard refuses even when the declared chain is testnet.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_testnet_chain_with_a_mainnet_passphrase_reports_the_signing_refusal() {
+        use stellar_agent_network::signing::Signer;
+
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let signer = stellar_agent_network::signing::SoftwareSigningKey::new_from_bytes([0x51; 32]);
+        let account = signer.public_key().await.unwrap().to_string().to_string();
+        let profile =
+            Profile::builder_testnet("sep53-mismatch", &account, "nonce-svc", "nonce-acct")
+                .with_noop_engine()
+                .build();
+        keyring_core::Entry::new("sep53-mismatch", &account)
+            .unwrap()
+            .set_password(
+                &stellar_strkey::ed25519::PrivateKey([0x51; 32])
+                    .as_unredacted()
+                    .to_string(),
+            )
+            .unwrap();
+        crate::tools::identity_fixture::store_signer_identity(&profile, [0x51; 32]);
+        let audit = &profile.audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&audit.service, &audit.account)
+            .unwrap()
+            .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x41; 32]))
+            .unwrap();
+        let mut server = crate::server::WalletServer::new(profile).unwrap();
+        std::sync::Arc::make_mut(&mut server.profile).network_passphrase =
+            stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE.to_owned();
+        let result = server
+            .call_stellar_sep53_sign_message(Sep53SignMessageArgs {
+                chain_id: "stellar:testnet".to_owned(),
+                message: "test message".to_owned(),
+                message_encoding: None,
+            })
+            .await
+            .unwrap();
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "network.mainnet_write_forbidden");
+        assert!(message.contains("network.mainnet_write_forbidden"));
+        assert!(!text.contains("\"signature\""));
+    }
+
+    fn message_args() -> Sep53SignMessageArgs {
+        Sep53SignMessageArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            message: crate::tools::message_signing_tests::MESSAGE.to_owned(),
+            message_encoding: None,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn message_scope_scenario_a_refuses_before_key_access() {
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.mainnet_sibling(false);
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(message_args())
+            .await
+            .unwrap();
+        crate::tools::message_signing_tests::assert_refusal(&result, "profile.key_scope_conflict");
+        let (_, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert!(message.contains("mainnet"));
+        assert!(!text.contains("keyring"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn message_scope_scenario_b_refuses_signer_overlay() {
+        let mut fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.overlay_mainnet_signer();
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(message_args())
+            .await
+            .unwrap();
+        crate::tools::message_signing_tests::assert_refusal(
+            &result,
+            "profile.non_overlayable_field",
+        );
+        let (_, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert!(message.contains("message signing"));
+        assert!(!text.contains("keyring"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn message_scope_refuses_testnet_shared_signer_coordinate() {
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        let mut sibling = fixture.mainnet_sibling(true);
+        sibling.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
+        stellar_agent_core::profile::loader::save_to_dir(
+            "main",
+            &sibling,
+            &fixture.dir.path().join("profiles"),
+        )
+        .unwrap();
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(message_args())
+            .await
+            .unwrap();
+        crate::tools::message_signing_tests::assert_refusal(&result, "profile.key_scope_conflict");
+        let (_, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert!(message.contains("also named") || message.contains("also names"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_mainnet_bound_signer_refuses_testnet_message_signing() {
+        let mut fixture = crate::tools::message_signing_tests::Fixture::new();
+        let reads = fixture.transplant_from_mainnet_victim();
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(message_args())
+            .await
+            .unwrap();
+        crate::tools::message_signing_tests::assert_refusal(
+            &result,
+            "auth.enrolled_identity_unusable",
+        );
+        let (_, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert!(message.contains("bound_elsewhere"), "{message}");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// An interrupted enrollment leaves a seed without its identity record.
+    /// A testnet profile naming that coordinate gets no signature: the
+    /// absent record refuses before the seed is read.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn an_interrupted_enrollment_refuses_message_signing() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&reads);
+        let seed = &fixture.profile.mcp_signer_default;
+        stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
+            stellar_agent_test_support::keyring_mock::ReadHook::new(
+                &seed.service,
+                &seed.account,
+                Arc::new(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }),
+            ),
+        ])
+        .unwrap();
+        fixture.seed_signer_without_identity();
+        fixture.seed_audit();
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(message_args())
+            .await
+            .unwrap();
+        crate::tools::message_signing_tests::assert_refusal(
+            &result,
+            "auth.enrolled_identity_unusable",
+        );
+        let (_, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert!(message.contains("(missing)"), "{message}");
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn message_signing_records_one_redacted_row_and_verifies() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.seed_signer();
+        fixture.seed_audit();
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(message_args())
+            .await
+            .unwrap();
+        fixture.assert_signed_row(
+            &result,
+            "stellar_sep53_sign_message",
+            "signature",
+            "signer_public_key",
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn message_signing_unacquirable_audit_writer_refuses_before_signer_load() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.seed_audit();
+        fixture.seed_identity();
+        fixture.profile.audit_log_path = fixture.dir.path().to_path_buf();
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(message_args())
+            .await
+            .unwrap();
+        crate::tools::message_signing_tests::assert_refusal(&result, "audit.chain_key_unavailable");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn malformed_message_reports_its_code_before_the_audit_preflight() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.seed_audit();
+        fixture.profile.audit_log_path = fixture.dir.path().to_path_buf();
+        let server = fixture.server();
+        for (encoding, code) in [
+            ("base64", "sep53.invalid_message_base64"),
+            ("hex", "sep53.invalid_encoding"),
+            ("CREDMARKER7", "sep53.invalid_encoding"),
+        ] {
+            let result = server
+                .call_stellar_sep53_sign_message(Sep53SignMessageArgs {
+                    message_encoding: Some(encoding.to_owned()),
+                    message: "not base64!".to_owned(),
+                    ..message_args()
+                })
+                .await
+                .unwrap();
+            assert!(
+                !serde_json::to_string(&result)
+                    .unwrap()
+                    .contains("CREDMARKER7")
+            );
+            crate::tools::message_signing_tests::assert_refusal(&result, code);
+        }
+    }
+
+    /// A message that is not base64 is refused by the field and the expected
+    /// form; the refusal carries none of the message, including the byte the
+    /// decoder stopped at.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn sep53_sign_base64_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.seed_audit();
+        fixture.profile.audit_log_path = fixture.dir.path().to_path_buf();
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(Sep53SignMessageArgs {
+                message_encoding: Some("base64".to_owned()),
+                message: format!("{CREDENTIAL_MARKER}~"),
+                ..message_args()
+            })
+            .await
+            .unwrap();
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "sep53.invalid_message_base64");
+        assert_eq!(
+            message,
+            "message must be standard padded base64 when message_encoding is 'base64'"
+        );
+        assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
+        assert_no_marker_in_text(&text, "symbol");
     }
 }

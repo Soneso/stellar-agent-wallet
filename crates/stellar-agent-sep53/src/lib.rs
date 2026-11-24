@@ -56,8 +56,9 @@ pub mod error;
 
 pub use error::Sep53Error;
 
-use sha2::{Digest, Sha256};
-use stellar_agent_network::signing::Signer;
+use stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL;
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+use stellar_agent_network::signing::{MessagePayload, Signer};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -72,10 +73,11 @@ use stellar_agent_network::signing::Signer;
 /// Cited from `sep-0053.md`.
 /// The trailing byte is `\n` = `0x0a`.
 ///
-/// This constant is the single source of truth for the SEP-53 prefix inside
-/// this crate. All code paths use [`PREFIX`] rather than an inline literal to
-/// prevent byte-drift.
-pub const PREFIX: &[u8] = b"Stellar Signed Message:\n";
+/// The prefix is defined once, as
+/// [`stellar_agent_network::signing::payload::SEP53_MESSAGE_PREFIX`], which
+/// [`stellar_agent_network::signing::MessagePayload::sep53`] hashes; this
+/// constant names the same bytes.
+pub const PREFIX: &[u8] = stellar_agent_network::signing::payload::SEP53_MESSAGE_PREFIX;
 
 /// Maximum message length in bytes accepted by [`sign_message`] and
 /// [`verify_message`] (DoS guard).
@@ -93,19 +95,17 @@ pub const MAX_MESSAGE_BYTES: usize = 65_536;
 /// Preimage = `PREFIX ‖ message_bytes`.
 /// Returns `SHA-256(preimage)` as a 32-byte array.
 ///
-/// Per `sep-0053.md` ("single-round SHA256"). This is the single source of the
-/// SEP-53 digest scheme; callers in other crates (e.g. the SEP-43 `signMessage`
-/// path) reuse it so the two SEPs cannot diverge.
+/// Per `sep-0053.md` ("single-round SHA256"). The bytes of
+/// [`MessagePayload::sep53`], which holds the one implementation of the
+/// digest; [`sign_message`] signs that payload and [`verify_message`]
+/// verifies against these bytes.
 ///
 /// # Panics
 ///
 /// Never panics.
 #[must_use]
 pub fn message_digest(message: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(PREFIX);
-    hasher.update(message);
-    hasher.finalize().into()
+    *MessagePayload::sep53(message).as_bytes()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -114,9 +114,9 @@ pub fn message_digest(message: &[u8]) -> [u8; 32] {
 
 /// Signs `message` using the SEP-53 prefixed scheme.
 ///
-/// Constructs the preimage `"Stellar Signed Message:\n" ‖ message`, computes
-/// `SHA-256(preimage)`, and calls `Signer::sign_tx_payload(&digest)` to
-/// produce a 64-byte ed25519 signature.
+/// Builds the SEP-53 payload [`MessagePayload::sep53`], the digest
+/// `SHA-256("Stellar Signed Message:\n" ‖ message)`, and calls
+/// `Signer::sign_message` on it to produce a 64-byte ed25519 signature.
 ///
 /// The caller is responsible for any base64 or hex encoding of the returned
 /// signature bytes for wire transport.
@@ -140,8 +140,19 @@ pub fn message_digest(message: &[u8]) -> [u8; 32] {
 /// path) reuses this crate's [`message_digest`] for the same SEP-53 scheme, so
 /// signatures it produces verify with [`verify_message`].
 ///
+/// # Mainnet
+///
+/// `network_passphrase` is the network of the profile the message is signed
+/// for. The mainnet passphrase is refused before any other check and before
+/// `signer` is asked for a signature: a message signature leaves the wallet
+/// for use elsewhere, so no mainnet signature is produced. The SEP-53 digest
+/// carries no network, so the refusal rests on the network the caller
+/// declares; callers pass their profile's passphrase.
+///
 /// # Errors
 ///
+/// - [`Sep53Error::MainnetSigningForbidden`]: `network_passphrase` is the
+///   mainnet passphrase.
 /// - [`Sep53Error::MessageTooLarge`] — `message.len()` exceeds [`MAX_MESSAGE_BYTES`].
 /// - [`Sep53Error::SigningFailed`] — the signer returned an error.
 ///
@@ -157,14 +168,22 @@ pub fn message_digest(message: &[u8]) -> [u8; 32] {
 ///
 /// # tokio_test::block_on(async {
 /// let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
-/// let sig = sign_message(b"hello sep53", &key).await.unwrap();
+/// let sig = sign_message(b"hello sep53", &key, "Test SDF Network ; September 2015")
+///     .await
+///     .unwrap();
 /// assert_eq!(sig.len(), 64);
 /// # });
 /// ```
 pub async fn sign_message(
     message: &[u8],
     signer: &(dyn Signer + Send + Sync),
+    network_passphrase: &str,
 ) -> Result<[u8; 64], Sep53Error> {
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(Sep53Error::MainnetSigningForbidden {
+            detail: MAINNET_SIGNING_REFUSAL_DETAIL.to_owned(),
+        });
+    }
     if message.len() > MAX_MESSAGE_BYTES {
         return Err(Sep53Error::MessageTooLarge {
             len: message.len(),
@@ -172,20 +191,10 @@ pub async fn sign_message(
         });
     }
 
-    // Build the SEP-53 digest: SHA-256("Stellar Signed Message:\n" ‖ message).
-    // Cited: sep-0053.md (single-round SHA256).
-    let digest = message_digest(message);
-
-    // sign_tx_payload is the correct primitive: it performs raw ed25519 over
-    // a 32-byte payload. The payload here is the SEP-53 prefixed digest, NOT
-    // a SEP-23 transaction payload. This is sanctioned use of sign_tx_payload
-    // the Signer trait does not expose a separate
-    // domain-isolated "sign_message" entry point; the 32-byte ed25519 primitive
-    // is identical but the payload domain is the SEP-53 prefixed digest.
-    // See `stellar_agent_network::signing::Signer::sign_tx_payload` rustdoc for
-    // the sanctioned-call-site list where this caller is registered.
+    // The SEP-53 digest, SHA-256("Stellar Signed Message:\n" ‖ message)
+    // (sep-0053.md, single-round SHA256), signed in the message domain.
     signer
-        .sign_tx_payload(&digest)
+        .sign_message(&MessagePayload::sep53(message))
         .await
         .map_err(|e| Sep53Error::SigningFailed {
             reason: format!("{e}"),
@@ -238,7 +247,9 @@ pub async fn sign_message(
 /// let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
 /// let pk_bytes = key.public_key().await.unwrap();
 /// let public_key = PublicKey(pk_bytes.0);
-/// let sig = sign_message(b"hello", &key).await.unwrap();
+/// let sig = sign_message(b"hello", &key, "Test SDF Network ; September 2015")
+///     .await
+///     .unwrap();
 /// verify_message(b"hello", &sig, &public_key).unwrap();
 /// # });
 /// ```
@@ -290,6 +301,8 @@ mod tests {
 
     use super::*;
     use stellar_agent_network::signing::SoftwareSigningKey;
+
+    const TESTNET: &str = "Test SDF Network ; September 2015";
 
     // ── prefix is exactly 24 bytes with correct hex representation ────────
 
@@ -436,6 +449,26 @@ mod tests {
             .expect("spec test vector signature must verify (sep-0053.md test case 3 binary)");
     }
 
+    /// `sign_message` signs the message payload in the message domain: its
+    /// signature is the signer's `sign_message` over `MessagePayload::sep53`.
+    #[test]
+    fn sign_message_signs_the_message_payload() {
+        let key = SoftwareSigningKey::new_from_bytes([9u8; 32]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let message = b"domain check";
+            assert_eq!(
+                sign_message(message, &key, TESTNET).await.unwrap(),
+                key.sign_message(&MessagePayload::sep53(message))
+                    .await
+                    .unwrap()
+            );
+        });
+    }
+
     // ── sign→verify round-trips with ephemeral keypair ────────────────────
 
     /// Verifies that a signature produced by sign_message verifies correctly.
@@ -450,7 +483,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let msg = b"roundtrip test message";
-            let sig = sign_message(msg, &key)
+            let sig = sign_message(msg, &key, TESTNET)
                 .await
                 .expect("sign_message must succeed");
             let pk_bytes = key.public_key().await.expect("public_key must succeed");
@@ -469,7 +502,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let msg = b"original message";
-            let sig = sign_message(msg, &key)
+            let sig = sign_message(msg, &key, TESTNET)
                 .await
                 .expect("sign_message must succeed");
             let pk_bytes = key.public_key().await.expect("public_key must succeed");
@@ -497,7 +530,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let msg = b"test message";
-            let sig = sign_message(msg, &key)
+            let sig = sign_message(msg, &key, TESTNET)
                 .await
                 .expect("sign_message must succeed");
             let wrong_pk_bytes = wrong_key
@@ -527,7 +560,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let err = sign_message(&oversized, &key)
+            let err = sign_message(&oversized, &key, TESTNET)
                 .await
                 .expect_err("sign_message must fail for oversized message");
             assert!(
@@ -573,5 +606,48 @@ mod tests {
             result.is_err(),
             "a small-order public key must be rejected, got: {result:?}"
         );
+    }
+
+    // ── mainnet refusal ───────────────────────────────────────────────────
+
+    use stellar_agent_network::signing::test_doubles::CountingSigner;
+
+    /// The mainnet passphrase is refused before the signer is called, with
+    /// the canonical refusal detail.
+    #[test]
+    fn sign_message_refuses_mainnet_before_any_key_access() {
+        let signer = CountingSigner::new([7u8; 32]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let err = sign_message(b"hello", &signer, MAINNET_PASSPHRASE)
+                .await
+                .expect_err("mainnet must be refused");
+            assert!(
+                matches!(&err, Sep53Error::MainnetSigningForbidden { detail }
+                    if detail.contains("network.mainnet_write_forbidden")),
+                "got: {err:?}"
+            );
+        });
+        assert_eq!(signer.key_accesses(), 0, "no key access before the refusal");
+    }
+
+    /// The same message on testnet signs once, so the refusal above is the
+    /// network's.
+    #[test]
+    fn sign_message_signs_on_testnet() {
+        let signer = CountingSigner::new([7u8; 32]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            sign_message(b"hello", &signer, TESTNET)
+                .await
+                .expect("testnet signs");
+        });
+        assert_eq!(signer.key_accesses(), 1);
     }
 }

@@ -36,8 +36,9 @@ use stellar_agent_network::friendbot::{default_friendbot_url, validate_friendbot
 pub struct StellarFriendbotArgs {
     /// CAIP-2 chain identifier.
     ///
-    /// Only `stellar:testnet` succeeds — mainnet profiles with a destructive
-    /// tool return `policy.engine_required`.
+    /// Only `stellar:testnet` succeeds. A mainnet profile on the Noop engine
+    /// returns `policy.engine_required`. On another engine it ends in a
+    /// Friendbot URL refusal or `network.friendbot_mainnet_forbidden`.
     pub chain_id: String,
 
     /// Stellar account G-strkey (ed25519 public key, 56 characters).
@@ -118,8 +119,9 @@ impl WalletServer {
     #[tool(
         name = "stellar_friendbot",
         description = "Fund a testnet account via the Stellar Friendbot HTTP endpoint. \
-                       Only available on testnet profiles — mainnet is rejected by the \
-                       policy gate. Returns the same JSON envelope as \
+                       Only available on testnet profiles. Mainnet never succeeds: the Noop \
+                       engine refuses at the policy gate, and the network layer refuses the \
+                       mainnet passphrase. Returns the same JSON envelope as \
                        `stellar-agent friendbot --account <G>`. \
                        read_only_hint=false; destructive_hint=true.",
         annotations(read_only_hint = false, destructive_hint = true)
@@ -144,14 +146,9 @@ impl WalletServer {
         }
 
         // ── Validate G-strkey (strict G-only ed25519 public key) ────────────
-        // Uses ed25519::PublicKey::from_string (not the permissive Strkey::from_string
-        // which accepts S/M/C strkeys) so only G-strkeys are accepted.
-        if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.account_id) {
-            return Err(rmcp::ErrorData::invalid_params(
-                format!("invalid account_id (expected G-strkey): {err}"),
-                None,
-            ));
-        }
+        // Friendbot creates the account, an AccountId, so an M input refuses
+        // with that reason and every other non-G input keeps the strkey error.
+        crate::tools::common::validate_plain_account(&args.account_id, "account_id")?;
 
         // ── Resolve and validate Friendbot URL ───────────────────────────────
         // When the caller supplies a URL, validate it against the allow-list.

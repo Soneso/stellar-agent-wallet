@@ -14,10 +14,8 @@ issue-specific acceptance commands. Use `bash .github/scripts/preflight.sh --lis
 to see the selection. `bash .github/scripts/preflight.sh --full` runs the complete
 local registry, including coverage.
 
-CI runs the offline workspace suite on every pull request. Pull-request
-coverage requires the `coverage` label; live acceptance uses its separate
-workflow. Local coverage, machete, and deny are optional reproductions.
-See [the building guide](docs/maintainers/building.md#preflight) for the gates.
+See [Gate suite](docs/maintainers/building.md#gate-suite) for the CI gates and the
+optional local reproductions.
 
 ## Self-review
 

@@ -60,8 +60,9 @@ p256 = { workspace = true, optional = true, features = ["pkcs8"] }
 # Exposes the software-authenticator test helper (p256 keypair signing
 # authenticatorData || SHA-256(clientDataJSON)) to produce valid and
 # adversarial WebAuthn assertions in tests, without a real platform
-# authenticator. Never compiled into a production binary.
-test-helpers = ["dep:p256"]
+# authenticator. Never compiled into a production binary. It also enables the
+# enrollment test inspection of the approval UI crate.
+test-helpers = ["dep:p256", "stellar-agent-approval-ui/test-helpers"]
 # Gate end-to-end testnet acceptance tests that require a live Friendbot +
 # RPC, a headless Chromium, and TLS-terminated loopback HTTP. NOT run under
 # default `cargo test`; invoke with:
@@ -69,18 +70,28 @@ test-helpers = ["dep:p256"]
 #     --test remote_approval_browser_testnet_acceptance -- --ignored
 # CI/dev-only; MUST NOT be enabled in any release-artefact feature set.
 testnet-acceptance = ["test-helpers", "stellar-agent-mcp/test-helpers", "stellar-agent-test-support/testnet-helpers"]
-# Gate the interactive operator-enrollment browser acceptance suite: a
-# headless Chromium driving the real loopback `operator_enroll` server. No
-# testnet/RPC dependency (unlike `testnet-acceptance` above) — only
+# Gate the browser acceptance tests of the approval pages with headless
+# Chromium and real loopback listeners. These tests require only
 # `test-helpers` (the p256 pkcs8 cross-check) and Chromium. NOT run under
 # default `cargo test`; invoke with:
 #   cargo test -p stellar-agent-approval-remote --features operator-enroll-browser-acceptance \
 #     --test operator_enroll_browser_acceptance -- --ignored
 # CI/dev-only; MUST NOT be enabled in any release-artefact feature set.
 operator-enroll-browser-acceptance = ["test-helpers"]
+# Builds the tests against the mainnet-write build of the wallet crates they
+# drive, so the acceptance runner's feature-on leg reaches this crate. Off by
+# default; the library itself has no mainnet-write gate.
+mainnet-write = ["stellar-agent-core/mainnet-write", "stellar-agent-network/mainnet-write", "stellar-agent-mcp/mainnet-write"]
 
 [dev-dependencies]
+stellar-agent-smart-account = { path = "../stellar-agent-smart-account", features = ["test-helpers"] }
 stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
+# The operator-enroll browser acceptance suite posts real registrations from a
+# software authenticator over HTTP.
+stellar-agent-approval-ui = { path = "../stellar-agent-approval-ui", features = ["test-helpers"] }
+# The cross-port browser acceptance tests run a second loopback HTTP service
+# on a raw socket.
+tokio = { workspace = true, features = ["io-util", "net"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 serial_test = { workspace = true }
 keyring-core = { workspace = true }
@@ -88,8 +99,10 @@ keyring-core = { workspace = true }
 # client, a headless-Chromium CDP client for the shipped browser frontend, and
 # the WebAuthn-ceremony-adjacent signing/encoding helpers the acceptance test
 # needs to seed a virtual authenticator with a known keypair.
-stellar-agent-mcp = { path = "../stellar-agent-mcp" }
-stellar-agent-network = { path = "../stellar-agent-network" }
+stellar-agent-mcp = { path = "../stellar-agent-mcp", default-features = false }
+# The signed-origin commit fixture routes submission through the network
+# test transport.
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-hooks"] }
 # The rule-proposal acceptance suite registers a co-signer WebAuthn credential
 # via the local bridge (the rules_webauthn precedent) and exercises the
 # toolset-gated sign-rule-create first-invoke-grant path.
@@ -109,11 +122,11 @@ rmcp = { workspace = true }
 workspace = true
 
 [package.metadata.cargo-machete]
-# `rustls` / `tokio-rustls` / `rustls-pki-types` are never imported directly
-# by name in this crate's source — they exist solely to pin the `ring`
-# crypto-provider feature onto the shared `rustls` dependency edge that
-# `axum-server` (with `tls-rustls-no-provider`) also pulls in. Removing them
-# would silently let the shared dependency default back to `aws-lc-rs`,
-# reintroducing the second crypto backend `deny.toml` forbids. See the
-# comment above the `rustls` dependency declaration.
+# `rustls` and `rustls-pki-types` build the signed listeners' TLS
+# configuration, and the test helpers use `tokio-rustls`. All three also pin
+# the `ring` crypto-provider feature onto the shared `rustls` dependency edge
+# that `axum-server` (with `tls-rustls-no-provider`) pulls in. Removing them
+# would let the shared dependency default back to `aws-lc-rs`, the second
+# crypto backend `deny.toml` forbids. See the comment above the `rustls`
+# dependency declaration.
 ignored = ["rustls", "tokio-rustls", "rustls-pki-types"]

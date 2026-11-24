@@ -1,0 +1,1 @@
+- Add the public `RecoveryError::Context` variant for authenticated sequence progress and bounded receipt repair diagnostics while preserving refusal codes.

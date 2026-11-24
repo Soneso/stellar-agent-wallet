@@ -68,6 +68,32 @@
 //! because a mainnet classic stage refuses to sign or send without a
 //! per-operation fee cap. A testnet profile is written without one.
 //!
+//! # Mainnet presets
+//!
+//! On `--network mainnet --engine v1`, `init` also writes the unsigned
+//! `version = 2` policy body of a spending preset to
+//! `<policy_dir>/<name>.toml`. `--preset` names it (default `api-day`),
+//! `--asset` picks USDC or XLM, and XLM takes `--tolerated-loss` and
+//! `--typical-payment`. `--unlisted-budget` chooses one budget for
+//! unlisted recipients, shared by every payment tool, and `--total-budget`
+//! a non-renewing total for the signed policy's digest (see
+//! `stellar_agent_core::policy::v1::presets::TOTAL_BUDGET_ALLOCATION_RULE`).
+//! These flags and `--output` apply to mainnet V1 only.
+//!
+//! At a terminal (stdin and stderr), `init` asks for a missing XLM amount,
+//! for a missing unlisted choice of an api preset, and for a missing total
+//! budget choice. Without a terminal the total budget is chosen, and any
+//! other missing input refuses with `profile.preset_input_required`.
+//!
+//! Before any write, `init` writes the spending preview to stderr. It holds
+//! the summary of the body, with `authority_status = "draft"`, and the
+//! funding plan, as one JSON line or, with `--output table`, a table. The policy
+//! file follows, then the profile, then the envelope, whose `data` carries
+//! `spending_summary` and `plan`. The policy file is written without
+//! replacing a file: an existing file of equal bytes is kept, so a rerun
+//! continues, and other content refuses. Every refusal after the preview
+//! carries it at `error.details.preview`.
+//!
 //! # Refusal order
 //!
 //! The flag parser refuses a malformed `--rpc-url`, and one that carries
@@ -75,7 +101,10 @@
 //! `validation.usage_error` envelope on stdout, whose message never repeats
 //! the rejected value. After the arguments parse, `init` refuses in this
 //! order: an unsafe profile name, mainnet without `--rpc-url`, an existing
-//! destination file, and an endpoint that breaks the endpoint rule.
+//! destination file, and an endpoint that breaks the endpoint rule. Then
+//! come a spending flag outside mainnet V1, a refused preset input, a
+//! generated body that does not load, an unwritable preview, the policy
+//! file, and the profile write.
 //!
 //! # Overwrite refusal
 //!
@@ -106,7 +135,7 @@
 //!       "Run `stellar-agent profile enroll-owner-key --profile default --secret-env <VAR>` to enroll the policy-file owner key.",
 //!       "Run `stellar-agent profile rotate-attestation-key default` to mint the approval-attestation key.",
 //!       "Create the V1 policy file `policies/default.toml` in the wallet's state directory, with `version = 1` and `scope = \"profile:default\"` (see \"Create the V1 policy file\" in the getting-started guide).",
-//!       "Run `stellar-agent profile sign-policy --profile default --secret-env <VAR>` to sign the V1 policy file."
+//!       "Run `stellar-agent profile sign-policy --profile default --secret-env <VAR>` to sign `policies/default.toml`."
 //!     ]
 //!   },
 //!   "request_id": "..."
@@ -125,22 +154,82 @@
 //!   `--profile <NAME>` already exists.
 //! - `validation.config_invalid` when the resolved `rpc_url` breaks the
 //!   endpoint rule.
-//! - An internal error when the write itself fails (I/O error, unwritable
-//!   directory).
+//! - `validation.usage_error` when a spending flag or `--output` is given
+//!   outside `--network mainnet --engine v1`. The message names the flags,
+//!   never their values.
+//! - `profile.preset_invalid` for an unknown preset, a malformed amount, or
+//!   an amount flag on a USDC preset. It also covers `--unlisted-budget yes`
+//!   on a preset other than api, a derived limit of zero, and an answer that
+//!   is not yes or no.
+//! - `profile.preset_input_required` for a missing XLM amount or a missing
+//!   unlisted choice of an api preset that no terminal can supply.
+//! - `internal.unexpected_state` when the generated policy body does not
+//!   load.
+//! - `profile.spending_preview_unwritable` when the preview cannot be
+//!   written to stderr; nothing is written.
+//! - `profile.policy_already_exists` when the policy file holds other
+//!   content, and `profile.preset_write_failed` when it cannot be written;
+//!   the profile is not written.
+//! - `validation.profile_already_exists` when the profile file appears
+//!   before the no-clobber write, and an internal error when the profile
+//!   write itself fails (I/O error, unwritable directory).
 
+use std::future::Future;
+use std::io::{self, Write};
 use std::path::Path;
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde::Serialize;
 
-use stellar_agent_core::envelope::Envelope;
+use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
+use stellar_agent_core::policy::v1::presets::{
+    self, Archetype, AuthorityStatus, DEFAULT_PRESET, DerivedSpending, PresetAsset, PresetError,
+    PresetInput, PresetPlan, SpendingSummary,
+};
+use stellar_agent_core::policy::v1::validate_unsigned_policy;
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 use stellar_agent_core::profile::loader;
-use stellar_agent_core::profile::schema::{KeyringEntryRef, PolicyEngineKind, Profile};
+use stellar_agent_core::profile::schema::{
+    KeyringEntryRef, PolicyEngineKind, Profile, default_policy_dir,
+};
 use stellar_agent_core::redact::redact_url_authority;
+use stellar_agent_stablecoin::pins::USDC_MAINNET_ISSUER;
 
 use crate::common::network::{EndpointUrlFlag, TargetNetwork};
+use crate::common::spending_preview::{SpendingPreview, with_shown_preview};
+use crate::common::tty::{read_line_from_terminal, stdin_and_stderr_are_terminals};
 use crate::common::{render, resolve_profile_name, validate_path_component_ascii_safe};
+
+/// The payment asset of a spending preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum PresetAssetArg {
+    /// USDC of the mainnet issuer.
+    #[value(name = "USDC")]
+    Usdc,
+    /// Native XLM.
+    #[value(name = "XLM")]
+    Xlm,
+}
+
+impl PresetAssetArg {
+    /// The code the prompts name.
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Usdc => "USDC",
+            Self::Xlm => "XLM",
+        }
+    }
+}
+
+/// A yes or no choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum YesNo {
+    /// Yes.
+    Yes,
+    /// No.
+    No,
+}
 
 /// Arguments for `stellar-agent profile init`.
 #[derive(Debug, Args)]
@@ -168,6 +257,55 @@ pub(crate) struct InitArgs {
     /// Policy engine for the new profile.
     #[arg(long, default_value_t = PolicyEngineKind::V1, value_name = "ENGINE")]
     pub(crate) engine: PolicyEngineKind,
+
+    /// Spending preset of the generated mainnet policy body.
+    ///
+    /// Defaults to `api-day`. Each `-week` preset fits an agent left
+    /// unattended for a week. Applies to `--network mainnet --engine v1`
+    /// only, as do the six flags after it.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) preset: Option<String>,
+
+    /// Payment asset of the preset. Defaults to USDC.
+    #[arg(long, value_enum, value_name = "USDC|XLM")]
+    pub(crate) asset: Option<PresetAssetArg>,
+
+    /// Tolerated loss over the preset's unattended days, in XLM.
+    ///
+    /// No default: XLM requires it and asks for it at a terminal. A USDC
+    /// preset fixes it and refuses the flag.
+    #[arg(long, value_name = "AMOUNT")]
+    pub(crate) tolerated_loss: Option<String>,
+
+    /// Typical payment, in XLM.
+    ///
+    /// No default: XLM requires it and asks for it at a terminal. A USDC
+    /// preset fixes it and refuses the flag.
+    #[arg(long, value_name = "AMOUNT")]
+    pub(crate) typical_payment: Option<String>,
+
+    /// Whether the payment tools pay unlisted recipients from one shared
+    /// budget; api presets only.
+    ///
+    /// No default: an api preset asks at a terminal and refuses without
+    /// one. Other presets default to no. A payment beyond either budget bound
+    /// requests a per-payment approval.
+    #[arg(long, value_enum, value_name = "yes|no")]
+    pub(crate) unlisted_budget: Option<YesNo>,
+
+    /// Whether the payment rules carry a total budget until the next policy
+    /// signature.
+    ///
+    /// Defaults to yes. Without the flag, a terminal asks, with yes as the
+    /// default answer.
+    #[arg(long, value_enum, value_name = "yes|no")]
+    pub(crate) total_budget: Option<YesNo>,
+
+    /// Format of the spending preview on stderr: `json` or `table`.
+    ///
+    /// Defaults to `json`. The envelope on stdout stays JSON.
+    #[arg(long, value_name = "FORMAT")]
+    pub(crate) output: Option<OutputFormat>,
 }
 
 /// Success payload for the `profile init` envelope.
@@ -186,6 +324,12 @@ struct InitData {
     /// Operator-facing enrollment guidance: the follow-up steps needed
     /// before the profile can sign, in order. See [`next_steps`].
     next_steps: Vec<String>,
+    /// The bounds of the generated policy body, on mainnet V1 only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spending_summary: Option<SpendingSummary>,
+    /// The funding plan of the preset, on mainnet V1 only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<PresetPlan>,
 }
 
 /// Runs `stellar-agent profile init`.
@@ -210,7 +354,24 @@ pub async fn run(args: &InitArgs) -> i32 {
             return 1;
         }
     };
-    run_with_dependencies(args, &profile_dir)
+    let policy_dir = match default_policy_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            let err = WalletError::Internal(InternalError::UnexpectedState {
+                detail: format!("could not determine policy directory: {e}"),
+            });
+            render::render_json(&Envelope::<()>::err(&err));
+            return 1;
+        }
+    };
+    run_with_dependencies(
+        args,
+        &profile_dir,
+        &policy_dir,
+        &mut std::io::stderr(),
+        || read_line_from_terminal("profile-init-answer"),
+    )
+    .await
 }
 
 /// First-stage typed refusals, evaluated before any build or write work.
@@ -232,25 +393,20 @@ fn init_refusal(args: &InitArgs, profile_name: &str, profile_dir: &Path) -> Opti
     if let Err(reason) = validate_path_component_ascii_safe(profile_name) {
         return Some(WalletError::Validation(ValidationError::ConfigInvalid {
             component: "profile",
-            reason: format!("invalid profile name '{profile_name}': {reason}"),
+            reason: format!("the profile name is not a valid profile name: {reason}"),
         }));
     }
 
     if args.network == TargetNetwork::Mainnet && args.rpc_url.is_none() {
         return Some(WalletError::Validation(
-            ValidationError::MainnetRpcUrlRequired {
-                name: profile_name.to_owned(),
-            },
+            ValidationError::MainnetRpcUrlRequired,
         ));
     }
 
     let dest = profile_dir.join(format!("{profile_name}.toml"));
     if dest.exists() {
         return Some(WalletError::Validation(
-            ValidationError::ProfileAlreadyExists {
-                name: profile_name.to_owned(),
-                path: dest.display().to_string(),
-            },
+            ValidationError::ProfileAlreadyExists,
         ));
     }
     None
@@ -298,11 +454,9 @@ fn build_profile(args: &InitArgs, profile_name: &str) -> Result<Profile, WalletE
             }
         }
         TargetNetwork::Mainnet => {
-            let rpc_url = args.rpc_url.clone().ok_or_else(|| {
-                WalletError::Validation(ValidationError::MainnetRpcUrlRequired {
-                    name: profile_name.to_owned(),
-                })
-            })?;
+            let rpc_url = args.rpc_url.clone().ok_or(WalletError::Validation(
+                ValidationError::MainnetRpcUrlRequired,
+            ))?;
             Profile::builder_mainnet_named(
                 profile_name,
                 rpc_url,
@@ -330,13 +484,318 @@ fn build_profile(args: &InitArgs, profile_name: &str) -> Result<Profile, WalletE
     Ok(profile)
 }
 
-/// Testable core of [`run`] with the profile directory injected.
+/// The spending flags given in `args`, in help order.
+fn spending_flags(args: &InitArgs) -> Vec<&'static str> {
+    [
+        ("--preset", args.preset.is_some()),
+        ("--asset", args.asset.is_some()),
+        ("--tolerated-loss", args.tolerated_loss.is_some()),
+        ("--typical-payment", args.typical_payment.is_some()),
+        ("--unlisted-budget", args.unlisted_budget.is_some()),
+        ("--total-budget", args.total_budget.is_some()),
+        ("--output", args.output.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(flag, given)| given.then_some(flag))
+    .collect()
+}
+
+/// Refuses the spending flags outside `--network mainnet --engine v1`, where
+/// no policy body is generated. The message names the flags, never their
+/// values.
+fn spending_flag_refusal(args: &InitArgs) -> Option<Envelope<()>> {
+    let flags = spending_flags(args);
+    (!flags.is_empty()).then(|| {
+        Envelope::err_raw(
+            "validation.usage_error",
+            format!(
+                "{}: these flags apply only to --network mainnet --engine v1",
+                flags.join(", ")
+            ),
+        )
+    })
+}
+
+/// The envelope of a refused preset input. An input that a terminal could
+/// supply names its flag and the prompt.
+fn preset_refusal(error: &PresetError) -> Envelope<()> {
+    let message = match error {
+        PresetError::InputRequired(name) => format!(
+            "{error}; pass --{}, or run at a terminal to answer its prompt",
+            name.replace('_', "-")
+        ),
+        PresetError::Invalid(_) => error.to_string(),
+    };
+    Envelope::err_raw(error.code(), message)
+}
+
+/// The envelope of an internal failure.
+fn internal_refusal(detail: String) -> Envelope<()> {
+    Envelope::err(&WalletError::Internal(InternalError::UnexpectedState {
+        detail,
+    }))
+}
+
+/// Asks the operator at a terminal, or refuses without one.
+struct Prompter<'a, F> {
+    terminal: bool,
+    stderr: &'a mut dyn Write,
+    read_line: &'a mut F,
+}
+
+impl<F, Fut> Prompter<'_, F>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = io::Result<Option<String>>>,
+{
+    /// Writes `prompt` to stderr, flushes, and reads one answer.
+    ///
+    /// The answer loses its line ending, `\r\n` from a Windows terminal
+    /// included, and then its surrounding spaces.
+    ///
+    /// # Errors
+    ///
+    /// [`PresetError::InputRequired`] naming `input` without a terminal, and
+    /// when the prompt cannot be written or the answer cannot be read, end
+    /// of input included.
+    async fn ask(&mut self, prompt: &str, input: &'static str) -> Result<String, PresetError> {
+        let required = || PresetError::InputRequired(input);
+        if !self.terminal {
+            return Err(required());
+        }
+        self.stderr
+            .write_all(prompt.as_bytes())
+            .and_then(|()| self.stderr.flush())
+            .map_err(|_| required())?;
+        match (self.read_line)().await {
+            Ok(Some(line)) => Ok(line
+                .trim_end_matches(['\r', '\n'])
+                .trim_matches(' ')
+                .to_owned()),
+            Ok(None) | Err(_) => Err(required()),
+        }
+    }
+}
+
+/// Builds the `total_budget` question of `profile init`.
+fn total_budget_prompt(loss_stroops: i128, code: &str) -> String {
+    format!(
+        "Limit total spending to {} {code} for this policy? {} [Y/n]: ",
+        presets::format_amount(loss_stroops),
+        presets::TOTAL_BUDGET_ALLOCATION_RULE
+    )
+}
+
+/// Resolves the preset inputs from the flags and, at a terminal, the
+/// prompts, and derives the limits.
+///
+/// The flags are checked before any prompt: an input [`presets::derive`]
+/// refuses as invalid never reaches a prompt. The prompts then ask for a
+/// missing XLM tolerated loss and typical payment, in that order. A missing
+/// unlisted choice of an api preset follows, then a missing total budget
+/// choice. Without a terminal the total budget is chosen and every
+/// other missing input refuses.
+async fn preset_spending<F, Fut>(
+    args: &InitArgs,
+    stderr: &mut dyn Write,
+    read_line: &mut F,
+) -> Result<DerivedSpending, PresetError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = io::Result<Option<String>>>,
+{
+    let preset = presets::find_preset(args.preset.as_deref().unwrap_or(DEFAULT_PRESET))?;
+    let asset_arg = args.asset.unwrap_or(PresetAssetArg::Usdc);
+    let code = asset_arg.code();
+    let amount = |flag: &Option<String>| flag.as_deref().map(presets::parse_amount).transpose();
+    let mut input = PresetInput {
+        preset,
+        asset: match asset_arg {
+            PresetAssetArg::Usdc => PresetAsset::Usdc {
+                issuer: USDC_MAINNET_ISSUER.to_owned(),
+            },
+            PresetAssetArg::Xlm => PresetAsset::Native,
+        },
+        tolerated_loss_stroops: amount(&args.tolerated_loss)?,
+        typical_payment_stroops: amount(&args.typical_payment)?,
+        unlisted_budget: args.unlisted_budget == Some(YesNo::Yes),
+        total_budget: args.total_budget != Some(YesNo::No),
+    };
+    if let Err(error @ PresetError::Invalid(_)) = presets::derive(&input) {
+        return Err(error);
+    }
+    let mut prompter = Prompter {
+        terminal: stdin_and_stderr_are_terminals(),
+        stderr,
+        read_line,
+    };
+    if input.asset == PresetAsset::Native {
+        if input.tolerated_loss_stroops.is_none() {
+            let answer = prompter
+                .ask("Tolerated loss in XLM: ", "tolerated_loss")
+                .await?;
+            input.tolerated_loss_stroops = Some(presets::parse_amount(&answer)?);
+        }
+        if input.typical_payment_stroops.is_none() {
+            let answer = prompter
+                .ask("Typical payment in XLM: ", "typical_payment")
+                .await?;
+            input.typical_payment_stroops = Some(presets::parse_amount(&answer)?);
+        }
+    }
+    if preset.archetype == Archetype::Api && args.unlisted_budget.is_none() {
+        let offered = presets::derive(&PresetInput {
+            unlisted_budget: true,
+            ..input.clone()
+        })?;
+        let budget = offered.unlisted.ok_or_else(|| {
+            PresetError::Invalid("the api preset derives no unlisted budget".to_owned())
+        })?;
+        let question = format!(
+            "Allow payments to unlisted recipients up to {} {code} per rolling day, shared by \
+             all payment tools, at most {} {code} per payment? [yes/no]: ",
+            presets::format_amount(budget.per_day_stroops),
+            presets::format_amount(budget.per_payment_stroops)
+        );
+        let answer = prompter.ask(&question, "unlisted_budget").await?;
+        input.unlisted_budget = if answer.eq_ignore_ascii_case("yes") {
+            true
+        } else if answer.eq_ignore_ascii_case("no") {
+            false
+        } else {
+            return Err(PresetError::Invalid(
+                "the unlisted budget answer must be yes or no".to_owned(),
+            ));
+        };
+    }
+    if args.total_budget.is_none() && prompter.terminal {
+        let loss = input
+            .tolerated_loss_stroops
+            .unwrap_or(preset.tolerated_loss_stroops);
+        let question = total_budget_prompt(loss, code);
+        let answer = prompter.ask(&question, "total_budget").await?;
+        input.total_budget = match answer.to_ascii_lowercase().as_str() {
+            "" | "y" | "yes" => true,
+            "n" | "no" => false,
+            _ => {
+                return Err(PresetError::Invalid(
+                    "the total budget answer must be y, yes, n, or no".to_owned(),
+                ));
+            }
+        };
+    }
+    presets::derive(&input)
+}
+
+/// The generated policy body of a mainnet V1 profile with its preview.
+struct GeneratedPolicy {
+    body: String,
+    summary: SpendingSummary,
+    plan: PresetPlan,
+}
+
+/// Derives the preset, writes its body, and checks that the body loads.
+async fn generate_policy<F, Fut>(
+    args: &InitArgs,
+    profile_name: &str,
+    stderr: &mut dyn Write,
+    read_line: &mut F,
+) -> Result<GeneratedPolicy, Envelope<()>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = io::Result<Option<String>>>,
+{
+    let derived = preset_spending(args, stderr, read_line)
+        .await
+        .map_err(|error| preset_refusal(&error))?;
+    let body = presets::policy_body(profile_name, &derived);
+    let does_not_load = |detail: String| {
+        internal_refusal(format!("the generated policy body does not load: {detail}"))
+    };
+    validate_unsigned_policy(&body, profile_name, MAINNET_PASSPHRASE)
+        .map_err(|error| does_not_load(error.to_string()))?;
+    let document = body
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| does_not_load(error.to_string()))?;
+    Ok(GeneratedPolicy {
+        summary: presets::summarize(&document, MAINNET_PASSPHRASE, AuthorityStatus::Draft),
+        plan: presets::plan(&derived),
+        body,
+    })
+}
+
+/// Writes the generated body to `{policy_dir}/{profile_name}.toml` without
+/// replacing a file.
+///
+/// The body goes to a temporary file in the directory, is synced, and is
+/// then persisted only where no file exists. An existing file of equal
+/// bytes is kept, so a rerun after a failed profile write continues.
+///
+/// # Errors
+///
+/// `profile.policy_already_exists` for an existing file of other or
+/// unreadable content, and `profile.preset_write_failed` for any other I/O
+/// failure. Neither writes the profile.
+fn write_policy_file(
+    policy_dir: &Path,
+    profile_name: &str,
+    body: &str,
+) -> Result<(), Envelope<()>> {
+    let path = policy_dir.join(format!("{profile_name}.toml"));
+    let failed = |error: &dyn std::fmt::Display| {
+        Envelope::err_raw(
+            "profile.preset_write_failed",
+            format!(
+                "the policy file {} could not be written: {error}; the profile was not written",
+                path.display()
+            ),
+        )
+    };
+    std::fs::create_dir_all(policy_dir).map_err(|e| failed(&e))?;
+    let mut file = tempfile::NamedTempFile::new_in(policy_dir).map_err(|e| failed(&e))?;
+    file.write_all(body.as_bytes()).map_err(|e| failed(&e))?;
+    file.as_file().sync_all().map_err(|e| failed(&e))?;
+    match file.persist_noclobber(&path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+            match std::fs::read(&path) {
+                Ok(existing) if existing == body.as_bytes() => Ok(()),
+                _ => Err(Envelope::err_raw(
+                    "profile.policy_already_exists",
+                    format!(
+                        "the policy file {} holds other content; the profile was not written",
+                        path.display()
+                    ),
+                )),
+            }
+        }
+        Err(error) => Err(failed(&error.error)),
+    }
+}
+
+/// Testable core of [`run`] with the directories, the stderr writer, and
+/// the answer reader injected.
 ///
 /// Production callers use [`run`], which resolves the real OS-conventional
-/// profile directory via [`loader::default_profile_dir`]. Tests inject a
-/// fresh `tempfile::tempdir()` path so unit tests never read or write the
-/// canonical data root.
-fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
+/// directories and reads answers from the terminal. Tests inject fresh
+/// temporary directories so unit tests never read or write the canonical
+/// data root.
+///
+/// A mainnet V1 profile also gets the generated policy body. Its preview
+/// reaches stderr before the policy file, the policy file before the
+/// profile, and the profile before the envelope. Every refusal after the
+/// preview carries it at `error.details.preview`.
+async fn run_with_dependencies<F, Fut>(
+    args: &InitArgs,
+    profile_dir: &Path,
+    policy_dir: &Path,
+    stderr: &mut dyn Write,
+    mut read_line: F,
+) -> i32
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = io::Result<Option<String>>>,
+{
     // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
     let profile_name = resolve_profile_name(args.profile.as_deref()).name;
 
@@ -354,22 +813,53 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
         }
     };
 
+    // ── Generate, preview, and write the policy body on mainnet V1 ───────────
+    let mainnet_v1 = args.network == TargetNetwork::Mainnet && args.engine == PolicyEngineKind::V1;
+    if !mainnet_v1 && let Some(refusal) = spending_flag_refusal(args) {
+        render::render_json(&refusal);
+        return 1;
+    }
+    let generated = if mainnet_v1 {
+        match generate_policy(args, &profile_name, &mut *stderr, &mut read_line).await {
+            Ok(generated) => Some(generated),
+            Err(refusal) => {
+                render::render_json(&refusal);
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+    let mut preview = SpendingPreview::new(stderr);
+    if let Some(generated) = &generated {
+        if let Err((code, message)) = preview.show(
+            Some(&generated.summary),
+            Some(&generated.plan),
+            args.output.unwrap_or(OutputFormat::Json),
+        ) {
+            render::render_json(&Envelope::<()>::err_raw(code, message));
+            return 1;
+        }
+        if let Err(refusal) = write_policy_file(policy_dir, &profile_name, &generated.body) {
+            render::render_json(&with_shown_preview(refusal, preview.shown()));
+            return 1;
+        }
+    }
+
     // ── Persist (no-clobber: atomic refusal if a file appeared meanwhile) ────
     let written_path = match loader::save_new_to_dir(&profile_name, &profile, profile_dir) {
         Ok(p) => p,
-        Err(loader::ProfileSaveError::AlreadyExists { path }) => {
-            let err = WalletError::Validation(ValidationError::ProfileAlreadyExists {
-                name: profile_name.clone(),
-                path: path.display().to_string(),
-            });
-            render::render_json(&Envelope::<()>::err(&err));
+        Err(loader::ProfileSaveError::AlreadyExists { .. }) => {
+            let err = WalletError::Validation(ValidationError::ProfileAlreadyExists);
+            render::render_json(&with_shown_preview(
+                Envelope::<()>::err(&err),
+                preview.shown(),
+            ));
             return 1;
         }
         Err(e) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("failed to write profile '{profile_name}': {e}"),
-            });
-            render::render_json(&Envelope::<()>::err(&err));
+            let refusal = internal_refusal(format!("failed to write the profile: {e}"));
+            render::render_json(&with_shown_preview(refusal, preview.shown()));
             return 1;
         }
     };
@@ -380,6 +870,9 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
         engine = %profile.policy.engine,
         "profile initialised"
     );
+    let (spending_summary, plan) = generated.map_or((None, None), |generated| {
+        (Some(generated.summary), Some(generated.plan))
+    });
     render::render_json(&Envelope::ok(InitData {
         profile: profile_name.clone(),
         path: written_path.display().to_string(),
@@ -387,6 +880,8 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
         rpc_url: redact_url_authority(&profile.rpc_url),
         engine: profile.policy.engine.to_string(),
         next_steps: next_steps(&profile_name, args.engine, args.network),
+        spending_summary,
+        plan,
     }));
     0
 }
@@ -400,8 +895,10 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
 /// `rotate-nonce-key` follows, because MCP
 /// payment simulation requires the commit-nonce key. The V1 list then names
 /// owner enrollment, attestation key rotation, the policy file `sign-policy`
-/// reads, and policy signing, in that order. A mainnet V1 profile adds the
-/// oracle setting.
+/// reads, and policy signing, in that order. On testnet the operator creates
+/// a version 1 policy file; on mainnet `init` has generated a version 2 body
+/// to review. A mainnet V1 profile adds the signer binding, the oracle
+/// setting, and what running without it costs.
 fn next_steps(profile_name: &str, engine: PolicyEngineKind, network: TargetNetwork) -> Vec<String> {
     let mut steps = vec![
         format!(
@@ -426,21 +923,33 @@ fn next_steps(profile_name: &str, engine: PolicyEngineKind, network: TargetNetwo
             "Run `stellar-agent profile rotate-attestation-key {profile_name}` to mint the \
              approval-attestation key."
         ));
-        steps.push(format!(
-            "Create the V1 policy file `policies/{profile_name}.toml` in the wallet's state \
-             directory, with `version = 1` and `scope = \"profile:{profile_name}\"` (see \
-             \"Create the V1 policy file\" in the getting-started guide)."
-        ));
+        steps.push(if network == TargetNetwork::Mainnet {
+            format!(
+                "Review the generated policy file `policies/{profile_name}.toml` in the wallet's \
+                 state directory, with `version = 2` and `scope = \"profile:{profile_name}\"` \
+                 (see \"Set up mainnet writes\" in the getting-started guide)."
+            )
+        } else {
+            format!(
+                "Create the V1 policy file `policies/{profile_name}.toml` in the wallet's state \
+                 directory, with `version = 1` and `scope = \"profile:{profile_name}\"` (see \
+                 \"Create the V1 policy file\" in the getting-started guide)."
+            )
+        });
         steps.push(format!(
             "Run `stellar-agent profile sign-policy --profile {profile_name} --secret-env \
-             <VAR>` to sign the V1 policy file."
+             <VAR>` to sign `policies/{profile_name}.toml`."
         ));
         if network == TargetNetwork::Mainnet {
+            steps.push(format!(
+                "Run `stellar-agent profile bind-signer --profile {profile_name} --owner-secret-env <VAR>` before `profile enable-mainnet` to bind the signer to its owner."
+            ));
             steps.push(
                 "Set `oracle_provider_url`, `[providers.oracle]`, and `[providers.primary]` in \
                  the profile file. Choose an independently administered endpoint on a different \
-                 host; a mainnet profile without `oracle_provider_url` cannot run the MCP payment \
-                 and account-creation commits that need a witness."
+                 host; `stellar-agent profile enable-mainnet` and every mainnet write refuse a \
+                 mainnet profile without `oracle_provider_url` with \
+                 `profile.mainnet_oracle_required`."
                     .to_owned(),
             );
         }
@@ -460,6 +969,8 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
+    use std::path::PathBuf;
+
     use stellar_agent_core::profile::loader::load_from_dir;
 
     use super::*;
@@ -470,7 +981,33 @@ mod tests {
             network: TargetNetwork::Testnet,
             rpc_url: None,
             engine: PolicyEngineKind::V1,
+            preset: None,
+            asset: None,
+            tolerated_loss: None,
+            typical_payment: None,
+            unlisted_budget: None,
+            total_budget: None,
+            output: None,
         }
+    }
+
+    /// Drives [`run_with_dependencies`] on a current-thread runtime with the
+    /// policy directory `dir/policies`, a captured stderr, no terminal, and
+    /// a reader at end of input.
+    fn run_init(args: &InitArgs, dir: &Path) -> i32 {
+        let _tty = crate::common::tty::tests::test_tty(false, false);
+        let mut stderr = Vec::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_with_dependencies(
+                args,
+                dir,
+                &dir.join("policies"),
+                &mut stderr,
+                || async { Ok(None) },
+            ))
     }
 
     /// The name `run_with_dependencies` resolves for these args — always the
@@ -537,6 +1074,7 @@ mod tests {
     #[serial_test::serial]
     fn audit_path_resolution_honors_the_test_home_override() {
         let home = tempfile::tempdir().unwrap();
+        stellar_agent_test_support::sandbox::mark_sandbox(home.path()).unwrap();
         let _guard = EnvGuard::set("STELLAR_AGENT_HOME".to_owned(), home.path().as_os_str());
 
         let path = stellar_agent_core::profile::schema::default_audit_log_path_for("override-x");
@@ -551,8 +1089,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_on_clean_dir_creates_a_loadable_v1_profile_with_derived_refs() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
-        let code = run_with_dependencies(&args("acceptance"), dir.path());
+        let code = run_init(&args("acceptance"), dir.path());
         assert_eq!(code, 0, "init must succeed on a clean directory");
 
         let path = dir.path().join("acceptance.toml");
@@ -606,8 +1147,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_default_name_is_loadable_without_the_synthesised_fallback() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
-        let code = run_with_dependencies(&args("default"), dir.path());
+        let code = run_init(&args("default"), dir.path());
         assert_eq!(code, 0);
 
         // The synthesised fallback is only reached on `ProfileLoadError::NotFound`
@@ -623,15 +1167,19 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn init_refuses_when_file_already_exists_and_leaves_it_untouched() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
-        let code = run_with_dependencies(&args("dup"), dir.path());
+        let code = run_init(&args("dup"), dir.path());
         assert_eq!(code, 0, "first init must succeed");
 
         let path = dir.path().join("dup.toml");
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let code = run_with_dependencies(&args("dup"), dir.path());
+        let code = run_init(&args("dup"), dir.path());
         assert_eq!(code, 1, "second init on the same name must refuse");
 
         let after = std::fs::read_to_string(&path).unwrap();
@@ -645,7 +1193,7 @@ mod tests {
         a.network = TargetNetwork::Mainnet;
         a.rpc_url = None;
 
-        let code = run_with_dependencies(&a, dir.path());
+        let code = run_init(&a, dir.path());
         assert_eq!(code, 1, "mainnet without --rpc-url must refuse");
         assert!(
             !dir.path().join("mainnet-guard.toml").exists(),
@@ -674,6 +1222,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn build_mainnet_plaintext_rpc_url_yields_typed_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut a = args("pin-plaintext");
         a.network = TargetNetwork::Mainnet;
         a.rpc_url = Some("http://mainnet.example.com/rpc".to_owned());
@@ -691,6 +1242,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn build_mainnet_plaintext_rpc_url_omits_the_url() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut a = args("redact-plaintext");
         a.network = TargetNetwork::Mainnet;
         a.rpc_url = Some(SENTINEL_HTTP.to_owned());
@@ -704,6 +1258,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn build_unsupported_scheme_yields_typed_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for network in [TargetNetwork::Testnet, TargetNetwork::Mainnet] {
             let mut a = args("pin-ftp");
             a.network = network;
@@ -723,6 +1280,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn build_mainnet_rpc_url_with_userinfo_yields_typed_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut a = args("pin-userinfo");
         a.network = TargetNetwork::Mainnet;
         a.rpc_url = Some(SENTINEL_HTTPS.to_owned());
@@ -749,6 +1309,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_endpoint_rule_refusals_write_no_file() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (network, url) in [
             (TargetNetwork::Testnet, "ftp://mainnet.example.com"),
             (TargetNetwork::Mainnet, "ftp://mainnet.example.com"),
@@ -758,7 +1321,7 @@ mod tests {
             let mut a = args("endpoint-refused");
             a.network = network;
             a.rpc_url = Some(url.to_owned());
-            let code = run_with_dependencies(&a, dir.path());
+            let code = run_init(&a, dir.path());
             assert_eq!(code, 1, "{network} `{url}` must be refused");
             assert!(
                 !dir.path().join("endpoint-refused.toml").exists(),
@@ -782,7 +1345,7 @@ mod tests {
         let err = init_refusal(&a, resolved_name(&a).as_str(), dir.path()).expect("must refuse");
         assert_eq!(err.code(), "validation.profile_already_exists");
 
-        assert_eq!(run_with_dependencies(&a, dir.path()), 1);
+        assert_eq!(run_init(&a, dir.path()), 1);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "version = 2\n");
     }
 
@@ -817,8 +1380,12 @@ mod tests {
             "the refusal must name the profile component: {message}"
         );
         assert!(
-            message.contains("invalid profile name '../escape'"),
-            "the refusal must quote the offending name: {message}"
+            message.contains("the profile name is not a valid profile name: "),
+            "the refusal must state the rule the name breaks: {message}"
+        );
+        assert!(
+            !message.contains("../escape"),
+            "the refusal must not repeat the refused name: {message}"
         );
         let clean = args("clean-name");
         assert!(
@@ -830,12 +1397,16 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_mainnet_with_rpc_url_writes_the_supplied_url() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("mainnet-ok");
         a.network = TargetNetwork::Mainnet;
         a.rpc_url = Some("https://mainnet.example.com/rpc".to_owned());
+        a.unlisted_budget = Some(YesNo::No);
 
-        let code = run_with_dependencies(&a, dir.path());
+        let code = run_init(&a, dir.path());
         assert_eq!(code, 0, "mainnet with --rpc-url must succeed");
 
         let loaded = load_from_dir("mainnet-ok", dir.path(), None).unwrap();
@@ -848,11 +1419,15 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn profile_init_mainnet_writes_fee_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("mainnet-cap");
         a.network = TargetNetwork::Mainnet;
         a.rpc_url = Some("https://mainnet.example.com/rpc".to_owned());
-        assert_eq!(run_with_dependencies(&a, dir.path()), 0);
+        a.unlisted_budget = Some(YesNo::No);
+        assert_eq!(run_init(&a, dir.path()), 0);
 
         let raw = std::fs::read_to_string(dir.path().join("mainnet-cap.toml")).unwrap();
         assert!(
@@ -863,7 +1438,7 @@ mod tests {
         let loaded = load_from_dir("mainnet-cap", dir.path(), None).unwrap();
         assert_eq!(loaded.classic_max_fee_per_op_stroops, Some(10_000));
 
-        assert_eq!(run_with_dependencies(&args("testnet-cap"), dir.path()), 0);
+        assert_eq!(run_init(&args("testnet-cap"), dir.path()), 0);
         let raw = std::fs::read_to_string(dir.path().join("testnet-cap.toml")).unwrap();
         assert!(
             !raw.contains("classic_max_fee_per_op_stroops"),
@@ -874,9 +1449,13 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn init_engine_flag_default_writes_v1() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
-        let code = run_with_dependencies(&args("engine-default"), dir.path());
+        let code = run_init(&args("engine-default"), dir.path());
         assert_eq!(code, 0);
 
         let raw = std::fs::read_to_string(dir.path().join("engine-default.toml")).unwrap();
@@ -886,11 +1465,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_engine_noop_writes_noop() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("engine-noop");
         a.engine = PolicyEngineKind::Noop;
 
-        let code = run_with_dependencies(&a, dir.path());
+        let code = run_init(&a, dir.path());
         assert_eq!(code, 0);
 
         let raw = std::fs::read_to_string(dir.path().join("engine-noop.toml")).unwrap();
@@ -903,15 +1485,18 @@ mod tests {
     #[test]
     fn init_invalid_profile_name_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let code = run_with_dependencies(&args("../escape"), dir.path());
+        let code = run_init(&args("../escape"), dir.path());
         assert_eq!(code, 1, "a path-traversal profile name must be refused");
     }
 
     #[test]
     #[serial_test::serial]
     fn init_testnet_default_rpc_url_when_omitted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
-        let code = run_with_dependencies(&args("testnet-default-rpc"), dir.path());
+        let code = run_init(&args("testnet-default-rpc"), dir.path());
         assert_eq!(code, 0);
 
         let loaded = load_from_dir("testnet-default-rpc", dir.path(), None).unwrap();
@@ -924,11 +1509,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_testnet_explicit_rpc_url_overrides_default() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("testnet-explicit-rpc");
         a.rpc_url = Some("https://custom-testnet-rpc.example.com".to_owned());
 
-        let code = run_with_dependencies(&a, dir.path());
+        let code = run_init(&a, dir.path());
         assert_eq!(code, 0);
 
         let loaded = load_from_dir("testnet-explicit-rpc", dir.path(), None).unwrap();
@@ -940,11 +1528,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn init_testnet_plaintext_rpc_url_is_accepted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("testnet-plaintext-rpc");
         a.rpc_url = Some("http://127.0.0.1:8000".to_owned());
 
-        let code = run_with_dependencies(&a, dir.path());
+        let code = run_init(&a, dir.path());
         assert_eq!(code, 0);
 
         let loaded = load_from_dir("testnet-plaintext-rpc", dir.path(), None).unwrap();
@@ -952,12 +1543,16 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn init_malformed_rpc_url_is_refused_before_write() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let mut a = args("malformed-rpc");
         a.rpc_url = Some("not a url".to_owned());
 
-        let code = run_with_dependencies(&a, dir.path());
+        let code = run_init(&a, dir.path());
         assert_eq!(code, 1, "a malformed --rpc-url must be refused");
         assert!(
             !dir.path().join("malformed-rpc.toml").exists(),
@@ -1018,19 +1613,1162 @@ mod tests {
     #[test]
     fn next_steps_for_mainnet_v1_end_with_the_oracle_setting() {
         let steps = next_steps("alpha", PolicyEngineKind::V1, TargetNetwork::Mainnet);
-        assert_eq!(steps.len(), 8, "{steps:#?}");
-        assert!(steps[7].contains("`oracle_provider_url`"), "{}", steps[7]);
-        assert!(steps[7].contains("`[providers.oracle]`"), "{}", steps[7]);
-        assert!(steps[7].contains("`[providers.primary]`"), "{}", steps[7]);
-        assert!(steps[7].contains("different host"), "{}", steps[7]);
+        assert_eq!(steps.len(), 9, "{steps:#?}");
+        assert!(steps[7].contains("profile bind-signer --profile alpha --owner-secret-env <VAR>"));
+        assert!(steps[8].contains("`oracle_provider_url`"), "{}", steps[8]);
+        assert!(steps[8].contains("`[providers.oracle]`"), "{}", steps[8]);
+        assert!(steps[8].contains("`[providers.primary]`"), "{}", steps[8]);
+        assert!(steps[8].contains("different host"), "{}", steps[8]);
         assert!(
-            steps[7].contains(
-                "a mainnet profile without `oracle_provider_url` cannot run the MCP payment \
-                 and account-creation commits that need a witness"
+            steps[8].contains(
+                "`stellar-agent profile enable-mainnet` and every mainnet write refuse a \
+                 mainnet profile without `oracle_provider_url` with \
+                 `profile.mainnet_oracle_required`"
             ),
             "{}",
-            steps[7]
+            steps[8]
         );
-        assert!(!steps[7].contains("skipped"), "{}", steps[7]);
+        assert!(!steps[8].contains("skipped"), "{}", steps[8]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn init_requested_name_marker_is_not_echoed() {
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+        let home = tempfile::tempdir().unwrap();
+        stellar_agent_test_support::sandbox::mark_sandbox(home.path()).unwrap();
+        let _guard = EnvGuard::set("STELLAR_AGENT_HOME".to_owned(), home.path().as_os_str());
+        let mut input = args(CREDENTIAL_MARKER);
+        input.network = TargetNetwork::Mainnet;
+        render::take_rendered_for_test();
+        assert_eq!(run(&input).await, 1);
+        let output = render::take_rendered_for_test();
+        assert_eq!(
+            output[0]["error"]["code"],
+            "validation.mainnet_rpc_url_required"
+        );
+        assert_eq!(
+            output[0]["error"]["message"],
+            "the mainnet profile requires an explicit RPC endpoint; set rpc_url in the profile file, or pass --rpc-url to profile init"
+        );
+        assert_no_marker_in_text(&format!("{output:?}"), CREDENTIAL_MARKER);
+        let error = init_refusal(&input, CREDENTIAL_MARKER, &home.path().join("profiles"))
+            .expect("the command's typed refusal is available");
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+        let error = build_profile(&input, CREDENTIAL_MARKER).unwrap_err();
+        assert_eq!(error.code(), "validation.mainnet_rpc_url_required");
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+        input.network = TargetNetwork::Testnet;
+        let profiles_dir = home.path().join("profiles");
+        let occupied = profiles_dir.join(format!("{CREDENTIAL_MARKER}.toml"));
+        std::fs::create_dir_all(&occupied).unwrap();
+        assert_eq!(run(&input).await, 1);
+        let output = render::take_rendered_for_test();
+        assert_eq!(
+            output[0]["error"]["code"],
+            "validation.profile_already_exists"
+        );
+        assert_eq!(
+            output[0]["error"]["message"],
+            "the profile destination already exists; choose a different --profile name or remove the existing entry"
+        );
+        assert_no_marker_in_text(&format!("{output:?}"), CREDENTIAL_MARKER);
+        let error = init_refusal(&input, CREDENTIAL_MARKER, &profiles_dir).unwrap();
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+        std::fs::remove_dir(&occupied).unwrap();
+        std::fs::remove_dir(&profiles_dir).unwrap();
+        std::fs::write(home.path().join("profiles"), "obstruction").unwrap();
+        assert_eq!(run(&input).await, 1);
+        let output = render::take_rendered_for_test();
+        assert_eq!(output[0]["error"]["code"], "internal.unexpected_state");
+        let profile = build_profile(&input, CREDENTIAL_MARKER).unwrap();
+        let error =
+            loader::save_new_to_dir(CREDENTIAL_MARKER, &profile, &home.path().join("profiles"))
+                .unwrap_err();
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+        assert_eq!(
+            output[0]["error"]["message"],
+            format!("unexpected internal state: failed to write the profile: {error}")
+        );
+        assert_no_marker_in_text(&format!("{output:?}"), CREDENTIAL_MARKER);
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+            &capture.captured_str(),
+            "CREDMARKER7",
+        );
+    }
+
+    /// A mainnet V1 profile on a valid endpoint.
+    fn mainnet(profile: &str) -> InitArgs {
+        let mut a = args(profile);
+        a.network = TargetNetwork::Mainnet;
+        a.rpc_url = Some("https://mainnet.example.com/rpc".to_owned());
+        a
+    }
+
+    /// A reader that answers from `answers` in order, then reports end of
+    /// input.
+    fn queue(
+        answers: &[&str],
+    ) -> impl FnMut() -> std::future::Ready<io::Result<Option<String>>> + use<> {
+        let mut answers: std::collections::VecDeque<String> =
+            answers.iter().map(|a| (*a).to_owned()).collect();
+        move || std::future::ready(Ok(answers.pop_front()))
+    }
+
+    /// What one init run printed and wrote.
+    struct Outcome {
+        code: i32,
+        stderr: String,
+        envelope: serde_json::Value,
+    }
+
+    impl Outcome {
+        fn error_code(&self) -> &str {
+            self.envelope["error"]["code"].as_str().unwrap_or("")
+        }
+
+        fn message(&self) -> &str {
+            self.envelope["error"]["message"].as_str().unwrap_or("")
+        }
+
+        /// The JSON preview line on stderr, the last line written there.
+        fn preview(&self) -> serde_json::Value {
+            serde_json::from_str(self.stderr.lines().last().unwrap()).unwrap()
+        }
+    }
+
+    /// Runs init with `profiles` and `policies` as the directories, the
+    /// terminal state `terminal` for both streams, and `stderr` as the
+    /// captured stream.
+    async fn init_into<F, Fut>(
+        a: &InitArgs,
+        (profiles, policies): (&Path, &Path),
+        terminal: bool,
+        stderr: &mut dyn Write,
+        reader: F,
+    ) -> (i32, serde_json::Value)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = io::Result<Option<String>>>,
+    {
+        let _tty = crate::common::tty::tests::test_tty(terminal, terminal);
+        render::take_rendered_for_test();
+        let code = run_with_dependencies(a, profiles, policies, stderr, reader).await;
+        let mut rendered = render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        (code, rendered.remove(0))
+    }
+
+    /// Runs init with `dir/profiles` and `dir/policies` and a captured
+    /// stderr.
+    async fn init_at<F, Fut>(a: &InitArgs, dir: &Path, terminal: bool, reader: F) -> Outcome
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = io::Result<Option<String>>>,
+    {
+        let mut stderr = Vec::new();
+        let (code, envelope) = init_into(
+            a,
+            (&dir.join("profiles"), &dir.join("policies")),
+            terminal,
+            &mut stderr,
+            reader,
+        )
+        .await;
+        Outcome {
+            code,
+            stderr: String::from_utf8(stderr).unwrap(),
+            envelope,
+        }
+    }
+
+    fn policy_path(dir: &Path, name: &str) -> PathBuf {
+        dir.join("policies").join(format!("{name}.toml"))
+    }
+
+    fn profile_path(dir: &Path, name: &str) -> PathBuf {
+        dir.join("profiles").join(format!("{name}.toml"))
+    }
+
+    /// The body `init` writes for a USDC preset.
+    fn usdc_body(name: &str, preset: &str, unlisted_budget: bool, total_budget: bool) -> String {
+        let derived = presets::derive(&PresetInput {
+            preset: presets::find_preset(preset).unwrap(),
+            asset: PresetAsset::Usdc {
+                issuer: USDC_MAINNET_ISSUER.to_owned(),
+            },
+            tolerated_loss_stroops: None,
+            typical_payment_stroops: None,
+            unlisted_budget,
+            total_budget,
+        })
+        .unwrap();
+        presets::policy_body(name, &derived)
+    }
+
+    /// Asserts that a refused run wrote neither the policy file nor the
+    /// profile.
+    fn assert_nothing_written(dir: &Path, name: &str) {
+        assert!(!policy_path(dir, name).exists(), "policy file written");
+        assert!(!profile_path(dir, name).exists(), "profile written");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn omitted_preset_flag_uses_api_day() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = mainnet("preset-default");
+        a.unlisted_budget = Some(YesNo::No);
+        let out = init_at(&a, dir.path(), false, queue(&[])).await;
+        assert_eq!(out.code, 0, "{}", out.envelope);
+        assert_eq!(out.envelope["data"]["plan"]["preset"], "api-day");
+        assert_eq!(
+            std::fs::read_to_string(policy_path(dir.path(), "preset-default")).unwrap(),
+            usdc_body("preset-default", "api-day", false, true)
+        );
+        assert!(profile_path(dir.path(), "preset-default").exists());
+        let written = std::fs::read_to_string(policy_path(dir.path(), "preset-default")).unwrap();
+        let parsed = written.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            parsed
+                .get("contract_transfer_max_fee_stroops")
+                .and_then(toml_edit::Item::as_integer),
+            Some(1_000_000)
+        );
+        assert!(!parsed.contains_key("signature"));
+        assert!(
+            stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+                &written,
+                "preset-default",
+                &[0; 32],
+                MAINNET_PASSPHRASE,
+            )
+            .is_err()
+        );
+    }
+
+    /// An api preset needs an explicit unlisted choice. Init refuses and
+    /// writes nothing without a terminal, at end of input, after a read
+    /// error, and for any answer but yes or no.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn api_question_requires_explicit_choice() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let required = "the unlisted_budget input is required; pass --unlisted-budget, or run \
+                        at a terminal to answer its prompt";
+        let dir = tempfile::tempdir().unwrap();
+        let a = mainnet("api-choice");
+        let out = init_at(&a, dir.path(), false, queue(&["yes"])).await;
+        assert_eq!(
+            (out.code, out.error_code(), out.message()),
+            (1, "profile.preset_input_required", required)
+        );
+        assert_eq!(out.stderr, "", "no prompt without a terminal");
+        assert_nothing_written(dir.path(), "api-choice");
+
+        let out = init_at(&a, dir.path(), true, queue(&[])).await;
+        assert_eq!(
+            (out.code, out.error_code(), out.message()),
+            (1, "profile.preset_input_required", required)
+        );
+        assert!(out.stderr.starts_with("Allow payments"), "{}", out.stderr);
+        assert_nothing_written(dir.path(), "api-choice");
+
+        let failing = || std::future::ready(Err(io::Error::other("read refused")));
+        let out = init_at(&a, dir.path(), true, failing).await;
+        assert_eq!(
+            (out.code, out.error_code(), out.message()),
+            (1, "profile.preset_input_required", required)
+        );
+        assert_nothing_written(dir.path(), "api-choice");
+
+        for answer in ["maybe", "y", ""] {
+            let out = init_at(&a, dir.path(), true, queue(&[answer, ""])).await;
+            assert_eq!(
+                (out.code, out.error_code(), out.message()),
+                (
+                    1,
+                    "profile.preset_invalid",
+                    "the unlisted budget answer must be yes or no"
+                ),
+                "{answer:?}"
+            );
+            assert_nothing_written(dir.path(), "api-choice");
+        }
+    }
+
+    /// The api question states the shared budget and its bounds, and a yes
+    /// puts one budget on every payment rule.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn api_question_states_shared_budget() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let a = mainnet("api-shared");
+        let out = init_at(&a, dir.path(), true, queue(&[" YES\r\n", "\r\n"])).await;
+        assert_eq!(out.code, 0, "{}", out.envelope);
+        assert!(
+            out.stderr.starts_with(
+                "Allow payments to unlisted recipients up to 0.5 USDC per rolling day, shared \
+                 by all payment tools, at most 0.1 USDC per payment? [yes/no]: Limit total \
+                 spending to 2 USDC"
+            ),
+            "{}",
+            out.stderr
+        );
+        assert_eq!(
+            std::fs::read_to_string(policy_path(dir.path(), "api-shared")).unwrap(),
+            usdc_body("api-shared", "api-day", true, true)
+        );
+        let limits = &out.envelope["data"]["spending_summary"]["limits"][0];
+        assert_eq!(
+            limits["unlisted_mode"],
+            serde_json::json!({"uniform": "budget"})
+        );
+        assert_eq!(
+            limits["unlisted_tools"],
+            serde_json::json!([
+                "stellar_pay",
+                "stellar_pay_commit",
+                "stellar_x402_create_payment",
+                "stellar_x402_authenticated_payment"
+            ])
+        );
+
+        let mut a = mainnet("api-shared-week");
+        a.preset = Some("api-week".to_owned());
+        a.total_budget = Some(YesNo::Yes);
+        let out = init_at(&a, dir.path(), true, queue(&["no"])).await;
+        assert_eq!(out.code, 0, "{}", out.envelope);
+        assert!(
+            out.stderr.starts_with(
+                "Allow payments to unlisted recipients up to 1.25 USDC per rolling day, shared \
+                 by all payment tools, at most 0.25 USDC per payment? [yes/no]: {"
+            ),
+            "{}",
+            out.stderr
+        );
+        assert_eq!(
+            std::fs::read_to_string(policy_path(dir.path(), "api-shared-week")).unwrap(),
+            usdc_body("api-shared-week", "api-week", false, true)
+        );
+    }
+
+    /// The total budget question defaults to yes at a terminal, without a
+    /// terminal the total budget is chosen without a question, and the `init`
+    /// envelope carries the version 2 allocation note.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn total_budget_prompt_defaults_to_yes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let question = "Limit total spending to 2 USDC for this policy? Signing identical \
+                        version 1 bytes keeps the allocation; every signing of a version 2 body \
+                        gives it a new sequence, a new digest, and a new allocation. [Y/n]: ";
+        let v2_note = "Every signing of a version 2 body gives it a new sequence, a new digest, \
+                       and a new total_budget allocation.";
+        let dir = tempfile::tempdir().unwrap();
+        for (n, (answer, total)) in [
+            ("", true),
+            ("\r\n", true),
+            ("Y", true),
+            ("yes", true),
+            (" n \r\n", false),
+            ("NO", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("total-{n}");
+            let mut a = mainnet(&name);
+            a.unlisted_budget = Some(YesNo::No);
+            let out = init_at(&a, dir.path(), true, queue(&[answer])).await;
+            assert_eq!(out.code, 0, "{answer:?}: {}", out.envelope);
+            assert!(out.stderr.starts_with(question), "{}", out.stderr);
+            assert!(
+                out.envelope["data"]["spending_summary"]["notes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|note| note.as_str() == Some(v2_note)),
+                "{answer:?}: {}",
+                out.envelope["data"]["spending_summary"]["notes"]
+            );
+            assert_eq!(
+                std::fs::read_to_string(policy_path(dir.path(), &name)).unwrap(),
+                usdc_body(&name, "api-day", false, total),
+                "{answer:?}"
+            );
+        }
+
+        let mut a = mainnet("total-other");
+        a.unlisted_budget = Some(YesNo::No);
+        let out = init_at(&a, dir.path(), true, queue(&["maybe"])).await;
+        assert_eq!(
+            (out.code, out.error_code(), out.message()),
+            (
+                1,
+                "profile.preset_invalid",
+                "the total budget answer must be y, yes, n, or no"
+            )
+        );
+        assert_nothing_written(dir.path(), "total-other");
+
+        let mut a = mainnet("total-unattended");
+        a.unlisted_budget = Some(YesNo::No);
+        let out = init_at(&a, dir.path(), false, queue(&["n"])).await;
+        assert_eq!(out.code, 0, "{}", out.envelope);
+        assert!(out.stderr.starts_with("{\"phase\""), "{}", out.stderr);
+        assert_eq!(out.stderr.lines().count(), 1);
+        assert_eq!(
+            std::fs::read_to_string(policy_path(dir.path(), "total-unattended")).unwrap(),
+            usdc_body("total-unattended", "api-day", false, true)
+        );
+    }
+
+    /// XLM takes its amounts from the flags or, at a terminal, from the
+    /// prompts in order; without a terminal a missing amount refuses.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn xlm_inputs_from_flags_and_prompts() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let xlm = |name: &str, loss: Option<&str>, typical: Option<&str>| {
+            let mut a = mainnet(name);
+            a.preset = Some("shop-day".to_owned());
+            a.asset = Some(PresetAssetArg::Xlm);
+            a.tolerated_loss = loss.map(str::to_owned);
+            a.typical_payment = typical.map(str::to_owned);
+            a.total_budget = Some(YesNo::Yes);
+            a
+        };
+        let amounts = |out: &Outcome| {
+            let plan = &out.envelope["data"]["plan"];
+            (
+                plan["asset"].as_str().unwrap().to_owned(),
+                plan["tolerated_loss"].as_str().unwrap().to_owned(),
+                plan["typical_payment"].as_str().unwrap().to_owned(),
+            )
+        };
+        let expected = ("XLM".to_owned(), "10".to_owned(), "5".to_owned());
+
+        let out = init_at(
+            &xlm("xlm-flags", Some("10"), Some("5")),
+            dir.path(),
+            false,
+            queue(&[]),
+        )
+        .await;
+        assert_eq!(out.code, 0, "{}", out.envelope);
+        assert_eq!(amounts(&out), expected);
+        let body = std::fs::read_to_string(policy_path(dir.path(), "xlm-flags")).unwrap();
+        assert!(body.contains("assets = [\"native\"]"), "{body}");
+
+        let out = init_at(
+            &xlm("xlm-prompts", None, None),
+            dir.path(),
+            true,
+            queue(&["10\r\n", " 5\n"]),
+        )
+        .await;
+        assert_eq!(out.code, 0, "{}", out.envelope);
+        assert_eq!(amounts(&out), expected);
+        assert!(
+            out.stderr
+                .starts_with("Tolerated loss in XLM: Typical payment in XLM: {"),
+            "{}",
+            out.stderr
+        );
+
+        let out = init_at(
+            &xlm("xlm-mixed", Some("10"), None),
+            dir.path(),
+            true,
+            queue(&["5"]),
+        )
+        .await;
+        assert_eq!(out.code, 0, "{}", out.envelope);
+        assert_eq!(amounts(&out), expected);
+        assert!(
+            out.stderr.starts_with("Typical payment in XLM: {"),
+            "{}",
+            out.stderr
+        );
+
+        let out = init_at(
+            &xlm("xlm-missing", None, Some("5")),
+            dir.path(),
+            false,
+            queue(&["10"]),
+        )
+        .await;
+        assert_eq!(
+            (out.code, out.error_code(), out.message()),
+            (
+                1,
+                "profile.preset_input_required",
+                "the tolerated_loss input is required; pass --tolerated-loss, or run at a \
+                 terminal to answer its prompt"
+            )
+        );
+        assert_nothing_written(dir.path(), "xlm-missing");
+
+        let out = init_at(
+            &xlm("xlm-malformed", None, None),
+            dir.path(),
+            true,
+            queue(&["1,5"]),
+        )
+        .await;
+        assert_eq!((out.code, out.error_code()), (1, "profile.preset_invalid"));
+        assert_nothing_written(dir.path(), "xlm-malformed");
+    }
+
+    /// Flag combinations the preset refuses fail before any prompt and
+    /// write nothing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn preset_flag_combinations_refuse() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let mut compute = mainnet("combo-compute");
+        compute.preset = Some("compute-week".to_owned());
+        compute.unlisted_budget = Some(YesNo::Yes);
+        let mut usdc_amount = mainnet("combo-usdc");
+        usdc_amount.tolerated_loss = Some("5".to_owned());
+        usdc_amount.unlisted_budget = Some(YesNo::No);
+        let mut unknown = mainnet("combo-unknown");
+        unknown.preset = Some("api-month".to_owned());
+        let mut malformed = mainnet("combo-malformed");
+        malformed.asset = Some(PresetAssetArg::Xlm);
+        malformed.tolerated_loss = Some("-1".to_owned());
+        for (a, message) in [
+            (
+                &compute,
+                "an unlisted budget applies to api presets only, not compute-week",
+            ),
+            (
+                &usdc_amount,
+                "a USDC preset fixes its tolerated loss and typical payment; these inputs apply \
+                 to XLM only",
+            ),
+            (&unknown, "unknown preset api-month; presets: "),
+            (&malformed, "amount \"-1\" must be a decimal number"),
+        ] {
+            let name = a.profile.clone().unwrap();
+            let out = init_at(a, dir.path(), true, queue(&["yes", "yes", "yes"])).await;
+            assert_eq!(
+                (out.code, out.error_code()),
+                (1, "profile.preset_invalid"),
+                "{name}"
+            );
+            assert!(
+                out.message().starts_with(message),
+                "{name}: {}",
+                out.message()
+            );
+            assert_eq!(out.stderr, "", "{name}: no prompt");
+            assert_nothing_written(dir.path(), &name);
+        }
+    }
+
+    /// The spending flags and `--output` refuse outside mainnet V1, after
+    /// the existing refusals, naming the flags in help order and never their
+    /// values.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spending_flags_outside_mainnet_v1_refuse() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let mut testnet = args("flags-testnet");
+        testnet.preset = Some("MARKER-VALUE".to_owned());
+        let mut every = args("flags-every");
+        every.output = Some(OutputFormat::Table);
+        every.total_budget = Some(YesNo::No);
+        every.unlisted_budget = Some(YesNo::Yes);
+        every.typical_payment = Some("MARKER-VALUE".to_owned());
+        every.tolerated_loss = Some("MARKER-VALUE".to_owned());
+        every.asset = Some(PresetAssetArg::Xlm);
+        every.preset = Some("MARKER-VALUE".to_owned());
+        let mut noop = mainnet("flags-noop");
+        noop.engine = PolicyEngineKind::Noop;
+        noop.output = Some(OutputFormat::Json);
+        for (a, flags) in [
+            (&testnet, "--preset"),
+            (
+                &every,
+                "--preset, --asset, --tolerated-loss, --typical-payment, --unlisted-budget, \
+                 --total-budget, --output",
+            ),
+            (&noop, "--output"),
+        ] {
+            let name = a.profile.clone().unwrap();
+            let out = init_at(a, dir.path(), false, queue(&[])).await;
+            assert_eq!(
+                (out.code, out.error_code(), out.message().to_owned()),
+                (
+                    1,
+                    "validation.usage_error",
+                    format!("{flags}: these flags apply only to --network mainnet --engine v1")
+                ),
+                "{name}"
+            );
+            assert!(!out.envelope.to_string().contains("MARKER"), "{name}");
+            assert_eq!(out.stderr, "");
+            assert_nothing_written(dir.path(), &name);
+        }
+
+        // An existing profile refuses first.
+        std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
+        std::fs::write(profile_path(dir.path(), "flags-testnet"), "version = 2\n").unwrap();
+        let out = init_at(&testnet, dir.path(), false, queue(&[])).await;
+        assert_eq!(
+            (out.code, out.error_code()),
+            (1, "validation.profile_already_exists")
+        );
+
+        // Without the flags, testnet and noop write no policy and carry no
+        // preview, summary, or plan.
+        for a in [args("plain-testnet"), {
+            let mut a = mainnet("plain-noop");
+            a.engine = PolicyEngineKind::Noop;
+            a
+        }] {
+            let name = a.profile.clone().unwrap();
+            let out = init_at(&a, dir.path(), true, queue(&[])).await;
+            assert_eq!(out.code, 0, "{}", out.envelope);
+            assert_eq!(out.stderr, "");
+            assert!(!policy_path(dir.path(), &name).exists());
+            let data = out.envelope["data"].as_object().unwrap();
+            assert!(!data.contains_key("spending_summary") && !data.contains_key("plan"));
+        }
+    }
+
+    /// The envelope carries the draft summary and the plan, equal to the
+    /// preview on stderr; `--output table` writes the table form there.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mainnet_init_envelope_carries_summary_and_plan() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = mainnet("envelope");
+        a.unlisted_budget = Some(YesNo::Yes);
+        let out = init_at(&a, dir.path(), false, queue(&[])).await;
+        assert_eq!(out.code, 0, "{}", out.envelope);
+        let data = &out.envelope["data"];
+        assert_eq!(data["spending_summary"]["authority_status"], "draft");
+        assert_eq!(data["plan"]["preset"], "api-day");
+        assert_eq!(data["plan"]["recommended_balance_xlm"], "2");
+        let preview = out.preview();
+        assert_eq!(preview["phase"], "before_write");
+        assert_eq!(preview["spending_summary"], data["spending_summary"]);
+        assert_eq!(preview["plan"], data["plan"]);
+
+        let mut a = mainnet("envelope-table");
+        a.unlisted_budget = Some(YesNo::No);
+        a.output = Some(OutputFormat::Table);
+        let out = init_at(&a, dir.path(), false, queue(&[])).await;
+        assert_eq!(out.code, 0, "{}", out.envelope);
+        assert!(
+            out.stderr
+                .starts_with("phase: before_write\nSpending summary\nauthority_status: draft\n"),
+            "{}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("\nPlan\npreset: api-day\n"),
+            "{}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("\nFloor M: 1.7 XLM\n"),
+            "{}",
+            out.stderr
+        );
+        assert_eq!(out.envelope["data"]["plan"]["preset"], "api-day");
+    }
+
+    /// The summary `init` previews equals, field by field, the summary of
+    /// the bytes `sign-policy` signs from the written file. Signing assigns
+    /// the next sequence, so that field is one past the written body's.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn init_preview_summarizes_the_signed_body() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = mainnet("signed");
+        a.unlisted_budget = Some(YesNo::Yes);
+        let out = init_at(&a, dir.path(), false, queue(&[])).await;
+        assert_eq!(out.code, 0, "{}", out.envelope);
+        let written = std::fs::read_to_string(policy_path(dir.path(), "signed")).unwrap();
+        let profile = load_from_dir("signed", &dir.path().join("profiles"), None).unwrap();
+        let signed = super::super::sign_policy::prepare_policy(
+            &written,
+            &profile,
+            "signed",
+            &policy_path(dir.path(), "signed"),
+            &dir.path().join("state.window"),
+        )
+        .unwrap();
+        let summary = serde_json::to_value(presets::summarize(
+            &signed.raw.parse::<toml_edit::DocumentMut>().unwrap(),
+            MAINNET_PASSPHRASE,
+            AuthorityStatus::Draft,
+        ))
+        .unwrap();
+        let preview = out.preview();
+        let shown = preview["spending_summary"].as_object().unwrap();
+        let summary = summary.as_object().unwrap();
+        assert_eq!(
+            shown.keys().collect::<Vec<_>>(),
+            summary.keys().collect::<Vec<_>>()
+        );
+        for (field, value) in summary {
+            if field == "sequence" {
+                assert_eq!(
+                    (&shown[field], value),
+                    (&serde_json::json!(1), &serde_json::json!(2))
+                );
+            } else {
+                assert_eq!(&shown[field], value, "{field}");
+            }
+        }
+        // Apart from the sequence line the signed body is the written one.
+        assert_eq!(
+            signed.raw.replacen("sequence = 2", "sequence = 1", 1),
+            written
+        );
+    }
+
+    /// A stderr writer that records, at each write and flush, whether the
+    /// policy file and the profile exist.
+    struct Observer {
+        policy: PathBuf,
+        profile: PathBuf,
+        seen: Vec<(bool, bool)>,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for Observer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.seen
+                .push((self.policy.exists(), self.profile.exists()));
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.seen
+                .push((self.policy.exists(), self.profile.exists()));
+            Ok(())
+        }
+    }
+
+    /// Every prompt and the whole preview reach stderr before the policy
+    /// file and the profile exist.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn preview_precedes_every_write() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let a = mainnet("observed");
+        let mut observer = Observer {
+            policy: policy_path(dir.path(), "observed"),
+            profile: profile_path(dir.path(), "observed"),
+            seen: Vec::new(),
+            bytes: Vec::new(),
+        };
+        let (code, envelope) = init_into(
+            &a,
+            (&dir.path().join("profiles"), &dir.path().join("policies")),
+            true,
+            &mut observer,
+            queue(&["no", ""]),
+        )
+        .await;
+        assert_eq!(code, 0, "{envelope}");
+        assert!(observer.policy.exists() && observer.profile.exists());
+        assert!(observer.seen.len() >= 5, "{:?}", observer.seen);
+        assert!(
+            observer.seen.iter().all(|seen| *seen == (false, false)),
+            "{:?}",
+            observer.seen
+        );
+        let text = String::from_utf8(observer.bytes).unwrap();
+        // The answers end the prompt lines at a terminal; the captured
+        // stderr holds the prompts and then the preview line.
+        let (prompts, preview) = text
+            .split_once("{\"phase\"")
+            .expect("the preview follows the prompts");
+        assert!(prompts.starts_with("Allow payments to unlisted recipients"));
+        assert!(prompts.ends_with("[Y/n]: "), "{prompts}");
+        let preview: serde_json::Value =
+            serde_json::from_str(&format!("{{\"phase\"{preview}")).unwrap();
+        assert_eq!(preview["phase"], "before_write");
+        assert!(preview["spending_summary"].is_object());
+        assert!(preview["plan"].is_object());
+    }
+
+    /// A preview that cannot be written refuses with its code, and nothing
+    /// is written.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn preview_output_failure_prevents_write() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for (n, writer) in [render::FailingWriter::Write, render::FailingWriter::Flush]
+            .into_iter()
+            .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let name = format!("unwritable-{n}");
+            let mut a = mainnet(&name);
+            a.unlisted_budget = Some(YesNo::No);
+            let mut out = writer;
+            let (code, envelope) = init_into(
+                &a,
+                (&dir.path().join("profiles"), &dir.path().join("policies")),
+                false,
+                &mut out,
+                queue(&[]),
+            )
+            .await;
+            assert_eq!(code, 1);
+            assert_eq!(
+                envelope["error"]["code"],
+                "profile.spending_preview_unwritable"
+            );
+            assert!(envelope["error"]["details"].is_null(), "{envelope}");
+            assert_nothing_written(dir.path(), &name);
+        }
+    }
+
+    /// The policy file is written before the profile: when the profile
+    /// cannot be written, the policy file exists and the refusal carries the
+    /// preview.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn policy_written_before_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("profiles"), "a regular file").unwrap();
+        let mut a = mainnet("ordered");
+        a.unlisted_budget = Some(YesNo::No);
+        let out = init_at(&a, dir.path(), false, queue(&[])).await;
+        assert_eq!(
+            (out.code, out.error_code()),
+            (1, "internal.unexpected_state")
+        );
+        assert!(
+            out.message()
+                .starts_with("unexpected internal state: failed to write the profile: "),
+            "{}",
+            out.message()
+        );
+        assert_eq!(
+            std::fs::read_to_string(policy_path(dir.path(), "ordered")).unwrap(),
+            usdc_body("ordered", "api-day", false, true)
+        );
+        let written = std::fs::read_to_string(policy_path(dir.path(), "ordered")).unwrap();
+        let parsed = written.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            parsed
+                .get("contract_transfer_max_fee_stroops")
+                .and_then(toml_edit::Item::as_integer),
+            Some(1_000_000)
+        );
+        assert!(
+            stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+                &written,
+                "ordered",
+                &[0; 32],
+                MAINNET_PASSPHRASE,
+            )
+            .is_err()
+        );
+        let (code, restarted) = init_into(
+            &a,
+            (
+                &dir.path().join("restarted-profiles"),
+                &dir.path().join("policies"),
+            ),
+            false,
+            &mut Vec::new(),
+            queue(&[]),
+        )
+        .await;
+        assert_eq!(code, 0, "{restarted}");
+        assert_eq!(
+            std::fs::read_to_string(policy_path(dir.path(), "ordered")).unwrap(),
+            written
+        );
+        assert_eq!(
+            out.envelope["error"]["details"]["preview"]["phase"],
+            "before_write"
+        );
+        assert_eq!(out.envelope["error"]["details"]["preview"], out.preview());
+    }
+
+    /// A rerun after a failed profile write finds its own policy file and
+    /// continues.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rerun_with_identical_policy_continues() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let policies = dir.path().join("policies");
+        let mut a = mainnet("rerun");
+        a.unlisted_budget = Some(YesNo::No);
+        for profiles in ["first", "second"] {
+            let (code, envelope) = init_into(
+                &a,
+                (&dir.path().join(profiles), &policies),
+                false,
+                &mut Vec::new(),
+                queue(&[]),
+            )
+            .await;
+            assert_eq!(code, 0, "{profiles}: {envelope}");
+            assert!(dir.path().join(profiles).join("rerun.toml").exists());
+        }
+        assert_eq!(
+            std::fs::read_to_string(policy_path(dir.path(), "rerun")).unwrap(),
+            usdc_body("rerun", "api-day", false, true)
+        );
+    }
+
+    /// A policy file of other content, or one that cannot be written,
+    /// refuses with the preview, leaves the file, and writes no profile.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rerun_with_other_policy_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let path = policy_path(dir.path(), "other");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "version = 2\n# authored\n").unwrap();
+        let mut a = mainnet("other");
+        a.unlisted_budget = Some(YesNo::No);
+        let out = init_at(&a, dir.path(), false, queue(&[])).await;
+        assert_eq!(
+            (out.code, out.error_code(), out.message().to_owned()),
+            (
+                1,
+                "profile.policy_already_exists",
+                format!(
+                    "the policy file {} holds other content; the profile was not written",
+                    path.display()
+                )
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "version = 2\n# authored\n"
+        );
+        assert!(!profile_path(dir.path(), "other").exists());
+        assert_eq!(out.envelope["error"]["details"]["preview"], out.preview());
+
+        let blocked = tempfile::tempdir().unwrap();
+        std::fs::write(blocked.path().join("policies"), "a regular file").unwrap();
+        let out = init_at(&a, blocked.path(), false, queue(&[])).await;
+        assert_eq!(
+            (out.code, out.error_code()),
+            (1, "profile.preset_write_failed")
+        );
+        assert!(
+            out.message().ends_with("; the profile was not written"),
+            "{}",
+            out.message()
+        );
+        assert!(!profile_path(blocked.path(), "other").exists());
+        assert_eq!(out.envelope["error"]["details"]["preview"], out.preview());
+    }
+
+    /// A mainnet V1 profile reviews the generated version 2 body; testnet
+    /// creates a version 1 file.
+    #[test]
+    fn next_steps_for_mainnet_v1_require_policy_body_version_2() {
+        let steps = next_steps("alpha", PolicyEngineKind::V1, TargetNetwork::Mainnet);
+        assert_eq!(steps.len(), 9, "{steps:#?}");
+        for marker in [
+            "policies/alpha.toml",
+            "`version = 2`",
+            "Set up mainnet writes",
+        ] {
+            assert!(steps[5].contains(marker), "{marker}: {}", steps[5]);
+        }
+        let testnet = next_steps("alpha", PolicyEngineKind::V1, TargetNetwork::Testnet);
+        assert!(testnet[5].contains("`version = 1`"), "{}", testnet[5]);
+    }
+
+    /// On both mainnet and testnet, `profile init` names the policy file to
+    /// sign by its `policies/<name>.toml` path, and mainnet never calls it
+    /// "the V1 policy file".
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn profile_init_sign_step_names_policy_file_path() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let mainnet_dir = tempfile::tempdir().unwrap();
+        let mut mainnet_args = mainnet("alpha");
+        mainnet_args.unlisted_budget = Some(YesNo::No);
+        let mainnet_out = init_at(&mainnet_args, mainnet_dir.path(), false, queue(&[])).await;
+        assert_eq!(mainnet_out.code, 0, "{}", mainnet_out.envelope);
+        let mainnet_steps: Vec<&str> = mainnet_out.envelope["data"]["next_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step.as_str().unwrap())
+            .collect();
+        assert!(
+            mainnet_steps
+                .iter()
+                .all(|step| !step.contains("the V1 policy file")),
+            "mainnet next_steps must not say 'the V1 policy file': {mainnet_steps:#?}"
+        );
+        assert_eq!(
+            mainnet_steps[6],
+            "Run `stellar-agent profile sign-policy --profile alpha --secret-env <VAR>` to sign \
+             `policies/alpha.toml`."
+        );
+
+        let testnet_dir = tempfile::tempdir().unwrap();
+        let testnet_out = init_at(&args("beta"), testnet_dir.path(), false, queue(&[])).await;
+        assert_eq!(testnet_out.code, 0, "{}", testnet_out.envelope);
+        let testnet_steps: Vec<&str> = testnet_out.envelope["data"]["next_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            testnet_steps[6],
+            "Run `stellar-agent profile sign-policy --profile beta --secret-env <VAR>` to sign \
+             `policies/beta.toml`."
+        );
+    }
+
+    /// The user-facing spending preview for a version 1 policy states that
+    /// signing identical version 1 bytes keeps its allocation.
+    #[test]
+    fn spending_summary_allocation_note_version_1() {
+        let doc: toml_edit::DocumentMut = "version = 1\nscope = \"profile:v1-alloc\"\n"
+            .parse()
+            .unwrap();
+        let summary = presets::summarize(&doc, MAINNET_PASSPHRASE, AuthorityStatus::Draft);
+        assert_eq!(summary.policy_version, Some(1));
+        let mut out = Vec::new();
+        SpendingPreview::new(&mut out)
+            .show(Some(&summary), None, OutputFormat::Table)
+            .unwrap();
+        let table = String::from_utf8(out).unwrap();
+        let expected = "Signing identical version 1 bytes keeps its total_budget allocation.";
+        assert!(
+            summary.notes.iter().any(|n| n == expected),
+            "v1 summary notes: {:#?}",
+            summary.notes
+        );
+        assert!(table.contains(expected), "{table}");
+        assert!(
+            !table.contains("Signing the same policy body again keeps"),
+            "{table}"
+        );
+        assert!(
+            !table.contains("Every signing of a version 2 body"),
+            "{table}"
+        );
+    }
+
+    /// The user-facing spending preview for a version 2 policy states that
+    /// every signing gives it a new sequence, digest, and allocation.
+    #[test]
+    fn spending_summary_allocation_note_version_2() {
+        let doc: toml_edit::DocumentMut = usdc_body("v2-alloc", "api-day", false, true)
+            .parse()
+            .unwrap();
+        let summary = presets::summarize(&doc, MAINNET_PASSPHRASE, AuthorityStatus::Draft);
+        assert_eq!(summary.policy_version, Some(2));
+        let mut out = Vec::new();
+        SpendingPreview::new(&mut out)
+            .show(Some(&summary), None, OutputFormat::Table)
+            .unwrap();
+        let table = String::from_utf8(out).unwrap();
+        let expected = "Every signing of a version 2 body gives it a new sequence, a new digest, \
+                        and a new total_budget allocation.";
+        assert!(
+            summary.notes.iter().any(|n| n == expected),
+            "v2 summary notes: {:#?}",
+            summary.notes
+        );
+        assert!(table.contains(expected), "{table}");
+        assert!(
+            !table.contains("Signing the same policy body again keeps"),
+            "{table}"
+        );
+    }
+
+    /// A policy body with no recognized version states the full per-version
+    /// allocation rule in its spending preview.
+    #[test]
+    fn spending_summary_allocation_note_unknown_version() {
+        let doc: toml_edit::DocumentMut = "scope = \"profile:no-version\"\n".parse().unwrap();
+        let summary = presets::summarize(&doc, MAINNET_PASSPHRASE, AuthorityStatus::Draft);
+        assert_eq!(summary.policy_version, None);
+        let mut out = Vec::new();
+        SpendingPreview::new(&mut out)
+            .show(Some(&summary), None, OutputFormat::Table)
+            .unwrap();
+        let table = String::from_utf8(out).unwrap();
+        let expected = "Signing identical version 1 bytes keeps the allocation; every signing of \
+                        a version 2 body gives it a new sequence, a new digest, and a new \
+                        allocation.";
+        assert!(
+            summary.notes.iter().any(|n| n == expected),
+            "unknown-version summary notes: {:#?}",
+            summary.notes
+        );
+        assert!(table.contains(expected), "{table}");
     }
 }

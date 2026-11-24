@@ -68,7 +68,9 @@ async fn run_reads(server: &WalletServer) -> Vec<(&'static str, rmcp::model::Cal
             server
                 .call_stellar_transaction_status(StellarTransactionStatusArgs {
                     chain_id: "stellar:testnet".to_owned(),
-                    tx_hash: "cd".repeat(32),
+                    tx_hash: Some("cd".repeat(32)),
+                    business_id: None,
+                    retry_recovery: false,
                 })
                 .await
                 .expect("no protocol error"),
@@ -142,6 +144,7 @@ async fn missing_primary_credential_reports_keyring_not_found() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: None,
+            business_id: None,
         })
         .await
         .expect("a credential failure is a tool result, not a protocol error");
@@ -156,9 +159,9 @@ async fn missing_primary_credential_reports_keyring_not_found() {
     for result in [pay, balances] {
         let (code, message, _text) = crate::common::assert_business_envelope(&result);
         assert_eq!(code, "auth.keyring_not_found");
-        assert!(
-            message.contains("stellar-agent-rpc-mcp-test/primary"),
-            "{message}"
+        assert_eq!(
+            message,
+            "the configured keyring entry must exist; provision or select the required entry."
         );
     }
     assert!(crate::common::received_methods(&endpoint).await.is_empty());

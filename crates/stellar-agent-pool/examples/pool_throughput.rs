@@ -276,6 +276,7 @@ async fn run_benchmark() {
         amount: Some(1),
         asset: Some("native".to_owned()),
         destination_redacted: Some(redact_strkey_first5_last5(&dest)),
+        destination_sha256: None,
     }];
     recordings.dir.disable_cleanup(true);
     eprintln!("Submission records: {}", recordings.dir.path().display());

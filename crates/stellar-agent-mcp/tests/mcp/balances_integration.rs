@@ -86,9 +86,11 @@ async fn assert_balances_account_id_invalid_params(account_id: String) {
     use stellar_agent_mcp::server::{StellarBalancesArgs, WalletServer};
 
     // Explicitly set Noop so WalletServer::new succeeds without a policy file
-    // on disk (PolicyEngineKind::default() is V1).
+    // on disk (PolicyEngineKind::default() is V1). The endpoint is a local
+    // mock, which a refusal never reaches.
+    let endpoint = wiremock::MockServer::start().await;
     let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
-        .rpc_url("https://soroban-testnet.stellar.org")
+        .rpc_url(endpoint.uri())
         .with_noop_engine()
         .build();
     let server = WalletServer::new(profile).expect("WalletServer::new must succeed");
@@ -112,6 +114,10 @@ async fn assert_balances_account_id_invalid_params(account_id: String) {
     assert!(
         !detail.contains(&account_id),
         "invalid_params detail must not echo key-material-adjacent strkey; got: {detail}"
+    );
+    assert!(
+        endpoint.received_requests().await.unwrap().is_empty(),
+        "the refusal precedes every request"
     );
 }
 
@@ -189,21 +195,108 @@ fn stellar_balances_args_with_assets_deserialises_ok() {
 /// `stellar_balances` rejects a structurally valid signing-key strkey at the
 /// MCP `account_id` boundary.
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_balances_rejects_s_strkey_account_id_with_invalid_params() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_balances_account_id_invalid_params(disposable_s_strkey()).await;
 }
 
-/// `stellar_balances` rejects a structurally valid muxed-account strkey at the
-/// MCP `account_id` boundary.
+/// `stellar_balances` accepts a muxed-account strkey with ID zero, a small ID
+/// and the largest ID: it reads the G base account from a local mock endpoint and
+/// echoes the address as given.
 #[tokio::test]
-async fn stellar_balances_rejects_m_strkey_account_id_with_invalid_params() {
-    assert_balances_account_id_invalid_params(disposable_m_strkey()).await;
+#[serial_test::serial]
+async fn stellar_balances_reads_the_base_of_an_m_strkey_account_id() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::profile::schema::Profile;
+    use stellar_agent_mcp::server::{StellarBalancesArgs, WalletServer};
+    use stellar_agent_test_support::xdr_fixtures::{
+        EchoIdResponder, account_entry_xdr_with_balance, account_ledger_key_xdr,
+    };
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer};
+
+    let base = stellar_strkey::ed25519::PublicKey([2_u8; 32])
+        .to_string()
+        .as_str()
+        .to_owned();
+    let base_key = account_ledger_key_xdr(&base);
+    for id in [0, 7, u64::MAX] {
+        let account_id = if id == 7 {
+            disposable_m_strkey()
+        } else {
+            stellar_strkey::ed25519::MuxedAccount {
+                ed25519: [2_u8; 32],
+                id,
+            }
+            .to_string()
+            .as_str()
+            .to_owned()
+        };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(EchoIdResponder::new(serde_json::json!({
+                "entries": [{
+                    "key": base_key,
+                    "xdr": account_entry_xdr_with_balance(&base, 25_000_000),
+                    "lastModifiedLedgerSeq": 1000
+                }],
+                "latestLedger": 1001
+            })))
+            .mount(&mock_server)
+            .await;
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .rpc_url(mock_server.uri())
+            .with_noop_engine()
+            .build();
+        let server = WalletServer::new(profile).expect("WalletServer::new must succeed");
+        let result = server
+            .call_stellar_balances(StellarBalancesArgs {
+                chain_id: "stellar:testnet".to_owned(),
+                account_id: account_id.clone(),
+                assets: Vec::new(),
+            })
+            .await
+            .expect("an M account_id must be accepted");
+        assert_ne!(result.is_error, Some(true), "{}", call_result_text(&result));
+        let payload = call_result_json(&result);
+        assert_eq!(payload["data"]["account_id"], account_id, "M{id} is echoed");
+        assert_eq!(payload["data"]["balances"][0]["balance"], "2.5000000");
+        let requested: Vec<String> = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .filter(|body| body["method"] == "getLedgerEntries")
+            .flat_map(|body| {
+                body["params"]["keys"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|key| key.as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            requested,
+            std::slice::from_ref(&base_key),
+            "M{id} reads the base account"
+        );
+    }
 }
 
 /// `stellar_balances` rejects a structurally valid contract strkey at the MCP
 /// `account_id` boundary.
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_balances_rejects_c_strkey_account_id_with_invalid_params() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_balances_account_id_invalid_params(disposable_c_strkey()).await;
 }
 
@@ -329,7 +422,11 @@ fn asset_from_code_and_issuer_accepts_valid_args() {
 /// and requested trustline from wiremock, and returns the standard JSON
 /// envelope.
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_balances_dispatch_returns_native_and_trustline_from_wiremock() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use serde_json::json;
     use stellar_agent_core::profile::schema::Profile;
     use stellar_agent_mcp::server::{StellarBalancesArgs, TrustlineAssetArg, WalletServer};
@@ -398,11 +495,24 @@ async fn stellar_balances_dispatch_returns_native_and_trustline_from_wiremock() 
         payload["data"]["balances"][0]["asset"]["asset_type"],
         "native"
     );
+    assert!(
+        payload["data"]["balances"][0]["asset"]
+            .get("code")
+            .is_none(),
+        "native asset must omit code"
+    );
+    assert!(
+        payload["data"]["balances"][0]["asset"]
+            .get("issuer")
+            .is_none(),
+        "native asset must omit issuer"
+    );
     assert_eq!(payload["data"]["balances"][0]["balance"], "2.5000000");
     assert_eq!(
         payload["data"]["balances"][1]["asset"]["asset_type"],
-        "USDC"
+        "credit_alphanum4"
     );
+    assert_eq!(payload["data"]["balances"][1]["asset"]["code"], "USDC");
     assert_eq!(
         payload["data"]["balances"][1]["asset"]["issuer"],
         TEST_USDC_ISSUER
@@ -416,7 +526,11 @@ async fn stellar_balances_dispatch_returns_native_and_trustline_from_wiremock() 
 /// envelope keeps only the host and port of both URLs. The profile points at
 /// the loopback server, so the test reaches no external network.
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_balances_error_envelope_keeps_only_host_and_port_of_echoed_urls() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::profile::schema::Profile;
     use stellar_agent_mcp::server::{StellarBalancesArgs, WalletServer};
     use wiremock::matchers::{method, path, query_param};
@@ -507,17 +621,22 @@ async fn stellar_balances_error_envelope_keeps_only_host_and_port_of_echoed_urls
 /// MAX_TRUSTLINE_ASSETS_PER_CALL` as a pure predicate; this test invokes the
 /// actual handler path via `WalletServer::call_stellar_balances`.
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_balances_rejects_when_assets_exceed_cap() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::profile::schema::Profile;
     use stellar_agent_mcp::server::{StellarBalancesArgs, TrustlineAssetArg, WalletServer};
 
-    // Build a testnet profile with a dummy RPC URL.
+    // Build a testnet profile on a local mock endpoint.
     // The handler returns invalid_params BEFORE any network call, so
-    // the RPC URL is never contacted.
+    // the endpoint is never contacted.
     // Explicitly set Noop so WalletServer::new succeeds without a policy file
     // on disk (PolicyEngineKind::default() is V1).
+    let endpoint = wiremock::MockServer::start().await;
     let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
-        .rpc_url("https://soroban-testnet.stellar.org")
+        .rpc_url(endpoint.uri())
         .with_noop_engine()
         .build();
 
@@ -566,7 +685,11 @@ async fn stellar_balances_rejects_when_assets_exceed_cap() {
 /// is a successful dispatch (the handler returns either `Ok(CallToolResult)`
 /// or a tool-level error inside `Ok`, but NOT `Err(invalid_params)`).
 #[tokio::test]
+#[serial_test::serial]
 async fn stellar_balances_accepts_assets_at_cap() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::profile::schema::Profile;
     use stellar_agent_mcp::server::{StellarBalancesArgs, TrustlineAssetArg, WalletServer};
     use stellar_agent_test_support::xdr_fixtures::EchoIdResponder;

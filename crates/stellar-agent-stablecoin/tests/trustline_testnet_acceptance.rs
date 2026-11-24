@@ -17,7 +17,7 @@
 //!   Friendbot-fund a fresh ephemeral ISSUER G-account, set
 //!   `AUTH_REVOCABLE | AUTH_CLAWBACK_ENABLED` on-chain, assert live flags,
 //!   run the gate (no opt-in → `RefuseWithWarning`), record + HMAC-attest the
-//!   opt-in via `new_trustline_clawback_opt_in_pending` + `compute_attestation`
+//!   opt-in via `new_trustline_clawback_opt_in_pending` + `compute_attestation_v4`
 //!   + `record_trustline_clawback_opt_in_attestation`, verify with
 //!     `verify_attested_trustline_clawback_opt_in` (HMAC key required; presence-
 //!     only `has_attested_trustline_clawback_opt_in` is insufficient), submit
@@ -55,7 +55,7 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use stellar_agent_core::approval::{
-    DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, compute_attestation,
+    DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, compute_attestation_v4,
     compute_trustline_clawback_opt_in_digest, process_uid_for_attestation,
 };
 use stellar_agent_network::{
@@ -292,7 +292,7 @@ async fn happy_path_usdc_trustline() {
         .await
         .expect("holder account re-fetch must succeed after ChangeTrust");
     let trustline_exists = holder_after.balances.iter().any(|b| {
-        b.asset.asset_type == resolved.code
+        b.asset.code.as_deref() == Some(resolved.code.as_str())
             && b.asset.issuer.as_deref() == Some(resolved.issuer.as_str())
     });
     assert!(
@@ -328,7 +328,7 @@ async fn happy_path_usdc_trustline() {
 /// 5. Record the opt-in through the real store write path:
 ///    `new_trustline_clawback_opt_in_pending` (network=`"stellar:testnet"`)
 ///    → `store.insert` → `compute_trustline_clawback_opt_in_digest` +
-///    `compute_attestation` → `record_trustline_clawback_opt_in_attestation`.
+///    `compute_attestation_v4` → `record_trustline_clawback_opt_in_attestation`.
 /// 6. Re-run the gate with `store.verify_attested_trustline_clawback_opt_in`
 ///    (HMAC key required — the test key is `[0x42; 32]`, the same key used to
 ///    compute the blob in step 5; a wrong key would return false) → assert
@@ -534,6 +534,7 @@ async fn clawback_gate_opt_in_round_trip() {
     .expect("new_trustline_clawback_opt_in_pending must succeed");
 
     let approval_nonce = pending_entry.approval_nonce.clone();
+    let attested = pending_entry.clone();
 
     store
         .insert(pending_entry, 1)
@@ -563,16 +564,22 @@ async fn clawback_gate_opt_in_round_trip() {
         &resolved.code,
         &resolved.issuer,
     );
-    let attestation_blob = compute_attestation(
+    let attestation_blob = compute_attestation_v4(
         &test_hmac_key,
         &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
         &approval_nonce,
         &digest,
         &uid,
+        &attested.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
 
     store
-        .record_trustline_clawback_opt_in_attestation(&approval_nonce, attestation_blob)
+        .record_trustline_clawback_opt_in_attestation(
+            &approval_nonce,
+            attestation_blob,
+            stellar_agent_core::approval::AttestedApprover::Local,
+        )
         .expect("record_trustline_clawback_opt_in_attestation must succeed");
 
     // Now the HMAC-verified lookup must return true.  This is the production-
@@ -658,10 +665,10 @@ async fn clawback_gate_opt_in_round_trip() {
         .await
         .expect("holder account re-fetch must succeed after ChangeTrust");
 
-    // BalanceView.asset is AssetView { asset_type: code, issuer: Some(g_strkey) }
-    // for non-native trustlines.
+    // BalanceView.asset carries `asset_type` (`CreditAlphanum4`/`CreditAlphanum12`),
+    // `code: Some(code)`, and `issuer: Some(g_strkey)` for non-native trustlines.
     let trustline_exists = holder_after.balances.iter().any(|b| {
-        b.asset.asset_type == resolved.code
+        b.asset.code.as_deref() == Some(resolved.code.as_str())
             && b.asset.issuer.as_deref() == Some(resolved.issuer.as_str())
     });
 
@@ -677,7 +684,7 @@ async fn clawback_gate_opt_in_round_trip() {
             .iter()
             .map(|b| format!(
                 "{}:{}",
-                b.asset.asset_type,
+                b.asset.code.as_deref().unwrap_or("native"),
                 b.asset.issuer.as_deref().unwrap_or("native")
             ))
             .collect::<Vec<_>>()
@@ -711,7 +718,7 @@ fn usdt_refusal() {
     let err = resolve_denomination(DenominationInput::BareCode("USDT".to_owned()), passphrase)
         .expect_err("USDT bare code must be refused");
     assert!(
-        matches!(&err, ResolveError::UsdtRefused { code } if code == "USDT"),
+        matches!(&err, ResolveError::UsdtRefused),
         "expected UsdtRefused for USDT, got: {err:?}"
     );
 
@@ -719,7 +726,7 @@ fn usdt_refusal() {
     let err = resolve_denomination(DenominationInput::BareCode("usdt".to_owned()), passphrase)
         .expect_err("USDT (lowercase) must be refused");
     assert!(
-        matches!(err, ResolveError::UsdtRefused { .. }),
+        matches!(err, ResolveError::UsdtRefused),
         "expected UsdtRefused for usdt, got: {err:?}"
     );
 
@@ -733,7 +740,7 @@ fn usdt_refusal() {
     )
     .expect_err("USDT with explicit issuer must be refused");
     assert!(
-        matches!(err, ResolveError::UsdtRefused { .. }),
+        matches!(err, ResolveError::UsdtRefused),
         "expected UsdtRefused for USDT+issuer, got: {err:?}"
     );
 
@@ -747,7 +754,7 @@ fn usdt_refusal() {
 /// A bare code with no pin row is refused as `UnpinnedBareCode` before any RPC call.
 ///
 /// Acceptance criteria:
-/// 1. `resolve_denomination("FOO", testnet)` → `UnpinnedBareCode { code="FOO" }`.
+/// 1. `resolve_denomination("FOO", testnet)` → `UnpinnedBareCode { network: Testnet }`.
 /// 2. `resolve_denomination("EURAU", testnet)` → `UnpinnedBareCode`.
 ///    EURAU is not pinnable — its live on-chain assets are lookalikes — so it
 ///    is refused as an unpinned bare code.
@@ -759,7 +766,7 @@ fn bare_unknown_code_refusal() {
     let err = resolve_denomination(DenominationInput::BareCode("FOO".to_owned()), passphrase)
         .expect_err("bare unknown code FOO must be refused");
     assert!(
-        matches!(&err, ResolveError::UnpinnedBareCode { code, .. } if code == "FOO"),
+        matches!(err, ResolveError::UnpinnedBareCode { .. }),
         "expected UnpinnedBareCode for FOO, got: {err:?}"
     );
 

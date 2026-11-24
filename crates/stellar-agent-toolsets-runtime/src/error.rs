@@ -22,6 +22,7 @@ use thiserror::Error;
 /// | [`ToolsetRuntimeError::ToolsetNotInstalled`] | pre-check | Toolset name has no pin record. |
 /// | [`ToolsetRuntimeError::Io`] | pre-check | I/O error reading the pin. |
 /// | [`ToolsetRuntimeError::ContentDigestMismatch`] | pre-check | On-disk `TOOLSET.md` hash differs from install-time digest. |
+/// | [`ToolsetRuntimeError::PinUnverifiable`] | pre-check | The install record does not verify under the installation's pin key. |
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ToolsetRuntimeError {
@@ -35,11 +36,8 @@ pub enum ToolsetRuntimeError {
     ///
     /// This variant fires before any capability check — a toolset cannot probe
     /// whether a signing tool "would be allowed" by its capabilities.
-    #[error("toolset.unknown_action: action '{action}' is not in the capability→tool matrix")]
-    UnknownToolsetAction {
-        /// Sanitised action name from the invocation request.
-        action: String,
-    },
+    #[error("toolset.unknown_action: the requested action is not in the capability-to-tool matrix")]
+    UnknownToolsetAction,
 
     /// Part (c): the action's granting capability is not in the toolset's
     /// declared [`stellar_agent_toolsets::CapabilitySet`].
@@ -76,11 +74,8 @@ pub enum ToolsetRuntimeError {
     ///
     /// The toolset is not installed, or has been uninstalled since the invocation
     /// was queued.
-    #[error("toolset.not_installed: toolset '{name}' is not installed")]
-    ToolsetNotInstalled {
-        /// Sanitised toolset package name.
-        name: String,
-    },
+    #[error("toolset.not_installed: the requested toolset is not installed")]
+    ToolsetNotInstalled,
 
     /// Pre-check: an I/O error occurred while reading the pin record.
     #[error("toolset.io_error: {0}")]
@@ -89,15 +84,16 @@ pub enum ToolsetRuntimeError {
     /// Pre-check: the on-disk `TOOLSET.md` SHA-256 digest does not match the
     /// digest recorded in the pin at install time.
     ///
-    /// Fires when the pin's `toolset_md_shasum` field is `Some` and the current
-    /// file's hash differs. This indicates post-install modification of the
-    /// manifest file.
+    /// Fires when the current file's hash differs from the pin's
+    /// `toolset_md_shasum`, or when the file cannot be read. This indicates
+    /// post-install modification or removal of the manifest file.
     ///
     /// ## Recovery
     ///
     /// Reinstall the toolset from the signed package:
     /// ```text
-    /// stellar-agent toolset install <package> --force
+    /// stellar-agent toolsets install <PKG@VERSION> --file <PATH> --shasum <HEX> \
+    ///     --signature <HEX> --publisher <G-STRKEY> --force
     /// ```
     ///
     /// ## Security note
@@ -113,6 +109,27 @@ pub enum ToolsetRuntimeError {
          (dispatch-time content digest check failed; reinstall the toolset to resolve)"
     )]
     ContentDigestMismatch {
+        /// Sanitised toolset package name.
+        name: String,
+    },
+
+    /// Pre-check: the install record exists but does not verify.
+    ///
+    /// Fires when no pin key is available, when the record does not use the
+    /// current format, or when its tag does not
+    /// verify under the installation's pin key (the record was edited or
+    /// written under another key). Nothing the record states is trusted.
+    ///
+    /// ## Recovery
+    ///
+    /// Uninstall the toolset (uninstall reads no record) and install it again
+    /// from the signed package, which re-verifies the publisher signature and
+    /// the attestation.
+    #[error(
+        "toolset.pin_unverifiable: the install record of '{name}' does not verify; \
+         uninstall the toolset and install it again"
+    )]
+    PinUnverifiable {
         /// Sanitised toolset package name.
         name: String,
     },
@@ -148,6 +165,12 @@ pub enum ToolsetRuntimeError {
         capability: String,
     },
 
+    /// The binding and the call must name the same profile before any store opens.
+    #[error(
+        "toolset.binding_mismatch: the attestation binding and the toolset call name different profiles; the call was refused"
+    )]
+    BindingMismatch,
+
     /// Gated path: an I/O error occurred accessing the toolset grant store.
     #[error("toolset.grant_store_error: {detail}")]
     GrantStoreError {
@@ -160,14 +183,42 @@ pub enum ToolsetRuntimeError {
     /// `authoritative_amount_stroops` must be greater than zero. A zero or
     /// negative value from the decoded envelope is rejected here before any
     /// grant-store lookup or approval queuing occurs.
+    #[error("toolset.invalid_authoritative_amount: authoritative_amount_stroops must be > 0")]
+    InvalidAuthoritativeAmount,
+
+    /// Gated path: an install, uninstall, or grant write holds the lock the
+    /// call needs, or a grant lease excludes the grant write it needs.
     #[error(
-        "toolset.invalid_authoritative_amount: authoritative_amount_stroops must be > 0 \
-         (got {amount_stroops})"
+        "toolset.coordination_busy: the toolset installation or its grants are being changed; retry"
     )]
-    InvalidAuthoritativeAmount {
-        /// The non-positive value that was rejected.
-        amount_stroops: i64,
-    },
+    CoordinationBusy,
+
+    /// Grant recheck: the toolsets lock file or the grant lock file is
+    /// absent. A recheck creates neither; a new gated resolution does.
+    #[error(
+        "toolset.coordination_unavailable: a toolset or grant lock file is absent; resolve the invocation again"
+    )]
+    CoordinationUnavailable,
+
+    /// Grant recheck: the invocation differs from the one the grant was
+    /// verified for. A new gated resolution checks the new invocation.
+    #[error(
+        "toolset.grant_invocation_mismatch: the verified grant covers another invocation; resolve this invocation"
+    )]
+    GrantInvocationMismatch,
+
+    /// Grant recheck: the verified installation changed, or its grant was
+    /// revoked, replaced, or no longer verifies.
+    #[error(
+        "toolset.grant_changed: the verified grant or its installation changed; resolve the invocation again"
+    )]
+    GrantChanged,
+
+    /// Grant recheck: the verified grant's stored expiry has passed.
+    #[error(
+        "toolset.grant_expired: the verified grant has expired; the first-invoke approval is required again"
+    )]
+    GrantExpired,
 }
 
 #[cfg(test)]
@@ -185,9 +236,7 @@ mod tests {
     #[test]
     fn all_variants_have_distinct_display() {
         let variants = [
-            ToolsetRuntimeError::UnknownToolsetAction {
-                action: "test-action".to_owned(),
-            },
+            ToolsetRuntimeError::UnknownToolsetAction,
             ToolsetRuntimeError::CapabilityNotDeclared {
                 action: "test-action".to_owned(),
                 capability: "read-balance".to_owned(),
@@ -196,11 +245,12 @@ mod tests {
                 tool: "stellar_balances".to_owned(),
                 action: "test-action".to_owned(),
             },
-            ToolsetRuntimeError::ToolsetNotInstalled {
-                name: "test-toolset".to_owned(),
-            },
+            ToolsetRuntimeError::ToolsetNotInstalled,
             ToolsetRuntimeError::Io("disk error".to_owned()),
             ToolsetRuntimeError::ContentDigestMismatch {
+                name: "test-toolset".to_owned(),
+            },
+            ToolsetRuntimeError::PinUnverifiable {
                 name: "test-toolset".to_owned(),
             },
             ToolsetRuntimeError::FirstInvokeApprovalRequired {
@@ -211,7 +261,13 @@ mod tests {
             ToolsetRuntimeError::GrantStoreError {
                 detail: "test error".to_owned(),
             },
-            ToolsetRuntimeError::InvalidAuthoritativeAmount { amount_stroops: 0 },
+            ToolsetRuntimeError::InvalidAuthoritativeAmount,
+            ToolsetRuntimeError::BindingMismatch,
+            ToolsetRuntimeError::CoordinationBusy,
+            ToolsetRuntimeError::CoordinationUnavailable,
+            ToolsetRuntimeError::GrantInvocationMismatch,
+            ToolsetRuntimeError::GrantChanged,
+            ToolsetRuntimeError::GrantExpired,
         ];
 
         // Collect display strings and verify they are all distinct.
@@ -228,9 +284,7 @@ mod tests {
 
     #[test]
     fn error_code_prefixes_present() {
-        let e = ToolsetRuntimeError::UnknownToolsetAction {
-            action: "x".to_owned(),
-        };
+        let e = ToolsetRuntimeError::UnknownToolsetAction;
         assert!(e.to_string().contains("toolset.unknown_action"));
 
         let e = ToolsetRuntimeError::CapabilityNotDeclared {
@@ -245,9 +299,7 @@ mod tests {
         };
         assert!(e.to_string().contains("toolset.tool_not_allowed"));
 
-        let e = ToolsetRuntimeError::ToolsetNotInstalled {
-            name: "s".to_owned(),
-        };
+        let e = ToolsetRuntimeError::ToolsetNotInstalled;
         assert!(e.to_string().contains("toolset.not_installed"));
 
         let e = ToolsetRuntimeError::Io("err".to_owned());
@@ -260,6 +312,15 @@ mod tests {
         assert!(
             e.to_string().contains("my-distinct-toolset"),
             "toolset name must appear in message"
+        );
+
+        let e = ToolsetRuntimeError::PinUnverifiable {
+            name: "my-distinct-toolset".to_owned(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "toolset.pin_unverifiable: the install record of 'my-distinct-toolset' does not \
+             verify; uninstall the toolset and install it again"
         );
 
         let e = ToolsetRuntimeError::FirstInvokeApprovalRequired {
@@ -281,14 +342,37 @@ mod tests {
         };
         assert!(e.to_string().contains("toolset.grant_store_error"));
 
-        let e = ToolsetRuntimeError::InvalidAuthoritativeAmount { amount_stroops: -1 };
+        let e = ToolsetRuntimeError::InvalidAuthoritativeAmount;
         assert!(
             e.to_string()
                 .contains("toolset.invalid_authoritative_amount")
         );
         assert!(
-            e.to_string().contains("-1"),
-            "rejected amount must appear in error message"
+            !e.to_string().contains("-1"),
+            "rejected amount must not appear in error message"
         );
+
+        for (e, code) in [
+            (
+                ToolsetRuntimeError::CoordinationBusy,
+                "toolset.coordination_busy",
+            ),
+            (
+                ToolsetRuntimeError::CoordinationUnavailable,
+                "toolset.coordination_unavailable",
+            ),
+            (
+                ToolsetRuntimeError::GrantInvocationMismatch,
+                "toolset.grant_invocation_mismatch",
+            ),
+            (ToolsetRuntimeError::GrantChanged, "toolset.grant_changed"),
+            (ToolsetRuntimeError::GrantExpired, "toolset.grant_expired"),
+        ] {
+            let display = e.to_string();
+            assert!(display.starts_with(code), "{display}");
+            for leak in ["/", "\\", ".toml", ".lock", "attestation_blob"] {
+                assert!(!display.contains(leak), "{display} leaks {leak}");
+            }
+        }
     }
 }

@@ -108,7 +108,7 @@ pub async fn run(args: &RegisterMulticallArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved_profile) {
         Ok(loaded) => loaded,
         Err(e) => {
-            render_json(&profile_access_envelope(&e, &resolved_profile.name));
+            render_json(&profile_access_envelope(&e));
             return 1;
         }
     };
@@ -155,15 +155,13 @@ pub async fn run(args: &RegisterMulticallArgs) -> i32 {
                 &request_id,
             );
         }
-        let err = WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!(
-                "--wasm-sha256 does not match the MULTICALL_WASM_SHA256 binary constant \
+        let err = WalletError::Validation(ValidationError::address_check(format!(
+            "--wasm-sha256 does not match the MULTICALL_WASM_SHA256 binary constant \
                  ({}). This wallet binary expects SHA-256 = {}. \
                  Verify your wallet binary version is up-to-date with the deployed router.",
-                &MULTICALL_WASM_SHA256[..8],
-                MULTICALL_WASM_SHA256
-            ),
-        });
+            &MULTICALL_WASM_SHA256[..8],
+            MULTICALL_WASM_SHA256
+        )));
         render_json(&Envelope::<()>::err(&err));
         return 1;
     }
@@ -241,11 +239,10 @@ pub async fn run(args: &RegisterMulticallArgs) -> i32 {
             "register-multicall: audit emit failed; registry file NOT written; \
              retry after resolving audit writer"
         );
-        let err = WalletError::Validation(ValidationError::AddressInvalid {
-            input: "register-multicall: audit emit failed; registry file NOT written; \
-                    retry after resolving audit writer"
-                .to_owned(),
-        });
+        let err = WalletError::Validation(ValidationError::address_check(
+            "register-multicall: audit emit failed; registry file NOT written; \
+                    retry after resolving audit writer",
+        ));
         render_json(&Envelope::<()>::err(&err));
         return 1;
     }

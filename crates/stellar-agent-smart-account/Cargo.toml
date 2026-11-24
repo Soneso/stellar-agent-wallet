@@ -33,7 +33,8 @@ default = []
 testnet-integration = ["test-helpers", "stellar-agent-test-support/testnet-helpers"]
 # Expose test-only inspection helpers as pub items for adversarial fixture tests.
 # Never enabled in production builds.
-test-helpers = []
+test-helpers = ["stellar-agent-network/test-helpers"]
+test-hooks = ["stellar-agent-network/test-hooks"]
 # Gates embedded deploy-time WASM bytes for binaries that upload vendored
 # verifier / policy contracts at runtime.
 deploy-cli = []
@@ -126,6 +127,7 @@ rand_core = { workspace = true }
 zeroize = { workspace = true }
 stellar-agent-core = { workspace = true }
 stellar-agent-network = { workspace = true }
+stellar-agent-soroban-auth = { workspace = true }
 stellar-agent-xdr-limits = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
@@ -149,6 +151,9 @@ stellar-governance = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+stellar-agent-smart-account = { path = ".", features = ["test-helpers"] }
+tokio = { workspace = true, features = ["test-util"] }
+stellar-agent-network = { workspace = true, features = ["test-helpers"] }
 static_assertions = { workspace = true }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["verifier-registry", "wiremock-helpers", "test-helpers"] }
 stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
@@ -160,12 +165,13 @@ sha2 = { workspace = true }
 wiremock = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
-# reqwest: Friendbot HTTP calls in testnet acceptance tests.
+# reqwest: the RPC relay of the timelock testnet acceptance test.
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

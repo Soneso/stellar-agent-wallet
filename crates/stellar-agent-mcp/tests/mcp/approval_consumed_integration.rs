@@ -23,7 +23,7 @@ use serial_test::serial;
 use stellar_agent_core::DEFAULT_CLASSIC_FEE_STROOPS;
 use stellar_agent_core::approval::{
     ApprovalKind, ConsumedOutcome, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore,
-    attestation::{compute_attestation, envelope_sha256},
+    attestation::{compute_attestation_v4, envelope_sha256},
     process_uid_for_attestation,
 };
 use stellar_agent_core::policy::v1::{
@@ -55,6 +55,33 @@ const AMOUNT_STROOPS: i64 = 100_000_000;
 struct RequireApprovalEngine;
 
 impl PolicyEngine for RequireApprovalEngine {
+    fn record_confirmed_checked(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &stellar_agent_core::policy::v1::ValueClass,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.record_confirmed_checked(tool, profile, value)
+    }
+    fn size_unvalued_call(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        reason: stellar_agent_core::policy::v1::OpaqueReason,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine
+            .size_unvalued_call(tool, profile, reason, now_ms)
+    }
+    fn size_no_value(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::CheckedSizing, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.size_no_value(tool, profile, now_ms)
+    }
+
     fn evaluate(
         &self,
         _tool: &ToolDescriptor,
@@ -65,6 +92,7 @@ impl PolicyEngine for RequireApprovalEngine {
         _counterparty_cache: Option<&dyn CounterpartyCacheView>,
         _sep10_sessions: Option<&dyn Sep10SessionView>,
         _sep45_sessions: Option<&dyn Sep45SessionView>,
+        _now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         Ok(Decision::RequireApproval(ApprovalRequest::new(
             "test-nonce".into(),
@@ -216,11 +244,12 @@ fn commit_args(
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce,
-        expires_at_unix_ms: expiry,
-        envelope_xdr: envelope_xdr.to_owned(),
+        nonce: Some(nonce),
+        expires_at_unix_ms: Some(expiry),
+        envelope_xdr: Some(envelope_xdr.to_owned()),
         approval_nonce: Some(approval.to_owned()),
         approval_attestation: Some(attestation.to_owned()),
+        business_id: None,
     }
 }
 
@@ -249,6 +278,7 @@ async fn exercise_approval_consumption(fail_once: bool) {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-consumed", seed);
     keyring_core::Entry::new("n-svc", "n-acct")
         .expect("Entry::new")
         .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xC1_u8; 32]))
@@ -295,19 +325,25 @@ async fn exercise_approval_consumption(fail_once: bool) {
     )
     .expect("pending approval");
     let approval_nonce = entry.approval_nonce.clone();
-    let blob = compute_attestation(
+    let blob = compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new("acct-consumed", "stellar:testnet"),
         &approval_nonce,
         &envelope_sha256(envelope_xdr.as_bytes()),
         &process_uid,
+        &entry.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
     {
         let mut store = PendingApprovalStore::open(store_path.clone()).expect("approval store");
         store.insert(entry, now_unix_ms).expect("insert");
         store
-            .record_attestation(&approval_nonce, blob)
+            .record_attestation(
+                &approval_nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
             .expect("record attestation");
     }
 
@@ -431,7 +467,9 @@ async fn exercise_approval_consumption(fail_once: bool) {
             let result = server
                 .call_stellar_transaction_status(StellarTransactionStatusArgs {
                     chain_id: "stellar:testnet".to_owned(),
-                    tx_hash: tx_hash.clone(),
+                    tx_hash: Some(tx_hash.clone()),
+                    business_id: None,
+                    retry_recovery: false,
                 })
                 .await
                 .unwrap();
@@ -480,14 +518,15 @@ async fn exercise_approval_consumption(fail_once: bool) {
     drop(store);
 }
 
-/// A commit the network refuses outright leaves its approval untouched.
+/// A commit the network refuses outright consumes its approval with an
+/// unknown outcome.
 ///
-/// Nothing was queued and no value moved, so the agent is expected to make a
-/// fresh attempt. Tombstoning the approval would make that attempt refuse at
-/// the gate with nothing to reconcile.
+/// The refusal is an endpoint claim about bytes that left the wallet, so they
+/// may still apply. The approval is spent on them, so it authorizes no second
+/// envelope while the first stays possible spending.
 #[tokio::test]
 #[serial]
-async fn a_refused_commit_leaves_its_approval_untouched() {
+async fn a_refused_commit_consumes_its_approval_with_an_unknown_outcome() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
@@ -497,6 +536,7 @@ async fn a_refused_commit_leaves_its_approval_untouched() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-rejected", seed);
     keyring_core::Entry::new("n-svc", "n-acct")
         .expect("Entry::new")
         .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xC5_u8; 32]))
@@ -550,19 +590,25 @@ async fn a_refused_commit_leaves_its_approval_untouched() {
     )
     .expect("pending approval");
     let approval_nonce = entry.approval_nonce.clone();
-    let blob = compute_attestation(
+    let blob = compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new("acct-rejected", "stellar:testnet"),
         &approval_nonce,
         &envelope_sha256(envelope_xdr.as_bytes()),
         &process_uid,
+        &entry.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
     {
         let mut store = PendingApprovalStore::open(store_path.clone()).expect("approval store");
         store.insert(entry, now_unix_ms).expect("insert");
         store
-            .record_attestation(&approval_nonce, blob)
+            .record_attestation(
+                &approval_nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
             .expect("record attestation");
     }
 
@@ -611,21 +657,36 @@ async fn a_refused_commit_leaves_its_approval_untouched() {
         "the network refused the bytes, which is not a timeout: {json}"
     );
 
-    // The approval stands: no value moved, and the agent is expected to try
-    // again under it.
     let store = PendingApprovalStore::open(store_path).expect("approval store");
     let entry = store
         .get(&approval_nonce)
         .expect("the approval entry must still be in the store");
-    assert!(
-        matches!(entry.kind, ApprovalKind::PaymentSimulated { .. }),
-        "a refused send leaves the approval as it was; got {:?}",
-        entry.kind
-    );
+    match &entry.kind {
+        ApprovalKind::Consumed {
+            original_kind_name,
+            tx_hash,
+            outcome,
+        } => {
+            assert_eq!(original_kind_name, "PaymentSimulated");
+            assert_eq!(tx_hash.len(), 64, "{tx_hash}");
+            assert!(
+                tx_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "{tx_hash}"
+            );
+            assert_eq!(
+                *outcome,
+                ConsumedOutcome::Unknown,
+                "a refusal does not settle the outcome"
+            );
+        }
+        other => panic!("the approval must be a Consumed tombstone; got {other:?}"),
+    }
     assert_eq!(
         entry.attestation_blob_b64.as_deref(),
         Some(attestation_b64.as_str()),
-        "the attestation is unchanged"
+        "the attestation the submission was made under is retained, unchanged"
     );
 }
 
@@ -667,6 +728,7 @@ async fn pay_commit_logs_a_queued_consent_row_before_the_signer_loads() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", ACCOUNT, seed);
     keyring_core::Entry::new("n-svc", "n-acct")
         .expect("Entry::new")
         .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xC2_u8; 32]))
@@ -707,12 +769,14 @@ async fn pay_commit_logs_a_queued_consent_row_before_the_signer_loads() {
     )
     .expect("pending approval");
     let approval_nonce = entry.approval_nonce.clone();
-    let blob = compute_attestation(
+    let blob = compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new(ACCOUNT, "stellar:testnet"),
         &approval_nonce,
         &envelope_sha256(envelope_xdr.as_bytes()),
         &process_uid,
+        &entry.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
 
@@ -730,16 +794,22 @@ async fn pay_commit_logs_a_queued_consent_row_before_the_signer_loads() {
     .expect("writer cached");
     // `approve --id` beside this server: the row is queued, then the
     // attestation is persisted.
-    AuditOutbox::for_log(&profile.audit_log_path)
-        .append(&AuditEntry::new_approval_attested(
-            "PaymentSimulated",
-            "stellar_pay_commit",
-            None,
-            &approval_nonce,
-            "cli",
-            "queued-consent",
-        ))
-        .expect("queue the consent row");
+    AuditOutbox::for_log(
+        &profile.audit_log_path,
+        stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        ),
+    )
+    .append(&AuditEntry::new_approval_attested(
+        "PaymentSimulated",
+        "stellar_pay_commit",
+        None,
+        &approval_nonce,
+        "cli",
+        "queued-consent",
+    ))
+    .expect("queue the consent row");
     {
         let mut store = PendingApprovalStore::open(store_path.clone()).expect("approval store");
         store
@@ -749,7 +819,11 @@ async fn pay_commit_logs_a_queued_consent_row_before_the_signer_loads() {
             )
             .expect("insert");
         store
-            .record_attestation(&approval_nonce, blob)
+            .record_attestation(
+                &approval_nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
             .expect("record attestation");
     }
 

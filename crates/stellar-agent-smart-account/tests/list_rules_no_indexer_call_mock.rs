@@ -104,7 +104,7 @@ fn u32_xdr(n: u32) -> String {
 /// `indexer_server.verify().await` confirms zero calls.
 ///
 /// Per-test servers (not shared `OnceCell`) are used to eliminate mount-accumulation
-/// and `OnceCell::get_or_init` races under `--all-targets --all-features`.
+/// and `OnceCell::get_or_init` races when tests execute concurrently.
 ///
 /// # No-indexer invariant
 ///
@@ -113,9 +113,13 @@ fn u32_xdr(n: u32) -> String {
 #[tokio::test]
 #[serial]
 async fn t8_no_indexer_call_during_enumeration() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     // Per-test servers: each test call gets a fresh server on an ephemeral port.
     // This avoids mount-accumulation on a shared server and OnceCell-init races
-    // that can cause hangs under cargo test --all-targets --all-features.
+    // that can cause hangs when tests execute concurrently.
     let rpc_server = MockServer::start().await;
     let indexer_server = MockServer::start().await;
 
@@ -162,6 +166,9 @@ async fn t8_no_indexer_call_during_enumeration() {
         NETWORK_PASSPHRASE.to_owned(),
         std::time::Duration::from_secs(5),
         CHAIN_ID.to_owned(),
+    )
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
     );
     let manager = ContextRuleManager::new(config).expect("ContextRuleManager::new must succeed");
 
@@ -210,6 +217,10 @@ async fn t8_no_indexer_call_during_enumeration() {
 #[tokio::test]
 #[serial]
 async fn t8b_no_indexer_call_under_proxy_blackhole() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     // RAII guard ensures proxy env vars are cleared even if the test panics
     // (otherwise a panic mid-test leaks proxy state into sibling #[serial]
     // tests — RAII is required to prevent proxy state leaking into sibling tests).
@@ -286,6 +297,9 @@ async fn t8b_no_indexer_call_under_proxy_blackhole() {
         NETWORK_PASSPHRASE.to_owned(),
         std::time::Duration::from_secs(5),
         CHAIN_ID.to_owned(),
+    )
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
     );
     let manager = ContextRuleManager::new(config).expect("ContextRuleManager::new must succeed");
 

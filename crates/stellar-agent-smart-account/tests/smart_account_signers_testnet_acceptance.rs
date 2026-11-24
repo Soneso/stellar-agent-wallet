@@ -88,6 +88,7 @@ use stellar_agent_smart_account::deployment::{
     derive_smart_account_address,
 };
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::auth_entry::test_helpers::partial_authorization_entry;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
@@ -187,14 +188,9 @@ fn fresh_deployer() -> (String, DeployerKeypair) {
 /// Funds a G-strkey via testnet Friendbot.
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 200 for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Opens a temporary `AuditWriter` and returns `(Arc<Mutex<writer>>, path, TempDir)`.
@@ -307,7 +303,7 @@ fn fresh_rule_manager(
 ) -> ContextRuleManager {
     rule_manager_for_tests(
         TESTNET_RPC_URL,
-        None,
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
         Arc::clone(signers_manager),
         Arc::clone(audit_writer),
         Duration::from_secs(TIMEOUT_SECS),
@@ -325,7 +321,7 @@ fn fresh_signers_manager(
 ) -> Arc<SignersManager> {
     signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         audit_writer,
         audit_log_path,
         Duration::from_secs(TIMEOUT_SECS),
@@ -692,6 +688,7 @@ async fn install_threshold_policy_on_fresh_sa(
 /// baseline records a threshold (bootstrap rule_id=0 has no policy).
 #[tokio::test]
 async fn b4_fresh_wallet_missing_baseline_then_refresh_then_verify_ok() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -811,6 +808,7 @@ async fn b4_fresh_wallet_missing_baseline_then_refresh_then_verify_ok() {
 /// `InvokeHostFunctionOp`.
 #[tokio::test]
 async fn b1_threshold_brick_refusal() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -918,6 +916,7 @@ async fn b1_threshold_brick_refusal() {
 /// observation's version-1 projection with it.
 #[tokio::test]
 async fn b3_divergence_detection_via_injected_baseline() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -1051,6 +1050,7 @@ async fn b3_divergence_detection_via_injected_baseline() {
 /// - [`build_external_signer_scval`] encodes this layout.
 #[tokio::test]
 async fn b7_add_external_signer_to_existing_rule() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     use stellar_agent_smart_account::deployment::{
         ResolvedFeePerOp, WebAuthnVerifierDeployArgs, deploy_webauthn_verifier,
     };
@@ -1257,6 +1257,7 @@ async fn b7_add_external_signer_to_existing_rule() {
 /// - `Signer::External(Address, Bytes)` ScVal encoding (no WebAuthn variant on-chain).
 #[tokio::test]
 async fn b8_add_webauthn_signer_to_existing_rule() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     use stellar_agent_smart_account::deployment::{
         ResolvedFeePerOp, WebAuthnVerifierDeployArgs, deploy_webauthn_verifier,
     };
@@ -1477,6 +1478,7 @@ fn digest_matches_first8_last8_pattern(s: &str) -> bool {
 /// - `get_threshold(e, context_rule_id: u32, smart_account: Address) -> u32`.
 #[tokio::test]
 async fn b2_set_threshold_single_op() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -1696,6 +1698,7 @@ async fn b5_a_policyless_rule_baselines_without_a_threshold() {
 /// writer-sharing architecture, not an on-chain contract surface.
 #[tokio::test(flavor = "multi_thread")]
 async fn b6_audit_log_request_id_pairing_across_divergence_emit() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     let (signer_g, signer_box) = fresh_signer();
@@ -1751,14 +1754,18 @@ async fn b6_audit_log_request_id_pairing_across_divergence_emit() {
 
     // Provide a fake bridge address (divergence fires before any bridge I/O).
     let bridge_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19906);
-    let auth_digest = [0u8; 32];
+    let entry = partial_authorization_entry(
+        parse_c_strkey_to_smart_account(&sa_strkey).expect("smart account strkey parses"),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(rule_id)],
+    )
+    .expect("auth entry builds");
 
     let outcome = creds_mgr
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "does-not-matter", // credential lookup never reached
-            &sa_strkey,
-            &auth_digest,
-            vec![rule_id],
+            &entry,
             Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),

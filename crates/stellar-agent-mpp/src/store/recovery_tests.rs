@@ -5,13 +5,17 @@
 )]
 
 use super::*;
-use crate::sponsored::tests::prepared_fixture;
+use crate::sponsored::tests::{
+    challenge_input, prepared_fixture_for_resource, prepared_fixture_for_selected,
+};
+use crate::{ChallengeInput, select_and_validate};
 use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 use stellar_agent_network::keyring::{load_hmac_key_32, rotate_keyring_secret_32};
 use stellar_agent_test_support::keyring_mock;
 use tempfile::TempDir;
 
 const NOW: i64 = 1_700_000_000;
+const HORIZON_REFUSAL: &str = "challenge expires within the replay horizon of a state reset or of pruned authorizations; ask the payee for a fresh challenge";
 
 struct Fixture {
     _directory: TempDir,
@@ -35,7 +39,6 @@ impl Fixture {
             KeyringEntryRef::new(format!("audit-{name}"), "default");
         let audit_ref = &profile.audit_log_hash_chain_key_id;
         rotate_keyring_secret_32(&audit_ref.service, &audit_ref.account).expect("audit key");
-        let (prepared, _signer, _rpc) = prepared_fixture(NOW).await;
         let mut records = Vec::new();
         for (index, status) in [
             AuthorizationStatus::Prepared,
@@ -46,6 +49,11 @@ impl Fixture {
         .into_iter()
         .enumerate()
         {
+            let (prepared, _, _) = prepared_fixture_for_resource(
+                NOW,
+                &format!("https://merchant.example/recovery/{index}"),
+            )
+            .await;
             let mut record = AuthorizationRecord::new(
                 &format!("{name}-{index}"),
                 TESTNET_PASSPHRASE,
@@ -124,20 +132,97 @@ impl Fixture {
         .ok_or_else(state_error)
     }
 
-    fn reset(&self) -> Result<Option<u64>, MppError> {
-        MppAuthorizationStore::reset_at(self.path.clone(), &self.key_ref, |generation| {
-            emit_state_audit(
-                &self.profile,
-                &self.name,
-                stellar_agent_core::audit_log::BindingCheck::Enforce,
-                AuditEntry::new_mpp_state_reset(
+    fn reset(&self) -> Result<MppStateReset, MppError> {
+        self.reset_on_clock(NOW)
+    }
+
+    fn reset_on_clock(&self, now: i64) -> Result<MppStateReset, MppError> {
+        MppAuthorizationStore::reset_at(
+            self.path.clone(),
+            &self.key_ref,
+            &self.name,
+            now,
+            |outcome| {
+                emit_state_audit(
+                    &self.profile,
                     &self.name,
-                    generation,
-                    "operator recovery",
-                    uuid::Uuid::new_v4().to_string(),
-                ),
-            )
-        })
+                    stellar_agent_core::audit_log::BindingCheck::Enforce,
+                    AuditEntry::new_mpp_state_reset(
+                        &self.name,
+                        outcome.discarded_generation,
+                        outcome.carried_generation,
+                        outcome.stale_carry,
+                        "operator recovery",
+                        uuid::Uuid::new_v4().to_string(),
+                    ),
+                )
+            },
+        )
+    }
+
+    fn intent_entry(&self) -> KeyringEntryRef {
+        generation_intent_entry_ref(&generation_entry_ref(&self.key_ref))
+    }
+
+    fn intent(&self) -> Option<u64> {
+        load_intent(&self.intent_entry()).expect("intent")
+    }
+
+    fn put(entry_ref: &KeyringEntryRef, value: &str) {
+        keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+            .expect("entry")
+            .set_password(value)
+            .expect("keyring value");
+    }
+
+    fn put_bytes(entry_ref: &KeyringEntryRef, value: &[u8]) {
+        keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+            .expect("entry")
+            .set_secret(value)
+            .expect("keyring bytes");
+    }
+
+    /// The pruned-expiry watermark of the state file on disk.
+    fn watermark(&self) -> i64 {
+        let bytes = fs::read(&self.path).expect("state");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes[HMAC_TAG_BYTES..]).expect("body");
+        body.get("pruned_through")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    }
+
+    /// A store anchored at generation 1, ready for prepares.
+    fn anchored(&self) -> MppAuthorizationStore {
+        write_generation(&generation_entry_ref(&self.key_ref), 1).expect("anchor");
+        self.open().expect("anchored store")
+    }
+
+    /// A reset at `now` that finds no state file and discards every marker.
+    fn discard(&self, now: i64) -> MppAuthorizationStore {
+        self.move_state_file_out();
+        let outcome = self.reset_on_clock(now).expect("discarding reset");
+        assert_eq!(outcome.carried_generation, None);
+        assert_eq!(self.watermark(), now + MAX_CHALLENGE_LIFETIME_SECS);
+        self.open().expect("clean state")
+    }
+
+    /// One prepare at `now`: admission, simulation and the store insert.
+    async fn prepare(
+        &self,
+        store: &MppAuthorizationStore,
+        input: &ChallengeInput,
+        now: i64,
+    ) -> Result<AuthorizationRecord, MppError> {
+        let selected = select_and_validate(input, now)?;
+        let (prepared, _, _) = prepared_fixture_for_selected(selected).await;
+        let record = AuthorizationRecord::new(&self.name, TESTNET_PASSPHRASE, &prepared, now)?;
+        store.insert_prepared(record, now)
+    }
+
+    async fn record_for(&self, resource: &str, now: i64) -> AuthorizationRecord {
+        let (prepared, _, _) = prepared_fixture_for_resource(now, resource).await;
+        AuthorizationRecord::new(&self.name, TESTNET_PASSPHRASE, &prepared, now).expect("record")
     }
 
     fn rows(&self, kind: &str) -> Vec<serde_json::Value> {
@@ -152,11 +237,22 @@ impl Fixture {
     fn generation(&self) -> Option<u64> {
         load_generation(&generation_entry_ref(&self.key_ref)).expect("counter")
     }
+
+    /// The operator step a carry refusal names: the state file leaves the
+    /// MPP state directory.
+    fn move_state_file_out(&self) {
+        fs::rename(&self.path, self._directory.path().join("moved-out.state"))
+            .expect("move the state file out");
+    }
 }
 
 #[tokio::test]
 #[serial_test::serial]
 async fn adoption_preserves_history_once_and_enforces_rollback() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("adopt-history", 1, 0).await;
     let expected = 1;
@@ -203,6 +299,10 @@ async fn adoption_preserves_history_once_and_enforces_rollback() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_protected_snapshot_without_its_anchor_is_not_adopted() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("adopt-refusal-anchored-format", STORE_VERSION, 7).await;
     assert!(
@@ -219,6 +319,10 @@ async fn a_protected_snapshot_without_its_anchor_is_not_adopted() {
 #[tokio::test]
 #[serial_test::serial]
 async fn adoption_refuses_bad_hmac_invalid_records_and_anchor_access_failure() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     for fault in ["hmac", "records", "keyring"] {
         let fx = Fixture::new(&format!("adopt-refusal-{fault}"), 1, 0).await;
@@ -254,6 +358,10 @@ async fn adoption_refuses_bad_hmac_invalid_records_and_anchor_access_failure() {
 #[tokio::test]
 #[serial_test::serial]
 async fn adoption_and_reset_require_a_durable_audit_row() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-audit-required", 1, 0).await;
     let coord = &fx.profile.audit_log_hash_chain_key_id;
@@ -268,13 +376,14 @@ async fn adoption_and_reset_require_a_durable_audit_row() {
             .message()
             .contains("audit")
     );
+    Fixture::put(&generation_entry_ref(&fx.key_ref), "0");
     assert!(
         fx.reset()
             .expect_err("audit required for reset")
             .message()
             .contains("audit")
     );
-    assert_eq!(fx.generation(), None);
+    assert_eq!(fx.generation(), Some(0));
     assert_eq!(fs::read(&fx.path).expect("state"), fx.snapshot);
     assert_eq!(*load_hmac_key_32(&fx.key_ref).expect("state key"), *key);
     assert!(fx.rows("mpp_state_adopted").is_empty());
@@ -284,6 +393,10 @@ async fn adoption_and_reset_require_a_durable_audit_row() {
 #[tokio::test]
 #[serial_test::serial]
 async fn adoption_and_reset_share_the_prepare_lock() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-maintenance-lock", 1, 0).await;
     let handle =
@@ -313,12 +426,86 @@ async fn adoption_and_reset_share_the_prepare_lock() {
     assert_eq!(fx.generation(), Some(1));
 }
 
+/// Only intent one identifies a resumable adoption beside a version 1 file.
+/// Any other intent cannot be told apart from anchor removal, so it refuses.
 #[tokio::test]
 #[serial_test::serial]
-async fn reset_recovers_a_counter_gap_and_invalidates_snapshots_and_handles() {
+async fn adoption_refuses_a_present_intent() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    for intent in ["0", "5"] {
+        let fx = Fixture::new(&format!("adopt-refusal-intent-{intent}"), 1, 0).await;
+        Fixture::put(&fx.intent_entry(), intent);
+        let error = fx.open().expect_err("intent without counter");
+        assert_eq!(error.message(), anchor_error().message());
+        assert_eq!(fx.generation(), None);
+        assert_eq!(fs::read(&fx.path).expect("snapshot"), fx.snapshot);
+    }
+}
+
+/// An adoption at intent one resumes at generation two before publication.
+/// A publication under an absent counter completes through its matching intent.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_interrupted_adoption_completes_on_the_next_open() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    for (index, (hook, published)) in [
+        (&tests::AFTER_RESERVATION, false),
+        (&tests::BEFORE_PUBLICATION, false),
+        (&tests::AFTER_PUBLICATION, true),
+        (&tests::BEFORE_GENERATION_WRITE, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fx = Fixture::new(&format!("adopt-interrupted-{index}"), 1, 0).await;
+        hook.with(|slot| *slot.borrow_mut() = Some(Box::new(|| Err(state_error()))));
+        assert_eq!(
+            fx.open().expect_err("interrupted adoption").code(),
+            "mpp.state_unavailable"
+        );
+        assert_eq!(fx.generation(), None);
+        assert_eq!(fx.intent(), Some(1));
+        let expected = if published { 1 } else { 2 };
+        let store = fx.open().expect("the next open completes the adoption");
+        assert_eq!(fx.generation(), Some(expected));
+        assert_eq!(fx.intent(), Some(expected));
+        assert_eq!(
+            store.read_for_test().expect("adopted snapshot").generation,
+            expected
+        );
+        for record in &fx.records {
+            assert_eq!(
+                serde_json::to_value(store.load(record.authorization_id()).expect("record"))
+                    .expect("value"),
+                serde_json::to_value(record).expect("value")
+            );
+        }
+        let rows = fx.rows("mpp_state_adopted");
+        assert_eq!(rows.len(), if published { 1 } else { 2 });
+        assert_eq!(rows[rows.len() - 1]["generation"], expected);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn reset_carries_authenticated_records_across_a_counter_gap() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-reset-gap", 1, 0).await;
     let stale_handle = fx.open().expect("adopt");
+    let key = load_hmac_key_32(&fx.key_ref).expect("key");
+    let snapshot = fs::read(&fx.path).expect("pre-reset snapshot");
     write_generation(&generation_entry_ref(&fx.key_ref), 2).expect("counter-only commit");
     assert!(
         fx.open()
@@ -326,68 +513,741 @@ async fn reset_recovers_a_counter_gap_and_invalidates_snapshots_and_handles() {
             .message()
             .contains("profile reset-mpp-state")
     );
-    assert_eq!(fx.reset().expect("reset"), Some(2));
-    assert_eq!(fx.generation(), Some(0));
-    assert!(!fx.path.exists());
+    let outcome = fx.reset().expect("reset");
+    assert_eq!(outcome.discarded_generation, Some(2));
+    assert_eq!(outcome.carried_records, 4);
+    assert_eq!(outcome.carried_generation, Some(1));
     assert!(
-        stale_handle.prune(NOW).is_err(),
-        "an old handle must not publish with the discarded key"
+        !outcome.stale_carry,
+        "a gap of one is an interrupted commit"
     );
-    let clean = MppAuthorizationStore::open_for_prepare_audited_at(
-        fx.path.clone(),
-        &fx.key_ref,
-        &fx.name,
-        |generation| fx.adopt_row(generation),
-    )
-    .expect("clean prepare");
+    assert_eq!(fx.generation(), Some(3));
+    assert_eq!(fx.watermark(), 0, "a current carry keeps the watermark");
+    assert_eq!(*load_hmac_key_32(&fx.key_ref).expect("key"), *key);
+    let carried = fx.open().expect("carried history");
+    for (index, record) in fx.records.iter().enumerate() {
+        let expected = if index == 0 {
+            AuthorizationStatus::ExpiredUnresolved
+        } else {
+            record.status()
+        };
+        assert_eq!(
+            carried
+                .load(record.authorization_id())
+                .expect("carried record")
+                .status(),
+            expected
+        );
+        assert_eq!(
+            stale_handle
+                .load(record.authorization_id())
+                .expect("old handle reads carried record")
+                .status(),
+            expected
+        );
+    }
     assert_eq!(
-        clean
-            .load(fx.records[0].authorization_id())
-            .expect_err("empty")
+        carried
+            .insert_prepared(fx.records[0].clone(), NOW)
+            .expect_err("replay")
             .code(),
-        "mpp.authorization_not_found"
+        "mpp.authorization_replayed"
     );
-    clean
-        .insert_prepared(fx.records[0].clone(), NOW)
-        .expect("first prepare proceeds");
-    assert_eq!(fx.generation(), Some(1));
     let rows = fx.rows("mpp_state_reset");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["profile"], fx.name);
     assert_eq!(rows[0]["discarded_generation"], 2);
+    assert_eq!(rows[0]["carried_generation"], 1);
+    assert!(rows[0].get("stale_carry").is_none());
     assert_eq!(rows[0]["reason"], "operator recovery");
-    fs::write(&fx.path, &fx.snapshot).expect("restore old generation one");
+    fs::write(&fx.path, snapshot).expect("restore pre-reset snapshot");
     assert!(
-        fx.open().is_err(),
-        "reset must invalidate old snapshots at reused generations"
+        fx.open()
+            .expect_err("rollback")
+            .message()
+            .contains("rolled back")
     );
+}
+
+/// A file more than one generation below the committed counter was rolled
+/// back. The reset carries it, reports it as stale, and refuses challenges
+/// expiring within the challenge lifetime cap, whose markers it may have lost.
+#[tokio::test]
+#[serial_test::serial]
+async fn reset_reports_a_stale_carry_and_refuses_challenges_it_may_have_lost() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    let fx = Fixture::new("mpp-reset-stale", STORE_VERSION, 1).await;
+    write_generation(&generation_entry_ref(&fx.key_ref), 1).expect("anchor");
+    let store = fx.open().expect("anchored store");
+    store.prune(NOW).expect("generation 2");
+    store.prune(NOW).expect("generation 3");
+    fs::write(&fx.path, &fx.snapshot).expect("roll back to generation 1");
+    let outcome = fx.reset().expect("reset");
+    assert_eq!(outcome.discarded_generation, Some(3));
+    assert_eq!(outcome.carried_generation, Some(1));
+    assert!(outcome.stale_carry);
+    assert_eq!(outcome.carried_records, 4);
+    assert_eq!(fx.generation(), Some(4));
+    assert_eq!(fx.watermark(), NOW + MAX_CHALLENGE_LIFETIME_SECS);
+    let rows = fx.rows("mpp_state_reset");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["carried_generation"], 1);
+    assert_eq!(rows[0]["stale_carry"], true);
+    let carried = fx.open().expect("carried store");
+    let lost = fx
+        .record_for("https://merchant.example/recovery/lost", NOW)
+        .await;
+    assert_eq!(lost.expires_at(), NOW + MAX_CHALLENGE_LIFETIME_SECS);
+    let refused = carried
+        .insert_prepared(lost, NOW)
+        .expect_err("a lost marker's challenge is refused");
+    assert_eq!(refused.code(), "mpp.challenge_expired");
+    assert_eq!(refused.message(), HORIZON_REFUSAL);
+    let fresh = fx
+        .record_for("https://merchant.example/recovery/fresh", NOW + 1)
+        .await;
+    assert_eq!(fresh.expires_at(), NOW + MAX_CHALLENGE_LIFETIME_SECS + 1);
+    carried
+        .insert_prepared(fresh, NOW + 1)
+        .expect("a challenge expiring past the horizon prepares");
+}
+
+/// A challenge cannot move its expiry past a reset's horizon: admission refuses
+/// a missing or distant expiry at every prepare, so no second authorization
+/// exists for a marker the reset lost. The first prepare's result is free
+/// because a discard leaves no record of it either way.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_renewable_expiry_cannot_pass_the_reset_horizon() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    for (label, expires) in [("absent", None), ("far", Some(NOW + 3600))] {
+        let fx = Fixture::new(&format!("mpp-renew-reset-{label}"), STORE_VERSION, 1).await;
+        let input = challenge_input("renewable", "https://merchant.example/renew", expires);
+        let store = fx.anchored();
+        drop(fx.prepare(&store, &input, NOW).await);
+        let clean = fx.discard(NOW + 10);
+        let error = fx
+            .prepare(&clean, &input, NOW + 11)
+            .await
+            .expect_err("no second authorization after the reset");
+        assert_eq!(error.code(), "mpp.challenge_invalid", "{label}");
+    }
+}
+
+/// The prune watermark holds the same way, on a challenge whose distant expiry
+/// still lies ahead of the clock after the retention period.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_renewable_expiry_cannot_pass_the_prune_watermark() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    let prune_at = NOW + MAX_CHALLENGE_LIFETIME_SECS + TERMINAL_RETENTION_SECS + 1;
+    for (label, expires) in [("absent", None), ("far", Some(prune_at + 3600))] {
+        let fx = Fixture::new(&format!("mpp-renew-prune-{label}"), STORE_VERSION, 1).await;
+        let input = challenge_input("renewable", "https://merchant.example/renew", expires);
+        let store = fx.anchored();
+        drop(fx.prepare(&store, &input, NOW).await);
+        store.prune(prune_at).expect("prune");
+        let error = fx
+            .prepare(&store, &input, prune_at + 1)
+            .await
+            .expect_err("no second authorization after the prune");
+        assert_eq!(error.code(), "mpp.challenge_invalid", "{label}");
+    }
+}
+
+/// A challenge's fixed expiry keeps it refused while it can still be live, and
+/// a different challenge past the horizon prepares.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_fixed_expiry_challenge_stays_refused_through_the_horizon() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    let fx = Fixture::new("mpp-fixed-expiry", STORE_VERSION, 1).await;
+    let resource = "https://merchant.example/fixed";
+    let input = challenge_input("fixed", resource, Some(NOW + MAX_CHALLENGE_LIFETIME_SECS));
+    let store = fx.anchored();
+    fx.prepare(&store, &input, NOW)
+        .await
+        .expect("a challenge at the cap prepares");
+    let reset_at = NOW + 10;
+    let clean = fx.discard(reset_at);
+    for now in [NOW + 11, NOW + 150, NOW + 270] {
+        let error = fx
+            .prepare(&clean, &input, now)
+            .await
+            .expect_err("a lost marker's challenge is refused");
+        assert_eq!(error.code(), "mpp.challenge_expired");
+        assert_eq!(error.message(), HORIZON_REFUSAL);
+    }
+    let horizon = reset_at + MAX_CHALLENGE_LIFETIME_SECS;
+    let fresh = challenge_input("fresh", resource, Some(horizon + 1));
+    let record = fx
+        .prepare(&clean, &fresh, NOW + 11)
+        .await
+        .expect("a new challenge past the horizon prepares");
+    assert_eq!(record.expires_at(), horizon + 1);
+}
+
+/// A malformed counter cannot bound the generations the retained key sealed,
+/// so a carry refuses before audit, key rotation, or publication. Once the
+/// state file is moved out, the reset discards: the fresh key leaves no
+/// earlier snapshot that authenticates, and the guarded writes replace the
+/// malformed value above every valid counter.
+#[tokio::test]
+#[serial_test::serial]
+async fn malformed_counters_refuse_a_carry_and_recover_by_discarding() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    check_malformed_counter_recovery("text-committed", b"bad-counter", b"3", None).await;
+    check_malformed_counter_recovery("text-intent", b"3", b"bad-intent", Some(3)).await;
 }
 
 #[tokio::test]
 #[serial_test::serial]
-async fn reset_recovers_a_malformed_anchor_and_missing_state_key() {
+async fn non_utf8_committed_counter_recovers_by_discarding() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    check_malformed_counter_recovery("bytes-committed", &[0xff, 0xfe], b"3", None).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn non_utf8_intent_counter_recovers_by_discarding() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    check_malformed_counter_recovery("bytes-intent", b"3", &[0xff, 0xfe], Some(3)).await;
+}
+
+async fn check_malformed_counter_recovery(
+    label: &str,
+    counter: &[u8],
+    intent: &[u8],
+    discarded: Option<u64>,
+) {
+    let fx = Fixture::new(&format!("mpp-reset-{label}"), STORE_VERSION, 3).await;
+    let anchor = generation_entry_ref(&fx.key_ref);
+    Fixture::put_bytes(&anchor, counter);
+    Fixture::put_bytes(&fx.intent_entry(), intent);
+    let key = load_hmac_key_32(&fx.key_ref).expect("key");
+    if discarded.is_none() {
+        assert_eq!(
+            fx.open().expect_err("invalid anchor").message(),
+            anchor_error().message()
+        );
+    } else {
+        assert_eq!(
+            fx.open()
+                .expect("committed snapshot reads")
+                .prune(NOW)
+                .expect_err("invalid intent refuses mutation")
+                .message(),
+            anchor_error().message()
+        );
+    }
+    assert_eq!(
+        fx.reset().expect_err("invalid counter").message(),
+        carry_anchor_error().message()
+    );
+    for (entry_ref, expected) in [(&anchor, counter), (&fx.intent_entry(), intent)] {
+        assert_eq!(
+            keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+                .expect("entry")
+                .get_secret()
+                .expect("counter bytes"),
+            expected
+        );
+    }
+    assert_eq!(fs::read(&fx.path).expect("snapshot"), fx.snapshot);
+    assert_eq!(*load_hmac_key_32(&fx.key_ref).expect("key"), *key);
+    assert!(fx.rows("mpp_state_reset").is_empty());
+    fx.move_state_file_out();
+    let outcome = fx.reset().expect("discarding reset");
+    assert_eq!(outcome.discarded_generation, discarded);
+    assert_eq!(outcome.carried_records, 0);
+    assert_eq!(outcome.carried_generation, None);
+    assert_eq!(fx.generation(), Some(4));
+    assert_eq!(fx.intent(), Some(4));
+    assert_ne!(*load_hmac_key_32(&fx.key_ref).expect("rotated key"), *key);
+    assert_eq!(fx.watermark(), NOW + MAX_CHALLENGE_LIFETIME_SECS);
+    let rows = fx.rows("mpp_state_reset");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["discarded_generation"],
+        discarded.map_or(serde_json::Value::Null, Into::into)
+    );
+    assert!(
+        fx.open()
+            .expect("discarded store")
+            .read_for_test()
+            .expect("snapshot")
+            .records
+            .is_empty()
+    );
+}
+
+/// The floor includes a burned intent above the counter, so the reset
+/// publishes above every generation a failed write gave out.
+#[tokio::test]
+#[serial_test::serial]
+async fn reset_publishes_above_a_burned_intent() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    let fx = Fixture::new("mpp-reset-floor-intent", STORE_VERSION, 3).await;
+    write_generation(&generation_entry_ref(&fx.key_ref), 3).expect("counter");
+    write_intent(&fx.intent_entry(), 6).expect("burned intent");
+    let outcome = fx.reset().expect("reset");
+    assert_eq!(outcome.discarded_generation, Some(3));
+    assert!(!outcome.stale_carry);
+    assert_eq!(fx.generation(), Some(7));
+    assert_eq!(fx.intent(), Some(7));
+}
+
+/// A state key equal to the owner public key never authenticates a carry:
+/// the reset discards the history and rotates the key.
+#[tokio::test]
+#[serial_test::serial]
+async fn reset_discards_history_under_an_owner_state_key() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use base64::Engine as _;
+    keyring_mock::install().expect("keyring");
+    let fx = Fixture::new("mpp-reset-owner-key", STORE_VERSION, 1).await;
+    write_generation(&generation_entry_ref(&fx.key_ref), 1).expect("anchor");
+    let key = load_hmac_key_32(&fx.key_ref).expect("key");
+    Fixture::put(
+        &KeyringEntryRef::default_owner_key(&fx.name),
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(*key),
+    );
+    let outcome = fx.reset().expect("reset");
+    assert_eq!(outcome.carried_records, 0);
+    assert_eq!(outcome.carried_generation, None);
+    assert_ne!(*load_hmac_key_32(&fx.key_ref).expect("rotated key"), *key);
+    assert!(
+        fx.open()
+            .expect("fresh store")
+            .read_for_test()
+            .expect("snapshot")
+            .records
+            .is_empty()
+    );
+}
+
+/// A present key with a file that does not authenticate takes the discard
+/// path: the key rotates and an empty snapshot carries the watermark.
+#[tokio::test]
+#[serial_test::serial]
+async fn reset_discards_a_file_that_does_not_authenticate() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    let fx = Fixture::new("mpp-reset-tampered", STORE_VERSION, 1).await;
+    write_generation(&generation_entry_ref(&fx.key_ref), 1).expect("anchor");
+    let key = load_hmac_key_32(&fx.key_ref).expect("key");
+    let mut tampered = fx.snapshot.clone();
+    tampered[HMAC_TAG_BYTES] ^= 1;
+    fs::write(&fx.path, tampered).expect("tamper");
+    let outcome = fx.reset().expect("reset");
+    assert_eq!(outcome.discarded_generation, Some(1));
+    assert_eq!(outcome.carried_records, 0);
+    assert_eq!(outcome.carried_generation, None);
+    assert!(!outcome.stale_carry);
+    assert_ne!(*load_hmac_key_32(&fx.key_ref).expect("rotated key"), *key);
+    assert_eq!(fx.generation(), Some(2));
+    assert_eq!(fx.intent(), Some(2));
+    assert_eq!(fx.watermark(), NOW + MAX_CHALLENGE_LIFETIME_SECS);
+    assert!(
+        fx.open()
+            .expect("fresh store")
+            .read_for_test()
+            .expect("snapshot")
+            .records
+            .is_empty()
+    );
+}
+
+/// A keyring access error on the state key, or a state path the reset cannot
+/// read as a file, refuses before the audit row and changes nothing, also
+/// when the state key is missing.
+#[tokio::test]
+#[serial_test::serial]
+async fn reset_refuses_read_errors_without_changing_state() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    for fault in ["directory", "directory-without-key", "keyring"] {
+        let fx = Fixture::new(&format!("mpp-reset-read-error-{fault}"), STORE_VERSION, 1).await;
+        write_generation(&generation_entry_ref(&fx.key_ref), 1).expect("anchor");
+        let key = load_hmac_key_32(&fx.key_ref).expect("key");
+        if fault != "keyring" {
+            fs::remove_file(&fx.path).expect("remove file");
+            fs::create_dir(&fx.path).expect("directory at the state path");
+        }
+        match fault {
+            "directory-without-key" => {
+                keyring_core::Entry::new(&fx.key_ref.service, &fx.key_ref.account)
+                    .expect("key")
+                    .delete_credential()
+                    .expect("remove key");
+            }
+            "keyring" => {
+                keyring_mock::inject_no_logon_session(&fx.key_ref.service, &fx.key_ref.account)
+                    .expect("access error");
+            }
+            _ => {}
+        }
+        assert_eq!(
+            fx.reset().expect_err("read error").code(),
+            "mpp.state_unavailable"
+        );
+        if fault == "directory-without-key" {
+            assert!(key_is_absent(&fx.key_ref).expect("key lookup"));
+        } else {
+            assert_eq!(*load_hmac_key_32(&fx.key_ref).expect("key"), *key);
+        }
+        assert_eq!(fx.generation(), Some(1));
+        assert_eq!(fx.intent(), None);
+        assert!(fx.rows("mpp_state_reset").is_empty());
+        if fault == "keyring" {
+            assert_eq!(fs::read(&fx.path).expect("snapshot"), fx.snapshot);
+        } else {
+            assert!(fx.path.is_dir());
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn reset_closes_a_ready_record() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    let fx = Fixture::new("mpp-reset-ready", 1, 0).await;
+    let store = fx.open().expect("adopt");
+    let id = fx.records[0].authorization_id();
+    store
+        .mutate(|wire| {
+            wire.records.truncate(1);
+            Ok(())
+        })
+        .expect("one record");
+    store.mark_ready(id, NOW + 10).expect("ready");
+    write_generation(&generation_entry_ref(&fx.key_ref), 4).expect("counter-only commit");
+    assert_eq!(fx.reset().expect("reset").carried_records, 1);
+    assert_eq!(
+        store
+            .claim_ready(id, NOW + 10)
+            .expect_err("closed record")
+            .code(),
+        "mpp.authorization_replayed"
+    );
+    let record = store.load(id).expect("record");
+    assert_eq!(record.status(), AuthorizationStatus::ExpiredUnresolved);
+    assert_eq!(record.updated_at(), NOW + 10);
+}
+
+/// An absent counter cannot bound the generations the retained key sealed,
+/// so a carry refuses and names the discarding reset, which then recovers
+/// the profile by initializing the counter through the guarded writes.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_absent_anchor_refuses_a_carry_and_recovers_by_discarding() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    let fx = Fixture::new("mpp-reset-absent", STORE_VERSION, 3).await;
+    let key = load_hmac_key_32(&fx.key_ref).expect("key");
+    assert_eq!(
+        fx.open().expect_err("absent anchor").message(),
+        anchor_error().message()
+    );
+    assert_eq!(
+        fx.reset().expect_err("absent anchor").message(),
+        carry_anchor_error().message()
+    );
+    assert_eq!(fx.generation(), None);
+    assert_eq!(fx.intent(), None);
+    assert_eq!(fs::read(&fx.path).expect("snapshot"), fx.snapshot);
+    assert_eq!(*load_hmac_key_32(&fx.key_ref).expect("key"), *key);
+    assert!(fx.rows("mpp_state_reset").is_empty());
+    fx.move_state_file_out();
+    let outcome = fx.reset().expect("discarding reset");
+    assert_eq!(outcome.discarded_generation, None);
+    assert_eq!(outcome.carried_records, 0);
+    assert_eq!(outcome.carried_generation, None);
+    assert!(!outcome.stale_carry);
+    assert_eq!(fx.generation(), Some(1));
+    assert_eq!(fx.intent(), Some(1));
+    assert_ne!(*load_hmac_key_32(&fx.key_ref).expect("rotated key"), *key);
+    let rows = fx.rows("mpp_state_reset");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["discarded_generation"].is_null());
+    assert!(
+        fx.open()
+            .expect("discarded store")
+            .read_for_test()
+            .expect("snapshot")
+            .records
+            .is_empty()
+    );
+}
+
+/// A state key with neither a counter nor a state file holds no history the
+/// reset could carry, so the reset discards without operator file moves.
+#[tokio::test]
+#[serial_test::serial]
+async fn reset_recovers_a_state_key_without_counter_or_file() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    let fx = Fixture::new("mpp-reset-keyonly", STORE_VERSION, 3).await;
+    fs::remove_file(&fx.path).expect("remove state file");
+    assert_eq!(
+        fx.open().expect_err("absent anchor").message(),
+        anchor_error().message()
+    );
+    let outcome = fx.reset().expect("discarding reset");
+    assert_eq!(outcome.discarded_generation, None);
+    assert_eq!(outcome.carried_generation, None);
+    assert_eq!(fx.generation(), Some(1));
+    assert_eq!(fx.intent(), Some(1));
+    assert!(
+        fx.open()
+            .expect("discarded store")
+            .read_for_test()
+            .expect("snapshot")
+            .records
+            .is_empty()
+    );
+}
+
+/// Without a state key no snapshot authenticates, so a malformed counter
+/// does not block the discard. It publishes above the valid burned intent,
+/// and a challenge whose marker the discard dropped refuses while it can
+/// still be live.
+#[tokio::test]
+#[serial_test::serial]
+async fn reset_discards_under_a_malformed_anchor_and_missing_state_key() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("keyring");
     let fx = Fixture::new("mpp-reset-malformed", 1, 0).await;
     let anchor = generation_entry_ref(&fx.key_ref);
-    keyring_core::Entry::new(&anchor.service, &anchor.account)
-        .expect("anchor")
-        .set_password("bad-counter")
-        .expect("counter");
+    Fixture::put(&anchor, "bad-counter");
+    Fixture::put(&fx.intent_entry(), "9");
     keyring_core::Entry::new(&fx.key_ref.service, &fx.key_ref.account)
         .expect("key")
         .delete_credential()
         .expect("remove key");
+    assert_eq!(
+        fx.open().expect_err("invalid anchor").message(),
+        anchor_error().message()
+    );
+    let outcome = fx.reset().expect("discarding reset");
+    assert_eq!(outcome.discarded_generation, None);
+    assert_eq!(outcome.carried_records, 0);
+    assert_eq!(outcome.carried_generation, None);
+    assert!(!outcome.stale_carry);
+    assert_eq!(fx.generation(), Some(10));
+    assert_eq!(fx.intent(), Some(10));
+    assert_eq!(fx.watermark(), NOW + MAX_CHALLENGE_LIFETIME_SECS);
+    assert!(load_hmac_key_32(&fx.key_ref).is_ok());
+    let rows = fx.rows("mpp_state_reset");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["discarded_generation"].is_null());
+    assert!(rows[0].get("carried_generation").is_none());
+    let clean = fx.open().expect("clean state");
+    assert!(
+        clean
+            .read_for_test()
+            .expect("empty snapshot")
+            .records
+            .is_empty()
+    );
+    let lost = fx
+        .record_for("https://merchant.example/recovery/0", NOW)
+        .await;
+    let refused = clean
+        .insert_prepared(lost, NOW)
+        .expect_err("a discarded marker's challenge is refused");
+    assert_eq!(refused.code(), "mpp.challenge_expired");
+    assert_eq!(refused.message(), HORIZON_REFUSAL);
+}
+
+/// Every committed-counter state has a recovery at each discard boundary.
+#[tokio::test]
+#[serial_test::serial]
+async fn discard_crash_boundaries_have_documented_recovery() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    for (label, committed) in [
+        ("absent", None),
+        ("text", Some(b"bad".as_slice())),
+        ("bytes", Some([0xff, 0xfe].as_slice())),
+        ("valid", Some(b"3".as_slice())),
+    ] {
+        for (phase, hook, published, reserved) in [
+            ("rotation", &tests::AFTER_KEY_ROTATION, false, false),
+            ("publication", &tests::BEFORE_PUBLICATION, false, true),
+            ("commit", &tests::AFTER_PUBLICATION, true, true),
+        ] {
+            let fx =
+                Fixture::new(&format!("discard-crash-{label}-{phase}"), STORE_VERSION, 3).await;
+            let anchor = generation_entry_ref(&fx.key_ref);
+            if let Some(bytes) = committed {
+                Fixture::put_bytes(&anchor, bytes);
+            }
+            Fixture::put(&fx.intent_entry(), "5");
+            keyring_core::Entry::new(&fx.key_ref.service, &fx.key_ref.account)
+                .expect("key entry")
+                .delete_credential()
+                .expect("absent key");
+            let observed = Counter::read(&anchor).expect("observed counter");
+            hook.with(|slot| *slot.borrow_mut() = Some(Box::new(|| Err(state_error()))));
+            assert_eq!(
+                fx.reset().expect_err("interrupted discard").message(),
+                state_error().message()
+            );
+            assert_eq!(
+                Counter::read(&anchor).expect("uncommitted counter"),
+                observed
+            );
+            assert_eq!(fx.intent(), Some(if reserved { 6 } else { 5 }));
+            assert_eq!(fx.rows("mpp_state_reset").len(), 1);
+            let malformed = matches!(observed, Counter::Malformed(_));
+            let expected = if published && !malformed {
+                fx.open().expect("matching publication completes");
+                6
+            } else {
+                assert_eq!(
+                    fx.open().expect_err("incomplete discard refuses").message(),
+                    if malformed {
+                        anchor_error().message()
+                    } else {
+                        state_error().message()
+                    }
+                );
+                if published {
+                    let snapshot = fs::read(&fx.path).expect("publication");
+                    assert_eq!(
+                        fx.reset()
+                            .expect_err("malformed counter refuses a carry")
+                            .message(),
+                        carry_anchor_error().message()
+                    );
+                    assert_eq!(fs::read(&fx.path).expect("publication"), snapshot);
+                    assert_eq!(fx.rows("mpp_state_reset").len(), 1);
+                    fx.move_state_file_out();
+                } else {
+                    assert_eq!(
+                        fs::read(&fx.path).expect("unpublished snapshot survives"),
+                        fx.snapshot
+                    );
+                }
+                let outcome = fx.reset().expect("discard recovery");
+                assert_eq!(outcome.carried_generation, None);
+                assert_eq!(outcome.carried_records, 0);
+                if reserved { 7 } else { 6 }
+            };
+            assert_eq!(fx.generation(), Some(expected), "{label} at {phase}");
+            assert_eq!(fx.intent(), Some(expected), "{label} at {phase}");
+            let store = fx.open().expect("recovered store opens");
+            let wire = store.read_for_test().expect("recovered snapshot");
+            assert!(wire.records.is_empty());
+            assert_eq!(wire.pruned_through, NOW + MAX_CHALLENGE_LIFETIME_SECS);
+        }
+    }
+}
+
+/// Intent two beside a version 1 file refuses, and a discarding reset
+/// publishes above that reservation after the operator moves the file out.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_resumed_adoption_interrupted_before_publication_requires_discard() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    keyring_mock::install().expect("keyring");
+    let fx = Fixture::new("adopt-resume-interrupted", 1, 0).await;
+    Fixture::put(&fx.intent_entry(), "1");
+    tests::BEFORE_PUBLICATION
+        .with(|slot| *slot.borrow_mut() = Some(Box::new(|| Err(state_error()))));
+    assert_eq!(
+        fx.open()
+            .expect_err("interrupted resumed adoption")
+            .message(),
+        state_error().message()
+    );
+    assert_eq!(fx.generation(), None);
+    assert_eq!(fx.intent(), Some(2));
+    assert_eq!(fs::read(&fx.path).expect("version 1 snapshot"), fx.snapshot);
+    assert_eq!(
+        fx.open().expect_err("ambiguous intent refuses").message(),
+        anchor_error().message()
+    );
+    assert_eq!(
+        fx.reset().expect_err("carry refuses").message(),
+        carry_anchor_error().message()
+    );
+    assert!(fx.rows("mpp_state_reset").is_empty());
+    assert_eq!(fx.rows("mpp_state_adopted").len(), 1);
+    fx.move_state_file_out();
+    assert_eq!(
+        fx.reset().expect("discard recovery").carried_generation,
+        None
+    );
+    assert_eq!(fx.generation(), Some(3));
+    assert_eq!(fx.intent(), Some(3));
     assert!(
         fx.open()
-            .expect_err("invalid anchor")
-            .message()
-            .contains("profile reset-mpp-state")
+            .expect("recovered store")
+            .read_for_test()
+            .expect("snapshot")
+            .records
+            .is_empty()
     );
-    assert_eq!(fx.reset().expect("reset"), None);
-    assert_eq!(fx.generation(), Some(0));
-    assert!(!fx.path.exists());
-    assert!(load_hmac_key_32(&fx.key_ref).is_ok());
-    assert_eq!(fx.rows("mpp_state_reset").len(), 1);
-    assert!(fx.rows("mpp_state_reset")[0]["discarded_generation"].is_null());
-    fx.open().expect("clean state");
 }

@@ -72,3 +72,6 @@ pub use receipt::{
 pub use schema::{
     KeyringEntryRef, PolicyConfig, PolicyEngineKind, PoolChannelRecord, PoolConfig, Profile,
 };
+
+/// Position-only TOML error diagnostics.
+pub mod toml_diagnostic;

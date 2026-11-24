@@ -1,6 +1,68 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import renderers from "./app_shared.js";
+import { b64url, browser, jsonReply, until } from "./browser_harness.mjs";
+
+for (const [lifetime, deadline] of [[86_400_000, "tomorrow 12:00 (in 1 day)"], [600_000, "12:10 (in 10 minutes)"]]) {
+  test(`pending detail renders the approval deadline after ${lifetime} ms`, () => {
+    const created = new Date(2026, 0, 2, 12, 0).getTime();
+    const module = { exports: {} };
+    const page = browser({
+      elements: ["expiry-line", "created-text", "expires-text", "execution-minutes"],
+      attributes: { "expiry-line": {
+        "data-created-ms": String(created), "data-expires-ms": String(created + lifetime),
+        "data-expiry-form": "remaining",
+      } },
+      globals: { module },
+    });
+    page.clock.now = created;
+    // refreshTimestamps leaves the server-rendered execution text unchanged.
+    const execution = "After approval, the action must run within 1 minute 40 seconds.";
+    page.byId["execution-minutes"].textContent = execution;
+    page.run("./app_shared.js");
+    module.exports.refreshTimestamps();
+    assert.equal(`Created ${page.byId["created-text"].textContent}. Approve by ${page.byId["expires-text"].textContent}.`,
+      `Created today 12:00. Approve by ${deadline}.`);
+    assert.equal(page.byId["execution-minutes"].textContent, execution);
+  });
+}
+
+test("resolved detail keeps absolute timestamps", () => {
+  const created = new Date(2026, 0, 2, 12, 0).getTime();
+  const expires = created + 600_000;
+  const module = { exports: {} };
+  const page = browser({
+    elements: ["expiry-line", "created-text", "expires-text"],
+    attributes: { "expiry-line": {
+      "data-created-ms": String(created), "data-expires-ms": String(expires), "data-expiry-form": "absolute",
+    } },
+    globals: { module },
+  });
+  page.clock.now = created;
+  page.run("./app_shared.js");
+  const renderers = module.exports;
+  renderers.refreshTimestamps();
+  assert.equal(page.byId["created-text"].textContent, renderers.absoluteText(created));
+  assert.equal(page.byId["expires-text"].textContent, renderers.absoluteText(expires));
+});
+
+test("inbox requests say approve within", () => {
+  globalThis.document = {
+    createElement: () => ({ children: [], appendChild(child) { this.children.push(child); } }),
+    createTextNode: (text) => ({ textContent: text }), getElementById: () => null,
+  };
+  const row = renderers.approvalRow({ expires_at_unix_ms: Date.now() + 600_000, summary: { kind: "payment" } });
+  assert.equal(row.children[2].children[0].textContent, "approve within");
+});
+
+test("today's approval deadline includes its clock time and remaining minutes", () => {
+  const module = { exports: {} };
+  const page = browser({ globals: { module } });
+  page.clock.now = new Date(2026, 0, 2, 12, 0).getTime();
+  page.run("./app_shared.js");
+  assert.equal(module.exports.remainingText(page.clock.now + 600_000), "12:10 (in 10 minutes)");
+});
 
 for (const [limit, rendered] of [
   [null, "unlimited"],
@@ -18,6 +80,768 @@ for (const [limit, rendered] of [
     }};
     assert.equal(renderers.kindLabel(view), "TRUSTLINE");
     assert.equal(renderers.headlineText(view), `Trustline USDC:${issuer}`);
-    assert.equal(renderers.metaText(view), `limit ${rendered} for ${holder}`);
+    assert.equal(renderers.metaText(view), `limit ${rendered} for ${holder} · memo none`);
   });
 }
+
+test("an inconsistent entry reads as one that cannot be approved", () => {
+  const view = { kind_name: "PaymentSimulated", summary: {
+    kind: "inconsistent", original_kind_name: "PaymentSimulated",
+    reason: "the stored digest is not the digest of the stored envelope",
+  }};
+  assert.equal(renderers.kindLabel(view), "INCONSISTENT");
+  assert.equal(renderers.headlineText(view), "Inconsistent PaymentSimulated");
+  assert.equal(renderers.metaText(view), "cannot be approved");
+});
+
+function renderedRow(view) {
+  function element() {
+    return { children: [], textContent: "", appendChild(child) { this.children.push(child); } };
+  }
+  globalThis.document = { createElement: element, createTextNode(text) {
+    return { textContent: text, children: [] };
+  }, getElementById() { return null; } };
+  const container = element();
+  renderers.renderInbox(container, [view]);
+  const main = container.children[0].children[1];
+  return { headline: main.children[0].textContent, meta: main.children[1].textContent,
+    metaClasses: main.children[1].className.split(" ") };
+}
+
+test("claim row renders signed fields and the ledger-value qualification", () => {
+  const view = { summary: { kind: "claim", balance_id_strkey: "B123", source: "G123",
+    fee_stroops: "100", seq_num: 42 } };
+  const row = renderedRow(view);
+  assert.equal(row.headline, "Claim balance B123");
+  assert.equal(row.meta, "source G123 · fee 100 stroops · sequence 42 · asset and amount: not part of the signed claim transaction · memo none");
+  assert.deepEqual(row.metaClasses, ["ap-meta"]);
+});
+
+test("path payment row labels the ceiling and destination terms", () => {
+  const view = { summary: { kind: "payment", to: "G123", amount_stroops: "10000000",
+    asset: "XLM", dest_asset: "USD:G456", dest_amount_stroops: "20000000", memo: { kind: "none" } } };
+  const row = renderedRow(view);
+  assert.match(row.headline, /^maximum sent /);
+  assert.match(row.headline, /1.*XLM/);
+  assert.match(row.meta, /destination receives at least 2.*USD/);
+  assert.match(row.meta, /to G123/);
+});
+
+test("toolset gate row names the version, the shasum prefix and the install identity", () => {
+  const view = { kind_name: "ToolsetFirstInvokeGate", summary: {
+    kind: "toolset_first_invoke_gate", toolset_name: "pay-toolset", package_version: "1.2.0",
+    package_shasum_short: "0123456789ab", install_id: "fedcba9876543210fedcba9876543210",
+    capability: "sign-payment", destination_redacted: "GAAAA...AAAAA",
+    destination: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", asset: "XLM",
+    amount_min_stroops: "1", amount_max_stroops: "10000000",
+  }};
+  const row = renderedRow(view);
+  assert.equal(row.headline, "Toolset capability request");
+  assert.equal(row.meta, "pay-toolset 1.2.0 · sha256 0123456789ab · " +
+    "install fedcba9876543210fedcba9876543210 · requests sign-payment · " +
+    "to GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF");
+  assert.deepEqual(row.metaClasses, ["ap-meta", "toolset-gate"]);
+});
+
+// The inbox rules as the server serves them, from `INBOX_STYLE`.
+function inboxRules() {
+  const source = readFileSync(new URL("../templates.rs", import.meta.url), "utf8");
+  const start = source.indexOf('pub const INBOX_STYLE: &str = r"') + 'pub const INBOX_STYLE: &str = r"'.length;
+  const css = source.slice(start, source.indexOf('";', start));
+  return [...css.matchAll(/([^{}]+)\{([^}]*)\}/g)].map(([, selector, body]) => ({
+    selector: selector.trim(),
+    declarations: Object.fromEntries(body.split(";").map((d) => d.trim()).filter(Boolean)
+      .map((d) => [d.slice(0, d.indexOf(":")).trim(), d.slice(d.indexOf(":") + 1).trim()])),
+  }));
+}
+
+// The value of `property` for an element with `classes`, applying every
+// single compound class rule that matches, by specificity and then order.
+function resolved(classes, property) {
+  const matching = inboxRules()
+    .map((rule, order) => ({ ...rule, order, compound: rule.selector.split(".").filter(Boolean) }))
+    .filter((rule) => /^(\.[\w-]+)+$/.test(rule.selector) &&
+      rule.compound.every((name) => classes.includes(name)))
+    .sort((a, b) => a.compound.length - b.compound.length || a.order - b.order);
+  let value;
+  for (const rule of matching) {
+    if (property in rule.declarations) value = rule.declarations[property];
+  }
+  return value;
+}
+
+// Every child row of the rendered entry's main column.
+function renderedMain(view) {
+  function element() {
+    return { children: [], textContent: "", appendChild(child) { this.children.push(child); } };
+  }
+  globalThis.document = { createElement: element, createTextNode(text) {
+    return { textContent: text, children: [] };
+  }, getElementById() { return null; } };
+  const container = element();
+  renderers.renderInbox(container, [view]);
+  return container.children[0].children[1].children.slice(1)
+    .map((child) => ({ text: child.textContent, classes: child.className.split(" ") }));
+}
+
+const MUX_BASE = "GDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LCRG";
+const MUX_17 = "MDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5KAAAAAAAAAAACHBWG";
+
+test("toolset inbox keeps the full muxed destination", () => {
+  const rows = renderedMain({ kind_name: "ToolsetFirstInvokeGate", summary: {
+    kind: "toolset_first_invoke_gate", toolset_name: "pay-toolset", package_version: "1.2.0",
+    package_shasum_short: "0123456789ab", install_id: "fedcba9876543210fedcba9876543210",
+    capability: "sign-payment", destination_redacted: "MDK5L...HBWG", destination: MUX_17,
+    destination_base: MUX_BASE, asset: "XLM", amount_min_stroops: "1",
+    amount_max_stroops: "10000000",
+  }});
+  assert.ok(rows[0].text.endsWith(" · to " + MUX_17), "the shared local/remote inbox shows the full M destination");
+  assert.deepEqual(rows[1], { text: "base account " + MUX_BASE, classes: ["ap-meta", "muxed"] });
+  for (const row of rows) {
+    assert.equal(resolved(row.classes, "text-overflow"), "clip");
+    assert.equal(resolved(row.classes, "white-space"), "normal");
+  }
+});
+
+const MUX_MAX = "MDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5L7777777777774ZMO";
+
+function toolsetView(destination, destinationBase) {
+  return { kind_name: "ToolsetFirstInvokeGate", summary: {
+    kind: "toolset_first_invoke_gate", toolset_name: "pay-toolset", package_version: "1.2.0",
+    package_shasum_short: "0123456789ab", install_id: "fedcba9876543210fedcba9876543210",
+    capability: "sign-payment", destination_redacted: destination.slice(0, 5) + "..." +
+      destination.slice(-5), destination, destination_base: destinationBase, asset: "XLM",
+    amount_min_stroops: "1", amount_max_stroops: "10000000",
+  }};
+}
+
+test("toolset_consent_shows_the_complete_destination", () => {
+  const plain = renderedMain(toolsetView(MUX_BASE, null));
+  assert.equal(plain.length, 1, "a G destination has no base row");
+  assert.ok(plain[0].text.endsWith(" · to " + MUX_BASE), plain[0].text);
+  assert.ok(!plain[0].text.includes("GDK5L..."), plain[0].text);
+  const muxed = renderedMain(toolsetView(MUX_MAX, MUX_BASE));
+  assert.ok(muxed[0].text.endsWith(" · to " + MUX_MAX), muxed[0].text);
+  assert.deepEqual(muxed[1], { text: "base account " + MUX_BASE, classes: ["ap-meta", "muxed"] });
+});
+
+test("payment_consent_shows_the_complete_destination", () => {
+  const rows = renderedMain({ summary: { kind: "payment", to: MUX_MAX, to_base: MUX_BASE,
+    amount_stroops: "10000000", asset: "XLM", memo: { kind: "none" } } });
+  assert.equal(rows[0].text, "to " + MUX_MAX + " · memo none");
+  assert.deepEqual(rows[1], { text: "base account " + MUX_BASE, classes: ["ap-meta", "muxed"] });
+});
+
+test("malformed_consent_terms_render_escaped", () => {
+  const hostile = "<b>é‮\u0007</b>";
+  const rows = renderedMain(toolsetView(hostile, null));
+  assert.ok(rows[0].text.endsWith(" · to " + hostile), "the text is a text node, never markup");
+  assert.ok(rows.every((row) => row.classes.every((name) => !name.includes("<"))));
+});
+
+test("payment inbox does not clip a muxed address", () => {
+  const rows = renderedMain({ summary: { kind: "payment", to: MUX_17, to_base: MUX_BASE,
+    amount_stroops: "10000000", asset: "XLM", memo: { kind: "none" } } });
+  assert.equal(rows[0].text, "to " + MUX_17 + " · memo none");
+  assert.deepEqual(rows[1], { text: "base account " + MUX_BASE, classes: ["ap-meta", "muxed"] });
+  for (const row of rows) {
+    assert.equal(resolved(row.classes, "text-overflow"), "clip",
+      "the M payment inbox row does not use the clipping rule");
+    assert.equal(resolved(row.classes, "white-space"), "normal");
+  }
+  // A G payment row keeps its single clipped line.
+  const plain = renderedMain({ summary: { kind: "payment", to: MUX_BASE,
+    amount_stroops: "10000000", asset: "XLM", memo: { kind: "none" } } });
+  assert.deepEqual(plain, [{ text: "to " + MUX_BASE + " · memo none", classes: ["ap-meta"] }]);
+  assert.equal(resolved(plain[0].classes, "text-overflow"), "ellipsis");
+});
+
+// testdata/inbox_bidi.json is the inbox JSON the Rust test
+// `inbox_json_bidi_fixture` asserts as parsed JSON, so this test renders
+// exactly what the server emits.
+test("Rust inbox JSON escapes bidi rule names and memos before DOM rendering", () => {
+  const views = JSON.parse(readFileSync(new URL("./testdata/inbox_bidi.json", import.meta.url), "utf8"));
+  assert.equal(views[0].summary.summary_line, "café\\u{202e}rule");
+  assert.equal(views[0].summary.definition.name, "café\\u{202e}rule");
+  assert.equal(views[1].summary.memo.value, "memo\\u{202e}");
+  assert.ok(!JSON.stringify(views).includes("\u202e"));
+  assert.equal(renderedRow(views[0]).headline, "café\\u{202e}rule");
+  assert.match(renderedRow(views[1]).meta, /memo text "memo\\u\{202e\}"/);
+});
+
+test("memo types remain distinct through JSON and DOM rendering", () => {
+  const meta = memo => renderedRow({summary: {kind: "payment", to: "G123",
+    amount_stroops: "1", asset: "XLM", memo}}).meta;
+  assert.match(meta({kind: "text", value: "id 7"}), /memo text "id 7"/);
+  assert.match(meta({kind: "id", value: "7"}), /memo id 7$/);
+  assert.match(meta({kind: "none"}), /memo none$/);
+  assert.match(meta({kind: "text", value: "(none)"}), /memo text "\(none\)"$/);
+  assert.match(meta({kind: "id", value: "18446744073709551615"}), /18446744073709551615$/);
+  for (const kind of ["hash", "return"]) {
+    assert.ok(meta({kind, value: Array(32).fill(171)}).endsWith(kind + " " + "ab".repeat(32)));
+  }
+});
+
+// ── Session proof: the bootstrap page, the inbox, and the enrollment page ──
+//
+// The enrollment cases share the confirmation-code vector of the Rust test
+// `confirmation_code_vectors_match_browser`: challenge 0x00..0x1f, credential
+// ID sixteen 0xa5 bytes, key 0x04 followed by 0x01..0x40.
+//
+// Each browser script runs in a fresh VM context with a minimal DOM, a
+// recorded sessionStorage, a recorded fetch, and a manual clock, so the tests
+// observe exactly what the script stores, requests, and navigates to.
+
+const INBOX_PROOF_KEY = "stellar-agent-approval-session-proof";
+const ENROLL_PROOF_KEY = "stellar-agent-operator-enroll-session-proof";
+const PROOF = "ab".repeat(32);
+
+const VECTOR_CHALLENGE = Uint8Array.from({ length: 32 }, (_, i) => i);
+const VECTOR_ID = new Uint8Array(16).fill(0xa5);
+const VECTOR_KEY = Uint8Array.from({ length: 65 }, (_, i) => (i === 0 ? 4 : i));
+const VECTOR_CODE = "305b-4244-62ef-fd53";
+const CLIENT_DATA = new TextEncoder().encode('{"type":"webauthn.create"}');
+const ATTESTATION_OBJECT = Uint8Array.from([0xa3, 0x01, 0x02]);
+
+// The credential a ceremony creates: `id` and `key` default to the vector.
+function makeCredential({ id = VECTOR_ID, key = VECTOR_KEY } = {}) {
+  const spki = new Uint8Array(26 + key.length);
+  spki.fill(0x30, 0, 26);
+  spki.set(key, 26);
+  return {
+    rawId: id.slice().buffer,
+    response: {
+      getPublicKey: () => spki.buffer,
+      clientDataJSON: CLIENT_DATA.slice().buffer,
+      attestationObject: ATTESTATION_OBJECT.slice().buffer,
+    },
+  };
+}
+
+function defaultCredential() {
+  return makeCredential();
+}
+
+// A server that issues `challenge` and answers the credential POST with
+// `credentialStatus` and `credentialBody`.
+function server({ challenge = VECTOR_CHALLENGE, credentialStatus = 200, credentialBody = { status: "awaiting_confirmation" } } = {}) {
+  return (url) => {
+    if (url === "/enroll/challenge") {
+      return jsonReply(200, {
+        challenge: b64url(challenge),
+        rp_id: "localhost",
+        alg: -7,
+        user_verification: "required",
+        resident_key: "required",
+        attestation: "none",
+        timeout_ms: 300000,
+      });
+    }
+    return jsonReply(credentialStatus, credentialBody);
+  };
+}
+
+test("bootstrap script stores the proof, clears it from the page, then navigates", () => {
+  const page = browser({
+    islands: { "session-bootstrap-data": { proof: PROOF, storageKey: INBOX_PROOF_KEY, next: "/inbox" } },
+    elements: ["bootstrap-status"],
+  });
+  page.run("./session_bootstrap.js");
+  assert.equal(page.stored.get(INBOX_PROOF_KEY), PROOF);
+  assert.deepEqual(page.log, [["setItem", INBOX_PROOF_KEY], ["replace", "/inbox"]]);
+  assert.equal(page.byId["session-bootstrap-data"].textContent, "");
+});
+
+for (const [label, options] of [
+  ["throws", { storageThrows: true }],
+  ["does not keep the value", { readBackDiffers: true }],
+]) {
+  test(`bootstrap script does not navigate when storage ${label}`, () => {
+    const page = browser({
+      islands: { "session-bootstrap-data": { proof: PROOF, storageKey: INBOX_PROOF_KEY, next: "/inbox" } },
+      elements: ["bootstrap-status"],
+      ...options,
+    });
+    page.run("./session_bootstrap.js");
+    assert.ok(!page.log.some(([kind]) => kind === "replace"));
+    assert.match(page.byId["bootstrap-status"].textContent, /did not let the wallet keep its session/);
+    assert.equal(page.byId["session-bootstrap-data"].textContent, "");
+  });
+}
+
+for (const next of ["https://example.invalid/", "//example.invalid", "/approval/x", ""]) {
+  test(`bootstrap script refuses the landing path ${JSON.stringify(next)}`, () => {
+    const page = browser({
+      islands: { "session-bootstrap-data": { proof: PROOF, storageKey: INBOX_PROOF_KEY, next } },
+      elements: ["bootstrap-status"],
+    });
+    page.run("./session_bootstrap.js");
+    assert.deepEqual(page.log, []);
+  });
+}
+
+// testdata/bootstrap_islands.json lists the (storageKey, next) pair of every
+// island a server renders on its bootstrap page; the Rust test
+// `every_bootstrap_island_matches_the_shared_list` renders each through the
+// production renderers and compares it with the same list, so a change on
+// either side fails a test.
+const ISLANDS = JSON.parse(readFileSync(new URL("./testdata/bootstrap_islands.json", import.meta.url), "utf8"));
+const CONSENT_PROOF_KEY = "stellar-agent-mainnet-presence-session-proof";
+const NONCE_PATH = "/approval/" + "A".repeat(22);
+
+function bootstrapLog(storageKey, next) {
+  const page = browser({
+    islands: { "session-bootstrap-data": { proof: PROOF, storageKey, next } },
+    elements: ["bootstrap-status"],
+  });
+  page.run("./session_bootstrap.js");
+  return page;
+}
+
+test("the shared list names the four server-rendered bootstrap islands", () => {
+  assert.deepEqual(ISLANDS.map(({ purpose }) => purpose), ["inbox", "operator_enroll", "mainnet_approval_enroll", "mainnet_presence"]);
+});
+
+for (const { purpose, storageKey, next } of ISLANDS) {
+  test(`bootstrap script lands the ${purpose} island on ${next}`, () => {
+    const page = bootstrapLog(storageKey, next);
+    assert.equal(page.stored.get(storageKey), PROOF);
+    assert.deepEqual(page.log, [["setItem", storageKey], ["replace", next]]);
+  });
+}
+
+test("bootstrap script lands the mainnet consent key on a 22-character nonce path", () => {
+  const page = bootstrapLog(CONSENT_PROOF_KEY, NONCE_PATH);
+  assert.deepEqual(page.log, [["setItem", CONSENT_PROOF_KEY], ["replace", NONCE_PATH]]);
+});
+
+for (const [storageKey, next] of [
+  [CONSENT_PROOF_KEY, "/inbox"],
+  [CONSENT_PROOF_KEY, "/enroll"],
+  [CONSENT_PROOF_KEY, "/approval/" + "A".repeat(21)],
+  [CONSENT_PROOF_KEY, "/approval/" + "A".repeat(23)],
+  [CONSENT_PROOF_KEY, "/approval/x"],
+  [CONSENT_PROOF_KEY, "/approval/" + "A".repeat(21) + "="],
+  [CONSENT_PROOF_KEY, "/approval/" + "A".repeat(22) + "/challenge"],
+  [CONSENT_PROOF_KEY, "//approval/" + "A".repeat(22)],
+  [INBOX_PROOF_KEY, NONCE_PATH],
+  [INBOX_PROOF_KEY, "/enroll"],
+  [ENROLL_PROOF_KEY, "/inbox"],
+  [ENROLL_PROOF_KEY, NONCE_PATH],
+  ["stellar-agent-unknown-session-proof", "/inbox"],
+]) {
+  test(`bootstrap script refuses ${next} under ${storageKey}`, () => {
+    const page = bootstrapLog(storageKey, next);
+    assert.deepEqual(page.log, []);
+    assert.match(page.byId["bootstrap-status"].textContent, /could not be opened/);
+  });
+}
+
+function detailPage(storage) {
+  const page = browser({
+    islands: {
+      "approval-data": { nonce: "NONCE", csrf: "c".repeat(64), activity_csrf: "d".repeat(64), approvable: true },
+    },
+    elements: ["approve-btn", "reject-btn", "result"],
+    storage,
+  });
+  page.run("./app_shared.js");
+  page.run("./app.js");
+  return page;
+}
+
+for (const action of ["approve", "reject"]) {
+  test(`${action} carries the session proof and the CSRF value`, () => {
+    const page = detailPage({ [INBOX_PROOF_KEY]: PROOF });
+    page.byId[`${action}-btn`].listeners.click[0]();
+    assert.equal(page.fetches.length, 1);
+    const { url, init } = page.fetches[0];
+    assert.equal(url, `/approval/NONCE/${action}`);
+    assert.equal(init.method, "POST");
+    assert.equal(init.headers["X-Session-Proof"], PROOF);
+    assert.equal(init.headers["X-Stellar-Approval-CSRF"], "c".repeat(64));
+  });
+
+  test(`${action} without a stored proof sends nothing and says why`, () => {
+    const page = detailPage({});
+    page.byId[`${action}-btn`].listeners.click[0]();
+    assert.equal(page.fetches.length, 0);
+    assert.match(page.byId.result.textContent, /no wallet session/);
+    assert.equal(page.byId.result.className, "result refused");
+  });
+}
+
+test("background polling never sends activity; trusted interaction does, once a minute", () => {
+  const page = browser({
+    islands: {
+      "pending-data": { pending: [], expired_count: 0, include_expired: false, activity_csrf: "d".repeat(64) },
+    },
+    elements: ["inbox", "status", "empty-state"],
+    storage: { [INBOX_PROOF_KEY]: PROOF },
+  });
+  page.run("./app_shared.js");
+  page.run("./app.js");
+  assert.equal(page.intervals.length, 1);
+  for (let i = 0; i < 600; i++) {
+    page.clock.now += 2000;
+    page.intervals[0].callback();
+  }
+  assert.equal(page.fetches.length, 600);
+  assert.ok(page.fetches.every(({ url, init }) => url.startsWith("/pending.json") && !init.method));
+
+  page.dispatch("pointerdown", false);
+  page.dispatch("keydown", false);
+  assert.equal(page.fetches.length, 600, "synthetic events send nothing");
+
+  page.dispatch("pointerdown", true);
+  const activity = page.fetches.slice(600);
+  assert.equal(activity.length, 1);
+  assert.equal(activity[0].url, "/session/activity");
+  assert.equal(activity[0].init.method, "POST");
+  assert.equal(activity[0].init.keepalive, true);
+  assert.equal(activity[0].init.headers["X-Session-Proof"], PROOF);
+  assert.equal(activity[0].init.headers["X-Stellar-Approval-CSRF"], "d".repeat(64));
+
+  page.clock.now += 59_999;
+  page.dispatch("keydown", true);
+  assert.equal(page.fetches.length, 601, "throttled within the minute");
+  page.clock.now += 1;
+  page.dispatch("wheel", true);
+  assert.equal(page.fetches.length, 602);
+});
+
+test("the activity throttle spans page loads in the same tab", () => {
+  const storage = { [INBOX_PROOF_KEY]: PROOF };
+  const first = detailPage(storage);
+  first.dispatch("pointerdown", true);
+  assert.equal(first.fetches.length, 1);
+  const lastSent = first.stored.get("stellar-agent-approval-session-activity-at");
+  const second = detailPage({ [INBOX_PROOF_KEY]: PROOF, "stellar-agent-approval-session-activity-at": lastSent });
+  second.clock.now = first.clock.now + 30_000;
+  second.dispatch("pointerdown", true);
+  assert.equal(second.fetches.length, 0);
+});
+
+test("a page without a proof sends no activity", () => {
+  const page = detailPage({});
+  page.dispatch("pointerdown", true);
+  assert.equal(page.fetches.length, 0);
+});
+
+const MAINNET_ENROLL_PROOF_KEY = "stellar-agent-mainnet-approval-enroll-session-proof";
+const CODE_SCRIPT = "../operator_enroll/web/operator-enroll-code.js";
+
+function proofPage(island) {
+  return `<!DOCTYPE html><html><body><p id="bootstrap-status">Opening</p>` +
+    `<script type="application/json" id="session-bootstrap-data">${JSON.stringify(island)}</script>` +
+    `<script src="/static/session-bootstrap.js"></script><script>throw new Error("never run");</script></body></html>`;
+}
+
+function codePage(reply) {
+  const page = browser({ elements: ["code-input", "code-btn", "status"], reply });
+  page.run(CODE_SCRIPT);
+  return page;
+}
+
+test("the code form posts the code, stores the proof of the reply and opens /enroll", async () => {
+  const page = codePage(() => Promise.resolve({
+    ok: true,
+    status: 200,
+    text: () => Promise.resolve(proofPage({ proof: PROOF, storageKey: MAINNET_ENROLL_PROOF_KEY, next: "/enroll" })),
+  }));
+  page.byId["code-input"].value = " 1234 5678 ";
+  page.byId["code-btn"].listeners.click[0]();
+  await until(() => page.log.some(([kind]) => kind === "replace"), "the navigation to /enroll");
+  assert.equal(page.fetches.length, 1);
+  const [post] = page.fetches;
+  assert.equal(post.url, "/enroll/code");
+  assert.equal(post.init.method, "POST");
+  assert.equal(post.init.headers["content-type"], "application/json");
+  assert.deepEqual(JSON.parse(post.init.body), { code: "12345678" });
+  assert.equal(page.stored.get(MAINNET_ENROLL_PROOF_KEY), PROOF);
+  assert.deepEqual(page.log, [["setItem", MAINNET_ENROLL_PROOF_KEY], ["replace", "/enroll"]]);
+});
+
+for (const [name, island] of [
+  ["another storage key", { proof: PROOF, storageKey: ENROLL_PROOF_KEY, next: "/enroll" }],
+  ["another landing", { proof: PROOF, storageKey: MAINNET_ENROLL_PROOF_KEY, next: "/inbox" }],
+  ["no proof", { storageKey: MAINNET_ENROLL_PROOF_KEY, next: "/enroll" }],
+]) {
+  test(`the code form stores nothing and stays for ${name}`, async () => {
+    const page = codePage(() => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(proofPage(island)) }));
+    page.byId["code-input"].value = "12345678";
+    page.byId["code-btn"].listeners.click[0]();
+    await until(() => /did not keep/.test(page.byId.status.textContent), "the storage refusal");
+    assert.equal(page.stored.size, 0);
+    assert.deepEqual(page.log, []);
+  });
+}
+
+test("a refused code shows the refusal, stores nothing and does not navigate", async () => {
+  const page = codePage(() => jsonReply(403, { error: "code_exhausted" }));
+  page.byId["code-input"].value = "12345678";
+  page.byId["code-btn"].listeners.click[0]();
+  await until(() => /attempt limit/.test(page.byId.status.textContent), "the exhaustion message");
+  assert.equal(page.byId["code-btn"].disabled, true);
+  assert.equal(page.stored.size, 0);
+  assert.deepEqual(page.log, []);
+  page.byId["code-input"].value = "1234";
+  const before = page.fetches.length;
+  page.byId["code-btn"].listeners.click[0]();
+  assert.equal(page.fetches.length, before, "a malformed code sends nothing");
+});
+
+test("the code script runs under the unchanged CSP: no inline code, eval or HTML injection", () => {
+  const body = readFileSync(new URL(CODE_SCRIPT, import.meta.url), "utf8");
+  for (const forbidden of ["innerHTML", "outerHTML", "eval(", "new Function", "document.write", "<form", "action="]) {
+    assert.ok(!body.includes(forbidden), forbidden);
+  }
+  assert.ok(body.includes('fetch("/enroll/code"'));
+});
+
+function enrollPage(storage, options = {}) {
+  const page = browser({
+    islands: { "enroll-data": { csrfToken: "e".repeat(64), rpId: "localhost" } },
+    attributes: { "enroll-data": { "data-purpose": "remote-operator" } },
+    elements: ["label-input", "enroll-btn", "status", "confirmation-code"],
+    storage,
+    credential: defaultCredential,
+    ...options,
+  });
+  page.byId["label-input"].value = "laptop";
+  page.run("../operator_enroll/web/operator-enroll.js");
+  return page;
+}
+
+test("local enrollment uses the trimmed label as both passkey user names", async () => {
+  const page = enrollPage({ [ENROLL_PROOF_KEY]: PROOF }, { reply: server() });
+  page.byId["label-input"].value = "  Travel key  ";
+  page.byId["enroll-btn"].listeners.click[0]();
+  await until(() => page.byId["confirmation-code"].textContent !== "", "the enrollment confirmation code");
+  assert.equal(page.credentialCalls.length, 1);
+  const user = page.credentialCalls[0].publicKey.user;
+  assert.equal(user.name, "Travel key");
+  assert.equal(user.displayName, "Travel key");
+  assert.equal(JSON.parse(page.fetches[1].init.body).label, "Travel key");
+});
+
+test("local enrollment with an empty label stops before the ceremony", () => {
+  for (const label of ["", "   "]) {
+    const page = enrollPage({ [ENROLL_PROOF_KEY]: PROOF }, { reply: server() });
+    page.byId["label-input"].value = label;
+    page.byId["enroll-btn"].listeners.click[0]();
+    assert.equal(page.byId.status.textContent, "Enter a label first.");
+    assert.equal(page.credentialCalls.length, 0);
+    assert.equal(page.fetches.length, 0);
+  }
+});
+
+test("enrollment registers over the server challenge and posts the authenticator response", async () => {
+  const page = enrollPage({ [ENROLL_PROOF_KEY]: PROOF }, { reply: server() });
+  page.byId["enroll-btn"].listeners.click[0]();
+  await until(() => page.byId["confirmation-code"].textContent !== "", "the enrollment confirmation code");
+  assert.equal(page.fetches.length, 2);
+  const [challenge, posted] = page.fetches;
+  assert.equal(challenge.url, "/enroll/challenge");
+  assert.equal(challenge.init.method, "POST");
+  assert.equal(challenge.init.headers["x-session-proof"], PROOF);
+  assert.equal(challenge.init.headers["x-stellar-approval-csrf"], "e".repeat(64));
+
+  assert.equal(page.credentialCalls.length, 1);
+  const options = page.credentialCalls[0].publicKey;
+  assert.deepEqual(Array.from(options.challenge), Array.from(VECTOR_CHALLENGE));
+  assert.equal(options.rp.id, "localhost");
+  assert.deepEqual(JSON.parse(JSON.stringify(options.pubKeyCredParams)), [{ type: "public-key", alg: -7 }]);
+  assert.equal(options.attestation, "none");
+  assert.equal(options.authenticatorSelection.userVerification, "required");
+  assert.equal(options.authenticatorSelection.residentKey, "required");
+
+  assert.equal(posted.url, "/enroll/credential");
+  assert.equal(posted.init.headers["x-session-proof"], PROOF);
+  assert.equal(posted.init.headers["x-stellar-approval-csrf"], "e".repeat(64));
+  assert.deepEqual(JSON.parse(posted.init.body), {
+    credential_id_b64url: b64url(VECTOR_ID),
+    public_key_sec1_b64: b64url(VECTOR_KEY),
+    label: "laptop",
+    client_data_json: b64url(CLIENT_DATA),
+    attestation_object: b64url(ATTESTATION_OBJECT),
+  });
+
+  assert.equal(page.byId["confirmation-code"].textContent, VECTOR_CODE);
+  assert.equal(page.byId["confirmation-code"].hidden, false);
+  assert.match(page.byId.status.textContent, /Awaiting confirmation/);
+  assert.match(page.byId.status.textContent, new RegExp(VECTOR_CODE));
+  assert.match(page.byId.status.textContent, /at the terminal/);
+  assert.doesNotMatch(page.byId.status.textContent, /Enrolled/);
+});
+
+for (const [name, setup, code] of [
+  ["challenge", { challenge: Uint8Array.from(VECTOR_CHALLENGE, (b, i) => (i === 0 ? b ^ 1 : b)) }, "641f-fb30-29a4-176c"],
+  ["credential ID", { id: Uint8Array.from(VECTOR_ID, (b, i) => (i === 0 ? b ^ 1 : b)) }, "852e-a601-133f-7a16"],
+  ["key", { key: Uint8Array.from(VECTOR_KEY, (b, i) => (i === 64 ? b ^ 1 : b)) }, "edb8-5c46-9d41-ab10"],
+  ["credential ID length", { id: new Uint8Array(32).fill(0xa5) }, "b449-2171-5701-0e67"],
+]) {
+  test(`the confirmation code changes with the ${name}, as the Rust vectors do`, async () => {
+    const page = enrollPage(
+      { [ENROLL_PROOF_KEY]: PROOF },
+      {
+        reply: server({ challenge: setup.challenge }),
+        credential: () => makeCredential({ id: setup.id, key: setup.key }),
+      }
+    );
+    page.byId["enroll-btn"].listeners.click[0]();
+    await until(() => page.byId["confirmation-code"].textContent !== "", `the confirmation code for ${name}`);
+    assert.equal(page.byId["confirmation-code"].textContent, code);
+  });
+}
+
+test("the page shows the code of its own ceremony, never one the server names", async () => {
+  const page = enrollPage(
+    { [ENROLL_PROOF_KEY]: PROOF },
+    { reply: server({ credentialBody: { status: "awaiting_confirmation", code: "0000-0000-0000-0000" } }) }
+  );
+  page.byId["enroll-btn"].listeners.click[0]();
+  await until(() => page.byId["confirmation-code"].textContent !== "", "the ceremony's own confirmation code");
+  assert.equal(page.byId["confirmation-code"].textContent, VECTOR_CODE);
+});
+
+test("a refused registration shows the server's error and no code", async () => {
+  const page = enrollPage(
+    { [ENROLL_PROOF_KEY]: PROOF },
+    { reply: server({ credentialStatus: 400, credentialBody: { error: "registration_invalid" } }) }
+  );
+  page.byId["enroll-btn"].listeners.click[0]();
+  await until(() => page.byId.status.textContent === "Enrollment failed: registration_invalid", "the registration refusal");
+  assert.equal(page.fetches.length, 2);
+  assert.equal(page.byId.status.textContent, "Enrollment failed: registration_invalid");
+  assert.equal(page.byId["confirmation-code"].textContent, "");
+  assert.equal(page.byId["confirmation-code"].hidden, true);
+});
+
+test("a refused challenge request creates no passkey", async () => {
+  const page = enrollPage(
+    { [ENROLL_PROOF_KEY]: PROOF },
+    { reply: () => jsonReply(409, { error: "already_completed" }) }
+  );
+  page.byId["enroll-btn"].listeners.click[0]();
+  await until(() => page.byId.status.textContent === "Enrollment failed: already_completed", "the challenge refusal");
+  assert.equal(page.fetches.length, 1);
+  assert.equal(page.credentialCalls.length, 0);
+  assert.equal(page.byId.status.textContent, "Enrollment failed: already_completed");
+});
+
+test("enrollment without a stored proof creates no passkey and sends nothing", async () => {
+  const page = enrollPage({ [INBOX_PROOF_KEY]: PROOF });
+  page.byId["enroll-btn"].listeners.click[0]();
+  await until(() => /no wallet session/.test(page.byId.status.textContent), "the missing session proof status");
+  assert.equal(page.credentialCalls.length, 0);
+  assert.equal(page.fetches.length, 0);
+  assert.match(page.byId.status.textContent, /no wallet session/);
+});
+
+for (const [name, attributes] of [
+  ["no purpose", {}],
+  ["an unknown purpose", { "enroll-data": { "data-purpose": "remote-mainnet" } }],
+]) {
+  test(`a page with ${name} creates no passkey and sends nothing`, async () => {
+    const page = enrollPage({ [ENROLL_PROOF_KEY]: PROOF }, { attributes, reply: server() });
+    page.byId["enroll-btn"].listeners.click[0]();
+    await until(() => /no enrollment purpose/.test(page.byId.status.textContent), "the purpose refusal");
+    assert.equal(page.credentialCalls.length, 0);
+    assert.equal(page.fetches.length, 0);
+  });
+}
+
+const VIEW_DIGEST = "ab".repeat(32);
+const CHANGED = {
+  error: "approval.presence_changed",
+  message: "The consent details have changed; reload the approval page and review them again.",
+};
+
+function digestDetailPage(reply) {
+  const page = browser({
+    islands: {
+      "approval-data": {
+        nonce: "NONCE", csrf: "c".repeat(64), activity_csrf: "d".repeat(64),
+        approvable: true, view_digest: VIEW_DIGEST,
+      },
+    },
+    elements: ["approve-btn", "reject-btn", "result"],
+    storage: { [INBOX_PROOF_KEY]: PROOF },
+    reply,
+  });
+  page.run("./app_shared.js");
+  page.run("./app.js");
+  return page;
+}
+
+function remoteDetailPage(reply) {
+  const page = browser({
+    islands: {
+      "approval-data": { nonce: "NONCE", csrf: "c".repeat(64), approvable: true, view_digest: VIEW_DIGEST },
+    },
+    elements: ["approve-btn", "reject-btn", "result"],
+    reply,
+    credential: () => { throw new Error("no passkey is asked for in this test"); },
+  });
+  page.run("./app_shared.js");
+  page.run("../../../stellar-agent-approval-remote/src/web/app.js");
+  return page;
+}
+
+test("the loopback approve posts the island digest", () => {
+  const page = digestDetailPage();
+  page.byId["approve-btn"].listeners.click[0]();
+  assert.equal(page.fetches.length, 1);
+  const { url, init } = page.fetches[0];
+  assert.equal(url, "/approval/NONCE/approve");
+  assert.equal(init.headers["Content-Type"], "application/json");
+  assert.deepEqual(JSON.parse(init.body), { view_digest: VIEW_DIGEST });
+});
+
+test("the remote approve posts it to the challenge route", () => {
+  const page = remoteDetailPage(() => new Promise(() => {}));
+  page.byId["approve-btn"].listeners.click[0]();
+  assert.equal(page.fetches.length, 1);
+  const { url, init } = page.fetches[0];
+  assert.equal(url, "/approval/NONCE/challenge");
+  assert.equal(init.method, "POST");
+  assert.equal(init.headers["content-type"], "application/json");
+  assert.equal(init.headers["x-stellar-remote-approval-csrf"], "c".repeat(64));
+  assert.deepEqual(JSON.parse(init.body), { view_digest: VIEW_DIGEST });
+});
+
+test("a reject posts no digest", () => {
+  const local = digestDetailPage();
+  local.byId["reject-btn"].listeners.click[0]();
+  assert.equal(local.fetches[0].url, "/approval/NONCE/reject");
+  assert.equal(local.fetches[0].init.body, undefined);
+  const remote = remoteDetailPage(() => new Promise(() => {}));
+  remote.byId["reject-btn"].listeners.click[0]();
+  assert.equal(remote.fetches[0].url, "/approval/NONCE/challenge");
+  assert.equal(remote.fetches[0].init.body, undefined);
+});
+
+test("a refusal shows its code and message", async () => {
+  const page = digestDetailPage(() => jsonReply(409, CHANGED));
+  page.byId["approve-btn"].listeners.click[0]();
+  const result = page.byId.result;
+  await until(() => result.children.length === 2, "the refusal");
+  assert.equal(result.className, "result refused");
+  assert.equal(result.children[0].textContent, "Not recorded: approval.presence_changed");
+  assert.equal(result.children[1].textContent, CHANGED.message);
+  assert.equal(page.documentElement.attributes["data-state"], "error");
+});
+
+test("a refused challenge asks for no passkey", async () => {
+  const page = remoteDetailPage(() => jsonReply(409, CHANGED));
+  page.byId["approve-btn"].listeners.click[0]();
+  const result = page.byId.result;
+  await until(() => result.children.length === 2, "the refusal");
+  assert.equal(page.credentialCalls.length, 0);
+  assert.equal(page.fetches.length, 1, "no decision is posted");
+  assert.equal(result.className, "result refused");
+  assert.equal(result.children[0].textContent, "Not recorded: approval.presence_changed");
+  assert.equal(result.children[1].textContent, CHANGED.message);
+  assert.equal(page.documentElement.attributes["data-state"], "error");
+});

@@ -262,7 +262,7 @@ where
     let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved) {
         Ok(p) => p,
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(e.code(), e.message(&profile_name)));
+            render_json(&Envelope::<()>::err_raw(e.code(), e.message()));
             return 1;
         }
     };
@@ -460,7 +460,9 @@ where
         &profile_name,
         crate::common::profile_access::ProfileOrigin::Persisted,
         &primary_rpc,
+        crate::commands::submission_record::settlement_oracle(&profile).as_ref(),
         now_ms,
+        None,
     )
     .await;
 
@@ -471,11 +473,12 @@ where
     // used to validate the amounts length above, and zips 1:1 against the
     // SAME `vault_args.amounts_desired` vector later placed into
     // `VaultDepositArgs` (single-decode invariant).
+    crate::commands::submission_record::observe_intents(&profile, &profile_name).await;
     let policy_engine =
         match build_v1_policy_engine("vault", &profile.policy.engine, &profile, &profile_name) {
             Ok(pe) => pe,
             Err(msg) => {
-                render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
+                render_json(&Envelope::<()>::err_raw(msg.code(), msg.to_string()));
                 return 1;
             }
         };
@@ -539,13 +542,14 @@ where
     // ── Load signer ───────────────────────────────────────────────────────────
     let signer_entry_ref = &profile.mcp_signer_default;
     let expected_g = signer_entry_ref.account.as_str();
-    let signer_handle = match enrolled_keyring_signer(&profile_name, &profile, expected_g).await {
-        Ok(s) => s,
-        Err(e) => {
-            render_json(&Envelope::<()>::err(&e));
-            return 1;
-        }
-    };
+    let signer_handle =
+        match enrolled_keyring_signer(&profile_name, &profile, expected_g, None).await {
+            Ok(s) => s,
+            Err(e) => {
+                render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
+        };
 
     // ── Build VaultOperationPreview ───────────────────────────────────────────
     let preview = VaultOperationPreview::from_deposit(
@@ -578,19 +582,23 @@ where
         secondary_rpc.as_ref(),
         Some(timeout),
     );
-    // Thread the pre-flight-acquired audit writer + gate-derived legs so the
-    // adapter emits the ValueActionSubmitted row after a confirmed submit
-    // (non-fatal past this point — the pre-flight above is what fails closed).
+    // Thread the pre-flight-acquired audit writer and the gate-derived legs into
+    // the context. With a recorder attached, the adapter emits no
+    // `ValueActionSubmitted` row on success. Failure paths emit
+    // `SaRawInvocation` when an audit writer is available. The audit pre-flight
+    // fails closed.
     ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
     ctx.audit_legs = Some(&audit_legs);
     ctx.audit_tool = Some("stellar_defindex_vault_deposit");
 
     // Record the submission before the bytes leave: the receipt, the pending
-    // audit row and the spending-window reservation. The recorder settles all
-    // three against what the network answers, and owns the confirmed row the
-    // adapter would otherwise emit.
+    // audit row and the spending-window reservation. A reported success
+    // updates the receipt and keeps the exposure open through its accounting
+    // horizon or, without a time bound, until an operator clears it. The
+    // pending audit row stays open.
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
+            unvalued: None,
             policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
             profile: &profile,
             profile_name: profile_name.clone(),
@@ -679,7 +687,7 @@ where
     let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved) {
         Ok(p) => p,
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(e.code(), e.message(&profile_name)));
+            render_json(&Envelope::<()>::err_raw(e.code(), e.message()));
             return 1;
         }
     };
@@ -875,18 +883,21 @@ where
         &profile_name,
         crate::common::profile_access::ProfileOrigin::Persisted,
         &primary_rpc,
+        crate::commands::submission_record::settlement_oracle(&profile).as_ref(),
         now_ms,
+        None,
     )
     .await;
 
     // ── Operator policy evaluation (value-carrying; mirrors the MCP
     // `stellar_defindex_vault_withdraw` twin's `dispatch_gate_with_value`
     // mechanism) ──────────────────────────────────────────────────────────
+    crate::commands::submission_record::observe_intents(&profile, &profile_name).await;
     let policy_engine =
         match build_v1_policy_engine("vault", &profile.policy.engine, &profile, &profile_name) {
             Ok(pe) => pe,
             Err(msg) => {
-                render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
+                render_json(&Envelope::<()>::err_raw(msg.code(), msg.to_string()));
                 return 1;
             }
         };
@@ -949,13 +960,14 @@ where
     // ── Load signer ───────────────────────────────────────────────────────────
     let signer_entry_ref = &profile.mcp_signer_default;
     let expected_g = signer_entry_ref.account.as_str();
-    let signer_handle = match enrolled_keyring_signer(&profile_name, &profile, expected_g).await {
-        Ok(s) => s,
-        Err(e) => {
-            render_json(&Envelope::<()>::err(&e));
-            return 1;
-        }
-    };
+    let signer_handle =
+        match enrolled_keyring_signer(&profile_name, &profile, expected_g, None).await {
+            Ok(s) => s,
+            Err(e) => {
+                render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
+        };
 
     // ── Build VaultOperationPreview ───────────────────────────────────────────
     let preview = VaultOperationPreview::from_withdraw(
@@ -988,19 +1000,23 @@ where
         secondary_rpc.as_ref(),
         Some(timeout),
     );
-    // Thread the pre-flight-acquired audit writer + gate-derived leg so the
-    // adapter emits the ValueActionSubmitted row after a confirmed submit
-    // (non-fatal past this point — the pre-flight above is what fails closed).
+    // Thread the pre-flight-acquired audit writer and the gate-derived leg into
+    // the context. With a recorder attached, the adapter emits no
+    // `ValueActionSubmitted` row on success. Failure paths emit
+    // `SaRawInvocation` when an audit writer is available. The audit pre-flight
+    // fails closed.
     ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
     ctx.audit_legs = Some(&audit_legs);
     ctx.audit_tool = Some("stellar_defindex_vault_withdraw");
 
     // Record the submission before the bytes leave: the receipt, the pending
-    // audit row and the spending-window reservation. The recorder settles all
-    // three against what the network answers, and owns the confirmed row the
-    // adapter would otherwise emit.
+    // audit row and the spending-window reservation. A reported success
+    // updates the receipt and keeps the exposure open through its accounting
+    // horizon or, without a time bound, until an operator clears it. The
+    // pending audit row stays open.
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
+            unvalued: None,
             policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
             profile: &profile,
             profile_name: profile_name.clone(),
@@ -1115,7 +1131,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn run_deposit_refuses_mainnet_before_keyring_and_any_request() {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         crate::common::render::take_rendered_for_test();
         let rpc = wiremock::MockServer::start().await;
@@ -1157,7 +1179,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn run_withdraw_refuses_mainnet_before_keyring_and_any_request() {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         crate::common::render::take_rendered_for_test();
         let rpc = wiremock::MockServer::start().await;
@@ -1197,14 +1225,20 @@ mod tests {
     // ── keyring store initialisation ordering (deposit) ───────────────────────
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_deposit_initialises_keyring_store_before_signer_resolution() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         // The keyring initialiser must be invoked on the deposit path, after
         // the profile load and before the signer is resolved from the keyring.
-        // Both dependencies are injected, so no OS keychain or on-disk profile
-        // is touched and no process-global keyring store is registered — hence
-        // this test needs no `#[serial]`.  The injected initialiser returns an
-        // error so the run bails at that step, which proves the store
-        // initialisation gates the path ahead of signer resolution.
+        // Injected dependencies refuse initialization before signer resolution.
+        // The marked home isolates state lookups before that refusal.
         let profile_loaded = Arc::new(AtomicBool::new(false));
         let init_invoked = Arc::new(AtomicBool::new(false));
 
@@ -1236,7 +1270,7 @@ mod tests {
                 );
                 init_writer.store(true, Ordering::SeqCst);
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
-                    name: "keyring-order-test-sentinel".to_owned(),
+                    cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                 }))
             },
         )
@@ -1255,7 +1289,16 @@ mod tests {
     // ── keyring store initialisation ordering (withdraw) ──────────────────────
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_withdraw_initialises_keyring_store_before_signer_resolution() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let profile_loaded = Arc::new(AtomicBool::new(false));
         let init_invoked = Arc::new(AtomicBool::new(false));
 
@@ -1286,7 +1329,7 @@ mod tests {
                 );
                 init_writer.store(true, Ordering::SeqCst);
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
-                    name: "keyring-order-test-sentinel".to_owned(),
+                    cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                 }))
             },
         )
@@ -1499,6 +1542,14 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn run_deposit_refuses_after_ordered_trust_gate_when_audit_key_unminted() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
 
         let vault_c = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
@@ -1573,6 +1624,14 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn run_withdraw_refuses_after_ordered_trust_gate_when_audit_key_unminted() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
 
         let vault_c = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
@@ -1634,5 +1693,81 @@ mod tests {
              bypassed, short-circuited, or the pre-flight fired at the wrong \
              point"
         );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    async fn early_observation_precedes_window_gate() {
+        use crate::commands::submission_record::intent_gate_fixture::{IntentGateState, home};
+        for withdraw in [false, true] {
+            let (_home, _guard) = home();
+            let vault = stellar_strkey::Contract([1; 32]).to_string().to_string();
+            let asset = stellar_strkey::Contract([2; 32]).to_string().to_string();
+            let (key_xdr, entry_xdr) =
+                defindex_vault_instance_key_and_entry_xdr(&vault, DEFINDEX_VAULT_WASM_HASH, &asset);
+            let primary = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(VaultInstanceResponder { key_xdr, entry_xdr })
+                .mount(&primary)
+                .await;
+            let name = "intent-vault";
+            let mut profile =
+                Profile::builder_testnet_named(name, "signer", "account", "nonce", name)
+                    .rpc_url(primary.uri())
+                    .build();
+            let state = IntentGateState::seed(name, &mut profile).await;
+            for after in [false, false, true] {
+                if after {
+                    state.after_retention();
+                }
+                let before = state.bytes();
+                crate::common::render::take_rendered_for_test();
+                let code = if withdraw {
+                    run_withdraw_with_dependencies(
+                        &VaultWithdrawCliArgs {
+                            profile: Some(name.into()),
+                            vault: vault.clone(),
+                            from: asset.clone(),
+                            shares: 1_000_000,
+                            min_amounts_out: vec![900_000],
+                            override_upgradable: false,
+                            secondary_rpc_url: None,
+                        },
+                        |_| Ok(profile.clone()),
+                        || Ok(()),
+                    )
+                    .await
+                } else {
+                    run_deposit_with_dependencies(
+                        &VaultDepositCliArgs {
+                            profile: Some(name.into()),
+                            vault: vault.clone(),
+                            from: asset.clone(),
+                            amounts_desired: vec![1_000_000],
+                            amounts_min: vec![900_000],
+                            invest: false,
+                            override_upgradable: false,
+                            secondary_rpc_url: None,
+                        },
+                        |_| Ok(profile.clone()),
+                        || Ok(()),
+                    )
+                    .await
+                };
+                assert_eq!(code, 1);
+                assert_eq!(
+                    crate::test_rpc::last_rendered()["error"]["code"],
+                    if after {
+                        "audit.chain_key_unavailable"
+                    } else {
+                        "policy.deny.rate_limit_exceeded"
+                    }
+                );
+                state.assert_closed(&profile, u32::from(!after)).await;
+                if after {
+                    assert_eq!(state.bytes(), before);
+                }
+            }
+        }
     }
 }

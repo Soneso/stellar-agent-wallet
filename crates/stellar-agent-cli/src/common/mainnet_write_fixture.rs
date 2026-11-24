@@ -1,0 +1,1343 @@
+//! The mainnet write fixture of the CLI verb tests.
+//!
+//! A [`MainnetFixture`] isolates the data root, the profile selection and the
+//! keyring in a temporary home. It saves a stored mainnet profile whose
+//! primary and oracle records name two hosts of their own, carries the
+//! profile through the enrollment ceremony with the public `profile`
+//! runners, and routes the two hosts to two mocked endpoints through the
+//! test route map of [`crate::common::mainnet_write`]. The keyring is a fresh
+//! in-memory mock store that every keyring initialization keeps, so the
+//! runners' own initialization and the verbs' initializer reach the same
+//! entries. It is not a headless store, so the mainnet keyring-backend check
+//! passes as it does on the platform keyring. The enabled policy admits the
+//! test-support fixture credential, and every presence ceremony is answered
+//! with an assertion of that credential over the issued challenge, verified
+//! by the core verifier, unless a test installs another driver.
+//!
+//! Every test that builds a fixture is `#[serial]`: the data root, the
+//! environment, the keyring store and the mainnet clock are process-global.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test fixture; a failed setup step fails the calling test loudly"
+)]
+
+use std::cell::Cell;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+use clap::Parser as _;
+use serde_json::Value;
+use sha2::Digest as _;
+use stellar_agent_core::approval::view::PendingApprovalView;
+use stellar_agent_core::approval::{
+    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry,
+};
+use stellar_agent_core::error::WalletError;
+use stellar_agent_core::profile::loader::{self, ProfileLoadError};
+use stellar_agent_core::profile::schema::{
+    KeyringEntryRef, PolicyEngineKind, PrimaryProviderRecord, Profile, ProviderRecord,
+    default_approval_dir, default_policy_dir, default_profile_dir,
+};
+use stellar_agent_network::policy_state::{OpenAuthorization, PersistedWindowStore};
+use stellar_agent_network::{
+    MessagePayload, Signer, SmartAccountAuthDigest, SorobanAuthPayload, TxSigningPayload,
+    WebAuthnAssertion,
+};
+use stellar_agent_test_support::{ProfileEnvVarGuard, StellarAgentHomeGuard, WarningCapture};
+use wiremock::MockServer;
+
+use crate::commands::profile::{
+    bind_signer, enable_mainnet, enroll_owner_key, enroll_signer, rotate_attestation_key,
+    rotate_audit_key, rotate_nonce_key, sign_policy,
+};
+use crate::common::mainnet_confirm::{clear_shown_summaries, shown_summaries};
+use crate::common::mainnet_presence::driver::{self, Ceremony, Driver, DriverGuard};
+use crate::common::mainnet_write::{TestRoutesGuard, set_test_routes};
+use crate::common::signer_ceremony::{LedgerSignerFactoryGuard, set_ledger_signer_factory};
+use crate::common::tty::tests::{TestTty, test_tty, tty_checks_on_this_thread};
+use crate::test_rpc::{ClassicRpc, EnvSigner, methods};
+
+/// How far a test's fixed mainnet clock runs ahead of the system clock: the
+/// confirmation entry is created on the system clock, and the resolver
+/// refuses an entry created after its own now.
+pub(crate) const CLOCK_LEAD_MS: u64 = 5_000;
+
+/// Asserts that the signed envelope carries the deadline chosen at build time.
+pub(crate) fn assert_deadline_bound(envelope: &str, built_at_ms: u64) {
+    use stellar_xdr::{Limits, Preconditions, ReadXdr as _, TransactionEnvelope};
+    let TransactionEnvelope::Tx(tx) =
+        TransactionEnvelope::from_xdr_base64(envelope, Limits::none()).unwrap()
+    else {
+        panic!("classic envelope expected");
+    };
+    let Preconditions::Time(bounds) = tx.tx.cond else {
+        panic!("deadline expected")
+    };
+    assert_eq!(bounds.min_time.0, 0);
+    assert!(bounds.max_time.0 > built_at_ms / 1000);
+    assert!(bounds.max_time.0 <= built_at_ms / 1000 + 120);
+}
+
+/// The `precondition` field of each warning whose message is the mainnet
+/// refusal log line and whose `path` is `path`.
+pub(crate) fn refusal_warnings(capture: &WarningCapture, path: &str) -> Vec<String> {
+    capture
+        .seen()
+        .into_iter()
+        .filter(|event| {
+            event.get("message").map(String::as_str) == Some("mainnet authorization refused")
+                && event.get("path").map(String::as_str) == Some(&format!("{path:?}"))
+        })
+        .map(|event| event.get("precondition").cloned().unwrap_or_default())
+        .collect()
+}
+
+/// The host of the profile's primary endpoint.
+pub(crate) const PRIMARY_HOST: &str = "rpc.example.invalid";
+/// The host of the profile's oracle endpoint.
+pub(crate) const ORACLE_HOST: &str = "oracle.example.invalid";
+/// The seed of the enrolled agent signer.
+pub(crate) const AGENT_SEED: [u8; 32] = [0x41; 32];
+/// The variable holding the agent seed: the enrollment ceremony and testnet
+/// signing read it, and a mainnet verb given it as `--secret-env` refuses.
+pub(crate) const AGENT_VAR: &str = "STELLAR_AGENT_MAINNET_FIXTURE_AGENT_SK";
+/// The seed of the enrolled policy owner.
+const OWNER_SEED: [u8; 32] = [0x42; 32];
+/// The variable holding the owner seed for the policy signature.
+const OWNER_VAR: &str = "STELLAR_AGENT_MAINNET_FIXTURE_OWNER_SK";
+/// The allowlisted payment destination.
+pub(crate) const DESTINATION: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+/// The allowlisted account a sponsored create opens.
+pub(crate) const NEW_ACCOUNT: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
+/// The mainnet issuer the wallet pins for USDC.
+pub(crate) const ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+/// The pinned trustline asset.
+pub(crate) const TRUSTLINE_ASSET: &str =
+    "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+/// The native cross-check threshold, the 1000 XLM floor a signed threshold
+/// may not undercut: the 1 XLM payment and the 2 XLM create stay below it.
+pub(crate) const NATIVE_THRESHOLD_STROOPS: i64 = 10_000_000_000;
+
+/// The size of the window store's authenticated prefix.
+pub(crate) const WINDOW_HMAC_TAG_BYTES: usize = 32;
+
+/// The rule-lifetime line an approval rule needs; empty for other decisions.
+fn decision_lines(decision: &str) -> &'static str {
+    if decision == "require_approval" {
+        "ttl_secs = 300\n"
+    } else {
+        ""
+    }
+}
+
+/// The minimal valid native-pay rule: one pinned asset, an allowlisted
+/// destination, both caps and a rate limit, with `decision`.
+pub(crate) fn pay_rule(decision: &str, extra: &str) -> String {
+    format!(
+        "[[rules]]\nmatch = {{ tool = \"stellar_pay\", chain = \"stellar:mainnet\" }}\n\
+         criteria = [\n\
+         {{ kind = \"asset_allowlist\", assets = [\"native\"] }},\n\
+         {{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [\"{DESTINATION}\"] }},\n\
+         {{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"1000000000\" }},\n\
+         {{ kind = \"per_period_cap\", window = \"1d\", asset = \"native\", max_stroops = \"10000000000\" }},\n\
+         {{ kind = \"rate_limit\", window = \"1d\", max_calls = 100 }},\n\
+         {extra}]\ndecision = \"{decision}\"\n{}",
+        decision_lines(decision)
+    )
+}
+
+/// The native-pay rule with the amount cap and the call cap given.
+pub(crate) fn pay_rule_capped(decision: &str, period_cap_stroops: i64, max_calls: u32) -> String {
+    format!(
+        "[[rules]]\nmatch = {{ tool = \"stellar_pay\", chain = \"stellar:mainnet\" }}\n\
+         criteria = [\n\
+         {{ kind = \"asset_allowlist\", assets = [\"native\"] }},\n\
+         {{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [\"{DESTINATION}\"] }},\n\
+         {{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"1000000000\" }},\n\
+         {{ kind = \"per_period_cap\", window = \"1d\", asset = \"native\", max_stroops = \"{period_cap_stroops}\" }},\n\
+         {{ kind = \"rate_limit\", window = \"1d\", max_calls = {max_calls} }},\n\
+         ]\ndecision = \"{decision}\"\n{}",
+        decision_lines(decision)
+    )
+}
+
+/// The minimal valid sponsored-create rule, with `extra` criteria.
+pub(crate) fn create_rule(decision: &str, extra: &str) -> String {
+    format!(
+        "[[rules]]\nmatch = {{ tool = \"stellar_create_account\", chain = \"stellar:mainnet\" }}\n\
+         criteria = [\n\
+         {{ kind = \"asset_allowlist\", assets = [\"native\"] }},\n\
+         {{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [\"{NEW_ACCOUNT}\"] }},\n\
+         {{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"1000000000\" }},\n\
+         {{ kind = \"per_period_cap\", window = \"1d\", asset = \"native\", max_stroops = \"10000000000\" }},\n\
+         {{ kind = \"rate_limit\", window = \"1d\", max_calls = 100 }},\n\
+         {extra}]\ndecision = \"{decision}\"\n{}",
+        decision_lines(decision)
+    )
+}
+
+/// The claim rule whose one window criterion is a rate limit, with `extra`
+/// criteria.
+pub(crate) fn claim_rule(decision: &str, extra: &str) -> String {
+    format!(
+        "[[rules]]\nmatch = {{ tool = \"stellar_claim\", chain = \"stellar:mainnet\" }}\n\
+         criteria = [\n\
+         {{ kind = \"rate_limit\", window = \"1d\", max_calls = 100 }},\n\
+         {extra}]\ndecision = \"{decision}\"\n{}",
+        decision_lines(decision)
+    )
+}
+
+/// The trustline rule pinning [`TRUSTLINE_ASSET`] under a rate limit, with
+/// `extra` criteria.
+pub(crate) fn trustline_rule(decision: &str, extra: &str) -> String {
+    format!(
+        "[[rules]]\nmatch = {{ tool = \"stellar_trustline\", chain = \"stellar:mainnet\" }}\n\
+         criteria = [\n\
+         {{ kind = \"asset_allowlist\", assets = [\"{TRUSTLINE_ASSET}\"] }},\n\
+         {{ kind = \"rate_limit\", window = \"1d\", max_calls = 100 }},\n\
+         {extra}]\ndecision = \"{decision}\"\n{}",
+        decision_lines(decision)
+    )
+}
+
+/// A `minimum_reserve` criterion with `margin_stroops` above the protocol
+/// reserve.
+pub(crate) fn minimum_reserve(margin_stroops: i64) -> String {
+    format!("{{ kind = \"minimum_reserve\", margin_stroops = {margin_stroops} }},\n")
+}
+
+/// A `balance_floor` criterion of `min_stroops`.
+pub(crate) fn balance_floor(min_stroops: i64) -> String {
+    format!("{{ kind = \"balance_floor\", min_stroops = \"{min_stroops}\" }},\n")
+}
+
+/// A writer another handle takes on a profile's audit log in the middle of a
+/// run, at the first request of one method the run sends to its endpoint
+/// after [`LateWriter::arm`].
+///
+/// The take drops the registry's cached writer of the profile and opens a
+/// second handle on the log, as a writer of another process would hold it.
+#[derive(Clone, Default)]
+pub(crate) struct LateWriter {
+    target: Arc<Mutex<Option<(Profile, &'static str)>>>,
+    held: Arc<Mutex<Option<Result<stellar_agent_core::audit_log::AuditWriter, String>>>>,
+    /// The armed method's requests the take lets pass first.
+    skip: Arc<Mutex<usize>>,
+}
+
+impl LateWriter {
+    /// `rpc`, answering as before, whose first `method` request after the
+    /// arm takes the writer of the armed profile.
+    pub(crate) fn on(&self, rpc: ClassicRpc, method: &'static str) -> ClassicRpc {
+        let this = self.clone();
+        rpc.with_script(move |seen, _, _| {
+            if seen == method {
+                this.take();
+            }
+            None
+        })
+    }
+
+    /// Names the profile whose writer the next take holds.
+    pub(crate) fn arm(&self, fixture: &MainnetFixture) {
+        self.arm_after(fixture, 0);
+    }
+
+    /// [`Self::arm`] whose take runs at the `skipped + 1`th request of the
+    /// method after the arm.
+    pub(crate) fn arm_after(&self, fixture: &MainnetFixture, skipped: usize) {
+        *self.skip.lock().unwrap() = skipped;
+        *self.target.lock().unwrap() = Some((fixture.profile(), fixture.name));
+    }
+
+    fn take(&self) {
+        let mut target = self.target.lock().unwrap();
+        if target.is_none() {
+            return;
+        }
+        {
+            let mut skip = self.skip.lock().unwrap();
+            if *skip > 0 {
+                *skip -= 1;
+                return;
+            }
+        }
+        let Some((profile, name)) = target.take() else {
+            return;
+        };
+        drop(target);
+        stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(name);
+        let writer = crate::commands::value_audit::open_best_effort_audit_writer(
+            &profile,
+            name,
+            crate::common::profile_access::ProfileOrigin::Persisted,
+        )
+        .map_err(|error| error.to_string());
+        *self.held.lock().unwrap() = Some(writer);
+    }
+
+    /// Whether the take ran and holds the writer; the open's error when it
+    /// failed.
+    pub(crate) fn held(&self) -> Result<bool, String> {
+        match &*self.held.lock().unwrap() {
+            None => Ok(false),
+            Some(Ok(_)) => Ok(true),
+            Some(Err(error)) => Err(error.clone()),
+        }
+    }
+}
+
+/// How the fixture's profile and policy are set up.
+pub(crate) struct Spec {
+    name: &'static str,
+    rules: Vec<String>,
+    enable: bool,
+    engine: PolicyEngineKind,
+    profile_fee_cap: Option<u32>,
+    signed_fee_cap: u32,
+    authorization_ttl_seconds: i64,
+    primary: Option<ClassicRpc>,
+    oracle: Option<ClassicRpc>,
+    oracle_removed: bool,
+    testnet: bool,
+    submit_timeout_seconds: Option<u64>,
+    record_keys: bool,
+    signed_origin: bool,
+    signed_thresholds: Vec<(String, String)>,
+}
+
+impl Spec {
+    /// The default fixture requires approval for every verb and supplies a ceremony.
+    /// The profile fee cap is 1000 stroops, and the signed cap is 500 stroops.
+    /// Authorization lasts 60 seconds, and the native threshold is [`NATIVE_THRESHOLD_STROOPS`].
+    pub(crate) fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            rules: vec![
+                pay_rule("require_approval", ""),
+                create_rule("require_approval", ""),
+                claim_rule("require_approval", ""),
+                trustline_rule("require_approval", ""),
+            ],
+            enable: true,
+            engine: PolicyEngineKind::V1,
+            profile_fee_cap: Some(1000),
+            signed_fee_cap: 500,
+            authorization_ttl_seconds: 60,
+            primary: None,
+            oracle: None,
+            oracle_removed: false,
+            testnet: false,
+            submit_timeout_seconds: None,
+            record_keys: false,
+            signed_origin: false,
+            signed_thresholds: Vec::new(),
+        }
+    }
+
+    /// Adds `asset` with `value` to the signed
+    /// `[mainnet.cross_check_thresholds]`, the only table a mainnet token
+    /// threshold is read from.
+    pub(crate) fn signed_threshold(mut self, asset: &str, value: &str) -> Self {
+        self.signed_thresholds
+            .push((asset.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// Serves consent at the signed HTTPS origin: the profile's remote
+    /// listener binds a loopback port with a test certificate, and the
+    /// signed policy names the origin and the certificate's pin.
+    pub(crate) fn signed_origin(mut self) -> Self {
+        self.signed_origin = true;
+        self
+    }
+
+    /// Removes `oracle_provider_url` and the oracle provider record from
+    /// the stored mainnet profile after the ceremony, as an operator who
+    /// drops the oracle of an enabled profile does. The oracle endpoint is
+    /// started and unused.
+    pub(crate) fn without_oracle(mut self) -> Self {
+        self.oracle_removed = true;
+        self
+    }
+
+    /// A testnet profile reading through the primary endpoint at its own
+    /// URL, with the ceremony up to the signed version 1 policy and every
+    /// rule on `stellar:testnet`. The oracle endpoint is started and
+    /// unused.
+    pub(crate) fn testnet(mut self) -> Self {
+        self.testnet = true;
+        self.enable = false;
+        self
+    }
+
+    /// Saves the mainnet profile with `submit_timeout_seconds` set to
+    /// `seconds`.
+    pub(crate) fn submit_timeout_seconds(mut self, seconds: u64) -> Self {
+        self.submit_timeout_seconds = Some(seconds);
+        self
+    }
+
+    /// Replaces the policy rules.
+    pub(crate) fn rules(mut self, rules: Vec<String>) -> Self {
+        self.rules = rules;
+        self
+    }
+
+    /// Sets the signed policy's authorization lifetime in seconds.
+    pub(crate) fn authorization_ttl(mut self, seconds: i64) -> Self {
+        self.authorization_ttl_seconds = seconds;
+        self
+    }
+
+    /// Stops the ceremony before `profile enable-mainnet`, so the signed
+    /// policy has no `[mainnet]` table.
+    pub(crate) fn pre_enable(mut self) -> Self {
+        self.enable = false;
+        self
+    }
+
+    /// Saves the profile with the Noop engine and runs no ceremony.
+    pub(crate) fn noop_engine(mut self) -> Self {
+        self.engine = PolicyEngineKind::Noop;
+        self
+    }
+
+    /// Sets the profile's classic fee cap per operation.
+    pub(crate) fn profile_fee_cap(mut self, cap: Option<u32>) -> Self {
+        self.profile_fee_cap = cap;
+        self
+    }
+
+    /// Sets the signed `[mainnet]` fee cap per operation.
+    pub(crate) fn signed_fee_cap(mut self, cap: u32) -> Self {
+        self.signed_fee_cap = cap;
+        self
+    }
+
+    /// Serves the primary endpoint with `rpc`.
+    pub(crate) fn primary(mut self, rpc: ClassicRpc) -> Self {
+        self.primary = Some(rpc);
+        self
+    }
+
+    /// Serves the oracle endpoint with `rpc`.
+    pub(crate) fn oracle(mut self, rpc: ClassicRpc) -> Self {
+        self.oracle = Some(rpc);
+        self
+    }
+
+    /// Records fixture credentials for transfer to a fresh process.
+    pub(crate) fn record_process_keys(mut self) -> Self {
+        self.record_keys = true;
+        self
+    }
+
+    /// Sets up the fixture.
+    pub(crate) async fn build(self) -> MainnetFixture {
+        MainnetFixture::new(self).await
+    }
+}
+
+/// Installs a fresh in-memory mock store and makes every keyring
+/// initialization keep it until dropped, then reinstalls a fresh mock store
+/// so no later test reaches this fixture's entries.
+struct MockKeyringScope(Option<stellar_agent_test_support::keyring_mock::MutationLog>);
+
+impl MockKeyringScope {
+    fn set(record_keys: bool) -> Self {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        Self(
+            record_keys
+                .then(|| stellar_agent_test_support::keyring_mock::record_mutations().unwrap()),
+        )
+    }
+}
+
+impl Drop for MockKeyringScope {
+    fn drop(&mut self) {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+    }
+}
+
+/// A stored mainnet profile after the enrollment ceremony, with its primary
+/// and oracle hosts routed to mocked endpoints.
+pub(crate) struct MainnetFixture {
+    /// The profile name.
+    pub(crate) name: &'static str,
+    /// The enrolled agent signer; its seed is in [`AGENT_VAR`].
+    pub(crate) agent: EnvSigner,
+    /// The primary endpoint.
+    pub(crate) primary: MockServer,
+    /// The oracle endpoint.
+    pub(crate) oracle: MockServer,
+    calls: Rc<Cell<usize>>,
+    /// The certificate files of the signed-origin listener.
+    _signed_files: Option<tempfile::TempDir>,
+    presence: Option<DriverGuard>,
+    listener_presence: Option<crate::common::mainnet_presence::listener_driver::Guard>,
+    tty: Option<TestTty>,
+    tty_checks_at_start: u64,
+    _routes: TestRoutesGuard,
+    _owner: EnvSigner,
+    /// Opt-outs that keep the legacy commands unenforced for every kind; a
+    /// test's later enforcement guard overrides them.
+    _unenforced: Vec<stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard>,
+    _keyring: MockKeyringScope,
+    _profile_var: ProfileEnvVarGuard,
+    _home: StellarAgentHomeGuard,
+    _dir: stellar_agent_test_support::sandbox::StateSandbox,
+}
+
+/// Fails the fixture when a ceremony runner exited non-zero, with what it
+/// rendered.
+fn require_runner(step: &str, code: i32) {
+    let rendered = crate::common::render::take_rendered_for_test();
+    assert_eq!(code, 0, "{step} failed: {rendered:?}");
+}
+
+impl MainnetFixture {
+    /// Drops the opt-outs, so the compiled kind capabilities decide.
+    pub(crate) fn enforce_listed(&mut self) {
+        self._unenforced.clear();
+    }
+
+    /// Exports only this isolated fixture's credentials for a fresh child process.
+    pub(crate) fn save_process_keyring(&self, path: &std::path::Path) {
+        stellar_agent_core::approval::fixtures::save_process_keyring(
+            path,
+            self._keyring.0.as_ref().unwrap(),
+        );
+    }
+
+    async fn new(mut spec: Spec) -> Self {
+        crate::common::render::take_rendered_for_test();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let home_guard = StellarAgentHomeGuard::new(home.path());
+        let profile_var = ProfileEnvVarGuard::cleared();
+        let keyring = MockKeyringScope::set(spec.record_keys);
+        let agent = EnvSigner::new(AGENT_SEED, AGENT_VAR);
+        let owner = EnvSigner::new(OWNER_SEED, OWNER_VAR);
+        let name = spec.name;
+
+        let primary_rpc = spec
+            .primary
+            .take()
+            .unwrap_or_else(|| ClassicRpc::mainnet(&[&agent.g, DESTINATION, ISSUER]));
+        let oracle_rpc = spec
+            .oracle
+            .take()
+            .unwrap_or_else(|| ClassicRpc::mainnet(&[&agent.g, DESTINATION, ISSUER]));
+        let primary = primary_rpc.serve().await;
+        let oracle = oracle_rpc.serve().await;
+        let routes =
+            set_test_routes(&[(PRIMARY_HOST, &primary.uri()), (ORACLE_HOST, &oracle.uri())]);
+
+        let signer = KeyringEntryRef::default_signer(name);
+        let nonce = KeyringEntryRef::default_nonce(name);
+        if spec.testnet {
+            spec.rules = spec
+                .rules
+                .iter()
+                .map(|rule| rule.replace("stellar:mainnet", "stellar:testnet"))
+                .collect();
+            let profile = Profile::builder_testnet_named(
+                name,
+                &signer.service,
+                &signer.account,
+                &nonce.service,
+                &nonce.account,
+            )
+            .rpc_url(primary.uri())
+            .audit_log_path(home.path().join("audit.jsonl"))
+            .classic_max_fee_per_op_stroops(spec.profile_fee_cap)
+            .policy_engine(PolicyEngineKind::V1)
+            .build();
+            loader::save_to_dir(name, &profile, &default_profile_dir().unwrap()).unwrap();
+            Self::ceremony(&spec, &agent, &owner, None).await;
+            return Self::assemble(
+                name,
+                agent,
+                owner,
+                primary,
+                oracle,
+                routes,
+                keyring,
+                profile_var,
+                home_guard,
+                home,
+            );
+        }
+        let mut builder = Profile::builder_mainnet_named(
+            name,
+            format!("https://{PRIMARY_HOST}"),
+            &signer.service,
+            &signer.account,
+            &nonce.service,
+            &nonce.account,
+        )
+        .primary_provider(PrimaryProviderRecord::new(
+            "Fixture primary operator",
+            PRIMARY_HOST,
+        ))
+        .oracle_provider_url(url::Url::parse(&format!("https://{ORACLE_HOST}")).unwrap())
+        .oracle_provider(ProviderRecord::new(
+            "Fixture oracle operator",
+            ORACLE_HOST,
+            true,
+        ))
+        .audit_log_path(home.path().join("audit.jsonl"))
+        .classic_max_fee_per_op_stroops(spec.profile_fee_cap)
+        .policy_engine(spec.engine);
+        if spec.engine == PolicyEngineKind::Noop {
+            builder = builder.with_noop_engine();
+        }
+        let mut profile = builder.build();
+        if let Some(seconds) = spec.submit_timeout_seconds {
+            profile.submit_timeout_seconds = Some(seconds);
+        }
+        let signed = spec.signed_origin.then(|| {
+            use stellar_agent_core::approval::mainnet_fixtures::SIGNED_RP_ID;
+            let files = tempfile::tempdir().unwrap();
+            let leaf = stellar_agent_approval_remote::signed_origin_test_leaf(SIGNED_RP_ID);
+            let cert = files.path().join("cert.pem");
+            let key = files.path().join("key.pem");
+            std::fs::write(&cert, leaf.chain_pem()).unwrap();
+            std::fs::write(&key, &leaf.key_pem).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            profile.remote_approval = Some(
+                serde_json::from_value(serde_json::json!({
+                    "enabled": true, "bind": "127.0.0.1:0", "rp_id": SIGNED_RP_ID,
+                    "cert_path": cert, "key_path": key
+                }))
+                .unwrap(),
+            );
+            (files, leaf.pin)
+        });
+        loader::save_to_dir(name, &profile, &default_profile_dir().unwrap()).unwrap();
+
+        if spec.engine == PolicyEngineKind::V1 {
+            Self::ceremony(&spec, &agent, &owner, signed.as_ref().map(|(_, pin)| *pin)).await;
+        }
+        if spec.oracle_removed {
+            let directory = default_profile_dir().unwrap();
+            let mut stored = loader::load_from_dir(name, &directory, None).unwrap();
+            stored.oracle_provider_url = None;
+            if let Some(providers) = stored.providers.as_mut() {
+                providers.oracle = None;
+            }
+            loader::save_to_dir(name, &stored, &directory).unwrap();
+        }
+        let mut fixture = Self::assemble(
+            name,
+            agent,
+            owner,
+            primary,
+            oracle,
+            routes,
+            keyring,
+            profile_var,
+            home_guard,
+            home,
+        );
+        fixture._signed_files = signed.map(|(files, _)| files);
+        fixture
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the guards are moved into the fixture in their drop order"
+    )]
+    fn assemble(
+        name: &'static str,
+        agent: EnvSigner,
+        owner: EnvSigner,
+        primary: MockServer,
+        oracle: MockServer,
+        routes: TestRoutesGuard,
+        keyring: MockKeyringScope,
+        profile_var: ProfileEnvVarGuard,
+        home_guard: StellarAgentHomeGuard,
+        home: stellar_agent_test_support::sandbox::StateSandbox,
+    ) -> Self {
+        let calls = Rc::new(Cell::new(0));
+        clear_shown_summaries();
+        Self {
+            name,
+            agent,
+            primary,
+            oracle,
+            calls,
+            _signed_files: None,
+            presence: Some(driver::install(driver::fixture_credential())),
+            listener_presence: None,
+            tty: Some(test_tty(true, true)),
+            tty_checks_at_start: tty_checks_on_this_thread(),
+            _routes: routes,
+            _owner: owner,
+            _unenforced:
+                stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+                    name,
+                ),
+            _keyring: keyring,
+            _profile_var: profile_var,
+            _home: home_guard,
+            _dir: home,
+        }
+    }
+
+    /// Runs the enrollment ceremony through the public runners. With
+    /// `signed_pin`, the final signed policy names the signed approval
+    /// origin and that certificate pin.
+    async fn ceremony(
+        spec: &Spec,
+        agent: &EnvSigner,
+        owner: &EnvSigner,
+        signed_pin: Option<[u8; 32]>,
+    ) {
+        let name = spec.name;
+        let profile = Some(name.to_owned());
+        require_runner(
+            "rotate-audit-key",
+            rotate_audit_key::run(&rotate_audit_key::RotateAuditKeyArgs {
+                name: None,
+                profile: profile.clone(),
+            })
+            .await,
+        );
+        require_runner(
+            "enroll-signer",
+            enroll_signer::run(&enroll_signer::EnrollSignerArgs {
+                profile: profile.clone(),
+                secret_env: Some(AGENT_VAR.to_owned()),
+                expected_address: Some(agent.g.clone()),
+                force: false,
+                repair_identity: false,
+            })
+            .await,
+        );
+        require_runner(
+            "rotate-nonce-key",
+            rotate_nonce_key::run(&rotate_nonce_key::RotateNonceKeyArgs {
+                name: None,
+                profile: profile.clone(),
+            })
+            .await,
+        );
+        require_runner(
+            "enroll-owner-key",
+            enroll_owner_key::run(&enroll_owner_key::EnrollOwnerKeyArgs {
+                profile: profile.clone(),
+                secret_env: OWNER_VAR.to_owned(),
+                expected_address: Some(owner.g.clone()),
+                force: false,
+            })
+            .await,
+        );
+        require_runner(
+            "rotate-attestation-key",
+            rotate_attestation_key::run(&rotate_attestation_key::RotateAttestationKeyArgs {
+                name: None,
+                profile: profile.clone(),
+            })
+            .await,
+        );
+
+        let mut document = format!(
+            "version = {}\nscope = \"profile:{name}\"\n",
+            if spec.enable { 2 } else { 1 }
+        );
+        for rule in &spec.rules {
+            document.push('\n');
+            document.push_str(rule);
+        }
+        let policy_path = Self::policy_path_of(name);
+        std::fs::create_dir_all(policy_path.parent().unwrap()).unwrap();
+        std::fs::write(&policy_path, document).unwrap();
+        let sign = sign_policy::SignPolicyArgs {
+            previous_owner_secret_env: None,
+            profile: profile.clone(),
+            secret_env: OWNER_VAR.to_owned(),
+            file: None,
+        };
+        require_runner("sign-policy", sign_policy::run(&sign).await);
+        if !spec.testnet {
+            #[derive(clap::Parser)]
+            struct BindSigner {
+                #[command(flatten)]
+                args: bind_signer::BindSignerArgs,
+            }
+            let bind = BindSigner::try_parse_from([
+                "bind-signer",
+                "--profile",
+                name,
+                "--owner-secret-env",
+                OWNER_VAR,
+            ])
+            .unwrap();
+            require_runner("bind-signer", bind_signer::run(&bind.args).await);
+        }
+        if !spec.enable {
+            return;
+        }
+
+        #[derive(clap::Parser)]
+        struct EnableMainnet {
+            #[command(flatten)]
+            args: enable_mainnet::EnableMainnetArgs,
+        }
+        let enable = EnableMainnet::try_parse_from(["enable-mainnet", "--profile", name]).unwrap();
+        require_runner("enable-mainnet", enable_mainnet::run(&enable.args));
+
+        let raw = std::fs::read_to_string(&policy_path).unwrap();
+        let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+        doc.remove("signature");
+        doc["mainnet"]["classic_max_fee_per_op_stroops"] =
+            toml_edit::value(i64::from(spec.signed_fee_cap));
+        doc["mainnet"]["authorization_ttl_seconds"] =
+            toml_edit::value(spec.authorization_ttl_seconds);
+        let mut thresholds = toml_edit::Table::new();
+        thresholds.insert(
+            "native",
+            toml_edit::value(NATIVE_THRESHOLD_STROOPS.to_string()),
+        );
+        if spec
+            .rules
+            .iter()
+            .any(|rule| rule.contains("tool = \"stellar_pay\"") && rule.contains(TRUSTLINE_ASSET))
+        {
+            thresholds.insert(
+                TRUSTLINE_ASSET,
+                toml_edit::value(NATIVE_THRESHOLD_STROOPS.to_string()),
+            );
+        }
+        for (asset, value) in &spec.signed_thresholds {
+            thresholds.insert(asset, toml_edit::value(value.as_str()));
+        }
+        doc["mainnet"]["cross_check_thresholds"] = toml_edit::Item::Table(thresholds);
+        let authenticator = stellar_agent_test_support::webauthn::fixture_authenticator();
+        let mut credential = toml_edit::InlineTable::new();
+        credential.insert(
+            "credential_id_b64url",
+            authenticator.credential_id_b64url().into(),
+        );
+        credential.insert(
+            "public_key_sec1_b64url",
+            authenticator.public_key_sec1_b64url().into(),
+        );
+        let mut credentials = toml_edit::Array::new();
+        credentials.push(credential);
+        doc["mainnet"]["approval_credentials"] = toml_edit::value(credentials);
+        if let Some(pin) = signed_pin {
+            doc["mainnet"]["approval_origin"] =
+                toml_edit::value(stellar_agent_core::approval::mainnet_fixtures::SIGNED_ORIGIN);
+            doc["mainnet"]["approval_cert_spki_sha256"] =
+                toml_edit::value(stellar_agent_core::hex::encode(&pin));
+        }
+        let sequence = doc
+            .get("sequence")
+            .and_then(toml_edit::Item::as_integer)
+            .unwrap_or(1);
+        doc["sequence"] = toml_edit::value(sequence + 1);
+        std::fs::write(&policy_path, doc.to_string()).unwrap();
+        require_runner(
+            "sign-policy after enable-mainnet",
+            sign_policy::run(&sign).await,
+        );
+    }
+
+    /// Leaves every later presence ceremony to the profile's real signed
+    /// origin listener, with no test driver.
+    pub(crate) fn present_at_signed_origin(&mut self) {
+        self.presence = None;
+        self.listener_presence = None;
+    }
+
+    /// Answers every later presence ceremony through `driver`, starting
+    /// with an empty ceremony record.
+    pub(crate) fn present_with(
+        &mut self,
+        driver: impl FnMut(
+            &Ceremony,
+        ) -> Result<stellar_agent_core::approval::AssertionInput, WalletError>
+        + 'static,
+    ) {
+        // The previous guard clears the driver when it drops, so it goes
+        // before the new driver is installed.
+        self.presence = None;
+        self.presence = Some(driver::install(Box::new(driver) as Driver));
+    }
+
+    /// Answers every later presence ceremony with the fixture credential one
+    /// second past the on-chain deadline of an envelope built at the prompt:
+    /// before it answers, the driver sets `clock` to the prompt time plus
+    /// [`MAINNET_CLASSIC_DEADLINE_SECONDS`] and one second.
+    ///
+    /// [`MAINNET_CLASSIC_DEADLINE_SECONDS`]: stellar_agent_network::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS
+    pub(crate) fn present_past_the_deadline(
+        &mut self,
+        clock: Rc<stellar_agent_network::mainnet::clock::TestClockGuard>,
+    ) {
+        use stellar_agent_network::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS;
+        let mut answer = driver::fixture_credential();
+        self.present_with(move |ceremony| {
+            let prompted_at = stellar_agent_network::mainnet::clock::now_ms().unwrap();
+            clock.set(prompted_at + (MAINNET_CLASSIC_DEADLINE_SECONDS + 1) * 1000);
+            answer(ceremony)
+        });
+    }
+
+    /// Drives the real loopback listener with signed assertion flags.
+    pub(crate) fn present_in_browser(&mut self, flags: u8) {
+        self.presence = None;
+        self.listener_presence = Some(crate::common::mainnet_presence::listener_driver::install(
+            flags,
+        ));
+    }
+
+    /// Reports `stdin` and `stderr` as the terminal state.
+    pub(crate) fn terminal(&mut self, stdin: bool, stderr: bool) {
+        // The previous guard restores the state it replaced when it drops,
+        // so it goes before the new state is set.
+        self.tty = None;
+        self.tty = Some(test_tty(stdin, stderr));
+    }
+
+    /// The summaries the confirmation showed, oldest first.
+    pub(crate) fn summaries(&self) -> Vec<String> {
+        shown_summaries()
+    }
+
+    /// The presence ceremonies the confirmation started, oldest first.
+    pub(crate) fn ceremonies(&self) -> Vec<Ceremony> {
+        driver::ceremonies()
+    }
+
+    /// How often a terminal check ran since the fixture was built.
+    pub(crate) fn terminal_checks(&self) -> u64 {
+        tty_checks_on_this_thread() - self.tty_checks_at_start
+    }
+
+    /// Fails unless the run showed no summary, started no presence ceremony
+    /// and checked no terminal.
+    pub(crate) fn assert_no_consent_ceremony(&self) {
+        assert_eq!(self.terminal_checks(), 0, "the terminal is never checked");
+        assert!(self.summaries().is_empty(), "no summary is shown");
+        assert!(self.ceremonies().is_empty(), "no ceremony starts");
+    }
+
+    fn policy_path_of(name: &str) -> PathBuf {
+        default_policy_dir().unwrap().join(format!("{name}.toml"))
+    }
+
+    /// The signed policy file.
+    pub(crate) fn policy_path(&self) -> PathBuf {
+        Self::policy_path_of(self.name)
+    }
+
+    /// The profile loader the verbs' production `run` uses, over the
+    /// fixture's profile directory.
+    pub(crate) fn loader(&self) -> impl Fn(&str) -> Result<Profile, ProfileLoadError> + use<> {
+        let dir = default_profile_dir().unwrap();
+        move |name| loader::load_from_dir(name, &dir, None)
+    }
+
+    /// The keyring initializer the verbs' production `run` uses, counting its
+    /// calls.
+    pub(crate) fn initializer(&self) -> impl Fn() -> Result<(), WalletError> + use<> {
+        let calls = Rc::clone(&self.calls);
+        move || {
+            calls.set(calls.get() + 1);
+            stellar_agent_network::keyring::init_platform_keyring_store()
+        }
+    }
+
+    /// How often the initializer of [`Self::initializer`] ran.
+    pub(crate) fn initializer_calls(&self) -> usize {
+        self.calls.get()
+    }
+
+    /// The stored profile.
+    pub(crate) fn profile(&self) -> Profile {
+        loader::load_from_dir(self.name, &default_profile_dir().unwrap(), None).unwrap()
+    }
+
+    /// Rewrites the stored profile's signer coordinate to the placeholder
+    /// `profile init` writes, so the enrolled pin is unusable.
+    pub(crate) fn unpin_signer(&self) {
+        let mut profile = self.profile();
+        profile.mcp_signer_default = KeyringEntryRef::default_signer(self.name);
+        loader::save_to_dir(self.name, &profile, &default_profile_dir().unwrap()).unwrap();
+    }
+
+    /// Records a sent submission of the agent under `envelope_hash` and
+    /// `tx_hash`: its receipt and its authenticated reservation of 75
+    /// stroops in a one-day native window. Its time bound and its pending
+    /// start lie three days back, so its accounting horizon has passed and
+    /// any reconciliation that runs ends it.
+    pub(crate) fn seed_expired_hold(&self, envelope_hash: &str, tx_hash: &str) {
+        const THREE_DAYS_MS: u64 = 3 * 86_400_000;
+        let now_ms = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        self.seed_hold_since(envelope_hash, tx_hash, now_ms - THREE_DAYS_MS);
+    }
+
+    /// Records the sent submission [`Self::seed_expired_hold`] records, with
+    /// its time bound and its pending start at `since_ms`.
+    pub(crate) fn seed_hold_since(&self, envelope_hash: &str, tx_hash: &str, since_ms: u64) {
+        use stellar_agent_core::policy::v1::criteria::state_store::{
+            StateKey, WindowEntry, WindowLimit,
+        };
+        let profile = self.profile();
+        let source = self.agent.g.clone();
+        let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(self.name).unwrap();
+        receipts
+            .try_begin(envelope_hash, tx_hash, &source, 7, since_ms / 1_000, 1_000)
+            .unwrap();
+        receipts.mark_submitted(envelope_hash).unwrap();
+        PersistedWindowStore::for_profile(self.name)
+            .record_pending(
+                &profile,
+                &[WindowEntry::new(
+                    StateKey::new(self.name, 1, "native", 86_400),
+                    since_ms,
+                    75,
+                    WindowLimit::Amount {
+                        asset: "native".to_owned(),
+                        window: "1d".to_owned(),
+                        max_stroops: 1_000_000,
+                    },
+                )],
+                &stellar_agent_network::policy_state::SubmissionHold {
+                    destinations: Default::default(),
+                    chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                        profile.chain_id,
+                    ),
+                    id: envelope_hash.to_owned(),
+                    tx_hash: tx_hash.to_owned(),
+                    source,
+                    sequence: 7,
+                    max_time: since_ms / 1_000,
+                    pending_since_ms: since_ms,
+                    submission_ledger: 1_000,
+                    submission_anchor: None,
+                    operator_required: false,
+                },
+            )
+            .unwrap();
+    }
+
+    /// Moves the stored profile's `rpc_url`, and its primary provider
+    /// record's host, to `url`, as a same-user edit after the ceremony. The
+    /// moved host routes to the fixture's primary endpoint, so a request to
+    /// it is recorded there.
+    pub(crate) fn set_stored_rpc_url(&self, url: &str) {
+        let mut profile = self.profile();
+        let host = url::Url::parse(url).unwrap().host_str().unwrap().to_owned();
+        crate::common::mainnet_write::add_test_route(&host, &self.primary.uri());
+        profile.rpc_url = url.to_owned();
+        if let Some(primary) = profile.providers.as_mut().and_then(|p| p.primary.as_mut()) {
+            primary.host = host;
+        }
+        loader::save_to_dir(self.name, &profile, &default_profile_dir().unwrap()).unwrap();
+    }
+
+    /// Moves the stored profile's `oracle_provider_url`, and its oracle
+    /// provider record's host, to `url`, as a same-user edit after the
+    /// ceremony. The moved host routes to the fixture's oracle endpoint, so
+    /// a request to it is recorded there.
+    pub(crate) fn set_stored_oracle_url(&self, url: &str) {
+        let mut profile = self.profile();
+        let parsed = url::Url::parse(url).unwrap();
+        let host = parsed.host_str().unwrap().to_owned();
+        crate::common::mainnet_write::add_test_route(&host, &self.oracle.uri());
+        if let Some(oracle) = profile.providers.as_mut().and_then(|p| p.oracle.as_mut()) {
+            oracle.host = host;
+        }
+        profile.oracle_provider_url = Some(parsed);
+        loader::save_to_dir(self.name, &profile, &default_profile_dir().unwrap()).unwrap();
+    }
+
+    /// Flips one hex digit of the policy signature.
+    pub(crate) fn tamper_policy_signature(&self) {
+        let raw = std::fs::read_to_string(self.policy_path()).unwrap();
+        let start = raw.find("sig = \"").unwrap() + "sig = \"".len();
+        let mut bytes = raw.into_bytes();
+        bytes[start] = if bytes[start] == b'0' { b'1' } else { b'0' };
+        std::fs::write(self.policy_path(), bytes).unwrap();
+    }
+
+    /// Removes [`AGENT_VAR`] from the process environment, so a later run
+    /// that signs as the agent can only have read the seed from the keyring.
+    #[allow(
+        unsafe_code,
+        reason = "test-only process environment mutation; serialised by #[serial]"
+    )]
+    pub(crate) fn remove_agent_seed_variable(&self) {
+        // SAFETY: every test that builds the fixture is `#[serial]`, so no
+        // other test thread reads or writes the environment meanwhile.
+        unsafe {
+            std::env::remove_var(AGENT_VAR);
+        }
+    }
+
+    /// Deletes the keyring entry at `coordinate`.
+    pub(crate) fn delete_keyring_entry(&self, coordinate: &KeyringEntryRef) {
+        keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+            .unwrap()
+            .delete_credential()
+            .unwrap();
+    }
+
+    /// The approval store file of the profile.
+    pub(crate) fn approval_store_path(&self) -> PathBuf {
+        default_approval_dir()
+            .unwrap()
+            .join(format!("{}.toml", self.name))
+    }
+
+    /// The entries of the profile's pending-approval store.
+    pub(crate) fn pending_entries(&self) -> Vec<PendingApprovalView> {
+        let path = self.approval_store_path();
+        if !path.exists() {
+            return Vec::new();
+        }
+        let store = open_with_retry(&path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF).unwrap();
+        store.snapshot(stellar_agent_core::timefmt::now_unix_ms().unwrap())
+    }
+
+    /// The authorizations effective at `now_ms`.
+    pub(crate) fn open_authorizations(&self, now_ms: u64) -> Vec<OpenAuthorization> {
+        PersistedWindowStore::for_profile(self.name)
+            .open_authorizations(&self.profile(), now_ms)
+            .unwrap()
+    }
+
+    /// The number of submissions whose window rows are still pending, not
+    /// settled against the network's answer.
+    pub(crate) fn pending_reservations(&self) -> usize {
+        PersistedWindowStore::for_profile(self.name)
+            .pending_reservations(&self.profile())
+            .unwrap()
+            .len()
+    }
+
+    /// Commits the window store's first write 310 s before now, so that the
+    /// native coverage marker it establishes covers a balance read that the
+    /// endpoint reports closed now.
+    pub(crate) fn cover_native_history(&self) {
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now - 310_000);
+        PersistedWindowStore::for_profile(self.name)
+            .record_and_persist(&self.profile(), &[])
+            .unwrap();
+    }
+
+    /// The window store file of the profile.
+    pub(crate) fn window_path(&self) -> PathBuf {
+        stellar_agent_core::profile::schema::default_policy_window_state_path_for(self.name)
+    }
+
+    /// The window store's JSON body after its 32-byte HMAC tag.
+    pub(crate) fn window_body(&self) -> Value {
+        let bytes = std::fs::read(self.window_path()).unwrap();
+        serde_json::from_slice(&bytes[WINDOW_HMAC_TAG_BYTES..]).unwrap()
+    }
+
+    /// The audit rows of `kind`, oldest first.
+    pub(crate) fn audit_rows(&self, kind: &str) -> Vec<Value> {
+        crate::test_rpc::audit_rows(&self.profile(), kind)
+    }
+
+    /// The number of rows of every kind in the audit log; zero when the log
+    /// does not exist.
+    pub(crate) fn audit_row_count(&self) -> usize {
+        std::fs::read_to_string(&self.profile().audit_log_path)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    /// The JSON-RPC methods the primary received.
+    pub(crate) async fn primary_methods(&self) -> Vec<String> {
+        methods(&self.primary).await
+    }
+
+    /// The JSON-RPC methods the oracle received.
+    pub(crate) async fn oracle_methods(&self) -> Vec<String> {
+        methods(&self.oracle).await
+    }
+
+    /// The envelopes the primary was asked to send, base64.
+    pub(crate) async fn sent_envelopes(&self) -> Vec<String> {
+        self.primary
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
+            .filter(|body| body["method"] == "sendTransaction")
+            .map(|body| body["params"]["transaction"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Asserts that `envelope` carries exactly one signature, verifying
+    /// under the enrolled agent key over the mainnet payload.
+    pub(crate) fn assert_signed_by_agent(&self, envelope: &str) {
+        use stellar_xdr::{Limits, ReadXdr as _, TransactionEnvelope, WriteXdr as _};
+        let TransactionEnvelope::Tx(v1) =
+            TransactionEnvelope::from_xdr_base64(envelope, Limits::none()).unwrap()
+        else {
+            panic!("not a v1 envelope");
+        };
+        assert_eq!(v1.signatures.len(), 1, "one signature");
+        let payload = stellar_xdr::TransactionSignaturePayload {
+            network_id: stellar_xdr::Hash(
+                sha2::Sha256::digest(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE).into(),
+            ),
+            tagged_transaction: stellar_xdr::TransactionSignaturePayloadTaggedTransaction::Tx(
+                v1.tx.clone(),
+            ),
+        };
+        let digest: [u8; 32] = sha2::Sha256::digest(payload.to_xdr(Limits::none()).unwrap()).into();
+        let key = ed25519_dalek::SigningKey::from_bytes(&AGENT_SEED).verifying_key();
+        let signature =
+            ed25519_dalek::Signature::from_slice(v1.signatures[0].signature.0.as_slice()).unwrap();
+        use ed25519_dalek::Verifier as _;
+        key.verify(&digest, &signature).unwrap();
+        assert_eq!(
+            v1.signatures[0].hint.0,
+            key.as_bytes()[28..32],
+            "the hint is the agent key's"
+        );
+    }
+}
+
+/// The calls a [`LedgerDouble`] received, in order.
+pub(crate) type LedgerCalls = Arc<Mutex<Vec<&'static str>>>;
+
+/// Runs inside the double's transaction signing call, before it signs.
+pub(crate) type BeforeSign = Arc<dyn Fn() -> Result<(), WalletError> + Send + Sync>;
+
+/// A Ledger in place of the device, holding the agent key.
+///
+/// Its constructor runs the test's `construct` hook, which may refuse with a
+/// device error, and records `construct`; its public key is the agent key;
+/// its transaction signing call records `sign_tx_payload`, runs the test's
+/// `before_sign` hook, which may refuse, and signs with the agent key.
+struct LedgerDouble {
+    key: ed25519_dalek::SigningKey,
+    calls: LedgerCalls,
+    before_sign: BeforeSign,
+}
+
+#[async_trait::async_trait]
+impl Signer for LedgerDouble {
+    async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
+        self.calls.lock().unwrap().push("sign_tx_payload");
+        (self.before_sign)()?;
+        use ed25519_dalek::Signer as _;
+        Ok(self.key.sign(payload.as_bytes()).to_bytes())
+    }
+
+    async fn sign_auth_digest(
+        &self,
+        _digest: &SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
+        panic!("the classic verbs sign no auth digest")
+    }
+
+    async fn sign_soroban_address_auth_payload(
+        &self,
+        _payload: &SorobanAuthPayload,
+    ) -> Result<[u8; 64], WalletError> {
+        panic!("the classic verbs sign no Soroban payload")
+    }
+
+    async fn sign_message(&self, _payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
+        panic!("the classic verbs sign no message")
+    }
+
+    async fn sign_webauthn_assertion(
+        &self,
+        _auth_digest: &SmartAccountAuthDigest,
+        _credential_id: &[u8],
+    ) -> Result<WebAuthnAssertion, WalletError> {
+        panic!("the classic verbs sign no WebAuthn assertion")
+    }
+
+    async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
+        self.calls.lock().unwrap().push("public_key");
+        Ok(stellar_strkey::ed25519::PublicKey(
+            self.key.verifying_key().to_bytes(),
+        ))
+    }
+}
+
+/// Makes the mainnet Ledger signer on this thread a [`LedgerDouble`] of the
+/// agent key until the guard drops, and returns the guard with the double's
+/// call record.
+///
+/// `construct` runs when the signer is constructed and refuses the
+/// construction with its error; `before_sign` runs inside every transaction
+/// signing call.
+pub(crate) fn install_ledger_double(
+    construct: impl Fn() -> Result<(), WalletError> + 'static,
+    before_sign: impl Fn() -> Result<(), WalletError> + Send + Sync + 'static,
+) -> (LedgerSignerFactoryGuard, LedgerCalls) {
+    let calls: LedgerCalls = Arc::default();
+    let before_sign: BeforeSign = Arc::new(before_sign);
+    let record = Arc::clone(&calls);
+    let guard = set_ledger_signer_factory(Rc::new(move |_account_index, _source| {
+        record.lock().unwrap().push("construct");
+        construct()?;
+        let key = ed25519_dalek::SigningKey::from_bytes(&AGENT_SEED);
+        Ok((
+            stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()),
+            Box::new(LedgerDouble {
+                key,
+                calls: Arc::clone(&record),
+                before_sign: Arc::clone(&before_sign),
+            }) as Box<dyn Signer + Send + Sync>,
+        ))
+    }));
+    (guard, calls)
+}
+
+/// Makes the mainnet Ledger on this thread report `DESTINATION` as its
+/// public key until the guard drops. The double panics when asked to sign.
+pub(crate) fn install_mismatched_ledger() -> LedgerSignerFactoryGuard {
+    set_ledger_signer_factory(Rc::new(|_, _| {
+        Ok((
+            stellar_strkey::ed25519::PublicKey::from_string(DESTINATION).unwrap(),
+            Box::new(LedgerDouble {
+                key: ed25519_dalek::SigningKey::from_bytes(&AGENT_SEED),
+                calls: Arc::default(),
+                before_sign: Arc::new(|| panic!("a mismatched Ledger must not sign")),
+            }),
+        ))
+    }))
+}
+
+/// The authorizations of the stored profile `name` effective at `now_ms`,
+/// for a hook that runs while a verb holds the fixture.
+pub(crate) fn open_authorizations_of(name: &str, now_ms: u64) -> Vec<OpenAuthorization> {
+    let profile = loader::load_from_dir(name, &default_profile_dir().unwrap(), None).unwrap();
+    PersistedWindowStore::for_profile(name)
+        .open_authorizations(&profile, now_ms)
+        .unwrap()
+}

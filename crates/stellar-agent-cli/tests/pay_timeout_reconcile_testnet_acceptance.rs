@@ -1,5 +1,5 @@
 //! Testnet acceptance: a payment whose confirmation does not arrive in time is
-//! recorded, and `tx status` settles it against the chain.
+//! recorded, and `tx status` reconciles it against the chain.
 //!
 //! # What this proves on-chain
 //!
@@ -24,15 +24,16 @@
 //!    `error.details` carries the full transaction hash, the envelope hash,
 //!    and the verb that resolves it.
 //! 3. `stellar-agent tx status <HASH>` reconciles the submission: the chain
-//!    reports `SUCCESS`, the receipt becomes `success`, and the reservation
-//!    becomes recorded spend.
-//! 4. The audit log holds the pending row written before the send and the
-//!    submitted row reconciliation wrote after.
+//!    reports `SUCCESS` and the receipt becomes `success`. The reservation
+//!    stays open as exposure through its accounting horizon or, without a
+//!    time bound, until an operator clears it.
+//! 4. The audit log holds the pending row written before the send, and
+//!    reconciliation writes no submitted row after it.
 //!
 //! # Fixture setup
 //!
 //! Mirrors `pay_policy_v1_testnet_acceptance.rs`: a per-run unique profile
-//! name, an owner keypair enrolled into the real OS keyring through
+//! name, an owner keypair enrolled into the selected acceptance store through
 //! `profile enroll-owner-key`, a signed V1 policy document, and a
 //! Friendbot-funded source and destination. Every keyring entry the fixture
 //! writes is removed by an RAII guard.
@@ -52,7 +53,9 @@
     reason = "test-only; panics and unwraps are acceptable in testnet acceptance tests"
 )]
 
-use std::process::Command;
+#[path = "cli/acceptance_storage.rs"]
+mod acceptance_storage;
+
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -74,10 +77,10 @@ const OWNER_KEY_SERVICE_PREFIX: &str = "stellar-agent-owner-";
 /// spending-window reservation.
 const CAP_STROOPS: i64 = 1_000_000_000;
 
-/// Submission timeout, in seconds. Below testnet's ledger-close interval, so
-/// the confirmation poll can expire on a transaction that then lands, and
-/// above the round trips the submit layer makes before the send, so the send
-/// itself is never cut off.
+/// Submission timeout, in seconds. It bounds the send and the confirmation
+/// poll, while the reads before the send run under the pre-send budget. Below
+/// testnet's ledger-close interval, so the confirmation poll can expire on a
+/// transaction that then lands.
 const SUBMIT_TIMEOUT_SECONDS: &str = "3";
 
 /// Delays, in milliseconds, applied after an observed ledger close before a
@@ -258,7 +261,8 @@ fn write_signed_policy_toml(home: &std::path::Path, profile: &str, owner: &Signi
 }
 
 fn rotate_audit_key_via_cli(home: &std::path::Path, profile: &str) -> KeyringGuard {
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
+    let output = acceptance_storage::command(env!("CARGO_BIN_EXE_stellar-agent"), home, None)
         .args(["profile", "rotate-audit-key", profile])
         .env("STELLAR_AGENT_HOME", home)
         .output()
@@ -282,7 +286,8 @@ fn enroll_owner_key_via_cli(
     owner_s_strkey: &str,
     owner_g_strkey: &str,
 ) -> KeyringGuard {
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
+    let output = acceptance_storage::command(env!("CARGO_BIN_EXE_stellar-agent"), home, None)
         .args([
             "profile",
             "enroll-owner-key",
@@ -308,7 +313,7 @@ fn enroll_owner_key_via_cli(
 }
 
 /// Removes the profile's window-state HMAC key and its generation counter,
-/// both of which the first recorded submission mints in the real keyring.
+/// both of which the first recorded submission mints in the selected store.
 fn window_state_guards(profile: &str) -> Vec<KeyringGuard> {
     let base =
         stellar_agent_core::profile::schema::KeyringEntryRef::default_policy_window_state_key(
@@ -330,7 +335,8 @@ fn run_cli(
     args: &[&str],
     env: &[(&str, &str)],
 ) -> (i32, serde_json::Value) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
+    let mut command = acceptance_storage::command(env!("CARGO_BIN_EXE_stellar-agent"), home, None);
     command.args(args).env("STELLAR_AGENT_HOME", home);
     for (key, value) in env {
         command.env(key, value);
@@ -370,14 +376,30 @@ fn audit_rows(home: &std::path::Path, profile: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// A timed-out payment is recorded, reported with its hash, and settled by
+/// A timed-out payment is recorded, reported with its hash, and reconciled by
 /// `tx status` once the chain has it.
 #[tokio::test]
+#[serial_test::serial]
 async fn pay_timeout_is_recorded_and_tx_status_reconciles_it() {
-    stellar_agent_network::init_platform_keyring_store()
-        .expect("platform keyring store must initialise on this host");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    // Parent key reads and child key writes share this owned home and the
+    // explicitly selected acceptance backend. Native access needs its permit.
+    acceptance_storage::dispatch(stellar_agent_network::init_platform_keyring_store, || {
+        #[cfg(feature = "live-platform-keyring")]
+        {
+            use stellar_agent_network::keyring::live::{
+                LivePlatformKeyring, init_platform_keyring_store_live,
+            };
+            init_platform_keyring_store_live(
+                LivePlatformKeyring::acknowledge_real_platform_keyring(),
+            )
+        }
+        #[cfg(not(feature = "live-platform-keyring"))]
+        unreachable!("selection requires the native feature")
+    })
+    .expect("selected acceptance store");
 
-    let home = tempfile::TempDir::new().expect("tempdir");
     let profile_name = unique_profile_name();
 
     let owner_signing_key = SigningKey::generate(&mut OsRng);
@@ -520,16 +542,16 @@ async fn pay_timeout_is_recorded_and_tx_status_reconciles_it() {
     );
     assert_eq!(
         settled["data"]["record"]["reservation_open"].as_bool(),
-        Some(false),
-        "a confirmed reservation becomes recorded spend: {settled}"
+        Some(true),
+        "a reported success retains possible spending: {settled}"
     );
 
-    // The submitted row the submission never got to write is now in the log.
+    // A success report supplies no authenticated outcome row.
     let rows = audit_rows(home.path(), &profile_name);
     assert_eq!(
         rows_for(&rows, "value_action_submitted", &envelope_hash).len(),
-        1,
-        "reconciliation writes the submitted row: {rows:?}"
+        0,
+        "reconciliation writes no authenticated outcome row: {rows:?}"
     );
 
     // The audit log's own chain still verifies after both rows.

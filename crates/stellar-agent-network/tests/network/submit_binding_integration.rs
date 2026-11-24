@@ -300,15 +300,16 @@ async fn signature_by_unknown_key_refuses_unverifiable() {
         "{err:?}"
     );
     let outsider = public_key_for_seed(OUTSIDER_SEED);
-    let expected_hint = format!(
+    let refused_hint = format!(
         "{:02x}{:02x}{:02x}{:02x}",
         outsider[28], outsider[29], outsider[30], outsider[31]
     );
-    assert!(
-        err.message().contains(&expected_hint),
-        "the refusal must report the offending signature's hint {expected_hint}: {}",
-        err.message()
+    assert_eq!(
+        err.message(),
+        "transaction_xdr must contain signatures that verify against a source-account signer on \
+         the selected network; rebuild and sign the envelope for that network."
     );
+    assert!(!format!("{err:?}").contains(&refused_hint), "{err:?}");
 }
 
 /// A signature that claims a gathered signer's hint but was produced by a

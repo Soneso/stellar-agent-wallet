@@ -307,6 +307,7 @@ pub async fn submit_fee_bump_idempotent(
     // This avoids re-decoding an outer fee-bump envelope.
     let inner_envelope_for_max_time = TransactionEnvelope::Tx(v1_inner.clone());
     let inner_max_time = extract_max_time(&inner_envelope_for_max_time);
+    let destinations = crate::submit::payment_destinations(&inner_envelope_for_max_time);
 
     // The replay identity is the INNER transaction's: the fee source consumes
     // no sequence of its own.
@@ -315,13 +316,14 @@ pub async fn submit_fee_bump_idempotent(
 
     // ── Step 5: atomic winner/loser gate ─────────────────────────────────────
     let outcome = store
-        .try_begin(
+        .try_begin_to(
             &inner_key,
             &outer_tx_hash_hex,
             &inner_source,
             inner_sequence,
             inner_max_time,
             recorded_at_ledger,
+            &destinations,
         )
         .map_err(|e| {
             WalletError::Internal(InternalError::UnexpectedState {
@@ -355,24 +357,32 @@ pub async fn submit_fee_bump_idempotent(
                 // if it refuses (submitted was somehow true), fall back to
                 // finalize(Failed) to ensure the entry does not accumulate as
                 // a stale Pending.
-                let abandoned = store
-                    .abandon_pre_submit(&inner_key)
-                    .map(|()| true)
-                    .unwrap_or_else(|fe| {
-                        tracing::warn!(
-                            inner_key = %redacted_inner,
-                            error = %fe,
-                            "submit_fee_bump_idempotent: abandon_pre_submit failed"
-                        );
-                        false
-                    });
+                #[cfg(test)]
+                let abandon = if DESTINATION_ABANDON_FAIL.replace(false) {
+                    Err(stellar_agent_core::profile::receipt::ReceiptStoreError::MutexPoisoned)
+                } else {
+                    store.abandon_pre_submit(&inner_key)
+                };
+                #[cfg(not(test))]
+                let abandon = store.abandon_pre_submit(&inner_key);
+                let abandoned = abandon.map(|()| true).unwrap_or_else(|fe| {
+                    tracing::warn!(
+                        inner_key = %redacted_inner,
+                        error = %fe,
+                        "submit_fee_bump_idempotent: abandon_pre_submit failed"
+                    );
+                    false
+                });
 
                 if !abandoned {
                     // Fallback: finalize as Failed so the entry is not left Pending.
                     let code = e.code().to_owned();
-                    if let Err(fe) =
-                        store.finalize(&inner_key, ReceiptStatus::Failed { code }, None)
-                    {
+                    if let Err(fe) = store.finalize_to(
+                        &inner_key,
+                        ReceiptStatus::Failed { code },
+                        None,
+                        &destinations,
+                    ) {
                         tracing::warn!(
                             inner_key = %redacted_inner,
                             error = %fe,
@@ -421,6 +431,7 @@ pub async fn submit_fee_bump_idempotent(
                 &inner_key,
                 recorded_at_ledger,
                 inner_max_time,
+                &destinations,
             )
             .await
         }
@@ -515,9 +526,9 @@ fn compute_outer_tx_hash_hex(
     // parse_fee_source helper, but we only need the MuxedAccount here and
     // parse_fee_source is private to fee_bump.rs).
     let pk = stellar_strkey::ed25519::PublicKey::from_string(fee_source).map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("fee_source invalid in outer hash computation: {e}"),
-        })
+        WalletError::Validation(ValidationError::address_check(format!(
+            "fee_source invalid in outer hash computation: {e}"
+        )))
     })?;
     let fee_source_muxed = MuxedAccount::Ed25519(Uint256(pk.0));
 
@@ -645,6 +656,11 @@ async fn wait_for_winner_fee_bump(
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+thread_local! {
+    static DESTINATION_ABANDON_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(
         clippy::unwrap_used,
@@ -671,6 +687,118 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ReceiptStore::open_at(dir.path(), "fee-bump-retry-test").unwrap();
         (dir, store)
+    }
+
+    #[tokio::test]
+    async fn idempotent_and_fee_bump_receipts_keep_their_destination() {
+        use crate::signing::{MessagePayload, TxSigningPayload};
+        use stellar_agent_core::profile::receipt::PaymentDestinations;
+        struct RefusingSigner {
+            store: ReceiptStore,
+            expected: PaymentDestinations,
+        }
+        #[async_trait::async_trait]
+        impl Signer for RefusingSigner {
+            async fn sign_tx_payload(&self, _: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
+                let receipts = self.store.all().unwrap();
+                assert_eq!(receipts.len(), 1);
+                assert_eq!(receipts[0].destinations, self.expected);
+                std::fs::write(self.store.file_path().unwrap(), b"{}").unwrap();
+                Err(WalletError::Internal(InternalError::UnexpectedState {
+                    detail: "signing refused".to_owned(),
+                }))
+            }
+            async fn sign_auth_digest(
+                &self,
+                _: &crate::signing::SmartAccountAuthDigest,
+            ) -> Result<[u8; 64], WalletError> {
+                unreachable!()
+            }
+            async fn sign_soroban_address_auth_payload(
+                &self,
+                _: &crate::signing::SorobanAuthPayload,
+            ) -> Result<[u8; 64], WalletError> {
+                unreachable!()
+            }
+            async fn sign_webauthn_assertion(
+                &self,
+                _: &crate::signing::SmartAccountAuthDigest,
+                _: &[u8],
+            ) -> Result<crate::signing::WebAuthnAssertion, WalletError> {
+                unreachable!()
+            }
+            async fn sign_message(&self, _: &MessagePayload) -> Result<[u8; 64], WalletError> {
+                unreachable!()
+            }
+            async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
+                Ok(stellar_strkey::ed25519::PublicKey(
+                    ed25519_dalek::SigningKey::from_bytes(&FEE_PAYER_SEED)
+                        .verifying_key()
+                        .to_bytes(),
+                ))
+            }
+        }
+        let source = format!(
+            "{}",
+            stellar_strkey::ed25519::PublicKey(
+                ed25519_dalek::SigningKey::from_bytes(&INNER_SOURCE_SEED)
+                    .verifying_key()
+                    .to_bytes()
+            )
+        );
+        let signer =
+            crate::signing::software::SoftwareSigningKey::new_from_bytes(INNER_SOURCE_SEED);
+        let mut builder =
+            crate::builder::ClassicOpBuilder::new(&source, 140, TESTNET_PASSPHRASE, 100);
+        let g = crate::submit::destination_tests::plain_destination();
+        let m = crate::submit::destination_tests::muxed_destination(u64::MAX);
+        for destination in [&g, &m] {
+            builder
+                .payment(
+                    destination,
+                    StellarAmount::from_stroops(1),
+                    &crate::builder::Asset::Native,
+                )
+                .unwrap();
+        }
+        let xdr = builder.build_and_sign(&signer).await.unwrap();
+        let expected = PaymentDestinations::PerOperation(vec![
+            stellar_agent_core::profile::receipt::OperationDestination {
+                operation: 0,
+                destination: g,
+            },
+            stellar_agent_core::profile::receipt::OperationDestination {
+                operation: 1,
+                destination: m,
+            },
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReceiptStore::open_at(dir.path(), "destination-fee").unwrap();
+        let signer = RefusingSigner {
+            store: store.clone(),
+            expected: expected.clone(),
+        };
+        let client = StellarRpcClient::new(crate::redact::rpc_error_fixtures::ENDPOINT).unwrap();
+        DESTINATION_ABANDON_FAIL.set(true);
+        let result = submit_fee_bump_idempotent(
+            &client,
+            &xdr,
+            &fee_payer_gstrkey(),
+            500,
+            10_000,
+            TESTNET_PASSPHRASE,
+            &signer,
+            &store,
+            100,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!DESTINATION_ABANDON_FAIL.get());
+        let receipts = store.all().unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].destinations, expected);
+        assert_eq!(receipts[0].status.label(), "failed");
     }
 
     /// Builds a signed inner V1 envelope using the test inner-source key.

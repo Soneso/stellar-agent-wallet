@@ -14,12 +14,25 @@
 //!
 //! ## Security posture
 //!
+//! - The toolset's capabilities are read from its install record, which is
+//!   authenticated by an HMAC under the installation's toolset pin key in the
+//!   platform keyring and carries the `TOOLSET.md` digest both resolver tiers
+//!   check. A record that does not verify refuses with
+//!   `toolset.pin_unverifiable`.
 //! - The four-part enforcement check runs BEFORE routing to a trusted tool.
 //! - After the four-part check passes, the trusted tool's normal handler
 //!   including `dispatch_gate` (operator-policy + chain + registry) runs.
 //!   The toolset gate is ADDITIVE, never substitutive.
-//! - No signing/key/policy tool is reachable via any capability grant
-//!   (structural isolation).
+//! - No signing/key/policy tool is reachable via an ungated capability grant;
+//!   the signing actions (sign-payment, sign-rule-create) route to the signing
+//!   commit tools only behind a first-invoke grant. Payment consent follows
+//!   the composed policies; rule creation requires per-action approval.
+//! - `stellar_toolset_invoke` is annotated destructive, so on mainnet the
+//!   default policy engine refuses it.
+//! - A toolset narrows what this dispatcher routes. It does not restrict the
+//!   native tools the same server registers, the `toolset` argument is chosen
+//!   by the caller, and no session is bound to a toolset; the operator policy
+//!   and the approvals bound native and routed calls alike.
 
 use rmcp::{
     handler::server::wrapper::Parameters,
@@ -27,10 +40,11 @@ use rmcp::{
     schemars, serde, tool, tool_router,
 };
 use serde_json::json;
+use stellar_agent_core::profile::schema::KeyringEntryRef;
 use stellar_agent_mcp_macros::mcp_tool_router;
 use stellar_agent_toolsets_runtime::{
-    GatedInvokeParams, GatedResolveOutcome, list_pinned_toolsets, resolve_toolset_and_check,
-    resolve_toolset_sign_payment_gated,
+    GatedInvokeParams, GatedResolveOutcome, PinKey, list_pinned_toolsets,
+    resolve_toolset_and_check, resolve_toolset_sign_payment_gated,
 };
 
 use crate::server::WalletServer;
@@ -96,6 +110,101 @@ pub struct StellarToolsetInvokeArgs {
     pub args: serde_json::Value,
 }
 
+/// Resolves payment effects for an outer gate without mainnet context.
+/// Commit effects come from the envelope; preparation uses routed arguments.
+fn toolset_payment_value(
+    action: &str,
+    args: &serde_json::Value,
+    chain: Option<&str>,
+    has_mainnet_context: bool,
+) -> Option<Result<stellar_agent_core::policy::v1::ValueClass, super::common::ToolError>> {
+    use stellar_agent_core::envelope_decode::decode_authoritative_args;
+    use stellar_agent_core::policy::v1::value::derive_value_class;
+    if has_mainnet_context {
+        return None;
+    }
+    let object = args.as_object()?;
+    match action {
+        "stellar_pay_commit" => object
+            .get("envelope_xdr")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|envelope| decode_authoritative_args(envelope, "stellar_pay_commit").ok())
+            .map(|authoritative| Ok(derive_value_class("stellar_pay_commit", &authoritative))),
+        "stellar_pay" => {
+            let mut merged = object.clone();
+            if let Some(chain) = chain.filter(|chain| !chain.is_empty()) {
+                merged.insert("chain_id".into(), chain.into());
+            }
+            let fields: GatedPaymentFields = serde_json::from_value(args.clone()).ok()?;
+            let (_, amount) = super::pay::parse_asset_and_amount(
+                &fields.asset,
+                fields.amount,
+                fields.amount_in_stroops,
+            )
+            .ok()?;
+            merged.insert(
+                "amount_stroops".into(),
+                amount.as_stroops().to_string().into(),
+            );
+            if let Err(err) =
+                super::common::validate_g_strkey(object.get("source")?.as_str()?, "source")
+            {
+                return Some(Err(super::common::ToolError::Protocol(err)));
+            }
+            if let Err(err) = super::common::validate_payment_destination(
+                object.get("destination")?.as_str()?,
+                "destination",
+            ) {
+                return Some(Err(super::common::ToolError::Protocol(err)));
+            }
+            let memo_text = match object
+                .get("memo_text")
+                .and_then(serde_json::Value::as_str)
+                .map(stellar_agent_core::amount::McpMemoTextArgument::try_from)
+                .transpose()
+            {
+                Ok(memo_text) => memo_text,
+                Err(err) => {
+                    let err = <serde_json::Error as serde::de::Error>::custom(err);
+                    return Some(Err(super::common::ToolError::Protocol(
+                        rmcp::ErrorData::invalid_params(
+                            format!(
+                                "toolset.args_deserialise: stellar_pay: {}",
+                                describe_args_error(&err)
+                            ),
+                            None,
+                        ),
+                    )));
+                }
+            };
+            let policy_memo = match stellar_agent_network::memo::parse_memo_with_fact(
+                memo_text
+                    .as_ref()
+                    .map(stellar_agent_core::amount::McpMemoTextArgument::as_str),
+                object.get("memo_id").and_then(serde_json::Value::as_u64),
+                object
+                    .get("memo_hash_hex")
+                    .and_then(serde_json::Value::as_str),
+                object
+                    .get("memo_return_hex")
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                Ok((_, fact)) => fact,
+                Err(err) => {
+                    return Some(Err(super::common::ToolError::Business(
+                        super::common::ledger_err_result(&err),
+                    )));
+                }
+            };
+            // Only the parsed routed memo supplies policy facts.
+            let mut merged = serde_json::Value::Object(merged);
+            policy_memo.insert_policy_fields(&mut merged);
+            Some(Ok(derive_value_class("stellar_pay", &merged)))
+        }
+        _ => None,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool router impl block
 // ─────────────────────────────────────────────────────────────────────────────
@@ -116,7 +225,9 @@ impl WalletServer {
     /// - `actions` — tool names the toolset may invoke (subject to enforcement).
     ///
     /// This is the canonical scriptable enumeration.  Uninstalling a toolset
-    /// removes it from this list without recompiling the binary.
+    /// removes it from this list without recompiling the binary.  A toolset
+    /// whose install record does not verify under the installation's pin key
+    /// is left out; without a pin key the list is empty.
     ///
     /// # Tool annotations
     ///
@@ -125,7 +236,8 @@ impl WalletServer {
     ///
     /// # Errors
     ///
-    /// Returns a tool-level error when the toolsets directory cannot be read.
+    /// Returns a tool-level error when the toolsets directory cannot be read,
+    /// or when the pin key cannot be read for a reason other than its absence.
     #[mcp_tool_item(
         name = "stellar_toolset_list",
         destructive_hint = false,
@@ -136,7 +248,9 @@ impl WalletServer {
         name = "stellar_toolset_list",
         description = "List all installed toolsets and their invocable actions. \
                        Returns a JSON array with name, capabilities, allowed_tools, \
-                       version, and actions for each installed toolset. \
+                       version, and actions for each installed toolset. actions lists the \
+                       tools reachable without a grant; the gated signing commit tools are \
+                       not listed. \
                        read_only_hint=true; destructive_hint=false.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]
@@ -159,7 +273,8 @@ impl WalletServer {
                 rmcp::ErrorData::internal_error(format!("toolset.toolsets_dir_error: {e}"), None)
             })?;
 
-        let entries = list_pinned_toolsets(&toolsets_root).map_err(|e| {
+        let pin_key = self.toolset_pin_key()?;
+        let entries = list_pinned_toolsets(&toolsets_root, pin_key.as_ref()).map_err(|e| {
             rmcp::ErrorData::internal_error(format!("toolset.list_error: {e}"), None)
         })?;
 
@@ -180,55 +295,68 @@ impl WalletServer {
     /// four-part capability enforcement check:
     ///
     /// 1. Action resolves to a registry tool-name constant via the matrix.
-    /// 2. The resolving capability is in the toolset's declared `CapabilitySet`.
+    /// 2. The resolving capability is in the toolset's declared `CapabilitySet`,
+    ///    read from its authenticated install record.
     /// 3. The resolved tool is in the toolset's `allowed_tools` (intersective narrowing).
     /// 4. The routed tool's normal handler runs including `dispatch_gate`.
     ///
     /// The toolset gate is ADDITIVE: a toolset action allowed by its manifest but
-    /// denied by operator policy is refused by the operator-policy gate.
+    /// denied by operator policy is refused by the operator-policy gate.  A
+    /// toolset adds these gates to the routed calls; it does not restrict the
+    /// native tools this server also exposes, and the caller chooses the
+    /// `toolset` argument.
     ///
     /// # Signing isolation
     ///
-    /// No signing/key/policy tool is reachable via any capability grant.
-    /// The matrix contains no such tool regardless of declared capabilities
-    /// (structural isolation).
+    /// No signing/key/policy tool is reachable via an ungated capability grant:
+    /// the ungated matrix contains no such tool regardless of declared
+    /// capabilities.  The signing actions (sign-payment, sign-rule-create)
+    /// route to `stellar_pay_commit` and `stellar_rule_create_commit` only
+    /// through the gated resolver and a first-invoke grant. Payment approval
+    /// follows the composed policies; rule creation requires per-action approval.
     ///
     /// # Tool annotations
     ///
-    /// - `readOnlyHint = true` — the toolset gate itself is read-only; the routed
-    ///   tool determines the actual mutability (all matrix tools are read-only
-    ///   or build-only).
-    /// - `destructiveHint = false` — all matrix tools are non-destructive.
+    /// - `readOnlyHint = false`: the signing actions route to commit tools
+    ///   that sign and submit.
+    /// - `destructiveHint = true`: the dispatcher reaches destructive tools,
+    ///   so on mainnet the default policy engine refuses it and the mainnet
+    ///   read-only tool set does not list it.
     ///
     /// # Errors
     ///
     /// - `profile.halted` or `profile.halt_unreadable`: the action names a tool
     ///   that is not read-only and the profile is halted, answered before any
     ///   other step.
-    /// - `network.mainnet_write_forbidden`: a signing action (sign-payment or
-    ///   rule-create) on a mainnet profile, answered as a business envelope
-    ///   before any gate, approval, key access, or RPC request.
-    /// - `toolset.not_installed` — toolset is not installed.
-    /// - `toolset.unknown_action` — action not in the capability→tool matrix.
-    /// - `toolset.capability_not_declared` — granting capability not declared.
-    /// - `toolset.tool_not_allowed` — tool excluded by `allowed_tools` narrowing.
+    /// - `network.mainnet_write_forbidden`: mainnet payment setup is incomplete,
+    ///   or a mainnet action has no admitted route. Rule creation stays excluded.
+    /// - `policy.engine_required` and the other dispatch-gate refusals: a non-signing
+    ///   action on a mainnet profile, refused by the dispatcher's policy gate.
+    /// - `toolset.pin_unverifiable`: the install record does not verify under
+    ///   the installation's pin key, or no pin key exists.
+    /// - `toolset.not_installed`: toolset is not installed.
+    /// - `toolset.unknown_action`: action not in the capability→tool matrix.
+    /// - `toolset.capability_not_declared`: granting capability not declared.
+    /// - `toolset.tool_not_allowed`: tool excluded by `allowed_tools` narrowing.
     /// - Plus any error from the routed tool (operator policy, chain mismatch, etc.).
     #[mcp_tool_item(
         name = "stellar_toolset_invoke",
-        destructive_hint = false,
-        read_only_hint = true,
+        destructive_hint = true,
+        read_only_hint = false,
         chain_id_required = false
     )]
     #[tool(
         name = "stellar_toolset_invoke",
-        description = "Invoke a named action of an installed toolset through the \
-                       four-part capability enforcement gate. \
-                       `toolset` is the package name; `action` is the registry tool name \
-                       (e.g. stellar_balances, stellar_pay). \
-                       Signing tools are never reachable regardless of declared capabilities. \
-                       The routed tool's normal operator-policy gate also runs (additive gate). \
-                       read_only_hint=true; destructive_hint=false.",
-        annotations(read_only_hint = true, destructive_hint = false)
+        description = "Invoke a named action of an installed toolset. `toolset` names the \
+                       package; `action` must be granted by the toolset's declared \
+                       capabilities, read from its authenticated install record. Signing \
+                       actions (sign-payment, sign-rule-create) route to the signing commit \
+                       tools behind a first-invoke grant. Payment consent follows the \
+                       composed policies; rule creation requires per-action approval. On \
+                       mainnet only the exact stellar_pay and stellar_pay_commit actions run, \
+                       after setup; every other action refuses. A toolset adds these gates; \
+                       it does not restrict the native tools this server also exposes.",
+        annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn stellar_toolset_invoke(
         &self,
@@ -236,68 +364,80 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use stellar_agent_toolsets_runtime::{ToolsetRuntimeError, matrix};
 
-        let toolset_name = stellar_agent_toolsets::sanitise_display(&args.toolset, 64);
-        let action = stellar_agent_toolsets::sanitise_display(&args.action, 128);
+        // Routing, policy, and halt decisions use the names exactly as sent:
+        // display sanitization can map distinct inputs to one name. Text
+        // rendered from them is sanitized where it is produced.
+        let toolset_name = args.toolset.clone();
+        let action = args.action.clone();
 
-        // Halt check for the routed tool. This tool's own descriptor is
-        // read-only, so the server's entry check passes it; the action names
-        // the tool whose handler runs in this process, and that tool's
-        // descriptor decides, before any gate, store, keyring, or network
-        // access of the call.
+        // Halt check for the routed tool, repeated from the server's entry
+        // check: the action names the tool whose handler runs in this
+        // process, and that tool's descriptor decides, before any gate,
+        // store, keyring, or network access of the call.
         if let Some(refusal) = self.halt_refusal_for_tool(&action) {
             return Ok(refusal);
         }
 
-        // Structural mainnet refusal for the signing actions (sign-payment and
-        // rule-create), keyed on the server's profile context. It precedes the
-        // toolset's own dispatch gate and the gated resolvers, so a mainnet
-        // profile queues neither a first-invoke approval nor a per-payment
-        // approval. Read-only actions stay allowed on mainnet.
+        let is_payment = matches!(action.as_str(), "stellar_pay" | "stellar_pay_commit");
         let is_signing_action = matrix::GATED_MATRIX_ENTRIES
             .iter()
             .any(|(_, tools)| tools.contains(&action.as_str()));
-        if is_signing_action && self.context.chain_id.is_mainnet() {
+        let mainnet_payment = self.context.chain_id.is_mainnet() && is_payment;
+        if self.context.chain_id.is_mainnet() && is_signing_action && !is_payment {
+            return Ok(crate::tools::common::mainnet_write_forbidden_result());
+        }
+        if mainnet_payment {
+            let guard = match self
+                .mainnet_write_admission(stellar_agent_network::mainnet::MainnetConsumer::McpPay)
+            {
+                Ok(guard) => guard,
+                Err(result) => return Ok(result),
+            };
+            if let Err(result) = self.verify_mainnet_freshness(&guard) {
+                return Ok(result);
+            }
+            let chain = args
+                .chain_id
+                .as_deref()
+                .filter(|chain| !chain.is_empty())
+                .or_else(|| {
+                    args.args
+                        .get("chain_id")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or("");
+            stellar_agent_core::profile::caip2::validate_chain_id_matches_profile(
+                chain,
+                self.security_profile(),
+            )
+            .map_err(|error| {
+                rmcp::ErrorData::invalid_params(format!("chain_id mismatch: {error}"), None)
+            })?;
+        }
+        // A contract payment refuses before the outer gate, the first-invoke
+        // grant, and every approval or nonce.
+        if is_payment
+            && let Some(refusal) = toolset_contract_refusal(self.context.chain_id, &args.args)
+        {
+            return Ok(refusal);
+        }
+        let outer = if mainnet_payment {
+            None
+        } else {
+            match self
+                .toolset_outer_gate(&toolset_name, &action, &args.args, args.chain_id.as_deref())
+                .await
+            {
+                Ok(outcome) => Some(outcome),
+                Err(error) => return error.into_result(),
+            }
+        };
+        // A signed outer payment rule grants no route to another mainnet action.
+        if self.context.chain_id.is_mainnet() && !is_payment {
             return Ok(crate::tools::common::mainnet_write_forbidden_result());
         }
 
-        let args_value = json!({
-            "toolset": &toolset_name,
-            "action": &action,
-        });
-        // dispatch_gate with empty chain_id (chain_id_required = false for the
-        // outer toolset_invoke tool — the routed tool handles its own chain_id check).
-        // Non-signing tool: RequireApproval produces no signing material; proceed.
-        if let Err(e) = self
-            .dispatch_gate("stellar_toolset_invoke", &args_value, "")
-            .await
-        {
-            return e.into_result();
-        }
-
-        let toolsets_root = {
-            #[cfg(any(test, feature = "test-helpers"))]
-            {
-                if let Some(ref override_root) = self.toolsets_root_override {
-                    override_root.clone()
-                } else {
-                    stellar_agent_core::profile::schema::default_toolsets_dir().map_err(|e| {
-                        rmcp::ErrorData::internal_error(
-                            format!("toolset.toolsets_dir_error: {e}"),
-                            None,
-                        )
-                    })?
-                }
-            }
-            #[cfg(not(any(test, feature = "test-helpers")))]
-            {
-                stellar_agent_core::profile::schema::default_toolsets_dir().map_err(|e| {
-                    rmcp::ErrorData::internal_error(
-                        format!("toolset.toolsets_dir_error: {e}"),
-                        None,
-                    )
-                })?
-            }
-        };
+        let toolsets_root = self.toolsets_root()?;
 
         // ── Check if this is a gated action ───────────────────────────────────
         //
@@ -320,25 +460,33 @@ impl WalletServer {
         }
         if is_signing_action {
             return self
-                .route_to_gated_resolver(&toolset_name, &action, &args, &toolsets_root)
+                .route_to_gated_resolver(&toolset_name, &action, &args, &toolsets_root, outer)
                 .await;
         }
 
         // ── Four-part enforcement (ungated path) ──────────────────────────────
-        let (tool_name, _pin) = resolve_toolset_and_check(&toolset_name, &action, &toolsets_root)
-            .map_err(|e| match e {
-            ToolsetRuntimeError::ToolsetNotInstalled { .. } => {
-                rmcp::ErrorData::invalid_params(e.to_string(), None)
-            }
-            ToolsetRuntimeError::UnknownToolsetAction { .. }
-            | ToolsetRuntimeError::CapabilityNotDeclared { .. }
-            | ToolsetRuntimeError::ToolNotAllowed { .. } => {
-                rmcp::ErrorData::invalid_params(e.to_string(), None)
-            }
-            ToolsetRuntimeError::Io(_) => rmcp::ErrorData::internal_error(e.to_string(), None),
-            // Forward-compat: new #[non_exhaustive] variants fail closed.
-            _ => rmcp::ErrorData::internal_error(format!("toolset.enforcement_error: {e}"), None),
-        })?;
+        let pin_key = self.toolset_pin_key()?;
+        let (tool_name, _pin) =
+            resolve_toolset_and_check(&toolset_name, &action, &toolsets_root, pin_key.as_ref())
+                .map_err(|e| match e {
+                    ToolsetRuntimeError::ToolsetNotInstalled
+                    | ToolsetRuntimeError::PinUnverifiable { .. } => {
+                        rmcp::ErrorData::invalid_params(e.to_string(), None)
+                    }
+                    ToolsetRuntimeError::UnknownToolsetAction
+                    | ToolsetRuntimeError::CapabilityNotDeclared { .. }
+                    | ToolsetRuntimeError::ToolNotAllowed { .. } => {
+                        rmcp::ErrorData::invalid_params(e.to_string(), None)
+                    }
+                    ToolsetRuntimeError::Io(_) => {
+                        rmcp::ErrorData::internal_error(e.to_string(), None)
+                    }
+                    // Forward-compat: new #[non_exhaustive] variants fail closed.
+                    _ => rmcp::ErrorData::internal_error(
+                        format!("toolset.enforcement_error: {e}"),
+                        None,
+                    ),
+                })?;
 
         // ── Build merged args: chain_id + tool-specific args ──────────────────
         let chain_id = args.chain_id.as_deref().unwrap_or("");
@@ -383,13 +531,16 @@ impl WalletServer {
         // The closed match below is the anti-aliasing anchor: only exact names
         // from ALL_MATRIX_TOOL_NAMES can appear here.
         //
-        // The routed handler's own dispatch_gate is the SINGLE authoritative
-        // operator-policy site for the matrix tool (additive gate).  No outer
-        // dispatch_gate call is made here: it would be redundant and would use
-        // the wrong args shape ({"toolset":...,"action":...} instead of the
-        // tool-specific args), which could cause spurious denials for tools that
-        // inspect args["amount"] or similar (e.g. stellar_pay via amount_in_stroops).
-        self.route_to_matrix_tool(tool_name, tool_args_value).await
+        // The routed handler evaluates its tool-specific arguments and live
+        // account views. Its strict decision and approval govern submission.
+        let preparation =
+            (tool_name == "stellar_pay").then_some(super::pay::ToolsetPreparationContext {
+                toolset: toolset_name,
+                action,
+                outer,
+            });
+        self.route_to_matrix_tool(tool_name, tool_args_value, preparation)
+            .await
     }
 }
 
@@ -397,9 +548,48 @@ impl WalletServer {
 // Gated resolver routing
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The payment fields of a toolset-routed `sign-payment` call, typed as
-/// `StellarPayCommitArgs` types them, for the validation that precedes the
-/// gated resolver.
+/// The destination, asset, and amount in stroops a grant is checked for,
+/// from a payment's decoded authoritative arguments.
+fn grant_invocation_facts(authoritative: &serde_json::Value) -> (String, String, i64) {
+    let destination = authoritative
+        .get("destination")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let asset = authoritative
+        .get("asset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("XLM")
+        .to_owned();
+    let amount_stroops = authoritative
+        .get("amount_stroops")
+        .and_then(crate::tools::amount_wire::value_as_stroops_i64)
+        .unwrap_or(0_i64);
+    (destination, asset, amount_stroops)
+}
+
+/// The contract payment refusal of a routed payment's raw arguments: its
+/// `envelope_xdr` with the context of its `asset`, then its `destination`.
+fn toolset_contract_refusal(
+    chain: stellar_agent_core::profile::caip2::Caip2,
+    args: &serde_json::Value,
+) -> Option<CallToolResult> {
+    let text = |key: &str| args.get(key).and_then(serde_json::Value::as_str);
+    let memo = ["memo_text", "memo_id", "memo_hash_hex", "memo_return_hex"]
+        .iter()
+        .any(|key| args.get(key).is_some_and(|value| !value.is_null()));
+    let asset = text("asset").and_then(|asset| stellar_agent_network::Asset::parse(asset).ok());
+    super::pay::contract_payment_refusal(
+        chain,
+        text("destination").unwrap_or_default(),
+        memo,
+        text("envelope_xdr"),
+        asset.as_ref(),
+    )
+}
+
+/// Payment fields shared by preparation and sign-payment routes.
+/// Both routes use the payment parser before deriving or signing an amount.
 #[derive(serde::Deserialize)]
 #[serde(crate = "rmcp::serde")]
 struct GatedPaymentFields {
@@ -411,6 +601,164 @@ struct GatedPaymentFields {
 }
 
 impl WalletServer {
+    /// Evaluates the outer `stellar_toolset_invoke` rule of one invocation
+    /// over its raw toolset and action names.
+    ///
+    /// Payment effects come from the envelope or the routed arguments, and
+    /// only without a mainnet context. The routed gate enforces approval and
+    /// reads live account state.
+    pub(crate) async fn toolset_outer_gate(
+        &self,
+        toolset: &str,
+        action: &str,
+        args: &serde_json::Value,
+        chain_id: Option<&str>,
+    ) -> Result<super::common::DispatchOutcome, super::common::ToolError> {
+        let args_value = json!({
+            "toolset": toolset,
+            "action": action,
+        });
+        match toolset_payment_value(action, args, chain_id, self.mainnet_context.is_some()) {
+            Some(Ok(value)) => {
+                self.dispatch_gate_provisional("stellar_toolset_invoke", &args_value, "", value)
+                    .await
+            }
+            Some(Err(err)) => Err(err),
+            None => {
+                self.dispatch_gate("stellar_toolset_invoke", &args_value, "")
+                    .await
+            }
+        }
+    }
+
+    /// The root directory of installed toolsets.
+    fn toolsets_root(&self) -> Result<std::path::PathBuf, rmcp::ErrorData> {
+        #[cfg(any(test, feature = "test-helpers"))]
+        if let Some(ref override_root) = self.toolsets_root_override {
+            return Ok(override_root.clone());
+        }
+        stellar_agent_core::profile::schema::default_toolsets_dir().map_err(|e| {
+            rmcp::ErrorData::internal_error(format!("toolset.toolsets_dir_error: {e}"), None)
+        })
+    }
+
+    /// Acquires the lease on the grant `context` holds for the payment that
+    /// `authoritative` describes, the decoded envelope of the commit.
+    ///
+    /// # Errors
+    ///
+    /// The runtime's refusal under its own wire code, such as
+    /// `toolset.grant_changed`, `toolset.grant_expired`,
+    /// `toolset.grant_invocation_mismatch`, or `toolset.coordination_busy`;
+    /// `policy.approval_required` without the attestation key.
+    pub(crate) fn lease_toolset_grant(
+        &self,
+        context: &super::pay::ToolsetPaymentContext,
+        authoritative: &serde_json::Value,
+    ) -> Result<stellar_agent_toolsets_runtime::ToolsetGrantLease, CallToolResult> {
+        let internal = |error: rmcp::ErrorData| {
+            crate::tools::common::business_error_result("toolset.enforcement_error", error.message)
+        };
+        let profile_name = self.profile_name_for_approval();
+        let (attestation_key, attestation_binding) =
+            self.load_gated_attestation_key(&profile_name)?;
+        let toolsets_root = self.toolsets_root().map_err(internal)?;
+        let pin_key = self.toolset_pin_key().map_err(internal)?;
+        let (destination, asset, amount_stroops) = grant_invocation_facts(authoritative);
+        let params = stellar_agent_toolsets_runtime::GrantRecheckParams {
+            toolset_name: &context.toolset,
+            action: &context.action,
+            toolsets_root: &toolsets_root,
+            profile_name: &profile_name,
+            attestation_key: &attestation_key,
+            attestation_binding: &attestation_binding,
+            authoritative_destination: &destination,
+            authoritative_asset: &asset,
+            authoritative_amount_stroops: amount_stroops,
+            pin_key: pin_key.as_ref(),
+            #[cfg(feature = "test-helpers")]
+            grant_store_path_override: self.grant_store_path_override.clone(),
+        };
+        stellar_agent_toolsets_runtime::acquire_toolset_grant_lease(&context.grant, &params)
+            .map_err(|error| {
+                let text = error.to_string();
+                let (code, message) = text
+                    .split_once(": ")
+                    .unwrap_or(("toolset.enforcement_error", text.as_str()));
+                crate::tools::common::business_error_result(code, message)
+            })
+    }
+
+    /// The restriction that owns `lease` for one payment commit.
+    pub(crate) fn toolset_restriction(
+        &self,
+        lease: stellar_agent_toolsets_runtime::ToolsetGrantLease,
+    ) -> stellar_agent_network::mainnet::restriction::ToolsetRestriction {
+        #[cfg(any(test, feature = "test-helpers"))]
+        if let Some(probe) = &self.toolset_lease_release_probe {
+            return stellar_agent_network::mainnet::restriction::ToolsetRestriction::new(Box::new(
+                ProbedLease {
+                    lease,
+                    probe: std::sync::Arc::clone(probe),
+                },
+            ));
+        }
+        stellar_agent_network::mainnet::restriction::ToolsetRestriction::new(Box::new(lease))
+    }
+
+    /// Reads the installation's toolset pin key for one toolset call.
+    ///
+    /// Read per call, so a key minted by an install after this server started
+    /// is used at once.  `Ok(None)` when no toolset was ever installed: every
+    /// resolver then reports an installed toolset as unverifiable.  A keyring
+    /// failure other than the key's absence is an internal error carrying the
+    /// keyring code, so a locked keyring never reads as an absent key.
+    fn toolset_pin_key(&self) -> Result<Option<PinKey>, rmcp::ErrorData> {
+        #[cfg(any(test, feature = "test-helpers"))]
+        if let Some(key) = &self.toolset_pin_key_override {
+            return Ok(Some(key.clone()));
+        }
+        stellar_agent_network::keyring::read_secret_32(&KeyringEntryRef::toolset_pin_key())
+            .map(|key| key.map(PinKey::from_bytes))
+            .map_err(|e| {
+                rmcp::ErrorData::internal_error(
+                    format!("{}: the toolset pin key cannot be read: {e}", e.code()),
+                    Some(json!({ "code": e.code() })),
+                )
+            })
+    }
+
+    /// Loads the profile's attestation key and the binding its toolset grants
+    /// are attested under, for the gated resolver's verified grant lookup.
+    ///
+    /// The binding is the profile and chain pair every approval surface
+    /// attests a first-invoke grant under, so a grant recorded by `approve`
+    /// verifies here and a grant attested for another profile or chain does
+    /// not.
+    ///
+    /// # Errors
+    ///
+    /// Returns the uniform `policy.approval_required` result of
+    /// [`crate::tools::common::load_attestation_key`] when the key is absent,
+    /// unreadable or refused; without the key no grant is honored.
+    fn load_gated_attestation_key<'a>(
+        &'a self,
+        profile_name: &'a str,
+    ) -> Result<
+        (
+            zeroize::Zeroizing<[u8; 32]>,
+            stellar_agent_core::approval::AttestationBinding<'a>,
+        ),
+        CallToolResult,
+    > {
+        let key = crate::tools::common::load_attestation_key(&self.profile)?;
+        let binding = stellar_agent_core::approval::AttestationBinding::new(
+            profile_name,
+            self.context.chain_id.caip2_str(),
+        );
+        Ok((key, binding))
+    }
+
     /// Route a toolset-routed `sign-payment` action through the GATED resolver.
     ///
     /// This is the DISTINCT internal entry point for the gated tier.  NOT a
@@ -425,9 +773,8 @@ impl WalletServer {
     ///    approval.
     /// 3. Four-part check via the gated matrix.
     /// 4. First-invoke gate check (via `resolve_toolset_sign_payment_gated`).
-    /// 5. On `GatedResolveOutcome::Resolved` → route to `stellar_pay_commit`
-    ///    with per-action `PaymentSimulated` approval FORCED ON (Override
-    ///    `Allow → RequireApproval`).
+    /// 5. On `GatedResolveOutcome::Resolved`, move the verified grant and outer
+    ///    outcome to the shared payment handler for policy composition.
     /// 6. On `GatedResolveOutcome::FirstInvokeApprovalRequired` → return
     ///    `FirstInvokeApprovalRequired` typed error with `approval_nonce`.
     ///
@@ -462,6 +809,7 @@ impl WalletServer {
         action: &str,
         toolset_args: &StellarToolsetInvokeArgs,
         toolsets_root: &std::path::Path,
+        outer: Option<super::common::DispatchOutcome>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use stellar_agent_core::approval::process_uid_for_attestation;
         use stellar_agent_core::envelope_decode::decode_authoritative_args;
@@ -520,7 +868,10 @@ impl WalletServer {
         let payment_fields: GatedPaymentFields =
             serde_json::from_value(serde_json::Value::Object(payment_fields)).map_err(|e| {
                 rmcp::ErrorData::invalid_params(
-                    format!("toolset.gated_args_deserialise: stellar_pay_commit: {e}"),
+                    format!(
+                        "toolset.gated_args_deserialise: stellar_pay_commit: {}",
+                        describe_args_error(&e)
+                    ),
                     None,
                 )
             })?;
@@ -542,27 +893,29 @@ impl WalletServer {
                 )
             })?;
 
-        let destination = authoritative_args
-            .get("destination")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
-        let asset = authoritative_args
-            .get("asset")
-            .and_then(|v| v.as_str())
-            .unwrap_or("XLM")
-            .to_owned();
-        let amount_stroops = authoritative_args
-            .get("amount_stroops")
-            .and_then(crate::tools::amount_wire::value_as_stroops_i64)
-            .unwrap_or(0_i64);
+        use stellar_agent_core::envelope_decode::{
+            ClassicOperation, ClassicTransactionKind, classic_summary,
+        };
+        if !matches!(
+            classic_summary(&envelope_xdr, ClassicTransactionKind::Payment)
+                .map(|summary| summary.operation),
+            Ok(ClassicOperation::Payment { .. })
+        ) {
+            return Ok(super::common::business_error_result(
+                "simulation.divergence",
+                "toolset_gated envelope_xdr decode: sign-payment needs one payment operation",
+            ));
+        }
+        let (destination, asset, amount_stroops) = grant_invocation_facts(&authoritative_args);
 
-        // Validate: destination must be a G-strkey (ed25519 public key).
-        // Uses stellar_strkey to validate the base32 checksum and version byte,
-        // matching the validation used at other tool boundaries in this crate.
-        if stellar_strkey::ed25519::PublicKey::from_string(&destination).is_err() {
+        // Validate: the destination is a G or M classic account. The parser
+        // checks the base32 checksum and version byte. An M destination keeps
+        // its full string: a G grant covers it, and an M grant covers only its
+        // exact key and ID.
+        if stellar_agent_core::payment_accounts::PaymentAccount::parse(&destination).is_err() {
             return Err(rmcp::ErrorData::internal_error(
-                "simulation.divergence: envelope_xdr did not yield a valid G-strkey destination",
+                "simulation.divergence: envelope_xdr did not yield a valid G-strkey or M-strkey \
+                 destination",
                 None,
             ));
         }
@@ -575,17 +928,27 @@ impl WalletServer {
         let now_unix_ms = stellar_agent_core::timefmt::now_unix_ms()
             .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
 
+        let (attestation_key, attestation_binding) =
+            match self.load_gated_attestation_key(&profile_name) {
+                Ok(loaded) => loaded,
+                Err(result) => return Ok(result),
+            };
+        let pin_key = self.toolset_pin_key()?;
+
         #[cfg(not(feature = "test-helpers"))]
         let gated_params = GatedInvokeParams {
             toolset_name,
             action,
             toolsets_root,
             profile_name: &profile_name,
+            attestation_key: &attestation_key,
+            attestation_binding: &attestation_binding,
             authoritative_destination: &destination,
             authoritative_asset: &asset,
             authoritative_amount_stroops: amount_stroops,
             now_unix_ms,
             process_uid: &process_uid,
+            pin_key: pin_key.as_ref(),
         };
         #[cfg(feature = "test-helpers")]
         let gated_params = GatedInvokeParams {
@@ -593,21 +956,29 @@ impl WalletServer {
             action,
             toolsets_root,
             profile_name: &profile_name,
+            attestation_key: &attestation_key,
+            attestation_binding: &attestation_binding,
             authoritative_destination: &destination,
             authoritative_asset: &asset,
             authoritative_amount_stroops: amount_stroops,
             now_unix_ms,
             process_uid: &process_uid,
+            pin_key: pin_key.as_ref(),
             approval_dir_override: self.approval_dir_override.clone(),
             grant_store_path_override: self.grant_store_path_override.clone(),
         };
 
         match resolve_toolset_sign_payment_gated(&gated_params) {
+            Err(ToolsetRuntimeError::CoordinationBusy) => Ok(super::common::business_error_result(
+                "toolset.coordination_busy",
+                "a toolset writer is active; retry this invocation",
+            )),
             Err(e) => {
                 // Hard errors (toolset not installed, capability not declared, etc.)
                 let err = match e {
-                    ToolsetRuntimeError::ToolsetNotInstalled { .. }
-                    | ToolsetRuntimeError::UnknownToolsetAction { .. }
+                    ToolsetRuntimeError::ToolsetNotInstalled
+                    | ToolsetRuntimeError::PinUnverifiable { .. }
+                    | ToolsetRuntimeError::UnknownToolsetAction
                     | ToolsetRuntimeError::CapabilityNotDeclared { .. }
                     | ToolsetRuntimeError::ToolNotAllowed { .. } => {
                         rmcp::ErrorData::invalid_params(e.to_string(), None)
@@ -615,6 +986,13 @@ impl WalletServer {
                     ToolsetRuntimeError::FirstInvokeApprovalRequired { .. } => {
                         // Should not happen as Err — the resolver returns Ok for
                         // this outcome.  Fail closed.
+                        rmcp::ErrorData::internal_error(
+                            format!("toolset.enforcement_error: {e}"),
+                            None,
+                        )
+                    }
+                    ToolsetRuntimeError::BindingMismatch
+                    | ToolsetRuntimeError::GrantStoreError { .. } => {
                         rmcp::ErrorData::internal_error(
                             format!("toolset.enforcement_error: {e}"),
                             None,
@@ -654,31 +1032,27 @@ impl WalletServer {
                 ))
             }
 
-            Ok(GatedResolveOutcome::Resolved { tool_name }) => {
-                // Gate passed (current grant found).
-                // Force per-action PaymentSimulated approval UNCONDITIONALLY,
-                // overriding DispatchOutcome::Allow.
-                // Route to stellar_pay_commit via the gated commit path.
-                self.route_to_gated_commit(tool_name, toolset_args, envelope_xdr)
+            Ok(GatedResolveOutcome::Resolved { tool_name, grant }) => {
+                let context = super::pay::ToolsetPaymentContext {
+                    toolset: toolset_name.to_owned(),
+                    action: action.to_owned(),
+                    grant,
+                    outer,
+                };
+                self.route_to_gated_commit(tool_name, toolset_args, envelope_xdr, context)
                     .await
             }
         }
     }
 
-    /// Routes to `stellar_pay_commit` with the per-action `PaymentSimulated`
-    /// approval FORCED ON UNCONDITIONALLY.
-    ///
-    /// This method synthesises a `RequireApproval` dispatch outcome if the
-    /// policy engine returned `Allow`, ensuring the per-action human
-    /// envelope-review approval fires for every toolset-routed payment.
-    ///
-    /// The `approval_nonce` and `approval_attestation` must be present in
-    /// `toolset_args.args` for the forced-approval path.
+    /// Routes a verified invocation to the shared payment commit handler.
+    /// Argument injection finishes before the dangerous-key check.
     async fn route_to_gated_commit(
         &self,
         tool_name: &'static str,
         toolset_args: &StellarToolsetInvokeArgs,
         envelope_xdr: String,
+        context: super::pay::ToolsetPaymentContext,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         // Build the full tool args, injecting chain_id and envelope_xdr.
         let chain_id = toolset_args.chain_id.as_deref().unwrap_or("");
@@ -724,7 +1098,8 @@ impl WalletServer {
 
         // Route to stellar_pay_commit via the gated routing arm.
         // The tool_name here is "stellar_pay_commit" (a &'static str constant).
-        self.route_to_gated_tool(tool_name, tool_args_value).await
+        self.route_to_gated_tool(tool_name, tool_args_value, Some(context))
+            .await
     }
 
     /// Route a toolset-routed `sign-rule-create` action through the GATED
@@ -732,7 +1107,7 @@ impl WalletServer {
     ///
     /// Distinct entry point from [`Self::route_to_gated_resolver`] (the
     /// `sign-payment` resolver): rule-create has no `envelope_xdr` to decode
-    /// the authoritative bucket-matching fields from — the pending
+    /// the authoritative bucket-matching fields from. The pending
     /// `RuleProposalSimulated` entry (looked up by the caller-supplied
     /// `approval_nonce`, which `stellar_rule_create` always mints) is the
     /// SOLE source of the authoritative smart-account.
@@ -742,15 +1117,18 @@ impl WalletServer {
     /// smart-account C-strkey as `authoritative_destination` and the fixed
     /// `matrix::SIGN_RULE_CREATE_ASSET_SENTINEL` /
     /// `matrix::SIGN_RULE_CREATE_AMOUNT_SENTINEL` for the asset/amount
-    /// dimensions, which carry no independent meaning for rule creation —
-    /// see that module's doc comments for the full rationale.
+    /// dimensions, which carry no independent meaning for rule creation.
+    /// See that module's doc comments for the full rationale.
     ///
     /// # Errors
     ///
-    /// - `toolset.gated_missing_approval_nonce` — `args.approval_nonce`
+    /// - `toolset.gated_missing_approval_nonce`: `args.approval_nonce`
     ///   absent, not a string, or does not resolve to a pending
     ///   `RuleProposalSimulated` entry.
-    /// - `toolset.first_invoke_approval_required` — gate fired, approval queued.
+    /// - `policy.approval_consumed` (a business result): `args.approval_nonce`
+    ///   resolves to an unexpired rule-proposal approval a commit already
+    ///   spent.
+    /// - `toolset.first_invoke_approval_required`: gate fired, approval queued.
     /// - All `stellar_rule_create_commit` errors (policy, attestation, chain, etc.).
     pub(crate) async fn route_to_gated_resolver_rule_create(
         &self,
@@ -813,8 +1191,20 @@ impl WalletServer {
                 None,
             )
         })?;
+        let now_unix_ms = stellar_agent_core::timefmt::now_unix_ms()
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
         let smart_account = match &entry.kind {
             ApprovalKind::RuleProposalSimulated { smart_account, .. } => smart_account.clone(),
+            // The commit spends a rule-proposal approval before its install
+            // starts. A retry through the toolset is named as spent, as the
+            // commit names it, rather than as a nonce of the wrong kind.
+            ApprovalKind::Consumed {
+                original_kind_name, ..
+            } if original_kind_name == "RuleProposalSimulated"
+                && !entry.is_expired(now_unix_ms) =>
+            {
+                return Ok(crate::tools::common::rule_proposal_consumed_error());
+            }
             other => {
                 return Err(rmcp::ErrorData::invalid_params(
                     format!(
@@ -831,8 +1221,13 @@ impl WalletServer {
         let process_uid = process_uid_for_attestation().map_err(|e| {
             rmcp::ErrorData::internal_error(format!("approval.uid_unavailable: {e}"), None)
         })?;
-        let now_unix_ms = stellar_agent_core::timefmt::now_unix_ms()
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
+
+        let (attestation_key, attestation_binding) =
+            match self.load_gated_attestation_key(&profile_name) {
+                Ok(loaded) => loaded,
+                Err(result) => return Ok(result),
+            };
+        let pin_key = self.toolset_pin_key()?;
 
         #[cfg(not(feature = "test-helpers"))]
         let gated_params = GatedInvokeParams {
@@ -840,6 +1235,8 @@ impl WalletServer {
             action,
             toolsets_root,
             profile_name: &profile_name,
+            attestation_key: &attestation_key,
+            attestation_binding: &attestation_binding,
             authoritative_destination: &smart_account,
             authoritative_asset:
                 stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_ASSET_SENTINEL,
@@ -847,6 +1244,7 @@ impl WalletServer {
                 stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_AMOUNT_SENTINEL,
             now_unix_ms,
             process_uid: &process_uid,
+            pin_key: pin_key.as_ref(),
         };
         #[cfg(feature = "test-helpers")]
         let gated_params = GatedInvokeParams {
@@ -854,6 +1252,8 @@ impl WalletServer {
             action,
             toolsets_root,
             profile_name: &profile_name,
+            attestation_key: &attestation_key,
+            attestation_binding: &attestation_binding,
             authoritative_destination: &smart_account,
             authoritative_asset:
                 stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_ASSET_SENTINEL,
@@ -861,6 +1261,7 @@ impl WalletServer {
                 stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_AMOUNT_SENTINEL,
             now_unix_ms,
             process_uid: &process_uid,
+            pin_key: pin_key.as_ref(),
             approval_dir_override: self.approval_dir_override.clone(),
             grant_store_path_override: self.grant_store_path_override.clone(),
         };
@@ -868,11 +1269,19 @@ impl WalletServer {
         match resolve_toolset_sign_payment_gated(&gated_params) {
             Err(e) => {
                 let err = match e {
-                    ToolsetRuntimeError::ToolsetNotInstalled { .. }
-                    | ToolsetRuntimeError::UnknownToolsetAction { .. }
+                    ToolsetRuntimeError::ToolsetNotInstalled
+                    | ToolsetRuntimeError::PinUnverifiable { .. }
+                    | ToolsetRuntimeError::UnknownToolsetAction
                     | ToolsetRuntimeError::CapabilityNotDeclared { .. }
                     | ToolsetRuntimeError::ToolNotAllowed { .. } => {
                         rmcp::ErrorData::invalid_params(e.to_string(), None)
+                    }
+                    ToolsetRuntimeError::BindingMismatch
+                    | ToolsetRuntimeError::GrantStoreError { .. } => {
+                        rmcp::ErrorData::internal_error(
+                            format!("toolset.enforcement_error: {e}"),
+                            None,
+                        )
                     }
                     _ => rmcp::ErrorData::internal_error(
                         format!("toolset.enforcement_error: {e}"),
@@ -903,7 +1312,7 @@ impl WalletServer {
                     Some(payload),
                 ))
             }
-            Ok(GatedResolveOutcome::Resolved { tool_name }) => {
+            Ok(GatedResolveOutcome::Resolved { tool_name, .. }) => {
                 self.route_to_gated_commit_rule_create(tool_name, toolset_args)
                     .await
             }
@@ -934,7 +1343,8 @@ impl WalletServer {
             rmcp::ErrorData::invalid_params(format!("toolset.args_validation: {e}"), None)
         })?;
 
-        self.route_to_gated_tool(tool_name, tool_args_value).await
+        self.route_to_gated_tool(tool_name, tool_args_value, None)
+            .await
     }
 }
 
@@ -943,47 +1353,38 @@ impl WalletServer {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl WalletServer {
-    /// Route to a GATED tool by its `&'static str` name constant.
-    ///
-    /// Unlike `route_to_matrix_tool`, this entry point routes to signing-adjacent
-    /// tools (`stellar_pay_commit`) with the per-action `PaymentSimulated` approval
-    /// FORCED ON UNCONDITIONALLY.
-    ///
-    /// The `args` object MUST contain `approval_nonce` and `approval_attestation`
-    /// (pre-approved per-action `PaymentSimulated` approval) for the commit to
-    /// succeed.  If the caller provides these (from a previously-approved
-    /// `PaymentSimulated` pending approval), the commit proceeds.  If absent,
-    /// `stellar_pay_commit` returns `policy.approval_required` as usual —
-    /// this is the correct behaviour (the forced gate fired; the operator must
-    /// approve via `stellar-agent approve --id <nonce> --profile <name>`).
+    /// Routes gated signing actions. Payments carry a verified invocation;
+    /// rule creation retains its per-proposal approval requirement.
     ///
     /// # Errors
-    ///
-    /// Returns an MCP error from `stellar_pay_commit` on any failure.
+    /// Returns the routed handler's refusal or an invalid argument error.
     pub(crate) async fn route_to_gated_tool(
         &self,
         tool_name: &'static str,
         args: serde_json::Value,
+        context: Option<super::pay::ToolsetPaymentContext>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         match tool_name {
             "stellar_pay_commit" => {
                 let typed: super::pay::StellarPayCommitArgs = serde_json::from_value(args)
                     .map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.gated_args_deserialise: stellar_pay_commit: {e}"),
+                            format!(
+                                "toolset.gated_args_deserialise: stellar_pay_commit: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
-                // Route via invoke_stellar_pay_commit_toolset_gated which forces
-                // RequireApproval unconditionally.
-                self.invoke_stellar_pay_commit_toolset_gated(typed).await
+                self.stellar_pay_commit_impl(typed, context).await
             }
             "stellar_rule_create_commit" => {
                 let typed: super::rule_create::StellarRuleCreateCommitArgs =
                     serde_json::from_value(args).map_err(|e| {
                         rmcp::ErrorData::invalid_params(
                             format!(
-                                "toolset.gated_args_deserialise: stellar_rule_create_commit: {e}"
+                                "toolset.gated_args_deserialise: stellar_rule_create_commit: {}",
+                                describe_args_error(&e)
                             ),
                             None,
                         )
@@ -1001,6 +1402,23 @@ impl WalletServer {
                 None,
             )),
         }
+    }
+}
+
+/// Describes why tool arguments did not deserialise, by the error class only.
+///
+/// A `serde_json` data error quotes the offending value (an unknown variant,
+/// an invalid string), and the arguments come from the caller, so the
+/// description names the class and never the value. A deserialisation from a
+/// `serde_json::Value` carries no source position, so none is reported.
+fn describe_args_error(error: &serde_json::Error) -> &'static str {
+    use serde_json::error::Category;
+    match error.classify() {
+        Category::Syntax | Category::Eof => "the arguments are not valid JSON",
+        Category::Data => {
+            "the arguments have a missing field or a field of the wrong type or value"
+        }
+        Category::Io => "the arguments could not be read",
     }
 }
 
@@ -1024,13 +1442,17 @@ impl WalletServer {
         &self,
         tool_name: &'static str,
         args: serde_json::Value,
+        preparation: Option<super::pay::ToolsetPreparationContext>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         match tool_name {
             "stellar_balances" => {
                 let typed: super::balances::StellarBalancesArgs = serde_json::from_value(args)
                     .map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.args_deserialise: stellar_balances: {e}"),
+                            format!(
+                                "toolset.args_deserialise: stellar_balances: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
@@ -1040,17 +1462,23 @@ impl WalletServer {
                 let typed: super::pay::StellarPayArgs =
                     serde_json::from_value(args).map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.args_deserialise: stellar_pay: {e}"),
+                            format!(
+                                "toolset.args_deserialise: stellar_pay: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
-                self.invoke_stellar_pay(typed).await
+                self.stellar_pay_impl(typed, preparation).await
             }
             "stellar_claim" => {
                 let typed: super::claim::StellarClaimArgs =
                     serde_json::from_value(args).map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.args_deserialise: stellar_claim: {e}"),
+                            format!(
+                                "toolset.args_deserialise: stellar_claim: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
@@ -1060,7 +1488,10 @@ impl WalletServer {
                 let typed: super::rule_create::StellarRuleCreateArgs = serde_json::from_value(args)
                     .map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.args_deserialise: stellar_rule_create: {e}"),
+                            format!(
+                                "toolset.args_deserialise: stellar_rule_create: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
@@ -1070,7 +1501,10 @@ impl WalletServer {
                 let typed: super::sep47_discover::Sep47DiscoverArgs = serde_json::from_value(args)
                     .map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.args_deserialise: stellar_sep47_discover: {e}"),
+                            format!(
+                                "toolset.args_deserialise: stellar_sep47_discover: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
@@ -1081,7 +1515,8 @@ impl WalletServer {
                     serde_json::from_value(args).map_err(|e| {
                         rmcp::ErrorData::invalid_params(
                             format!(
-                                "toolset.args_deserialise: stellar_sep48_preview_invocation: {e}"
+                                "toolset.args_deserialise: stellar_sep48_preview_invocation: {}",
+                                describe_args_error(&e)
                             ),
                             None,
                         )
@@ -1092,7 +1527,10 @@ impl WalletServer {
                 let typed: super::sep7_parse_uri::Sep7ParseUriArgs = serde_json::from_value(args)
                     .map_err(|e| {
                     rmcp::ErrorData::invalid_params(
-                        format!("toolset.args_deserialise: stellar_sep7_parse_uri: {e}"),
+                        format!(
+                            "toolset.args_deserialise: stellar_sep7_parse_uri: {}",
+                            describe_args_error(&e)
+                        ),
                         None,
                     )
                 })?;
@@ -1102,7 +1540,10 @@ impl WalletServer {
                 let typed: super::rules::StellarRulesListArgs = serde_json::from_value(args)
                     .map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.args_deserialise: stellar_rules_list: {e}"),
+                            format!(
+                                "toolset.args_deserialise: stellar_rules_list: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
@@ -1112,7 +1553,10 @@ impl WalletServer {
                 let typed: super::rules::StellarRulesGetArgs = serde_json::from_value(args)
                     .map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.args_deserialise: stellar_rules_get: {e}"),
+                            format!(
+                                "toolset.args_deserialise: stellar_rules_get: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
@@ -1154,13 +1598,286 @@ impl TypeStrName for serde_json::Value {
     }
 }
 
+/// A grant lease that runs a test probe as it drops, before its locks do.
+#[cfg(any(test, feature = "test-helpers"))]
+struct ProbedLease {
+    lease: stellar_agent_toolsets_runtime::ToolsetGrantLease,
+    probe: std::sync::Arc<dyn Fn() + Send + Sync>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl stellar_agent_core::mainnet::toolset_grant::ToolsetGrantEvidence for ProbedLease {
+    fn facts(&self) -> stellar_agent_core::mainnet::toolset_grant::ToolsetGrantFacts<'_> {
+        stellar_agent_core::mainnet::toolset_grant::ToolsetGrantEvidence::facts(&self.lease)
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for ProbedLease {
+    fn drop(&mut self) {
+        (self.probe)();
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Unit tests for route_to_matrix_tool fail-closed `other =>` arm
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test-only fixture construction and assertions"
+    )]
+
+    use stellar_agent_core::profile::Profile;
+    use stellar_agent_toolsets_runtime::PinKey;
     use stellar_agent_toolsets_runtime::matrix::ALL_MATRIX_TOOL_NAMES;
+
+    use super::StellarToolsetInvokeArgs;
+    use crate::server::WalletServer;
+
+    #[test]
+    fn raw_payment_facts_are_provisional_only_off_mainnet() {
+        let args = serde_json::json!({
+            "source": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "destination": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "asset": "native", "amount_in_stroops": "10",
+        });
+        assert!(
+            super::toolset_payment_value("stellar_pay", &args, Some("stellar:mainnet"), true)
+                .is_none()
+        );
+        let value =
+            super::toolset_payment_value("stellar_pay", &args, Some("stellar:testnet"), false);
+        assert!(
+            matches!(value, Some(Ok(stellar_agent_core::policy::v1::ValueClass::Value(ref effects))) if effects.legs()[0].amount == Some(10))
+        );
+        for args in [serde_json::Value::Null, serde_json::json!([])] {
+            assert!(super::toolset_payment_value("stellar_pay", &args, None, false).is_none());
+        }
+        assert!(super::toolset_payment_value("stellar_balances", &args, None, false).is_none());
+        assert!(super::toolset_payment_value("stellar_pay_commit", &args, None, false).is_none());
+    }
+
+    /// Router metadata carries the annotations clients receive in `tools/list`.
+    #[test]
+    fn toolset_invoke_router_annotations_are_destructive() {
+        let tool = WalletServer::toolsets_tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "stellar_toolset_invoke")
+            .unwrap();
+        let annotations = tool.annotations.unwrap();
+        assert_eq!(annotations.destructive_hint, Some(true));
+        assert_eq!(annotations.read_only_hint, Some(false));
+    }
+
+    fn pin_key(byte: u8) -> PinKey {
+        PinKey::from_bytes(zeroize::Zeroizing::new([byte; 32]))
+    }
+
+    fn balances_invoke(toolset: &str) -> StellarToolsetInvokeArgs {
+        StellarToolsetInvokeArgs {
+            toolset: toolset.to_owned(),
+            action: "stellar_balances".to_owned(),
+            chain_id: None,
+            args: serde_json::json!({
+                "account_id": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+            }),
+        }
+    }
+
+    /// A record written under another key, and a record of the earlier
+    /// untagged format, both refuse with `toolset.pin_unverifiable` before
+    /// any routing.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn toolset_invoke_refuses_an_unverifiable_pin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let toolsets = tempfile::TempDir::new().unwrap();
+        stellar_agent_toolsets_install::write_toolset_for_test(
+            toolsets.path(),
+            "balance-reporter",
+            &["read-balance"],
+            &[],
+            "2026-06-02T00:00:00Z",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &pin_key(0x5a),
+        )
+        .unwrap();
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_toolsets_root_for_test(toolsets.path().to_path_buf());
+        server.set_toolset_pin_key_for_test(pin_key(0x5b));
+
+        let err = server
+            .call_stellar_toolset_invoke(balances_invoke("balance-reporter"))
+            .await
+            .expect_err("a record under another key must refuse");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("toolset.pin_unverifiable"),
+            "{}",
+            err.message
+        );
+
+        std::fs::write(
+            toolsets
+                .path()
+                .join("balance-reporter")
+                .join(".stellar-agent-toolset-pin.json"),
+            r#"{"package":"balance-reporter","version":"1.0.0","shasum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","publisher":"GABC","installed_at":"2026-06-02T00:00:00Z","capabilities":["read-balance"],"allowed_tools":[]}"#,
+        )
+        .unwrap();
+        server.set_toolset_pin_key_for_test(pin_key(0x5a));
+        let err = server
+            .call_stellar_toolset_invoke(balances_invoke("balance-reporter"))
+            .await
+            .expect_err("an untagged record must refuse");
+        assert!(
+            err.message.contains("toolset.pin_unverifiable"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// On a mainnet profile without an operator policy, the dispatcher is
+    /// refused by its own policy gate for a read-only action, before the
+    /// resolver reads any record: the toolset here is not installed, and the
+    /// refusal is the policy code, not `toolset.not_installed`.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn toolset_invoke_is_refused_on_mainnet_under_the_default_engine() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let toolsets = tempfile::TempDir::new().unwrap();
+        let profile = Profile::builder_mainnet(
+            "https://rpc.example.invalid",
+            "svc",
+            "acct",
+            "n-svc",
+            "n-acct",
+        )
+        .with_noop_engine()
+        .build();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_toolsets_root_for_test(toolsets.path().to_path_buf());
+        server.set_toolset_pin_key_for_test(pin_key(0x5a));
+
+        let result = server
+            .call_stellar_toolset_invoke(balances_invoke("balance-reporter"))
+            .await
+            .expect("the policy refusal is a business envelope");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "policy.engine_required");
+    }
+
+    /// Routed arguments that do not deserialise into the tool's argument type
+    /// are refused by the tool and the error class, and the refusal repeats
+    /// none of the argument values the deserialiser quotes.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn toolset_args_marker_is_not_echoed() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+
+        let toolsets = tempfile::TempDir::new().unwrap();
+        stellar_agent_toolsets_install::write_toolset_for_test(
+            toolsets.path(),
+            "balance-reporter",
+            &[
+                "read-balance",
+                "propose-transaction",
+                "suggest-destination",
+                "read-rules",
+                "sign-payment",
+            ],
+            &[],
+            "2026-06-02T00:00:00Z",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &pin_key(0x5a),
+        )
+        .unwrap();
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_toolsets_root_for_test(toolsets.path().to_path_buf());
+        server.set_toolset_pin_key_for_test(pin_key(0x5a));
+
+        for action in ALL_MATRIX_TOOL_NAMES {
+            let mut invoke = balances_invoke("balance-reporter");
+            invoke.chain_id = Some("stellar:testnet".to_owned());
+            invoke.action = (*action).to_owned();
+            invoke.args =
+                serde_json::json!({"chain_id": "stellar:testnet", "account_id": CREDENTIAL_MARKER});
+            // A string in a required numeric field or a missing required field
+            // reaches each arm's independent deserializer.
+            invoke.args["assets"] = serde_json::json!(CREDENTIAL_MARKER);
+            invoke.args["limit"] = serde_json::json!(CREDENTIAL_MARKER);
+            invoke.args["transaction_xdr"] = serde_json::json!([CREDENTIAL_MARKER]);
+            let err = server
+                .call_stellar_toolset_invoke(invoke)
+                .await
+                .expect_err("arguments are refused");
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert_eq!(
+                err.message,
+                format!(
+                    "toolset.args_deserialise: {action}: the arguments have a missing field or a field of the wrong type or value"
+                )
+            );
+            assert_no_marker(&err, CREDENTIAL_MARKER);
+        }
+        let mut invoke = balances_invoke("balance-reporter");
+        invoke.action = "stellar_pay_commit".to_owned();
+        invoke.chain_id = Some("stellar:testnet".to_owned());
+        invoke.args = serde_json::json!({"envelope_xdr": "unused", "asset": "native", "amount_in_stroops": [CREDENTIAL_MARKER]});
+        let err = server
+            .call_stellar_toolset_invoke(invoke)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            err.message,
+            "toolset.gated_args_deserialise: stellar_pay_commit: the arguments have a missing field or a field of the wrong type or value"
+        );
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        assert_no_marker_in_text(&capture.captured_str(), "CREDMARKER7");
+    }
 
     /// Verify that ALL_MATRIX_TOOL_NAMES lists only names that have a routing arm
     /// in route_to_matrix_tool (i.e. no name exists in the matrix that is missing
@@ -1204,6 +1921,322 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn toolset_name_and_action_marker_is_not_echoed() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+        let toolsets = tempfile::tempdir().unwrap();
+        stellar_agent_toolsets_install::write_toolset_for_test(
+            toolsets.path(),
+            "balance-reporter",
+            &["read-balance"],
+            &[],
+            "2026-06-02T00:00:00Z",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &pin_key(0x5a),
+        )
+        .unwrap();
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_toolsets_root_for_test(toolsets.path().to_path_buf());
+        server.set_toolset_pin_key_for_test(pin_key(0x5a));
+        for (name, action, expected) in [
+            (
+                CREDENTIAL_MARKER,
+                "stellar_balances",
+                "toolset.not_installed: the requested toolset is not installed",
+            ),
+            (
+                "missing",
+                "stellar_balances",
+                "toolset.not_installed: the requested toolset is not installed",
+            ),
+            (
+                "balance-reporter",
+                CREDENTIAL_MARKER,
+                "toolset.unknown_action: the requested action is not in the capability-to-tool matrix",
+            ),
+        ] {
+            let mut invoke = balances_invoke(name);
+            invoke.action = action.to_owned();
+            let error = server
+                .call_stellar_toolset_invoke(invoke)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert_eq!(error.message, expected);
+            stellar_agent_test_support::rejected_value::assert_no_marker(&error, CREDENTIAL_MARKER);
+            assert_no_marker_in_text(&format!("{error:?}"), CREDENTIAL_MARKER);
+        }
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+            &capture.captured_str(),
+            "CREDMARKER7",
+        );
+    }
+    #[cfg(feature = "test-helpers")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn gated_toolset_args_marker_is_not_echoed() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        use base64::Engine as _;
+        use stellar_agent_core::approval::{
+            AttestationBinding, ContextRuleProposalSnapshot, PendingApproval, PendingApprovalStore,
+            RuleProposalContextType, RuleProposalSigner, TOOLSET_GRANT_DEFAULT_TTL_MS,
+            ToolsetGrantStore, build_attested_grant, process_uid_for_attestation,
+        };
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        use stellar_xdr::{
+            Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
+            SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
+            TransactionV1Envelope, Uint256, VecM, WriteXdr,
+        };
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let approval_dir = root.path().join("approvals");
+        std::fs::create_dir(&approval_dir).unwrap();
+        let grant_path = root.path().join("grants.toml");
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        let key = [0x42; 32];
+        keyring_core::Entry::new(
+            &profile.attestation_key_id.service,
+            &profile.attestation_key_id.account,
+        )
+        .unwrap()
+        .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key))
+        .unwrap();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_toolsets_root_for_test(root.path().to_path_buf());
+        server.set_toolset_pin_key_for_test(pin_key(0x5a));
+        server.set_approval_dir_for_test(approval_dir.clone());
+        server.set_grant_store_path_for_test(grant_path.clone());
+        stellar_agent_toolsets_install::write_toolset_for_test(
+            root.path(),
+            "marker-tools",
+            &["sign-payment", "sign-rule-create"],
+            &[],
+            "2026-06-02T00:00:00Z",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &pin_key(0x5a),
+        )
+        .unwrap();
+        let dest = stellar_strkey::ed25519::PublicKey([7; 32])
+            .to_string()
+            .to_string();
+        let contract = stellar_strkey::Contract([8; 32]).to_string().to_string();
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        for (capability, destination, asset, amount) in [
+            ("sign-payment", dest.as_str(), "XLM", 1_000_000),
+            (
+                "sign-rule-create",
+                contract.as_str(),
+                stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_ASSET_SENTINEL,
+                stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_AMOUNT_SENTINEL,
+            ),
+        ] {
+            let grant = build_attested_grant(
+                "marker-tools".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                "1.0.0".to_owned(),
+                "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+                capability.to_owned(),
+                destination.to_owned(),
+                asset.to_owned(),
+                0,
+                amount,
+                process_uid_for_attestation().unwrap(),
+                now,
+                TOOLSET_GRANT_DEFAULT_TTL_MS,
+                &key,
+                &AttestationBinding::new("acct", "stellar:testnet"),
+            )
+            .unwrap();
+            ToolsetGrantStore::open(grant_path.clone(), now)
+                .unwrap()
+                .insert(grant)
+                .unwrap();
+        }
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([7; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::Payment(PaymentOp {
+                        destination: MuxedAccount::Ed25519(Uint256([7; 32])),
+                        asset: Asset::Native,
+                        amount: 1_000_000,
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+        let entry = PendingApproval::new_rule_proposal_pending(
+            contract,
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
+            "stellar:testnet".to_owned(),
+            ContextRuleProposalSnapshot::new(
+                RuleProposalContextType::Default,
+                "daily".to_owned(),
+                None,
+                vec![RuleProposalSigner::delegated(dest.clone(), true)],
+                vec![],
+                vec![0],
+                false,
+                false,
+            ),
+            "rule".to_owned(),
+            process_uid_for_attestation().unwrap(),
+            60_000,
+        )
+        .unwrap();
+        let nonce = entry.approval_nonce.clone();
+        PendingApprovalStore::open(approval_dir.join("acct.toml"))
+            .unwrap()
+            .insert(entry, now)
+            .unwrap();
+        for (action, args) in [
+            (
+                "stellar_pay_commit",
+                serde_json::json!({"source": dest, "destination": dest, "asset": "native",
+                "amount": "0.1 XLM", "envelope_xdr": envelope, "nonce": "unused", "expires_at_unix_ms": CREDENTIAL_MARKER}),
+            ),
+            (
+                "stellar_rule_create_commit",
+                serde_json::json!({"approval_nonce": nonce, "approval_attestation": [CREDENTIAL_MARKER]}),
+            ),
+        ] {
+            let err = server
+                .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                    toolset: "marker-tools".to_owned(),
+                    action: action.to_owned(),
+                    chain_id: Some("stellar:testnet".to_owned()),
+                    args,
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert_eq!(
+                err.message,
+                format!(
+                    "toolset.gated_args_deserialise: {action}: the arguments have a missing field or a field of the wrong type or value"
+                )
+            );
+            assert_no_marker(&err, CREDENTIAL_MARKER);
+        }
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+            &capture.captured_str(),
+            "CREDMARKER7",
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn toolset_invoke_refuses_muxed_contract_payment_before_outer_gate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let rpc = wiremock::MockServer::start().await;
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "acct", "n-svc", "n-acct",
+        )
+        .with_noop_engine()
+        .rpc_url(rpc.uri())
+        .build();
+        let server = WalletServer::new(profile).unwrap();
+        let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+        let destination =
+            stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string();
+        for (with_memo, expected_code) in [
+            (false, "validation.contract_payment_unavailable"),
+            (true, "validation.contract_payment_memo_unsupported"),
+        ] {
+            for action in ["stellar_pay", "stellar_pay_commit"] {
+                let mut args = serde_json::json!({
+                    "source": source.as_str(),
+                    "destination": destination.as_str(),
+                    "asset": "native",
+                    "amount": "1 XLM",
+                });
+                if with_memo {
+                    args["memo_text"] = serde_json::json!("memo");
+                }
+                let result = server
+                    .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                        toolset: "not-even-installed".to_owned(),
+                        action: action.to_owned(),
+                        chain_id: Some("stellar:testnet".to_owned()),
+                        args,
+                    })
+                    .await
+                    .expect("business error envelope for W destination");
+                let (code, _, text) = crate::tools::common::assert_business_envelope(&result);
+                assert_eq!(
+                    code, expected_code,
+                    "{action}, with_memo={with_memo}: {text}"
+                );
+            }
+        }
+        assert!(
+            rpc.received_requests().await.unwrap().is_empty(),
+            "no network request may be sent for W destination"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1231,6 +2264,71 @@ impl WalletServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         self.stellar_toolset_invoke(rmcp::handler::server::wrapper::Parameters(args))
             .await
+    }
+
+    /// Builds the toolset context of a payment commit for `invoke` from the
+    /// gated resolver's `resolved` outcome. Without a mainnet context it runs
+    /// the invocation's outer gate and carries its outcome.
+    ///
+    /// # Errors
+    ///
+    /// A `FirstInvokeApprovalRequired` outcome refuses with
+    /// `toolset.first_invoke_approval_required`; an outer gate refusal
+    /// answers with its own error.
+    pub(crate) async fn toolset_payment_context(
+        &self,
+        invoke: &StellarToolsetInvokeArgs,
+        resolved: GatedResolveOutcome,
+    ) -> Result<super::pay::ToolsetPaymentContext, super::common::ToolError> {
+        let GatedResolveOutcome::Resolved { grant, .. } = resolved else {
+            return Err(super::common::ToolError::Business(
+                crate::tools::common::business_error_result(
+                    "toolset.first_invoke_approval_required",
+                    "the invocation has no verified grant",
+                ),
+            ));
+        };
+        let outer = if self.mainnet_context.is_some() {
+            None
+        } else {
+            Some(
+                self.toolset_outer_gate(
+                    &invoke.toolset,
+                    &invoke.action,
+                    &invoke.args,
+                    invoke.chain_id.as_deref(),
+                )
+                .await?,
+            )
+        };
+        Ok(super::pay::ToolsetPaymentContext {
+            toolset: invoke.toolset.clone(),
+            action: invoke.action.clone(),
+            grant,
+            outer,
+        })
+    }
+
+    /// Commits a payment through the shared handler with the toolset context
+    /// [`Self::toolset_payment_context`] builds for `invoke` and `resolved`.
+    ///
+    /// Integration-test entry point for independently checked grant snapshots.
+    ///
+    /// # Errors
+    ///
+    /// As `stellar_pay_commit`.
+    #[doc(hidden)]
+    pub async fn call_stellar_pay_commit_in_toolset(
+        &self,
+        invoke: &StellarToolsetInvokeArgs,
+        resolved: GatedResolveOutcome,
+        args: super::pay::StellarPayCommitArgs,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let context = match self.toolset_payment_context(invoke, resolved).await {
+            Ok(context) => context,
+            Err(error) => return error.into_result(),
+        };
+        self.stellar_pay_commit_impl(args, Some(context)).await
     }
 }
 

@@ -25,7 +25,8 @@ use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 use stellar_agent_toolsets_install::signature::build_preimage;
 use stellar_agent_toolsets_install::{
-    InstallOptions, ToolsetInstallError, install_toolset, uninstall_toolset,
+    InstallOptions, PinKey, ToolsetInstallError, install_toolset, lock_toolsets, read_pin,
+    uninstall_toolset,
 };
 use stellar_strkey::ed25519::PublicKey as StrPublicKey;
 use tempfile::TempDir;
@@ -149,6 +150,20 @@ fn make_trust_setup() -> (SigningKey, [u8; 32], std::path::PathBuf, TempDir) {
     (sk, pk, trust_path, tmp)
 }
 
+/// The pin key every install in this suite writes its record under.
+fn test_pin_key() -> PinKey {
+    PinKey::from_bytes(zeroize::Zeroizing::new([0x5a; 32]))
+}
+
+/// Runs [`uninstall_toolset`] under a freshly taken lock of `toolsets_root`.
+fn uninstall_locked(
+    package: &str,
+    toolsets_root: &std::path::Path,
+) -> Result<(), ToolsetInstallError> {
+    let lock = lock_toolsets(toolsets_root)?;
+    uninstall_toolset(package, toolsets_root, &lock)
+}
+
 /// Calls [`install_toolset`] for tests that do NOT declare key-touching
 /// capabilities.  Passes `None` for attestation and a non-existent auditor
 /// trust path (the gate does not fire for non-key-touching toolsets, so the
@@ -169,6 +184,7 @@ fn install_no_attestation(
     options: &InstallOptions,
 ) -> Result<(), ToolsetInstallError> {
     let auditor_trust_path = trust_path.with_file_name("auditor-trust.txt");
+    let lock = lock_toolsets(toolsets_root)?;
     install_toolset(
         package,
         version,
@@ -181,6 +197,8 @@ fn install_no_attestation(
         None,
         &auditor_trust_path,
         options,
+        &lock,
+        &test_pin_key(),
     )
     .map(|_outcome| ())
 }
@@ -213,6 +231,7 @@ fn install_expecting_err(
     // capability), so the attestation gate does not fire.  The auditor trust
     // path is kept adjacent to the publisher trust file but will not be read.
     let auditor_trust_path = trust_path.with_file_name("auditor-trust.txt");
+    let lock = lock_toolsets(toolsets_root).unwrap();
     install_toolset(
         package,
         version,
@@ -225,6 +244,8 @@ fn install_expecting_err(
         None,
         &auditor_trust_path,
         &opts,
+        &lock,
+        &test_pin_key(),
     )
     .unwrap_err()
 }
@@ -256,7 +277,7 @@ fn traversal_dotdot_rejected() {
     assert!(
         matches!(
             err,
-            ToolsetInstallError::ArchivePathTraversal { .. }
+            ToolsetInstallError::ArchivePathTraversal
                 | ToolsetInstallError::ArchiveBadTopLevel { .. }
                 | ToolsetInstallError::ArchiveEntryNameInvalid { .. }
         ),
@@ -291,7 +312,7 @@ fn absolute_path_entry_rejected() {
     assert!(
         matches!(
             err,
-            ToolsetInstallError::ArchivePathTraversal { .. }
+            ToolsetInstallError::ArchivePathTraversal
                 | ToolsetInstallError::ArchiveBadTopLevel { .. }
                 | ToolsetInstallError::ArchiveEntryNameInvalid { .. }
         ),
@@ -515,7 +536,7 @@ fn case_collision_rejected() {
         &toolsets_root,
     );
     assert!(
-        matches!(err, ToolsetInstallError::ArchiveDuplicateEntry { .. }),
+        matches!(err, ToolsetInstallError::ArchiveDuplicateEntry),
         "expected ArchiveDuplicateEntry for case collision, got: {err:?}"
     );
 }
@@ -619,7 +640,7 @@ fn untrusted_publisher_rejected() {
     .unwrap_err();
 
     assert!(
-        matches!(err, ToolsetInstallError::UntrustedPublisher { .. }),
+        matches!(err, ToolsetInstallError::UntrustedPublisher),
         "expected UntrustedPublisher, got: {err:?}"
     );
 }
@@ -876,7 +897,7 @@ fn uninstall_removes_dir_and_pin() {
             .exists()
     );
 
-    uninstall_toolset("my-toolset", &toolsets_root).unwrap();
+    uninstall_locked("my-toolset", &toolsets_root).unwrap();
 
     assert!(!toolsets_root.join("my-toolset").exists());
 }
@@ -889,9 +910,9 @@ fn uninstall_absent_returns_not_installed() {
     let toolsets_root = tmp.path().join("toolsets");
     std::fs::create_dir_all(&toolsets_root).unwrap();
 
-    let err = uninstall_toolset("my-toolset", &toolsets_root).unwrap_err();
+    let err = uninstall_locked("my-toolset", &toolsets_root).unwrap_err();
     assert!(
-        matches!(err, ToolsetInstallError::NotInstalled { .. }),
+        matches!(err, ToolsetInstallError::NotInstalled),
         "expected NotInstalled, got: {err:?}"
     );
 }
@@ -962,15 +983,16 @@ fn valid_install_end_to_end() {
         "pin record must be written after install"
     );
 
-    let pin: stellar_agent_toolsets_install::ToolsetPinRecord =
-        serde_json::from_str(&std::fs::read_to_string(&pin_path).unwrap()).unwrap();
+    let pin = read_pin("my-toolset", &toolsets_root, Some(&test_pin_key()))
+        .unwrap()
+        .expect("the record must verify under the install key");
     assert_eq!(pin.package, "my-toolset");
     assert_eq!(pin.version, "1.0.0");
     assert_eq!(pin.shasum, shasum);
 
     // The pin must record the SHA-256 of the extracted TOOLSET.md so the dispatch
     // path can detect later manifest tampering.  Assert it is present and equals
-    // the digest of the bytes actually on disk (not None, not a stale value).
+    // the digest of the bytes actually on disk.
     let on_disk_toolset_md =
         std::fs::read(toolsets_root.join("my-toolset").join("TOOLSET.md")).unwrap();
     let expected_toolset_md_shasum = {
@@ -979,8 +1001,7 @@ fn valid_install_end_to_end() {
         hex::encode(h.finalize())
     };
     assert_eq!(
-        pin.toolset_md_shasum,
-        Some(expected_toolset_md_shasum),
+        pin.toolset_md_shasum, expected_toolset_md_shasum,
         "pin must record the SHA-256 of the extracted TOOLSET.md for tamper detection"
     );
 }
@@ -1182,37 +1203,40 @@ fn char_device_entry_rejected() {
 #[cfg(unix)]
 #[test]
 fn uninstall_with_symlink_toolset_dir_refuses() {
-    use stellar_agent_toolsets_install::uninstall_toolset;
-
-    let tmp = TempDir::new().unwrap();
+    let (sk, pk, trust_path, tmp) = make_trust_setup();
     let toolsets_root = tmp.path().join("toolsets");
     std::fs::create_dir_all(&toolsets_root).unwrap();
 
-    // Create a legitimate directory somewhere else.
+    let toolset_md = minimal_toolset_md("my-toolset");
+    let pkg_bytes = make_valid_tar_gz("my-toolset", &toolset_md);
+    let (sig, shasum) = sign_package("my-toolset", "1.0.0", &pkg_bytes, &sk);
+    install_no_attestation(
+        "my-toolset",
+        "1.0.0",
+        &pkg_bytes,
+        &shasum,
+        &sig,
+        &pk,
+        &toolsets_root,
+        &trust_path,
+        &InstallOptions::default(),
+    )
+    .unwrap();
+
+    // Move the installed directory, record included, elsewhere and place a
+    // symlink at toolsets_root/my-toolset pointing at it.
     let real_dir = tmp.path().join("real-toolset-dir");
-    std::fs::create_dir_all(&real_dir).unwrap();
-
-    // Place a symlink at toolsets_root/my-toolset → real-toolset-dir.
     let symlink_path = toolsets_root.join("my-toolset");
+    std::fs::rename(&symlink_path, &real_dir).unwrap();
     std::os::unix::fs::symlink(&real_dir, &symlink_path).unwrap();
-
-    // Write a pin record (directly, bypassing the install flow).
-    // ToolsetPinRecord is #[non_exhaustive]; construct via JSON serialisation.
-    let pkg_dir = toolsets_root.join("my-toolset");
-    // The pin path is inside the symlink destination, but we write via the link.
-    std::fs::create_dir_all(&pkg_dir).unwrap(); // creates inside real_dir via symlink
-    let pin_json = serde_json::json!({
-        "package": "my-toolset",
-        "version": "1.0.0",
-        "shasum": "a".repeat(64),
-        "publisher": "GABCDEFG...",
-        "installed_at": "2026-06-01T00:00:00Z"
-    });
-    let pin_path = pkg_dir.join(".stellar-agent-toolset-pin.json");
-    std::fs::write(&pin_path, serde_json::to_string(&pin_json).unwrap()).unwrap();
+    assert!(
+        symlink_path
+            .join(".stellar-agent-toolset-pin.json")
+            .is_file()
+    );
 
     // Uninstall must refuse (symlink leaf on toolset dir).
-    let err = uninstall_toolset("my-toolset", &toolsets_root).unwrap_err();
+    let err = uninstall_locked("my-toolset", &toolsets_root).unwrap_err();
     assert!(
         matches!(err, ToolsetInstallError::PinRecordMalformed { .. }),
         "expected PinRecordMalformed for symlink toolset dir, got: {err:?}"
@@ -1220,4 +1244,257 @@ fn uninstall_with_symlink_toolset_dir_refuses() {
 
     // The real directory must still exist (no deletion through symlink).
     assert!(real_dir.exists(), "real dir must not have been removed");
+    assert!(real_dir.join("TOOLSET.md").is_file());
+}
+
+// ── 29. Refused values stay out of every refusal ─────────────────────────────
+
+/// Installs `pkg_bytes` as version `1.0.0` of `my-toolset`, returning the
+/// refusal and the events it logged.
+fn refusal_and_logs(pkg_bytes: &[u8]) -> (ToolsetInstallError, String) {
+    let (sk, pk, trust_path, tmp) = make_trust_setup();
+    let toolsets_root = tmp.path().join("toolsets");
+    std::fs::create_dir_all(&toolsets_root).unwrap();
+    let mut refusal = None;
+    let logs = stellar_agent_test_support::log_capture::with_captured_logs(|| {
+        refusal = Some(install_expecting_err(
+            "my-toolset",
+            "1.0.0",
+            pkg_bytes,
+            &sk,
+            &pk,
+            &trust_path,
+            &toolsets_root,
+        ));
+    });
+    (refusal.expect("the install must refuse"), logs)
+}
+
+/// Asserts that `error` renders exactly `expected` and that no rendering of it
+/// holds any casing of the marker.
+fn assert_rule_only(error: &ToolsetInstallError, expected: &str) {
+    assert_eq!(error.to_string(), expected);
+    let rendered = format!("{error} {error:?}").to_ascii_lowercase();
+    assert!(!rendered.contains("credmarker7"), "{rendered}");
+}
+
+/// A tar header with `field` in its numeric size field and a valid checksum, so
+/// that the failure comes from the tar reader's numeric parse.
+fn header_with_size_field(field: &[u8; 12]) -> [u8; 512] {
+    let mut block = tar_header(b"my-toolset/\0", 0, b'5', b"");
+    block[124..136].copy_from_slice(field);
+    block[148..156].copy_from_slice(b"        ");
+    let sum: u32 = block.iter().map(|byte| u32::from(*byte)).sum();
+    block[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    block
+}
+
+#[test]
+fn malformed_tar_header_stays_out_of_the_error() {
+    let mut tar = header_with_size_field(b"credmarker7\0").to_vec();
+    tar.extend(vec![0u8; 1024]);
+    let (err, _) = refusal_and_logs(&gzip(&tar));
+    assert_rule_only(
+        &err,
+        "i/o error: archive entry header must be a valid tar header",
+    );
+}
+
+#[test]
+fn refused_entry_names_stay_out_of_the_errors() {
+    let wrong_first = make_raw_tar(&[(b"credmarker7/\0", b"", b'5', b"")]);
+    let second_top = make_raw_tar(&[
+        (b"my-toolset/\0", b"", b'5', b""),
+        (b"credmarker7/\0", b"", b'5', b""),
+    ]);
+    let top_level_file = make_raw_tar(&[(b"credmarker7\0", b"x", b'0', b"")]);
+    const TOP_LEVEL: &str = "archive bad top-level: the archive must contain exactly one \
+                             top-level directory named after the package";
+    for tar in [wrong_first, second_top, top_level_file] {
+        let (err, _) = refusal_and_logs(&gzip(&tar));
+        assert_rule_only(&err, TOP_LEVEL);
+    }
+
+    let traversal = make_raw_tar(&[
+        (b"my-toolset/\0", b"", b'5', b""),
+        (b"my-toolset/../credmarker7\0", b"x", b'0', b""),
+    ]);
+    let (err, _) = refusal_and_logs(&gzip(&traversal));
+    assert_rule_only(
+        &err,
+        "archive path traversal: every entry must stay within the package root",
+    );
+
+    let non_ascii = make_raw_tar(&[
+        (b"my-toolset/\0", b"", b'5', b""),
+        ("my-toolset/credmarker7\u{e9}\0".as_bytes(), b"x", b'0', b""),
+    ]);
+    let (err, _) = refusal_and_logs(&gzip(&non_ascii));
+    assert!(
+        matches!(&err, ToolsetInstallError::ArchiveEntryNameInvalid { detail }
+            if detail == "entry names must contain only ASCII characters"),
+        "{err:?}"
+    );
+    assert!(!format!("{err:?}").contains("credmarker7"), "{err:?}");
+
+    let collision = make_raw_tar(&[
+        (b"my-toolset/\0", b"", b'5', b""),
+        (b"my-toolset/credmarker7\0", b"x", b'0', b""),
+        (b"my-toolset/CREDMARKER7\0", b"x", b'0', b""),
+    ]);
+    let (err, _) = refusal_and_logs(&gzip(&collision));
+    assert_rule_only(
+        &err,
+        "archive duplicate entry: entry names must be unique under ASCII-lowercase comparison",
+    );
+}
+
+/// A refused `TOOLSET.md` value stays out of the install error and of the
+/// rollback warning, and the warning fires.
+#[test]
+fn refused_toolset_md_values_stay_out_of_the_rollback_warning() {
+    const HEAD: &str = "---\nname: my-toolset\ndescription: test\nmetadata:\n";
+    for (metadata, expected) in [
+        (
+            "  credmarker7:\n    inner: value\n",
+            "toolset format error: TOOLSET.md frontmatter is malformed YAML: a metadata value \
+             must be a string, not a mapping or sequence",
+        ),
+        (
+            "  credmarker7:\n    - value\n",
+            "toolset format error: TOOLSET.md frontmatter is malformed YAML: a metadata value \
+             must be a string, not a mapping or sequence",
+        ),
+        (
+            "  stellar-agent-capabilities: \"credmarker7!\"\n",
+            "toolset format error: capability token must contain only characters from [a-z0-9-]",
+        ),
+    ] {
+        let toolset_md = format!("{HEAD}{metadata}---\n");
+        let (err, logs) = refusal_and_logs(&make_valid_tar_gz("my-toolset", &toolset_md));
+        assert_rule_only(&err, expected);
+        assert!(logs.contains("TOOLSET.md parse failed"), "{logs}");
+        assert!(!logs.contains("credmarker7"), "{logs}");
+    }
+}
+
+#[test]
+fn refused_versions_stay_out_of_the_error() {
+    let (sk, pk, trust_path, tmp) = make_trust_setup();
+    let toolsets_root = tmp.path().join("toolsets");
+    std::fs::create_dir_all(&toolsets_root).unwrap();
+    let pkg_bytes = make_valid_tar_gz("my-toolset", &minimal_toolset_md("my-toolset"));
+    for version in ["1.x.0", "1.2.3-credmarker7!"] {
+        let err = install_expecting_err(
+            "my-toolset",
+            version,
+            &pkg_bytes,
+            &sk,
+            &pk,
+            &trust_path,
+            &toolsets_root,
+        );
+        assert_rule_only(
+            &err,
+            "invalid version: version must be SemVer, such as 1.2.3",
+        );
+        assert!(!err.to_string().contains("unexpected"), "{err}");
+    }
+}
+
+#[test]
+fn untrusted_publisher_key_stays_out_of_the_error() {
+    let (_sk, _pk, trust_path, tmp) = make_trust_setup();
+    let toolsets_root = tmp.path().join("toolsets");
+    std::fs::create_dir_all(&toolsets_root).unwrap();
+    let other = SigningKey::from_bytes(&[0xCD; 32]);
+    let other_pk = other.verifying_key().to_bytes();
+    let pkg_bytes = make_valid_tar_gz("my-toolset", &minimal_toolset_md("my-toolset"));
+    let err = install_expecting_err(
+        "my-toolset",
+        "1.0.0",
+        &pkg_bytes,
+        &other,
+        &other_pk,
+        &trust_path,
+        &toolsets_root,
+    );
+    assert_rule_only(
+        &err,
+        "untrusted publisher: the --publisher key must be in the trust set; add its G-strkey \
+         to the trust set",
+    );
+    let strkey = StrPublicKey(other_pk).to_string();
+    let strkey = strkey.as_str();
+    let rendered = format!("{err} {err:?}");
+    assert!(!rendered.contains(strkey), "{rendered}");
+    assert!(!rendered.contains(&strkey[..5]), "{rendered}");
+    assert!(
+        !rendered.contains(&strkey[strkey.len() - 5..]),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn uninstall_refusals_stay_out_of_the_errors() {
+    let tmp = TempDir::new().unwrap();
+    let toolsets_root = tmp.path().join("toolsets");
+    std::fs::create_dir_all(&toolsets_root).unwrap();
+    let err = uninstall_locked("credmarker7", &toolsets_root).unwrap_err();
+    assert_rule_only(
+        &err,
+        "not installed: the requested package must be installed before it can be uninstalled",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_refusals_hold_no_path() {
+    let (sk, pk, trust_path, tmp) = make_trust_setup();
+    let marked_root = tmp.path().join("credmarker7");
+    let toolsets_root = marked_root.join("toolsets");
+    std::fs::create_dir_all(&toolsets_root).unwrap();
+
+    let pkg_bytes = make_valid_tar_gz("my-toolset", &minimal_toolset_md("my-toolset"));
+    let (sig, shasum) = sign_package("my-toolset", "1.0.0", &pkg_bytes, &sk);
+    install_no_attestation(
+        "my-toolset",
+        "1.0.0",
+        &pkg_bytes,
+        &shasum,
+        &sig,
+        &pk,
+        &toolsets_root,
+        &trust_path,
+        &InstallOptions::default(),
+    )
+    .unwrap();
+    let real_dir = tmp.path().join("real-toolset-dir");
+    let leaf = toolsets_root.join("my-toolset");
+    std::fs::rename(&leaf, &real_dir).unwrap();
+    std::os::unix::fs::symlink(&real_dir, &leaf).unwrap();
+    let err = uninstall_locked("my-toolset", &toolsets_root).unwrap_err();
+    assert_rule_only(
+        &err,
+        "pin record malformed: the toolset directory must be a real directory; refusing \
+         removal of a symlink",
+    );
+    assert!(real_dir.join("TOOLSET.md").is_file());
+
+    let symlink_root = tmp.path().join("credmarker7-root");
+    std::os::unix::fs::symlink(&toolsets_root, &symlink_root).unwrap();
+    let err = install_expecting_err(
+        "other-toolset",
+        "1.0.0",
+        &make_valid_tar_gz("other-toolset", &minimal_toolset_md("other-toolset")),
+        &sk,
+        &pk,
+        &trust_path,
+        &symlink_root,
+    );
+    assert_rule_only(
+        &err,
+        "toolsets root invalid: the toolsets root must be a real directory; correct \
+         --toolsets-dir",
+    );
 }

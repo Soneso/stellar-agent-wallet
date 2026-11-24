@@ -10,6 +10,7 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::ToolsetFormatError;
+use crate::error::CAPABILITY_TOKEN_CHARSET_RULE;
 
 /// The reserved metadata key that carries the capability manifest.
 pub(crate) const CAPABILITY_KEY: &str = "stellar-agent-capabilities";
@@ -281,16 +282,14 @@ impl<'de> Deserialize<'de> for CapabilitySet {
                     if !token.chars().all(is_valid_token_char) {
                         // A tampered or malformed record contains an invalid-charset
                         // token.  Reject the entire deserialise.
-                        return Err(de::Error::custom(format!(
-                            "capability token '{token}' contains characters outside [a-z0-9-]"
-                        )));
+                        return Err(de::Error::custom(CAPABILITY_TOKEN_CHARSET_RULE));
                     }
 
                     match match_capability_token(&token) {
                         Ok(cap) => {
                             set.insert(cap);
                         }
-                        Err(ToolsetFormatError::UnknownCapability { .. }) => {
+                        Err(ToolsetFormatError::UnknownCapability) => {
                             // Forward-compat: a capability added in a future binary
                             // version was stored in this record; ignore it so the
                             // record remains loadable on an older binary.
@@ -363,9 +362,7 @@ pub(crate) fn parse_capability_value(value: &str) -> Result<CapabilitySet, Tools
     for token in value.split_ascii_whitespace() {
         // Step 2: charset gate — must be [a-z0-9-] only.
         if !token.chars().all(is_valid_token_char) {
-            return Err(ToolsetFormatError::CapabilityTokenInvalidChar {
-                token: token.to_owned(),
-            });
+            return Err(ToolsetFormatError::CapabilityTokenInvalidChar);
         }
 
         // Step 3: name-match within [a-z0-9-] tokens.
@@ -421,9 +418,7 @@ fn match_capability_token(token: &str) -> Result<Capability, ToolsetFormatError>
         // sign-rule-create is declarable but INERT at parse/install time.
         // The first-invoke gate is the sole admission control for this code path.
         SIGN_RULE_CREATE_TOKEN => Ok(Capability::SignRuleCreate),
-        other => Err(ToolsetFormatError::UnknownCapability {
-            token: other.to_owned(),
-        }),
+        _ => Err(ToolsetFormatError::UnknownCapability),
     }
 }
 
@@ -515,7 +510,7 @@ mod tests {
         // never BareSignTransactionForbidden or UnknownCapability.
         let err = parse_capability_value("Sign-Transaction").unwrap_err();
         assert!(
-            matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar { .. }),
+            matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar),
             "expected CapabilityTokenInvalidChar, got {err:?}"
         );
     }
@@ -524,7 +519,7 @@ mod tests {
     fn sign_transaction_all_caps_refused_at_charset_gate() {
         let err = parse_capability_value("SIGN-TRANSACTION").unwrap_err();
         assert!(
-            matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar { .. }),
+            matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar),
             "expected CapabilityTokenInvalidChar, got {err:?}"
         );
     }
@@ -533,7 +528,7 @@ mod tests {
     fn sign_transaction_underscore_refused_at_charset_gate() {
         let err = parse_capability_value("sign_transaction").unwrap_err();
         assert!(
-            matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar { .. }),
+            matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar),
             "expected CapabilityTokenInvalidChar, got {err:?}"
         );
     }
@@ -557,7 +552,7 @@ mod tests {
         let homoglyph = "ѕign-transaction"; // Cyrillic ѕ, not ASCII s
         let err = parse_capability_value(homoglyph).unwrap_err();
         assert!(
-            matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar { .. }),
+            matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar),
             "expected CapabilityTokenInvalidChar, got {err:?}"
         );
     }
@@ -568,7 +563,7 @@ mod tests {
         let homoglyph = "re\u{0430}d-balance"; // 'а' instead of 'a'
         let err = parse_capability_value(homoglyph).unwrap_err();
         assert!(
-            matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar { .. }),
+            matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar),
             "expected CapabilityTokenInvalidChar, got {err:?}"
         );
     }
@@ -577,7 +572,7 @@ mod tests {
     fn unknown_token_refused() {
         let err = parse_capability_value("send-xdr").unwrap_err();
         assert!(
-            matches!(err, ToolsetFormatError::UnknownCapability { .. }),
+            matches!(err, ToolsetFormatError::UnknownCapability),
             "expected UnknownCapability, got {err:?}"
         );
     }
@@ -592,7 +587,7 @@ mod tests {
         // both of which are unknown tokens (not in taxonomy).
         let err = parse_capability_value(s).unwrap_err();
         assert!(
-            matches!(err, ToolsetFormatError::UnknownCapability { .. }),
+            matches!(err, ToolsetFormatError::UnknownCapability),
             "got {err:?}"
         );
     }
@@ -658,6 +653,18 @@ mod tests {
         let set: CapabilitySet = serde_json::from_str(json).unwrap();
         assert!(set.contains(Capability::ReadBalance));
         assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn stored_invalid_charset_token_stays_out_of_the_serde_error() {
+        let err = serde_json::from_str::<CapabilitySet>(r#"["credmarker7!"]"#).unwrap_err();
+        assert!(
+            err.to_string().starts_with(
+                "capability token must contain only characters from [a-z0-9-] at line 1"
+            ),
+            "{err}"
+        );
+        assert!(!format!("{err:?}").contains("credmarker7"), "{err:?}");
     }
 
     #[test]

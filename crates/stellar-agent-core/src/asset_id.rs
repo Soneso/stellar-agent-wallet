@@ -64,7 +64,7 @@ impl CanonicalAsset {
             Self::Native => StellarAmount::parse_with_unit(input),
             Self::Classic { code, .. } => StellarAmount::parse_with_unit_for(input, code),
             Self::Contract(_) => Err(ValidationError::AssetInvalid {
-                input: self.to_string(),
+                field: "asset".into(),
             }),
         }
     }
@@ -115,6 +115,18 @@ impl CanonicalAsset {
             return Self::contract(key);
         }
         Err(AssetIdError::Form)
+    }
+
+    /// Parses the asset of an authoritative payment decode: `XLM` and
+    /// `native` name the native asset, and any other text is a threshold key.
+    ///
+    /// # Errors
+    /// Returns the threshold-key error of any other text.
+    pub fn parse_payment_asset(text: &str) -> Result<Self, AssetIdError> {
+        match text {
+            "XLM" | "native" => Ok(Self::Native),
+            key => Self::parse_threshold_key(key),
+        }
     }
 
     /// Derives the Stellar Asset Contract address on the supplied network.
@@ -216,8 +228,9 @@ mod tests {
             assert_eq!(error.code(), "validation.amount_malformed");
             assert_eq!(
                 error.to_string(),
-                format!("amount '100 {supplied}' has unit '{supplied}'; expected unit '{code}'")
+                format!("the amount has the wrong unit; expected unit '{code}'")
             );
+            assert!(!format!("{error:?}").contains(&format!("100 {supplied}")));
         }
         let contract = stellar_strkey::Contract([7; 32]).to_string();
         assert!(matches!(

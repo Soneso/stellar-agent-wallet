@@ -18,10 +18,10 @@
 //! `camelCase` JSON convention per the spec. `rename_all = "camelCase"` is
 //! applied at the struct level.
 
-// Wire struct fields mirror the full @simplewebauthn/browser JSON shape.
-// Not every field is consumed by the current handlers — some are part of the
-// spec shape and are retained for future validation steps.
-#![allow(dead_code, reason = "wire fields: spec shape, future use")]
+// Wire struct fields mirror the full @simplewebauthn/browser JSON shape. The
+// handlers read the fields their checks need; `type` and `userHandle` are
+// part of that shape and stay unread.
+#![allow(dead_code, reason = "wire fields: the full spec shape is deserialised")]
 
 use serde::Deserialize;
 
@@ -50,7 +50,8 @@ pub(crate) struct RegistrationResponseJSON {
     pub id: String,
     /// The raw credential ID, duplicated as a base64url string.
     ///
-    /// Provided for completeness; `id` is preferred.
+    /// The registration handler refuses a response whose `rawId` differs
+    /// from `id`.
     pub raw_id: String,
     /// Always `"public-key"` per WebAuthn-2 §5.1.
     #[serde(rename = "type")]
@@ -77,27 +78,25 @@ pub(crate) struct RegistrationResponse {
     pub client_data_json: String,
     /// Base64url-encoded `attestationObject` CBOR bytes per WebAuthn-2 §6.4.
     ///
-    /// Stored as `attestation_blob_b64` in `RegistrationInput` after
-    /// normalisation from URL-safe to standard base64.
+    /// Required: the handler verifies its authenticator data and refuses an
+    /// empty value. Stored as `attestation_blob_b64` in `RegistrationInput`
+    /// after normalisation from URL-safe to standard base64.
     pub attestation_object: String,
     /// CTAP2 transport hints returned by the authenticator.
     ///
     /// Empty when the authenticator does not report transports.
     #[serde(default)]
     pub transports: Vec<String>,
-    /// Uncompressed SEC1 P-256 public key provided by the vendored JS.
+    /// Uncompressed SEC1 P-256 public key the page extracted from the
+    /// credential, in standard base64.
     ///
     /// # Contract
     ///
-    /// The vendored JS (`webauthn.js`) decodes the COSE public key from
-    /// the attestation object client-side and provides the uncompressed SEC1
-    /// form (`0x04 || X (32 bytes) || Y (32 bytes)`) here as standard base64.
-    /// This avoids adding a CBOR / COSE parser to the bridge's Rust code for
-    /// the registration path. The bridge handler validates the decoded bytes
-    /// against the 65-byte uncompressed SEC1 constraint before persisting.
-    ///
-    /// Validated at `RegistrationInput::new` time: exactly 65 bytes,
-    /// `[0] == 0x04` per ANSI X9.62 / SEC1 §2.3.3.
+    /// The page's glue takes the uncompressed SEC1 form
+    /// (`0x04 || X (32 bytes) || Y (32 bytes)`) from the credential's SPKI
+    /// public key. The handler accepts it only when it is a point on P-256
+    /// and equals the COSE key the verified attestation object's
+    /// authenticator data names.
     pub public_key_sec1_b64: String,
 }
 

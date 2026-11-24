@@ -148,7 +148,9 @@ impl Respond for PayFeeRpcResponder {
                     })
                 }
             }
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
 
         ResponseTemplate::new(200)
@@ -251,6 +253,279 @@ async fn funded_accounts_endpoint() -> MockServer {
     server
 }
 
+/// Answers `rpc_method` on `server` with `result`, ahead of the server's
+/// other mocks.
+async fn mount_ahead(server: &MockServer, rpc_method: &str, result: serde_json::Value) {
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({ "method": rpc_method }),
+        ))
+        .respond_with(stellar_agent_test_support::EchoIdResponder::new(result))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+/// A `getLedgers` answer whose latest ledger 1001 closed at `close`, in Unix
+/// seconds.
+fn ledgers_closed_at(close: u64) -> serde_json::Value {
+    serde_json::json!({
+        "latestLedger": 1001, "latestLedgerCloseTime": close.to_string(),
+        "oldestLedger": 1, "oldestLedgerCloseTime": 1, "cursor": "1001", "ledgers": []
+    })
+}
+
+/// The test clock in Unix seconds.
+fn now_secs() -> u64 {
+    stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000
+}
+
+/// A native 10 XLM testnet payment from `SOURCE_G` to `DEST_G`.
+fn ten_xlm_args() -> StellarPayArgs {
+    StellarPayArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: SOURCE_G.to_owned(),
+        destination: DEST_G.to_owned(),
+        amount: Some(serde_json::from_str(r#""10 XLM""#).unwrap()),
+        amount_in_stroops: None,
+        asset: "native".to_owned(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        classic_base: None,
+        business_id: None,
+    }
+}
+
+/// Asserts that a prepare refused with `network.endpoint_not_ready` after
+/// exactly the requests `checks`, minting no prepare token.
+async fn assert_not_ready_before_any_read(
+    result: Result<rmcp::model::CallToolResult, rmcp::ErrorData>,
+    endpoint: &MockServer,
+    checks: &[&str],
+) -> serde_json::Value {
+    let result = result.expect("a not-ready endpoint is a tool-level refusal");
+    assert_eq!(result.is_error, Some(true), "{}", call_result_text(&result));
+    let json = call_result_json(&result);
+    assert_eq!(
+        json["error"]["code"], "network.endpoint_not_ready",
+        "{json}"
+    );
+    assert!(json.get("data").is_none(), "no prepare token: {json}");
+    assert_eq!(
+        crate::common::received_methods(endpoint).await,
+        checks,
+        "the readiness check precedes every account read"
+    );
+    json
+}
+
+/// The prepare result carries the ledger the operational check observed:
+/// the mock's latest ledger, its close time, and the lag of that close time
+/// against the clock of the check.
+#[tokio::test]
+#[serial]
+async fn simulate_reports_the_ledger_the_operational_check_observed() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(21);
+    let endpoint = funded_accounts_endpoint().await;
+    let close = now_secs() - 7;
+    mount_ahead(&endpoint, "getLedgers", ledgers_closed_at(close)).await;
+    let server =
+        WalletServer::new(testnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
+
+    let before = now_secs();
+    let result = server
+        .call_stellar_pay(ten_xlm_args())
+        .await
+        .expect("simulate must not error");
+    let after = now_secs();
+
+    assert_ne!(result.is_error, Some(true), "{}", call_result_text(&result));
+    let operational = call_result_json(&result)["data"]["operational"].clone();
+    assert_eq!(operational["latest_ledger"], 1001, "{operational}");
+    assert_eq!(operational["close_time_unix"], close, "{operational}");
+    let lag = operational["close_lag_seconds"].as_u64().unwrap();
+    assert!(
+        (before - close..=after - close).contains(&lag),
+        "the lag is the check's clock minus the close time: {operational}"
+    );
+}
+
+/// A latest ledger that closed beyond the readiness bound refuses the
+/// prepare with `network.endpoint_not_ready` and no prepare token; the
+/// reason names the lag the check's clock observed.
+#[tokio::test]
+#[serial]
+async fn simulate_refuses_a_stale_endpoint_before_any_account_read() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(22);
+    let endpoint = funded_accounts_endpoint().await;
+    let close = now_secs() - 120;
+    mount_ahead(&endpoint, "getLedgers", ledgers_closed_at(close)).await;
+    let server =
+        WalletServer::new(testnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
+
+    let before = now_secs();
+    let result = server.call_stellar_pay(ten_xlm_args()).await;
+    let after = now_secs();
+
+    let json = assert_not_ready_before_any_read(
+        result,
+        &endpoint,
+        &["getNetwork", "getHealth", "getLedgers"],
+    )
+    .await;
+    let message = json["error"]["message"].as_str().unwrap();
+    let lag: u64 = message
+        .split_once("ledger 1001 closed ")
+        .and_then(|(_, rest)| rest.split_once(" s ago; "))
+        .and_then(|(lag, _)| lag.parse().ok())
+        .unwrap_or_else(|| panic!("the reason names the ledger and its lag: {json}"));
+    assert!(
+        (before - close..=after - close).contains(&lag),
+        "the lag is the check's clock minus the close time: {json}"
+    );
+}
+
+/// An account read still running at the deadline the readiness check ran
+/// under, the pre-send budget, refuses the prepare with
+/// `network.endpoint_not_ready` and no prepare token, and the prepare sends
+/// no later request. A one-second submit timeout does not shorten it. The
+/// budget is set to two seconds, longer than the timeout.
+#[tokio::test]
+#[serial]
+async fn simulate_refuses_an_account_read_past_the_readiness_deadline() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(24);
+    let budget = std::time::Duration::from_secs(2);
+    let _budget = stellar_agent_network::operational::set_readiness_budget_for_test(budget);
+    let answer_delay = budget + std::time::Duration::from_secs(3);
+    let endpoint = funded_accounts_endpoint().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({ "method": "getLedgerEntries" }),
+        ))
+        .respond_with(
+            crate::common::TimeoutRpc::new(vec![(
+                account_ledger_key_xdr(SOURCE_G),
+                account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000_000),
+            )])
+            .with_delay(answer_delay),
+        )
+        .with_priority(1)
+        .mount(&endpoint)
+        .await;
+    let mut profile = testnet_profile_with_rpc(&endpoint.uri());
+    profile.submit_timeout_seconds = Some(1);
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let started = std::time::Instant::now();
+    let result = server.call_stellar_pay(ten_xlm_args()).await;
+
+    assert!(
+        started.elapsed() < answer_delay,
+        "the deadline ends the read before its answer"
+    );
+    assert!(
+        started.elapsed() >= budget,
+        "the read runs under the budget, not the submit timeout"
+    );
+    let json = assert_not_ready_before_any_read(
+        result,
+        &endpoint,
+        &["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"],
+    )
+    .await;
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("account read exceeded the readiness deadline"),
+        "{json}"
+    );
+}
+
+/// With a one-second submit timeout, an identity probe that answers after
+/// two seconds still passes, and the prepare reads the accounts and returns
+/// its token: the probe runs under the pre-send budget.
+#[tokio::test]
+#[serial]
+async fn prepare_probe_outlasts_a_short_submit_timeout() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(25);
+    let endpoint = funded_accounts_endpoint().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({ "method": "getNetwork" }),
+        ))
+        .respond_with(
+            crate::common::TimeoutRpc::new(Vec::new())
+                .with_delay(std::time::Duration::from_secs(2)),
+        )
+        .with_priority(1)
+        .mount(&endpoint)
+        .await;
+    let mut profile = testnet_profile_with_rpc(&endpoint.uri());
+    profile.submit_timeout_seconds = Some(1);
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let result = server
+        .call_stellar_pay(ten_xlm_args())
+        .await
+        .expect("prepare must not error");
+
+    assert_ne!(result.is_error, Some(true), "{}", call_result_text(&result));
+    let json = call_result_json(&result);
+    assert!(
+        json["data"].is_object(),
+        "the prepare returns its token: {json}"
+    );
+    let methods = crate::common::received_methods(&endpoint).await;
+    assert_eq!(methods.first().map(String::as_str), Some("getNetwork"));
+    assert!(
+        methods.iter().any(|m| m == "getLedgerEntries"),
+        "the prepare reads the accounts: {methods:?}"
+    );
+}
+
+/// An endpoint reporting a status other than healthy refuses the prepare
+/// with `network.endpoint_not_ready` and no prepare token, before it is
+/// asked for its ledgers.
+#[tokio::test]
+#[serial]
+async fn simulate_refuses_an_unhealthy_endpoint_before_any_account_read() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(23);
+    let endpoint = funded_accounts_endpoint().await;
+    mount_ahead(
+        &endpoint,
+        "getHealth",
+        crate::common::health_result("unhealthy"),
+    )
+    .await;
+    let server =
+        WalletServer::new(testnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
+
+    let result = server.call_stellar_pay(ten_xlm_args()).await;
+
+    let json =
+        assert_not_ready_before_any_read(result, &endpoint, &["getNetwork", "getHealth"]).await;
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("endpoint reports status \"unhealthy\""),
+        "{json}"
+    );
+}
+
 /// Builds a mainnet profile with `engine = Noop` and a caller-supplied
 /// `rpc_url`.
 ///
@@ -332,6 +607,7 @@ async fn simulate_rejects_invalid_source_strkey() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     assert!(result.is_err(), "invalid source must return Err");
@@ -363,6 +639,7 @@ async fn simulate_rejects_invalid_destination_strkey() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     assert!(result.is_err(), "invalid destination must return Err");
@@ -395,6 +672,7 @@ async fn simulate_rejects_chain_id_mismatch() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     assert!(result.is_err(), "chain_id mismatch must return Err");
@@ -405,8 +683,14 @@ async fn simulate_rejects_chain_id_mismatch() {
     );
     assert_eq!(
         crate::common::received_methods(&endpoint).await,
-        ["getNetwork", "getLedgerEntries", "getLedgerEntries"],
-        "the chain check runs after the endpoint check and the account reads"
+        [
+            "getNetwork",
+            "getHealth",
+            "getLedgers",
+            "getLedgerEntries",
+            "getLedgerEntries"
+        ],
+        "the chain check runs after the endpoint checks and the account reads"
     );
 }
 
@@ -431,6 +715,7 @@ async fn simulate_rejects_bad_asset_format() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     assert!(result.is_err(), "invalid asset must return Err");
@@ -465,6 +750,7 @@ async fn simulate_rejects_multiple_memo_variants() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     // Multiple memo variants produce a tool-level error (is_error=true), not
@@ -521,6 +807,7 @@ async fn simulate_invalid_memo_hash_does_not_log_memo_content() {
                     memo_hash_hex: Some(invalid_hash.to_owned()),
                     memo_return_hex: None,
                     classic_base: None,
+                    business_id: None,
                 };
 
                 server.call_stellar_pay(args).await
@@ -561,6 +848,7 @@ fn simulate_args_on(chain_id: &str, classic_base: Option<&str>) -> StellarPayArg
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: classic_base.map(str::to_owned),
+        business_id: None,
     }
 }
 
@@ -733,6 +1021,7 @@ async fn simulate_rejects_native_payment_on_insufficient_balance() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
 
@@ -781,7 +1070,7 @@ async fn simulate_issued_amount_refuses_xlm_unit_before_rpc() {
     assert_eq!(error.data.unwrap()["code"], "validation.amount_malformed");
     assert_eq!(
         error.message,
-        "validation.amount_malformed: amount '100 XLM' has unit 'XLM'; expected unit 'TST'"
+        "validation.amount_malformed: the amount has the wrong unit; expected unit 'TST'"
     );
 }
 
@@ -801,13 +1090,13 @@ async fn commit_issued_amount_refuses_xlm_unit_before_rpc() {
     assert_eq!(error.data.unwrap()["code"], "validation.amount_malformed");
     assert_eq!(
         error.message,
-        "validation.amount_malformed: amount '100 XLM' has unit 'XLM'; expected unit 'TST'"
+        "validation.amount_malformed: the amount has the wrong unit; expected unit 'TST'"
     );
 }
 
 #[tokio::test]
 #[serial]
-async fn payment_amount_errors_preserve_raw_input_before_rpc() {
+async fn payment_amount_errors_name_the_amount_before_rpc() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().unwrap();
     let server = WalletServer::new(testnet_profile_with_rpc("http://127.0.0.1:1")).unwrap();
@@ -816,49 +1105,49 @@ async fn payment_amount_errors_preserve_raw_input_before_rpc() {
             "1 000 xlm",
             "native".to_owned(),
             "validation.amount_malformed",
-            "amount '1 000 xlm' could not be parsed as a valid amount",
+            "the amount could not be parsed as a valid amount",
         ),
         (
             "+1 xlm",
             "native".to_owned(),
             "validation.amount_malformed",
-            "amount '+1 xlm' could not be parsed as a valid amount",
+            "the amount could not be parsed as a valid amount",
         ),
         (
             "1.2.3 xlm",
             "native".to_owned(),
             "validation.amount_malformed",
-            "amount '1.2.3 xlm' could not be parsed as a valid amount",
+            "the amount could not be parsed as a valid amount",
         ),
         (
             " 1.2.3 xlm ",
             "native".to_owned(),
             "validation.amount_malformed",
-            "amount ' 1.2.3 xlm ' could not be parsed as a valid amount",
+            "the amount could not be parsed as a valid amount",
         ),
         (
             "10 usdc",
             format!("USDC:{DEST_G}"),
             "validation.amount_malformed",
-            "amount '10 usdc' has unit 'usdc'; expected unit 'USDC'",
+            "the amount has the wrong unit; expected unit 'USDC'",
         ),
         (
             " 10 usdc ",
             format!("USDC:{DEST_G}"),
             "validation.amount_malformed",
-            "amount ' 10 usdc ' has unit 'usdc'; expected unit 'USDC'",
+            "the amount has the wrong unit; expected unit 'USDC'",
         ),
         (
             " 0.00000001 xlm ",
             "native".to_owned(),
             "validation.amount_precision_exceeded",
-            "amount ' 0.00000001 xlm ' exceeds the maximum precision of 7 decimal places",
+            "the amount exceeds the maximum precision of 7 decimal places",
         ),
         (
             " 99999999999999999999 xlm ",
             "native".to_owned(),
             "validation.amount_out_of_range",
-            "amount ' 99999999999999999999 xlm ' is outside the representable i64 stroop range",
+            "the amount is outside the representable i64 stroop range",
         ),
     ] {
         let value = serde_json::json!({
@@ -876,6 +1165,7 @@ async fn payment_amount_errors_preserve_raw_input_before_rpc() {
             let error = result.unwrap_err();
             assert_eq!(error.data.unwrap()["code"], expected_code);
             assert_eq!(error.message, format!("{expected_code}: {message}"));
+            assert!(!error.message.contains(raw.trim()), "{}", error.message);
         }
     }
 }
@@ -901,6 +1191,7 @@ async fn simulate_rejects_non_native_bad_issuer() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     assert!(result.is_err(), "invalid issuer must return Err");
@@ -953,6 +1244,7 @@ async fn simulate_sep29_memo_required_no_memo_fails() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     // With a non-routable RPC the source account fetch fails; we get
@@ -1003,6 +1295,7 @@ async fn simulate_sep29_memo_present_bypasses_check() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     // Should fail at the source account fetch (non-routable), not at SEP-29.
@@ -1080,6 +1373,7 @@ async fn simulate_reaches_rpc_with_valid_inputs() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await;
     // Either a tool-level error (is_error=true) or an internal JSON-RPC error.
@@ -1137,6 +1431,7 @@ async fn simulate_fee_auto_selects_p95_and_binds_envelope_fee() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: Some("auto".to_owned()),
+        business_id: None,
     };
     let result = server
         .call_stellar_pay(args)
@@ -1193,6 +1488,7 @@ async fn simulate_fee_auto_p99_selects_p99() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: Some("auto:p99".to_owned()),
+        business_id: None,
     };
     let result = server
         .call_stellar_pay(args)
@@ -1248,6 +1544,7 @@ async fn simulate_fee_explicit_above_profile_cap_fails() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: Some("500".to_owned()),
+        business_id: None,
     };
     let result = server
         .call_stellar_pay(args)
@@ -1260,8 +1557,8 @@ async fn simulate_fee_explicit_above_profile_cap_fails() {
     );
     assert_eq!(
         message,
-        "the explicit per-operation fee 500 stroops exceeds the profile cap of 100 stroops; \
-         lower the fee or raise classic_max_fee_per_op_stroops"
+        "fee must be a per-operation stroop amount within classic_max_fee_per_op_stroops; \
+         lower fee or raise classic_max_fee_per_op_stroops."
     );
 }
 
@@ -1300,6 +1597,7 @@ async fn simulate_fee_auto_above_profile_cap_names_the_percentile() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: Some("auto:p99".to_owned()),
+        business_id: None,
     };
     let result = server.call_stellar_pay(args).await.unwrap();
     let (code, message, _text) = crate::common::assert_business_envelope(&result);
@@ -1356,13 +1654,14 @@ async fn mainnet_profile_commit_refuses_with_mainnet_write_forbidden() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: "dGVzdA".to_owned(),
-        expires_at_unix_ms: u64::MAX,
+        nonce: Some("dGVzdA".to_owned()),
+        expires_at_unix_ms: Some(u64::MAX),
         // Valid Payment XDR, so nothing but the mainnet refusal stops the
         // call before the policy gate.
-        envelope_xdr: valid_payment_envelope_b64(),
+        envelope_xdr: Some(valid_payment_envelope_b64()),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -1419,11 +1718,12 @@ async fn policy_v1_engine_allow_rule_passes_gate() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: "dGVzdA".to_owned(),
-        expires_at_unix_ms: u64::MAX,
-        envelope_xdr: valid_payment_envelope_b64(),
+        nonce: Some("dGVzdA".to_owned()),
+        expires_at_unix_ms: Some(u64::MAX),
+        envelope_xdr: Some(valid_payment_envelope_b64()),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -1472,11 +1772,12 @@ async fn policy_v1_engine_no_matching_rule_emits_wire_code() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: "dGVzdA".to_owned(),
-        expires_at_unix_ms: u64::MAX,
-        envelope_xdr: valid_payment_envelope_b64(),
+        nonce: Some("dGVzdA".to_owned()),
+        expires_at_unix_ms: Some(u64::MAX),
+        envelope_xdr: Some(valid_payment_envelope_b64()),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -1522,11 +1823,12 @@ async fn policy_v1_engine_explicit_deny_emits_wire_code() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: "dGVzdA".to_owned(),
-        expires_at_unix_ms: u64::MAX,
-        envelope_xdr: valid_payment_envelope_b64(),
+        nonce: Some("dGVzdA".to_owned()),
+        expires_at_unix_ms: Some(u64::MAX),
+        envelope_xdr: Some(valid_payment_envelope_b64()),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -1565,13 +1867,14 @@ async fn commit_returns_nonce_expired_on_bad_nonce() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: "!!invalid-base64!!".to_owned(),
-        expires_at_unix_ms: u64::MAX,
+        nonce: Some("!!invalid-base64!!".to_owned()),
+        expires_at_unix_ms: Some(u64::MAX),
         // Supply valid Payment XDR so the re-derivation step succeeds
         // and the call reaches the nonce parse gate.
-        envelope_xdr: valid_payment_envelope_b64(),
+        envelope_xdr: Some(valid_payment_envelope_b64()),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -1608,13 +1911,14 @@ async fn commit_returns_nonce_expired_on_wrong_length_nonce() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: short_nonce,
-        expires_at_unix_ms: u64::MAX,
+        nonce: Some(short_nonce),
+        expires_at_unix_ms: Some(u64::MAX),
         // Supply valid Payment XDR so the re-derivation step succeeds
         // and the call reaches the nonce parse gate.
-        envelope_xdr: valid_payment_envelope_b64(),
+        envelope_xdr: Some(valid_payment_envelope_b64()),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -1701,13 +2005,14 @@ async fn commit_handles_rpc_error_during_rebuild() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: zero_nonce,
-        expires_at_unix_ms: 3_000_000_000_000, // far future
+        nonce: Some(zero_nonce),
+        expires_at_unix_ms: Some(3_000_000_000_000), // far future
         // Supply valid Payment XDR so the re-derivation step succeeds
         // and the call reaches the account-fetch step (which uses the mock RPC).
-        envelope_xdr: valid_payment_envelope_b64(),
+        envelope_xdr: Some(valid_payment_envelope_b64()),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -1758,13 +2063,14 @@ async fn indistinguishability_expired_and_parse_fail_produce_same_wire_code() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: "!!invalid-base64!!".to_owned(),
-        expires_at_unix_ms: 0,
+        nonce: Some("!!invalid-base64!!".to_owned()),
+        expires_at_unix_ms: Some(0),
         // Supply valid Payment XDR so re-derivation succeeds before the nonce
         // parse gate that this test exercises.
-        envelope_xdr: valid_payment_envelope_b64(),
+        envelope_xdr: Some(valid_payment_envelope_b64()),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     use base64::Engine;
@@ -1772,7 +2078,7 @@ async fn indistinguishability_expired_and_parse_fail_produce_same_wire_code() {
 
     // Path B: valid base64 but wrong byte length
     let args_short = StellarPayCommitArgs {
-        nonce: short_nonce,
+        nonce: Some(short_nonce),
         ..args_bad_b64.clone()
     };
 
@@ -1834,11 +2140,12 @@ async fn commit_invalid_memo_parse_matches_nonce_hmac_wire_response() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: zero_nonce,
-        expires_at_unix_ms: 3_000_000_000_000,
-        envelope_xdr: valid_payment_envelope_b64(),
+        nonce: Some(zero_nonce),
+        expires_at_unix_ms: Some(3_000_000_000_000),
+        envelope_xdr: Some(valid_payment_envelope_b64()),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let nonce_result = server
@@ -1887,7 +2194,7 @@ async fn commit_invalid_memo_parse_matches_nonce_hmac_wire_response() {
 /// numbers.  Run with:
 ///
 /// ```text
-/// cargo test -p stellar-agent-mcp --all-features -- --ignored \
+/// cargo test -p stellar-agent-mcp --test mcp -- --ignored \
 ///     timing_expired_rebuild_vs_hmac_mismatch_rebuild
 /// ```
 ///
@@ -1939,6 +2246,7 @@ async fn commit_invalid_memo_parse_matches_nonce_hmac_wire_response() {
 /// the handler boundary.  That finding should be escalated; the structural wire-collapse
 /// defence (`commit_invalid_memo_parse_matches_nonce_hmac_wire_response`) is unaffected.
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial]
 #[ignore = "timing measurement; run on demand — use `cargo test -- --ignored timing_expired_rebuild_vs_hmac_mismatch_rebuild`"]
 async fn timing_expired_rebuild_vs_hmac_mismatch_rebuild() {
@@ -1988,11 +2296,12 @@ async fn timing_expired_rebuild_vs_hmac_mismatch_rebuild() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce: zero_nonce.clone(),
-            expires_at_unix_ms: 3_000_000_000_000, // far future: expiry check passes
-            envelope_xdr: valid_payment_envelope_b64(),
+            nonce: Some(zero_nonce.clone()),
+            expires_at_unix_ms: Some(3_000_000_000_000), // far future: expiry check passes
+            envelope_xdr: Some(valid_payment_envelope_b64()),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         };
         let t0 = Instant::now();
         let _ = server.call_stellar_pay_commit(args_a).await;
@@ -2015,11 +2324,12 @@ async fn timing_expired_rebuild_vs_hmac_mismatch_rebuild() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce: zero_nonce.clone(),
-            expires_at_unix_ms: 1, // past epoch: expiry check fires immediately
-            envelope_xdr: valid_payment_envelope_b64(),
+            nonce: Some(zero_nonce.clone()),
+            expires_at_unix_ms: Some(1), // past epoch: expiry check fires immediately
+            envelope_xdr: Some(valid_payment_envelope_b64()),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         };
         let t0 = Instant::now();
         let _ = server.call_stellar_pay_commit(args_b).await;
@@ -2175,7 +2485,9 @@ impl Respond for AccountOnlyResponder {
                     serde_json::json!({ "entries": [], "latestLedger": 1001 })
                 }
             }
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
 
         ResponseTemplate::new(200)
@@ -2272,7 +2584,9 @@ impl Respond for PaySubmitSuccessRpcResponder {
                 "ledger": 1005,
                 "txHash": crate::common::polled_tx_hash(request),
             }),
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
 
         ResponseTemplate::new(200)
@@ -2308,6 +2622,7 @@ async fn pay_commit_full_round_trip_succeeds_with_string_encoded_amounts() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     // 10_000_000 XLM: comfortably covers the 100 XLM payment, base reserve, and fee.
@@ -2339,6 +2654,7 @@ async fn pay_commit_full_round_trip_succeeds_with_string_encoded_amounts() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_pay(simulate_args.clone())
@@ -2381,11 +2697,12 @@ async fn pay_commit_full_round_trip_succeeds_with_string_encoded_amounts() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce,
-        expires_at_unix_ms,
-        envelope_xdr,
+        nonce: Some(nonce),
+        expires_at_unix_ms: Some(expires_at_unix_ms),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let commit_result = server
         .call_stellar_pay_commit(commit_args)
@@ -2443,6 +2760,7 @@ async fn pay_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rule(
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     // 10_000_000 XLM: comfortably covers the 100 XLM payment, base reserve,
@@ -2481,6 +2799,7 @@ async fn pay_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rule(
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_pay(simulate_args.clone())
@@ -2521,11 +2840,12 @@ async fn pay_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rule(
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce,
-        expires_at_unix_ms,
-        envelope_xdr,
+        nonce: Some(nonce),
+        expires_at_unix_ms: Some(expires_at_unix_ms),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let commit_result = server
         .call_stellar_pay_commit(commit_args)
@@ -2596,11 +2916,12 @@ async fn pay_commit_denies_under_unsatisfied_minimum_reserve_rule() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: "dGVzdA".to_owned(),
-        expires_at_unix_ms: u64::MAX,
-        envelope_xdr: valid_payment_envelope_b64(),
+        nonce: Some("dGVzdA".to_owned()),
+        expires_at_unix_ms: Some(u64::MAX),
+        envelope_xdr: Some(valid_payment_envelope_b64()),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let result = server
         .call_stellar_pay_commit(args)
@@ -2659,6 +2980,7 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: Some("auto".to_owned()),
+        business_id: None,
     };
     let result = server
         .call_stellar_pay(args)
@@ -2681,17 +3003,10 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
 /// Builds a `PolicyEngineV1` with one `Decision::Allow` `per_period_cap` rule
 /// per tool name in `tools`.
 ///
-/// `profile_name` MUST equal the target `Profile`'s
-/// `profile_name_for_approval()` value exactly: the engine bakes
-/// `profile_name` into every `StateKey` its `evaluate`/`record_confirmed`
-/// calls derive, while `dispatch_gate_inner`'s window-state refresh
-/// reconstructs `StateKey`s using `profile_name_for_approval()` when
-/// re-hydrating from the persisted file. A mismatch does not error — it
-/// silently makes the refreshed entries invisible to the engine's own
-/// criteria, breaking cross-dispatch persistence without any test failure to
-/// flag it. (The shared `common::v1_engine_mock::minimum_reserve_engine`
-/// helper hardcodes `"default"` — safe there only because `minimum_reserve`
-/// is stateless and never touches the window-state store.)
+/// `profile_name` must equal the target profile's `profile_name_for_approval()`.
+/// Evaluation and recording derive state keys from the engine's name; private
+/// gate hydration derives them from the profile. A mismatch makes persisted
+/// entries invisible to the engine's criteria.
 fn per_period_cap_engine(
     tools: &[&str],
     profile_name: &str,
@@ -2732,17 +3047,366 @@ fn per_period_cap_engine(
     stellar_agent_core::policy::v1::PolicyEngineV1::new(document, profile_name.to_owned())
 }
 
+#[tokio::test]
+async fn dispatch_observes_stored_endpoints_before_refresh() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+    for endpoint in [&primary, &secondary] {
+        Mock::given(method("POST"))
+            .respond_with(|request: &Request| {
+                let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "getNetwork" => {
+                        stellar_agent_test_support::signed_envelope::get_network_result(
+                            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                        )
+                    }
+                    "getLatestLedger" => serde_json::json!({
+                        "id": "ab".repeat(32), "sequence": 100_000, "protocolVersion": 27,
+                    }),
+                    method => panic!("unexpected environment request {method}"),
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"], "result": result,
+                }))
+            })
+            .mount(endpoint)
+            .await;
+    }
+    let primary_url = primary.uri();
+    let secondary_url = stellar_agent_test_support::second_loopback_host(&secondary.uri());
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pay_integration::dispatch_stored_endpoints_environment_child",
+            ])
+            .env("DISPATCH_STORED_ENDPOINTS_CHILD", "1")
+            .env("STELLAR_AGENT_RPC_URL", primary_url)
+            .env("STELLAR_AGENT_SECONDARY_RPC_URL", secondary_url)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("test result: ok. 1 passed;"), "{stdout}");
+    for endpoint in [&primary, &secondary] {
+        assert!(endpoint.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+#[serial(mainnet_clock)]
+#[serial]
+async fn dispatch_stored_endpoints_environment_child() {
+    if std::env::var_os("DISPATCH_STORED_ENDPOINTS_CHILD").is_none() {
+        return;
+    }
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use stellar_agent_core::policy::Decision;
+    use stellar_agent_core::policy::v1::criteria::state_store::StateKey;
+    use stellar_agent_core::policy::v1::criteria::{
+        per_period_cap::Window, rate_limit::RateLimitCriterion,
+    };
+    use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+    use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+    use stellar_agent_network::policy_state::PersistedWindowStore;
+    use stellar_xdr::{OperationBody, TransactionEnvelope};
+
+    struct WitnessRpc(Arc<AtomicU32>);
+    impl Respond for WitnessRpc {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "getNetwork" => stellar_agent_test_support::signed_envelope::get_network_result(
+                    TESTNET_PASSPHRASE,
+                ),
+                "getLatestLedger" => {
+                    serde_json::json!({"id": "ab".repeat(32), "sequence": self.0.load(Ordering::SeqCst), "protocolVersion": 27})
+                }
+                method => panic!("unexpected stored-endpoint request {method}"),
+            };
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result}),
+            )
+        }
+    }
+
+    keyring_mock::install().unwrap();
+    install_test_nonce_key(246);
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        dir.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+    let stored_primary = MockServer::start().await;
+    let stored_secondary = MockServer::start().await;
+    let stored_height = Arc::new(AtomicU32::new(100));
+    for endpoint in [&stored_primary, &stored_secondary] {
+        Mock::given(method("POST"))
+            .respond_with(WitnessRpc(Arc::clone(&stored_height)))
+            .mount(endpoint)
+            .await;
+    }
+    let environment_primary = std::env::var("STELLAR_AGENT_RPC_URL").unwrap();
+    let environment_secondary = std::env::var("STELLAR_AGENT_SECONDARY_RPC_URL").unwrap();
+    let caller_secondary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(WitnessRpc(Arc::new(AtomicU32::new(100_000))))
+        .mount(&caller_secondary)
+        .await;
+    let loaded_primary = funded_accounts_endpoint().await;
+    let mut stored = Profile::builder_testnet_named("intent", "svc", "acct", "n-svc", "n-acct")
+        .with_noop_engine()
+        .rpc_url(stored_primary.uri())
+        .secondary_rpc_url(stellar_agent_test_support::second_loopback_host(
+            &stored_secondary.uri(),
+        ))
+        .build();
+    crate::common::install_test_audit_key(&mut stored);
+    let profiles = stellar_agent_core::profile::loader::default_profile_dir().unwrap();
+    std::fs::create_dir_all(&profiles).unwrap();
+    let mut profile_toml = format!(
+        "version = 2\nchain_id = \"stellar:testnet\"\nrpc_url = {:?}\nsecondary_rpc_url = {:?}\n",
+        stored.rpc_url,
+        stored.secondary_rpc_url.as_ref().unwrap(),
+    );
+    for (table, key) in [
+        ("mcp_signer_default", &stored.mcp_signer_default),
+        ("mcp_nonce_key_alias", &stored.mcp_nonce_key_alias),
+        (
+            "audit_log_hash_chain_key_id",
+            &stored.audit_log_hash_chain_key_id,
+        ),
+        ("policy_owner_key_id", &stored.policy_owner_key_id),
+        ("attestation_key_id", &stored.attestation_key_id),
+        (
+            "counterparty_cache_key_id",
+            &stored.counterparty_cache_key_id,
+        ),
+        (
+            "policy_window_state_key_id",
+            &stored.policy_window_state_key_id,
+        ),
+    ] {
+        profile_toml.push_str(&format!(
+            "\n[{table}]\nservice = {:?}\naccount = {:?}\n",
+            key.service, key.account,
+        ));
+    }
+    profile_toml.push_str("\n[policy]\nengine = \"noop\"\n");
+    std::fs::write(profiles.join("intent.toml"), profile_toml).unwrap();
+    let environment_loaded =
+        stellar_agent_core::profile::loader::load_from_dir("intent", &profiles, None).unwrap();
+    assert_eq!(environment_loaded.rpc_url, environment_primary);
+    assert_eq!(
+        environment_loaded.secondary_rpc_url.as_deref(),
+        Some(environment_secondary.as_str())
+    );
+    let profile = stellar_agent_core::profile::loader::load_with_overlay_from_dir(
+        "intent",
+        &profiles,
+        std::collections::HashMap::from([
+            ("rpc_url", serde_json::json!(loaded_primary.uri())),
+            (
+                "secondary_rpc_url",
+                serde_json::json!(stellar_agent_test_support::second_loopback_host(
+                    &caller_secondary.uri()
+                )),
+            ),
+        ]),
+        None,
+    )
+    .unwrap();
+    assert_eq!(profile.rpc_url, loaded_primary.uri());
+    let mut server = WalletServer::new(profile.clone()).unwrap();
+    assert_eq!(server.profile_name_for_approval(), "intent");
+    let engine = Arc::new(PolicyEngineV1::new(
+        PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            signature: None,
+            rules: vec![PolicyRule {
+                r#match: RuleMatch {
+                    tool: "*".into(),
+                    chain: "*".into(),
+                },
+                criteria: vec![Box::new(RateLimitCriterion::new(
+                    Window::parse("1w").unwrap(),
+                    1,
+                ))],
+                decision: Decision::Allow,
+                allow_opaque_signing: false,
+            }],
+        },
+        "intent".into(),
+    ));
+    server.set_policy_engine_for_test(engine.clone());
+    let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(1000);
+    let query_clock =
+        stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(1000);
+    let store = PersistedWindowStore::for_profile("intent");
+    let (plan, envelope) =
+        stellar_agent_network::signed_intent::test_helpers::intent_fixture_plan(1, 60);
+    let TransactionEnvelope::Tx(tx) = envelope else {
+        panic!("V1 fixture")
+    };
+    let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+        panic!("invoke fixture")
+    };
+    let plan = plan
+        .classify_purpose(&op.host_function, None)
+        .unwrap()
+        .with_envelope_max_ledger(100)
+        .unwrap();
+    let _exposure = store.admit_signed_intent(&profile, &plan).unwrap().expose();
+    store
+        .load_into("intent", &profile, engine.state_store())
+        .unwrap();
+    let count_key = StateKey::new("intent", 1, "rate_limit", 604_800);
+    assert_eq!(
+        engine.state_store().query_window(&count_key, 1000).unwrap(),
+        (1, 1)
+    );
+    let original = std::fs::read(store.path()).unwrap();
+
+    let denied = server
+        .call_stellar_pay(pay_args(SOURCE_G, "1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::common::assert_business_envelope(&denied).0,
+        "policy.deny.rate_limit_exceeded"
+    );
+    assert_eq!(
+        std::fs::read(store.path()).unwrap(),
+        original,
+        "override heights cannot close at stored equality"
+    );
+    assert_eq!(
+        store.signed_intents("intent", &profile).unwrap()[0].expiry_observed_at_ms,
+        None
+    );
+
+    stored_height.store(101, Ordering::SeqCst);
+    clock.set(2000);
+    query_clock.set(2000);
+    let denied = server
+        .call_stellar_pay(pay_args(SOURCE_G, "1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::common::assert_business_envelope(&denied).0,
+        "policy.deny.rate_limit_exceeded"
+    );
+    let closed = std::fs::read(store.path()).unwrap();
+    assert_ne!(closed, original);
+    assert_eq!(
+        store.signed_intents("intent", &profile).unwrap()[0].expiry_observed_at_ms,
+        Some(2000)
+    );
+    assert_eq!(
+        engine.state_store().query_window(&count_key, 2000).unwrap(),
+        (1, 1)
+    );
+    for endpoint in [&stored_primary, &stored_secondary] {
+        assert_eq!(endpoint.received_requests().await.unwrap().len(), 4);
+    }
+    assert!(
+        caller_secondary
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let retention =
+        stellar_agent_core::policy::v1::criteria::per_period_cap::MAX_SUPPORTED_WINDOW_SECS * 1000;
+    for now in [3000, 2000 + retention] {
+        clock.set(now);
+        query_clock.set(now);
+        let denied = server
+            .call_stellar_pay(pay_args(SOURCE_G, "1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::common::assert_business_envelope(&denied).0,
+            "policy.deny.rate_limit_exceeded"
+        );
+        assert_eq!(
+            engine.state_store().query_window(&count_key, now).unwrap(),
+            (1, 1)
+        );
+        assert_eq!(std::fs::read(store.path()).unwrap(), closed);
+    }
+    clock.set(2001 + retention);
+    query_clock.set(2001 + retention);
+    let allowed = server
+        .call_stellar_pay(pay_args(SOURCE_G, "1"))
+        .await
+        .unwrap();
+    assert_ne!(
+        allowed.is_error,
+        Some(true),
+        "{}",
+        call_result_text(&allowed)
+    );
+    assert_eq!(
+        engine
+            .state_store()
+            .query_window(&count_key, 2001 + retention)
+            .unwrap(),
+        (0, 0),
+        "dispatch refreshes the shared engine's exposure image"
+    );
+    let fresh = stellar_agent_core::policy::v1::PolicyStateStore::new();
+    store
+        .load_into_at("intent", &profile, &fresh, 2001 + retention)
+        .unwrap();
+    assert_eq!(
+        fresh.query_window(&count_key, 2001 + retention).unwrap(),
+        (0, 0)
+    );
+    assert_eq!(std::fs::read(store.path()).unwrap(), closed);
+    for endpoint in [&stored_primary, &stored_secondary] {
+        assert_eq!(endpoint.received_requests().await.unwrap().len(), 4);
+    }
+    assert!(
+        caller_secondary
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        loaded_primary
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| {
+                let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                request["method"] != "getLatestLedger" && request["method"] != "sendTransaction"
+            })
+    );
+}
+
 /// Two dispatches of `stellar_pay` through the SAME server instance under a
 /// `per_period_cap` rule (cap 100 XLM, each payment 60 XLM): the first
 /// simulates, commits, and submits successfully, which records the confirmed
-/// amount to the PERSISTED window-state store (not just the engine's
-/// in-memory state — the commit handler's post-submit
-/// `record_confirmed_window_state` call writes through to disk). The second
-/// simulate call is DENIED: `dispatch_gate_inner`'s window-state refresh
-/// clears the in-memory store and re-hydrates from the file BEFORE
-/// evaluating, so the deny is driven by the on-disk record, proving the
-/// persist -> refresh -> evaluate wiring end to end through the real MCP
-/// dispatch path.
+/// amount to the persisted window-state store. The second simulation must
+/// deny: its private gate image includes the first commit's durable record.
+/// This exercises persistence, capture and evaluation through public MCP
+/// dispatch.
 ///
 /// (`end_to_end_persist_seam_second_process_denies` in
 /// `stellar-agent-network`'s `store.rs` covers the same invariant at the
@@ -2755,7 +3419,14 @@ async fn pay_two_phase_per_period_cap_second_call_denied_by_persisted_window() {
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(210);
 
-    let home_dir = tempfile::TempDir::new().expect("tempdir");
+    let home_dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+    assert!(
+        home_dir
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home_dir.path());
 
     let seed = [0x51_u8; 32];
@@ -2764,6 +3435,7 @@ async fn pay_two_phase_per_period_cap_second_call_denied_by_persisted_window() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     // 10_000_000 XLM: comfortably covers two 60 XLM payments, base reserve,
@@ -2802,6 +3474,7 @@ async fn pay_two_phase_per_period_cap_second_call_denied_by_persisted_window() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
 
     // ── Call 1: simulate → commit → submit succeeds, recording 60 XLM ────────
@@ -2846,11 +3519,12 @@ async fn pay_two_phase_per_period_cap_second_call_denied_by_persisted_window() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce: nonce1,
-            expires_at_unix_ms: expires1,
-            envelope_xdr: envelope1,
+            nonce: Some(nonce1),
+            expires_at_unix_ms: Some(expires1),
+            envelope_xdr: Some(envelope1),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("first commit must not error");
@@ -2866,8 +3540,7 @@ async fn pay_two_phase_per_period_cap_second_call_denied_by_persisted_window() {
     );
 
     // ── Call 2: simulate is DENIED — 60 + 60 = 120 XLM exceeds the cap ────────
-    // dispatch_gate_inner refreshes the window-state store from the file call
-    // 1's commit just wrote, before evaluating this second call.
+    // The second gate hydrates its image from the first commit's durable record.
     let sim2 = server
         .call_stellar_pay(pay_args)
         .await
@@ -2906,6 +3579,7 @@ async fn pay_commit_refuses_with_audit_chain_key_unavailable_when_key_unminted()
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc-issue88-unminted", "acct-issue88-unminted", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
@@ -2945,6 +3619,7 @@ async fn pay_commit_refuses_with_audit_chain_key_unavailable_when_key_unminted()
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_pay(pay_args.clone())
@@ -2985,11 +3660,12 @@ async fn pay_commit_refuses_with_audit_chain_key_unavailable_when_key_unminted()
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce,
-            expires_at_unix_ms,
-            envelope_xdr,
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must not error at the protocol layer");
@@ -3053,6 +3729,7 @@ async fn pay_simulate_unaffected_by_missing_audit_key() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: None,
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -3084,6 +3761,7 @@ async fn pay_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_back() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc-anchor-rollback", "acct-anchor-rollback", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
@@ -3123,6 +3801,7 @@ async fn pay_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_back() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
 
     // Round one: a commit that succeeds, leaving the anchor naming the log.
@@ -3197,11 +3876,12 @@ async fn commit_once(
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce,
-            expires_at_unix_ms,
-            envelope_xdr,
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must not error at the protocol layer")
@@ -3239,6 +3919,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
@@ -3271,6 +3952,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_pay(simulate_args.clone())
@@ -3310,11 +3992,12 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce,
-        expires_at_unix_ms,
-        envelope_xdr,
+        nonce: Some(nonce),
+        expires_at_unix_ms: Some(expires_at_unix_ms),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     // ── Commit against the wrong network ───────────────────────────────────
@@ -3437,7 +4120,9 @@ impl Respond for PayTimeoutRpcResponder {
                 "latestLedger": 1002,
                 "oldestLedger": 1,
             }),
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
 
         ResponseTemplate::new(200)
@@ -3505,11 +4190,12 @@ async fn simulate_then_commit(
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce: data["nonce"].as_str().expect("nonce").to_owned(),
-            expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().expect("expires"),
-            envelope_xdr: data["envelope_xdr"].as_str().expect("envelope").to_owned(),
+            nonce: Some(data["nonce"].as_str().expect("nonce").to_owned()),
+            expires_at_unix_ms: Some(data["expires_at_unix_ms"].as_u64().expect("expires")),
+            envelope_xdr: Some(data["envelope_xdr"].as_str().expect("envelope").to_owned()),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must not error")
@@ -3528,6 +4214,7 @@ fn pay_args(source: &str, stroops: &str) -> StellarPayArgs {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     }
 }
 
@@ -3555,6 +4242,7 @@ async fn a_timed_out_commit_records_the_submission_and_reports_the_hash() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-f2-timeout", seed);
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -3649,6 +4337,7 @@ async fn a_standing_reservation_denies_a_second_payment_under_the_cap() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-f2-cap", seed);
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -3702,6 +4391,7 @@ async fn a_rebuilt_envelope_at_the_same_sequence_is_refused() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-f2-dup", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
@@ -3754,7 +4444,15 @@ async fn a_rebuilt_envelope_at_the_same_sequence_is_refused() {
 #[tokio::test]
 #[serial]
 async fn a_submission_that_cannot_be_recorded_sends_nothing() {
-    let data_root = tempfile::tempdir().expect("temporary data root");
+    let data_root =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("temporary data root");
+    assert!(
+        data_root
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(233);
@@ -3770,6 +4468,7 @@ async fn a_submission_that_cannot_be_recorded_sends_nothing() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-f2-unwritable", seed);
 
     let mock_server = MockServer::start().await;
     let send_guard = Mock::given(method("POST"))
@@ -3940,7 +4639,9 @@ impl Respond for PayReconcileRpcResponder {
                     })
                 }
             }
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
 
         ResponseTemplate::new(200)
@@ -3953,8 +4654,9 @@ impl Respond for PayReconcileRpcResponder {
     }
 }
 
-/// Reconciling a timed-out submission the chain did confirm records the spend
-/// and writes the value-action row the submission never got to write.
+/// Reconciling a timed-out submission the chain did confirm records the
+/// success on the receipt and sends nothing. No submitted row is written, and
+/// the pending row stands.
 #[tokio::test]
 #[serial]
 async fn transaction_status_confirms_a_timed_out_submission() {
@@ -3968,6 +4670,7 @@ async fn transaction_status_confirms_a_timed_out_submission() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-f2-status", seed);
 
     let responder = PayReconcileRpcResponder::new(&source_g, 100_000_000_000_000, 41);
     let confirm = Arc::clone(&responder.confirm);
@@ -4014,7 +4717,9 @@ async fn transaction_status_confirms_a_timed_out_submission() {
     let status = server
         .call_stellar_transaction_status(stellar_agent_mcp::server::StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
-            tx_hash: tx_hash.clone(),
+            tx_hash: Some(tx_hash.clone()),
+            business_id: None,
+            retry_recovery: false,
         })
         .await
         .expect("the status tool must not error");
@@ -4041,20 +4746,7 @@ async fn transaction_status_confirms_a_timed_out_submission() {
         1,
         "the pending row stands: {rows:?}"
     );
-    let submitted = rows_of_kind(&rows, "value_action_submitted");
-    assert_eq!(
-        submitted.len(),
-        1,
-        "reconciliation writes the row the submission never got to write: {rows:?}"
-    );
-    assert_eq!(
-        submitted[0]["ledger"], 1005,
-        "the settled row names the ledger the chain confirmed it in: {rows:?}"
-    );
-    assert_eq!(
-        submitted[0]["envelope_hash"], envelope_hash,
-        "the settled row names the same submission as the pending row: {rows:?}"
-    );
+    assert!(rows_of_kind(&rows, "value_action_submitted").is_empty());
     assert_eq!(
         sends.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -4063,11 +4755,11 @@ async fn transaction_status_confirms_a_timed_out_submission() {
     drop(mock_server);
 }
 
-/// Reconciling a timed-out submission the chain never took releases its hold
-/// on the spending window, and the next payment proceeds.
+/// Reconciling an absent timed-out submission retains its spending hold and
+/// the next payment remains subject to the cap.
 #[tokio::test]
 #[serial]
-async fn transaction_status_releases_a_submission_the_chain_never_took() {
+async fn transaction_status_retains_a_submission_the_endpoint_cannot_find() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(235);
@@ -4078,6 +4770,7 @@ async fn transaction_status_releases_a_submission_the_chain_never_took() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-f2-release", seed);
 
     let responder = PayReconcileRpcResponder::new(&source_g, 100_000_000_000_000, 41);
     let advance = Arc::clone(&responder.advance_sequence);
@@ -4131,7 +4824,9 @@ async fn transaction_status_releases_a_submission_the_chain_never_took() {
     let status = server
         .call_stellar_transaction_status(stellar_agent_mcp::server::StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
-            tx_hash,
+            tx_hash: Some(tx_hash),
+            business_id: None,
+            retry_recovery: false,
         })
         .await
         .expect("the status tool must not error");
@@ -4143,62 +4838,54 @@ async fn transaction_status_releases_a_submission_the_chain_never_took() {
     );
     assert_eq!(status_json["data"]["chain_status"], "NOT_FOUND");
     assert_eq!(
-        status_json["data"]["record"]["status"], "ambiguous",
+        status_json["data"]["record"]["status"], "pending",
         "the release rests on the endpoint's answers, so the outcome is recorded as unknown: \
          {status_json}"
     );
     assert_eq!(
-        status_json["data"]["record"]["reservation_open"], false,
-        "the reservation is released: {status_json}"
+        status_json["data"]["record"]["reservation_open"], true,
+        "the reservation stays charged: {status_json}"
     );
+    assert!(status_json["data"]["record"]["release_code"].is_null());
     assert_eq!(
-        status_json["data"]["record"]["release_code"], "submission.sequence_consumed",
-        "the record names the evidence the reservation was released on: {status_json}"
-    );
-    assert!(
-        status_json["data"]["reservation"].is_null(),
-        "no hold remains: {status_json}"
+        status_json["data"]["reservation"]["envelope_hash"],
+        envelope_hash
     );
 
     let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name)
         .expect("receipt store");
     assert_eq!(
         receipts.get(&envelope_hash).unwrap().unwrap().status,
-        stellar_agent_core::profile::receipt::ReceiptStatus::Ambiguous
+        stellar_agent_core::profile::receipt::ReceiptStatus::Pending
     );
     let rows = audit_rows(&audit_profile);
     let failed: Vec<_> = rows_of_kind(&rows, "value_action_failed")
         .into_iter()
         .filter(|row| row["envelope_hash"] == envelope_hash.as_str())
         .collect();
-    assert_eq!(
-        failed.len(),
-        1,
-        "the release writes its settled row: {rows:?}"
-    );
-    assert_eq!(failed[0]["code"], "submission.sequence_consumed");
+    assert!(failed.is_empty(), "{rows:?}");
     assert_eq!(
         sends.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "reconciliation sent nothing after the commit's own send"
     );
 
-    // With the reservation released, the cap admits the next payment again.
+    // The retained reservation keeps the next payment over the cap.
     let sim = server
         .call_stellar_pay(pay_args(&source_g, "600000000"))
         .await
         .expect("the next simulate must not error");
-    assert_ne!(
+    assert_eq!(
         sim.is_error,
         Some(true),
-        "a released reservation stops holding the cap: {}",
+        "the reservation keeps holding the cap: {}",
         call_result_text(&sim)
     );
 }
 
 /// A resend of the same signed bytes after their receipt was lost is refused
-/// before the send, and the original's settlement stays owed, so a later
-/// `SUCCESS` writes the submitted row for it.
+/// before the send and writes no row. The original's pending row stays open,
+/// and a later `SUCCESS` is recorded on the receipt without a submitted row.
 ///
 /// The rebuilt payment carries the same fee, sequence and operation, so its
 /// envelope hash is the original's. The receipt gate admits it because the
@@ -4218,6 +4905,7 @@ async fn a_resend_after_a_lost_receipt_is_refused_and_the_original_settles_later
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-lost-receipt", seed);
 
     let responder = PayReconcileRpcResponder::new(&source_g, 100_000_000_000_000, 41);
     let confirm = Arc::clone(&responder.confirm);
@@ -4301,7 +4989,9 @@ async fn a_resend_after_a_lost_receipt_is_refused_and_the_original_settles_later
             .call_stellar_transaction_status(
                 stellar_agent_mcp::server::StellarTransactionStatusArgs {
                     chain_id: "stellar:testnet".to_owned(),
-                    tx_hash: tx_hash.clone(),
+                    tx_hash: Some(tx_hash.clone()),
+                    business_id: None,
+                    retry_recovery: false,
                 },
             )
             .await
@@ -4311,8 +5001,8 @@ async fn a_resend_after_a_lost_receipt_is_refused_and_the_original_settles_later
     let rows = audit_rows(&audit_profile);
     assert_eq!(
         named(&rows, "value_action_submitted"),
-        1,
-        "the original's settled row is the submitted one: {rows:?}"
+        0,
+        "a reported success supplies no authenticated outcome row: {rows:?}"
     );
     assert_eq!(named(&rows, "value_action_failed"), 0, "{rows:?}");
     drop(mock_server);
@@ -4351,7 +5041,7 @@ impl CompetingReservationResponder {
         use stellar_agent_core::policy::v1::criteria::state_store::{
             StateKey, WindowEntry, WindowLimit,
         };
-        use stellar_agent_network::policy_state::{PersistedWindowStore, WindowReservation};
+        use stellar_agent_network::policy_state::{PersistedWindowStore, SubmissionHold};
 
         let now = stellar_agent_core::timefmt::now_unix_ms().expect("clock");
         let entry = WindowEntry::new(
@@ -4368,7 +5058,11 @@ impl CompetingReservationResponder {
             .record_pending(
                 &self.profile,
                 &[entry],
-                &WindowReservation {
+                &SubmissionHold {
+                    destinations: Default::default(),
+                    chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                        self.profile.chain_id,
+                    ),
                     id: "9".repeat(64),
                     tx_hash: "9".repeat(64),
                     source: DEST_G.to_owned(),
@@ -4376,6 +5070,7 @@ impl CompetingReservationResponder {
                     max_time: 0,
                     pending_since_ms: now,
                     submission_ledger: 1_000,
+                    submission_anchor: None,
                     operator_required: false,
                 },
             )
@@ -4436,7 +5131,14 @@ async fn pay_commit_refused_at_the_reservation_reports_the_gate_code_and_sends_n
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(211);
 
-    let home_dir = tempfile::TempDir::new().expect("tempdir");
+    let home_dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+    assert!(
+        home_dir
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home_dir.path());
 
     let seed = [0x52_u8; 32];
@@ -4445,6 +5147,7 @@ async fn pay_commit_refused_at_the_reservation_reports_the_gate_code_and_sends_n
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
@@ -4506,6 +5209,7 @@ async fn pay_commit_refused_at_the_reservation_reports_the_gate_code_and_sends_n
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
 
     let sim = server
@@ -4548,11 +5252,12 @@ async fn pay_commit_refused_at_the_reservation_reports_the_gate_code_and_sends_n
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce,
-            expires_at_unix_ms: expires,
-            envelope_xdr,
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("the commit must return a business-error result, not a protocol error");
@@ -4602,6 +5307,7 @@ async fn round_trip_endpoint(
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(
@@ -4640,11 +5346,12 @@ fn simulated_commit_args(
         memo_id: args.memo_id,
         memo_hash_hex: args.memo_hash_hex.clone(),
         memo_return_hex: args.memo_return_hex.clone(),
-        nonce: data["nonce"].as_str().expect("nonce").to_owned(),
-        expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().expect("expires"),
-        envelope_xdr: data["envelope_xdr"].as_str().expect("envelope").to_owned(),
+        nonce: Some(data["nonce"].as_str().expect("nonce").to_owned()),
+        expires_at_unix_ms: Some(data["expires_at_unix_ms"].as_u64().expect("expires")),
+        envelope_xdr: Some(data["envelope_xdr"].as_str().expect("envelope").to_owned()),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     }
 }
 
@@ -4720,9 +5427,32 @@ async fn the_gate_reconcile_client_is_the_only_other_client_a_v1_round_trip_buil
     install_test_nonce_key(232);
     let seed = [0x57_u8; 32];
     let endpoint = round_trip_endpoint(seed, crate::common::EndpointNetwork::testnet()).await;
-    let mut server =
-        WalletServer::new(testnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
+    let stored_primary = MockServer::start().await;
+    let stored_secondary = MockServer::start().await;
+    let profile = testnet_profile_with_rpc(&endpoint.uri());
+    let mut server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     let profile_name = server.profile_name_for_approval();
+    let profiles = stellar_agent_core::profile::loader::default_profile_dir().unwrap();
+    std::fs::create_dir_all(&profiles).unwrap();
+    std::fs::write(
+        profiles.join(format!("{profile_name}.toml")),
+        format!(
+            "chain_id = \"stellar:testnet\"\nrpc_url = {:?}\nsecondary_rpc_url = {:?}\n",
+            stored_primary.uri(),
+            stellar_agent_test_support::second_loopback_host(&stored_secondary.uri()),
+        ),
+    )
+    .unwrap();
+    let window =
+        stellar_agent_network::policy_state::PersistedWindowStore::for_profile(&profile_name);
+    window.record_and_persist(&profile, &[]).unwrap();
+    assert!(window.path().exists());
+    assert!(
+        window
+            .signed_intents(&profile_name, &profile)
+            .unwrap()
+            .is_empty()
+    );
     server.set_policy_engine_for_test(Arc::new(per_period_cap_engine(
         &["stellar_pay", "stellar_pay_commit"],
         &profile_name,
@@ -4752,12 +5482,27 @@ async fn the_gate_reconcile_client_is_the_only_other_client_a_v1_round_trip_buil
         commit_clients, 2,
         "the commit client and the gate's reconcile client"
     );
+    assert!(stored_primary.received_requests().await.unwrap().is_empty());
+    assert!(
+        stored_secondary
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        window
+            .signed_intents(&profile_name, &profile)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// The gate's reconcile client carries the primary credential too: a V1
 /// simulate builds two clients, its own and the reconcile's, and each reads
 /// the credential once.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn the_gate_reconcile_client_reads_the_primary_credential() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4766,13 +5511,25 @@ async fn the_gate_reconcile_client_reads_the_primary_credential() {
     let entry = crate::common::rpc_credential_entry(ProviderRole::Primary);
     let reads = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&reads);
-    keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
-        &entry.service,
-        &entry.account,
-        Arc::new(move || {
-            counter.fetch_add(1, Ordering::SeqCst);
-        }),
-    )])
+    let secondary_entry = crate::common::rpc_credential_entry(ProviderRole::Secondary);
+    let secondary_reads = Arc::new(AtomicUsize::new(0));
+    let secondary_counter = Arc::clone(&secondary_reads);
+    keyring_mock::install_with_read_hooks(vec![
+        keyring_mock::ReadHook::new(
+            &entry.service,
+            &entry.account,
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        ),
+        keyring_mock::ReadHook::new(
+            &secondary_entry.service,
+            &secondary_entry.account,
+            Arc::new(move || {
+                secondary_counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        ),
+    ])
     .expect("hooked mock keyring store init");
     install_test_nonce_key(236);
     let seed = [0x5b_u8; 32];
@@ -4780,7 +5537,7 @@ async fn the_gate_reconcile_client_reads_the_primary_credential() {
     crate::common::require_rpc_credential(&endpoint).await;
     let mut profile = testnet_profile_with_rpc(&endpoint.uri());
     crate::common::bind_rpc_credential(&mut profile, ProviderRole::Primary, true);
-    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    let mut server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     let profile_name = server.profile_name_for_approval();
     server.set_policy_engine_for_test(Arc::new(per_period_cap_engine(
         &["stellar_pay", "stellar_pay_commit"],
@@ -4805,6 +5562,101 @@ async fn the_gate_reconcile_client_reads_the_primary_credential() {
     );
     let trace = crate::common::credential_trace(&endpoint).await;
     assert!(trace.iter().all(|(_, keyed)| *keyed), "{trace:?}");
+    let stored_primary = MockServer::start().await;
+    let stored_secondary = MockServer::start().await;
+    let caller_secondary = MockServer::start().await;
+    for witness in [&stored_primary, &stored_secondary] {
+        crate::common::require_rpc_credential(witness).await;
+        Mock::given(method("POST")).respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "getNetwork" => stellar_agent_test_support::signed_envelope::get_network_result(
+                    stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE),
+                "getLatestLedger" => serde_json::json!({"id":"ab".repeat(32),"sequence":101,"protocolVersion":27}),
+                other => panic!("only stored witness reads are expected: {other}"),
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+        }).mount(witness).await;
+    }
+    profile.secondary_rpc_url = Some(caller_secondary.uri());
+    crate::common::bind_rpc_credential(&mut profile, ProviderRole::Secondary, true);
+    let profiles = stellar_agent_core::profile::loader::default_profile_dir().unwrap();
+    std::fs::create_dir_all(&profiles).unwrap();
+    std::fs::write(
+        profiles.join(format!("{profile_name}.toml")),
+        format!(
+            "chain_id = \"stellar:testnet\"\nrpc_url = {:?}\nsecondary_rpc_url = {:?}\n",
+            stored_primary.uri(),
+            stellar_agent_test_support::second_loopback_host(&stored_secondary.uri()),
+        ),
+    )
+    .unwrap();
+    let mut server = WalletServer::new(profile.clone()).unwrap();
+    server.set_policy_engine_for_test(Arc::new(per_period_cap_engine(
+        &["stellar_pay", "stellar_pay_commit"],
+        &profile_name,
+        10_000_000_000,
+        "1d",
+    )));
+    let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(1000);
+    let query_clock =
+        stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(1000);
+    let (plan, envelope) =
+        stellar_agent_network::signed_intent::test_helpers::intent_fixture_plan(99, 1);
+    let stellar_xdr::TransactionEnvelope::Tx(tx) = envelope else {
+        panic!("V1")
+    };
+    let stellar_xdr::OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+        panic!("invoke")
+    };
+    let plan = plan
+        .classify_purpose(&op.host_function, None)
+        .unwrap()
+        .with_envelope_max_ledger(100)
+        .unwrap();
+    let window =
+        stellar_agent_network::policy_state::PersistedWindowStore::for_profile(&profile_name);
+    let _exposure = window
+        .admit_signed_intent(&profile, &plan)
+        .unwrap()
+        .expose();
+    clock.set(2000);
+    query_clock.set(2000);
+    let primary_before = reads.load(Ordering::SeqCst);
+    let secondary_before = secondary_reads.load(Ordering::SeqCst);
+    let (sim, clients) = crate::common::clients_built_by(
+        server.call_stellar_pay(pay_args(&gstrkey_for_seed(seed), "1000000000")),
+    )
+    .await;
+    let sim = sim.unwrap();
+    assert_ne!(sim.is_error, Some(true), "{}", call_result_text(&sim));
+    assert_eq!(
+        clients, 4,
+        "the command, reconcile, and two stored witnesses"
+    );
+    assert_eq!(reads.load(Ordering::SeqCst) - primary_before, 3);
+    assert_eq!(secondary_reads.load(Ordering::SeqCst) - secondary_before, 1);
+    assert_eq!(
+        window.signed_intents(&profile_name, &profile).unwrap()[0].expiry_observed_at_ms,
+        Some(2000)
+    );
+    for witness in [&stored_primary, &stored_secondary] {
+        let trace = crate::common::credential_trace(witness).await;
+        assert_eq!(
+            trace,
+            vec![
+                ("getNetwork".into(), true),
+                ("getLatestLedger".into(), true)
+            ]
+        );
+    }
+    assert!(
+        caller_secondary
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Runs `commit` against `endpoint` twice. While the endpoint reports testnet,
@@ -4864,6 +5716,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
     let mock_server = MockServer::start().await;
     crate::common::require_rpc_credential(&mock_server).await;
     Mock::given(method("POST"))
@@ -4890,6 +5743,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_pay(simulate_args.clone())
@@ -4913,14 +5767,17 @@ async fn prepare_and_commit_send_the_primary_credential() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: sim_data["nonce"].as_str().expect("nonce").to_owned(),
-        expires_at_unix_ms: sim_data["expires_at_unix_ms"].as_u64().expect("expiry"),
-        envelope_xdr: sim_data["envelope_xdr"]
-            .as_str()
-            .expect("envelope")
-            .to_owned(),
+        nonce: Some(sim_data["nonce"].as_str().expect("nonce").to_owned()),
+        expires_at_unix_ms: Some(sim_data["expires_at_unix_ms"].as_u64().expect("expiry")),
+        envelope_xdr: Some(
+            sim_data["envelope_xdr"]
+                .as_str()
+                .expect("envelope")
+                .to_owned(),
+        ),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let committed = server
         .call_stellar_pay_commit(commit_args.clone())
@@ -4960,11 +5817,12 @@ fn unverifiable_commit() -> StellarPayCommitArgs {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 48]),
-        expires_at_unix_ms: 3_000_000_000_000,
-        envelope_xdr: valid_payment_envelope_b64(),
+        nonce: Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 48])),
+        expires_at_unix_ms: Some(3_000_000_000_000),
+        envelope_xdr: Some(valid_payment_envelope_b64()),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     }
 }
 
@@ -5058,7 +5916,7 @@ async fn commit_endpoint_refusal_precedes_a_malformed_nonce() {
     let server =
         WalletServer::new(testnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
     let mut malformed = unverifiable_commit();
-    malformed.nonce = "!!invalid-base64!!".to_owned();
+    malformed.nonce = Some("!!invalid-base64!!".to_owned());
     assert_endpoint_refusal_precedes(&server, &endpoint, &network, malformed, "nonce.expired")
         .await;
 }
@@ -5193,6 +6051,7 @@ async fn witness_payment_case(
         .unwrap()
         .set_password(&sstrkey_for_seed(seed))
         .unwrap();
+    crate::common::store_signer_identity("svc", &account, seed);
     let mut entries = vec![(
         account_ledger_key_xdr(&source),
         account_entry_xdr_with_balance(&source, 100_000_000_000_000),
@@ -5339,6 +6198,10 @@ async fn witness_payment_case(
     );
     let rows = audit_rows(&profile);
     for kind in ["value_action_pending", "value_action_submitted"] {
+        if kind == "value_action_submitted" {
+            assert!(rows.iter().all(|row| row["kind"] != kind));
+            continue;
+        }
         let rows = rows_of_kind(&rows, kind);
         assert_eq!(rows.len(), 1, "{kind}: {rows:?}");
         if expected == "passed" {
@@ -5360,10 +6223,7 @@ async fn witness_payment_case(
             crate::common::received_methods(&oracle).await,
             ["getNetwork", "getLedgerEntries"]
         );
-        assert_eq!(
-            rows_of_kind(&rows, "value_action_pending")[0]["witness"],
-            rows_of_kind(&rows, "value_action_submitted")[0]["witness"]
-        );
+        assert!(rows_of_kind(&rows, "value_action_submitted").is_empty());
     } else {
         assert!(crate::common::received_methods(&oracle).await.is_empty());
         assert_eq!(
@@ -5400,6 +6260,7 @@ async fn pay_prepare_makes_no_oracle_request() {
         .unwrap()
         .set_password(&sstrkey_for_seed(seed))
         .unwrap();
+    crate::common::store_signer_identity("svc", &account, seed);
     let entries = vec![(
         account_ledger_key_xdr(&source),
         account_entry_xdr_with_balance(&source, 100_000_000_000_000),

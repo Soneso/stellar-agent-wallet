@@ -62,6 +62,8 @@
 //!   `submission.hash_mismatch`: [`SaError::SubmissionUnresolved`], by kind
 //! - `sa.policy_hash_drift`: [`SaError::PolicyHashDrift`], passed through by a step
 //! - `sa.pinned_policy_absent`: [`SaError::PinnedPolicyAbsent`], passed through by a step
+//! - `sa.wasm_pin_incomplete`: [`SaError::WasmPinIncomplete`], before a pair's removal is
+//!   sent, when the rule's pin record holds eight-byte hash prefixes
 //! - `sa.pin_check_unavailable`: [`SaError::PinCheckUnavailable`], passed through by a step
 //! - `sa.auth_entry_construction_failed`: [`SaError::AuthEntryConstructionFailed`],
 //!   passed through by a step, including lock and signer-set deadline stages
@@ -72,6 +74,7 @@
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use stellar_agent_core::audit_log::WasmHashPin;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
@@ -212,8 +215,8 @@ impl_common_args_view!(MigrateVerifierArgs);
 pub struct MigrateStepResult {
     /// On-chain signer ID.
     pub signer_id: u32,
-    /// First-8 hex chars of the old verifier wasm hash.
-    pub current_hash_first8: String,
+    /// The full wasm hash of the old verifier.
+    pub current_hash: WasmHashPin,
     /// The key data the step's add restores on the destination verifier, as
     /// lower-case hex, taken from the plan's add argument. With
     /// `--signer-external <to_verifier_address>` it rebuilds the step's
@@ -269,8 +272,8 @@ pub struct MigratePendingAdd {
 pub struct MigrateRuleResult {
     /// Context-rule identifier.
     pub rule_id: u32,
-    /// First-8 hex chars of the current verifier wasm hash for this rule.
-    pub current_hash_first8: String,
+    /// The full wasm hash of the current verifier for this rule.
+    pub current_hash: WasmHashPin,
     /// Number of on-chain transactions required for this rule (`2 * signer_steps`).
     pub transaction_count: usize,
     /// Per-signer steps within this rule.
@@ -289,10 +292,10 @@ pub struct MigrateRuleResult {
 pub struct MigrateVerifierResult {
     /// Smart-account C-strkey.
     pub smart_account: String,
-    /// First-8 hex chars of the source verifier WASM hash.
-    pub from_hash_first8: String,
-    /// First-8 hex chars of the destination verifier WASM hash (queried from chain).
-    pub to_hash_first8: String,
+    /// The full source verifier WASM hash.
+    pub from_hash: WasmHashPin,
+    /// The full destination verifier WASM hash (queried from chain).
+    pub to_hash: WasmHashPin,
     /// Destination verifier C-strkey (caller-supplied `--to`).
     pub to_verifier_address: String,
     /// Destination verifier audit status label.
@@ -376,6 +379,7 @@ fn dry_run_signers_manager(
         timeout,
         audit_writer,
         &audit_log_path,
+        None,
     )?;
     Ok((manager, chain_id))
 }
@@ -397,7 +401,7 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved_profile) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved_profile.name);
+            let e = map_access_error(&error);
             return emit_error(&e, &request_id);
         }
     };
@@ -431,16 +435,9 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
     }
 
     // Parse the `--from` hex hash.
-    let from_hash = match parse_hex_hash(&args.from) {
+    let from_hash = match parse_from_hash(&args.from) {
         Ok(h) => h,
-        Err(detail) => {
-            return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("--from: {detail}"),
-                }),
-                &request_id,
-            );
-        }
+        Err(e) => return emit_error(&e, &request_id),
     };
 
     // Parse the `--to` destination verifier C-strkey.
@@ -448,9 +445,7 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
         Ok(a) => a,
         Err(e) => {
             return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("--to: {e}"),
-                }),
+                &WalletError::Validation(ValidationError::address_check(format!("--to: {e}"))),
                 &request_id,
             );
         }
@@ -460,9 +455,7 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
         Ok(a) => a,
         Err(e) => {
             return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("--account: {e}"),
-                }),
+                &WalletError::Validation(ValidationError::address_check(format!("--account: {e}"))),
                 &request_id,
             );
         }
@@ -509,11 +502,29 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
     }
 
     // Build handler context: resolves signer, opens audit writer, constructs RPC handles.
-    let ctx =
-        match CommonHandlerContext::new(args, resolved_profile, profile, origin, &context).await {
-            Ok(ctx) => ctx,
-            Err(e) => return emit_error(&e, &request_id),
-        };
+    let ctx = match async {
+        let admission = crate::commands::smart_account::common::submission_admission(
+            &profile,
+            origin,
+            &resolved_profile.name,
+            "stellar_smart_account_migrate_verifier",
+            &context,
+        )?;
+        CommonHandlerContext::new(
+            args,
+            resolved_profile,
+            profile,
+            origin,
+            &context,
+            Some(admission),
+        )
+        .await
+    }
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => return emit_error(&e, &request_id),
+    };
 
     // Build the SignersManager — needed by MigrationPlanner for RPC access.
     let manager = match ctx.signers_manager() {
@@ -637,37 +648,39 @@ fn mainnet_submit_refusal(network: Caip2, dry_run: bool) -> Option<WalletError> 
         .then_some(WalletError::Network(NetworkError::MainnetWriteForbidden))
 }
 
+/// The refusal of a `--from` value that is not a 64-hex-character hash. It
+/// names the argument and the expected form, never the value; the detail of
+/// [`parse_hex_hash`] follows it.
+const FROM_HASH_REFUSAL: &str = "--from must be 64 hex characters (a 32-byte SHA-256 WASM hash)";
+
+/// Parses the `--from` WASM hash, refusing with `validation.address_invalid`
+/// under [`FROM_HASH_REFUSAL`].
+fn parse_from_hash(from: &str) -> Result<[u8; 32], WalletError> {
+    parse_hex_hash(from).map_err(|detail| {
+        WalletError::Validation(ValidationError::address_check(format!(
+            "{FROM_HASH_REFUSAL}: {detail}"
+        )))
+    })
+}
+
 /// Parses a 64-char lowercase hex string into a 32-byte WASM hash.
 ///
 /// # Errors
 ///
-/// Returns a human-readable error string if the input is not exactly 64 hex chars
-/// or contains non-hex characters.
+/// Returns the refused check if the input is not exactly 64 hex chars or
+/// contains a non-hex character. The text names the expected length or the
+/// position of the first non-hex character, never the input.
 fn parse_hex_hash(hex: &str) -> Result<[u8; 32], String> {
     let hex = hex.trim();
     if hex.len() != 64 {
-        return Err(format!(
-            "expected 64 hex chars (32-byte SHA-256), got {} chars: {:?}",
-            hex.len(),
-            hex
-        ));
+        return Err("expected 64 hex characters (32-byte SHA-256)".to_owned());
     }
     let mut out = [0u8; 32];
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let hi = hex_nibble(chunk[0]).ok_or_else(|| {
-            format!(
-                "invalid hex char '{}' at position {}",
-                chunk[0] as char,
-                i * 2
-            )
-        })?;
-        let lo = hex_nibble(chunk[1]).ok_or_else(|| {
-            format!(
-                "invalid hex char '{}' at position {}",
-                chunk[1] as char,
-                i * 2 + 1
-            )
-        })?;
+        let hi = hex_nibble(chunk[0])
+            .ok_or_else(|| format!("invalid hex character at position {}", i * 2))?;
+        let lo = hex_nibble(chunk[1])
+            .ok_or_else(|| format!("invalid hex character at position {}", i * 2 + 1))?;
         out[i] = (hi << 4) | lo;
     }
     Ok(out)
@@ -695,14 +708,14 @@ fn migration_plan_to_result_dry_run(
         .iter()
         .map(|r| MigrateRuleResult {
             rule_id: r.rule_id,
-            current_hash_first8: r.current_hash_first8.clone(),
+            current_hash: r.current_hash,
             transaction_count: r.transaction_count(),
             signer_steps: r
                 .signer_steps
                 .iter()
                 .map(|s| MigrateStepResult {
                     signer_id: s.signer_id,
-                    current_hash_first8: s.current_hash_first8.clone(),
+                    current_hash: s.current_hash,
                     key_data_hex: add_step_key_data_hex(s),
                     remove_tx_hash: None,
                     add_tx_hash: None,
@@ -714,8 +727,8 @@ fn migration_plan_to_result_dry_run(
 
     MigrateVerifierResult {
         smart_account: account_strkey.to_owned(),
-        from_hash_first8: plan.from_hash_first8(),
-        to_hash_first8: plan.to_hash_first8(),
+        from_hash: WasmHashPin::new(plan.from_hash),
+        to_hash: WasmHashPin::new(plan.to_hash),
         to_verifier_address: to_verifier_strkey.to_owned(),
         destination_audit_status: audit_status_label(&plan.destination_audit_status),
         total_transaction_count: plan.total_transaction_count(),
@@ -777,7 +790,7 @@ fn migration_plan_to_result_submitted(
         .iter()
         .map(|r| MigrateRuleResult {
             rule_id: r.rule_id,
-            current_hash_first8: r.current_hash_first8.clone(),
+            current_hash: r.current_hash,
             transaction_count: r.transaction_count(),
             signer_steps: r
                 .signer_steps
@@ -786,7 +799,7 @@ fn migration_plan_to_result_submitted(
                     let submitted = step_lookup.remove(&(r.rule_id, s.signer_id));
                     MigrateStepResult {
                         signer_id: s.signer_id,
-                        current_hash_first8: s.current_hash_first8.clone(),
+                        current_hash: s.current_hash,
                         key_data_hex: add_step_key_data_hex(s),
                         remove_tx_hash: submitted
                             .as_ref()
@@ -815,8 +828,8 @@ fn migration_plan_to_result_submitted(
 
     MigrateVerifierResult {
         smart_account: args.account.clone(),
-        from_hash_first8: plan.from_hash_first8(),
-        to_hash_first8: plan.to_hash_first8(),
+        from_hash: WasmHashPin::new(plan.from_hash),
+        to_hash: WasmHashPin::new(plan.to_hash),
         to_verifier_address: args.to_verifier.clone(),
         destination_audit_status: audit_status_label(&plan.destination_audit_status),
         total_transaction_count: plan.total_transaction_count(),
@@ -1093,6 +1106,110 @@ mod tests {
     };
     use stellar_xdr::ScVal;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    #[allow(clippy::unwrap_used, reason = "test fixture assertions")]
+    async fn migrate_verifier_submission_admits_under_its_own_identifier() {
+        use stellar_agent_core::policy::v1::criteria::state_store::{
+            StateKey, WindowEntry, WindowLimit,
+        };
+        use stellar_agent_network::policy_state::PersistedWindowStore;
+        for tool in [
+            "stellar_smart_account_migrate_verifier",
+            "stellar_smart_account_signers",
+        ] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                dir.path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+            let profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+                "intent",
+                "migration",
+                "account",
+                "migration-nonce",
+                "account",
+            )
+            .build();
+            let owner = ed25519_dalek::SigningKey::from_bytes(&[0x53; 32]);
+            let owner_key = stellar_agent_core::profile::owner_key::encode_owner_public_key(
+                &owner.verifying_key().to_bytes(),
+            );
+            keyring_core::Entry::new(
+                &profile.policy_owner_key_id.service,
+                &profile.policy_owner_key_id.account,
+            )
+            .unwrap()
+            .set_password(&owner_key)
+            .unwrap();
+            let body = format!(
+                "version = 1\nscope = \"profile:intent\"\n[[rules]]\nmatch = {{ tool = \"{tool}\", chain = \"*\" }}\ncriteria = [{{kind = \"rate_limit\", window = \"1m\", max_calls = 1}}]\ndecision = \"allow\"\n"
+            );
+            let digest = stellar_agent_core::policy::v1::signature::digest(
+                &stellar_agent_core::policy::v1::canonical::canonical_bytes(&body).unwrap(),
+            );
+            let signature = stellar_agent_core::policy::v1::signature::sign(&digest, &owner);
+            let policies = stellar_agent_core::profile::schema::default_policy_dir().unwrap();
+            std::fs::create_dir_all(&policies).unwrap();
+            std::fs::write(
+                policies.join("intent.toml"),
+                format!(
+                    "{body}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                    stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()),
+                    stellar_agent_core::hex::encode(&signature)
+                ),
+            )
+            .unwrap();
+            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+            let window = PersistedWindowStore::for_profile("intent");
+            window
+                .record_and_persist(
+                    &profile,
+                    &[WindowEntry::new(
+                        StateKey::new("intent", 1, "rate_limit", 60),
+                        now,
+                        1,
+                        WindowLimit::Count {
+                            window: "1m".into(),
+                            max_calls: 1,
+                        },
+                    )],
+                )
+                .unwrap();
+            let before = std::fs::read(window.path()).unwrap();
+            let admission = crate::commands::submission_record::no_value_admission(
+                &profile,
+                "intent",
+                "stellar_smart_account_migrate_verifier",
+                "stellar:testnet",
+                now,
+            )
+            .unwrap();
+            let plan =
+                stellar_agent_network::signed_intent::test_helpers::intent_fixture_plan(1, 60).0;
+            let result = admission.admit(&plan).await;
+            if tool == "stellar_smart_account_migrate_verifier" {
+                assert_eq!(
+                    result.err().unwrap().code(),
+                    "policy.deny.rate_limit_exceeded"
+                );
+            } else {
+                assert!(result.unwrap().expose().intent_id().is_none());
+            }
+            assert_eq!(std::fs::read(window.path()).unwrap(), before);
+            assert!(
+                window
+                    .signed_intents("intent", &profile)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
     /// A smart-account C-strkey for the recovery fixtures.
     const ACCOUNT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
@@ -1161,7 +1278,7 @@ mod tests {
         )));
         SignerMigrationStep::new_for_test(
             signer_id,
-            "aabbccdd",
+            [0xaa; 32],
             call("remove_signer", vec![ScVal::U32(1), ScVal::U32(signer_id)]),
             call("add_signer", vec![ScVal::U32(1), external]),
         )
@@ -1178,10 +1295,54 @@ mod tests {
             [0xaa; 32],
             [0x11; 32],
             parse_c_strkey_to_smart_account(DESTINATION).unwrap(),
-            vec![RuleMigration::new_for_test(1, "aabbccdd", steps)],
+            vec![RuleMigration::new_for_test(1, [0xaa; 32], steps)],
             VerifierAuditStatus::Unaudited,
             "req-partial",
         )
+    }
+
+    /// The migration envelope carries the full source, destination and
+    /// current hashes: a destination sharing the source's first eight bytes
+    /// stays distinguishable, and no `_first8` field appears.
+    #[test]
+    #[allow(clippy::unwrap_used, reason = "test-only; the fixture strkeys parse")]
+    fn migration_envelope_carries_full_source_and_destination_hashes() {
+        let from = [0x42u8; 32];
+        let mut to = from;
+        to[8..].fill(0x43);
+        let plan = MigrationPlan::new_for_test(
+            parse_c_strkey_to_smart_account(ACCOUNT).unwrap(),
+            from,
+            to,
+            parse_c_strkey_to_smart_account(DESTINATION).unwrap(),
+            vec![RuleMigration::new_for_test(
+                1,
+                from,
+                vec![plan_step(7, &[0xab; 4])],
+            )],
+            VerifierAuditStatus::Unaudited,
+            "req-full",
+        );
+        let result =
+            migration_plan_to_result_dry_run(&plan, ACCOUNT, DESTINATION, "stellar:testnet");
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["from_hash"], hex::encode(from));
+        assert_eq!(json["to_hash"], hex::encode(to));
+        assert_ne!(json["from_hash"], json["to_hash"]);
+        assert_eq!(json["affected_rules"][0]["current_hash"], hex::encode(from));
+        // The step fixture records the 0xaa hash for its step.
+        assert_eq!(
+            json["affected_rules"][0]["signer_steps"][0]["current_hash"],
+            "aa".repeat(32)
+        );
+        for field in ["from_hash_first8", "to_hash_first8"] {
+            assert!(json.get(field).is_none(), "{field}: {json}");
+        }
+        assert!(
+            json["affected_rules"][0]
+                .get("current_hash_first8")
+                .is_none()
+        );
     }
 
     /// The envelope data the production converter renders for a plan with
@@ -1646,7 +1807,14 @@ mod tests {
     async fn run_mainnet_flag_without_profile_reaches_no_endpoint() {
         let primary = wiremock::MockServer::start().await;
         let secondary = wiremock::MockServer::start().await;
-        let guard_home = tempfile::tempdir().expect("home");
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         const SIGNER_ENV: &str = "MIGRATE_VERIFIER_MAINNET_GATE_TEST_SEED";
@@ -1670,6 +1838,40 @@ mod tests {
                     .await
                     .expect("requests")
                     .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn a_seed_as_the_from_hash_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+        let seed = seed_marker();
+        let mut odd_character = "a".repeat(64);
+        odd_character.replace_range(5..6, "S");
+        for (from, detail) in [
+            (seed.clone(), "expected 64 hex characters (32-byte SHA-256)"),
+            (
+                format!("{seed}{seed}"),
+                "expected 64 hex characters (32-byte SHA-256)",
+            ),
+            (odd_character, "invalid hex character at position 5"),
+        ] {
+            let helper = parse_hex_hash(&from).expect_err("not a hex hash");
+            assert!(!helper.contains(&seed), "the helper repeats the input");
+            assert_eq!(helper, detail);
+            let error = parse_from_hash(&from).expect_err("not a hex hash");
+            assert_no_marker(&error, &seed);
+            assert_eq!(error.code(), "validation.address_invalid");
+            assert_eq!(error.to_string(), format!("{FROM_HASH_REFUSAL}: {detail}"));
+            let envelope = serde_json::to_string(&Envelope::<()>::err_with_request_id(
+                &error,
+                "request".to_owned(),
+            ))
+            .expect("envelope serializes");
+            assert!(!envelope.contains(&seed), "{envelope}");
+            assert!(
+                envelope.contains("--from must be 64 hex characters"),
+                "{envelope}"
             );
         }
     }

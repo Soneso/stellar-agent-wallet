@@ -66,6 +66,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
+use stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL;
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+
 use crate::entries::AuthorizationEntries;
 use crate::error::Sep45Error;
 use crate::session::Sep45Session;
@@ -202,8 +205,13 @@ impl Sep45Client {
     /// This is a cheap one-shot construction; in production callers should
     /// create a single client and reuse it across requests.
     ///
+    /// A client exists to sign challenges, so the mainnet passphrase is
+    /// refused here, before any HTTP client is built.
+    ///
     /// # Errors
     ///
+    /// - [`Sep45Error::MainnetSigningForbidden`] if `network_passphrase` is the
+    ///   mainnet passphrase.
     /// - [`Sep45Error::HttpError`] if the underlying `reqwest::Client` cannot
     ///   be constructed (extremely rare; indicates system-level TLS init failure).
     ///
@@ -215,6 +223,8 @@ impl Sep45Client {
     /// let client = Sep45Client::new("Test SDF Network ; September 2015").unwrap();
     /// ```
     pub fn new(network_passphrase: impl Into<String>) -> Result<Self, Sep45Error> {
+        let network_passphrase = network_passphrase.into();
+        refuse_mainnet(&network_passphrase)?;
         let http = reqwest::Client::builder()
             // HTTPS-only enforcement — rejects any http:// URL at request time.
             // HTTPS IS the security boundary for SEP-45: the JWT is trusted
@@ -233,7 +243,7 @@ impl Sep45Client {
             })?;
         Ok(Self {
             http,
-            network_passphrase: network_passphrase.into(),
+            network_passphrase,
         })
     }
 
@@ -253,6 +263,9 @@ impl Sep45Client {
     /// production code MUST use [`Sep45Client::new`] which enforces HTTPS.
     ///
     /// **NOT for production use.** Only available under `#[cfg(any(test, feature = "test-helpers"))]`.
+    ///
+    /// Any passphrase is accepted, the mainnet one included, so tests reach
+    /// the signing functions' own mainnet refusal.
     ///
     /// # Errors
     ///
@@ -544,6 +557,20 @@ fn system_time_unix_secs() -> Result<u64, Sep45Error> {
         .map_err(|e| Sep45Error::HttpError {
             detail: format!("system clock is before UNIX epoch: {e}"),
         })
+}
+
+/// Refuses the mainnet passphrase with the structural mainnet refusal.
+///
+/// # Errors
+///
+/// [`Sep45Error::MainnetSigningForbidden`] for the mainnet passphrase.
+pub(crate) fn refuse_mainnet(network_passphrase: &str) -> Result<(), Sep45Error> {
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(Sep45Error::MainnetSigningForbidden {
+            detail: MAINNET_SIGNING_REFUSAL_DETAIL.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1072,5 +1099,30 @@ mod tests {
             .unwrap(),
         );
         format!("{header}.{payload}.")
+    }
+
+    // ── mainnet refusal ───────────────────────────────────────────────────────
+
+    #[test]
+    fn new_refuses_the_mainnet_passphrase() {
+        let result = Sep45Client::new("Public Global Stellar Network ; September 2015");
+        assert!(
+            matches!(
+                &result,
+                Err(Sep45Error::MainnetSigningForbidden { detail })
+                    if detail.contains("network.mainnet_write_forbidden")
+            ),
+            "got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn new_accepts_the_testnet_passphrase() {
+        let client = Sep45Client::new("Test SDF Network ; September 2015").unwrap();
+        assert_eq!(
+            client.network_passphrase(),
+            "Test SDF Network ; September 2015"
+        );
     }
 }

@@ -64,6 +64,22 @@ pub enum BindingCheck {
     CheckOnly,
 }
 
+/// Whether the profile's audit binding was already recorded when a keyed use
+/// of its log began.
+///
+/// A keyed use records an absent binding once the audit chain-root key has
+/// loaded, so a binding that was recorded before the current use means a keyed
+/// use already reached this profile's log. A writer that finds no tip anchor
+/// for a log with entries, while the binding was recorded, refuses to adopt the
+/// log: the anchor that should be there is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingHistory {
+    /// No binding was recorded before the current use.
+    NotRecorded,
+    /// A binding equal to the profile's was recorded before the current use.
+    Recorded,
+}
+
 /// A stored binding that is not a well-formed version 1 record.
 ///
 /// Carries no part of the stored value.
@@ -114,6 +130,20 @@ impl RecordedBinding {
         matches!(self, Self::Changed(_) | Self::Unparseable)
     }
 
+    /// What this record says about earlier keyed use of the profile's log.
+    ///
+    /// Only an equal record is a binding this profile recorded. An absent
+    /// record says nothing was recorded, and a changed or unparseable one names
+    /// another log or key, so it says nothing about the log the profile names
+    /// now.
+    #[must_use]
+    pub fn history(&self) -> BindingHistory {
+        match self {
+            Self::Equal => BindingHistory::Recorded,
+            Self::Absent | Self::Changed(_) | Self::Unparseable => BindingHistory::NotRecorded,
+        }
+    }
+
     /// The wire label an operator-facing report uses for this record.
     #[must_use]
     pub fn label(&self) -> &'static str {
@@ -147,6 +177,10 @@ impl AuditBinding {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use stellar_agent_core::audit_log::binding::AuditBinding;
     /// use stellar_agent_core::profile::schema::Profile;
     ///
@@ -155,6 +189,7 @@ impl AuditBinding {
     /// assert_eq!(binding.audit_key, profile.audit_log_hash_chain_key_id);
     /// let parsed = AuditBinding::parse(&binding.to_keyring_value()).unwrap();
     /// assert_eq!(parsed, binding);
+    /// # }
     /// ```
     #[must_use]
     pub fn for_profile(profile: &Profile) -> Self {
@@ -220,7 +255,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn the_wire_form_is_the_documented_json() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let binding = AuditBinding::for_profile(&profile("/var/log/alice.jsonl"));
         let value: serde_json::Value =
             serde_json::from_str(&binding.to_keyring_value()).expect("JSON");
@@ -246,7 +285,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn the_digest_follows_the_lexically_normalized_path() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let plain = AuditBinding::for_profile(&profile("/var/log/alice.jsonl"));
         let dotted = AuditBinding::for_profile(&profile("/var/log/./x/../alice.jsonl"));
         let other = AuditBinding::for_profile(&profile("/var/log/bob.jsonl"));
@@ -255,7 +298,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn parsing_is_strict() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let good = AuditBinding::for_profile(&profile("/a.jsonl")).to_keyring_value();
         assert!(AuditBinding::parse(&good).is_ok());
         let upper = good.replace(
@@ -288,7 +335,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn classification_covers_every_record() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let expected = AuditBinding::for_profile(&profile("/a.jsonl"));
         let other = AuditBinding::for_profile(&profile("/b.jsonl"));
         assert_eq!(

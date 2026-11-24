@@ -212,14 +212,19 @@ mod tests {
 
     /// Criterion passes when all groups are satisfied.
     #[test]
+    #[serial_test::serial]
     fn passes_when_quorum_satisfied() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = QuorumSatisfiedCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
         let args = serde_json::Value::Null;
         let store = PolicyStateStore::new();
         let view = SatisfiedQuorum;
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store).with_quorum(&view);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
+            .with_quorum(&view);
 
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(result.is_none(), "expected pass, got: {result:?}");
@@ -228,7 +233,11 @@ mod tests {
     /// Criterion returns QuorumNotSatisfied with And combinator when groups
     /// are short.
     #[test]
+    #[serial_test::serial]
     fn denies_when_and_groups_unsatisfied() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = QuorumSatisfiedCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
@@ -237,7 +246,8 @@ mod tests {
         let view = UnsatisfiedAndQuorum {
             short_groups: vec!["admins".to_owned(), "ops".to_owned()],
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store).with_quorum(&view);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
+            .with_quorum(&view);
 
         let result = criterion.evaluate(&ctx).unwrap();
         match result {
@@ -255,7 +265,11 @@ mod tests {
     /// Criterion returns QuorumNotSatisfied with Or combinator when no group
     /// is satisfied.
     #[test]
+    #[serial_test::serial]
     fn denies_when_or_no_group_satisfied() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = QuorumSatisfiedCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
@@ -264,7 +278,8 @@ mod tests {
         let view = UnsatisfiedOrQuorum {
             all_groups: vec!["g1".to_owned(), "g2".to_owned()],
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store).with_quorum(&view);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
+            .with_quorum(&view);
 
         let result = criterion.evaluate(&ctx).unwrap();
         match result {
@@ -282,14 +297,18 @@ mod tests {
     /// Criterion returns CriterionEvaluationFailed (fail-closed) when quorum
     /// view is absent.
     #[test]
+    #[serial_test::serial]
     fn fails_closed_when_quorum_view_absent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = QuorumSatisfiedCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
         let args = serde_json::Value::Null;
         let store = PolicyStateStore::new();
         // No .with_quorum() call — ctx.quorum is None.
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000);
 
         let result = criterion.evaluate(&ctx);
         match result {

@@ -4,10 +4,11 @@ use std::path::PathBuf;
 
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::error::{ApprovalFailure, WalletError};
+use stellar_agent_core::profile::loader::list_profiles;
 use stellar_agent_core::profile::schema::default_approval_dir;
 
 /// Resolves the approval directory or returns its approval-specific refusal.
-pub(super) fn approval_store_dir() -> Result<PathBuf, WalletError> {
+pub(crate) fn approval_store_dir() -> Result<PathBuf, WalletError> {
     default_approval_dir().map_err(|_| {
         WalletError::Approval(ApprovalFailure::StoreDirError {
             detail: "could not determine approval store directory".to_owned(),
@@ -15,12 +16,20 @@ pub(super) fn approval_store_dir() -> Result<PathBuf, WalletError> {
     })
 }
 
+/// Reports include a profile name only when it appears in the saved-profile
+/// directory. If that directory cannot be read, the name is omitted.
+pub(crate) fn saved_profile_name(name: String) -> Option<String> {
+    list_profiles()
+        .is_ok_and(|saved| saved.contains(&name))
+        .then_some(name)
+}
+
 /// Maps an [`ApprovalError`] from opening the pending-approval store onto a
 /// [`WalletError::Approval`] carrying a distinct wire code per failure class.
 ///
 /// The `approve`, `approve gc`, and `approve list` paths
 /// share this mapping for store-open failures from `open_with_retry`.
-pub(super) fn approval_store_open_error(e: &ApprovalError) -> WalletError {
+pub(crate) fn approval_store_open_error(e: &ApprovalError) -> WalletError {
     let detail = e.to_string();
     WalletError::Approval(match e {
         ApprovalError::Permission { .. } => ApprovalFailure::PermissionDenied { detail },

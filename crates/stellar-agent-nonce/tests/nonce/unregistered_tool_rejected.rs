@@ -12,6 +12,7 @@
 
 use serial_test::serial;
 use stellar_agent_nonce::{NonceError, NonceMint};
+use stellar_agent_test_support::rejected_value::{assert_refusal_text, capture_refusal};
 
 use crate::helpers::{
     RejectAllCatalogue, far_future_expiry, init_mock, make_profile, now_before_expiry,
@@ -20,6 +21,9 @@ use crate::helpers::{
 #[test]
 #[serial]
 fn unregistered_tool_rejected_before_key_state() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
 
     // Intentionally do NOT seed a key — if key state were engaged, the call
@@ -43,7 +47,31 @@ fn unregistered_tool_rejected_before_key_state() {
     // If this is InvalidTool, key state was never engaged (correct).
     // If this is KeyringError, key was loaded before validation (bug).
     assert!(
-        matches!(err, NonceError::InvalidTool { ref tool } if tool == "unregistered_tool"),
+        matches!(err, NonceError::InvalidTool),
         "expected InvalidTool, got: {err:?}"
     );
+}
+
+#[test]
+#[serial]
+fn rejected_input_nonce_tool() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    capture_refusal(|| {
+        let profile = make_profile("refusal-marker");
+        let mint = NonceMint::from_profile(&profile, "nonce-test").expect("mint configuration");
+        let error = mint
+            .mint(
+                &RejectAllCatalogue,
+                b"xdr",
+                now_before_expiry(),
+                far_future_expiry(),
+                "CREDMARKER7",
+                "stellar:testnet",
+            )
+            .expect_err("unknown tool");
+        assert_eq!(error.wire_code(), "tool.unknown");
+        assert_refusal_text(&error, "tool_name must name a registered tool");
+    });
 }

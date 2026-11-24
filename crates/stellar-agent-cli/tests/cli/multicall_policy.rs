@@ -36,14 +36,13 @@ use stellar_xdr::{
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-use crate::v1_ceremony::{CliRun, IsolatedHome, Keypair, policy_document, policy_rule};
+use crate::v1_ceremony::{
+    CliRun, IsolatedHome, Keypair, MULTICALL_SIGNER_ENV, policy_document, policy_rule,
+};
 
 const PROFILE: &str = "multicall-policy";
 const SIGNER_SEED: [u8; 32] = [0x11; 32];
 const OWNER_SEED: [u8; 32] = [0x22; 32];
-
-/// The variable the multicall child reads the signer secret from.
-const MULTICALL_SIGNER_ENV: &str = "MULTICALL_POLICY_SIGNER_SECRET";
 
 /// The bundle's inner invocations: three native-asset `symbol` calls.
 const INNER_COUNT: usize = 3;
@@ -329,6 +328,18 @@ fn register(home: &IsolatedHome) -> String {
 /// Submits [`INNER_COUNT`] `symbol` calls under rule 0, with `rpc` as the
 /// secondary endpoint and the enrolled signer's secret.
 fn multicall(home: &IsolatedHome, rpc: &str) -> CliRun {
+    multicall_with_secondary(home, &stellar_agent_test_support::second_loopback_host(rpc))
+}
+
+/// [`multicall`] with `secondary` as its secondary endpoint.
+fn multicall_with_secondary(home: &IsolatedHome, secondary: &str) -> CliRun {
+    let signer = signer();
+    multicall_with_env(home, secondary, &[(MULTICALL_SIGNER_ENV, signer.secret())])
+}
+
+/// [`multicall_with_secondary`] with `envs` as the process environment the
+/// signer variable is read from.
+fn multicall_with_env(home: &IsolatedHome, secondary: &str, envs: &[(&str, &str)]) -> CliRun {
     let invocation = format!("{}:symbol:[]", inner_target());
     let wallet = wallet();
     let mut args = vec![
@@ -341,15 +352,14 @@ fn multicall(home: &IsolatedHome, rpc: &str) -> CliRun {
         "--rule-id",
         "0",
         "--secondary-rpc-url",
-        rpc,
+        secondary,
         "--signer-secret-env",
         MULTICALL_SIGNER_ENV,
     ];
     for _ in 0..INNER_COUNT {
         args.extend(["--invocation", invocation.as_str()]);
     }
-    let signer = signer();
-    home.run(&args, &[(MULTICALL_SIGNER_ENV, signer.secret())])
+    home.run(&args, envs)
 }
 
 /// Asserts the run refused at the policy gate as `sa.multicall_failed`.
@@ -414,6 +424,133 @@ async fn multicall_allow_rule_submits_the_bundle_once() {
         run.envelope
     );
     assert_eq!(rpc.count("sendTransaction"), 1);
+}
+
+/// A secondary on the primary's host is no ledger witness: the bundle refuses
+/// with the witness code and asks neither endpoint anything. The signer
+/// variable is unset; the witness refusal precedes signer resolution.
+#[tokio::test]
+async fn multicall_with_a_secondary_on_the_primary_host_refuses_before_any_request() {
+    let rpc = MockRpc::start().await;
+    let home = IsolatedHome::new();
+    provision(&home, &rpc.uri(), &[multicall_rule("[]", "allow")]);
+    home.write_multicall_registry(&router());
+
+    let run = multicall_with_env(&home, &rpc.uri(), &[]);
+
+    assert_eq!(run.code, 1, "{} stderr={}", run.envelope, run.stderr);
+    assert_eq!(
+        run.error_code(),
+        "smart_account.ledger_witness_unavailable",
+        "{}",
+        run.envelope
+    );
+    assert_eq!(rpc.requests().await, 0, "no endpoint is contacted");
+}
+
+/// Every signing verb refuses with the witness code when no secondary is
+/// configured, with no fallback to the primary and no simulation. The signer
+/// variable is unset; the witness refusal precedes signer resolution.
+#[tokio::test]
+async fn signing_verbs_without_a_secondary_refuse_before_the_signer_loads() {
+    let rpc = MockRpc::start().await;
+    let home = IsolatedHome::new();
+    provision(&home, &rpc.uri(), &[multicall_rule("[]", "allow")]);
+    home.write_multicall_registry(&router());
+    let contract = router();
+    let operation = "ab".repeat(32);
+    let invocation = format!("{}:symbol:[]", inner_target());
+    let wallet = wallet();
+    let verbs: [Vec<&str>; 6] = [
+        vec![
+            "multicall",
+            "--smart-account",
+            &wallet,
+            "--rule-id",
+            "0",
+            "--invocation",
+            &invocation,
+        ],
+        vec![
+            "rules",
+            "set-name",
+            "--account",
+            &wallet,
+            "--rule-id",
+            "1",
+            "--name",
+            "renamed",
+        ],
+        vec![
+            "execute",
+            "--account",
+            &wallet,
+            "--contract",
+            &contract,
+            "--function",
+            "symbol",
+            "--auth-rule-id",
+            "0",
+            "--rule-signer-ed25519-secret-env",
+            MULTICALL_SIGNER_ENV,
+            "--verifier",
+            &contract,
+        ],
+        vec![
+            "timelock",
+            "schedule",
+            "--timelock",
+            &contract,
+            "--target",
+            &contract,
+            "--function",
+            "upgrade",
+            "--delay-ledgers",
+            "1",
+        ],
+        vec![
+            "timelock",
+            "cancel",
+            "--timelock",
+            &contract,
+            "--operation-id",
+            &operation,
+        ],
+        vec![
+            "timelock",
+            "execute",
+            "--timelock",
+            &contract,
+            "--target",
+            &contract,
+            "--function",
+            "upgrade",
+            "--operation-id",
+            &operation,
+            "--salt",
+            &operation,
+        ],
+    ];
+    for verb in verbs {
+        let mut args = vec!["smart-account"];
+        args.extend(verb);
+        args.extend([
+            "--profile",
+            PROFILE,
+            "--signer-secret-env",
+            MULTICALL_SIGNER_ENV,
+        ]);
+        let run = home.run(&args, &[]);
+        assert_eq!(run.code, 1, "{args:?}: {} {}", run.envelope, run.stderr);
+        assert_eq!(
+            run.error_code(),
+            "smart_account.ledger_witness_unavailable",
+            "{args:?}: {}",
+            run.envelope
+        );
+    }
+    assert_eq!(rpc.count("simulateTransaction"), 0);
+    assert_eq!(rpc.count("sendTransaction"), 0);
 }
 
 /// A matching deny rule refuses at the policy gate with its own audit code

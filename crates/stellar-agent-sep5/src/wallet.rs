@@ -77,8 +77,7 @@ impl Sep5Wallet {
     pub fn from_mnemonic(phrase: &str, passphrase: &str) -> Result<Self, DeriveError> {
         let mnemonic: Mnemonic = phrase.parse()?;
         // to_seed_normalized returns [u8; 64] without zeroizing; wrap immediately.
-        let raw_seed = mnemonic.to_seed_normalized(passphrase);
-        let seed = Zeroizing::new(raw_seed);
+        let seed = Zeroizing::new(mnemonic.to_seed_normalized(passphrase));
         Ok(Self { seed })
     }
 
@@ -156,7 +155,8 @@ impl Sep5Wallet {
         // Clone the seed into a local Zeroizing buffer so `master_key` can
         // take ownership (and zeroize the local copy on drop) without
         // consuming `self.seed`.
-        let seed_copy = Zeroizing::new(*self.seed);
+        let mut seed_copy = Zeroizing::new([0u8; 64]);
+        seed_copy.copy_from_slice(self.seed.as_ref());
 
         // Master key: m
         let master = slip10::master_key(seed_copy);

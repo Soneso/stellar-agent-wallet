@@ -22,10 +22,14 @@
  *   exception-mapping branch to compose error-message strings; that path
  *   never affects ceremony input selection, only the diagnostic surfaced
  *   to the operator via `textContent`.)
- * - For registration, the challenge is generated client-side via
- *   `crypto.getRandomValues`.  The bridge does NOT verify the challenge
- *   value at registration time — the approval-store nonce (path-bound,
- *   one-shot per `AlreadyAttested`) is the actual replay defence.
+ * - For registration, the challenge comes from the data island: the bridge
+ *   issued it with the pending registration and verifies the browser's
+ *   response against it, together with the origin, the RP-ID hash and the
+ *   credential the authenticator data names.  The page shows the
+ *   confirmation code of its own credential only after the bridge accepted
+ *   the response; the operator types that code at the terminal, which
+ *   registers the passkey only when the code matches the credential the
+ *   bridge recorded.
  * - For authentication, the challenge IS the wallet's `auth_digest` bytes
  *   (the SHA-256 over the signing context).  The bridge re-binds this
  *   server-side at submit time.
@@ -33,8 +37,8 @@
  *   `/approve/<nonce>/assertion` on the same origin.  `script-src 'self'`
  *   blocks anything else even if this glue is replaced at runtime.
  *
- * The challenge is server-rendered into the page; error rendering is generic
- * (the bridge collapses error details before they reach the browser).
+ * Both challenges are server-rendered into the page; error rendering is
+ * generic (the bridge collapses error details before they reach the browser).
  *
  * # Presentation
  *
@@ -64,6 +68,25 @@
 
   function setStatusError(msg) {
     setStatus("Error: " + msg, "error");
+  }
+
+  // Shows the registration's confirmation code in `#confirmation-code`.
+  function showConfirmationCode(code) {
+    var el = document.getElementById("confirmation-code");
+    if (el) {
+      el.textContent = code;
+      el.hidden = false;
+    }
+  }
+
+  // Hides and empties `#confirmation-code`, so a failed or refused
+  // registration never leaves a code on the page.
+  function clearConfirmationCode() {
+    var el = document.getElementById("confirmation-code");
+    if (el) {
+      el.textContent = "";
+      el.hidden = true;
+    }
   }
 
   // ───── Encoding helpers ─────────────────────────────────────────────
@@ -127,6 +150,57 @@
     return sec1;
   }
 
+  // The domain separator of a passkey registration's confirmation code; the
+  // terminal computes the code under the same domain.
+  var PASSKEY_REGISTRATION_CODE_DOMAIN =
+    "stellar-agent-passkey-registration-confirmation:v1";
+
+  // The confirmation code, under `domain`, of the credential this page's
+  // ceremony created: the first 16 hexadecimal digits of SHA-256 over the
+  // domain, the 32-byte challenge, the credential ID's length as a
+  // big-endian u32, the ID, and the 65-byte SEC1 key, in four groups of four.
+  function confirmationCode(domain, challenge, credentialId, sec1) {
+    var length = domain.length + challenge.length + 4 + credentialId.length + sec1.length;
+    var input = new Uint8Array(length);
+    var offset = 0;
+    for (var i = 0; i < domain.length; i++) {
+      input[offset++] = domain.charCodeAt(i);
+    }
+    input.set(challenge, offset);
+    offset += challenge.length;
+    var idLength = credentialId.length;
+    input[offset++] = (idLength >>> 24) & 0xff;
+    input[offset++] = (idLength >>> 16) & 0xff;
+    input[offset++] = (idLength >>> 8) & 0xff;
+    input[offset++] = idLength & 0xff;
+    input.set(credentialId, offset);
+    offset += credentialId.length;
+    input.set(sec1, offset);
+    return crypto.subtle.digest("SHA-256", input).then(function (digest) {
+      var bytes = new Uint8Array(digest);
+      var hex = "";
+      for (var j = 0; j < 8; j++) {
+        hex += (bytes[j] < 16 ? "0" : "") + bytes[j].toString(16);
+      }
+      return hex.slice(0, 4) + "-" + hex.slice(4, 8) + "-" + hex.slice(8, 12) + "-" + hex.slice(12, 16);
+    });
+  }
+
+  // The island's registration challenge as 32 bytes, or null when it is
+  // missing or not 32 bytes of base64url.
+  function islandChallenge(opts) {
+    if (typeof opts.challenge !== "string") {
+      return null;
+    }
+    var bytes;
+    try {
+      bytes = base64urlToBytes(opts.challenge);
+    } catch (e) {
+      return null;
+    }
+    return bytes.length === 32 ? bytes : null;
+  }
+
   // ───── Network helpers ─────────────────────────────────────────────
 
   // POST `payload` (a plain object) as JSON to `path` with the CSRF header.
@@ -170,13 +244,18 @@
   // ───── Registration flow ────────────────────────────────────────────
 
   function doRegister(opts) {
-    setStatus("Tap your authenticator to register a new passkey\u2026", "busy");
-
-    // 32 bytes of CSPRNG — bridge does not bind this; the approval nonce is
-    // the actual one-shot guard.
-    var challenge = new Uint8Array(32);
-    crypto.getRandomValues(challenge);
+    clearConfirmationCode();
+    // The bridge verifies the response against the challenge it issued;
+    // without that challenge no passkey is created.
+    var challenge = islandChallenge(opts);
+    if (challenge === null) {
+      throw new Error("the registration page has no valid challenge");
+    }
     var challengeB64 = bytesToBase64url(challenge);
+    var credentialId = null;
+    var sec1 = null;
+
+    setStatus("Tap your authenticator to register a new passkey\u2026", "busy");
 
     var optionsJSON = {
       challenge: challengeB64,
@@ -206,7 +285,8 @@
           );
         }
         var spkiBytes = base64urlToBytes(cred.response.publicKey);
-        var sec1 = spkiToSec1Uncompressed(spkiBytes);
+        sec1 = spkiToSec1Uncompressed(spkiBytes);
+        credentialId = base64urlToBytes(cred.rawId);
         var publicKeySec1B64 = bytesToBase64Standard(sec1);
 
         var body = {
@@ -229,7 +309,22 @@
         );
       })
       .then(function () {
-        setStatus("Passkey registered. You can close this window.", "ok");
+        // The bridge accepted the response; the code names the credential
+        // this ceremony created.
+        return confirmationCode(PASSKEY_REGISTRATION_CODE_DOMAIN, challenge, credentialId, sec1);
+      })
+      .then(function (code) {
+        showConfirmationCode(code);
+        setStatus(
+          "Passkey created. Type the code " +
+            code +
+            " at the terminal that started this registration. The passkey is registered only after the terminal accepts the code.",
+          "ok"
+        );
+      })
+      .catch(function (e) {
+        clearConfirmationCode();
+        throw e;
       });
   }
 

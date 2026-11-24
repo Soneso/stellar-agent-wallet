@@ -88,7 +88,14 @@ const WASM_PINS: &[WasmPin] = &[
     },
 ];
 
-fn main() {
+/// Text of the refusal for a `CARGO_MANIFEST_DIR` value that is not valid
+/// UTF-8. The value stays out of the text because the refusal is for it.
+const MANIFEST_DIR_REFUSAL: &str = "CARGO_MANIFEST_DIR must name the project directory using \
+                                    valid UTF-8; rebuild from the project directory.";
+
+/// Verifies the vendored artefacts against their pins, and exits non-zero
+/// with one line on stderr when a check refuses the build.
+pub fn main() {
     if let Err(err) = run() {
         let _ = writeln!(io::stderr(), "build.rs: {err}");
         process::exit(1);
@@ -96,8 +103,8 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR")
-        .map_err(|err| format!("failed to read CARGO_MANIFEST_DIR: {err}"))?;
+    let manifest_dir =
+        env::var("CARGO_MANIFEST_DIR").map_err(|_| MANIFEST_DIR_REFUSAL.to_owned())?;
     let manifest_dir = PathBuf::from(manifest_dir);
 
     for pin in WASM_PINS {

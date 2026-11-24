@@ -25,7 +25,6 @@ fn remove_sole_signer_error_shape_and_wire_code() {
         rule_id: 1,
         current_signer_count: 1,
         current_threshold: 1,
-        requested_op: ThresholdAffectingOp::RemoveSigner { signer_id: 0 },
         safe_ordering_hint: "no safe ordering: cannot remove the last signer of a 1-of-1 rule; \
              add a new signer first"
             .to_owned(),
@@ -76,15 +75,13 @@ fn threshold_unreachable_safe_ordering_hint_is_always_non_empty() {
 /// `ThresholdUnreachable` from `SetThreshold` with `new_threshold > signer_count`
 /// has the same wire code as `RemoveSigner` that bricks the threshold.
 ///
-/// Both triggering conditions produce the same variant and wire code, differing
-/// only in the `requested_op` field.
+/// Both triggering conditions produce the same variant and wire code.
 #[test]
 fn set_threshold_exceeding_signer_count_has_same_wire_code() {
     let remove_err = SaError::ThresholdUnreachable {
         rule_id: 1,
         current_signer_count: 1,
         current_threshold: 1,
-        requested_op: ThresholdAffectingOp::RemoveSigner { signer_id: 0 },
         safe_ordering_hint: "add a new signer first".to_owned(),
         smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AD2KM"),
         request_id: Uuid::new_v4().to_string(),
@@ -93,7 +90,6 @@ fn set_threshold_exceeding_signer_count_has_same_wire_code() {
         rule_id: 1,
         current_signer_count: 2,
         current_threshold: 2,
-        requested_op: ThresholdAffectingOp::SetThreshold { new: 5 },
         safe_ordering_hint: "new_threshold=5 > signer_count=2; add 3 signers first".to_owned(),
         smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AD2KM"),
         request_id: Uuid::new_v4().to_string(),

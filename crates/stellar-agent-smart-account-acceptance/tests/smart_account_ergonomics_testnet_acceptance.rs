@@ -26,7 +26,7 @@
 //!    audit row; `set_weighted_threshold` to 2 (still authorized by A alone,
 //!    against the pre-call threshold of 1); the same single-signer (A) auth
 //!    now fails (3213 `NotAllowed`, weight 1 < threshold 2); dual-signer auth
-//!    via `AuthorizationInfo`/`collect_quorum_signatures` succeeds (weight
+//!    via `AuthorizationInfo`/`plan_quorum_signatures` succeeds (weight
 //!    sum 1 + 2 = 3 >= threshold 2).
 //! 4. `deploy_c_external_ed25519_genesis_testnet_acceptance` — two decoupled
 //!    claims kept in one test: (a) deploys a smart account with an
@@ -119,6 +119,7 @@ use chromiumoxide::cdp::browser_protocol::web_authn::{
     AddVirtualAuthenticatorParams, AuthenticatorProtocol, AuthenticatorTransport, EnableParams,
     VirtualAuthenticatorOptions,
 };
+use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use common::{TESTNET_PASSPHRASE, TESTNET_RPC_URL, fund_via_friendbot};
 use ed25519_dalek::SigningKey;
 use futures::StreamExt as _;
@@ -260,7 +261,7 @@ fn fresh_rule_manager(
 ) -> ContextRuleManager {
     rule_manager_for_tests(
         TESTNET_RPC_URL,
-        None,
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
         Arc::clone(signers_manager),
         Arc::clone(audit_writer),
         Duration::from_secs(TIMEOUT_SECS),
@@ -274,7 +275,7 @@ fn fresh_signers_manager(
 ) -> Arc<SignersManager> {
     signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         audit_writer,
         audit_log_path,
         Duration::from_secs(TIMEOUT_SECS),
@@ -686,6 +687,7 @@ async fn deploy_policy_all_kinds_and_idempotent_testnet_acceptance() {
 /// `get_signer_weights` views).
 #[tokio::test]
 async fn weighted_threshold_ordering_proof_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
 
@@ -871,11 +873,12 @@ async fn weighted_threshold_ordering_proof_testnet_acceptance() {
 ///    by signer A alone (the retune itself validates against the threshold
 ///    as it stood BEFORE this call takes effect, i.e. 1).
 /// 4. The SAME single-signer (A) auth now fails (weight 1 < threshold 2).
-/// 5. Dual-signer auth via `AuthorizationInfo` / `collect_quorum_signatures`
+/// 5. Dual-signer auth via `AuthorizationInfo` / `plan_quorum_signatures`
 ///    succeeds — the weight sum is now 1 (A) + 2 (B, bumped in step 2) = 3,
 ///    which is >= threshold 2.
 #[tokio::test]
 async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
 
@@ -996,11 +999,15 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
     );
     let single_signer_result_1 = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(&smart_account_strkey)
             .auth_rule_ids(auth_rule_ids.as_slice())
             .host_function(read_threshold_fn.clone())
             .signer(signer_a.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(Duration::from_secs(TIMEOUT_SECS))
@@ -1132,11 +1139,15 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
     // ── the SAME single-signer auth now fails (weight 1 < threshold 2) ───────
     let single_signer_result_2 = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(&smart_account_strkey)
             .auth_rule_ids(auth_rule_ids.as_slice())
             .host_function(read_threshold_fn.clone())
             .signer(signer_a.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(Duration::from_secs(TIMEOUT_SECS))
@@ -1161,7 +1172,7 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
         other => panic!("expected DeploymentFailed{{phase:\"simulate\"}}; got {other:?}"),
     }
 
-    // ── dual-signer auth via AuthorizationInfo/collect_quorum_signatures succeeds ──
+    // ── dual-signer auth via AuthorizationInfo/plan_quorum_signatures succeeds ──
     let signer_a_pk = stellar_strkey::ed25519::PublicKey::from_string(&signer_a_g)
         .expect("signer A G-strkey must parse")
         .0;
@@ -1180,6 +1191,9 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
 
     let dual_signer_result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(&smart_account_strkey)
             .auth_rule_ids(auth_rule_ids.as_slice())
             .host_function(read_threshold_fn)
@@ -1187,6 +1201,7 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
             .maybe_authorization(Some(&authz))
             .signers(quorum_signers.as_slice())
             .primary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(Duration::from_secs(TIMEOUT_SECS))
@@ -1223,6 +1238,7 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
 /// account below, in the SAME test function to keep the two claims together.
 #[tokio::test]
 async fn deploy_c_external_ed25519_genesis_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
 
@@ -1409,6 +1425,7 @@ async fn deploy_c_external_ed25519_genesis_testnet_acceptance() {
 ///   `rule_id` and one of the returned `new_signer_ids`.
 #[tokio::test]
 async fn batch_add_delegated_signers_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (admin_g, admin_signer) = fresh_signer();
     fund_via_friendbot(&admin_g).await;
     let smart_account_strkey = deploy_fresh_smart_account(&admin_g, None).await;
@@ -1559,6 +1576,7 @@ async fn batch_add_delegated_signers_testnet_acceptance() {
 /// suffice, so the wallet cannot check a removal.
 #[tokio::test]
 async fn weighted_threshold_negatives_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
 
@@ -1877,6 +1895,37 @@ async fn goto_loopback(page: &chromiumoxide::Page, url: &str) -> Result<(), Goto
     Ok(())
 }
 
+/// Reads the confirmation code the registration page shows once the bridge
+/// accepted the browser's response, retrying for up to ten seconds.
+async fn read_confirmation_code(page: &chromiumoxide::Page) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let code: String = page
+            .evaluate(
+                EvaluateParams::builder()
+                    .expression(
+                        "(function(){var el = document.getElementById('confirmation-code'); \
+                         return el && !el.hidden ? el.textContent : '';})()",
+                    )
+                    .return_by_value(true)
+                    .build()
+                    .expect("EvaluateParams must build"),
+            )
+            .await
+            .expect("evaluate must not error")
+            .into_value()
+            .expect("evaluate result must deserialise as String");
+        if !code.is_empty() {
+            return code;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the registration page did not show a confirmation code within ten seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Drives a CDP virtual-authenticator registration ceremony for a single
 /// credential and returns `(credential_id_bytes, pubkey_65_bytes)`.
 async fn register_one_credential(
@@ -1904,14 +1953,18 @@ async fn register_one_credential(
             credential_name,
             &reg_handle.nonce,
             reg_deadline,
-            Some(&mut reg_audit),
+            &mut reg_audit,
         )
         .await
         .expect("poll_registration must not error");
-    let metadata = match reg_outcome {
-        AddPasskeyOutcome::Registered { metadata } => metadata,
-        other => panic!("registration: expected Registered; got {other:?}"),
+    let pending = match reg_outcome {
+        AddPasskeyOutcome::AwaitingConfirmation { pending } => pending,
+        other => panic!("registration: expected AwaitingConfirmation; got {other:?}"),
     };
+    let code = read_confirmation_code(page).await;
+    let metadata = creds_manager
+        .confirm_registration(pending, &code, Instant::now(), &mut reg_audit)
+        .expect("the code the page shows must confirm the registration");
 
     let credential_id_bytes = URL_SAFE_NO_PAD
         .decode(&metadata.credential_id_b64url)
@@ -1961,6 +2014,7 @@ async fn register_one_credential(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires testnet, chromium, and explicit --ignored flag"]
 async fn deploy_c_webauthn_genesis_and_batch_add_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = TempDir::new().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
     let passkeys_dir = tmp.path().join("passkeys");

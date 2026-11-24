@@ -24,7 +24,7 @@ use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::submit::{
     SubmissionResult, SubmissionSignerKind, submit_transaction_and_wait,
 };
-use stellar_agent_network::{SoftwareSigningKey, StellarRpcClient, fetch_account};
+use stellar_agent_network::{AssetType, SoftwareSigningKey, StellarRpcClient, fetch_account};
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::rules::{
     parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
@@ -58,25 +58,14 @@ const SUBMIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Ensures an account is funded via testnet Friendbot.
 ///
-/// Friendbot refuses to fund an account at or above the Friendbot starting
-/// balance, answering 400 with an "account already funded to starting balance"
-/// detail. For this helper's postcondition (the account exists and holds XLM),
-/// that state is success. Panics if the HTTP request fails or
-/// Friendbot answers with anything else.
+/// An account Friendbot reports as already funded meets this helper's
+/// postcondition: the account exists and holds XLM. Panics when Friendbot
+/// does not fund the account.
 pub async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    let status = resp.status();
-    if status.is_success() {
-        return;
-    }
-    let body = resp.text().await.unwrap_or_default();
-    assert!(
-        status == reqwest::StatusCode::BAD_REQUEST && body.contains("account already funded"),
-        "Friendbot must fund {g_strkey}; got {status}: {body}"
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Fetches an account's current sequence number via the testnet RPC.
@@ -126,7 +115,7 @@ pub async fn xlm_stroops_balance(g_strkey: &str) -> i64 {
     let native = account
         .balances
         .iter()
-        .find(|b| b.asset.asset_type == "native")
+        .find(|b| b.asset.asset_type == AssetType::Native)
         .expect("account must have a native balance entry");
     StellarAmount::parse_with_unit(&format!("{} XLM", native.balance))
         .expect("native balance decimal string must parse as a StellarAmount")

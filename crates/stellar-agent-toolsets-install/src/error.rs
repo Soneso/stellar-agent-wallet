@@ -54,7 +54,10 @@ use stellar_agent_toolsets::ToolsetFormatError;
 /// | `AlreadyInstalled` | Toolset is already installed and `--force` was not supplied. |
 /// | `VersionDowngrade` | `--force` reinstall would downgrade the version; requires `--allow-downgrade`. |
 /// | `NotInstalled` | Uninstall requested for a toolset that is not installed. |
-/// | `PinRecordMalformed` | Stored pin record is invalid (bad name, escaping path, or symlink target) during uninstall. |
+/// | `PinRecordMalformed` | Stored pin record does not parse, names another package, or carries a malformed digest; or the uninstall path escapes the root or is a symlink. |
+/// | `PinRecordUnverifiable` | Stored pin record carries no valid tag under the installation's pin key. |
+/// | `PinKeyBusy` | Another install holds the installation pin-key lock. |
+/// | `Busy` | Another process holds the toolsets directory lock. |
 /// | `ToolsetsRootInvalid` | The toolsets root directory itself is a symlink leaf (install-time check). |
 /// | `AttestationRequired` | Toolset declares a key-touching capability but no attestation was supplied and `override_attestation` is `false`. |
 /// | `AttestationInvalid` | Attestation signature fails `verify_strict`, or `auditor_pubkey` is not a valid ed25519 point. |
@@ -98,12 +101,12 @@ pub enum ToolsetInstallError {
 
     /// The signer public key is not present in the trust set.
     ///
-    /// The publisher key is redacted to first-5-last-5 in `Display` output.
-    #[error("untrusted publisher: signer {publisher_key_redacted} is not in the trust set")]
-    UntrustedPublisher {
-        /// Publisher G-strkey, redacted to first-5-last-5.
-        publisher_key_redacted: String,
-    },
+    /// The refused key stays out of the error.
+    #[error(
+        "untrusted publisher: the --publisher key must be in the trust set; add its G-strkey to \
+         the trust set"
+    )]
+    UntrustedPublisher,
 
     /// Trust-set file is absent or contains no entries.
     ///
@@ -119,7 +122,7 @@ pub enum ToolsetInstallError {
     /// parse contract).
     #[error("trust set malformed: {detail}")]
     TrustSetMalformed {
-        /// Sanitised description of the malformed entry.
+        /// The file kind, line number, and refusal, with no line content.
         detail: String,
     },
 
@@ -160,11 +163,8 @@ pub enum ToolsetInstallError {
     ///
     /// Triggered by `..` components, absolute paths, drive prefixes, or
     /// root-only paths.
-    #[error("archive path traversal: entry {entry_name} escapes the package root")]
-    ArchivePathTraversal {
-        /// Sanitised entry name (length-capped, control/ANSI stripped).
-        entry_name: String,
-    },
+    #[error("archive path traversal: every entry must stay within the package root")]
+    ArchivePathTraversal,
 
     /// Archive entry name contains NUL, control bytes, or non-UTF-8 bytes.
     ///
@@ -186,13 +186,8 @@ pub enum ToolsetInstallError {
     /// Rejected to prevent APFS/HFS+ case-folding attacks.  ASCII-lowercase
     /// collision detection is used; full Unicode NFC+case-fold is not yet
     /// implemented.
-    #[error(
-        "archive duplicate entry: {entry_name} collides with an already-seen entry (ASCII-lowercase)"
-    )]
-    ArchiveDuplicateEntry {
-        /// Sanitised entry name that triggered the collision.
-        entry_name: String,
-    },
+    #[error("archive duplicate entry: entry names must be unique under ASCII-lowercase comparison")]
+    ArchiveDuplicateEntry,
 
     /// Archive entry count exceeds the configured cap.
     #[error("archive too many entries: exceeds the {cap}-entry cap")]
@@ -227,11 +222,9 @@ pub enum ToolsetInstallError {
     ///
     /// A valid package must contain exactly one top-level directory whose name
     /// equals the package name.
-    #[error(
-        "archive bad top-level: expected exactly one directory named after the package; got {detail}"
-    )]
+    #[error("archive bad top-level: {detail}")]
     ArchiveBadTopLevel {
-        /// Sanitised description of the top-level shape found.
+        /// Fixed description of the shape the archive must have.
         detail: String,
     },
 
@@ -288,23 +281,52 @@ pub enum ToolsetInstallError {
     },
 
     /// Uninstall was requested for a toolset that is not installed.
-    #[error("not installed: '{package}' is not installed")]
-    NotInstalled {
-        /// Package name requested for uninstall (validated).
-        package: String,
-    },
+    #[error("not installed: the requested package must be installed before it can be uninstalled")]
+    NotInstalled,
 
     /// The stored pin record is invalid.
     ///
-    /// Triggered during uninstall when the pin record's `package` name fails
-    /// validation or the reconstructed path escapes the toolsets root or resolves
-    /// to a symlink.  NOT used for install-time toolsets-root checks; see
+    /// Triggered when the pin file is not a pin record (not JSON, or a field
+    /// this build does not know), when a verified record names a package other
+    /// than the one it is stored under, or when its `TOOLSET.md` digest is not
+    /// 64 lowercase hex characters; and during uninstall when the toolset
+    /// directory path escapes the toolsets root or is a symlink.  NOT used for
+    /// install-time toolsets-root checks; see
     /// [`ToolsetInstallError::ToolsetsRootInvalid`] for those.
     #[error("pin record malformed: {detail}")]
     PinRecordMalformed {
         /// Sanitised description of the malformed field.
         detail: String,
     },
+
+    /// The stored pin record does not verify under the installation's pin key.
+    ///
+    /// The record has no tag, is of another format version, lacks its
+    /// `TOOLSET.md` digest, was written under another key, was edited after
+    /// the install, or no pin key is available.  Its contents are not
+    /// trusted, so the toolset is refused until it is uninstalled and
+    /// installed again.
+    #[error(
+        "pin record unverifiable: the install record of '{package}' does not verify; \
+         uninstall the toolset and install it again"
+    )]
+    PinRecordUnverifiable {
+        /// Package name (validated `[a-z0-9-]`).
+        package: String,
+    },
+
+    /// Another process holds the toolsets directory lock.
+    ///
+    /// Install and uninstall take the lock for their whole run; the lock
+    /// stayed held through every retry.
+    #[error(
+        "toolsets directory busy: another install or uninstall holds its lock; retry when it finishes"
+    )]
+    Busy,
+
+    /// Another install holds the installation pin-key lock through every retry.
+    #[error("another toolset install holds the installation pin-key lock")]
+    PinKeyBusy,
 
     /// The toolsets root directory is invalid at install time.
     ///
@@ -358,15 +380,12 @@ pub enum ToolsetInstallError {
     /// DISTINCT from the publisher trust set (`trust.txt`) — placing a key in
     /// `trust.txt` does NOT implicitly grant auditor status.
     ///
-    /// The auditor key is redacted to first-5-last-5 in `Display`.
+    /// The refused key stays out of the error.
     #[error(
-        "auditor untrusted: auditor {auditor_key_redacted} is not in the auditor trust set \
-         (auditor-trust.txt); add the key to trust it"
+        "auditor untrusted: the attestation auditor key must be in auditor-trust.txt; add the \
+         key to trust it"
     )]
-    AuditorUntrusted {
-        /// Auditor G-strkey, redacted to first-5-last-5.
-        auditor_key_redacted: String,
-    },
+    AuditorUntrusted,
 
     /// An attestation field does not match the verified install values.
     ///

@@ -73,13 +73,42 @@ fn from_config_single_channel_boundary() {
 // from_config — size validation errors
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A refused size stays out of both pool refusals, and a length mismatch
+/// states the rule with no size.
+#[test]
+fn refused_sizes_stay_out_of_the_errors() {
+    let err = ChannelPool::from_config(&PoolConfig::new(424_242, vec![]), &[])
+        .expect_err("the size must be refused");
+    assert_eq!(
+        err.to_string(),
+        "pool.size_out_of_range: pool size (--size) must be an integer from 1 through 19 so all \
+         transaction signatures fit"
+    );
+    assert!(!format!("{err:?}").contains("424242"), "{err:?}");
+
+    let err = stellar_agent_pool::init::total_init_fee(u32::MAX, 1).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "pool.fee_overflow: classic_fee_per_op_stroops multiplied by the operation count must \
+         fit in u32; lower classic_fee_per_op_stroops."
+    );
+    assert!(!format!("{err:?}").contains("4294967295"), "{err:?}");
+
+    let err = ChannelPool::from_config(&make_config(2), &[1, 2, 3])
+        .expect_err("the lengths must be refused");
+    assert_eq!(
+        err.to_string(),
+        "pool.init_failed: config.channels and sequence_numbers must each hold pool_size entries"
+    );
+}
+
 /// `from_config` with pool_size == 0 returns `SizeOutOfRange`.
 #[test]
 fn from_config_size_zero_returns_size_out_of_range() {
     let config = PoolConfig::new(0, vec![]);
     match ChannelPool::from_config(&config, &[]) {
-        Err(PoolError::SizeOutOfRange { requested: 0 }) => {}
-        other => panic!("expected SizeOutOfRange(0), got: {other:?}"),
+        Err(PoolError::SizeOutOfRange) => {}
+        other => panic!("expected SizeOutOfRange, got: {other:?}"),
     }
 }
 
@@ -90,8 +119,8 @@ fn from_config_size_20_returns_size_out_of_range() {
     let config = PoolConfig::new(20, channels);
     let seqs: Vec<i64> = vec![100; 20];
     match ChannelPool::from_config(&config, &seqs) {
-        Err(PoolError::SizeOutOfRange { requested: 20 }) => {}
-        other => panic!("expected SizeOutOfRange(20), got: {other:?}"),
+        Err(PoolError::SizeOutOfRange) => {}
+        other => panic!("expected SizeOutOfRange, got: {other:?}"),
     }
 }
 

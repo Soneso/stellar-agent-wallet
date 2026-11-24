@@ -48,7 +48,7 @@ use stellar_xdr::{
 };
 use zeroize::Zeroizing;
 
-use crate::client::{ChallengeRequest, Sep45Client};
+use crate::client::{ChallengeRequest, Sep45Client, refuse_mainnet};
 use crate::entries::AuthorizationEntries;
 use crate::error::Sep45Error;
 use crate::session::Sep45Session;
@@ -85,6 +85,8 @@ use crate::session::Sep45Session;
 ///
 /// # Steps
 ///
+/// 0. Refuse a client on the mainnet passphrase, before any key is generated
+///    and before any request.
 /// 1. Generate fresh `SigningKey` via `OsRng` (CSPRNG; per-request unique).
 /// 2. Fetch + validate the challenge (steps 1-12 SEP-45 validation; server
 ///    signature verified against `expected_server_signing_key`; step 13 deferred
@@ -98,6 +100,8 @@ use crate::session::Sep45Session;
 ///
 /// # Errors
 ///
+/// - [`Sep45Error::MainnetSigningForbidden`] if `client` is on the mainnet
+///   passphrase.
 /// - Any [`Sep45Error`] from [`Sep45Client::fetch_challenge`] on challenge
 ///   fetch/validation failure.
 /// - [`Sep45Error::InvalidSignatureExpirationLedger`] if
@@ -151,6 +155,7 @@ pub async fn auth_with_ephemeral_key(
     client: &Sep45Client,
     request: ChallengeRequest<'_>,
 ) -> Result<Sep45Session, Sep45Error> {
+    refuse_mainnet(client.network_passphrase())?;
     let contract_id = request.contract_id;
     let web_auth_endpoint = request.web_auth_endpoint;
 
@@ -160,7 +165,11 @@ pub async fn auth_with_ephemeral_key(
     // implements `ZeroizeOnDrop` — key material zeroed automatically when
     // `ephemeral_key` drops at end of function scope.
     let mut seed = Zeroizing::new([0u8; 32]);
+    #[cfg(test)]
+    SEED_GENERATIONS.with(|count| count.set(count.get() + 1));
     OsRng.fill_bytes(seed.as_mut());
+    #[cfg(test)]
+    KEY_READS.with(|count| count.set(count.get() + 1));
     let ephemeral_key = SigningKey::from_bytes(&seed);
 
     // Step 2: Fetch and validate the challenge.
@@ -285,6 +294,8 @@ pub(crate) fn sign_client_entry(
 
     // Sign the hash with the ephemeral key.
     // `ed25519_dalek::Signer::sign(&hash)` produces a 64-byte signature.
+    #[cfg(test)]
+    SIGNATURES.with(|count| count.set(count.get() + 1));
     let signature = signing_key.sign(&payload_hash);
     let sig_bytes: [u8; 64] = signature.to_bytes();
 
@@ -292,6 +303,8 @@ pub(crate) fn sign_client_entry(
     // `ScVal::Vec([ScVal::Map({public_key: ScBytes(32), signature: ScBytes(64)})])`
     // Per the SEP-45 signing convention (same shape used by the server;
     // client must match).
+    #[cfg(test)]
+    KEY_READS.with(|count| count.set(count.get() + 1));
     let pubkey_bytes = signing_key.verifying_key().to_bytes();
 
     let pk_bytesm: BytesM =
@@ -385,6 +398,8 @@ fn re_encode_entries(entries: &[SorobanAuthorizationEntry]) -> Result<String, Se
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn generate_ephemeral_seed() -> Zeroizing<[u8; 32]> {
     let mut seed = Zeroizing::new([0u8; 32]);
+    #[cfg(test)]
+    SEED_GENERATIONS.with(|count| count.set(count.get() + 1));
     OsRng.fill_bytes(seed.as_mut());
     seed
 }
@@ -428,6 +443,8 @@ pub fn signing_key_from_seed(seed: &Zeroizing<[u8; 32]>) -> SigningKey {
 ///
 /// # Errors
 ///
+/// - [`Sep45Error::MainnetSigningForbidden`] if `client` is on the mainnet
+///   passphrase; no signer key is used.
 /// - [`Sep45Error::InvalidSignatureExpirationLedger`] if
 ///   `signature_expiration_ledger` is 0.
 /// - [`Sep45Error::XdrDecodeError`] if XDR encode of the auth preimage or the
@@ -472,6 +489,7 @@ pub fn sign_authorization_entries(
     client: &Sep45Client,
     signature_expiration_ledger: u32,
 ) -> Result<String, Sep45Error> {
+    refuse_mainnet(client.network_passphrase())?;
     if signature_expiration_ledger == 0 {
         return Err(Sep45Error::InvalidSignatureExpirationLedger {
             detail: "signature_expiration_ledger must be non-zero; caller must supply current_ledger + margin".to_owned(),
@@ -530,7 +548,11 @@ pub fn sign_authorization_entries(
     // Order is preserved — entry[i] corresponds to signers[i].
     let mut inner_vals: Vec<ScVal> = Vec::with_capacity(signers.len());
     for signer in signers {
+        #[cfg(test)]
+        KEY_READS.with(|count| count.set(count.get() + 1));
         let pubkey_bytes = signer.verifying_key().to_bytes();
+        #[cfg(test)]
+        SIGNATURES.with(|count| count.set(count.get() + 1));
         let sig_bytes: [u8; 64] = signer.sign(&payload_hash).to_bytes();
 
         let pk_bytesm: BytesM =
@@ -596,7 +618,9 @@ pub fn sign_authorization_entries(
 ///
 /// # Errors
 ///
-/// Returns the same [`Sep45Error`] variants as `sign_client_entry`.
+/// - [`Sep45Error::MainnetSigningForbidden`] if `client` is on the mainnet
+///   passphrase; `signing_key` is not used.
+/// - The other [`Sep45Error`] variants of `sign_client_entry`.
 ///
 /// # Panics
 ///
@@ -608,7 +632,18 @@ pub fn sign_challenge_for_test(
     client: &Sep45Client,
     signature_expiration_ledger: u32,
 ) -> Result<String, Sep45Error> {
+    refuse_mainnet(client.network_passphrase())?;
     sign_client_entry(challenge, signing_key, client, signature_expiration_ledger)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Counts ephemeral seed generation on the current test thread.
+    static SEED_GENERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Counts ephemeral key derivation and public-key reads on the current test thread.
+    static KEY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Counts ephemeral signatures on the current test thread.
+    static SIGNATURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1418,5 +1453,195 @@ mod tests {
             key_b.verifying_key().to_bytes(),
             "two OsRng-generated signing keys must differ"
         );
+    }
+
+    // ── mainnet refusals ──────────────────────────────────────────────────────
+
+    const MAINNET: &str = "Public Global Stellar Network ; September 2015";
+    const TESTNET: &str = "Test SDF Network ; September 2015";
+
+    /// A minimal challenge whose only entry is the client's, with address
+    /// credentials: enough for the signing functions, which sign that entry.
+    fn client_only_challenge() -> crate::entries::AuthorizationEntries {
+        use stellar_xdr::{
+            ContractId, Hash, InvokeContractArgs, ScAddress, ScSymbol, ScVal,
+            SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
+            SorobanAuthorizedInvocation, SorobanCredentials, VecM,
+        };
+
+        let contract = stellar_strkey::Contract::from_string(
+            "CALI6JC3MSNDGFRP7Z2OKUEPREHOJRRXKMJEWQDEFZPFGXALA45RAUTH",
+        )
+        .unwrap();
+        let client = stellar_strkey::Contract::from_string(
+            "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ",
+        )
+        .unwrap();
+        let server = stellar_strkey::ed25519::PublicKey(
+            SigningKey::from_bytes(&[1u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let entry = SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                address: ScAddress::Contract(ContractId(Hash(client.0))),
+                nonce: 11,
+                signature_expiration_ledger: 0,
+                signature: ScVal::Void,
+            }),
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash(contract.0))),
+                    function_name: ScSymbol("web_auth_verify".try_into().unwrap()),
+                    args: VecM::default(),
+                }),
+                sub_invocations: VecM::default(),
+            },
+        };
+        crate::entries::AuthorizationEntries {
+            entries: vec![entry],
+            server_account: server,
+            client_account: client,
+            web_auth_domain: "auth.example.com".to_owned(),
+            web_auth_domain_account: server,
+            nonce: "NONCE".to_owned(),
+            expected_home_domain: "example.com".to_owned(),
+            web_auth_contract: contract,
+            client_domain: None,
+            client_domain_account: None,
+            server_entry_index: 0,
+            client_entry_index: 0,
+            client_domain_entry_index: None,
+        }
+    }
+
+    fn reset_access_counts() {
+        super::SEED_GENERATIONS.set(0);
+        super::KEY_READS.set(0);
+        super::SIGNATURES.set(0);
+    }
+
+    fn access_counts() -> (usize, usize, usize) {
+        (
+            super::SEED_GENERATIONS.get(),
+            super::KEY_READS.get(),
+            super::SIGNATURES.get(),
+        )
+    }
+
+    fn is_mainnet_refusal(result: &Result<String, crate::Sep45Error>) -> bool {
+        matches!(
+            result,
+            Err(crate::Sep45Error::MainnetSigningForbidden { detail })
+                if detail.contains("network.mainnet_write_forbidden")
+        )
+    }
+
+    #[test]
+    fn sign_authorization_entries_refuses_a_mainnet_client() {
+        reset_access_counts();
+        let client = crate::client::Sep45Client::new_for_unit_test(MAINNET).unwrap();
+        let result = sign_authorization_entries(
+            &client_only_challenge(),
+            &[SigningKey::from_bytes(&[0xDE; 32])],
+            &client,
+            7_777_777,
+        );
+        assert!(is_mainnet_refusal(&result), "got: {result:?}");
+        assert_eq!(access_counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn sign_authorization_entries_signs_on_testnet() {
+        reset_access_counts();
+        let client = crate::client::Sep45Client::new_for_unit_test(TESTNET).unwrap();
+        sign_authorization_entries(
+            &client_only_challenge(),
+            &[SigningKey::from_bytes(&[0xDE; 32])],
+            &client,
+            7_777_777,
+        )
+        .expect("testnet signs");
+        assert_eq!(access_counts(), (0, 1, 1));
+    }
+
+    #[test]
+    fn sign_challenge_for_test_refuses_a_mainnet_client() {
+        reset_access_counts();
+        let client = crate::client::Sep45Client::new_for_unit_test(MAINNET).unwrap();
+        let result = super::sign_challenge_for_test(
+            &client_only_challenge(),
+            &SigningKey::from_bytes(&[0xDE; 32]),
+            &client,
+            7_777_777,
+        );
+        assert!(is_mainnet_refusal(&result), "got: {result:?}");
+        assert_eq!(access_counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn sign_challenge_for_test_signs_on_testnet() {
+        reset_access_counts();
+        let client = crate::client::Sep45Client::new_for_unit_test(TESTNET).unwrap();
+        super::sign_challenge_for_test(
+            &client_only_challenge(),
+            &SigningKey::from_bytes(&[0xDE; 32]),
+            &client,
+            7_777_777,
+        )
+        .expect("testnet signs");
+        assert_eq!(access_counts(), (0, 1, 1));
+    }
+
+    /// The challenge request against a mock endpoint, for `contract_id`.
+    fn request(endpoint: &str) -> crate::client::ChallengeRequest<'_> {
+        crate::client::ChallengeRequest {
+            web_auth_endpoint: endpoint,
+            contract_id: "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ",
+            home_domain: "example.com",
+            expected_web_auth_contract: "CALI6JC3MSNDGFRP7Z2OKUEPREHOJRRXKMJEWQDEFZPFGXALA45RAUTH",
+            expected_server_signing_key: "GCHLHDBOKG2JWMJQBTLSL5XG6NO7ESXI2TAQKZXCXWXB5WI2X6W233PR",
+            client_domain: None,
+            web_auth_domain: Some("auth.example.com"),
+            signature_expiration_ledger: 7_777_777,
+        }
+    }
+
+    /// A mainnet client is refused before the ephemeral key exists and
+    /// before any request.
+    #[tokio::test]
+    async fn auth_with_ephemeral_key_refuses_a_mainnet_client_before_any_request() {
+        reset_access_counts();
+        let server = wiremock::MockServer::start().await;
+        let endpoint = format!("{}/auth", server.uri());
+        let client = crate::client::Sep45Client::new_for_unit_test(MAINNET).unwrap();
+
+        let result = super::auth_with_ephemeral_key(&client, request(&endpoint)).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::Sep45Error::MainnetSigningForbidden { .. })
+            ),
+            "got: {result:?}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(access_counts(), (0, 0, 0));
+    }
+
+    /// The same request on testnet reaches the endpoint, so the refusal above
+    /// is the network's.
+    #[tokio::test]
+    async fn auth_with_ephemeral_key_requests_the_challenge_on_testnet() {
+        reset_access_counts();
+        let server = wiremock::MockServer::start().await;
+        let endpoint = format!("{}/auth", server.uri());
+        let client = crate::client::Sep45Client::new_for_unit_test(TESTNET).unwrap();
+
+        let result = super::auth_with_ephemeral_key(&client, request(&endpoint)).await;
+
+        assert!(result.is_err(), "the mock serves no challenge");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(access_counts(), (1, 1, 0));
     }
 }

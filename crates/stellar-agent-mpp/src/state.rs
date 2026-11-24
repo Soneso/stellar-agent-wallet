@@ -189,6 +189,33 @@ impl AuthorizationRecord {
         &self.fingerprint
     }
 
+    /// Computes the replay identity from payer, request context, and exact challenge.
+    /// The identity is independent of the preparation time; the challenge's
+    /// own expiry is part of the exact challenge.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted challenge error if context serialization fails.
+    pub(crate) fn challenge_identity(&self) -> Result<[u8; 32], MppError> {
+        let selected = self.prepared.selected();
+        let context_digest = selected.context().digest()?;
+        let mut hash = Sha256::new();
+        hash.update(b"stellar-agent-mpp-challenge:v1\0");
+        for value in [
+            self.prepared.payer().as_bytes(),
+            &context_digest,
+            selected.challenge_digest(),
+        ] {
+            hash.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hash.update(value);
+        }
+        Ok(hash.finalize().into())
+    }
+
+    pub(crate) const fn created_at(&self) -> i64 {
+        self.created_at
+    }
+
     /// Returns the current lifecycle state.
     #[must_use]
     pub const fn status(&self) -> AuthorizationStatus {
@@ -410,6 +437,11 @@ impl fmt::Debug for AuthorizationRecord {
 /// Computes the versioned authorization fingerprint that binds profile,
 /// network, payer, transport context, exact challenge, terms, and expiry.
 ///
+/// The bytes are those of
+/// [`stellar_agent_core::approval::mpp::authorization_fingerprint`], which
+/// pending approvals are checked against. Challenge identity supplies the replay
+/// key independently of the fingerprint and authorization identifier.
+///
 /// # Errors
 ///
 /// Returns a redacted challenge error if context serialization fails.
@@ -419,26 +451,24 @@ pub fn authorization_fingerprint(
     payer: &str,
     selected: &SelectedChallenge,
 ) -> Result<[u8; 32], MppError> {
-    let mut hash = Sha256::new();
-    hash.update(b"stellar-agent-mpp-authorization:v1\0");
-    update(&mut hash, profile_name.as_bytes());
-    update(&mut hash, &Sha256::digest(network_passphrase.as_bytes()));
-    update(&mut hash, payer.as_bytes());
-    update(&mut hash, &selected.context().digest()?);
-    update(&mut hash, selected.challenge_digest());
-    update(&mut hash, b"stellar");
-    update(&mut hash, b"charge");
-    update(&mut hash, b"sponsored_pull");
-    update(&mut hash, selected.request().amount_decimal().as_bytes());
-    update(&mut hash, selected.request().currency().as_bytes());
-    update(&mut hash, selected.request().recipient().as_bytes());
-    update(&mut hash, &selected.effective_expires_at().to_be_bytes());
-    Ok(hash.finalize().into())
-}
-
-fn update(hash: &mut Sha256, value: &[u8]) {
-    hash.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
-    hash.update(value);
+    use stellar_agent_core::approval::mpp::{MppAuthorizationContext, MppChargeTerms};
+    Ok(
+        stellar_agent_core::approval::mpp::authorization_fingerprint(
+            &MppChargeTerms {
+                profile: profile_name,
+                payer,
+                amount: selected.request().amount_decimal(),
+                currency: selected.request().currency(),
+                recipient: selected.request().recipient(),
+                effective_expires_at_unix: selected.effective_expires_at(),
+            },
+            &MppAuthorizationContext {
+                context_digest: selected.context().digest()?,
+                network_passphrase_hash: Sha256::digest(network_passphrase.as_bytes()).into(),
+                challenge_digest: *selected.challenge_digest(),
+            },
+        ),
+    )
 }
 
 const fn state_error() -> MppError {
@@ -460,7 +490,8 @@ mod tests {
     use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 
     use super::*;
-    use crate::sponsored::tests::prepared_fixture;
+    use crate::limits::MAX_CHALLENGE_LIFETIME_SECS;
+    use crate::sponsored::tests::{prepared_fixture, prepared_fixture_expiring};
 
     fn status(index: u8) -> AuthorizationStatus {
         match index % 13 {
@@ -534,7 +565,7 @@ mod tests {
 
         assert!(record.authorization_id().starts_with("mpp_"));
         assert_eq!(record.status(), AuthorizationStatus::Prepared);
-        assert_eq!(record.expires_at(), now + 300);
+        assert_eq!(record.expires_at(), now + MAX_CHALLENGE_LIFETIME_SECS);
         assert_eq!(record.updated_at(), now);
         assert_eq!(record.approval_nonce(), None);
         assert!(!record.credential_constructed());
@@ -700,6 +731,25 @@ mod tests {
         );
     }
 
+    /// The fingerprint keys stored authorization records, so its bytes are
+    /// pinned: the same vector as the core known-answer test.
+    #[tokio::test]
+    async fn authorization_fingerprint_known_answer() {
+        let (prepared, _signer, _rpc) =
+            prepared_fixture_expiring(1_700_000_000, 1_700_000_300).await;
+        let fingerprint = authorization_fingerprint(
+            "default",
+            TESTNET_PASSPHRASE,
+            prepared.payer(),
+            prepared.selected(),
+        )
+        .expect("fingerprint");
+        assert_eq!(
+            hex::encode(fingerprint),
+            "d189c555768dbc6c25ef5feed2212b7a7bf34b93fbc58aa7b5a64a7765d57818"
+        );
+    }
+
     #[tokio::test]
     async fn fingerprints_bind_every_authority_dimension() {
         use serde_json::{Value, json};
@@ -730,7 +780,7 @@ mod tests {
 
         // The remaining preimage dimensions flow through the selected
         // challenge: transport context, exact challenge echo, amount,
-        // currency, recipient, and effective expiry. Each perturbation must
+        // currency, recipient, and challenge expiry. Each perturbation must
         // change the fingerprint.
         const OTHER_CONTRACT: &str = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
         const OTHER_ACCOUNT: &str = "GAJZR5RMNUNEK7CRXJVEWXZ5XUXWT7FJGILCDDOITF7EC26RPWJ4UVOE";
@@ -751,6 +801,7 @@ mod tests {
                     "realm": "server",
                     "method": "stellar",
                     "intent": "charge",
+                    "expires": crate::sponsored::tests::rfc3339(now + 60),
                     "request": request
                 });
                 challenge_mutate(&mut challenge);
@@ -821,7 +872,7 @@ mod tests {
                 ),
             ),
             (
-                "effective expiry",
+                "challenge expiry",
                 selected_with(
                     request_with(&|_| {}),
                     &|challenge| {

@@ -11,9 +11,13 @@
 //!   in trusted automation flows.
 //! - `stellar-agent approve gc`: evict expired pending approvals.
 //! - `stellar-agent approve gc --profile <name>`: per-profile gc.
+//! - `stellar-agent approve gc --include-consumed`: also evict consumed
+//!   approvals before their TTL elapses.
 //! - `stellar-agent approve list`: enumerate pending approvals (read-only).
 //! - `stellar-agent approve serve`: local web UI for the pending-approval
 //!   queue (loopback HTTP; approve/reject in a browser).
+//! - `stellar-agent approve credential enroll --profile <name>`: enroll a
+//!   WebAuthn approval credential for the owner-signed mainnet policy.
 //!
 //! # Dispatch
 //!
@@ -34,6 +38,7 @@
 //! stellar-agent approve --id ABCnonce --profile <name> --yes
 //! stellar-agent approve gc
 //! stellar-agent approve gc --profile <name>
+//! stellar-agent approve gc --profile <name> --include-consumed
 //! stellar-agent approve list
 //! stellar-agent approve list --profile <name> --output table
 //! stellar-agent approve serve
@@ -43,11 +48,16 @@
 //! This is the CLI user-tty half of the wallet-owned approval spine.
 
 mod common;
+pub(crate) use common::{approval_store_dir, approval_store_open_error};
+mod consent_record;
+pub mod credential;
 pub mod gc;
 pub mod list;
 pub mod operator;
+pub mod revoke;
 pub mod run;
 pub mod serve;
+pub mod status;
 
 use clap::{Args, Subcommand};
 
@@ -82,9 +92,12 @@ pub struct ApproveArgs {
 #[derive(Debug, Subcommand)]
 #[non_exhaustive]
 pub enum ApproveSubcommand {
+    /// Revoke an existing durable approval selected by its inbox nonce.
+    Revoke(revoke::RevokeArgs),
     /// Garbage-collect expired pending approvals.
     ///
-    /// Removes entries whose TTL has elapsed from the pending-approvals store.
+    /// Removes entries whose TTL has elapsed from the pending-approvals store,
+    /// and with `--include-consumed` also every consumed entry.
     /// On success prints a JSON envelope with the count of evicted entries.
     Gc(gc::GcArgs),
 
@@ -94,16 +107,24 @@ pub enum ApproveSubcommand {
     /// Performs no keyring access and no network calls.
     List(list::ListArgs),
 
+    /// Inspect one approval by its public nonce without consuming it.
+    Status(status::StatusArgs),
+
     /// Serve a local web UI for the pending-approval queue.
     ///
     /// Binds a loopback HTTP server so the operator can review and
     /// approve/reject pending approvals in a browser. Runs until Ctrl-C.
     /// Pass `--remote` to bind the TLS-protected, passkey-authenticated
-    /// remote-approval surface instead.
+    /// remote-approval surface instead. On mainnet `--remote` requires a
+    /// signed approval origin.
     Serve(serve::ServeArgs),
 
     /// Manage operator-approval credentials for the remote-approval surface.
     Operator(operator::OperatorArgs),
+
+    /// Manage the WebAuthn approval credentials of the owner-signed mainnet
+    /// policy.
+    Credential(credential::CredentialArgs),
 }
 
 /// Runs the `approve` subcommand group.
@@ -123,10 +144,15 @@ pub enum ApproveSubcommand {
 /// Never panics.
 pub async fn dispatch(args: ApproveArgs) -> i32 {
     match args.subcommand {
+        Some(ApproveSubcommand::Revoke(args)) => revoke::run(args).await,
         Some(ApproveSubcommand::Gc(gc_args)) => gc::run(gc_args).await,
         Some(ApproveSubcommand::List(list_args)) => list::run(list_args).await,
+        Some(ApproveSubcommand::Status(args)) => status::run(args).await,
         Some(ApproveSubcommand::Serve(serve_args)) => serve::run(serve_args).await,
         Some(ApproveSubcommand::Operator(operator_args)) => operator::dispatch(operator_args).await,
+        Some(ApproveSubcommand::Credential(credential_args)) => {
+            credential::dispatch(credential_args).await
+        }
         None => run::run(args.run).await,
     }
 }
@@ -142,10 +168,13 @@ impl ApproveArgs {
     /// the audit log of the profile the command uses.
     pub(crate) fn profile_flag(&self) -> Option<&str> {
         match &self.subcommand {
+            Some(ApproveSubcommand::Revoke(a)) => a.profile.as_deref(),
             Some(ApproveSubcommand::Gc(a)) => a.profile.as_deref(),
             Some(ApproveSubcommand::List(a)) => a.profile.as_deref(),
+            Some(ApproveSubcommand::Status(a)) => a.profile.as_deref(),
             Some(ApproveSubcommand::Serve(a)) => a.profile.as_deref(),
             Some(ApproveSubcommand::Operator(a)) => a.profile_flag(),
+            Some(ApproveSubcommand::Credential(a)) => a.profile_flag(),
             None => self.run.profile.as_deref(),
         }
     }

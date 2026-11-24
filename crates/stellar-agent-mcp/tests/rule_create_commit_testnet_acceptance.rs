@@ -27,13 +27,16 @@
 //!    `proposal_sha256_hex`.
 //! 5. Recompute the operator attestation exactly as `stellar-agent approve`
 //!    does for a `RuleProposalSimulated` entry
-//!    (`compute_attestation(key, binding, nonce, proposal_sha256, process_uid)`,
+//!    (`compute_attestation_v4(key, binding, nonce, proposal_sha256, process_uid, &stellar_agent_core::approval::AttestedApprover::Local)`,
 //!    verified by `PendingApprovalStore::verify_rule_proposal_gate` — the
 //!    dedicated rule-proposal gate, not the shared pay/claim attestation
 //!    gate).
 //! 6. Commit via `stellar_rule_create_commit`; assert the response reports a
 //!    non-bootstrap `rule_id` and a 64-hex-char confirmed `tx_hash`.
-//! 7. On-chain assert: `ContextRuleManager::get_rule` returns `Some(_)` for
+//! 7. Assert the approval is spent: the stored entry is a tombstone holding
+//!    the proposal digest, and a retry of the same commit returns
+//!    `policy.approval_consumed`.
+//! 8. On-chain assert: `ContextRuleManager::get_rule` returns `Some(_)` for
 //!    the newly installed rule.
 //!
 //! `stellar_rule_create` / `stellar_rule_create_commit` are called through
@@ -65,7 +68,7 @@ use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore as _};
 use serial_test::serial;
-use stellar_agent_core::approval::{compute_attestation, process_uid_for_attestation};
+use stellar_agent_core::approval::{compute_attestation_v4, process_uid_for_attestation};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::{
     RuleCreateSignerArg, StellarRuleCreateArgs, StellarRuleCreateCommitArgs, WalletServer,
@@ -112,14 +115,9 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 2xx for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Polls RPC until the freshly-funded account is queryable, tolerating
@@ -156,6 +154,20 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .expect("signer keyring entry")
         .set_password(&s_strkey)
         .expect("set signing key");
+    // The identity record an enrollment stores beside the seed.
+    stellar_agent_network::keyring::write_keyring_string(
+        &stellar_agent_core::profile::schema::signer_identity_entry_ref(signer_ref),
+        &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .to_bytes(),
+            stellar_agent_core::profile::name::profile_name_for_approval(profile),
+            profile.chain_id,
+        )
+        .render()
+        .expect("an agent record renders"),
+    )
+    .expect("set identity record");
 
     // Nonce key.
     let nonce_ref = &profile.mcp_nonce_key_alias;
@@ -233,6 +245,10 @@ async fn deploy_smart_account_with_signer(initial_signer_g: &str) -> String {
 #[tokio::test]
 #[serial]
 async fn t1_rule_create_commit_happy_path() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     // ── 1. Fresh agent keypair, funded and queryable ──────────────────────────
@@ -252,6 +268,8 @@ async fn t1_rule_create_commit_happy_path() {
             .with_noop_engine()
             .build();
     profile.rpc_url = TESTNET_RPC_URL.to_owned();
+    profile.secondary_rpc_url =
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url().to_owned());
     seed_keyring(&profile, &agent_seed, &attestation_key);
 
     let server = WalletServer::new(profile).expect("WalletServer::new");
@@ -303,7 +321,37 @@ async fn t1_rule_create_commit_happy_path() {
         .try_into()
         .expect("proposal_sha256_hex must decode to exactly 32 bytes");
     let uid = process_uid_for_attestation().expect("process uid");
-    let blob = compute_attestation(
+    let stored = stellar_agent_core::approval::PendingApprovalStore::open(
+        stellar_agent_core::profile::schema::default_approval_dir()
+            .expect("approval dir")
+            .join(format!("{}.toml", server.profile_name_for_approval())),
+    )
+    .expect("open approval store")
+    .get(&approval_nonce)
+    .expect("the approval request is persisted")
+    .clone();
+    let stellar_agent_core::approval::ApprovalKind::RuleProposalSimulated {
+        smart_account,
+        network_passphrase,
+        chain_id,
+        definition,
+        summary_line,
+        ..
+    } = &stored.kind
+    else {
+        panic!("expected rule proposal")
+    };
+    assert_eq!(
+        proposal_sha256,
+        stellar_agent_core::approval::rule_proposal_digest(
+            smart_account,
+            network_passphrase,
+            chain_id,
+            definition,
+            summary_line,
+        )
+    );
+    let blob = compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new(
             &server.profile_name_for_approval(),
@@ -312,16 +360,34 @@ async fn t1_rule_create_commit_happy_path() {
         &approval_nonce,
         &proposal_sha256,
         &uid,
+        &stored.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
+    // `approve` records the blob with its approver; the commit gate verifies
+    // the presented blob against that record. The store drops at the end of
+    // the statement, so the commit gate can open it.
+    stellar_agent_core::approval::PendingApprovalStore::open(
+        stellar_agent_core::profile::schema::default_approval_dir()
+            .expect("approval dir")
+            .join(format!("{}.toml", server.profile_name_for_approval())),
+    )
+    .expect("open approval store")
+    .record_rule_proposal_attestation(
+        &approval_nonce,
+        blob,
+        stellar_agent_core::approval::AttestedApprover::Local,
+    )
+    .expect("record the local approval");
+    let commit_args = || StellarRuleCreateCommitArgs {
+        chain_id: TESTNET_CHAIN_ID.to_owned(),
+        approval_nonce: approval_nonce.clone(),
+        approval_attestation: Some(blob_b64.clone()),
+    };
 
     // ── 6. Commit: gate verifies the attestation, install_rule signs+submits ──
     let commit = server
-        .call_stellar_rule_create_commit(StellarRuleCreateCommitArgs {
-            chain_id: TESTNET_CHAIN_ID.to_owned(),
-            approval_nonce: approval_nonce.clone(),
-            approval_attestation: Some(blob_b64),
-        })
+        .call_stellar_rule_create_commit(commit_args())
         .await
         .expect("commit must pass the gate and install on-chain");
     let commit_json = result_json(&commit);
@@ -342,7 +408,49 @@ async fn t1_rule_create_commit_happy_path() {
         .expect("commit must report an on-chain tx_hash");
     assert_eq!(tx_hash.len(), 64, "tx_hash must be a 32-byte hex digest");
 
-    // ── 7. On-chain assert: the installed rule is fetchable ───────────────────
+    // ── 7. The confirmed install leaves the approval spent ────────────────────
+    let spent = stellar_agent_core::approval::PendingApprovalStore::open(
+        stellar_agent_core::profile::schema::default_approval_dir()
+            .expect("approval dir")
+            .join(format!("{}.toml", server.profile_name_for_approval())),
+    )
+    .expect("open approval store")
+    .get(&approval_nonce)
+    .expect("the spent approval stays as a tombstone")
+    .kind
+    .clone();
+    match spent {
+        stellar_agent_core::approval::ApprovalKind::Consumed {
+            original_kind_name,
+            tx_hash: spent_on,
+            outcome,
+        } => {
+            assert_eq!(original_kind_name, "RuleProposalSimulated");
+            assert_eq!(spent_on, proposal_sha256_hex);
+            assert_eq!(
+                outcome,
+                stellar_agent_core::approval::ConsumedOutcome::Unknown
+            );
+        }
+        other => panic!(
+            "the confirmed install must leave the approval spent, got {}",
+            other.kind_name()
+        ),
+    }
+    let retry = server
+        .call_stellar_rule_create_commit(commit_args())
+        .await
+        .expect("the spent approval returns a business envelope");
+    let retry_json = result_json(&retry);
+    assert_eq!(retry.is_error, Some(true), "{retry_json}");
+    assert_eq!(retry_json["error"]["code"], "policy.approval_consumed");
+    assert_eq!(
+        retry_json["error"]["message"],
+        "this rule-proposal approval is already spent; list the account's rules before \
+         proposing the rule again"
+    );
+
+    // ── 8. On-chain assert: the installed rule is fetchable ───────────────────
     let manager = ContextRuleManager::new(ContextRuleManagerConfig::new(
         TESTNET_RPC_URL.to_owned(),
         TESTNET_PASSPHRASE.to_owned(),

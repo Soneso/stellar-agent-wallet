@@ -314,11 +314,9 @@ impl AuthorizationEntries {
         // semantically distinct from `InvalidContractAddress` (which is
         // returned when an *entry's* contract address does not match).
         let expected_contract = stellar_strkey::Contract::from_string(expected_web_auth_contract)
-            .map_err(|e| Sep45Error::InvalidExpectedContractArg {
-                detail: format!(
-                    "expected_web_auth_contract {expected_web_auth_contract:?} is not a valid C-strkey: {e}"
-                ),
-            })?;
+            .map_err(|_| Sep45Error::InvalidExpectedContractArg {
+            detail: "expected_web_auth_contract must be a C-strkey".to_owned(),
+        })?;
 
         // ── Parse expected server signing key (validate G-strkey input) ──────
         // A malformed caller-supplied key is a different error class from a
@@ -328,8 +326,8 @@ impl AuthorizationEntries {
         let expected_server_key = stellar_strkey::ed25519::PublicKey::from_string(
             expected_server_signing_key,
         )
-        .map_err(|e| Sep45Error::InvalidExpectedServerKeyArg {
-            detail: format!("expected_server_signing_key {expected_server_signing_key:?} is not a valid G-strkey: {e}"),
+        .map_err(|_| Sep45Error::InvalidExpectedServerKeyArg {
+            detail: "expected_server_signing_key must be a G-strkey".to_owned(),
         })?;
 
         // ── Step 3-6: per-entry structural checks ────────────────────────────
@@ -3633,6 +3631,54 @@ mod tests {
             "expected InvalidExpectedServerKeyArg for malformed expected_server_signing_key; got {err:?}"
         );
         assert_eq!(err.wire_code(), "sep45.invalid_expected_server_key_arg");
+        match &err {
+            Sep45Error::InvalidExpectedServerKeyArg { detail } => {
+                assert_eq!(detail, "expected_server_signing_key must be a G-strkey");
+            }
+            other => panic!("expected InvalidExpectedServerKeyArg, got {other:?}"),
+        }
+    }
+
+    /// A malformed `expected_web_auth_contract` is named by the argument and
+    /// its strkey form, with no form of the value.
+    #[test]
+    fn fail_malformed_expected_web_auth_contract() {
+        let (contract, client, home, web_auth, server_seed) = test_params();
+        let nonce = test_nonce();
+        let network = test_network();
+
+        let xdr_b64 = build_test_entries_xdr(
+            contract,
+            home,
+            web_auth,
+            &server_seed,
+            client,
+            &nonce,
+            network,
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let err = AuthorizationEntries::parse_and_validate(
+            &xdr_b64,
+            network,
+            "credmarker7",
+            home,
+            web_auth,
+            "not-a-valid-g-strkey",
+            None,
+            client,
+        )
+        .unwrap_err();
+        match &err {
+            Sep45Error::InvalidExpectedContractArg { detail } => {
+                assert_eq!(detail, "expected_web_auth_contract must be a C-strkey");
+            }
+            other => panic!("expected InvalidExpectedContractArg, got {other:?}"),
+        }
+        assert!(!format!("{err:?} {err}").contains("credmarker7"));
     }
 
     // ── duplicate Symbol key with non-String second value ────────────────────

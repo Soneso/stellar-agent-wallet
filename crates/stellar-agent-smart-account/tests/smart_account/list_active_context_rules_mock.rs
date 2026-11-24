@@ -112,6 +112,9 @@ fn manager_for_server(server: &MockServer) -> ContextRuleManager {
         NETWORK_PASSPHRASE.to_owned(),
         std::time::Duration::from_secs(5),
         CHAIN_ID.to_owned(),
+    )
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
     );
     ContextRuleManager::new(config).expect("ContextRuleManager::new must succeed")
 }
@@ -130,7 +133,12 @@ fn manager_for_server(server: &MockServer) -> ContextRuleManager {
 /// No additional `simulateTransaction` calls must be issued (early-exit at step 2).
 ///
 #[tokio::test]
+#[serial_test::serial]
 async fn t1_empty_account_returns_empty_vec() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x01);
 
@@ -181,7 +189,12 @@ async fn t1_empty_account_returns_empty_vec() {
 /// Early-exit fires after rule 2 because `returned(3) >= active_count(3)`.
 ///
 #[tokio::test]
+#[serial_test::serial]
 async fn t2_dense_scan_all_returned() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x02);
     let signers = signer_set_n_of_n(1);
@@ -282,7 +295,12 @@ async fn t2_dense_scan_all_returned() {
 /// - `result.rules[0].rule_id == 0`.
 ///
 #[tokio::test]
+#[serial_test::serial]
 async fn t2b_valid_until_some_decoded_correctly() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x0B);
     let signers = signer_set_n_of_n(1);
@@ -352,7 +370,12 @@ async fn t2b_valid_until_some_decoded_correctly() {
 /// iteration; ID 4 is never probed).
 ///
 #[tokio::test]
+#[serial_test::serial]
 async fn t3_sparse_scan_single_gap() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x03);
     let signers = signer_set_n_of_n(1);
@@ -435,7 +458,12 @@ async fn t3_sparse_scan_single_gap() {
 /// and 5 and return rules at IDs 0, 3, 4, 6 in monotonic order.
 ///
 #[tokio::test]
+#[serial_test::serial]
 async fn t4_multi_gap_sparse_scan() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x04);
     let signers = signer_set_n_of_n(1);
@@ -514,7 +542,12 @@ async fn t4_multi_gap_sparse_scan() {
 /// After the scan, `returned=0 < active_count=2` → exhaustion error.
 ///
 #[tokio::test]
+#[serial_test::serial]
 async fn t5_max_scan_id_exhaustion_returns_error() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x05);
 
@@ -575,7 +608,12 @@ async fn t5_max_scan_id_exhaustion_returns_error() {
 /// The symbolic string `"ContextRuleNotFound"` triggers the
 /// `redacted_reason.contains("ContextRuleNotFound")` branch in the decoder.
 #[tokio::test]
+#[serial_test::serial]
 async fn t6_symbolic_not_found_treated_as_gap() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x06);
     let signers = signer_set_n_of_n(1);
@@ -649,7 +687,12 @@ async fn t6_symbolic_not_found_treated_as_gap() {
 /// - `enumeration.rules_skipped >= 1` (the #9999 error increments the skip counter).
 ///
 #[tokio::test]
+#[serial_test::serial]
 async fn t7_non_context_rule_not_found_error_is_skipped_defensively() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x07);
     let signers = signer_set_n_of_n(1);
@@ -781,7 +824,12 @@ impl wiremock::Respond for DelayedPerRuleResponder {
 /// per-rule `get_rule` probe past that budget (300ms) must refuse with the
 /// collective-budget message, NOT continue probing toward `max_scan_id`.
 #[tokio::test]
+#[serial_test::serial]
 async fn t8_collective_scan_budget_fires_before_max_scan_id_exhaustion() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x08);
 
@@ -816,6 +864,9 @@ async fn t8_collective_scan_budget_fires_before_max_scan_id_exhaustion() {
         NETWORK_PASSPHRASE.to_owned(),
         std::time::Duration::from_millis(100),
         CHAIN_ID.to_owned(),
+    )
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
     );
     let manager = ContextRuleManager::new(config).expect("ContextRuleManager::new must succeed");
 
@@ -844,7 +895,12 @@ async fn t8_collective_scan_budget_fires_before_max_scan_id_exhaustion() {
 /// version-2 row `v2` and rule 2 with a version-1 row `v1`; the same chain
 /// through a manager without a writer reports `unknown` for every rule.
 #[tokio::test]
+#[serial_test::serial]
 async fn t9_baseline_column_reports_each_rules_state_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x09);
     let strkey = stellar_strkey::Contract([0x09; 32]).to_string();
@@ -904,6 +960,9 @@ async fn t9_baseline_column_reports_each_rules_state_row() {
             std::time::Duration::from_secs(5),
             CHAIN_ID.to_owned(),
         )
+        .with_intent_admission(
+            stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+        )
         .with_audit_writer(writer),
     )
     .expect("ContextRuleManager::new must succeed");
@@ -954,7 +1013,12 @@ async fn t9_baseline_column_reports_each_rules_state_row() {
 /// answers: the audit-log cross-check verifies the chain and does not
 /// validate state-row snapshots.
 #[tokio::test]
+#[serial_test::serial]
 async fn t10_a_malformed_state_row_reports_unreadable_and_the_listing_answers() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x0a);
     let strkey = stellar_strkey::Contract([0x0a; 32]).to_string();
@@ -1018,6 +1082,9 @@ async fn t10_a_malformed_state_row_reports_unreadable_and_the_listing_answers() 
             NETWORK_PASSPHRASE.to_owned(),
             std::time::Duration::from_secs(5),
             CHAIN_ID.to_owned(),
+        )
+        .with_intent_admission(
+            stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
         )
         .with_audit_writer(writer),
     )

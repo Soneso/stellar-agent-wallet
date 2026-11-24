@@ -23,8 +23,9 @@
 //! halt in effect and reports `audit_row: "not_written"`.
 //!
 //! `profile resume` on a halted profile reads the marker, appends the
-//! `profile_resumed` row, and only then removes the marker, so a resume that
-//! took effect is always recorded:
+//! `profile_resumed` row, and removes the marker only after the row is
+//! written or queued in the audit outbox. A row that cannot be appended
+//! keeps the halt:
 //!
 //! - a marker that cannot be read, such as a directory at its path, refuses
 //!   with `profile.halt_unreadable` and writes no row;
@@ -44,7 +45,10 @@
 //! written when the log is available and the command exits `0` either way.
 //!
 //! While an MCP server holds the profile's audit log, both rows are queued in
-//! the audit outbox, and the server appends them at its next audit write.
+//! the audit outbox, and the server appends them at its next audit write. The
+//! server also drains the outbox when it exits: on client EOF, on SIGINT, and
+//! on SIGTERM on Unix. A refused drain leaves the row queued and is logged. A
+//! row queued after that drain waits for the next draining writer.
 //!
 //! # Output (JSON envelope)
 //!
@@ -87,10 +91,8 @@ use stellar_agent_core::profile::schema::{Profile, canonical_data_root};
 use stellar_agent_network::keyring::init_platform_keyring_store;
 use uuid::Uuid;
 
-use crate::commands::value_audit::{
-    OperatorRowSink, acquire_operator_row_sink, append_value_audit_row_strict,
-    audit_writer_open_failed,
-};
+use crate::commands::value_audit::{append_value_audit_row_strict, audit_writer_open_failed};
+use crate::common::consent::{OperatorRowSink, acquire_operator_row_sink};
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::render::{render_json, sanitize_for_table};
 
@@ -253,8 +255,8 @@ pub(crate) async fn run_halt(args: &HaltArgs) -> i32 {
     let profile = match load_profile_reconciled(&ResolvedProfileName::from_flag(name)) {
         Ok(profile) => profile,
         Err(e) => {
-            tracing::debug!(profile = %name, error = %e, "profile access refused");
-            print_error(&profile_access_envelope(&e, name), format);
+            tracing::debug!(error = %e, "profile access refused");
+            print_error(&profile_access_envelope(&e), format);
             return 1;
         }
     };
@@ -334,8 +336,8 @@ pub(crate) async fn run_resume(args: &ResumeArgs) -> i32 {
     let profile = match load_profile_reconciled(&ResolvedProfileName::from_flag(name)) {
         Ok(profile) => profile,
         Err(e) => {
-            tracing::debug!(profile = %name, error = %e, "profile access refused");
-            print_error(&profile_access_envelope(&e, name), format);
+            tracing::debug!(error = %e, "profile access refused");
+            print_error(&profile_access_envelope(&e), format);
             return 1;
         }
     };
@@ -493,10 +495,10 @@ fn reason_refusal(reason: &str) -> Result<(), Envelope<()>> {
 /// Maps a marker write or removal failure to `io.halt_marker`.
 fn marker_io_error(error: &HaltError) -> WalletError {
     match error {
-        HaltError::InvalidName { name, reason } => {
+        HaltError::InvalidName { reason } => {
             WalletError::Validation(ValidationError::ConfigInvalid {
                 component: "profile",
-                reason: format!("profile name `{name}` {reason}"),
+                reason: format!("the profile name is not a valid profile name: {reason}"),
             })
         }
         other => WalletError::Io {

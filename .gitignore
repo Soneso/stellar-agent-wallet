@@ -24,6 +24,9 @@ Cargo.lock.bak
 # Python virtual environment of the preflight workflow checks
 .venv/
 
+# Python bytecode the preflight self-tests write next to the scripts
+__pycache__/
+
 # Misc
 .cache/
 

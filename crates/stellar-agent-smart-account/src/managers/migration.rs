@@ -133,7 +133,7 @@ use crate::managers::verifiers::{
     MutabilityStatus, detect_contract_mutability, same_executable_reference,
 };
 use crate::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
-use stellar_agent_core::audit_log::schema::ContractKind;
+use stellar_agent_core::audit_log::schema::{ContractKind, WasmHashPin};
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::scval::scval_variant_name;
 use stellar_agent_network::Signer;
@@ -163,8 +163,8 @@ use stellar_agent_network::Signer;
 pub struct SignerMigrationStep {
     /// On-chain signer ID to remove (from `get_context_rule` simulation).
     pub signer_id: u32,
-    /// First-8 hex chars of the old verifier wasm hash (for audit + display).
-    pub current_hash_first8: String,
+    /// The full wasm hash of the old verifier the step migrates away from.
+    pub current_hash: WasmHashPin,
     /// Pre-formed `HostFunction::InvokeContract` for the `remove_signer` call.
     ///
     /// Invokes `remove_signer(rule_id, signer_id)` on the smart-account contract.
@@ -188,8 +188,8 @@ pub struct SignerMigrationStep {
 pub struct RuleMigration {
     /// Context-rule identifier.
     pub rule_id: u32,
-    /// First-8 hex chars of the current verifier wasm hash observed on this rule.
-    pub current_hash_first8: String,
+    /// The full wasm hash of the current verifier observed on this rule.
+    pub current_hash: WasmHashPin,
     /// One entry per External signer on this rule whose verifier wasm matches `from_hash`.
     ///
     /// Each step is a remove + add pair submitted sequentially via
@@ -272,7 +272,8 @@ pub struct MigrationPlan {
 }
 
 impl MigrationPlan {
-    /// First-8 hex chars of `from_hash` for envelope display.
+    /// First-8 hex chars of `from_hash`, a labeled display projection for
+    /// logs and human-readable text; it never takes part in a comparison.
     ///
     /// Returns 16 lower-hex characters (8 bytes × 2 chars/byte).
     #[must_use]
@@ -280,7 +281,8 @@ impl MigrationPlan {
         stellar_agent_core::hex::wasm_hash_first8_hex(&self.from_hash)
     }
 
-    /// First-8 hex chars of `to_hash` for envelope display.
+    /// First-8 hex chars of `to_hash`, a labeled display projection for logs
+    /// and human-readable text; it never takes part in a comparison.
     ///
     /// Returns 16 lower-hex characters (8 bytes × 2 chars/byte).
     #[must_use]
@@ -558,8 +560,9 @@ impl MigrationPlan {
     /// - [`SaError::SubmissionUnresolved`]: a step was sent and its outcome
     ///   is unknown.
     /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase or
-    ///   primary endpoint is mainnet, or the endpoint reports mainnet; no
-    ///   transaction is sent.
+    ///   primary endpoint is mainnet, refused before the signer's public key
+    ///   is read and before any request, with zero attempted steps; or
+    ///   the endpoint reports mainnet, and no transaction is sent.
     /// - [`SaError::AuthEntryConstructionFailed`]: the signer public-key
     ///   fetch failed, the rule lock was not acquired within its budget, or
     ///   a step's auth entry could not be built.
@@ -574,6 +577,17 @@ impl MigrationPlan {
         signers_manager: &SignersManager,
         request_id: &str,
     ) -> MigrationSubmitResult {
+        if let Err(error) = signers_manager.refuse_mainnet_write() {
+            return MigrationSubmitResult {
+                successful_steps: vec![],
+                failed_step_index: Some(0),
+                failed_step_error: Some(error),
+                failed_step_remove_tx_hash: None,
+                pending_add: None,
+                total_steps_attempted: 0,
+            };
+        }
+
         let smart_account_strkey = match scaddress_to_strkey(&self.smart_account) {
             Ok(s) => s,
             Err(e) => {
@@ -604,6 +618,10 @@ impl MigrationPlan {
 
         let from_hash_first8 = self.from_hash_first8();
         let to_hash_first8 = self.to_hash_first8();
+        // The pair carries the full hashes into the pin repoint and the
+        // migrated row; the first-8 forms above only label log lines.
+        let from_hash = WasmHashPin::new(self.from_hash);
+        let to_hash = WasmHashPin::new(self.to_hash);
 
         // Resolve the source pubkey once — reused across all steps.
         let source_pubkey = match signer.public_key().await {
@@ -672,8 +690,8 @@ impl MigrationPlan {
                         rule.rule_id,
                         step.signer_id,
                         &self.to_verifier_addr,
-                        &from_hash_first8,
-                        &to_hash_first8,
+                        from_hash,
+                        to_hash,
                         remove_args,
                         add_args,
                         signer,
@@ -814,13 +832,13 @@ impl SignerMigrationStep {
     #[doc(hidden)]
     pub fn new_for_test(
         signer_id: u32,
-        current_hash_first8: impl Into<String>,
+        current_hash: [u8; 32],
         remove_host_function: HostFunction,
         add_host_function: HostFunction,
     ) -> Self {
         Self {
             signer_id,
-            current_hash_first8: current_hash_first8.into(),
+            current_hash: WasmHashPin::new(current_hash),
             remove_host_function,
             add_host_function,
         }
@@ -834,12 +852,12 @@ impl RuleMigration {
     #[doc(hidden)]
     pub fn new_for_test(
         rule_id: u32,
-        current_hash_first8: impl Into<String>,
+        current_hash: [u8; 32],
         signer_steps: Vec<SignerMigrationStep>,
     ) -> Self {
         Self {
             rule_id,
-            current_hash_first8: current_hash_first8.into(),
+            current_hash: WasmHashPin::new(current_hash),
             signer_steps,
         }
     }
@@ -1044,12 +1062,11 @@ impl<'a> MigrationPlanner<'a> {
     ) -> Result<MigrationPlan, SaError> {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
-        let to_verifier_strkey = scaddress_to_strkey(&to_verifier_addr)?;
-        let to_verifier_redacted = redact_strkey_first5_last5(&to_verifier_strkey);
+        // The destination has passed no check yet, so the event below omits it.
+        scaddress_to_strkey(&to_verifier_addr)?;
 
         debug!(
             smart_account = %smart_account_redacted,
-            to_verifier = %to_verifier_redacted,
             request_id,
             "MigrationPlanner::build: starting pre-flight"
         );
@@ -1092,17 +1109,15 @@ impl<'a> MigrationPlanner<'a> {
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted.clone(),
                 ),
-                detail: format!(
-                    "destination verifier contract at {to_verifier_redacted} has no deployed WASM \
-                 (contract not found or not a contract instance)"
-                ),
+                detail: "to_verifier must identify a deployed verifier contract with Wasm code; \
+                         deploy an allowlisted immutable verifier."
+                    .to_owned(),
                 request_id: request_id.to_owned(),
             }
         })?;
 
-        let to_hash_first8 = stellar_agent_core::hex::wasm_hash_first8_hex(&to_hash);
-
-        // Pre-flight 1: destination hash must be in VERIFIER_ALLOWLIST.
+        // Pre-flight 1: destination hash must be in VERIFIER_ALLOWLIST. A
+        // refused destination hash is named in no field of the error.
         let allowlist_entry = VERIFIER_ALLOWLIST
             .iter()
             .find(|e| e.wasm_hash == to_hash)
@@ -1111,45 +1126,18 @@ impl<'a> MigrationPlanner<'a> {
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted.clone(),
                 ),
-                detail: format!(
-                    "destination verifier wasm hash {to_hash_first8} is not in VERIFIER_ALLOWLIST"
-                ),
+                detail: "destination verifier wasm hash must be in VERIFIER_ALLOWLIST".to_owned(),
                 request_id: request_id.to_owned(),
             })?;
 
-        // Pre-flight 2: destination audit status — refuse Revoked / Retired.
+        // Membership admits a verifier; disclosed problems refuse migration.
         let destination_audit_status = allowlist_entry.audit_status.clone();
-        match &destination_audit_status {
-            VerifierAuditStatus::Revoked { reason, .. } => {
-                return Err(SaError::VerifierWasmRevoked {
-                    rule_id: 0,
-                    smart_account_redacted: RedactedStrkey::from_already_redacted(
-                        smart_account_redacted.clone(),
-                    ),
-                    verifier_hash_first8: to_hash_first8.clone(),
-                    revoked_reason: (*reason).to_owned(),
-                    request_id: request_id.to_owned(),
-                });
-            }
-            VerifierAuditStatus::Retired { .. } => {
-                return Err(SaError::VerifierWasmRetired {
-                    rule_id: 0,
-                    smart_account_redacted: RedactedStrkey::from_already_redacted(
-                        smart_account_redacted.clone(),
-                    ),
-                    verifier_hash_first8: to_hash_first8.clone(),
-                    request_id: request_id.to_owned(),
-                });
-            }
-            VerifierAuditStatus::Audited { .. }
-            | VerifierAuditStatus::Provisional { .. }
-            | VerifierAuditStatus::Unaudited => {
-                // Accepted — continue to mutability check. Migration
-                // preflight refuses only statuses that record a disclosed
-                // problem (`Revoked`, `Retired`); allowlist membership, not
-                // the audit status, is what admits a verifier.
-            }
-        }
+        crate::verifier_allowlist::refuse_revoked_or_retired_verifier(
+            &to_hash,
+            None,
+            &smart_account_redacted,
+            request_id,
+        )?;
 
         // Pre-flight 3: destination contract must be immutable.
         let mutability = detect_contract_mutability(
@@ -1170,31 +1158,15 @@ impl<'a> MigrationPlanner<'a> {
             request_id: request_id.to_owned(),
         })?;
 
-        if let MutabilityStatus::Mutable {
-            admin_or_owner_key,
-            executable_ref,
-            ..
-        } = &mutability
-        {
-            let reference = executable_ref
-                .as_ref()
-                .map_or_else(String::new, |external| {
-                    format!(
-                        ", owner {}, tag \"{}\"",
-                        external.owner_redacted(),
-                        external.tag_display()
-                    )
-                });
+        if matches!(mutability, MutabilityStatus::Mutable { .. }) {
             return Err(SaError::VerifierMigrationFailed {
                 phase: MIGRATION_PHASES[1], // "preflight_destination_mutable"
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted.clone(),
                 ),
-                detail: format!(
-                    "destination verifier at {to_verifier_redacted} is mutable \
-                     (reason={admin_or_owner_key}{reference}); mutable contracts are \
-                     refused as migration destinations"
-                ),
+                detail: "to_verifier must identify an immutable verifier contract; deploy or \
+                         select an immutable verifier."
+                    .to_owned(),
                 request_id: request_id.to_owned(),
             });
         }
@@ -1210,9 +1182,6 @@ impl<'a> MigrationPlanner<'a> {
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted.clone(),
                 ),
-                contract_address_redacted: RedactedStrkey::from_already_redacted(
-                    to_verifier_redacted,
-                ),
                 reason: crate::AdminOrOwnerKey::ExecutableChanged,
                 request_id: request_id.to_owned(),
             });
@@ -1220,7 +1189,7 @@ impl<'a> MigrationPlanner<'a> {
 
         debug!(
             smart_account = %smart_account_redacted,
-            to_hash_first8 = %to_hash_first8,
+            to_hash_first8 = %stellar_agent_core::hex::wasm_hash_first8_hex(&to_hash),
             request_id,
             "MigrationPlanner::build: pre-flight passed; building rule-signer inventory"
         );
@@ -1475,7 +1444,7 @@ impl<'a> MigrationPlanner<'a> {
 
                 steps.push(SignerMigrationStep {
                     signer_id: ext.signer_id,
-                    current_hash_first8: from_hash_first8.clone(),
+                    current_hash: WasmHashPin::new(from_hash),
                     remove_host_function,
                     add_host_function,
                 });
@@ -1494,7 +1463,7 @@ impl<'a> MigrationPlanner<'a> {
                 );
                 affected.push(RuleMigration {
                     rule_id,
-                    current_hash_first8: from_hash_first8.clone(),
+                    current_hash: WasmHashPin::new(from_hash),
                     signer_steps: steps,
                 });
             }
@@ -1531,7 +1500,7 @@ impl<'a> MigrationPlanner<'a> {
         .map_err(|e| SaError::VerifierMigrationFailed {
             phase: MIGRATION_PHASES[2],
             smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
-            detail: format!("get_context_rule({rule_id}) simulation failed: {e}"),
+            detail: format!("get_context_rule simulation failed: {e}"),
             request_id: request_id.to_owned(),
         })?;
 
@@ -1840,19 +1809,19 @@ mod tests {
         };
         let step = || SignerMigrationStep {
             signer_id: 0,
-            current_hash_first8: "00000000".to_owned(),
+            current_hash: WasmHashPin::new([0x00; 32]),
             remove_host_function: dummy_hf(),
             add_host_function: dummy_hf(),
         };
         let affected_rules = vec![
             RuleMigration {
                 rule_id: 1,
-                current_hash_first8: "aabbccdd".to_owned(),
+                current_hash: WasmHashPin::new([0xaa; 32]),
                 signer_steps: vec![step(), step()], // 2 signers → 4 txs
             },
             RuleMigration {
                 rule_id: 2,
-                current_hash_first8: "aabbccdd".to_owned(),
+                current_hash: WasmHashPin::new([0xaa; 32]),
                 signer_steps: vec![step()], // 1 signer → 2 txs
             },
         ];
@@ -2089,7 +2058,7 @@ mod tests {
     fn rule_migration_transaction_count_zero_for_empty_steps() {
         let rule = RuleMigration {
             rule_id: 5,
-            current_hash_first8: "aabbccdd".to_owned(),
+            current_hash: WasmHashPin::new([0xaa; 32]),
             signer_steps: vec![],
         };
         assert_eq!(
@@ -2482,7 +2451,7 @@ mod tests {
         assert_eq!(
             detail,
             "get_context_rule(6): signer at index 1 (id 20) is not a recognised Signer: \
-             unknown signer tag \"Future\""
+             signer tag must be Delegated or External"
         );
     }
 
@@ -2586,13 +2555,13 @@ mod tests {
         };
         let step = SignerMigrationStep {
             signer_id: 0,
-            current_hash_first8: "deadbeef".to_owned(),
+            current_hash: WasmHashPin::new([0xde; 32]),
             remove_host_function: dummy_hf(),
             add_host_function: dummy_hf(),
         };
         let rule = RuleMigration {
             rule_id: 0,
-            current_hash_first8: "deadbeef".to_owned(),
+            current_hash: WasmHashPin::new([0xde; 32]),
             signer_steps: vec![step],
         };
         let plan = MigrationPlan {
@@ -2617,5 +2586,87 @@ mod tests {
             plan.warnings.is_empty(),
             "2-tx plan must not trigger inter-tx failure warning"
         );
+    }
+
+    // ── Mainnet refusal before the signer and the endpoint ──────────────────
+
+    /// Submits a plan with no steps through a signers manager declared for
+    /// `network_passphrase` whose endpoints are a mock that answers nothing.
+    /// Returns the result, the signer's key accesses and the requests sent.
+    async fn submit_empty_plan_on(
+        network_passphrase: &str,
+    ) -> (MigrationSubmitResult, usize, usize) {
+        use crate::managers::signers::SignersManagerConfig;
+        use stellar_agent_core::audit_log::writer::AuditWriter;
+
+        let server = wiremock::MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log_path = dir.path().join("audit.jsonl");
+        let manager = SignersManager::new(SignersManagerConfig::new(
+            server.uri(),
+            server.uri(),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                AuditWriter::open(audit_log_path.clone(), None).unwrap(),
+            )),
+            audit_log_path,
+            network_passphrase.to_owned(),
+            "test".to_owned(),
+            std::time::Duration::from_secs(1),
+            "stellar:fixture".to_owned(),
+        ))
+        .unwrap();
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x73; 32]);
+        let plan = MigrationPlan {
+            smart_account: ScAddress::Contract(ContractId(Hash([0x81u8; 32]))),
+            from_hash: [0x01; 32],
+            to_hash: [0x02; 32],
+            to_verifier_addr: ScAddress::Contract(ContractId(Hash([0x83u8; 32]))),
+            affected_rules: vec![],
+            destination_audit_status: VerifierAuditStatus::Unaudited,
+            request_id: "req-migrate".to_owned(),
+            warnings: vec![],
+            rules_skipped_count: 0,
+            audit_log_missing: vec![],
+        };
+
+        let result = plan.submit(&signer, &manager, "req-migrate").await;
+        let requests = server.received_requests().await.unwrap().len();
+        (result, signer.key_accesses(), requests)
+    }
+
+    #[tokio::test]
+    async fn submit_on_testnet_reads_the_signer_key_and_completes_an_empty_plan() {
+        let (result, key_accesses, requests) =
+            submit_empty_plan_on(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE).await;
+
+        assert!(
+            result.failed_step_error.is_none(),
+            "{:?}",
+            result.failed_step_error
+        );
+        assert_eq!(result.total_steps_attempted, 0);
+        assert_eq!(key_accesses, 1, "the source public key is read once");
+        assert_eq!(requests, 0, "a plan with no steps sends nothing");
+    }
+
+    #[tokio::test]
+    async fn submit_refuses_a_mainnet_manager_before_any_key_access_or_request() {
+        let (result, key_accesses, requests) =
+            submit_empty_plan_on(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE).await;
+
+        assert!(
+            matches!(
+                result.failed_step_error,
+                Some(SaError::MainnetWriteForbidden)
+            ),
+            "{:?}",
+            result.failed_step_error
+        );
+        assert_eq!(result.failed_step_index, Some(0));
+        assert_eq!(result.total_steps_attempted, 0);
+        assert!(result.successful_steps.is_empty());
+        assert!(result.pending_add.is_none());
+        assert_eq!(key_accesses, 0);
+        assert_eq!(requests, 0);
     }
 }

@@ -5,6 +5,8 @@
 //! - [`network`] — `TargetNetwork` enum unifying the network selector across
 //!   write subcommands.  Carries passphrase constants and implements
 //!   `FromStr` / `Display` for clap.
+//! - `private_open`: opens a bearer URL in the browser through a private
+//!   redirect file, so no launcher argument ever carries the secret.
 //! - [`profile_access`] — the profile-access choke point: the one place that
 //!   decides whether a missing profile file may be replaced by the synthesised
 //!   zero-config profile, keyed on the resolved name's provenance.
@@ -15,11 +17,17 @@
 //! - [`signer_ceremony`] — `resolve_software_signer_from_env`, the single
 //!   mlock-protected secret-env signer ceremony shared by every write
 //!   subcommand that accepts a `--*-secret-env <VAR>` flag.
+//! - `spending_preview`: the spending bounds `profile init` and
+//!   `profile enable-mainnet` write to stderr before their first write.
 //!
 //! # Free helpers
 //!
 //! - [`display_available`] — whether a graphical display is available for a
 //!   browser auto-launch, shared by every subcommand that offers one.
+//! - `interrupted`: resolves when the operator interrupts a ceremony wait,
+//!   shared by every subcommand that holds a browser handoff while it waits.
+//! - `log_pair_refusal`: the `debug` record of a localhost ceremony that
+//!   cannot hold both loopback addresses, shared by every such ceremony.
 //!
 //! # Re-exports
 //!
@@ -29,17 +37,51 @@
 //! - [`validate_path_component_ascii_safe`] — validates that a string is safe
 //!   to use as a path component (no path traversal, no special characters).
 
+#[cfg(test)]
+pub(crate) mod approval_fixture;
+pub(crate) mod business_entry;
+#[cfg(test)]
+mod capture_isolation;
+pub(crate) mod consent;
+#[cfg(test)]
+pub(crate) mod identity_fixture;
+#[cfg(test)]
+pub(crate) mod installation_key_fixture;
+pub(crate) mod intent_summary;
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) mod mainnet_authority_tests;
+pub(crate) mod mainnet_confirm;
+pub(crate) mod mainnet_presence;
+pub(crate) mod mainnet_write;
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) mod mainnet_write_fixture;
 pub mod network;
+#[cfg(all(test, feature = "mainnet-write"))]
+mod operation_replay_tests;
+pub(crate) mod private_open;
 pub mod profile_access;
+#[cfg(all(test, feature = "mainnet-write"))]
+mod proof_row_status_tests;
+#[cfg(test)]
+pub(crate) mod refusal_fixture;
+#[cfg(test)]
+pub(crate) mod refusal_log_fixture;
 pub mod render;
 pub mod served_pages;
 pub mod signer_ceremony;
+pub(crate) mod spending_preview;
+#[cfg(test)]
+pub(crate) mod test_support;
+pub(crate) mod tty;
+#[cfg(test)]
+pub(crate) mod unenforced_fixture;
 
 /// Returns `true` when a graphical display is available for a browser launch.
 ///
 /// On Linux, requires `DISPLAY` or `WAYLAND_DISPLAY`; a headless host must not
-/// spawn a browser (which could also leak a URL-embedded one-time token into
-/// another process's argv). Other platforms are assumed to have a display.
+/// spawn a browser. Other platforms are assumed to have a display. A browser
+/// that is spawned receives only a private redirect file's URL (see
+/// `private_open`), never the one-time token.
 ///
 /// Shared by every subcommand that offers to auto-launch a browser
 /// (`approve serve`, `approve operator enroll --interactive`) so the
@@ -56,6 +98,43 @@ pub fn display_available() -> bool {
     }
 }
 
+/// Resolves once `signal` reports an operator interrupt (Ctrl-C).
+///
+/// A command races this against its ceremony wait, so an interrupt ends the
+/// wait and the command still runs its shutdown and removes its browser
+/// handoff file. When the interrupt listener cannot be installed, `signal`
+/// returns an error and this never resolves: the wait continues to its own
+/// end rather than being cut short.
+pub(crate) async fn interrupted(signal: impl Future<Output = std::io::Result<()>>) {
+    if let Err(error) = signal.await {
+        tracing::debug!(
+            error = %error,
+            "interrupt listener unavailable; the wait continues without it"
+        );
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Records at `debug` why the localhost ceremony named `ceremony` cannot
+/// hold both loopback addresses: the family whose bind failed, or `both`
+/// when no port could be held on the two together, and the error kind.
+///
+/// The caller reports its own refusal code; this only adds the detail the
+/// code does not carry.
+pub(crate) fn log_pair_refusal(
+    ceremony: &'static str,
+    pair: &stellar_agent_loopback_http::PairBindError,
+) {
+    tracing::debug!(
+        ceremony,
+        family = pair
+            .family()
+            .map_or("both", stellar_agent_loopback_http::LoopbackFamily::as_str),
+        kind = ?pair.kind(),
+        "the ceremony cannot hold both loopback addresses"
+    );
+}
+
 /// Profile-name resolution and path-component validation, re-exported from
 /// `stellar-agent-core` so the CLI and the MCP server cannot drift apart on
 /// either rule.
@@ -67,3 +146,34 @@ pub fn display_available() -> bool {
 pub use stellar_agent_core::profile::name::{
     ResolvedProfileName, resolve_profile_name, validate_path_component_ascii_safe,
 };
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::expect_used,
+        reason = "test-only; panics acceptable in unit tests"
+    )]
+
+    use std::time::Duration;
+
+    use super::interrupted;
+
+    /// A delivered interrupt resolves the wait.
+    #[tokio::test(flavor = "current_thread")]
+    async fn interrupted_resolves_on_the_signal() {
+        tokio::time::timeout(Duration::from_secs(5), interrupted(async { Ok(()) }))
+            .await
+            .expect("a delivered interrupt resolves");
+    }
+
+    /// A listener that could not be installed never cuts the wait short.
+    #[tokio::test(flavor = "current_thread")]
+    async fn interrupted_without_a_listener_never_resolves() {
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(200),
+            interrupted(async { Err(std::io::Error::other("no signal listener")) }),
+        )
+        .await;
+        assert!(outcome.is_err(), "a failed listener must not end the wait");
+    }
+}

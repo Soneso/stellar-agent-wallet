@@ -46,6 +46,14 @@ mod keyring_integration;
 mod pay_integration;
 #[path = "network/pay_live.rs"]
 mod pay_live;
+#[path = "network/payload_fixtures.rs"]
+mod payload_fixtures;
+#[path = "network/policy_engine.rs"]
+mod policy_engine;
+#[path = "network/pre_send_budget.rs"]
+mod pre_send_budget;
+#[path = "network/pre_send_guards.rs"]
+mod pre_send_guards;
 #[path = "network/redaction_audit.rs"]
 mod redaction_audit;
 #[path = "network/retention_poll_deadline.rs"]
@@ -70,6 +78,8 @@ mod submit_binding_integration;
 mod submit_integration;
 #[path = "network/submit_result_mapping.rs"]
 mod submit_result_mapping;
+#[path = "network/submit_send_by.rs"]
+mod submit_send_by;
 #[path = "network/transaction_status_reads.rs"]
 mod transaction_status_reads;
 #[path = "network/window_admission.rs"]

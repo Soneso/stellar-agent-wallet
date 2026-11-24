@@ -26,6 +26,7 @@ serde                 = { workspace = true }
 tracing               = { workspace = true }
 
 [dev-dependencies]
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-helpers"] }
 serde_json                 = { workspace = true }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 ed25519-dalek              = { workspace = true }

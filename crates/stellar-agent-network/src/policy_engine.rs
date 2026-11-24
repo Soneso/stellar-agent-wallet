@@ -1,0 +1,355 @@
+//! Shared construction of hydrated, verified policy engines.
+
+use crate::policy_state::{PersistedWindowStore, WindowStoreError};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use stellar_agent_core::{
+    mainnet::{
+        enablement::{EnablementRecord, read_enablement_nonce, verify_enablement},
+        verified_policy::VerifiedPolicy,
+    },
+    policy::{
+        NoopPolicyEngine, PolicyEngine, PolicyError,
+        v1::{
+            PolicyStateStore,
+            verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+        },
+    },
+    profile::{
+        name::{ProfileNameSource, derive_profile_name_from_owner_key},
+        schema::{PolicyEngineKind, Profile, default_policy_dir},
+    },
+};
+
+/// An engine and the proofs produced while constructing it.
+pub struct BuiltPolicyEngine {
+    /// The shared evaluator.
+    pub engine: Arc<dyn PolicyEngine>,
+    /// Signature and freshness proof, absent for a Noop engine.
+    pub verified: Option<VerifiedPolicy>,
+    /// Installation proof, present only for a fully enabled mainnet selection.
+    pub enablement: Option<EnablementRecord>,
+    /// The verified policy's path, absent for an ownerless Noop engine.
+    pub policy_path: Option<PathBuf>,
+}
+
+/// The operator's explicit profile selection, which installation verification
+/// binds to.
+#[derive(Debug, Clone, Copy)]
+pub struct ProfileSelection<'a> {
+    /// The resolved profile name.
+    pub name: &'a str,
+    /// How the name was selected.
+    pub source: ProfileNameSource,
+    /// The directory holding the profile file, read without overlays.
+    pub profile_dir: &'a Path,
+}
+
+/// Prefixes `code` onto `text` only when `text` does not already start with
+/// `code` (either bare or followed by `:`).
+fn with_wire_code(code: &str, text: String) -> String {
+    if text
+        .strip_prefix(code)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+    {
+        text
+    } else {
+        format!("{code}: {text}")
+    }
+}
+
+/// A typed cause preserved by binary-specific error rendering.
+#[derive(Debug, thiserror::Error)]
+pub enum PolicyEngineBuildError {
+    /// The profile names an engine kind this build does not support.
+    #[error("unsupported policy engine kind {kind:?}")]
+    UnsupportedEngineKind {
+        /// The unsupported kind.
+        kind: PolicyEngineKind,
+    },
+    /// Policy parsing, signature, restrictions, or freshness failed.
+    #[error("{}", with_wire_code(.0.wire_code(), .0.to_string()))]
+    Policy(PolicyError),
+    /// Enrolled owner discovery failed in the registered keyring backend.
+    #[error("{}", with_wire_code(.0.code(), .0.to_string()))]
+    OwnerKeyring(stellar_agent_core::error::WalletError),
+    /// The persisted window state could not be hydrated.
+    #[error("policy-window-state store for profile '{store_name}' failed to load ({source})")]
+    WindowState {
+        /// The name selecting the store file.
+        store_name: String,
+        /// The store's error.
+        source: WindowStoreError,
+    },
+    /// Mainnet installation binding failed.
+    #[error("{0}")]
+    Enablement(stellar_agent_core::error::ValidationError),
+    /// The owner-key namespace or the policy directory could not be resolved.
+    #[error("{0}")]
+    Configuration(String),
+}
+
+/// Hydrates the window state, verifies the policy, and verifies installation
+/// binding.
+///
+/// An enrolled owner authorizes either engine through the signed policy.
+/// `selection` is the operator's explicit profile selection; `None` omits
+/// installation verification for readers that do not select a profile, and
+/// then no profile directory is resolved.
+///
+/// # Which name keys the window state
+///
+/// `store_name` selects the window-state FILE, so a binary keeps the file its
+/// own writers append to: the CLI passes the requested name, the name every
+/// CLI writer of the store, `profile reset-window-state`, and
+/// `profile rotate-policy-state-key` use. The entries hydrated from that file
+/// and the engine's `StateKey` namespace both stay the name derived from the
+/// owner-key coordinate, and they must stay equal: the wire format carries no
+/// name, so hydration re-attaches one, and the engine looks entries up under
+/// its own namespace. An entry hydrated under any other name would read as an
+/// empty window with every cap unbound.
+///
+/// # Errors
+/// Refuses an unsupported engine kind, an unresolvable namespace or policy
+/// directory, unloadable window state, an invalid or stale policy, and a
+/// failed installation binding.
+pub fn build_policy_engine(
+    profile: &Profile,
+    selection: Option<ProfileSelection<'_>>,
+    store_name: &str,
+    policy_dir_override: Option<&Path>,
+    owner_key: [u8; 32],
+    owner_source: OwnerKeySource,
+) -> Result<BuiltPolicyEngine, PolicyEngineBuildError> {
+    let mut owner_key = owner_key;
+    match profile.policy.engine {
+        PolicyEngineKind::Noop => {
+            // A host with no registered backend holds no owner entry and serves read-only;
+            // a registered backend's failures refuse in `read_enrolled_owner`.
+            let _ = crate::keyring::ensure_platform_keyring_store();
+            let enrolled = stellar_agent_core::profile::owner_key::read_enrolled_owner(profile)
+                .map_err(PolicyEngineBuildError::OwnerKeyring)?;
+            match enrolled {
+                Some(owner) => owner_key = owner,
+                None => {
+                    if keyring_core::get_default_store().is_some()
+                        && stellar_agent_core::policy::pin::entry_present(
+                            &profile.policy_window_state_key_id,
+                        )
+                        .map_err(|error| PolicyEngineBuildError::Policy(error.into()))?
+                    {
+                        return Err(PolicyEngineBuildError::Policy(
+                            PolicyError::MissingOwnerKey {
+                                profile: store_name.to_owned(),
+                            },
+                        ));
+                    }
+                    return Ok(BuiltPolicyEngine {
+                        engine: Arc::new(NoopPolicyEngine),
+                        verified: None,
+                        enablement: None,
+                        policy_path: None,
+                    });
+                }
+            }
+        }
+        PolicyEngineKind::V1 => {}
+        kind => return Err(PolicyEngineBuildError::UnsupportedEngineKind { kind }),
+    }
+    let namespace = derive_profile_name_from_owner_key(profile)
+        .ok_or_else(|| PolicyEngineBuildError::Configuration("invalid owner-key service".into()))?;
+    let directory = policy_dir_override.map_or_else(
+        || default_policy_dir().map_err(|e| PolicyEngineBuildError::Configuration(e.to_string())),
+        |path| Ok(path.to_path_buf()),
+    )?;
+    let path = directory.join(format!("{namespace}.toml"));
+    let window_store = PersistedWindowStore::for_profile(store_name);
+    let window_path = window_store.path();
+    let window_state = PolicyStateStore::new();
+    window_store
+        .load_into(namespace, profile, &window_state)
+        .map_err(|source| PolicyEngineBuildError::WindowState {
+            store_name: store_name.to_owned(),
+            source,
+        })?;
+    if let Some(parent) = window_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            PolicyEngineBuildError::Policy(PolicyError::StateLockIo { kind: e.kind() })
+        })?;
+    }
+    let verified = load_verified_policy(
+        &PolicyLoad {
+            path: &path,
+            profile,
+            profile_name: namespace,
+            owner_pubkey: &owner_key,
+            owner_source,
+            window_path,
+        },
+        window_state,
+        PinMode::Advance,
+    )
+    .map_err(PolicyEngineBuildError::Policy)?;
+    if profile.policy.engine == PolicyEngineKind::Noop {
+        return Ok(BuiltPolicyEngine {
+            engine: Arc::new(NoopPolicyEngine),
+            verified: None,
+            enablement: None,
+            policy_path: Some(path),
+        });
+    }
+    let enablement = if cfg!(feature = "mainnet-write")
+        && profile.chain_id.is_mainnet()
+        && verified.mainnet().is_some()
+    {
+        selection
+            .map(|selection| {
+                verify_enablement(
+                    &verified,
+                    selection.name,
+                    selection.source,
+                    profile,
+                    selection.profile_dir,
+                    &read_enablement_nonce,
+                )
+            })
+            .transpose()
+            .map_err(PolicyEngineBuildError::Enablement)?
+    } else {
+        None
+    };
+    Ok(BuiltPolicyEngine {
+        engine: verified.engine(),
+        verified: Some(verified),
+        enablement,
+        policy_path: Some(path),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `PolicyError` carries its wire code once through
+    /// `PolicyEngineBuildError::Policy`, whether its own `Display` starts with
+    /// the code or not; `OwnerKeyring` obeys the same rule.
+    #[test]
+    fn policy_engine_build_error_does_not_double_wire_code() {
+        let self_prefixed = [
+            PolicyError::ResetConsentReplayed,
+            PolicyError::EngineSelectionUnsigned { selection: "noop" },
+            PolicyError::MainnetTableOnTestnet,
+            PolicyError::SequenceRollback,
+            PolicyError::SequenceFork,
+            PolicyError::PinAbsent,
+            PolicyError::OwnerRotationRequired,
+            PolicyError::OwnerRotationInvalid,
+            PolicyError::StateLockBusy,
+            PolicyError::StateLockIo {
+                kind: std::io::ErrorKind::PermissionDenied,
+            },
+            PolicyError::MainnetMinimumUnmet {
+                requirement: "rules",
+                rule: None,
+            },
+            PolicyError::PinUnusable {
+                detail: "corrupt".to_owned(),
+            },
+            PolicyError::TestOwnerKeyRefused,
+        ];
+        for error in self_prefixed {
+            let code = error.wire_code();
+            let rendered = PolicyEngineBuildError::Policy(error).to_string();
+            assert!(
+                rendered.starts_with(code),
+                "expected code {code} at start of {rendered:?}"
+            );
+            assert_eq!(
+                rendered.matches(code).count(),
+                1,
+                "wire code {code} must appear once: {rendered:?}"
+            );
+        }
+
+        let unprefixed = [
+            PolicyError::MissingOwnerKey {
+                profile: "alpha".to_owned(),
+            },
+            PolicyError::OwnerSignatureInvalid {
+                profile: "alpha".to_owned(),
+                rules_with_signed_optional_keys: Vec::new(),
+            },
+            PolicyError::PolicyFileLoadFailed {
+                detail: "not found".to_owned(),
+            },
+        ];
+        for error in unprefixed {
+            let code = error.wire_code();
+            let rendered = PolicyEngineBuildError::Policy(error).to_string();
+            assert!(
+                rendered.starts_with(&format!("{code}: ")),
+                "expected prefixed {code}: in {rendered:?}"
+            );
+            assert_eq!(
+                rendered.matches(code).count(),
+                1,
+                "wire code {code} must appear once: {rendered:?}"
+            );
+        }
+
+        let self_coded_wallet = stellar_agent_core::error::WalletError::Validation(
+            stellar_agent_core::error::ValidationError::AuditCarriersUnbound {
+                detail: "audit.carriers_unbound: stop every wallet process".to_owned(),
+            },
+        );
+        let rendered_self = PolicyEngineBuildError::OwnerKeyring(self_coded_wallet).to_string();
+        assert!(rendered_self.starts_with("audit.carriers_unbound: "));
+        assert_eq!(
+            rendered_self.matches("audit.carriers_unbound").count(),
+            1,
+            "{rendered_self:?}"
+        );
+
+        let plain_wallet = stellar_agent_core::error::WalletError::Auth(
+            stellar_agent_core::error::AuthError::KeyringConfigInvalid {
+                detail: "backend missing".to_owned(),
+            },
+        );
+        let plain_code = plain_wallet.code();
+        let rendered_plain = PolicyEngineBuildError::OwnerKeyring(plain_wallet).to_string();
+        assert!(
+            rendered_plain.starts_with(&format!("{plain_code}: ")),
+            "{rendered_plain:?}"
+        );
+        assert_eq!(
+            rendered_plain.matches(plain_code).count(),
+            1,
+            "{rendered_plain:?}"
+        );
+    }
+
+    #[test]
+    fn with_wire_code_checks_code_boundary() {
+        assert_eq!(
+            with_wire_code("policy.pin_absent", "policy.pin_absent".to_owned()),
+            "policy.pin_absent"
+        );
+        assert_eq!(
+            with_wire_code("policy.pin_absent", "policy.pin_absent: missing".to_owned()),
+            "policy.pin_absent: missing"
+        );
+        assert_eq!(
+            with_wire_code(
+                "policy.pin_absent",
+                "policy.pin_absent_extra: other".to_owned()
+            ),
+            "policy.pin_absent: policy.pin_absent_extra: other"
+        );
+        assert_eq!(
+            with_wire_code("policy.pin_absent", "plain text".to_owned()),
+            "policy.pin_absent: plain text"
+        );
+    }
+}

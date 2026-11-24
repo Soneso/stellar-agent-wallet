@@ -17,7 +17,7 @@
 //!     → Err(CriterionEvaluationFailed)   [fail-closed; view required]
 //!
 //! let contract_id = ctx.profile.account
-//! let now_unix    = system_time_unix_secs()
+//! let now_unix    = ctx.now_ms / 1_000
 //!
 //! if ctx.sep45_sessions.is_active(contract_id, now_unix)
 //!     → Ok(None)                          [pass; active session present]
@@ -45,11 +45,9 @@
 //!
 //! # Clock source
 //!
-//! The `now_unix` timestamp is sourced from [`std::time::SystemTime`].  The
-//! implementation falls back to `u64::MAX` (always expired) on clock-before-
-//! epoch anomalies — a conservative fail-closed choice.
-
-use std::time::{SystemTime, UNIX_EPOCH};
+//! The `now_unix` timestamp is the whole seconds of the evaluation instant
+//! [`EvalContext::now_ms`], so the session check and every other criterion of
+//! one evaluation observe the same instant.
 
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::criteria::Criterion;
@@ -144,13 +142,8 @@ impl Criterion for Sep45SessionActiveCriterion {
         // that authenticates to the anchor via SEP-45.
         let contract_id = &ctx.profile.mcp_signer_default.account;
 
-        // Clock anchor: seconds since UNIX epoch.  Fall back to u64::MAX on
-        // anomalous pre-epoch clocks — always-expired is a conservative,
-        // fail-closed choice consistent with §2.11 signing-window discipline.
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(u64::MAX);
+        // Clock anchor: whole seconds of the evaluation instant.
+        let now_unix = ctx.now_ms / 1_000;
 
         if sessions.is_active(contract_id, now_unix) {
             return Ok(None);
@@ -212,19 +205,17 @@ mod tests {
 
     // ── Mock Sep45SessionView ─────────────────────────────────────────────────
 
-    struct AlwaysActiveView;
+    /// The whole second at which the test session expires. It lies years
+    /// before the host clock, so a criterion that read the host clock would
+    /// find the session expired.
+    const EXPIRES_AT_UNIX: u64 = 1_000_000_000;
 
-    impl Sep45SessionView for AlwaysActiveView {
-        fn is_active(&self, _contract_id: &str, _now_unix: u64) -> bool {
-            true
-        }
-    }
+    /// A session active strictly before [`EXPIRES_AT_UNIX`].
+    struct ExpiringView;
 
-    struct NeverActiveView;
-
-    impl Sep45SessionView for NeverActiveView {
-        fn is_active(&self, _contract_id: &str, _now_unix: u64) -> bool {
-            false
+    impl Sep45SessionView for ExpiringView {
+        fn is_active(&self, _contract_id: &str, now_unix: u64) -> bool {
+            now_unix < EXPIRES_AT_UNIX
         }
     }
 
@@ -246,7 +237,11 @@ mod tests {
     /// When the dispatch site has not wired a session view, the criterion MUST
     /// error rather than silently passing.
     #[test]
+    #[serial_test::serial]
     fn missing_view_fails_closed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = Sep45SessionActiveCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
@@ -267,6 +262,9 @@ mod tests {
             sep45_sessions: None, // ← not wired
             state_store: &store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: 1_700_000_000_000,
         };
 
         let result = criterion.evaluate(&ctx);
@@ -287,15 +285,20 @@ mod tests {
         );
     }
 
-    /// Active session → `Ok(None)` pass.
+    /// A session the view holds active at the evaluation instant passes: one
+    /// millisecond before expiry, `ctx.now_ms` names the second before it.
     #[test]
+    #[serial_test::serial]
     fn active_session_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = Sep45SessionActiveCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
         let args = serde_json::Value::Null;
         let store = make_state_store();
-        let view = AlwaysActiveView;
+        let view = ExpiringView;
 
         let ctx = EvalContext {
             tool: &tool,
@@ -311,6 +314,9 @@ mod tests {
             sep45_sessions: Some(&view),
             state_store: &store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: EXPIRES_AT_UNIX * 1_000 - 1,
         };
 
         let result = criterion.evaluate(&ctx);
@@ -320,15 +326,20 @@ mod tests {
         );
     }
 
-    /// No active session → `Ok(Some(DenyReason::Sep45SessionMissing))`.
+    /// At the expiry instant `ctx.now_ms`, the session is inactive and the
+    /// criterion denies with `Sep45SessionMissing`.
     #[test]
+    #[serial_test::serial]
     fn inactive_session_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = Sep45SessionActiveCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
         let args = serde_json::Value::Null;
         let store = make_state_store();
-        let view = NeverActiveView;
+        let view = ExpiringView;
 
         let ctx = EvalContext {
             tool: &tool,
@@ -344,6 +355,9 @@ mod tests {
             sep45_sessions: Some(&view),
             state_store: &store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: EXPIRES_AT_UNIX * 1_000,
         };
 
         let result = criterion.evaluate(&ctx);
@@ -363,7 +377,11 @@ mod tests {
     /// to the session view.  Verified by a `ContractCheckingView` that only
     /// returns `true` for the exact profile account.
     #[test]
+    #[serial_test::serial]
     fn passes_profile_account_to_view() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = Sep45SessionActiveCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
@@ -390,6 +408,9 @@ mod tests {
             sep45_sessions: Some(&view),
             state_store: &store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: 1_700_000_000_000,
         };
 
         // Must pass because the view is active for the exact profile account.
@@ -420,6 +441,9 @@ mod tests {
             sep45_sessions: Some(&view),
             state_store: &store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: 1_700_000_000_000,
         };
 
         assert!(

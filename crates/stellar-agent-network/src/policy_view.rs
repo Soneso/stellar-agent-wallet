@@ -40,11 +40,12 @@
 //! `PolicyError::CriterionEvaluationFailed` when its view is absent, denying
 //! rather than allowing the call).
 
+use stellar_agent_core::policy::v1::asset_equivalence::assets_equivalent;
 use stellar_agent_core::policy::v1::{
     AccountIdentityView, AccountReserveLookupError, AccountReservesView,
 };
 
-use crate::AccountView;
+use crate::{AccountView, AssetView};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AccountViewAdapter
@@ -152,7 +153,7 @@ impl AccountReservesView for AccountViewAdapter<'_> {
         self.0
             .balances
             .first()
-            .filter(|b| b.asset.asset_type == "native")
+            .filter(|b| b.asset.asset_type == crate::account::AssetType::Native)
             .ok_or_else(|| AccountReserveLookupError {
                 detail: "no native balance entry".to_owned(),
             })
@@ -161,6 +162,52 @@ impl AccountReservesView for AccountViewAdapter<'_> {
                     detail: e.to_string(),
                 })
             })
+    }
+
+    /// `Some(true)` when a non-native entry of `AccountView.balances` is
+    /// `asset`, `Some(false)` when the read requested `asset` and listed no
+    /// entry for it, and `None` otherwise.
+    ///
+    /// The view lists only the trustlines its read requested, so an asset
+    /// the read did not request is unknown.
+    fn holds_trustline(&self, asset: &str, network_passphrase: &str) -> Option<bool> {
+        let is_asset = |view: &AssetView| {
+            view.code
+                .as_deref()
+                .zip(view.issuer.as_deref())
+                .is_some_and(|(code, issuer)| {
+                    assets_equivalent(&format!("{code}:{issuer}"), asset, network_passphrase)
+                })
+        };
+        if self
+            .0
+            .balances
+            .iter()
+            .any(|b| b.asset.asset_type != crate::account::AssetType::Native && is_asset(&b.asset))
+        {
+            Some(true)
+        } else if self.0.requested_trustlines.iter().any(is_asset) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
+/// An owned account view, the form an
+/// [`ObservedAccount`](stellar_agent_core::policy::v1::ObservedAccount) keeps
+/// after one live read. Each fact delegates to [`AccountViewAdapter`].
+impl AccountReservesView for AccountView {
+    fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+        AccountViewAdapter(self).reserves_stroops(base_reserve_stroops)
+    }
+
+    fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+        AccountViewAdapter(self).balance_stroops()
+    }
+
+    fn holds_trustline(&self, asset: &str, network_passphrase: &str) -> Option<bool> {
+        AccountViewAdapter(self).holds_trustline(asset, network_passphrase)
     }
 }
 
@@ -202,6 +249,57 @@ mod tests {
     use crate::{AssetView, BalanceView, ThresholdsView};
     use stellar_agent_core::BASE_RESERVE_STROOPS;
 
+    /// The observed account answers from its one read: the owned view's
+    /// facts equal the adapter's, and the observation is the read's own.
+    #[tokio::test]
+    async fn observed_account_view_keeps_one_read() {
+        use stellar_agent_test_support::xdr_fixtures::{account_entry_xdr, account_ledger_key_xdr};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        const OWNER: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                serde_json::json!({
+                    "entries": [{
+                        "key": account_ledger_key_xdr(OWNER),
+                        "xdr": account_entry_xdr(OWNER, 70_000_000, 3),
+                        "lastModifiedLedgerSeq": 6,
+                    }],
+                    "latestLedger": 300,
+                }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::StellarRpcClient::new(&server.uri()).unwrap();
+        let report = crate::operational::OperationalReport {
+            latest_ledger: 299,
+            close_time_unix: 1_700_000_100,
+            close_lag_seconds: 1,
+        };
+        let observed = crate::fetch_account_observed(&client, OWNER, &report)
+            .await
+            .unwrap();
+        let adapter = AccountViewAdapter::new(observed.view());
+        assert_eq!(observed.balance_stroops().unwrap(), 70_000_000);
+        assert_eq!(
+            observed.balance_stroops().unwrap(),
+            adapter.balance_stroops().unwrap()
+        );
+        assert_eq!(
+            observed.reserves_stroops(BASE_RESERVE_STROOPS),
+            adapter.reserves_stroops(BASE_RESERVE_STROOPS)
+        );
+        assert_eq!(observed.view().balance_stroops().unwrap(), 70_000_000);
+        let observation = observed.observation().unwrap();
+        assert_eq!(observation.ledger_sequence, 300);
+        assert_eq!(observation.close_time_floor_ms, 1_700_000_100_000);
+        assert_eq!(observed.view().observation(), None);
+        server.verify().await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
     fn make_view(balance: &str, subentry_count: u32) -> AccountView {
         AccountView::new(
             "GABC123456789012345678901234567890123456789012345678901234".to_owned(),
@@ -219,6 +317,124 @@ mod tests {
             None,
             None,
         )
+    }
+
+    /// A listed trustline answers `Some(true)`, a requested one without an
+    /// entry `Some(false)`, and one the read did not request is unknown.
+    #[test]
+    fn account_view_adapter_holds_only_listed_trustlines() {
+        const ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+        let passphrase = stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+        let mut view = make_view("100.0000000", 1);
+        view.balances.push(BalanceView::new(
+            AssetView {
+                asset_type: crate::account::AssetType::Native,
+                code: Some("USDC".to_owned()),
+                issuer: Some(ISSUER.to_owned()),
+            },
+            "0.0000000".to_owned(),
+            None,
+            "0.0000000".to_owned(),
+            "0.0000000".to_owned(),
+        ));
+        let adapter = AccountViewAdapter::new(&view);
+        assert_eq!(
+            adapter.holds_trustline(&format!("USDC:{ISSUER}"), passphrase),
+            None
+        );
+        view.balances.push(BalanceView::new(
+            AssetView::credit("USDC", ISSUER),
+            "0.0000000".to_owned(),
+            Some("100.0000000".to_owned()),
+            "0.0000000".to_owned(),
+            "0.0000000".to_owned(),
+        ));
+        let adapter = AccountViewAdapter::new(&view);
+        assert_eq!(
+            adapter.holds_trustline(&format!("USDC:{ISSUER}"), passphrase),
+            Some(true)
+        );
+        assert_eq!(
+            adapter.holds_trustline(&format!("EURC:{ISSUER}"), passphrase),
+            None
+        );
+        assert_eq!(
+            view.holds_trustline(&format!("USDC:{ISSUER}"), passphrase),
+            Some(true)
+        );
+        view.requested_trustlines = vec![
+            AssetView::credit("USDC", ISSUER),
+            AssetView::credit("EURC", ISSUER),
+        ];
+        let adapter = AccountViewAdapter::new(&view);
+        assert_eq!(
+            adapter.holds_trustline(&format!("USDC:{ISSUER}"), passphrase),
+            Some(true)
+        );
+        assert_eq!(
+            adapter.holds_trustline(&format!("EURC:{ISSUER}"), passphrase),
+            Some(false)
+        );
+        assert_eq!(
+            adapter.holds_trustline(&format!("USDT:{ISSUER}"), passphrase),
+            None
+        );
+    }
+
+    /// A read that requests a trustline records it: the listed one answers
+    /// `Some(true)` and the absent one `Some(false)`.
+    #[tokio::test]
+    async fn a_requested_trustline_answers_present_or_absent() {
+        use stellar_agent_test_support::xdr_fixtures::{
+            account_entry_xdr, account_ledger_key_xdr, trustline_entry_xdr,
+            trustline_ledger_key_xdr,
+        };
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        const OWNER: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        const ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                serde_json::json!({
+                    "entries": [
+                        {
+                            "key": account_ledger_key_xdr(OWNER),
+                            "xdr": account_entry_xdr(OWNER, 70_000_000, 1),
+                            "lastModifiedLedgerSeq": 6,
+                        },
+                        {
+                            "key": trustline_ledger_key_xdr(OWNER, "USDC", ISSUER),
+                            "xdr": trustline_entry_xdr(OWNER, "USDC", ISSUER, 0),
+                            "lastModifiedLedgerSeq": 6,
+                        },
+                    ],
+                    "latestLedger": 300,
+                }),
+            ))
+            .mount(&server)
+            .await;
+        let client = crate::StellarRpcClient::new(&server.uri()).unwrap();
+        let requested = [
+            crate::Asset::from_code_and_issuer("USDC", ISSUER).unwrap(),
+            crate::Asset::from_code_and_issuer("EURC", ISSUER).unwrap(),
+        ];
+        let view = crate::fetch_account(&client, OWNER, &requested)
+            .await
+            .unwrap();
+        let passphrase = stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+        assert_eq!(
+            view.holds_trustline(&format!("USDC:{ISSUER}"), passphrase),
+            Some(true)
+        );
+        assert_eq!(
+            view.holds_trustline(&format!("EURC:{ISSUER}"), passphrase),
+            Some(false)
+        );
+        assert_eq!(
+            view.holds_trustline(&format!("USDT:{ISSUER}"), passphrase),
+            None
+        );
     }
 
     // ── account_view_adapter_reserves_stroops_passes_through ─────────────────

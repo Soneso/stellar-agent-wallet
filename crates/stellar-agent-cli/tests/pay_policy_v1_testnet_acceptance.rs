@@ -10,11 +10,10 @@
 //!
 //! # Fixture setup
 //!
-//! A fresh temp directory stands in for `STELLAR_AGENT_HOME` (only ever set on
-//! the CHILD process's environment, never the test-process environment). The
-//! profile name is unique per test run (`pay-v1-acceptance-<pid>-<unix_secs>-<n>`)
-//! so the OS keyring coordinate it drives (below) never collides with a
-//! concurrent or prior local run.
+//! Parent and child processes share one owned, marked `STELLAR_AGENT_HOME`
+//! and the explicitly selected acceptance store. The profile name is unique
+//! per run (`pay-v1-acceptance-<pid>-<unix_secs>-<n>`) so its keyring coordinates
+//! remain distinct across concurrent runs.
 //!
 //! 1. An ed25519 owner keypair is generated in-process.
 //! 2. A signed V1 policy document — one `per_tx_cap` rule matching
@@ -30,7 +29,7 @@
 //!    `policy_owner_key_id.service = "stellar-agent-owner-<profile>"` (the
 //!    prefix `build_v1_policy_engine` strips to recover the profile name) is
 //!    written to `<home>/profiles/<profile>.toml`.
-//! 4. The owner **PUBLIC** key is enrolled into the REAL OS keyring by
+//! 4. The owner **PUBLIC** key is enrolled into the selected store by
 //!    spawning `stellar-agent profile enroll-owner-key --secret-env <VAR>
 //!    --expected-address <owner_g>` as its own subprocess (the owner seed is
 //!    set only on that subprocess's environment) — the production write path
@@ -66,22 +65,20 @@
 //!
 //! This suite covers the FULL production path for the owner coordinate:
 //! profile load -> `enroll-owner-key` keyring registration (subprocess) ->
-//! `pay`'s V1 gate reading the owner public key from that SAME OS keyring
+//! `pay`'s V1 gate reading the owner public key from that same store
 //! entry -> signature verification -> `per_tx_cap` evaluation -> (on allow)
 //! sign -> submit -> confirm. The window-state HMAC key and generation
-//! counter already round-trip the real keyring in this same suite (via
+//! counter also round-trip the selected store in this suite (via
 //! `PersistedWindowStore`, unconditionally, no test-only override exists for
 //! that coordinate); the owner coordinate now exercises the identical
 //! keyring backend end to end.
 //!
-//! # Platform keyring precondition
+//! # Storage route
 //!
-//! The v1 policy path registers the platform keyring store before the gate
-//! and refuses when registration fails, so this suite requires a functioning
-//! platform keyring (macOS Keychain in local dev; a headless Secret Service,
-//! provisioned by the CI workflow via gnome-keyring, in CI). Keyring init
-//! failure fails this test — it is not an infrastructure precondition to be
-//! skipped.
+//! The acceptance driver configures an encrypted headless store by default.
+//! Platform selection requires the live feature and its exact permit, with
+//! a functioning native store. Parent and children use the same selection.
+//! Store registration failure fails the test.
 //!
 //! Gated behind `testnet-acceptance`:
 //!
@@ -98,7 +95,9 @@
     reason = "test-only; panics and unwraps are acceptable in testnet acceptance tests"
 )]
 
-use std::process::Command;
+#[path = "cli/acceptance_storage.rs"]
+mod acceptance_storage;
+
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -159,14 +158,9 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 2xx for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Polls RPC until the freshly-funded account is queryable, tolerating
@@ -240,7 +234,8 @@ fn write_profile_toml(home: &std::path::Path, profile: &str) {
 /// coordinate-generic) that removes the entry when dropped.
 fn rotate_audit_key_via_cli(home: &std::path::Path, profile: &str) -> OwnerKeyringGuard {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
-    let output = Command::new(bin_path)
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
+    let output = acceptance_storage::command(bin_path, home, None)
         .args(["profile", "rotate-audit-key", profile])
         .env("STELLAR_AGENT_HOME", home)
         .output()
@@ -268,6 +263,7 @@ fn write_signed_policy_toml(
     home: &std::path::Path,
     profile: &str,
     owner_signing_key: &SigningKey,
+    asset: &str,
 ) -> [u8; 32] {
     let owner_pubkey = owner_signing_key.verifying_key().to_bytes();
 
@@ -276,7 +272,7 @@ fn write_signed_policy_toml(
          scope = \"profile:{profile}\"\n\n\
          [[rules]]\n\
          match = {{ tool = \"stellar_pay\", chain = \"*\" }}\n\
-         criteria = [{{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = {CAP_STROOPS} }}]\n\
+         criteria = [{{ kind = \"per_tx_cap\", asset = \"{asset}\", max_stroops = {CAP_STROOPS} }}, {{ kind = \"per_period_cap\", asset = \"{asset}\", window = \"1d\", max_stroops = 10000000000 }}]\n\
          decision = \"allow\"\n"
     );
 
@@ -299,12 +295,12 @@ fn write_signed_policy_toml(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Owner-key enrollment (real keyring) + cleanup guard
+// Owner-key enrollment and entry lifetime
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// RAII guard that deletes the enrolled owner-key keyring entry on drop
 /// (success, assertion panic, or early return alike), so a failed test run
-/// never leaks an entry into the OS keyring — belt-and-suspenders on top of
+/// never leaves an entry in the selected store, in addition to
 /// [`unique_profile_name`]'s per-run namespacing.
 struct OwnerKeyringGuard {
     coord: stellar_agent_core::profile::schema::KeyringEntryRef,
@@ -323,7 +319,7 @@ impl Drop for OwnerKeyringGuard {
     }
 }
 
-/// Enrolls `owner_s_strkey`'s derived public key into the REAL OS keyring for
+/// Enrolls `owner_s_strkey`'s derived public key into the selected store for
 /// `profile`, by spawning `stellar-agent profile enroll-owner-key` as its own
 /// subprocess — the exact production write path `enroll_owner_key.rs` drives.
 ///
@@ -340,7 +336,8 @@ fn enroll_owner_key_via_cli(
     owner_g_strkey: &str,
 ) -> OwnerKeyringGuard {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
-    let output = Command::new(bin_path)
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
+    let output = acceptance_storage::command(bin_path, home, None)
         .args([
             "profile",
             "enroll-owner-key",
@@ -390,6 +387,10 @@ fn enroll_owner_key_via_cli(
 /// Spawns `stellar-agent pay <destination> <amount>` with `STELLAR_AGENT_HOME`
 /// and the owner-pubkey-file override set on the CHILD process only, and
 /// returns `(exit_code, stdout_json_envelope)`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the acceptance command supplies each explicit payment input"
+)]
 fn run_pay(
     home: &std::path::Path,
     profile: &str,
@@ -397,13 +398,17 @@ fn run_pay(
     source_secret: &str,
     destination_g: &str,
     amount: &str,
+    asset: &str,
+    rpc_url: &str,
 ) -> (i32, serde_json::Value) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
-    let output = Command::new(bin_path)
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
+    let output = acceptance_storage::command(bin_path, home, None)
         .args([
             "pay",
             destination_g,
             amount,
+            asset,
             "--source",
             source_g,
             "--secret-env",
@@ -413,10 +418,11 @@ fn run_pay(
             "--network",
             "testnet",
             "--rpc-url",
-            TESTNET_RPC_URL,
+            rpc_url,
         ])
         .env(PAY_SECRET_ENV_VAR, source_secret)
         .env("STELLAR_AGENT_HOME", home)
+        .env("STELLAR_AGENT_TEST_COUNT_SENDS", "1")
         .output()
         .expect("stellar-agent pay subprocess must spawn");
 
@@ -449,21 +455,56 @@ fn run_pay(
 /// under-cap payment runs the full build-sign-submit pipeline and reaches
 /// ledger inclusion.
 #[tokio::test]
+#[serial_test::serial]
 async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
-    // The v1 policy path registers the platform keyring store before the gate
-    // and refuses when registration fails, so this suite needs a functioning
-    // platform keyring (macOS Keychain locally; a headless Secret Service,
-    // provisioned by the CI workflow, on Linux CI runners).
-    stellar_agent_network::init_platform_keyring_store()
-        .expect("platform keyring store must initialise on this host");
+    let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let home = tempfile::tempdir_in(scratch.canonicalize().unwrap()).expect("storage sandbox");
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).unwrap();
+    let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    // Parent key reads and child key writes share this owned home and the
+    // explicitly selected acceptance backend. Native access needs its permit.
+    acceptance_storage::dispatch(stellar_agent_network::init_platform_keyring_store, || {
+        #[cfg(feature = "live-platform-keyring")]
+        {
+            use stellar_agent_network::keyring::live::{
+                LivePlatformKeyring, init_platform_keyring_store_live,
+            };
+            init_platform_keyring_store_live(
+                LivePlatformKeyring::acknowledge_real_platform_keyring(),
+            )
+        }
+        #[cfg(not(feature = "live-platform-keyring"))]
+        unreachable!("selection requires the native feature")
+    })
+    .expect("selected acceptance store");
 
-    let home = tempfile::TempDir::new().expect("tempdir");
     let profile_name = unique_profile_name();
 
-    // ── Fixture: owner keypair, signed policy, profile, real-keyring enrollment ─
+    // Owner keypair, signed policy, profile and selected-store enrollment.
     let owner_signing_key = SigningKey::generate(&mut OsRng);
-    let owner_pubkey = write_signed_policy_toml(home.path(), &profile_name, &owner_signing_key);
+    let owner_pubkey =
+        write_signed_policy_toml(home.path(), &profile_name, &owner_signing_key, "native");
     write_profile_toml(home.path(), &profile_name);
+
+    let isolated =
+        acceptance_storage::command(env!("CARGO_BIN_EXE_stellar-agent"), home.path(), None)
+            .args(["profile", "list"])
+            .env("STELLAR_AGENT_HOME", home.path())
+            .output()
+            .unwrap();
+    assert!(
+        isolated.status.success(),
+        "read-only profile check: {} {}",
+        String::from_utf8_lossy(&isolated.stdout),
+        String::from_utf8_lossy(&isolated.stderr)
+    );
+    let isolated: serde_json::Value = serde_json::from_slice(&isolated.stdout).unwrap();
+    assert_eq!(
+        isolated["data"],
+        serde_json::json!([profile_name]),
+        "read-only proof of the child's isolated profile directory"
+    );
 
     let owner_g_strkey = stellar_strkey::ed25519::PublicKey(owner_pubkey).to_string();
     // `Unredacted::to_string` yields a stack-allocated heapless string (the
@@ -474,7 +515,7 @@ async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
         .to_string()
         .as_str()
         .to_owned();
-    // Enroll the owner PUBLIC key through the REAL OS keyring via the
+    // Enroll the owner PUBLIC key through the selected store via the
     // production `enroll-owner-key` subprocess; `_owner_keyring_guard` deletes
     // the entry when it drops at the end of this function (every exit path).
     let _owner_keyring_guard =
@@ -482,11 +523,22 @@ async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
 
     // ── Fixture: source + destination accounts ────────────────────────────────
     let (source_g, source_seed) = fresh_keypair();
-    let (dest_g, _dest_seed) = fresh_keypair();
-    fund_via_friendbot(&source_g).await;
-    fund_via_friendbot(&dest_g).await;
+    let (dest_g, dest_seed) = fresh_keypair();
+    let (issuer, issuer_seed) = fresh_keypair();
+    let local = std::env::var_os("TOOLSET_ACCEPTANCE_LOCAL").is_some();
+    let mock = if local {
+        Some(local_payment_rpc(&source_g, &dest_g, &issuer).await)
+    } else {
+        fund_via_friendbot(&source_g).await;
+        fund_via_friendbot(&dest_g).await;
+        fund_via_friendbot(&issuer).await;
+        None
+    };
+    let rpc_url = mock
+        .as_ref()
+        .map_or_else(|| TESTNET_RPC_URL.to_owned(), wiremock::MockServer::uri);
 
-    let client = StellarRpcClient::new(TESTNET_RPC_URL).expect("RPC client");
+    let client = StellarRpcClient::new(&rpc_url).expect("RPC client");
     wait_until_account_queryable(&client, &source_g).await;
     wait_until_account_queryable(&client, &dest_g).await;
 
@@ -508,6 +560,8 @@ async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
         &source_s_strkey,
         &dest_g,
         "150 XLM",
+        "native",
+        &rpc_url,
     );
 
     assert_eq!(
@@ -557,6 +611,8 @@ async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
         &source_s_strkey,
         &dest_g,
         "10 XLM",
+        "native",
+        &rpc_url,
     );
 
     assert_eq!(
@@ -584,4 +640,303 @@ async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
         "destination native balance must strictly increase after the under-cap payment \
          (before={dest_balance_before}, after={dest_balance_after})"
     );
+
+    wait_until_account_queryable(&client, &issuer).await;
+    let mut issued_asset = String::new();
+    for seed in [*source_seed, *dest_seed] {
+        let sequence = fetch_account(&client, &issuer, &[])
+            .await
+            .unwrap()
+            .sequence_number
+            + 1;
+        let (asset, setup) =
+            stellar_agent_test_support::signed_envelope::funded_issued_payment_envelope(
+                seed,
+                *issuer_seed,
+                sequence,
+            );
+        stellar_agent_network::submit_transaction_and_wait(
+            &client,
+            &setup,
+            Duration::from_secs(120),
+            stellar_agent_test_support::signed_envelope::TESTNET_PASSPHRASE,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        issued_asset = asset;
+    }
+    let profile = stellar_agent_core::profile::loader::load_from_path(
+        &profile_name,
+        &home
+            .path()
+            .join("profiles")
+            .join(format!("{profile_name}.toml")),
+        None,
+    )
+    .unwrap();
+    let base = stellar_strkey::ed25519::PublicKey::from_string(&dest_g)
+        .unwrap()
+        .0;
+    let evidence_dir = std::env::var_os("STELLAR_AGENT_PAYMENT_EVIDENCE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/tmp/payment-evidence")
+        });
+    let evidence_dir = if local {
+        evidence_dir.join("local")
+    } else {
+        evidence_dir
+    };
+    std::fs::create_dir_all(&evidence_dir).unwrap();
+    let revision = std::process::Command::new("git")
+        .args(["--no-optional-locks", "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(revision.status.success());
+    let revision = String::from_utf8(revision.stdout).unwrap();
+    let feature_state = if cfg!(feature = "mainnet-write") {
+        "on"
+    } else {
+        "off"
+    };
+    let evidence_path = evidence_dir.join(format!(
+        "cli-{feature_state}-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    let mut completed = 0;
+    for asset in ["native", issued_asset.as_str()] {
+        write_signed_policy_toml(home.path(), &profile_name, &owner_signing_key, asset);
+        let mut asset_cases = u32::from(asset == "native");
+        for id in [None, Some(0), Some(u64::MAX)] {
+            let destination = id.map_or_else(
+                || dest_g.clone(),
+                |id| {
+                    stellar_strkey::ed25519::MuxedAccount { ed25519: base, id }
+                        .to_string()
+                        .as_str()
+                        .to_owned()
+                },
+            );
+            let source_before = account_state(&client, &source_g).await;
+            let attempts = || {
+                std::fs::read_to_string(home.path().join("payment-send-attempts"))
+                    .map(|text| text.lines().count())
+                    .unwrap_or(0)
+            };
+            let sends_before = attempts();
+            let recorded_before = match &mock {
+                Some(mock) => {
+                    stellar_agent_test_support::rpc_request_count(mock, "sendTransaction").await
+                }
+                None => 0,
+            };
+            let (code, denied) = run_pay(
+                home.path(),
+                &profile_name,
+                &source_g,
+                &source_s_strkey,
+                &destination,
+                if asset == "native" {
+                    "150 XLM"
+                } else {
+                    "150 USD"
+                },
+                asset,
+                &rpc_url,
+            );
+            assert_eq!(code, 1, "{denied}");
+            assert_eq!(denied["error"]["code"], "policy.deny.per_tx_cap_exceeded");
+            assert_eq!(account_state(&client, &source_g).await, source_before);
+            let (code, paid) = run_pay(
+                home.path(),
+                &profile_name,
+                &source_g,
+                &source_s_strkey,
+                &destination,
+                if asset == "native" {
+                    "10 XLM"
+                } else {
+                    "10 USD"
+                },
+                asset,
+                &rpc_url,
+            );
+            assert_eq!(code, 0, "{paid}");
+            assert_eq!(paid["ok"], true);
+            let hash = paid["data"]["tx_hash"].as_str().unwrap();
+            let raw = client
+                .get_transaction_raw(&stellar_xdr::Hash(
+                    stellar_agent_core::hex::decode_hex32(hash).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let sent = raw
+                .raw()
+                .envelope_xdr
+                .as_deref()
+                .expect("confirmed transaction retains its envelope");
+            use stellar_agent_core::envelope_decode::{
+                ClassicOperation, ClassicTransactionKind, classic_summary,
+            };
+            assert_eq!(
+                classic_summary(sent, ClassicTransactionKind::Payment)
+                    .unwrap()
+                    .operation,
+                ClassicOperation::Payment {
+                    destination: destination.clone(),
+                    asset: if asset == "native" {
+                        "XLM".to_owned()
+                    } else {
+                        asset.to_owned()
+                    },
+                    amount_stroops: 100_000_000
+                }
+            );
+            assert_eq!(
+                account_state(&client, &source_g).await.0 - source_before.0,
+                1,
+                "one confirmed sequence increment"
+            );
+            let send_count = attempts() - sends_before;
+            if let Some(mock) = &mock {
+                assert_eq!(
+                    send_count,
+                    stellar_agent_test_support::rpc_request_count(mock, "sendTransaction").await
+                        - recorded_before,
+                    "the child observer agrees with the endpoint"
+                );
+            }
+            assert_eq!(
+                send_count, 1,
+                "one endpoint send for a cap refusal followed by success"
+            );
+            asset_cases += 1;
+            let memory = stellar_agent_core::policy::v1::PolicyStateStore::new();
+            stellar_agent_network::policy_state::PersistedWindowStore::for_profile(&profile_name)
+                .load_into(&profile_name, &profile, &memory)
+                .unwrap();
+            let observed = memory
+                .query_window(
+                    &stellar_agent_core::policy::v1::criteria::state_store::StateKey::new(
+                        &profile_name,
+                        1,
+                        asset,
+                        86_400,
+                    ),
+                    stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                observed,
+                (i128::from(asset_cases) * 100_000_000, asset_cases),
+                "one durable debit"
+            );
+            let audit = std::fs::read_to_string(&profile.audit_log_path).unwrap();
+            let row = audit
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .rfind(|row| row["kind"] == "value_action_pending")
+                .unwrap();
+            use sha2::{Digest as _, Sha256};
+            let destination_hash =
+                stellar_agent_core::hex::encode(&Sha256::digest(destination.as_bytes()));
+            assert_eq!(row["legs"][0]["destination_sha256"], destination_hash);
+            assert_eq!(
+                row["legs"][0]["destination_redacted"],
+                stellar_agent_core::observability::redact_strkey_first5_last5(&destination)
+            );
+            assert_eq!(row["legs"][0]["asset"], asset);
+            assert_eq!(row["legs"][0]["amount"], "100000000");
+            assert!(!row.to_string().contains(&destination));
+            let receipt = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name)
+                .unwrap()
+                .find_by_tx_hash(hash)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                receipt.destinations,
+                id.map_or(
+                    stellar_agent_core::profile::receipt::PaymentDestinations::None,
+                    |_| stellar_agent_core::profile::receipt::PaymentDestinations::Single(
+                        destination.clone()
+                    )
+                )
+            );
+            let evidence = serde_json::json!({
+                "schema": 1, "revision": revision.trim(), "feature_state": feature_state,
+                "execution": if local { "local-fixture" } else { "live-testnet" },
+                "test": "pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap", "route": "cli",
+                "case": format!("{}/{}", if asset == "native" { "native" } else { "issued" }, id.map_or("G", |id| if id == 0 { "M0" } else { "Mmax" })),
+                "envelope_hash": stellar_agent_network::submit::envelope_hash_hex(sent), "destination": destination, "asset": asset, "amount_stroops": "100000000",
+                "transaction_hash": hash, "ledger": raw.ledger().unwrap(), "send_count": send_count,
+                "send_count_basis": "recorded RPC attempts",
+                "debit_count": observed.1 - (asset_cases - 1), "audit_destination_sha256": destination_hash,
+                "receipt": {"envelope_hash": receipt.envelope_hash, "transaction_hash": receipt.tx_hash, "destination": id.map(|_| destination.clone())},
+            });
+            use std::io::Write as _;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&evidence_path)
+                    .unwrap(),
+                "{evidence}"
+            )
+            .unwrap();
+            completed += 1;
+        }
+    }
+    assert_eq!(
+        completed, 6,
+        "every native/issued G/M0/Mmax CLI case executes"
+    );
+}
+
+/// Local ledger fixture for the same acceptance body, including actual sent XDR.
+async fn local_payment_rpc(source: &str, destination: &str, issuer: &str) -> wiremock::MockServer {
+    let mock = wiremock::MockServer::start().await;
+    let accounts = [source.to_owned(), destination.to_owned(), issuer.to_owned()];
+    let state = std::sync::Mutex::new((0i64, std::collections::HashMap::<String, String>::new()));
+    wiremock::Mock::given(wiremock::matchers::method("POST")).respond_with(move |request: &wiremock::Request| {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let mut state = state.lock().unwrap();
+        let result = match body["method"].as_str().unwrap() {
+            "getNetwork" => serde_json::json!({"passphrase": stellar_agent_test_support::signed_envelope::TESTNET_PASSPHRASE, "protocolVersion": 23}),
+            "getHealth" => serde_json::json!({"status":"healthy", "latestLedger":1001, "oldestLedger":1, "ledgerRetentionWindow":1000}),
+            "getLedgers" => serde_json::json!({"latestLedger":1001, "latestLedgerCloseTime":(stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000).to_string(), "oldestLedger":1, "oldestLedgerCloseTime":1, "cursor":"1001", "ledgers":[]}),
+            "getLedgerEntries" => {
+                use stellar_agent_test_support::xdr_fixtures::*;
+                let mut entries = Vec::new();
+                for (index, account) in accounts.iter().enumerate() {
+                    let key = account_ledger_key_xdr(account);
+                    if body["params"]["keys"].as_array().unwrap().contains(&key.clone().into()) {
+                        let balance = 100_000_000_000 + if index == 1 { state.0 * 100_000_000 } else { 0 };
+                        entries.push(serde_json::json!({"key": key, "xdr": account_entry_xdr_with_seq(account, balance, 0, 100 + state.0), "lastModifiedLedgerSeq": 1000}));
+                    }
+                    let key = trustline_ledger_key_xdr(account, "USD", &accounts[2]);
+                    if body["params"]["keys"].as_array().unwrap().contains(&key.clone().into()) {
+                        entries.push(serde_json::json!({"key": key, "xdr": trustline_entry_xdr(account, "USD", &accounts[2], 1_000_000_000), "lastModifiedLedgerSeq": 1000}));
+                    }
+                }
+                serde_json::json!({"entries": entries, "latestLedger": 1001})
+            }
+            "sendTransaction" => {
+                let envelope = body["params"]["transaction"].as_str().unwrap();
+                let hash = stellar_agent_test_support::signed_envelope::transaction_hash_hex(envelope, stellar_agent_test_support::signed_envelope::TESTNET_PASSPHRASE);
+                if state.1.insert(hash.clone(), envelope.to_owned()).is_none() { state.0 += 1; }
+                serde_json::json!({"hash": hash, "status": "PENDING", "latestLedger": 1001, "latestLedgerCloseTime": "1234567890"})
+            }
+            "getTransaction" => serde_json::json!({"status": "SUCCESS", "ledger": 1001, "latestLedger": 1002, "oldestLedger": 1, "createdAt": (stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000).to_string(), "envelopeXdr": state.1.get(body["params"]["hash"].as_str().unwrap()), "txHash": body["params"]["hash"]}),
+            "getFeeStats" => {
+                let fee = serde_json::json!({"max":"100", "min":"100", "mode":"100", "p10":"100", "p20":"100", "p30":"100", "p40":"100", "p50":"100", "p60":"100", "p70":"100", "p80":"100", "p90":"100", "p95":"100", "p99":"100", "transactionCount":"10", "ledgerCount":5});
+                serde_json::json!({"inclusionFee":fee, "sorobanInclusionFee":fee, "latestLedger":1001})
+            }
+            method => panic!("unexpected local RPC method {method}"),
+        };
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
+    }).mount(&mock).await;
+    mock
 }

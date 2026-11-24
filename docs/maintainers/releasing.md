@@ -1,15 +1,39 @@
 # Releasing
 
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This page covers cutting a release tag, the checks the release and publish
 workflows run, the GitHub settings they rely on, and the crates.io publish
 dispatch.
 
 ## Cut a release tag
 
-1. Merge the release preparation into `main` through a pull request. It bumps
-   the workspace version and every internal dependency pin (see
-   [Building and testing](building.md)) and adds a `## [<version>]` heading to
-   `CHANGELOG.md`.
+1. Prepare the release in a pull request to `main`.
+   Bump the workspace version, every internal dependency pin, and documentation
+   pins as [Building and testing](building.md) describes.
+   Put the existing Unreleased body under a dated
+   `## [<version>] - YYYY-MM-DD` heading.
+   Leave a fresh `## [Unreleased]` heading above it and update the comparison
+   definitions separately.
+   Keep existing entries in place within the new version section.
+   Run the fragment fold with the version string without `v`:
+
+   ```bash
+   python3 .github/scripts/changelog.py check
+   python3 .github/scripts/changelog.py release --version VERSION
+   ```
+
+   Review the compiled entries and fragment deletions, then merge the
+   preparation pull request.
+   Rerun release mode when pending fragments remain, including fragments that
+   arrive during preparation.
+   Never edit an existing fragment. Add a new file for a further entry.
+   Each fragment file belongs to one pull request and is never reused.
+   A sync merge deletes fragments that `main` folds and deletes.
+   It never deletes a fragment that holds an unreleased entry under this rule.
+   If a fragment violates this rule, preserve every unreleased item in a new
+   file before accepting deletion.
 2. Wait for CI to pass on that `main` commit.
 3. From a checkout of that commit, check the workspace members on crates.io:
 
@@ -17,9 +41,10 @@ dispatch.
    .github/scripts/check-crates-exist.sh
    ```
 
-   The script exits 1 and names every publishable member missing on
-   crates.io. The publish run halts at each of them, so have the crates.io
-   token for each first upload ready, as
+   The script exits 1 when a publishable member is missing on crates.io or
+   its existence is not confirmed, and prints one line per crate. The publish
+   run halts at each missing member, so have the crates.io token for each
+   first upload ready, as
    [Publish a new crate for the first time](#publish-a-new-crate-for-the-first-time)
    describes.
 4. Tag that commit and push the tag:
@@ -35,6 +60,14 @@ The tag push starts `.github/workflows/release.yml`. Tag only a commit on
 same script with `--warn`, annotates the run with one warning per missing
 member, and the release proceeds.
 
+The changelog guard checks pull requests into `mainnet-write`.
+An eligible sync merge there has exactly two parents and brings new ancestry
+from `main` through its second parent.
+Its `CHANGELOG.md` equals the clean three-way merge over the parents' merge
+base, preserving both sides' lines.
+The guard refuses conflicts; a maintainer resolves and merges them.
+The guard never accepts hand-resolved changelog bytes.
+
 ## What the release preflight refuses
 
 The `preflight` job runs before any build. It stops the release when any of
@@ -47,10 +80,21 @@ these holds:
 - A workspace member's version differs from the tag.
 - A workspace member's `repository` differs from this repository's URL.
 - `CHANGELOG.md` has no heading for the version.
+- `changelog.d/` contains any entry other than `README.md`, including hidden
+  files or directories.
 - The documented install surface fails
   `.github/scripts/check-install-surface.py`.
 - `cargo deny check` fails.
 - The checkout has uncommitted or untracked files.
+
+`Verify no pending changelog fragments` reads the tagged tree immediately
+after the version header check.
+When it fails, rerun release mode during preparation, review the fold, and
+merge the prepared version before tagging.
+Only release preparation pull requests to `main` change the compiled
+changelog; reviewers enforce this policy on `main`.
+The release workflow reads the folded entries and leaves the tagged tree
+unchanged.
 
 A tag push runs the `release.yml` of the tagged commit. These checks therefore
 bind only tags whose commit carries them. The settings in
@@ -63,17 +107,24 @@ No job that holds a credential compiles code or runs dependency code.
 | Workflow | Job | Credential | Compiles code |
 |---|---|---|---|
 | `release.yml` | `preflight` | none | no |
+| `release.yml` | `vendored-wasm` | none | yes |
 | `release.yml` | `build` | none | yes |
 | `release.yml` | `sign-macos` | Apple secrets of `release-signing` | no |
+| `release.yml` | `verify-packaged` | none | no |
+| `release.yml` | `verify-provenance` | none | no |
 | `release.yml` | `hashes` | none | no |
 | `release.yml` | `sign` | OIDC token for cosign | no |
 | `release.yml` | `provenance` | OIDC token, `contents: write` | no |
 | `release.yml` | `publish` | `contents: write` | no |
 | `publish.yml` | `verify` | none | yes |
+| `publish.yml` | `vendored-wasm` | none | yes |
 | `publish.yml` | `publish` | OIDC token for crates.io, in `crates-io` | no |
+| `publish.yml` | `verify-install` | none | yes |
 | `notarize-smoke.yml` | `build` | none | yes |
 | `notarize-smoke.yml` | `sign` | Apple secrets of `release-signing` | no |
 | `release-rehearsal.yml` | `build` | none | yes |
+| `release-rehearsal.yml` | `verify-packaged` | none | no |
+| `release-rehearsal.yml` | `verify-crates` | none | yes |
 
 A credentialed job downloads artifacts of other jobs under the runner's temp
 directory and reads them as data. It reads outputs of other jobs only through
@@ -92,20 +143,77 @@ check the checkout again before they sign. The publish job must check the
 checkout after the download and run the ancestry, checksum, and toolchain
 checks. It must check the checkout again after the checksum comparison and
 before it mints the registry token. None of these steps may be conditional,
-turn off errexit, or chain a check with a shell operator.
+turn off errexit, or chain a check with a shell operator, and a line before a
+check that ends in `&&`, `||`, `|`, or `|&` fails the check. An inline comment
+after the operator, as in `false && # note`, hides the operator from that
+test, so the check on the next line is counted although the shell may skip it
+or pipe into it. A function defined earlier in the step that shadows the
+checked command, such as `bash() { return 0; }`, makes the check count a call
+that runs the function.
 
 The same check holds every job of `release-rehearsal.yml` to a token that
 reads the repository contents and nothing else, with no environment, no
-secret, and no expression that reads the workflow token. It also requires the
-build scripts under `.github/scripts/release/` to equal the build job of
-`release.yml`: the same `cargo build` and `cross build` lines, and the Perl
-and libsodium setup steps line for line.
+secret, and no expression that reads the workflow token. Both build jobs must
+call the shared build, Perl, and libsodium scripts under `.github/scripts/release/`.
+The build immediately follows the environment setup, and its first action
+checks compiler overrides and cargo configuration files.
 
-The `sign-macos` job receives the unsigned binaries as a tar.
-`.github/scripts/validate-unsigned-archive.py` refuses the tar unless it holds
-exactly the two binaries as regular files, each a thin Mach-O executable for
-the target. The job then signs, notarizes, and packs the archive through the
-composite action in `.github/actions/macos-sign-notarize/`.
+Each release verification step must run its check as an unconditional
+command: the archive check, the provenance content and source discipline
+checks, the packaged marker check, and the install check. A comment, an
+operator that ignores the status, or a condition fails the check. The
+verification jobs hold no publishing or signing credential, their token has
+`contents: read`, and they download the run's artifacts and the registry
+dependencies. The archive checks run on a runner of each release target, and
+the rehearsal packages with the toolchain that `publish.yml` packages with.
+In `ci.yml`, `feature-discipline` runs unconditionally. The other feature jobs
+skip only a documentation-only pull request into `mainnet-write`, where
+`docs-tests` runs instead. Each job runs its defining commands unconditionally.
+
+The `release-cache` rule refuses cache actions in the release and rehearsal.
+Both build cold from locked sources. The `release-toolchain` rule requires
+both builds to install `RELEASE_TOOLCHAIN` and pin `RUSTUP_TOOLCHAIN` before
+compilation, with the same value as `publish.yml`.
+
+The `release-wasm-gate` rule requires `hashes` and `publish` to depend on the
+local vendored Wasm workflow call, without conditions, inputs, or secrets, so
+signing, provenance, and publication wait for the rebuild. The called
+workflow declares `workflow_call`; every cache step starts its condition with
+`github.ref_type != 'tag' && !inputs.publication`, so tag and publication runs
+use no cache. Its rebuild runs exactly when the tree check asks
+for one, reads both stellar-cli artifacts of its own run, uses no cache, and
+rebuilds and compares unconditionally. No job or step of it continues on an
+error, and no step of the tree check, the rebuild, or the gate suppresses a
+failure. The gate job runs on `always()`, needs the four other jobs, and runs
+the gate command with each job result and the run's ref type. On a tag the
+gate passes only after a rebuild.
+
+The `release-publish-sums` rule requires an unconditional checksum check before
+publication. The archives under `all-artifacts` must equal `SHA256SUMS` by
+name, count, and digest.
+
+The build copies `stellar-agent` to `stellar-agent-mcp` and compares the
+bytes, so the `sign-macos` job receives one executable under two names as a
+tar. `.github/scripts/validate-unsigned-archive.py` refuses the tar unless it
+holds exactly those two names as regular files with equal bytes, each a thin
+Mach-O executable for the target. The job then signs `stellar-agent`, copies
+the signed file to `stellar-agent-mcp` with `derive-alias.sh`, notarizes both,
+verifies both signatures, and packs the archive through the composite action
+in `.github/actions/macos-sign-notarize/`.
+
+The Windows build leg links libsodium from `libsodium-1.0.22-stable-msvc.zip`.
+The build script of `libsodium-sys-stable` verifies it with the minisign key
+embedded in that pinned dependency and fails the build on an invalid signature.
+Upstream replaces stable archives in place, so
+`.github/scripts/release/sodium.sh` logs the fetched archive's SHA-256 and
+pins no digest. An update of `libsodium-sys-stable` that changes the libsodium
+version changes the file names in `sodium.sh`, and one that changes the
+minisign key changes the key in the command below.
+Verify a downloaded archive by hand with:
+
+```sh
+minisign -Vm libsodium-1.0.22-stable-msvc.zip -P RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
+```
 
 ## GitHub settings
 
@@ -115,6 +223,7 @@ them before the next release.
 
 - A tag ruleset on `refs/tags/v*` that restricts creations, updates, and
   deletions, with a bypass list of release maintainers only.
+- The rulesets for `main` and `mainnet-write` require the `changelog` check.
 - The `release-signing` environment:
   - The five secrets `APPLE_DEVELOPER_ID_P12`,
     `APPLE_DEVELOPER_ID_P12_PASSWORD`, `APPLE_ASC_API_KEY_P8`,
@@ -142,15 +251,16 @@ Apply the `release-signing` settings in this order:
 
 ## Bump the publish toolchain
 
-`publish.yml` sets `RELEASE_TOOLCHAIN` to an exact Rust release. Both publish
-jobs install that release and set `RUSTUP_TOOLCHAIN` to it. The publish job
+`publish.yml` sets `RELEASE_TOOLCHAIN` to an exact Rust release. The `verify`,
+`publish`, and `verify-install` jobs install that release and set
+`RUSTUP_TOOLCHAIN` to it. The publish job
 refuses any other `cargo` or `rustc` version, since the archive bytes can
 depend on the cargo version.
 
-To bump it, change the value in a pull request and merge it before the
-dispatch. `rustup check` and
-`https://static.rust-lang.org/dist/channel-rust-stable.toml` show the current
-stable release.
+To bump it, change `RELEASE_TOOLCHAIN` in `publish.yml`, `release.yml`, and
+`release-rehearsal.yml` in one pull request and merge it before the dispatch.
+`rustup check` and `https://static.rust-lang.org/dist/channel-rust-stable.toml`
+show the current stable release.
 
 ## Publish to crates.io
 
@@ -165,7 +275,12 @@ gh workflow run publish.yml --ref main -f tag=v<version>
   which builds and packages every workspace member, the unpublished
   acceptance member included. It uploads the archive checksums as
   `SHA256SUMS` and holds no credential.
-- `publish` starts after the `crates-io` approval. It regenerates the archives
+- `vendored-wasm` rebuilds every vendored contract Wasm file of the tag's
+  verified commit from its pinned source with the pinned tools and compares
+  the bytes. It holds no credential and builds both stellar-cli binaries
+  from source.
+- `publish` starts only after that rebuild passes and the `crates-io` approval.
+  It refuses a tag that moves after verification. It regenerates the archives
   without building and requires them to equal `SHA256SUMS`. It then mints a
   short-lived token through Trusted Publishing and uploads each crate with
   `cargo publish --no-verify`.
@@ -178,12 +293,14 @@ gh workflow run publish.yml --ref main -f tag=v<version>
 `-f verify_only=true` runs only `verify`, for example to rehearse a tag before
 the approval.
 
-Both jobs package the tag's tree and run the scripts of the commit the
-dispatch runs on, which is `main` for a publish. The tier lists in
-`publish-crates.sh` must match the tag's publishable workspace members, so a
-tag with another member set stops before any upload. Every tag up to
-`v0.1.0-alpha.9` has another member set, so none of them can be published
-again through this workflow.
+The `verify` and `publish` jobs package the tag's tree and run the scripts of
+the commit the dispatch runs on, which is `main` for a publish. The
+`vendored-wasm` job runs the rebuild script of the tagged commit, so a tag
+whose script does not accept the `publication` ref type stops at that gate.
+The tier lists in `publish-crates.sh` must match the tag's publishable
+workspace members, so a tag with another member set stops before any upload.
+Every tag up to `v0.1.0-alpha.9` has another member set, so none of them can be
+published again through this workflow.
 
 ## Publish a new crate for the first time
 
@@ -261,8 +378,8 @@ target as the release does and uploads each as the artifact
 notarized, and the run hashes, attests, and publishes nothing.
 
 The workflow holds no credential: its token reads the repository contents and
-nothing else. Its build cache has a key prefix of its own, so a release build
-never restores a cache that a rehearsal saved.
+nothing else. The release and rehearsal restore and save no cache, so both
+build cold from locked sources.
 
 GitHub runs a `workflow_dispatch` workflow only once its file exists on the
 default branch. From then on, `--ref` selects any branch that holds the file,
@@ -279,3 +396,72 @@ Store Connect API key, and before the first release that relies on either.
 The build job builds `aarch64-apple-darwin` with no secrets. The sign job runs
 in `release-signing`, signs and notarizes the binaries with the version
 `0.0.0-smoke`, and checks the archive layout and the signature authority.
+
+To export the signed archive for the
+[keychain measurement](keychain-measurement.md), set the `export_archive`
+input:
+
+```bash
+gh workflow run notarize-smoke.yml --ref main -f export_archive=true
+```
+
+After its checks pass, the sign job uploads the signed archive as the
+workflow artifact `signed-aarch64-apple-darwin-smoke`, kept for 7 days. The
+archive carries the version `0.0.0-smoke`: it is a smoke build, never a
+release, and it serves only the keychain measurement. Without the input the
+run uploads no signed archive.
+
+### Feature-state checks
+
+Release, publish, and rehearsal expect `mainnet-write` to be on. The shared
+build script runs the environment guard immediately before the release recipe.
+Archive verification executes both packaged binaries and checks their embedded
+markers. Archive and host checks also refuse three test-override literals:
+`STELLAR_AGENT_HOME`, `STELLAR_AGENT_TEST_`, and `.stellar-agent-test-sandbox`.
+Hashing depends on archive
+verification and on the vendored Wasm rebuild of the tagged commit, so
+signing and provenance wait for that rebuild. Publication depends on the
+provenance content check, the source discipline check, and the rebuild.
+Crate publication also requires a rebuild of every vendored Wasm file of the
+verified tag's commit from its pinned source with pinned tools and matching
+bytes. A failed, canceled, or skipped rebuild stops it before the registry
+credential is requested.
+
+The generic SLSA generator records source identity and checksum subjects.
+It records the `vars` context, which holds the repository, organization, and
+environment variables, as its only parameter. Its environment is `{}`, and it
+records no Cargo command. The content checker requires a parameters mapping
+whose only key is `vars`, a mapping of string names to string values, and an
+empty environment, and pins the generic build type, the builder, the source,
+and the exact subjects. The release workflow, the reusable workflows it calls,
+and its local actions never read the `vars` context, and the `release-vars`
+rule of the workflow invariants check refuses a reference to it, so a
+repository or organization variable cannot reach the build.
+Empty provenance fields do not prove that the compiler receives no extra flags.
+
+The provenance boundary combines three checks: statement content, workflow
+guards and resolved feature graphs, and markers from packaged executables.
+The graph checker resolves each invocation for its explicit target or the
+reviewed [runner triple](building.md#feature-discipline-and-release-markers).
+Release and rehearsal cover all five archive targets in the Linux checker job.
+CLI and MCP root views share workspace feature unification; isolated package
+commands keep their own selection. Unknown runners, missing binary roots, and
+unexpected graph output fail.
+
+These checks detect configuration drift and feature-state mismatches.
+They do not establish compiler execution against a compromised build job.
+[Signature verification](../verifying-releases.md) establishes authenticity;
+the content checker validates the statement's fields.
+
+The publish verification job checks the binaries produced from unpacked crate
+sources, including their freshness. The install check runs only after a real
+publish, retries index propagation a bounded number of times, and verifies both
+installed binaries. It holds no publishing credential.
+Package and install inventory rows use these marker checks as their evidence.
+They require no graph claim about registry sources.
+
+The checks that the ruleset of `main` requires include the five feature jobs
+of `ci.yml`: `feature-on-clippy`, `feature-on-test`, `feature-on-doc`,
+`feature-discipline`, and `release-shape`. The `coverage` required check
+needs both coverage measurement jobs and enforces the floors of both feature
+configurations.

@@ -1,8 +1,7 @@
 //! Testnet acceptance: the approval-gated payment commit completes on-chain.
 //!
-//! Closes the end-to-end gap noted in
-//! `toolset_sign_payment_gated_testnet_acceptance.rs`: a payment the policy engine
-//! gates with `RequireApproval` is simulated, approved, then committed and
+//! A payment the policy engine gates with `RequireApproval` is simulated,
+//! approved, then committed and
 //! submitted to the live testnet ledger. The operator's `approve` step surfaces
 //! the HMAC attestation blob the commit requires; this test recomputes that blob
 //! exactly as `approve` does and presents it to the commit.
@@ -41,7 +40,7 @@ use rand_core::OsRng;
 use serial_test::serial;
 use stellar_agent_core::approval::store::PendingApproval;
 use stellar_agent_core::approval::{
-    PendingApprovalStore, compute_attestation, envelope_sha256, process_uid_for_attestation,
+    PendingApprovalStore, compute_attestation_v4, envelope_sha256, process_uid_for_attestation,
 };
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
@@ -61,6 +60,8 @@ use stellar_agent_test_support::keyring_mock;
 use tempfile::TempDir;
 use zeroize::Zeroizing;
 
+mod common;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -78,6 +79,33 @@ const PAYMENT_STROOPS: i64 = 10_000_000; // 1 XLM
 struct RequireApprovalEngine;
 
 impl PolicyEngine for RequireApprovalEngine {
+    fn record_confirmed_checked(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &stellar_agent_core::policy::v1::ValueClass,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.record_confirmed_checked(tool, profile, value)
+    }
+    fn size_unvalued_call(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        reason: stellar_agent_core::policy::v1::OpaqueReason,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine
+            .size_unvalued_call(tool, profile, reason, now_ms)
+    }
+    fn size_no_value(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::CheckedSizing, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.size_no_value(tool, profile, now_ms)
+    }
+
     fn evaluate(
         &self,
         _tool: &ToolDescriptor,
@@ -88,6 +116,7 @@ impl PolicyEngine for RequireApprovalEngine {
         _counterparty_cache: Option<&dyn CounterpartyCacheView>,
         _sep10_sessions: Option<&dyn Sep10SessionView>,
         _sep45_sessions: Option<&dyn Sep45SessionView>,
+        _now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         Ok(Decision::RequireApproval(ApprovalRequest::new(
             "pay-testnet-approval".into(),
@@ -111,14 +140,9 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 2xx for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Polls RPC until the freshly-funded account is queryable, tolerating
@@ -155,6 +179,20 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .expect("signer keyring entry")
         .set_password(&s_strkey)
         .expect("set signing key");
+    // The identity record an enrollment stores beside the seed.
+    stellar_agent_network::keyring::write_keyring_string(
+        &stellar_agent_core::profile::schema::signer_identity_entry_ref(signer_ref),
+        &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .to_bytes(),
+            stellar_agent_core::profile::name::profile_name_for_approval(profile),
+            profile.chain_id,
+        )
+        .render()
+        .expect("an agent record renders"),
+    )
+    .expect("set identity record");
 
     // Nonce key.
     let nonce_ref = &profile.mcp_nonce_key_alias;
@@ -172,8 +210,8 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .set_password(&attest_key_b64)
         .expect("set attestation key");
 
-    // Audit-log chain-root HMAC key, so the commit's post-submit
-    // `value_action_submitted` row is signed and lands (the loader reads this
+    // Audit-log chain-root HMAC key, so the commit's pre-send
+    // `value_action_pending` row is signed and lands (the loader reads this
     // coordinate; without it the emission is a non-fatal no-op).
     let audit_ref = &profile.audit_log_hash_chain_key_id;
     let audit_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x33u8; 32]);
@@ -192,6 +230,16 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
 #[tokio::test]
 #[serial]
 async fn pay_with_approval_commits_and_submits_on_testnet() {
+    common::payment_matrix::run(
+        common::payment_matrix::Route::Direct,
+        "pay_with_approval_commits_and_submits_on_testnet",
+        false,
+    )
+    .await;
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (g_strkey, seed) = fresh_keypair();
@@ -228,6 +276,7 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate must succeed against funded account");
@@ -266,6 +315,7 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
     )
     .expect("new_payment_pending");
     let approval_nonce = entry.approval_nonce.clone();
+    let attested = entry.clone();
     {
         let store_path = approval_dir.path().join(format!("{g_strkey}.toml"));
         let mut store = PendingApprovalStore::open(store_path).expect("open store");
@@ -276,7 +326,7 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
 
     // The attestation blob exactly as `stellar-agent approve --id <nonce> --profile <name>` surfaces it.
     let sha = envelope_sha256(envelope_xdr.as_bytes());
-    let blob = compute_attestation(
+    let blob = compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new(
             &server.profile_name_for_approval(),
@@ -285,8 +335,24 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
         &approval_nonce,
         &sha,
         &uid,
+        &attested.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
+    {
+        // `approve` records the blob with its approver; the commit gate
+        // verifies the presented blob against that record.
+        let store_path = approval_dir.path().join(format!("{g_strkey}.toml"));
+        let mut store = PendingApprovalStore::open(store_path).expect("open store");
+        store
+            .record_attestation(
+                &approval_nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
+            .expect("record the local approval");
+        // Store dropped: lock released so the commit gate can open it.
+    }
 
     // ── 3. Commit: gate verifies the attestation, signs, and submits on-chain ──
     let commit = server
@@ -301,11 +367,12 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce,
-            expires_at_unix_ms,
-            envelope_xdr,
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: Some(approval_nonce),
             approval_attestation: Some(blob_b64),
+            business_id: None,
         })
         .await
         .expect("commit must pass the gate and submit on-chain");
@@ -324,7 +391,7 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
         "commit must report the ledger it was included in: {commit_json}"
     );
 
-    // The confirmed commit must have recorded a `value_action_submitted`
+    // The confirmed commit must have recorded a `value_action_pending`
     // row for `stellar_pay_commit`, signed under the profile's audit chain-root
     // key (verifiable by `audit verify`).
     let audit_path = approval_dir.path().join("audit.jsonl");
@@ -334,10 +401,15 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
     .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
     .collect();
     assert!(
+        audit_rows
+            .iter()
+            .all(|row| row["kind"] != "value_action_submitted")
+    );
+    assert!(
         audit_rows.iter().any(|row| {
-            row["kind"] == "value_action_submitted" && row["tool"] == "stellar_pay_commit"
+            row["kind"] == "value_action_pending" && row["tool"] == "stellar_pay_commit"
         }),
-        "commit must record a value_action_submitted row: {audit_rows:?}"
+        "commit must record a value_action_pending row: {audit_rows:?}"
     );
 }
 
@@ -381,7 +453,7 @@ fn per_tx_cap_document(tools: &[&str]) -> PolicyDocument {
 /// A `stellar_pay` self-payment under a `PolicyEngineV1` `per_tx_cap` rule
 /// (rather than the `Noop` engine the happy-path test above uses) commits and
 /// submits on the live testnet ledger, and the confirmed commit's
-/// `value_action_submitted` audit row carries a `legs` entry whose content —
+/// `value_action_pending` audit row carries a `legs` entry whose content ,
 /// `action`, `amount`, `asset`, and the redacted `destination` — equals
 /// exactly the values submitted on-chain, proving the row is built from the
 /// same `ValueEffects` the V1 engine sized rather than a placeholder or
@@ -389,6 +461,16 @@ fn per_tx_cap_document(tools: &[&str]) -> PolicyDocument {
 #[tokio::test]
 #[serial]
 async fn pay_v1_engine_commit_records_matching_leg_content_on_testnet() {
+    common::payment_matrix::run(
+        common::payment_matrix::Route::Direct,
+        "pay_v1_engine_commit_records_matching_leg_content_on_testnet",
+        false,
+    )
+    .await;
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (g_strkey, seed) = fresh_keypair();
@@ -423,6 +505,7 @@ async fn pay_v1_engine_commit_records_matching_leg_content_on_testnet() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -456,11 +539,12 @@ async fn pay_v1_engine_commit_records_matching_leg_content_on_testnet() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce,
-            expires_at_unix_ms,
-            envelope_xdr,
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must pass the gate and submit on-chain");
@@ -475,23 +559,26 @@ async fn pay_v1_engine_commit_records_matching_leg_content_on_testnet() {
         "commit must report an on-chain tx_hash: {commit_json}"
     );
 
-    // ── The value_action_submitted row's leg content matches the submitted
+    // ── The value_action_pending row's leg content matches the submitted
     // values ─────────────────────────────────────────────────────────────────
     let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(std::io::BufReader::new(
         std::fs::File::open(audit_dir.path().join("audit.jsonl")).expect("audit log after commit"),
     ))
     .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
     .collect();
+    assert!(
+        audit_rows
+            .iter()
+            .all(|row| row["kind"] != "value_action_submitted")
+    );
     let row = audit_rows
         .iter()
-        .find(|row| row["kind"] == "value_action_submitted" && row["tool"] == "stellar_pay_commit")
-        .unwrap_or_else(|| {
-            panic!("commit must record a value_action_submitted row: {audit_rows:?}")
-        });
+        .find(|row| row["kind"] == "value_action_pending" && row["tool"] == "stellar_pay_commit")
+        .unwrap_or_else(|| panic!("commit must record a value_action_pending row: {audit_rows:?}"));
 
     let legs = row["legs"]
         .as_array()
-        .expect("value_action_submitted row must carry a legs array");
+        .expect("value_action_pending row must carry a legs array");
     assert_eq!(
         legs.len(),
         1,
@@ -579,9 +666,22 @@ fn per_period_cap_document(tools: &[&str], window: &str, cap_stroops: i128) -> P
 #[tokio::test]
 #[serial]
 async fn pay_v1_per_period_cap_second_payment_denied_by_persisted_window_on_testnet() {
+    common::payment_matrix::run(
+        common::payment_matrix::Route::Alternating,
+        "pay_v1_per_period_cap_second_payment_denied_by_persisted_window_on_testnet",
+        false,
+    )
+    .await;
     keyring_mock::install().expect("mock keyring store init");
 
-    let home_dir = tempfile::TempDir::new().expect("tempdir");
+    let home_dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+    assert!(
+        home_dir
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home_dir.path());
 
     let (g_strkey, seed) = fresh_keypair();
@@ -619,6 +719,7 @@ async fn pay_v1_per_period_cap_second_payment_denied_by_persisted_window_on_test
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: Some(FEE_STROOPS.to_string()),
+        business_id: None,
     };
 
     // ── Payment 1: simulate -> commit -> submit succeeds on-chain ────────────
@@ -663,11 +764,12 @@ async fn pay_v1_per_period_cap_second_payment_denied_by_persisted_window_on_test
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce: nonce1,
-            expires_at_unix_ms: expires1,
-            envelope_xdr: envelope1,
+            nonce: Some(nonce1),
+            expires_at_unix_ms: Some(expires1),
+            envelope_xdr: Some(envelope1),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("first commit must not error");

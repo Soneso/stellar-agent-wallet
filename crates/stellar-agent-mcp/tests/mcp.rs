@@ -1,4 +1,9 @@
 //! Offline integration tests for the MCP server.
+//!
+//! The suites that start a server child run the `stellar-agent` executable of
+//! `stellar-agent-cli` under its `stellar-agent-mcp` alias. Build both packages
+//! together first, with this run's `--target` and feature flags:
+//! `cargo test -p stellar-agent-cli -p stellar-agent-mcp --no-run`.
 
 #[path = "common/mod.rs"]
 #[allow(
@@ -41,8 +46,14 @@ mod friendbot_integration;
 mod halt_integration;
 #[path = "mcp/integration.rs"]
 mod integration;
+#[path = "mcp/mainnet_oracle_required_integration.rs"]
+mod mainnet_oracle_required_integration;
+#[path = "mcp/mainnet_presence_integration.rs"]
+mod mainnet_presence_integration;
 #[path = "mcp/mpp_audit_anchor_integration.rs"]
 mod mpp_audit_anchor_integration;
+#[path = "mcp/muxed_destination_integration.rs"]
+mod muxed_destination_integration;
 #[path = "mcp/pay_commit_args_redrive_integration.rs"]
 mod pay_commit_args_redrive_integration;
 #[path = "mcp/pay_integration.rs"]
@@ -57,14 +68,20 @@ mod preflight_integration;
 mod profile_selection_integration;
 #[path = "mcp/registry_walk.rs"]
 mod registry_walk;
+#[path = "mcp/rejected_client_input.rs"]
+mod rejected_client_input;
 #[path = "mcp/resource_no_secrets.rs"]
 mod resource_no_secrets;
+#[path = "mcp/restricted_submission_lease.rs"]
+mod restricted_submission_lease;
 #[path = "mcp/rpc_credential_integration.rs"]
 mod rpc_credential_integration;
 #[path = "mcp/sep48_sep47_envelope_shape.rs"]
 mod sep48_sep47_envelope_shape;
 #[path = "mcp/toolset_args_validation_integration.rs"]
 mod toolset_args_validation_integration;
+#[path = "mcp/toolset_payment_context.rs"]
+mod toolset_payment_context;
 #[path = "mcp/toolset_sign_payment_gated_integration.rs"]
 mod toolset_sign_payment_gated_integration;
 #[path = "mcp/toolsets_matrix_invariants.rs"]
@@ -73,5 +90,15 @@ mod toolsets_matrix_invariants;
 mod transaction_status_integration;
 #[path = "mcp/trustline_integration.rs"]
 mod trustline_integration;
+#[path = "mcp/version_marker.rs"]
+mod version_marker;
 #[path = "mcp/x402_audit_gate_integration.rs"]
 mod x402_audit_gate_integration;
+
+#[path = "mcp/transaction_status_wire_guard.rs"]
+mod transaction_status_wire_guard;
+#[path = "mcp/value_tool_wire_guard.rs"]
+mod value_tool_wire_guard;
+
+#[path = "mcp/proof_rows.rs"]
+mod proof_rows;

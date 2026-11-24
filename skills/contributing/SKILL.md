@@ -33,8 +33,10 @@ in these steps from the checkout root.
    Use `bash .github/scripts/preflight.sh --list` to inspect the selection.
    `bash .github/scripts/preflight.sh --full` runs the complete local registry,
    including coverage. Local coverage, machete, and deny are optional reproductions.
-   CI runs the offline workspace suite on every pull request. Pull-request
-   coverage requires the `coverage` label; live acceptance uses its separate workflow.
+   CI runs the offline gates on every pull request; a docs-only pull request
+   into `mainnet-write` runs the reduced set that
+   [docs/maintainers/building.md](../../docs/maintainers/building.md) describes.
+   Pull-request coverage requires the `coverage` label; live acceptance uses its separate workflow.
    Follow [docs/maintainers/building.md](../../docs/maintainers/building.md#preflight)
    for the gates, and record each exit code and unavailable gate.
 6. Complete the self-review in

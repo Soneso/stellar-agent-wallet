@@ -9,15 +9,44 @@
 //!
 //! The loader runs [`validate_policy_keys`] to refuse keys outside the policy
 //! schema before it decodes and verifies the signature. An unknown key is
-//! reported by name even when the signature also fails.
+//! reported with its location and the keys its container accepts, even when
+//! the signature also fails. The rejected key itself is never part of the
+//! report: a policy key is operator input and may hold a secret.
 
 use toml_edit::{DocumentMut, Item, TableLike, Value};
 
 use crate::policy::PolicyError;
 
+/// Default full transaction fee bound for contract transfers, in stroops.
+pub const DEFAULT_CONTRACT_TRANSFER_MAX_FEE_STROOPS: u32 = 1_000_000;
+
 /// Top-level keys of a policy file. `signature` is the envelope, which the
 /// canonical form excludes.
-const ROOT_KEYS: &[&str] = &["version", "scope", "rules", "signature"];
+const ROOT_KEYS: &[&str] = &[
+    "version",
+    "scope",
+    "contract_transfer_max_fee_stroops",
+    "rules",
+    "signature",
+    "owner_rotation",
+];
+
+/// Keys of the signed mainnet installation binding, in canonical order.
+pub(crate) const MAINNET_KEYS: &[&str] = &[
+    "profile",
+    "endpoint_host",
+    "oracle_host",
+    "installation_nonce_sha256",
+    "classic_max_fee_per_op_stroops",
+    "authorization_ttl_seconds",
+    "cross_check_thresholds",
+    "approval_credentials",
+    "approval_origin",
+    "approval_cert_spki_sha256",
+];
+
+/// Keys of the previous owner's rotation statement, in canonical order.
+pub(crate) const OWNER_ROTATION_KEYS: &[&str] = &["previous_owner", "new_owner", "sig"];
 
 /// Keys of the `[signature]` envelope.
 const SIGNATURE_KEYS: &[&str] = &["owner_id", "sig"];
@@ -42,6 +71,7 @@ const MATCH_KEYS: &[&str] = &["tool", "chain"];
 /// The loader refuses a kind absent from this table, so a kind cannot be
 /// parsed without a closed key set.
 pub(crate) const CRITERION_KEY_SETS: &[(&str, &[&str])] = &[
+    ("asset_allowlist", &["kind", "assets"]),
     ("per_tx_cap", &["kind", "asset", "max_stroops"]),
     ("approval_above", &["kind", "asset", "max_stroops"]),
     (
@@ -51,7 +81,7 @@ pub(crate) const CRITERION_KEY_SETS: &[(&str, &[&str])] = &[
     ("rate_limit", &["kind", "window", "max_calls"]),
     (
         "counterparty_allowlist",
-        &["kind", "kinds", "allowlist", "gate_inflows"],
+        &["kind", "kinds", "allowlist", "gate_inflows", "unlisted"],
     ),
     ("minimum_reserve", &["kind", "margin_stroops"]),
     ("inner_invocation_count_cap", &["kind", "max_count"]),
@@ -67,7 +97,24 @@ pub(crate) const CRITERION_KEY_SETS: &[(&str, &[&str])] = &[
     ("home_domain_resolved", &["kind"]),
     ("sep10_session_active", &["kind"]),
     ("sep45_session_active", &["kind"]),
+    ("total_budget", &["kind", "asset", "max_stroops"]),
+    ("balance_floor", &["kind", "min_stroops"]),
+    ("memo_binding", &["kind", "bindings"]),
 ];
+
+/// Keys of the inline `unlisted` table of a `counterparty_allowlist`
+/// criterion. Modes `deny` and `approval` admit `mode` alone; the loader
+/// refuses the other keys with them.
+pub(crate) const UNLISTED_KEYS: &[&str] = &[
+    "mode",
+    "per_tx_stroops",
+    "per_period_stroops",
+    "asset",
+    "window",
+];
+
+/// Keys of one element of a `memo_binding` criterion's `bindings` array.
+pub(crate) const MEMO_BINDING_KEYS: &[&str] = &["destination", "kind", "value"];
 
 /// Returns the closed key set of the criterion kind `kind`, or `None` when the
 /// loader does not support the kind.
@@ -78,30 +125,40 @@ pub(crate) fn criterion_keys(kind: &str) -> Option<&'static [&'static str]> {
         .map(|(_, keys)| *keys)
 }
 
-/// Refuses a policy document that holds a key outside the V1 policy schema.
+/// Refuses a policy document that holds a key outside the policy schema for
+/// versions 1 and 2.
 ///
 /// Checks these containers in order:
 ///
-/// 1. The top level.
-/// 2. The `[signature]` table.
-/// 3. Each rule of a `[[rules]]` array or an inline `rules = [...]` array in
+/// 1. The top level, against the key set of the document's `version`: a
+///    version 2 document also accepts `sequence` and `mainnet`.
+/// 2. The `[mainnet]` table, then its `cross_check_thresholds` table, whose
+///    keys must be `native` or a pinned asset identity.
+/// 3. The `[signature]` and `[owner_rotation]` tables.
+/// 4. Each rule of a `[[rules]]` array or an inline `rules = [...]` array in
 ///    order, with its `match` table and its criteria. Each criterion is checked
-///    against the key set of its `kind`.
+///    against the key set of its `kind`, then an inline `unlisted` table of a
+///    `counterparty_allowlist` criterion and each inline element of a
+///    `memo_binding` criterion's `bindings` array against their own sets.
 ///
 /// A container of another shape, and a criterion whose `kind` is absent, not
 /// a string, or not a supported kind, is left to the loader's own diagnostics.
 ///
-/// The first unknown key is reported with the loader's location form:
-/// ``rule[2].criteria[0]: unknown key `foo` ``,
-/// `rule[1]`, `rule[0].match`, `signature`, and no location for a top-level key.
+/// The first container that holds an unknown key is reported with the
+/// loader's location form and the keys that container accepts, for example
+/// `rule[0].match: unknown key; match accepts tool, chain`. The other
+/// locations are `rule[1]`, `rule[2].criteria[0]`,
+/// `rule[2].criteria[0].unlisted`, `rule[2].criteria[0].bindings[1]`, `mainnet`,
+/// `mainnet.cross_check_thresholds`, `signature`, `owner_rotation`, and no
+/// location for a top-level key. The rejected key is never part of the detail.
 ///
 /// [`crate::policy::v1::loader::load_signed_policy`] runs this check before it
 /// verifies the owner signature.
 ///
 /// # Errors
 ///
-/// Returns [`PolicyError::PolicyFileParseFailed`] naming the first unknown key
-/// and its location.
+/// Returns [`PolicyError::PolicyFileParseFailed`] naming the location of the
+/// first unknown key and the keys its container accepts.
 ///
 /// # Examples
 ///
@@ -122,11 +179,48 @@ pub(crate) fn criterion_keys(kind: &str) -> Option<&'static [&'static str]> {
 /// assert!(matches!(
 ///     err,
 ///     PolicyError::PolicyFileParseFailed { ref detail }
-///         if detail.starts_with("rule[0]: unknown key `ttl`")
+///         if detail.starts_with("rule[0]: unknown key; a rule accepts match, criteria")
 /// ));
 /// ```
 pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
-    reject_unknown_keys(doc.as_table(), ROOT_KEYS, None, "the policy file")?;
+    let v2 = doc.get("version").and_then(Item::as_integer) == Some(2);
+    let root = if v2 {
+        &[
+            "version",
+            "scope",
+            "contract_transfer_max_fee_stroops",
+            "sequence",
+            "engine",
+            "mainnet",
+            "rules",
+            "signature",
+            "owner_rotation",
+        ][..]
+    } else {
+        ROOT_KEYS
+    };
+    reject_unknown_keys(doc.as_table(), root, None, "the policy file")?;
+    signed_engine(doc)?;
+    if let Some(mainnet) = doc.get("mainnet").and_then(Item::as_table_like) {
+        reject_unknown_keys(mainnet, MAINNET_KEYS, Some("mainnet"), "the mainnet table")?;
+        super::approval_credentials::reject_unknown_fields(mainnet.get("approval_credentials"))?;
+        if let Some(thresholds) = mainnet
+            .get("cross_check_thresholds")
+            .and_then(Item::as_table_like)
+        {
+            for (key, _) in thresholds.iter() {
+                if key != "native"
+                    && crate::asset_id::CanonicalAsset::parse_threshold_key(key).is_err()
+                {
+                    return Err(PolicyError::PolicyFileParseFailed {
+                        detail: "mainnet.cross_check_thresholds: unknown key; the thresholds \
+                                 table accepts native and asset identities"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+    }
 
     if let Some(Item::Table(signature)) = doc.get("signature") {
         reject_unknown_keys(
@@ -134,6 +228,15 @@ pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
             SIGNATURE_KEYS,
             Some("signature"),
             "the signature table",
+        )?;
+    }
+
+    if let Some(rotation) = doc.get("owner_rotation").and_then(Item::as_table_like) {
+        reject_unknown_keys(
+            rotation,
+            OWNER_ROTATION_KEYS,
+            Some("owner_rotation"),
+            "the owner rotation table",
         )?;
     }
 
@@ -154,6 +257,48 @@ pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
     }
 
     Ok(())
+}
+
+/// Reads the optional full transaction fee bound for contract transfers.
+///
+/// Zero permits only a zero fee. Absence carries no signed fee consent.
+///
+/// # Errors
+/// Returns [`PolicyError::PolicyFileParseFailed`] for a non-integer or a value
+/// outside the `u32` range.
+pub fn contract_transfer_max_fee_stroops(doc: &DocumentMut) -> Result<Option<u32>, PolicyError> {
+    doc.get("contract_transfer_max_fee_stroops")
+        .map(|item| {
+            item.as_integer()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                    detail: "contract_transfer_max_fee_stroops must be an integer in the u32 range"
+                        .into(),
+                })
+        })
+        .transpose()
+}
+
+/// Reads the optional signed engine selector without inserting a default field.
+pub(super) fn signed_engine(
+    doc: &DocumentMut,
+) -> Result<crate::profile::schema::PolicyEngineKind, PolicyError> {
+    use crate::profile::schema::PolicyEngineKind;
+    match doc.get("engine") {
+        None => Ok(PolicyEngineKind::V1),
+        Some(item) if doc.get("version").and_then(Item::as_integer) == Some(2) => {
+            match item.as_str() {
+                Some("v1") => Ok(PolicyEngineKind::V1),
+                Some("noop") => Ok(PolicyEngineKind::Noop),
+                _ => Err(PolicyError::PolicyFileParseFailed {
+                    detail: "engine selection must be the string 'v1' or 'noop'".into(),
+                }),
+            }
+        }
+        Some(_) => Err(PolicyError::PolicyFileParseFailed {
+            detail: "engine selection requires policy version 2".into(),
+        }),
+    }
 }
 
 /// Checks the keys of the rule at index `idx`, its `match` table, and its
@@ -183,37 +328,66 @@ fn validate_rule_keys(rule: &dyn TableLike, idx: usize) -> Result<(), PolicyErro
             else {
                 continue;
             };
+            let criterion_loc = format!("{loc}.criteria[{criterion_idx}]");
             reject_unknown_keys(
                 criterion,
                 keys,
-                Some(&format!("{loc}.criteria[{criterion_idx}]")),
+                Some(&criterion_loc),
                 &format!("a `{kind}` criterion"),
             )?;
+            match kind {
+                "counterparty_allowlist" => {
+                    if let Some(unlisted) =
+                        criterion.get("unlisted").and_then(Value::as_inline_table)
+                    {
+                        reject_unknown_keys(
+                            unlisted,
+                            UNLISTED_KEYS,
+                            Some(&format!("{criterion_loc}.unlisted")),
+                            "an `unlisted` table",
+                        )?;
+                    }
+                }
+                "memo_binding" => {
+                    if let Some(bindings) = criterion.get("bindings").and_then(Value::as_array) {
+                        for (binding_idx, binding) in bindings.iter().enumerate() {
+                            if let Some(binding) = binding.as_inline_table() {
+                                reject_unknown_keys(
+                                    binding,
+                                    MEMO_BINDING_KEYS,
+                                    Some(&format!("{criterion_loc}.bindings[{binding_idx}]")),
+                                    "a binding",
+                                )?;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
     Ok(())
 }
 
-/// Refuses the first key of `table` that `accepted` does not list.
+/// Refuses a `table` that holds a key `accepted` does not list.
 ///
 /// `location` prefixes the detail in the loader's form; `owner` names the
-/// container in the list of accepted keys. The key is escaped so a control
-/// character in a quoted key cannot break the diagnostic.
-fn reject_unknown_keys(
+/// container in the list of accepted keys. The rejected key is not part of the
+/// detail: a policy key is operator input and may hold a secret.
+pub(crate) fn reject_unknown_keys(
     table: &dyn TableLike,
     accepted: &[&str],
     location: Option<&str>,
     owner: &str,
 ) -> Result<(), PolicyError> {
-    let Some((key, _)) = table.iter().find(|(key, _)| !accepted.contains(key)) else {
+    if table.iter().all(|(key, _)| accepted.contains(&key)) {
         return Ok(());
-    };
+    }
     let prefix = location.map(|loc| format!("{loc}: ")).unwrap_or_default();
     Err(PolicyError::PolicyFileParseFailed {
         detail: format!(
-            "{prefix}unknown key `{}`; {owner} accepts {}",
-            key.escape_debug(),
+            "{prefix}unknown key; {owner} accepts {}",
             accepted.join(", ")
         ),
     })
@@ -243,9 +417,10 @@ mod tests {
         assert_eq!(RULE_KEYS, signed.as_slice());
     }
 
-    /// A quoted key with a control character is escaped in the diagnostic.
+    /// A quoted key with a control character leaves the diagnostic to the
+    /// fixed text: the key is not part of it.
     #[test]
-    fn unknown_key_with_a_control_character_is_escaped() {
+    fn unknown_key_with_a_control_character_is_not_echoed() {
         let doc = DocumentMut::from_str("version = 1\nscope = \"profile:alice\"\n\"a\\nb\" = 1\n")
             .unwrap();
         let err = validate_policy_keys(&doc).unwrap_err();
@@ -253,10 +428,37 @@ mod tests {
             matches!(
                 err,
                 PolicyError::PolicyFileParseFailed { ref detail }
-                    if detail.starts_with("unknown key `a\\nb`;") && !detail.contains('\n')
+                    if detail == "unknown key; the policy file accepts version, scope, contract_transfer_max_fee_stroops, rules, \
+                                  signature, owner_rotation"
             ),
             "{err:?}"
         );
+    }
+
+    /// An unknown key inside `[owner_rotation]` is refused with its location
+    /// and the accepted keys, in either version.
+    #[test]
+    fn unknown_owner_rotation_key_is_refused() {
+        for head in [
+            "version = 1\nscope = \"profile:alice\"\n",
+            "version = 2\nscope = \"profile:alice\"\nsequence = 1\n",
+        ] {
+            let doc = DocumentMut::from_str(&format!(
+                "{head}[owner_rotation]\nprevious_owner = \"G\"\nnew_owner = \"G\"\n\
+                 sig = \"00\"\nextra = 1\n"
+            ))
+            .unwrap();
+            let err = validate_policy_keys(&doc).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    PolicyError::PolicyFileParseFailed { ref detail }
+                        if detail == "owner_rotation: unknown key; the owner rotation table \
+                                      accepts previous_owner, new_owner, sig"
+                ),
+                "{head}: {err:?}"
+            );
+        }
     }
 
     /// A container of another shape is left to the loader's diagnostics: a

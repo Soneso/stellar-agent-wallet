@@ -31,11 +31,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::schema::{EventKind, WasmHashPin};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
+use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::auth_entry::PartialSorobanAuthorizationEntry;
+use stellar_agent_smart_account::managers::auth_entry::test_helpers::partial_authorization_entry;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
 use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
 use stellar_xdr::{ContractId, Hash, ScAddress};
@@ -51,9 +55,19 @@ use super::rpc_mock_helpers::{
 
 const RULE_ID: u32 = 1;
 
-/// The first-8 the pin record holds for the rule's verifier; the live
-/// verifier runs another executable.
-const PINNED_VERIFIER_FIRST8: &str = "4242424242424242";
+/// A valid testnet auth entry for the zero smart account over [`RULE_ID`].
+fn testnet_entry() -> PartialSorobanAuthorizationEntry {
+    partial_authorization_entry(
+        ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(RULE_ID)],
+    )
+    .expect("fixture auth entry builds")
+}
+
+/// The hash the pin record holds for the rule's verifier; the live verifier
+/// runs another executable.
+const PINNED_VERIFIER_HASH: WasmHashPin = WasmHashPin::new([0x42; 32]);
 
 fn verifier() -> ScAddress {
     ScAddress::Contract(ContractId(Hash([0x2a; 32])))
@@ -67,16 +81,19 @@ fn signers_manager(
     timeout: Duration,
 ) -> Arc<SignersManager> {
     Arc::new(
-        SignersManager::new(SignersManagerConfig::new(
-            rpc_url.to_owned(),
-            rpc_url.to_owned(),
-            audit_writer,
-            audit_log_path,
-            "Test SDF Network ; September 2015".to_owned(),
-            "test-profile".to_owned(),
-            timeout,
-            "stellar:testnet".to_owned(),
-        ))
+        SignersManager::new(
+            SignersManagerConfig::new(
+                rpc_url.to_owned(),
+                rpc_url.to_owned(),
+                audit_writer,
+                audit_log_path,
+                "Test SDF Network ; September 2015".to_owned(),
+                "test-profile".to_owned(),
+                timeout,
+                "stellar:testnet".to_owned(),
+            )
+            .with_intent_admission(stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission()),
+        )
         .expect("SignersManager::new must succeed"),
     )
 }
@@ -85,14 +102,16 @@ fn signers_manager(
 /// signer-set state row refuses at the baseline read, before any RPC: no
 /// drift row is written and the endpoint is never contacted.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_missing_baseline_refuses_before_the_drift_check_reads_the_chain() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, dir) = tmp_audit_writer();
     let smart_account_strkey = format!("{}", stellar_strkey::Contract([0u8; 32]));
     let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
     audit_writer
         .lock()
         .expect("audit writer poisoned")
-        .write_entry(AuditEntry::new_sa_context_rule_created(
+        .write_entry(AuditEntry::new_sa_context_rule_created_v2(
             &smart_account_redacted,
             RULE_ID,
             "default",
@@ -101,7 +120,7 @@ async fn a_missing_baseline_refuses_before_the_drift_check_reads_the_chain() {
             None,
             "stellar:testnet",
             uuid::Uuid::new_v4().to_string(),
-            vec![PINNED_VERIFIER_FIRST8.to_owned()],
+            vec![PINNED_VERIFIER_HASH],
             vec![],
             false,
             false,
@@ -133,10 +152,9 @@ async fn a_missing_baseline_refuses_before_the_drift_check_reads_the_chain() {
 
     let result = credentials
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "laptop-passkey",
-            &smart_account_strkey,
-            &[0u8; 32],
-            vec![RULE_ID],
+            &testnet_entry(),
             manager,
             "127.0.0.1:0".parse().expect("socket addr parses"),
             Duration::from_millis(10),
@@ -148,13 +166,7 @@ async fn a_missing_baseline_refuses_before_the_drift_check_reads_the_chain() {
 
     match &result {
         Err(CredentialsError::SignerSetDivergence { source }) => assert!(
-            matches!(
-                source.as_ref(),
-                SaError::SignerSetMissingBaseline {
-                    rule_id: RULE_ID,
-                    ..
-                }
-            ),
+            matches!(source.as_ref(), SaError::SignerSetMissingBaseline { .. }),
             "the baseline read refuses first: {source:?}"
         ),
         other => panic!("expected SignerSetDivergence; got {other:?}"),
@@ -188,7 +200,9 @@ async fn a_missing_baseline_refuses_before_the_drift_check_reads_the_chain() {
 /// A deadline of zero passes during the baseline read, and the refusal is
 /// the read's elapse, wrapped as a signer-set refusal.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_spent_deadline_refuses_at_the_baseline_read() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, dir) = tmp_audit_writer();
     let smart_account_strkey = format!("{}", stellar_strkey::Contract([0u8; 32]));
     let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
@@ -211,10 +225,9 @@ async fn a_spent_deadline_refuses_at_the_baseline_read() {
 
     let result = credentials
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "laptop-passkey",
-            &smart_account_strkey,
-            &[0u8; 32],
-            vec![RULE_ID],
+            &testnet_entry(),
             manager,
             "127.0.0.1:0".parse().expect("socket addr parses"),
             Duration::from_millis(10),
@@ -247,7 +260,9 @@ async fn a_spent_deadline_refuses_at_the_baseline_read() {
 /// diverged row and the `PasskeyAssertion` row share the request id, and no
 /// ceremony starts.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_changed_signer_set_refuses_at_the_comparison() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, dir) = tmp_audit_writer();
     let smart_account_strkey = format!("{}", stellar_strkey::Contract([0u8; 32]));
     let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
@@ -295,10 +310,9 @@ async fn a_changed_signer_set_refuses_at_the_comparison() {
 
     let result = credentials
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "laptop-passkey",
-            &smart_account_strkey,
-            &[0u8; 32],
-            vec![RULE_ID],
+            &testnet_entry(),
             manager,
             "127.0.0.1:0".parse().expect("socket addr parses"),
             Duration::from_millis(10),

@@ -32,6 +32,8 @@ mod owner_key_refusal;
 mod replay_rejected;
 #[path = "nonce/replay_window_eviction.rs"]
 mod replay_window_eviction;
+#[path = "nonce/salt_binding.rs"]
+mod salt_binding;
 #[path = "nonce/tool_mismatch.rs"]
 mod tool_mismatch;
 #[path = "nonce/ttl_enforcement.rs"]

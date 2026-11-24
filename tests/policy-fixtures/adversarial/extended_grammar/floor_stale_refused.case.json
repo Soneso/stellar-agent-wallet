@@ -1,0 +1,31 @@
+{
+  "test_kind": "sequence",
+  "name": "floor_stale_refused",
+  "category": "extended_grammar",
+  "description": "An observation older than 120000 ms is stale and refuses as account.stale with its age, however large the balance. The same account read now passes.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "total_fee_stroops": 0, "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "account": { "balance_stroops": 1000000, "observed_age_ms": 120001, "reservations_stroops": 0 },
+      "expected": {
+        "kind": "Deny",
+        "deny_reason": "account.stale",
+        "wire_code": "account.stale",
+        "reason": { "AccountStale": { "age_ms": 120001 } }
+      }
+    },
+    {
+      "args": { "total_fee_stroops": 0, "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "account": { "balance_stroops": 1000000, "observed_age_ms": 0, "reservations_stroops": 0 },
+      "expected": { "kind": "Allow" }
+    }
+  ]
+}

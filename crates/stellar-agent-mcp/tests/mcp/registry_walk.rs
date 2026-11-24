@@ -52,7 +52,9 @@ use stellar_agent_core::{
     profile::schema::Profile,
 };
 use stellar_agent_mcp::server::{WalletServer, check_duplicate_registrations};
-use stellar_agent_test_support::source_order::{assert_called_between, production_half};
+use stellar_agent_test_support::source_order::{
+    assert_called_between, assert_calls_in_order, assert_not_called, production_half,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: iterate all registered McpToolRegistration records
@@ -199,7 +201,11 @@ fn stellar_friendbot_annotations_correct() {
 /// Also asserts that `WalletServer::new` is `Ok` for a valid (non-duplicate)
 /// registry — the fail-closed path is tested by `duplicate_registration_fails_closed`.
 #[test]
+#[serial_test::serial]
 fn wallet_server_registry_matches_inventory() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     // Explicitly set Noop so WalletServer::new succeeds without a policy file
     // on disk (PolicyEngineKind::default() is V1).
     let profile_testnet = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
@@ -246,7 +252,11 @@ fn wallet_server_registry_matches_inventory() {
 /// advertises in its `initialize` response.  Adding a tool without adding its
 /// line to `INSTRUCTIONS_STATIC` in `server.rs` fails this test.
 #[test]
+#[serial_test::serial]
 fn instructions_string_names_every_registered_tool() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use rmcp::ServerHandler as _;
 
     let profile_testnet = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
@@ -277,12 +287,12 @@ fn instructions_string_names_every_registered_tool() {
 /// The count assertion guards against a tool being accidentally added or dropped.
 /// When the tool set changes, update the expected count and the name list below.
 #[test]
-fn registry_contains_forty_three_tools() {
+fn registry_contains_forty_five_tools() {
     let registry = collect_registry_names();
     assert_eq!(
         registry.len(),
-        43,
-        "registry must contain exactly 43 tools \
+        45,
+        "registry must contain exactly 45 tools \
          (stellar_balances + stellar_friendbot + stellar_create_account \
          + stellar_create_account_commit + stellar_pay + stellar_pay_commit \
          + stellar_fee_stats + stellar_sep43_get_address + stellar_sep43_get_network \
@@ -302,7 +312,8 @@ fn registry_contains_forty_three_tools() {
          + stellar_rule_create + stellar_rule_create_commit \
          + stellar_mpp_charge_prepare + stellar_mpp_charge_commit \
          + stellar_mpp_record_receipt + stellar_mpp_reconcile_transaction \
-         + stellar_mpp_authorization_status + stellar_transaction_status); \
+         + stellar_mpp_authorization_status + stellar_transaction_status \
+         + stellar_signed_intents_list + stellar_approval_status); \
          got: {registry:?}"
     );
     assert!(
@@ -1030,19 +1041,19 @@ fn stellar_toolset_list_annotations_correct() {
     );
 }
 
-/// Verifies `stellar_toolset_invoke` annotations: read-only, not destructive,
+/// Verifies `stellar_toolset_invoke` annotations: destructive, not read-only,
 /// chain_id not required at the outer gate level.
 #[test]
-fn stellar_toolset_invoke_annotations_correct() {
+fn stellar_toolset_invoke_is_annotated_destructive() {
     let reg = find_registration("stellar_toolset_invoke")
         .expect("stellar_toolset_invoke McpToolRegistration not found");
     assert!(
-        !reg.destructive_hint,
-        "stellar_toolset_invoke: destructive_hint must be false (all routable matrix tools are non-destructive)"
+        reg.destructive_hint,
+        "stellar_toolset_invoke: destructive_hint must be true (its signing actions route to the signing commit tools)"
     );
     assert!(
-        reg.read_only_hint,
-        "stellar_toolset_invoke: read_only_hint must be true (outer gate; routed tool determines actual mutability)"
+        !reg.read_only_hint,
+        "stellar_toolset_invoke: read_only_hint must be false (its signing actions route to the signing commit tools)"
     );
     assert!(
         !reg.chain_id_required,
@@ -1154,7 +1165,11 @@ fn stellar_claim_commit_annotations_correct() {
 /// contains no duplicates — belt-and-braces against a regression where the
 /// production fns accidentally share a name.
 #[test]
+#[serial_test::serial]
 fn wallet_server_new_succeeds_with_production_registry() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     // Explicitly set Noop so WalletServer::new succeeds without a policy file
     // on disk (PolicyEngineKind::default() is V1).
     let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
@@ -1556,51 +1571,70 @@ fn value_kind_classification_matches_design() {
 // calls require_value_audit_writer
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `(tool_name, source_text)` for every MCP tool that signs or submits
-/// value-moving state and therefore MUST call `require_value_audit_writer`
-/// (the fail-closed audit pre-flight) before doing so.
+/// `(tool_name, source_text, acquisition)` for every MCP tool that signs or
+/// submits value-moving state and therefore MUST acquire the value-audit
+/// writer (the fail-closed audit pre-flight) before doing so.
 ///
-/// `include_str!` pulls each file in at compile time — a genuine scan of the
-/// shipped implementation, not a hand-copied duplicate. `vault.rs` appears
-/// twice (deposit and withdraw share one file); both checks are redundant
-/// against the same content, which is harmless.
-const MOVES_VALUE_COMMIT_HANDLER_SOURCES: &[(&str, &str)] = &[
-    ("stellar_pay_commit", include_str!("../../src/tools/pay.rs")),
+/// The acquisition is `require_value_audit_writer(` for a handler that
+/// acquires the writer itself, and `.write_audit()` for the four classic
+/// commit handlers, which acquire it through the server's `write_audit`:
+/// that routes a mainnet write through the anchored audit readiness and every
+/// other write through `require_value_audit_writer`, which
+/// `write_audit_routes_both_branches_through_the_keyed_preflight` pins.
+///
+/// `include_str!` pulls each file in at compile time, so the scan reads the
+/// shipped implementation. `vault.rs` appears twice (deposit and withdraw
+/// share one file); both checks read the same content.
+const MOVES_VALUE_COMMIT_HANDLER_SOURCES: &[(&str, &str, &str)] = &[
+    (
+        "stellar_pay_commit",
+        include_str!("../../src/tools/pay.rs"),
+        ".write_audit()",
+    ),
     (
         "stellar_create_account_commit",
         include_str!("../../src/tools/create_account.rs"),
+        ".write_audit()",
     ),
     (
         "stellar_claim_commit",
         include_str!("../../src/tools/claim.rs"),
+        ".write_audit()",
     ),
     (
         "stellar_trustline_commit",
         include_str!("../../src/tools/trustline.rs"),
+        ".write_audit()",
     ),
     (
         "stellar_dex_trade",
         include_str!("../../src/tools/dex_trade.rs"),
+        "require_value_audit_writer(",
     ),
     (
         "stellar_defindex_vault_deposit",
         include_str!("../../src/tools/vault.rs"),
+        "require_value_audit_writer(",
     ),
     (
         "stellar_defindex_vault_withdraw",
         include_str!("../../src/tools/vault.rs"),
+        "require_value_audit_writer(",
     ),
     (
         "stellar_x402_authenticated_payment",
         include_str!("../../src/tools/x402_authenticated_payment.rs"),
+        "require_value_audit_writer(",
     ),
     (
         "stellar_x402_create_payment",
         include_str!("../../src/tools/x402_create_payment.rs"),
+        "require_value_audit_writer(",
     ),
     (
         "stellar_mpp_charge_commit",
         include_str!("../../src/tools/mpp.rs"),
+        "require_value_audit_writer(",
     ),
 ];
 
@@ -1648,7 +1682,7 @@ fn every_moves_value_commit_handler_calls_require_value_audit_writer() {
 
     let covered: HashSet<&str> = MOVES_VALUE_COMMIT_HANDLER_SOURCES
         .iter()
-        .map(|(name, _)| *name)
+        .map(|(name, _, _)| *name)
         .collect();
     let exempt: HashSet<&str> = MOVES_VALUE_SIMULATE_PHASE_EXEMPT.iter().copied().collect();
 
@@ -1665,13 +1699,90 @@ fn every_moves_value_commit_handler_calls_require_value_audit_writer() {
         );
     }
 
-    for (tool_name, source) in MOVES_VALUE_COMMIT_HANDLER_SOURCES {
+    for (tool_name, source, acquisition) in MOVES_VALUE_COMMIT_HANDLER_SOURCES {
         assert!(
-            source.contains("require_value_audit_writer"),
-            "the source file implementing '{tool_name}' does not call \
-             require_value_audit_writer — the fail-closed audit pre-flight is missing"
+            production_half(source).contains(acquisition),
+            "the source file implementing '{tool_name}' does not call {acquisition}: the \
+             fail-closed audit pre-flight is missing"
         );
     }
+}
+
+/// The server's `write_audit`, which the four classic commit handlers call,
+/// acquires the anchored audit readiness on a mainnet write and the keyed
+/// `require_value_audit_writer` pre-flight on every other write.
+#[test]
+fn write_audit_routes_both_branches_through_the_keyed_preflight() {
+    assert_calls_in_order(
+        "common.rs",
+        include_str!("../../src/tools/common.rs"),
+        "pub(crate) fn write_audit(",
+        &["audit_readiness(", "require_value_audit_writer("],
+    );
+}
+
+/// The toolset payment commit, `stellar_toolset_invoke/stellar_pay_commit`,
+/// reaches the shared payment commit handler, whose writer order
+/// [`every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the_signer`]
+/// checks: the invoke handler routes a signing action to the gated resolver,
+/// the resolver hands a verified invocation to the gated commit route, that
+/// route dispatches to the gated tool router with the payment context, and
+/// the router's payment arm calls `stellar_pay_commit_impl` with it. The
+/// handler reads the approval through `mainnet_authority` or the testnet gate,
+/// acquires the writer through `write_audit`, and only then signs through
+/// `sign_and_submit_classic`, so the toolset commit acquires the audit writer
+/// before the signing key loads on mainnet and off it.
+#[test]
+fn the_toolset_commit_reaches_the_handler_that_acquires_the_writer_before_the_signer() {
+    let toolsets = include_str!("../../src/tools/toolsets.rs");
+    assert_calls_in_order(
+        "toolsets.rs",
+        toolsets,
+        "async fn stellar_toolset_invoke(",
+        &[
+            "if is_signing_action {",
+            ".route_to_gated_resolver(&toolset_name, &action, &args, &toolsets_root, outer)",
+        ],
+    );
+    assert_calls_in_order(
+        "toolsets.rs",
+        toolsets,
+        "pub(crate) async fn route_to_gated_resolver(",
+        &["self.route_to_gated_commit(tool_name, toolset_args, envelope_xdr, context)"],
+    );
+    assert_calls_in_order(
+        "toolsets.rs",
+        toolsets,
+        "async fn route_to_gated_commit(",
+        &["self.route_to_gated_tool(tool_name, tool_args_value, Some(context))"],
+    );
+    assert_calls_in_order(
+        "toolsets.rs",
+        toolsets,
+        "pub(crate) async fn route_to_gated_tool(",
+        &[
+            "\"stellar_pay_commit\" =>",
+            "self.stellar_pay_commit_impl(typed, context).await",
+            "\"stellar_rule_create_commit\" =>",
+        ],
+    );
+    let pay = include_str!("../../src/tools/pay.rs");
+    for read in ["mainnet_authority(", "verify_attestation_gate("] {
+        assert_called_between(
+            "pay.rs",
+            pay,
+            "pub(crate) async fn stellar_pay_commit_impl(",
+            read,
+            ".write_audit()",
+            "sign_and_submit_classic(",
+        );
+    }
+    assert_calls_in_order(
+        "submission_record.rs",
+        include_str!("../../src/tools/submission_record.rs"),
+        "pub(crate) async fn sign_and_submit_classic(",
+        &["audit.ok_or_else(", "mainnet_enrolled_signer("],
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1766,6 +1877,16 @@ fn rule_create_audit_writer_routes_through_the_keyed_preflight() {
 /// Every MCP consumer of an approval acquires the keyed audit writer after it
 /// reads the approval and before it loads the signing key. The acquisition
 /// drains consent rows `stellar-agent approve` queued beside the server.
+///
+/// The four classic commit handlers read the approval, acquire the writer
+/// through `write_audit`, and then call the shared `sign_and_submit_classic`,
+/// which is the only place they load a signer. Inside the helper the mainnet
+/// branch refuses without the acquired audit readiness before it resolves the
+/// enrolled signer and builds the lazy seed handle, and the other branch loads
+/// the enrollment helper after it. The two mainnet x402 paths read the
+/// approval, acquire the readiness, and only then build the lazy handle
+/// through the one shared helper; the authenticated path verifies the
+/// counterparty between the two. Neither path builds a handle of its own.
 #[test]
 fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the_signer() {
     assert_called_between(
@@ -1806,13 +1927,112 @@ fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the
             "async fn stellar_trustline_commit(",
         ),
     ] {
-        assert_called_between(
+        // The mainnet wrapper, then the testnet gate, read the approval
+        // before the writer is acquired.
+        for read in ["mainnet_authority(", "verify_attestation_gate("] {
+            assert_called_between(
+                file,
+                source,
+                function,
+                read,
+                ".write_audit()",
+                "sign_and_submit_classic(",
+            );
+        }
+        assert_not_called(
             file,
             source,
             function,
-            "verify_attestation_gate(",
-            "require_value_audit_writer(",
-            "enrolled_keyring_signer(",
+            &[
+                "enrolled_keyring_signer(",
+                "lazy_signer_from_keyring(",
+                "mainnet_enrolled_signer(",
+            ],
         );
     }
+    assert_calls_in_order(
+        "submission_record.rs",
+        include_str!("../../src/tools/submission_record.rs"),
+        "pub(crate) async fn sign_and_submit_classic(",
+        &[
+            "audit.ok_or_else(",
+            "mainnet_enrolled_signer(",
+            "lazy_signer_from_keyring(",
+            "enrolled_keyring_signer(",
+        ],
+    );
+    assert_calls_in_order(
+        "x402_create_payment.rs",
+        include_str!("../../src/tools/x402_create_payment.rs"),
+        "async fn mainnet_x402_payment(",
+        &[
+            "mainnet_authority(",
+            "audit_readiness(",
+            "x402_mainnet_signing_handle(",
+            "create_payment_authorized(",
+        ],
+    );
+    assert_calls_in_order(
+        "x402_authenticated_payment.rs",
+        include_str!("../../src/tools/x402_authenticated_payment.rs"),
+        "async fn mainnet_authenticated_payment(",
+        &[
+            "mainnet_authority(",
+            "audit_readiness(",
+            ".verify_x402_counterparty_authorized(",
+            "x402_mainnet_signing_handle(",
+            "create_payment_authorized(",
+        ],
+    );
+    assert_calls_in_order(
+        "x402_create_payment.rs",
+        include_str!("../../src/tools/x402_create_payment.rs"),
+        "pub(super) fn x402_mainnet_signing_handle(",
+        &["lazy_signer_from_keyring("],
+    );
+    for (file, source, function) in [
+        (
+            "x402_create_payment.rs",
+            include_str!("../../src/tools/x402_create_payment.rs"),
+            "async fn mainnet_x402_payment(",
+        ),
+        (
+            "x402_authenticated_payment.rs",
+            include_str!("../../src/tools/x402_authenticated_payment.rs"),
+            "async fn mainnet_authenticated_payment(",
+        ),
+    ] {
+        assert_not_called(
+            file,
+            source,
+            function,
+            &["lazy_signer_from_keyring(", "enrolled_keyring_signer("],
+        );
+    }
+}
+
+/// The mainnet authority wrapper verifies a presented proof through the
+/// subject gate and derives every authority through `from_decision`.
+#[test]
+fn every_mainnet_authority_wrapper_calls_its_subject_gate() {
+    let body = stellar_agent_test_support::source_order::function_body(
+        "common.rs",
+        include_str!("../../src/tools/common.rs"),
+        "pub(crate) async fn mainnet_authority<",
+    );
+    for call in ["verify_attestation_subject_gate(", "from_decision("] {
+        assert!(
+            body.contains(call),
+            "common.rs: `mainnet_authority` must call `{call}`"
+        );
+    }
+}
+
+/// The intent inspection tool has no state-changing annotation.
+#[test]
+fn stellar_signed_intents_list_annotations_correct() {
+    let registration = find_registration("stellar_signed_intents_list").unwrap();
+    assert!(registration.read_only_hint);
+    assert!(!registration.destructive_hint);
+    assert!(!registration.chain_id_required);
 }

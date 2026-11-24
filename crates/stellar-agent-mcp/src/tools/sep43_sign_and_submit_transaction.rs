@@ -27,6 +27,14 @@
 //!
 //! # Signing path
 //!
+//! Before the signer, the order is: mainnet refusal, address forms, the
+//! tool's own rule, the effects decision of [`crate::tools::sep43_effects`],
+//! audit pre-flight, admission. Admission charges each payment route; the
+//! submission recorder charges the tool's own count limits with an opaque
+//! value class, so no value is charged twice. A signer, signing or send
+//! failure keeps the admitted usage. The recorder spends a verified approval
+//! with the send.
+//!
 //! 1. Loads the signer from `profile.mcp_signer_default` via
 //!    `stellar_agent_network::keyring::enrolled_keyring_signer`.
 //! 2. Dispatches to `stellar_agent_sep43::StellarAgentModule::sign_transaction`.
@@ -79,18 +87,20 @@ use crate::tools::common::redact_rpc_error_detail;
 ///
 /// # Schema
 ///
-/// - `chain_id` — CAIP-2 chain identifier (`"stellar:pubnet"` or
-///   `"stellar:testnet"`); validated against the active profile.
+/// - `chain_id`: CAIP-2 chain identifier, `stellar:testnet` or
+///   `stellar:mainnet`; validated against the active profile.
 /// - `transaction_xdr` — base64-encoded `TransactionEnvelope` XDR to sign and
 ///   submit.
 /// - `network_passphrase` — optional; if provided must equal the profile's
 ///   configured passphrase.
 /// - `address` — optional signer address (G-strkey); if provided must match
 ///   the active signer enrolled in the profile.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+/// - `approval_nonce`, `approval_attestation`: the approval proof of the
+///   repeat call after an approval response.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(crate = "rmcp::serde")]
 pub struct Sep43SignAndSubmitTransactionArgs {
-    /// CAIP-2 chain identifier (`"stellar:pubnet"` or `"stellar:testnet"`).
+    /// CAIP-2 chain identifier: `stellar:testnet` or `stellar:mainnet`.
     ///
     /// Validated against the active profile. Mismatch returns JSON-RPC
     /// `ErrorData` from the `dispatch_gate` preamble.
@@ -114,6 +124,32 @@ pub struct Sep43SignAndSubmitTransactionArgs {
     /// (`InvalidAddress`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+
+    /// The `approval_nonce` of the approval response this call repeats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_nonce: Option<String>,
+
+    /// The operator's attestation for `approval_nonce`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_attestation: Option<String>,
+}
+
+/// Prints every field but the attestation, which shows only whether it is
+/// set: the attestation is the operator's approval credential.
+impl std::fmt::Debug for Sep43SignAndSubmitTransactionArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sep43SignAndSubmitTransactionArgs")
+            .field("chain_id", &self.chain_id)
+            .field("transaction_xdr", &self.transaction_xdr)
+            .field("network_passphrase", &self.network_passphrase)
+            .field("address", &self.address)
+            .field("approval_nonce", &self.approval_nonce)
+            .field(
+                "approval_attestation",
+                &crate::tools::common::AttestationPresence(&self.approval_attestation),
+            )
+            .finish()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -183,8 +219,12 @@ impl WalletServer {
         name = "stellar_sep43_sign_and_submit_transaction",
         description = "Sign and submit a TransactionEnvelope XDR (SEP-43 signAndSubmit / \
                        WC v2 stellar_signAndSubmitXDR). Signs with the active profile signer, \
-                       submits via RPC, polls until confirmed. \
+                       submits via RPC, polls until confirmed. Testnet only. A mainnet profile \
+                       refuses with network.mainnet_write_forbidden before the policy gate, any \
+                       key access, and any RPC request. \
                        Returns { signedTxXdr: string, txHash: string, status: \"success\" | \"pending\" }. \
+                       An approval requirement returns { approval } instead; the repeat \
+                       passes approval_nonce and approval_attestation. \
                        read_only_hint=false; destructive_hint=true.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
@@ -194,7 +234,6 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use std::sync::Arc;
 
-        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
         use stellar_agent_core::policy::v1::OpaqueReason;
         use stellar_agent_network::StellarRpcClient;
         use stellar_agent_network::keyring::enrolled_keyring_signer;
@@ -202,12 +241,16 @@ impl WalletServer {
         use stellar_agent_sep43::StellarAgentModule;
         use stellar_agent_sep43::module::ModuleAdapter;
 
-        use crate::tools::value_audit::emit_value_audit_row_with_writer;
-
         // Structural mainnet refusal, keyed on the server's profile context:
         // before the policy gate, any key access, and any RPC request.
         if self.context.chain_id.is_mainnet() {
             return Ok(crate::tools::common::mainnet_signing_forbidden_result());
+        }
+
+        if let Err(result) =
+            crate::tools::common::check_sep43_envelope_address_forms(&args.transaction_xdr)
+        {
+            return Ok(result);
         }
 
         // ── Telemetry preamble ────────────────────────────────────────────────
@@ -217,9 +260,9 @@ impl WalletServer {
             "transaction_xdr_len": args.transaction_xdr.len(),
         });
 
-        // The gate performs registry lookup, chain validation, and policy evaluation.
-        // Single-shot sign tool: a RequireApproval verdict is fail-closed.
-        // The two-phase approval flow is not supported on this path.
+        // The gate performs registry lookup, chain validation, and policy
+        // evaluation; the effects gate decides an approval requirement of the
+        // tool rule.
         let dispatch_outcome = match self
             .dispatch_gate(
                 "stellar_sep43_sign_and_submit_transaction",
@@ -231,12 +274,26 @@ impl WalletServer {
             Ok(o) => o,
             Err(e) => return e.into_result(),
         };
-        match dispatch_outcome {
-            crate::tools::common::DispatchOutcome::Allow(_) => {}
-            crate::tools::common::DispatchOutcome::RequireApproval(_) => {
-                return Ok(crate::tools::common::single_shot_require_approval_error());
-            }
-        }
+        // The recorder charges this tool's own count limits, so admission
+        // charges only the payment routes.
+        let proof = crate::tools::common::SuppliedProof {
+            nonce: args.approval_nonce.clone(),
+            attestation: args.approval_attestation.clone(),
+        };
+        let effects = match self
+            .sep43_effects_gate(
+                "stellar_sep43_sign_and_submit_transaction",
+                &args.transaction_xdr,
+                &args.chain_id,
+                false,
+                &dispatch_outcome,
+                &proof,
+            )
+            .await
+        {
+            Ok(effects) => effects,
+            Err(error) => return error.into_result(),
+        };
 
         // ── Audit pre-flight (fail-closed) ────────────────────────────────────
         // Runs AFTER the dispatch gate: a policy denial or approval escalation
@@ -244,8 +301,7 @@ impl WalletServer {
         // surface its own code rather than audit.chain_key_unavailable. The
         // pre-flight still precedes the signer load, the signature, and the
         // submit — the transaction must not exist unless the row recording its
-        // production can be written. Reused (not re-acquired) for the
-        // post-confirm `opaque_action_submitted` row.
+        // production can be written.
         let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
             &self.profile,
             &self.profile_name_for_approval(),
@@ -266,6 +322,12 @@ impl WalletServer {
             "sep43_sign_and_submit: dispatch gate passed",
         );
 
+        // Admission precedes the signer: a signer, signing or send failure
+        // keeps the admitted usage.
+        if let Err(result) = self.sep43_admit(&effects) {
+            return Ok(result);
+        }
+
         let account = self.profile.mcp_signer_default.account.as_str();
 
         // ── Load signer from keyring ──────────────────────────────────────────
@@ -273,6 +335,7 @@ impl WalletServer {
             &self.profile_name_for_approval(),
             &self.profile,
             account,
+            self.established_owner().as_ref(),
         )
         .await
         {
@@ -283,6 +346,7 @@ impl WalletServer {
                     stellar_agent_core::error::WalletError::Auth(
                         stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
                             | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
+                            | stellar_agent_core::error::AuthError::EnrolledIdentityUnusable { .. }
                     )
                 ) {
                     return Ok(crate::tools::common::business_error_result(
@@ -379,29 +443,28 @@ impl WalletServer {
         };
         let recorder = match crate::tools::submission_record::build_recorder(
             crate::tools::submission_record::CommitRecord {
-                policy_decision: dispatch_outcome.audit_decision(),
+                policy_decision: effects.decision,
                 profile: &self.profile,
                 profile_name: profile_name.clone(),
                 tool: "stellar_sep43_sign_and_submit_transaction",
                 chain_id: self.context.chain_id.caip2_str().to_owned(),
-                legs: Vec::new(),
+                legs: effects.legs,
                 engine: self.policy_engine.as_ref(),
                 registry: &self.tool_registry,
                 value_class: stellar_agent_core::policy::v1::ValueClass::Opaque(
                     OpaqueReason::RawTransactionSignature,
                 ),
-                audit: std::sync::Arc::clone(&audit_writer),
+                audit: audit_writer,
                 nonce_id: None,
-                approval_nonce: None,
-                approval_dir: None,
+                // The recorder tombstones a verified approval with the send.
+                approval_nonce: effects.approval_nonce,
+                approval_dir: self.resolve_approval_dir().ok(),
                 now_ms,
+                provenance: None,
             },
             None,
         ) {
-            // The tool writes the row that carries its own contract, so the
-            // recorder leaves the confirmed arm to it: one settled row per
-            // confirmed send.
-            Ok(r) => r.with_caller_written_confirmed_row(),
+            Ok(r) => r,
             Err(err) => {
                 return Ok(crate::tools::submission_record::submission_error_result(
                     &err,
@@ -437,35 +500,9 @@ impl WalletServer {
                     "sep43_sign_and_submit: transaction confirmed",
                 );
 
-                // Non-fatal allow-path audit row. This is an opaque submit: the
-                // wallet did not decode the caller-supplied envelope's value, so
-                // legs are empty and the opaque reason is the tool's fixed
-                // classification (name-derived, not argument-derived). The on-chain
-                // tx is identified by the redacted hash.
-                //
-                // The row names the submission it settles. It is the only
-                // settled row this send writes, so without the envelope hash
-                // the pending row written before the send stays owed for good
-                // and a later reconciliation of the same transaction appends a
-                // second one.
-                let request_id = uuid::Uuid::new_v4().to_string();
-                let audit_entry = AuditEntry::new_opaque_action_submitted(
-                    "stellar_sep43_sign_and_submit_transaction",
-                    args.chain_id.as_str(),
-                    OpaqueReason::RawTransactionSignature.as_str(),
-                    redacted.as_str(),
-                    result.ledger,
-                    PolicyDecision::Allow,
-                    Some(stellar_agent_network::envelope_hash_hex(&signed_xdr)),
-                    None,
-                    &request_id,
-                );
-                emit_value_audit_row_with_writer(
-                    &audit_writer,
-                    &self.profile_name_for_approval(),
-                    audit_entry,
-                );
-
+                // A reported success is an endpoint claim, not authenticated
+                // evidence: it writes no submitted audit row, and the pending
+                // row stays open.
                 let response = json!({
                     "signedTxXdr": signed_xdr,
                     "txHash": result.tx_hash,
@@ -760,9 +797,59 @@ mod tests {
             _counterparty_cache: Option<&dyn CounterpartyCacheView>,
             _sep10_sessions: Option<&dyn Sep10SessionView>,
             _sep45_sessions: Option<&dyn Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             Ok(Decision::Deny(DenyReason::NoMatchingRule))
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn muxed_contract_intake_refuses_before_state() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&reads);
+        stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
+            stellar_agent_test_support::keyring_mock::ReadHook::new(
+                "svc",
+                "acct",
+                Arc::new(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }),
+            ),
+        ])
+        .unwrap();
+        let server = make_require_approval_server();
+        let before = std::fs::read_dir(home.path()).unwrap().count();
+        let result = server
+            .call_stellar_sep43_sign_and_submit_transaction(Sep43SignAndSubmitTransactionArgs {
+                chain_id: "stellar:testnet".to_owned(),
+                transaction_xdr: stellar_agent_test_support::xdr_fixtures::muxed_contract_envelope(
+                ),
+                address: None,
+                approval_nonce: None,
+                approval_attestation: None,
+                network_passphrase: None,
+            })
+            .await
+            .unwrap();
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "sep43.invalid_xdr");
+        assert!(message.ends_with("a muxed contract address (W) is not accepted on this path"));
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), before);
     }
 
     fn make_require_approval_server() -> crate::server::WalletServer {
@@ -817,16 +904,27 @@ mod tests {
     /// MUST NOT sign or submit the transaction.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn require_approval_verdict_is_fail_closed_no_signature_produced() {
-        let home = tempfile::tempdir().expect("isolated home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("isolated home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let server = make_require_approval_server();
+        // A bump sequence: no payment leg, so only the tool-rule guard
+        // refuses it.
         let args = Sep43SignAndSubmitTransactionArgs {
             chain_id: "stellar:testnet".to_owned(),
-            transaction_xdr: "AAAAAQAA".to_owned(),
+            transaction_xdr: crate::tools::sep43_effects::tests::bump_sequence([0; 32]),
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         };
         let result = server
             .call_stellar_sep43_sign_and_submit_transaction(args)
@@ -855,7 +953,11 @@ mod tests {
     /// it must never be masked by `audit.chain_key_unavailable`.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn policy_denial_precedes_the_audit_preflight() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::Arc;
         stellar_agent_test_support::keyring_mock::install().ok();
         let profile = Profile::builder_testnet(
@@ -874,6 +976,8 @@ mod tests {
             transaction_xdr: "AAAAAQAA".to_owned(),
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         };
         let result = server
             .call_stellar_sep43_sign_and_submit_transaction(args)
@@ -885,6 +989,51 @@ mod tests {
             !text.contains("signedTxXdr"),
             "no signature may be produced on a policy denial; got: {text}"
         );
+    }
+
+    /// A third-party contract transfer keeps the opaque policy decision: a
+    /// denial refuses with the policy code, and an allowance reaches the
+    /// audit pre-flight. No contract payment refusal applies to this tool.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn contract_transfer_keeps_the_opaque_policy_decision() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let transfer = crate::tools::sep43_effects::tests::contract_transfer();
+        for (deny, expected) in [
+            (true, "policy.deny.no_matching_rule"),
+            (false, "audit.chain_key_unavailable"),
+        ] {
+            let profile = Profile::builder_testnet(
+                "svc-s43sas-transfer",
+                "acct-s43sas-transfer",
+                "n-svc",
+                "n-acct",
+            )
+            .with_noop_engine()
+            .build();
+            let mut server =
+                crate::server::WalletServer::new(profile).expect("WalletServer::new in tests");
+            if deny {
+                server.policy_engine = std::sync::Arc::new(DenyEngine);
+            }
+            let result = server
+                .call_stellar_sep43_sign_and_submit_transaction(Sep43SignAndSubmitTransactionArgs {
+                    chain_id: "stellar:testnet".to_owned(),
+                    transaction_xdr: transfer.clone(),
+                    network_passphrase: None,
+                    address: None,
+                    approval_nonce: None,
+                    approval_attestation: None,
+                })
+                .await
+                .expect("a business envelope");
+            let (code, _message, text) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(code, expected, "{text}");
+        }
     }
 
     struct EnrolledAllowEngine;
@@ -900,15 +1049,43 @@ mod tests {
             _counterparty_cache: Option<&dyn CounterpartyCacheView>,
             _sep10_sessions: Option<&dyn Sep10SessionView>,
             _sep45_sessions: Option<&dyn Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             Ok(Decision::Allow)
         }
     }
 
+    /// The call of every test below: a mainnet chain id over a placeholder
+    /// envelope, which the signer load refuses before any decode.
+    fn mainnet_submit_args() -> Sep43SignAndSubmitTransactionArgs {
+        Sep43SignAndSubmitTransactionArgs {
+            chain_id: "stellar:mainnet".into(),
+            // Decodable and without a value effect, so the call reaches the
+            // signer load.
+            transaction_xdr: crate::tools::sep43_effects::tests::bump_sequence([0; 32]),
+            network_passphrase: None,
+            address: None,
+            approval_nonce: None,
+            approval_attestation: None,
+        }
+    }
+
+    /// A testnet context over a mainnet profile passes the entry refusal,
+    /// which keys on the context, and reaches the enrolled-signer load, which
+    /// keys on the profile. Without a verified policy the server has no
+    /// established owner, so the identity check refuses before the seed is
+    /// read.
     #[tokio::test]
     #[serial_test::serial(keyring)]
-    async fn enrolled_signer_mismatch_survives_sep43_sign_and_submit_mapping() {
-        stellar_agent_test_support::keyring_mock::install().unwrap();
+    #[serial_test::serial]
+    async fn a_mainnet_profile_without_an_established_owner_refuses_before_the_seed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use stellar_agent_core::profile::{
+            schema::signer_identity_entry_ref, signer_identity::SignerIdentityRecord,
+        };
         let dir = tempfile::tempdir().unwrap();
         let key = |seed: [u8; 32]| {
             stellar_strkey::ed25519::PublicKey(
@@ -931,35 +1108,85 @@ mod tests {
         .audit_log_path(dir.path().join("audit.jsonl"))
         .with_noop_engine()
         .build();
+        let reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&reads);
+        stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
+            stellar_agent_test_support::keyring_mock::ReadHook::new(
+                &profile.mcp_signer_default.service,
+                &pin,
+                std::sync::Arc::new(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }),
+            ),
+        ])
+        .unwrap();
         stellar_agent_network::keyring::rotate_keyring_secret_32(
             &profile.audit_log_hash_chain_key_id.service,
             &profile.audit_log_hash_chain_key_id.account,
         )
         .unwrap();
-        let secret = stellar_strkey::ed25519::PrivateKey([2; 32])
-            .as_unredacted()
-            .to_string()
-            .to_string();
         keyring_core::Entry::new(&profile.mcp_signer_default.service, &pin)
             .unwrap()
-            .set_password(&secret)
+            .set_password(
+                &stellar_strkey::ed25519::PrivateKey([1; 32])
+                    .as_unredacted()
+                    .to_string(),
+            )
             .unwrap();
+        stellar_agent_network::keyring::write_keyring_string(
+            &signer_identity_entry_ref(&profile.mcp_signer_default),
+            &SignerIdentityRecord::signed_for_test(
+                ed25519_dalek::SigningKey::from_bytes(&[1; 32])
+                    .verifying_key()
+                    .to_bytes(),
+                "sep43-enrolled",
+                &profile,
+                &ed25519_dalek::SigningKey::from_bytes(&[11; 32]),
+            )
+            .render()
+            .unwrap(),
+        )
+        .unwrap();
         let mut server = crate::server::WalletServer::new(profile).unwrap();
         server.policy_engine = std::sync::Arc::new(EnrolledAllowEngine);
-        // A testnet context over the mainnet profile passes the entry refusal,
-        // which keys on the context, and reaches the enrolled-signer check,
-        // which keys on the profile. The mapping it pins stays reachable.
         server.context = stellar_agent_network::NetworkContext::new(
             stellar_agent_core::profile::caip2::Caip2::Testnet,
             "https://rpc.example.invalid".into(),
         );
         let result = server
-            .call_stellar_sep43_sign_and_submit_transaction(Sep43SignAndSubmitTransactionArgs {
-                chain_id: "stellar:mainnet".into(),
-                transaction_xdr: "AAAAAQAA".into(),
-                network_passphrase: None,
-                address: None,
-            })
+            .call_stellar_sep43_sign_and_submit_transaction(mainnet_submit_args())
+            .await
+            .unwrap();
+        assert_eq!(result_code(&result), "auth.enrolled_identity_unusable");
+        let (_, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert!(message.contains("(owner_required)"), "{message}");
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "no seed read");
+    }
+
+    /// With a verified policy whose owner the identity record names, a seed
+    /// that derives to another key than the pin refuses with the enrolled
+    /// signer mismatch, and the tool reports that code as it is.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn enrolled_signer_mismatch_survives_sep43_sign_and_submit_mapping() {
+        use crate::tools::common::tests::mainnet::{Fixture, put};
+        let mut fixture = Fixture::new(|raw| raw);
+        put(
+            &fixture.server.profile.mcp_signer_default,
+            &stellar_strkey::ed25519::PrivateKey([2; 32])
+                .as_unredacted()
+                .to_string(),
+        );
+        fixture.server.policy_engine = std::sync::Arc::new(EnrolledAllowEngine);
+        fixture.server.context = stellar_agent_network::NetworkContext::new(
+            stellar_agent_core::profile::caip2::Caip2::Testnet,
+            "https://rpc.example.invalid".into(),
+        );
+        let result = fixture
+            .server
+            .call_stellar_sep43_sign_and_submit_transaction(mainnet_submit_args())
             .await
             .unwrap();
         assert_eq!(result_code(&result), "auth.enrolled_signer_mismatch");

@@ -12,6 +12,9 @@
     reason = "test-only; panics acceptable in unit tests"
 )]
 
+const SOURCE_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+const DEST_G: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+
 // ChangeTrust with transaction source [1; 32] and operation source [2; 32].
 const CHANGE_TRUST_ENVELOPE: &str = concat!(
     "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
@@ -32,18 +35,35 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tower::ServiceExt as _;
 
-use stellar_agent_core::approval::attestation::{compute_attestation, verify_attestation};
+use stellar_agent_core::approval::AttestedApprover;
+use stellar_agent_core::approval::attestation::{compute_attestation_v4, verify_attestation};
 use stellar_agent_core::approval::{
-    ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, decode_sha256_hex,
-    process_uid_for_attestation,
+    ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, approval_view_digest,
+    decode_sha256_hex, fixtures, process_uid_for_attestation,
 };
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::profile::schema::KeyringEntryRef;
 use stellar_agent_core::timefmt;
 
-use crate::auth::{AuthState, OpaqueToken, compute_csrf};
+use crate::auth::{
+    AuthState, OpaqueToken, SESSION_ABSOLUTE_TIMEOUT, SESSION_IDLE_TIMEOUT, SessionClock,
+    SessionPurpose, compute_csrf,
+};
 use crate::decision::DecisionContext;
 use crate::{PageIdentity, ServeConfig, ServeStartError, ServeState, build_router, start_serve};
+
+/// The approve body a freshly loaded detail page sends: the view digest of
+/// the entry the store holds for `nonce` now, or `null` when the page would
+/// carry none. `the_detail_page_carries_the_digest_of_the_entry_it_renders`
+/// pins that the page carries exactly this value.
+pub(crate) fn view_digest_body_for(ctx: &DecisionContext, nonce: &str) -> Body {
+    let store = PendingApprovalStore::open(ctx.store_path.clone()).unwrap();
+    let digest = store
+        .get(nonce)
+        .and_then(|entry| approval_view_digest(entry, &ctx.context.binding()).ok())
+        .map(|digest| stellar_agent_core::hex::encode(&digest));
+    Body::from(serde_json::json!({ "view_digest": digest }).to_string())
+}
 
 const BOUND: &str = "127.0.0.1:8080";
 const HOST: &str = "127.0.0.1:8080";
@@ -53,8 +73,11 @@ pub(crate) struct Harness {
     _dir: TempDir,
     state: ServeState,
     pub(crate) store_path: std::path::PathBuf,
+    audit_path: std::path::PathBuf,
     bootstrap_hex: String,
     raw_key: [u8; 32],
+    clock: SessionClock,
+    proof: StdMutex<Option<String>>,
 }
 
 impl Harness {
@@ -72,7 +95,7 @@ impl Harness {
             .unwrap();
 
         let audit_writer = Arc::new(StdMutex::new(
-            AuditWriter::open(audit_path, None).expect("audit writer"),
+            AuditWriter::open(audit_path.clone(), None).expect("audit writer"),
         ));
         let ctx = DecisionContext::new(
             stellar_agent_core::approval::ApprovalContext::from_profile(
@@ -90,8 +113,14 @@ impl Harness {
         );
         let bootstrap = OpaqueToken::generate();
         let bootstrap_hex = bootstrap.to_hex();
+        let clock = SessionClock::manual();
         let state = ServeState {
-            auth: Arc::new(StdMutex::new(AuthState::new(bootstrap))),
+            presence: None,
+            auth: Arc::new(StdMutex::new(AuthState::with_clock(
+                bootstrap,
+                SessionPurpose::Inbox,
+                clock.clone(),
+            ))),
             ctx: Arc::new(ctx),
             identity: Arc::new(PageIdentity::neutral()),
         };
@@ -99,14 +128,23 @@ impl Harness {
             _dir: dir,
             state,
             store_path,
+            audit_path,
             bootstrap_hex,
             raw_key,
+            clock,
+            proof: StdMutex::new(None),
         }
     }
 
     pub(crate) fn router(&self) -> Router {
         let bound: SocketAddr = BOUND.parse().unwrap();
         build_router(self.state.clone(), bound)
+    }
+
+    /// The body the detail page's approve sends for `nonce` (see
+    /// [`view_digest_body_for`]).
+    pub(crate) fn view_digest_body(&self, nonce: &str) -> Body {
+        view_digest_body_for(&self.state.ctx, nonce)
     }
 
     pub(crate) fn insert(&self, entry: PendingApproval) -> String {
@@ -118,7 +156,9 @@ impl Harness {
         nonce
     }
 
-    /// Perform the bootstrap exchange and return the session cookie header value.
+    /// Perform the bootstrap exchange and return the session cookie header
+    /// value. The session proof the bootstrap page carries is kept for
+    /// [`Self::proof`].
     pub(crate) async fn bootstrap(&self) -> String {
         let req = Request::builder()
             .uri(format!("/bootstrap/{}", self.bootstrap_hex))
@@ -126,15 +166,23 @@ impl Harness {
             .body(Body::empty())
             .unwrap();
         let resp = self.router().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "bootstrap should 302");
-        let set_cookie = resp
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("bootstrap sets a session cookie")
-            .to_str()
-            .unwrap();
-        // Keep only the `name=value` part for the Cookie header.
-        set_cookie.split(';').next().unwrap().trim().to_owned()
+        let (cookie, proof) = read_bootstrap_response(resp).await;
+        *self.proof.lock().unwrap() = Some(proof);
+        cookie
+    }
+
+    /// The session proof the last bootstrap exchange delivered.
+    pub(crate) fn proof(&self) -> String {
+        self.proof
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("bootstrap delivered a proof")
+    }
+
+    /// The audit log bytes, or `None` while no event was written.
+    fn audit_bytes(&self) -> Option<Vec<u8>> {
+        std::fs::read(&self.audit_path).ok()
     }
 
     /// The session CSRF value for `nonce` under the live session key.
@@ -145,24 +193,518 @@ impl Harness {
     }
 }
 
+/// Reads a successful bootstrap response: `200`, an HTML page, the session
+/// cookie, and the proof from the page's data island. Returns the cookie's
+/// `name=value` part and the proof.
+pub(crate) async fn read_bootstrap_response(resp: axum::response::Response) -> (String, String) {
+    assert_eq!(resp.status(), StatusCode::OK, "bootstrap returns its page");
+    let set_cookie = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("bootstrap sets a session cookie")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+    let island = json_island(&html, "session-bootstrap-data");
+    let proof = island["proof"].as_str().unwrap().to_owned();
+    assert_eq!(island["next"], "/inbox");
+    // Keep only the `name=value` part for the Cookie header.
+    let cookie = set_cookie.split(';').next().unwrap().trim().to_owned();
+    (cookie, proof)
+}
+
+/// Parses the JSON data island with element id `id` out of `html`.
+fn json_island(html: &str, id: &str) -> serde_json::Value {
+    let open = format!(r#"<script type="application/json" id="{id}">"#);
+    let start = html.find(&open).expect("data island present") + open.len();
+    let end = start + html[start..].find("</script>").unwrap();
+    serde_json::from_str(&html[start..end]).unwrap()
+}
+
 fn uid() -> String {
     process_uid_for_attestation().expect("uid on test host")
 }
 
+/// One [`RecordingConsent`] completion: the witnessed nonce and the row
+/// source.
+pub(crate) type CompletionCall = (String, crate::decision::ConsentRowSource);
+
+/// A consent recording that notes each completion and refuses every one
+/// while `refuse` is set. While `publish` is set it publishes every kind and
+/// notes whether each completion carried a verified publication handoff.
+#[derive(Default)]
+pub(crate) struct RecordingConsent {
+    pub(crate) calls: StdMutex<Vec<CompletionCall>>,
+    pub(crate) refuse: std::sync::atomic::AtomicBool,
+    pub(crate) missing_record: std::sync::atomic::AtomicBool,
+    pub(crate) publish: std::sync::atomic::AtomicBool,
+    pub(crate) published: StdMutex<Vec<bool>>,
+}
+impl RecordingConsent {
+    pub(crate) fn calls(&self) -> Vec<CompletionCall> {
+        self.calls.lock().unwrap().clone()
+    }
+    pub(crate) fn published(&self) -> Vec<bool> {
+        self.published.lock().unwrap().clone()
+    }
+}
+impl crate::decision::ConsentRecording for RecordingConsent {
+    fn precheck(&self, _: &PendingApproval) -> Result<(), stellar_agent_core::error::WalletError> {
+        if self
+            .missing_record
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(stellar_agent_core::error::WalletError::Approval(
+                stellar_agent_core::ApprovalFailure::NotFound {
+                    detail: "no durable approval record for that nonce".to_owned(),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn publishes(&self, _: stellar_agent_core::approval::witness::ApprovedKind) -> bool {
+        self.publish.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn complete(
+        &self,
+        consent: crate::decision::VerifiedConsent,
+        row: crate::decision::ConsentRowSource,
+    ) -> Result<(), stellar_agent_core::error::WalletError> {
+        self.published
+            .lock()
+            .unwrap()
+            .push(consent.publication.is_some());
+        self.calls
+            .lock()
+            .unwrap()
+            .push((consent.witness.nonce().to_owned(), row));
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(stellar_agent_core::error::WalletError::Approval(
+                stellar_agent_core::ApprovalFailure::PresenceUnavailable,
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct CountingRevocations {
+    pub(crate) calls: std::sync::atomic::AtomicUsize,
+}
+impl CountingRevocations {
+    pub(crate) fn new() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+impl crate::decision::RevocationAccess for CountingRevocations {
+    fn lookup(
+        &self,
+        _: &str,
+    ) -> Result<crate::decision::RevocationView, crate::decision::RevocationFailure> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(crate::decision::RevocationView {
+            state: "pending".to_owned(),
+            expired: false,
+            waiting_expires_at_ms: u64::MAX,
+            execution_expires_at_ms: None,
+            consent_at_ms: None,
+            revoked_at_ms: None,
+            closed_at_ms: None,
+        })
+    }
+    fn revoke(
+        &self,
+        nonce: &str,
+        _: stellar_agent_core::approval::Surface,
+        _: Option<&str>,
+    ) -> Result<crate::decision::RevocationView, crate::decision::RevocationFailure> {
+        let mut view = self.lookup(nonce)?;
+        view.state = "revoked".to_owned();
+        view.revoked_at_ms = Some(1);
+        Ok(view)
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn revocation_control_matches_record_eligibility() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let mut h = Harness::new("revoke-controls");
+    let ctx = Arc::try_unwrap(h.state.ctx).ok().unwrap();
+    h.state.ctx = Arc::new(ctx.with_revocation_access(Arc::new(CountingRevocations::new())));
+    let cookie = h.bootstrap().await;
+    for eligible in [true, false] {
+        let mut entry = payment_entry(DEFAULT_TTL_MS);
+        if !eligible {
+            entry.process_uid = "4294967294".to_owned();
+        }
+        let nonce = h.insert(entry);
+        let response = h
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/approval/{nonce}"))
+                    .header("host", HOST)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        for marker in [
+            "id=\"revoke-btn\"",
+            "id=\"revoke-data\"",
+            "/static/revoke.js",
+            "/static/revoke.css",
+        ] {
+            assert_eq!(html.contains(marker), eligible, "{marker}");
+        }
+    }
+    for (path, content) in [
+        ("/static/revoke.js", crate::web::REVOKE_JS),
+        ("/static/revoke.css", crate::web::REVOKE_CSS),
+    ] {
+        let response = h
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("host", HOST)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            content
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn revocation_authentication_matrix() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use std::sync::atomic::Ordering;
+    let mut h = Harness::new("revoke-auth");
+    let access = Arc::new(CountingRevocations::new());
+    let ctx = Arc::try_unwrap(h.state.ctx).ok().unwrap();
+    h.state.ctx = Arc::new(ctx.with_revocation_access(access.clone()));
+    let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let cookie = h.bootstrap().await;
+    let csrf = h.csrf_for(&nonce);
+    let before = std::fs::read(&h.store_path).unwrap();
+    for omitted in ["cookie", "x-stellar-approval-csrf", "x-session-proof"] {
+        for invalid in [false, true] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(format!("/approval/{nonce}/revoke"))
+                .header("host", HOST)
+                .header("origin", ORIGIN);
+            for (name, value) in [
+                ("cookie", cookie.clone()),
+                ("x-stellar-approval-csrf", csrf.clone()),
+                ("x-session-proof", h.proof()),
+            ] {
+                if name != omitted {
+                    request = request.header(name, value);
+                } else if invalid {
+                    request = request.header(name, "invalid");
+                }
+            }
+            let response = h
+                .router()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if omitted == "cookie" {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::FORBIDDEN
+                }
+            );
+            assert_eq!(access.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(std::fs::read(&h.store_path).unwrap(), before);
+        }
+    }
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/approval/{nonce}/revoke"))
+        .header("host", HOST)
+        .header("origin", ORIGIN)
+        .header("cookie", &cookie)
+        .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        body_json(h.router().oneshot(request).await.unwrap()).await["view"]["state"],
+        "revoked"
+    );
+    assert_eq!(access.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(std::fs::read(&h.store_path).unwrap(), before);
+}
+
+/// SHA-256 of each page fragment and asset, rendered from fixed
+/// inputs.
+pub(crate) fn unaffected_outputs() -> Vec<(&'static str, String)> {
+    use sha2::{Digest as _, Sha256};
+    let hash = |bytes: &[u8]| stellar_agent_core::hex::encode(&Sha256::digest(bytes));
+    const NOW: u64 = 1_700_000_000_000;
+    let dir = TempDir::new().unwrap();
+    let mut entry = fixtures::payment_pending(
+        SOURCE_G,
+        DEST_G,
+        "XLM",
+        10,
+        Some("memo"),
+        100,
+        7,
+        "1000".to_owned(),
+        600_000,
+    );
+    entry.approval_nonce = "AAAAAAAAAAAAAAAAAAAAAA".to_owned();
+    entry.created_at_unix_ms = NOW;
+    entry.expires_at_unix_ms = NOW + 600_000;
+    let mut store = PendingApprovalStore::open(dir.path().join("base.toml")).unwrap();
+    store.insert(entry, NOW).unwrap();
+    let view = store.snapshot(NOW).remove(0);
+    let profile = stellar_agent_core::profile::schema::Profile::builder_mainnet_named(
+        "base",
+        "https://rpc.example.invalid",
+        "base-signer",
+        "default",
+        "base-nonce",
+        "default",
+    )
+    .build();
+    let mut context = stellar_agent_core::approval::ApprovalContext::from_profile("base", &profile);
+    context.endpoint_host = "rpc.example.invalid".to_owned();
+    context.signer_account = Some(SOURCE_G.to_owned());
+    let identity = PageIdentity::neutral();
+    let data = serde_json::json!({
+        "nonce": view.approval_nonce, "csrf": "00", "consent_view_digest": "11",
+        "storageKey": "key", "mode": "inbox",
+    });
+    let base = |memo: serde_json::Value| {
+        serde_json::json!({
+            "chain_id": "stellar:mainnet",
+            "source": SOURCE_G,
+            "policy_digest": "11".repeat(32),
+            "fee_bound_stroops": "300",
+            "memo": memo,
+        })
+    };
+    let trustline = |limit: &str| {
+        serde_json::json!({"base": base(serde_json::json!("none")), "payload": {"trustline": {
+            "issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+            "code": "USDC", "limit_stroops": limit,
+        }}})
+    };
+    let intents: Vec<_> = [
+        serde_json::json!({"base": base(serde_json::json!({"text": "<b>&\"x"})), "payload": {"pay": {
+            "destination": DEST_G, "asset": "native", "amount_stroops": "25000000",
+        }}}),
+        trustline("0"),
+        trustline("9223372036854775807"),
+        serde_json::json!({"base": base(serde_json::json!({"id": "7"})), "payload": {"claim": {
+            "balance_id": format!("00000000{}", "0b".repeat(32)),
+            "asset": {"issued": {
+                "code": "USDC", "issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+            }},
+            "amount_stroops": "1", "claimant": SOURCE_G,
+        }}}),
+    ]
+    .into_iter()
+    .map(|value| {
+        let intent: stellar_agent_core::approval::ClassicIntent =
+            serde_json::from_value(value).unwrap();
+        stellar_agent_core::approval::IntentView::new(&intent)
+    })
+    .collect();
+    vec![
+        (
+            "summary",
+            hash(crate::templates::render_summary_html(&view).as_bytes()),
+        ),
+        (
+            "context",
+            hash(crate::templates::render_context_header_html(&context).as_bytes()),
+        ),
+        (
+            "detail",
+            hash(
+                crate::templates::render_detail_page(
+                    &view, &context, "00", "11", None, None, &identity,
+                )
+                .as_bytes(),
+            ),
+        ),
+        (
+            "consent",
+            hash(
+                crate::templates::render_mainnet_consent_page(
+                    &view,
+                    &context,
+                    &data,
+                    None,
+                    None,
+                    crate::templates::ConsentPageMode::Inbox,
+                    &identity,
+                )
+                .as_bytes(),
+            ),
+        ),
+        (
+            "intent_pay",
+            hash(
+                crate::templates::render_intent_html(&view.approval_nonce, &intents[0]).as_bytes(),
+            ),
+        ),
+        (
+            "intent_trustline",
+            hash(
+                crate::templates::render_intent_html(&view.approval_nonce, &intents[1]).as_bytes(),
+            ),
+        ),
+        (
+            "intent_unlimited",
+            hash(
+                crate::templates::render_intent_html(&view.approval_nonce, &intents[2]).as_bytes(),
+            ),
+        ),
+        (
+            "intent_claim",
+            hash(
+                crate::templates::render_intent_html(&view.approval_nonce, &intents[3]).as_bytes(),
+            ),
+        ),
+        (
+            "consent_intent",
+            hash(
+                crate::templates::render_mainnet_consent_page(
+                    &view,
+                    &context,
+                    &data,
+                    Some("ab12"),
+                    Some(&intents[0]),
+                    crate::templates::ConsentPageMode::Inbox,
+                    &identity,
+                )
+                .as_bytes(),
+            ),
+        ),
+        ("app.js", hash(crate::web::APP_JS)),
+        ("app_shared.js", hash(crate::web::APP_SHARED_JS)),
+        (
+            "mainnet-presence.js",
+            hash(include_bytes!("web/mainnet-presence.js")),
+        ),
+    ]
+}
+
+/// The pinned digests of [`unaffected_outputs`] from fixed rendering inputs.
+const BASE_OUTPUTS: &[(&str, &str)] = &[
+    (
+        "summary",
+        "affc57a44007272a557beb87cabc27e32ec05d116b057a8c8e23c0f562a32ea2",
+    ),
+    (
+        "context",
+        "8248314bbad2eba5d026d559772dbba2590287227c32f6d83aa8dd0b41a9b9d2",
+    ),
+    (
+        "detail",
+        "ea8ca599025c533524f83479246fbe4576b090f4b1310a9cc3a465a6280c1d6b",
+    ),
+    (
+        "consent",
+        "1f4be3d25f09f27b7050cc998b914ba3517c245a920485106cbe44a8726401ec",
+    ),
+    (
+        "intent_pay",
+        "697cf8a3705b791e4b59ffabc8a5b6dc745aa3cb75c09a5bb8e1ba12fad3b14f",
+    ),
+    (
+        "intent_trustline",
+        "c3cf390434d64615c68d365f57f13de7faf4f1dad17d1032ffd02a7bf7e72470",
+    ),
+    (
+        "intent_unlimited",
+        "a3b71d75c756a8a3ec744fadde393cbcef26d0ac829364edf4790d9b8920b5ed",
+    ),
+    (
+        "intent_claim",
+        "d312ad91c8c553b131e4aeb76a8ea7b18f2d924fb08a134d29d618a3ba2ff515",
+    ),
+    (
+        "consent_intent",
+        "fab2c2bf57bbb5d6f811dd63eb03b60ab65e4ed9e4ac16f7f393f77f9cf9a650",
+    ),
+    (
+        "app.js",
+        "d9d9539353991cf5f404b8c05555530f91eed203747afaca0ee2bc54aab1d18d",
+    ),
+    (
+        "app_shared.js",
+        "2b322abfb843c8b828e37230e088fea2b9780cf3c01176aff735735bfed510ec",
+    ),
+    (
+        "mainnet-presence.js",
+        "33e1630b8b2a4a35c30bacebbd0c1ea0fa13c422accb78798b85836fb6d870f4",
+    ),
+];
+
+#[test]
+#[serial_test::serial]
+fn unaffected_approval_outputs_keep_base_bytes() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let outputs = unaffected_outputs();
+    assert_eq!(outputs.len(), BASE_OUTPUTS.len());
+    for ((label, digest), (base_label, base)) in outputs.iter().zip(BASE_OUTPUTS) {
+        assert_eq!((*label, digest.as_str()), (*base_label, *base));
+    }
+}
+
 fn payment_entry(ttl_ms: u64) -> PendingApproval {
-    PendingApproval::new_payment_pending(
-        "b64xdr".to_owned(),
-        b"fake-xdr",
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+    fixtures::payment_pending(
+        SOURCE_G,
+        DEST_G,
+        "XLM",
         2_500_000,
-        "XLM".to_owned(),
         None,
         100,
         1_234_567,
         uid(),
         ttl_ms,
     )
-    .unwrap()
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -177,9 +719,12 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 #[tokio::test]
 #[serial]
 async fn bootstrap_is_single_use() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("bootstrap-single");
     let cookie = h.bootstrap().await;
-    assert!(cookie.starts_with("stellar_agent_approval_session="));
+    assert!(cookie.starts_with("stellar_agent_approval_session_"));
 
     // Second attempt with the same token must 404.
     let req = Request::builder()
@@ -203,6 +748,9 @@ async fn bootstrap_is_single_use() {
 #[tokio::test]
 #[serial]
 async fn protected_route_without_cookie_is_404() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("no-cookie");
     let req = Request::builder()
         .uri("/pending.json")
@@ -216,6 +764,9 @@ async fn protected_route_without_cookie_is_404() {
 #[tokio::test]
 #[serial]
 async fn wrong_host_is_421() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("wrong-host");
     let req = Request::builder()
         .uri("/inbox")
@@ -233,6 +784,9 @@ async fn wrong_host_is_421() {
 #[tokio::test]
 #[serial]
 async fn post_without_origin_is_403() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("no-origin");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -244,7 +798,8 @@ async fn post_without_origin_is_403() {
         .header(header::HOST, HOST)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
-        .body(Body::empty())
+        .header("x-session-proof", h.proof())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -253,6 +808,9 @@ async fn post_without_origin_is_403() {
 #[tokio::test]
 #[serial]
 async fn post_with_missing_or_wrong_csrf_is_403_and_does_not_mutate() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("bad-csrf");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -264,7 +822,7 @@ async fn post_with_missing_or_wrong_csrf_is_403_and_does_not_mutate() {
         .header(header::HOST, HOST)
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
-        .body(Body::empty())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -277,6 +835,7 @@ async fn post_with_missing_or_wrong_csrf_is_403_and_does_not_mutate() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", "00".repeat(32))
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -296,6 +855,9 @@ async fn post_with_missing_or_wrong_csrf_is_403_and_does_not_mutate() {
 #[tokio::test]
 #[serial]
 async fn approve_payment_mints_verifiable_attestation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("approve-ok");
     let cookie = h.bootstrap().await;
     let entry = payment_entry(DEFAULT_TTL_MS);
@@ -307,6 +869,7 @@ async fn approve_payment_mints_verifiable_attestation() {
         } => envelope_sha256_hex.clone(),
         _ => unreachable!(),
     };
+    let attested = entry.clone();
     let nonce = h.insert(entry);
     let csrf = h.csrf_for(&nonce);
 
@@ -317,7 +880,8 @@ async fn approve_payment_mints_verifiable_attestation() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
-        .body(Body::empty())
+        .header("x-session-proof", h.proof())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -326,12 +890,14 @@ async fn approve_payment_mints_verifiable_attestation() {
     let blob_b64 = json["attestation"].as_str().unwrap();
 
     let sha = decode_sha256_hex(&envelope_sha256_hex).unwrap();
-    let expected = compute_attestation(
+    let expected = compute_attestation_v4(
         &h.raw_key,
         &h.state.ctx.context.binding(),
         &nonce,
         &sha,
         &process_uid,
+        &attested.attested_lifetime(),
+        &AttestedApprover::Local,
     );
     let blob: [u8; 32] = URL_SAFE_NO_PAD
         .decode(blob_b64)
@@ -339,12 +905,17 @@ async fn approve_payment_mints_verifiable_attestation() {
         .try_into()
         .unwrap();
     assert_eq!(blob, expected);
+    let store = PendingApprovalStore::open(h.state.ctx.store_path.clone()).unwrap();
+    let persisted = store.get(&nonce).unwrap().clone();
+    drop(store);
+    assert!(persisted.attested_approver == Some(AttestedApprover::Local));
     assert!(verify_attestation(
         &h.raw_key,
         &h.state.ctx.context.binding(),
         &nonce,
         &sha,
         &process_uid,
+        &persisted.attestation_scope().unwrap(),
         &blob
     ));
 }
@@ -352,6 +923,9 @@ async fn approve_payment_mints_verifiable_attestation() {
 #[tokio::test]
 #[serial]
 async fn serve_trustline_json_returns_attestation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("approve-trustline");
     let cookie = h.bootstrap().await;
     let limit = None;
@@ -376,6 +950,7 @@ async fn serve_trustline_json_returns_attestation() {
         } => envelope_sha256_hex.clone(),
         _ => unreachable!(),
     };
+    let attested = entry.clone();
     let nonce = h.insert(entry);
     let csrf = h.csrf_for(&nonce);
 
@@ -386,7 +961,8 @@ async fn serve_trustline_json_returns_attestation() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
-        .body(Body::empty())
+        .header("x-session-proof", h.proof())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -395,12 +971,14 @@ async fn serve_trustline_json_returns_attestation() {
     let blob_b64 = json["attestation"].as_str().unwrap();
 
     let sha = decode_sha256_hex(&envelope_sha256_hex).unwrap();
-    let expected = compute_attestation(
+    let expected = compute_attestation_v4(
         &h.raw_key,
         &h.state.ctx.context.binding(),
         &nonce,
         &sha,
         &process_uid,
+        &attested.attested_lifetime(),
+        &AttestedApprover::Local,
     );
     let blob: [u8; 32] = URL_SAFE_NO_PAD
         .decode(blob_b64)
@@ -408,12 +986,17 @@ async fn serve_trustline_json_returns_attestation() {
         .try_into()
         .unwrap();
     assert_eq!(blob, expected);
+    let store = PendingApprovalStore::open(h.state.ctx.store_path.clone()).unwrap();
+    let persisted = store.get(&nonce).unwrap().clone();
+    drop(store);
+    assert!(persisted.attested_approver == Some(AttestedApprover::Local));
     assert!(verify_attestation(
         &h.raw_key,
         &h.state.ctx.context.binding(),
         &nonce,
         &sha,
         &process_uid,
+        &persisted.attestation_scope().unwrap(),
         &blob
     ));
     let req = Request::builder()
@@ -432,6 +1015,9 @@ async fn serve_trustline_json_returns_attestation() {
 #[tokio::test]
 #[serial]
 async fn reject_creates_tombstone() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("reject-ok");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -444,6 +1030,7 @@ async fn reject_creates_tombstone() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -458,6 +1045,9 @@ async fn reject_creates_tombstone() {
 #[tokio::test]
 #[serial]
 async fn second_approve_is_idempotent_already_resolved() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("reshow");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -471,7 +1061,8 @@ async fn second_approve_is_idempotent_already_resolved() {
             .header(header::ORIGIN, ORIGIN)
             .header(header::COOKIE, &cookie)
             .header("x-stellar-approval-csrf", &csrf)
-            .body(Body::empty())
+            .header("x-session-proof", h.proof())
+            .body(h.view_digest_body(&nonce))
             .unwrap()
     };
 
@@ -489,6 +1080,9 @@ async fn second_approve_is_idempotent_already_resolved() {
 #[tokio::test]
 #[serial]
 async fn approve_expired_entry_reports_expired() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("expired");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(1));
@@ -502,7 +1096,8 @@ async fn approve_expired_entry_reports_expired() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
-        .body(Body::empty())
+        .header("x-session-proof", h.proof())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -515,21 +1110,22 @@ async fn approve_expired_entry_reports_expired() {
 #[tokio::test]
 #[serial]
 async fn approve_foreign_process_uid_reports_user_mismatch() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("approve-mismatch");
     let cookie = h.bootstrap().await;
-    let entry = PendingApproval::new_payment_pending(
-        "b64xdr".to_owned(),
-        b"fake-xdr",
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+    let entry = fixtures::payment_pending(
+        SOURCE_G,
+        DEST_G,
+        "XLM",
         2_500_000,
-        "XLM".to_owned(),
         None,
         100,
         1_234_567,
         "99999999".to_owned(),
         DEFAULT_TTL_MS,
-    )
-    .unwrap();
+    );
     let nonce = h.insert(entry);
     let csrf = h.csrf_for(&nonce);
 
@@ -540,7 +1136,8 @@ async fn approve_foreign_process_uid_reports_user_mismatch() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
-        .body(Body::empty())
+        .header("x-session-proof", h.proof())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -555,21 +1152,22 @@ async fn approve_foreign_process_uid_reports_user_mismatch() {
 #[tokio::test]
 #[serial]
 async fn reject_foreign_process_uid_reports_user_mismatch() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("reject-mismatch");
     let cookie = h.bootstrap().await;
-    let entry = PendingApproval::new_payment_pending(
-        "b64xdr".to_owned(),
-        b"fake-xdr",
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+    let entry = fixtures::payment_pending(
+        SOURCE_G,
+        DEST_G,
+        "XLM",
         2_500_000,
-        "XLM".to_owned(),
         None,
         100,
         1_234_567,
         "99999999".to_owned(),
         DEFAULT_TTL_MS,
-    )
-    .unwrap();
+    );
     let nonce = h.insert(entry);
     let csrf = h.csrf_for(&nonce);
 
@@ -580,6 +1178,7 @@ async fn reject_foreign_process_uid_reports_user_mismatch() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -601,6 +1200,9 @@ async fn reject_foreign_process_uid_reports_user_mismatch() {
 #[tokio::test]
 #[serial]
 async fn pending_json_reports_shape() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("pending-json");
     let cookie = h.bootstrap().await;
     h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -622,6 +1224,9 @@ async fn pending_json_reports_shape() {
 #[tokio::test]
 #[serial]
 async fn detail_page_renders_for_known_nonce() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("detail");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -648,10 +1253,14 @@ async fn detail_page_renders_for_known_nonce() {
 #[tokio::test]
 #[serial]
 async fn approve_when_store_locked_returns_503_busy() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("busy");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
     let csrf = h.csrf_for(&nonce);
+    let body = h.view_digest_body(&nonce);
 
     // Hold the store lock for the whole request so open_with_retry exhausts.
     let _holder = PendingApprovalStore::open(h.store_path.clone()).unwrap();
@@ -663,7 +1272,8 @@ async fn approve_when_store_locked_returns_503_busy() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
-        .body(Body::empty())
+        .header("x-session-proof", h.proof())
+        .body(body)
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -701,7 +1311,11 @@ fn config_for(
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn start_serve_rejects_non_loopback_bind() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let dir = TempDir::new().unwrap();
     let config = config_for(
         "0.0.0.0:0".parse().unwrap(),
@@ -713,7 +1327,11 @@ async fn start_serve_rejects_non_loopback_bind() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn start_serve_bind_conflict_is_clean_error() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let dir = TempDir::new().unwrap();
     // Occupy a loopback port, then ask the server to bind the same one.
     let occupier = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -734,6 +1352,9 @@ async fn start_serve_bind_conflict_is_clean_error() {
 #[tokio::test]
 #[serial]
 async fn start_serve_end_to_end_over_real_tcp_bind() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let dir = TempDir::new().unwrap();
     let config = config_for(
@@ -783,12 +1404,18 @@ async fn start_serve_end_to_end_over_real_tcp_bind() {
         .expect("read the bootstrap response");
     let response_text = String::from_utf8_lossy(&response);
     assert!(
-        response_text.starts_with("HTTP/1.1 303"),
-        "bootstrap exchange over a real socket must redirect: {response_text}"
+        response_text.starts_with("HTTP/1.1 200"),
+        "bootstrap exchange over a real socket must return its page: {response_text}"
+    );
+    let lower = response_text.to_ascii_lowercase();
+    assert!(
+        lower.contains("set-cookie: stellar_agent_approval_session_")
+            && lower.contains("max-age=28800"),
+        "bootstrap exchange must set the bounded session cookie: {response_text}"
     );
     assert!(
-        response_text.to_ascii_lowercase().contains("set-cookie"),
-        "bootstrap exchange must set the session cookie: {response_text}"
+        response_text.contains(r#"id="session-bootstrap-data""#),
+        "bootstrap exchange must deliver the session proof page: {response_text}"
     );
 
     handle
@@ -797,9 +1424,152 @@ async fn start_serve_end_to_end_over_real_tcp_bind() {
         .expect("shutdown must join both tasks cleanly");
 }
 
+/// One HTTP/1.1 request over `addr` with `host: localhost:<port>`, returning
+/// the raw response text.
+async fn localhost_request(addr: SocketAddr, path: &str, cookie: Option<&str>) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .unwrap_or_else(|error| panic!("{addr} must accept: {error}"));
+    let cookie = cookie.map_or_else(String::new, |value| format!("cookie: {value}\r\n"));
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nhost: localhost:{}\r\n{cookie}connection: close\r\n\r\n",
+        addr.port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// The mainnet inbox hands out a `localhost` URL, so it holds `127.0.0.1`
+/// and `[::1]` on that port: a bootstrap exchanged over `[::1]` opens the
+/// session the inbox serves over `127.0.0.1`, no other socket can bind
+/// `[::1]` there, and shutdown releases both.
+#[tokio::test]
+#[serial]
+async fn the_mainnet_inbox_binds_both_families() {
+    use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
+    let fixture = MainnetConsentFixture::new("inbox-pair");
+    let context = DecisionContext::new(
+        stellar_agent_core::approval::ApprovalContext::from_profile(
+            fixture.name(),
+            fixture.profile(),
+        ),
+        fixture.store_path(),
+        fixture.profile().attestation_key_id.clone(),
+        stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
+            fixture.name(),
+            fixture.profile(),
+        ),
+        Arc::new(StdMutex::new(fixture.audit_writer())),
+        None,
+    )
+    .with_mainnet_authority(fixture.authority());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let handle = start_serve(ServeConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        context,
+        tx,
+        false,
+    ))
+    .await
+    .unwrap();
+    let port = handle.local_addr().port();
+    assert_eq!(
+        handle.local_addr(),
+        SocketAddr::from(([127, 0, 0, 1], port))
+    );
+    let token = handle.bootstrap_token_hex().to_owned();
+    assert_eq!(
+        handle.bootstrap_url(),
+        format!("http://localhost:{port}/bootstrap/{token}")
+    );
+    let ipv6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+    let bootstrap = localhost_request(ipv6, &format!("/bootstrap/{token}"), None).await;
+    assert!(bootstrap.starts_with("HTTP/1.1 200"), "{bootstrap}");
+    let cookie = bootstrap
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("set-cookie: ")
+                .or_else(|| line.strip_prefix("Set-Cookie: "))
+        })
+        .and_then(|value| value.split(';').next())
+        .expect("the bootstrap over [::1] sets the session cookie")
+        .to_owned();
+    let inbox = localhost_request(handle.local_addr(), "/inbox", Some(&cookie)).await;
+    assert!(
+        inbox.starts_with("HTTP/1.1 200"),
+        "the session opened over [::1] is served over 127.0.0.1: {inbox}"
+    );
+    assert_eq!(
+        std::net::TcpListener::bind(ipv6).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    handle.shutdown().await.unwrap();
+    for addr in [SocketAddr::from(([127, 0, 0, 1], port)), ipv6] {
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "{addr} closed after shutdown"
+        );
+    }
+}
+
+/// The testnet inbox hands out a `127.0.0.1` URL, the address an SSH
+/// tunnel forwards, and keeps its single IPv4 listener: it starts on a port
+/// another socket holds on `[::1]`, binds nothing there, and still serves
+/// its bootstrap over `127.0.0.1`.
+#[tokio::test]
+#[serial]
+async fn the_testnet_inbox_keeps_one_listener() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let dir = TempDir::new().unwrap();
+    let (held_v6, port) = (0..64)
+        .find_map(|_| {
+            let held = std::net::TcpListener::bind("[::1]:0").unwrap();
+            let port = held.local_addr().unwrap().port();
+            std::net::TcpListener::bind(("127.0.0.1", port))
+                .is_ok()
+                .then_some((held, port))
+        })
+        .expect("a port free on 127.0.0.1 among 64 held on ::1");
+    let handle = start_serve(config_for(
+        SocketAddr::from(([127, 0, 0, 1], port)),
+        dir.path().join("default.toml"),
+        dir.path().join("audit.log"),
+    ))
+    .await
+    .expect("the testnet inbox needs only 127.0.0.1");
+    assert_eq!(
+        handle.local_addr(),
+        SocketAddr::from(([127, 0, 0, 1], port))
+    );
+    let token = handle.bootstrap_token_hex().to_owned();
+    assert_eq!(
+        handle.bootstrap_url(),
+        format!("http://127.0.0.1:{port}/bootstrap/{token}")
+    );
+    drop(held_v6);
+    let ipv6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+    assert!(
+        std::net::TcpListener::bind(ipv6).is_ok(),
+        "the testnet inbox binds nothing on [::1]"
+    );
+    let bootstrap =
+        localhost_request(handle.local_addr(), &format!("/bootstrap/{token}"), None).await;
+    assert!(bootstrap.starts_with("HTTP/1.1 200"), "{bootstrap}");
+    handle.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 #[serial]
 async fn oversized_post_body_is_rejected() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("body-cap");
     // Host + Origin are valid; the body-limit layer sits before the handler, so
     // no session cookie is needed to observe the 413.
@@ -823,6 +1593,9 @@ async fn oversized_post_body_is_rejected() {
 #[tokio::test]
 #[serial]
 async fn inbox_get_renders_for_authenticated_session() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("inbox-ok");
     let cookie = h.bootstrap().await;
     h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -841,9 +1614,76 @@ async fn inbox_get_renders_for_authenticated_session() {
     assert!(html.contains("Pending approvals"));
 }
 
+/// Both inbox sinks, the `/inbox` data island and the `/pending.json`
+/// poll, carry a memo's U+202E only as the visible escape.
+#[tokio::test]
+#[serial]
+async fn inbox_sinks_carry_a_bidi_memo_escaped() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let h = Harness::new("inbox-bidi");
+    let cookie = h.bootstrap().await;
+    // The envelope carries the memo; the stored summary memo, which no
+    // surface displays, is absent.
+    let envelope = fixtures::payment_envelope(
+        SOURCE_G,
+        DEST_G,
+        "XLM",
+        2_500_000,
+        Some("memo\u{202e}"),
+        100,
+        1_234_567,
+    );
+    h.insert(
+        PendingApproval::new_payment_pending(
+            envelope.clone(),
+            envelope.as_bytes(),
+            DEST_G.to_owned(),
+            2_500_000,
+            "XLM".to_owned(),
+            None,
+            100,
+            1_234_567,
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap(),
+    );
+
+    let get = |uri: &'static str| {
+        Request::builder()
+            .uri(uri)
+            .header(header::HOST, HOST)
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let resp = h.router().oneshot(get("/inbox")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+    let html = std::str::from_utf8(&bytes).unwrap();
+    assert!(html.contains(r#""value":"memo\\u{202e}""#), "{html}");
+    assert!(!html.contains('\u{202e}'), "{html}");
+
+    let resp = h.router().oneshot(get("/pending.json")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body = std::str::from_utf8(&bytes).unwrap();
+    assert!(!body.contains('\u{202e}'), "{body}");
+    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(
+        json["pending"][0]["summary"]["memo"]["value"],
+        r"memo\u{202e}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn inbox_get_without_cookie_is_404() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("inbox-no-cookie");
     let req = Request::builder()
         .uri("/inbox")
@@ -859,6 +1699,9 @@ async fn inbox_get_without_cookie_is_404() {
 #[tokio::test]
 #[serial]
 async fn include_expired_query_flag_controls_expired_visibility() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("include-expired");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(1)); // TTL=1ms
@@ -909,6 +1752,9 @@ async fn include_expired_query_flag_controls_expired_visibility() {
 #[tokio::test]
 #[serial]
 async fn detail_page_without_cookie_is_404() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("detail-no-cookie");
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
     let req = Request::builder()
@@ -925,15 +1771,16 @@ async fn detail_page_without_cookie_is_404() {
 #[tokio::test]
 #[serial]
 async fn protected_route_with_wrong_cookie_value_is_404() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("wrong-cookie-value");
-    let _cookie = h.bootstrap().await;
+    let cookie = h.bootstrap().await;
+    let (name, _) = cookie.split_once('=').unwrap();
     let req = Request::builder()
         .uri("/pending.json")
         .header(header::HOST, HOST)
-        .header(
-            header::COOKIE,
-            format!("stellar_agent_approval_session={}", "0".repeat(64)),
-        )
+        .header(header::COOKIE, format!("{name}={}", "0".repeat(64)))
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -943,10 +1790,13 @@ async fn protected_route_with_wrong_cookie_value_is_404() {
 #[tokio::test]
 #[serial]
 async fn detail_page_unknown_nonce_returns_not_found_page() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("detail-unknown");
     let cookie = h.bootstrap().await;
     let req = Request::builder()
-        .uri("/approval/AAAAAAAAAAAAAAAAAAAAAA")
+        .uri("/approval/credmarker7AAAAAAAAAAA")
         .header(header::HOST, HOST)
         .header(header::COOKIE, &cookie)
         .body(Body::empty())
@@ -959,11 +1809,17 @@ async fn detail_page_unknown_nonce_returns_not_found_page() {
     let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
     let html = std::str::from_utf8(&bytes).unwrap();
     assert!(html.contains("Approval not found"));
+    assert!(html.contains("Approval nonce must identify a pending approval"));
+    assert!(html.contains(r#"href="/inbox""#));
+    assert!(!html.contains("credmarker7"), "{html}");
 }
 
 #[tokio::test]
 #[serial]
 async fn detail_page_reshows_attestation_after_approve() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("detail-reshow");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -976,7 +1832,8 @@ async fn detail_page_reshows_attestation_after_approve() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
-        .body(Body::empty())
+        .header("x-session-proof", h.proof())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let approve_resp = h.router().oneshot(approve_req).await.unwrap();
     let attestation = body_json(approve_resp).await["attestation"]
@@ -1005,6 +1862,9 @@ async fn detail_page_reshows_attestation_after_approve() {
 #[tokio::test]
 #[serial]
 async fn post_approve_and_reject_without_cookie_are_404() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("post-no-cookie");
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
 
@@ -1032,6 +1892,9 @@ async fn post_approve_and_reject_without_cookie_are_404() {
 #[tokio::test]
 #[serial]
 async fn static_app_js_requires_session_and_serves_expected_content() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("app-js");
 
     let no_cookie_req = Request::builder()
@@ -1070,6 +1933,9 @@ async fn static_app_js_requires_session_and_serves_expected_content() {
 #[tokio::test]
 #[serial]
 async fn get_endpoints_report_busy_or_degrade_when_store_locked() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("get-busy");
     let cookie = h.bootstrap().await;
     let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
@@ -1119,12 +1985,18 @@ async fn get_endpoints_report_busy_or_degrade_when_store_locked() {
 #[tokio::test]
 #[serial]
 async fn approve_toolset_first_invoke_gate_via_router_returns_grant_active() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("toolset-router");
     let cookie = h.bootstrap().await;
     let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
         "my-toolset".to_owned(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        "1.0.0".to_owned(),
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
         "sign-payment".to_owned(),
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
         "XLM".to_owned(),
         0,
         1_000_000,
@@ -1142,7 +2014,8 @@ async fn approve_toolset_first_invoke_gate_via_router_returns_grant_active() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
-        .body(Body::empty())
+        .header("x-session-proof", h.proof())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1152,6 +2025,9 @@ async fn approve_toolset_first_invoke_gate_via_router_returns_grant_active() {
 #[tokio::test]
 #[serial]
 async fn approve_unknown_nonce_via_router_returns_not_found_status() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("unknown-router");
     let cookie = h.bootstrap().await;
     let nonce = "AAAAAAAAAAAAAAAAAAAAAA".to_owned();
@@ -1164,7 +2040,8 @@ async fn approve_unknown_nonce_via_router_returns_not_found_status() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
-        .body(Body::empty())
+        .header("x-session-proof", h.proof())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1174,6 +2051,9 @@ async fn approve_unknown_nonce_via_router_returns_not_found_status() {
 #[tokio::test]
 #[serial]
 async fn approve_sign_with_passkey_via_router_returns_wrong_kind_status() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("passkey-router");
     let cookie = h.bootstrap().await;
     let entry = PendingApproval::new_passkey_pending(
@@ -1197,11 +2077,14 @@ async fn approve_sign_with_passkey_via_router_returns_wrong_kind_status() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
-        .body(Body::empty())
+        .header("x-session-proof", h.proof())
+        .body(h.view_digest_body(&nonce))
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await["status"], "wrong_kind");
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let value = body_json(resp).await;
+    assert_eq!(value["status"], "wrong_kind");
+    assert_eq!(value["error"], "approval.wrong_kind");
 }
 
 /// A missing/unseeded attestation key surfaces `Outcome::Unavailable`
@@ -1209,6 +2092,9 @@ async fn approve_sign_with_passkey_via_router_returns_wrong_kind_status() {
 #[tokio::test]
 #[serial]
 async fn approve_with_unseeded_keyring_returns_unavailable_status() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let dir = TempDir::new().unwrap();
     let store_path = dir.path().join("default.toml");
@@ -1234,7 +2120,11 @@ async fn approve_with_unseeded_keyring_returns_unavailable_status() {
     let bootstrap = OpaqueToken::generate();
     let bootstrap_hex = bootstrap.to_hex();
     let state = ServeState {
-        auth: Arc::new(StdMutex::new(AuthState::new(bootstrap))),
+        presence: None,
+        auth: Arc::new(StdMutex::new(AuthState::new(
+            bootstrap,
+            SessionPurpose::Inbox,
+        ))),
         ctx: Arc::new(ctx),
         identity: Arc::new(PageIdentity::neutral()),
     };
@@ -1247,30 +2137,19 @@ async fn approve_with_unseeded_keyring_returns_unavailable_status() {
         .body(Body::empty())
         .unwrap();
     let bootstrap_resp = router.clone().oneshot(bootstrap_req).await.unwrap();
-    let cookie = bootstrap_resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
+    let (cookie, proof) = read_bootstrap_response(bootstrap_resp).await;
 
-    let entry = PendingApproval::new_payment_pending(
-        "b64xdr".to_owned(),
-        b"fake-xdr",
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+    let entry = fixtures::payment_pending(
+        SOURCE_G,
+        DEST_G,
+        "XLM",
         1_000,
-        "XLM".to_owned(),
         None,
         100,
         1,
         uid(),
         DEFAULT_TTL_MS,
-    )
-    .unwrap();
+    );
     let nonce = entry.approval_nonce.clone();
     {
         let mut store = PendingApprovalStore::open(store_path).unwrap();
@@ -1291,7 +2170,8 @@ async fn approve_with_unseeded_keyring_returns_unavailable_status() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
-        .body(Body::empty())
+        .header("x-session-proof", &proof)
+        .body(view_digest_body_for(&state.ctx, &nonce))
         .unwrap();
     let approve_resp = router.oneshot(approve_req).await.unwrap();
     assert_eq!(approve_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1307,6 +2187,9 @@ async fn approve_with_unseeded_keyring_returns_unavailable_status() {
 #[tokio::test]
 #[serial]
 async fn protected_route_survives_poisoned_auth_mutex() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("poisoned-session");
     let cookie = h.bootstrap().await;
 
@@ -1335,6 +2218,9 @@ async fn protected_route_survives_poisoned_auth_mutex() {
 #[tokio::test]
 #[serial]
 async fn bootstrap_survives_poisoned_auth_mutex() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("poisoned-bootstrap");
 
     let auth = Arc::clone(&h.state.auth);
@@ -1351,7 +2237,8 @@ async fn bootstrap_survives_poisoned_auth_mutex() {
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let (cookie, _proof) = read_bootstrap_response(resp).await;
+    assert!(cookie.starts_with("stellar_agent_approval_session_"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1361,6 +2248,9 @@ async fn bootstrap_survives_poisoned_auth_mutex() {
 #[tokio::test]
 #[serial]
 async fn get_endpoints_report_unavailable_on_corrupt_store_file() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let h = Harness::new("corrupt-store-get");
     let cookie = h.bootstrap().await;
     std::fs::write(&h.store_path, b"this is not valid toml {{{").unwrap();
@@ -1389,19 +2279,31 @@ async fn get_endpoints_report_unavailable_on_corrupt_store_file() {
 #[tokio::test]
 #[serial]
 async fn authenticated_detail_renders_selected_context_and_envelope_source() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut h = Harness::new("context-source");
     let context = &mut Arc::get_mut(&mut h.state.ctx).unwrap().context;
     context.profile_name = "treasury-route".to_owned();
     context.chain_id = "stellar:mainnet".to_owned();
     context.endpoint_host = "https://route-rpc.example".to_owned();
     context.signer_account = Some("GENROLLED".to_owned());
-    let mut entry = payment_entry(DEFAULT_TTL_MS);
-    if let stellar_agent_core::approval::ApprovalKind::PaymentSimulated {
-        envelope_xdr_b64, ..
-    } = &mut entry.kind
-    {
-        *envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=".to_owned();
-    }
+    // A payment whose operation source ([2; 32]) overrides its transaction
+    // source ([1; 32]).
+    let envelope = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=";
+    let entry = PendingApproval::new_payment_pending(
+        envelope.to_owned(),
+        envelope.as_bytes(),
+        DEST_G.to_owned(),
+        1_000_000,
+        "XLM".to_owned(),
+        None,
+        100,
+        1,
+        uid(),
+        DEFAULT_TTL_MS,
+    )
+    .unwrap();
     let nonce = h.insert(entry);
     let cookie = h.bootstrap().await;
     let response = h
@@ -1428,4 +2330,856 @@ async fn authenticated_detail_renders_selected_context_and_envelope_source() {
     ] {
         assert!(html.contains(value), "missing {value}: {html}");
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Session proof, lifetime and cookie shape
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A `POST` to `path` carrying the given cookie, CSRF value and proof headers.
+fn mutation(path: &str, cookie: &str, csrf: Option<&str>, proof: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::HOST, HOST)
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::COOKIE, cookie);
+    if let Some(csrf) = csrf {
+        builder = builder.header("x-stellar-approval-csrf", csrf);
+    }
+    if let Some(proof) = proof {
+        builder = builder.header("x-session-proof", proof);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+/// A cookie-only `GET` of `path`.
+fn cookie_get(path: &str, cookie: &str) -> Request<Body> {
+    Request::builder()
+        .uri(path)
+        .header(header::HOST, HOST)
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn body_text(resp: axum::response::Response) -> String {
+    let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// The session cookie and a valid CSRF value do not authorize approve or
+/// reject without the session proof: a missing, malformed, or wrong proof is
+/// refused with `session_proof_invalid`, and neither the store nor the audit
+/// log changes.
+#[tokio::test]
+#[serial]
+async fn cookie_and_csrf_without_proof_cannot_mutate() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let h = Harness::new("proof-required");
+    let cookie = h.bootstrap().await;
+    let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let csrf = h.csrf_for(&nonce);
+    let store_before = std::fs::read(&h.store_path).unwrap();
+    let audit_before = h.audit_bytes();
+    let wrong = OpaqueToken::generate().to_hex();
+    let session_id = h
+        .state
+        .auth
+        .lock()
+        .unwrap()
+        .session
+        .as_ref()
+        .unwrap()
+        .session_id
+        .to_hex();
+
+    for action in ["approve", "reject"] {
+        for proof in [
+            None,
+            Some("not-a-proof"),
+            Some(wrong.as_str()),
+            Some(session_id.as_str()),
+        ] {
+            let resp = h
+                .router()
+                .oneshot(mutation(
+                    &format!("/approval/{nonce}/{action}"),
+                    &cookie,
+                    Some(&csrf),
+                    proof,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{action} {proof:?}");
+            assert_eq!(
+                body_json(resp).await,
+                serde_json::json!({"error": "session_proof_invalid"}),
+                "{action} {proof:?}"
+            );
+        }
+    }
+
+    assert_eq!(std::fs::read(&h.store_path).unwrap(), store_before);
+    assert_eq!(h.audit_bytes(), audit_before);
+    {
+        let store = PendingApprovalStore::open(h.store_path.clone()).unwrap();
+        let entry = store.get(&nonce).expect("entry still present");
+        assert!(matches!(entry.kind, ApprovalKind::PaymentSimulated { .. }));
+        assert!(entry.attestation_blob_b64.is_none());
+    }
+
+    // The same request with the proof, and the digest the page carries, is
+    // the operator's and goes through.
+    let mut approve = mutation(
+        &format!("/approval/{nonce}/approve"),
+        &cookie,
+        Some(&csrf),
+        Some(&h.proof()),
+    );
+    *approve.body_mut() = h.view_digest_body(&nonce);
+    let resp = h.router().oneshot(approve).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["status"], "attested");
+}
+
+/// The proof leaves the server once, in the successful bootstrap response.
+/// No cookie-authorized page, script, JSON body, or header carries it, and a
+/// repeated bootstrap cannot mint or recover it.
+#[tokio::test]
+#[serial]
+async fn bootstrap_proof_is_one_shot_and_not_recoverable() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let h = Harness::new("proof-one-shot");
+    let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let cookie = h.bootstrap().await;
+    let proof = h.proof();
+    assert_eq!(proof.len(), 64);
+
+    let paths = [
+        "/inbox".to_owned(),
+        "/inbox?include_expired=1".to_owned(),
+        "/pending.json".to_owned(),
+        format!("/approval/{nonce}"),
+        "/approval/AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        "/static/app.js".to_owned(),
+        "/static/app-shared.js".to_owned(),
+        "/static/session-bootstrap.js".to_owned(),
+    ];
+    for path in &paths {
+        let resp = h.router().oneshot(cookie_get(path, &cookie)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        for value in resp.headers().values() {
+            assert!(
+                !value.to_str().unwrap_or_default().contains(&proof),
+                "{path} header"
+            );
+        }
+        assert!(!body_text(resp).await.contains(&proof), "{path} body");
+    }
+
+    let resp = h
+        .router()
+        .oneshot(cookie_get(
+            &format!("/bootstrap/{}", h.bootstrap_hex),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(resp.headers().get(header::SET_COOKIE).is_none());
+    assert!(!body_text(resp).await.contains(&proof));
+
+    // The decision responses do not echo it either.
+    let resp = h
+        .router()
+        .oneshot(mutation(
+            &format!("/approval/{nonce}/reject"),
+            &cookie,
+            Some(&h.csrf_for(&nonce)),
+            Some(&proof),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!body_text(resp).await.contains(&proof));
+}
+
+/// The session cookie is bounded and per listener: `Max-Age` of the absolute
+/// limit, `HttpOnly`, `SameSite=Strict`, `Path=/`, and a name no other
+/// listener shares.
+#[tokio::test]
+#[serial]
+async fn bootstrap_sets_max_age_and_distinct_cookie_names() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let a = Harness::new("cookie-a");
+    let b = Harness::new("cookie-b");
+    let mut names = Vec::new();
+    for h in [&a, &b] {
+        let req = Request::builder()
+            .uri(format!("/bootstrap/{}", h.bootstrap_hex))
+            .header(header::HOST, HOST)
+            .body(Body::empty())
+            .unwrap();
+        let resp = h.router().oneshot(req).await.unwrap();
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let attributes: Vec<&str> = set_cookie.split(';').map(str::trim).collect();
+        assert!(attributes.contains(&"HttpOnly"), "{set_cookie}");
+        assert!(attributes.contains(&"SameSite=Strict"), "{set_cookie}");
+        assert!(attributes.contains(&"Path=/"), "{set_cookie}");
+        assert!(
+            attributes
+                .contains(&format!("Max-Age={}", SESSION_ABSOLUTE_TIMEOUT.as_secs()).as_str()),
+            "{set_cookie}"
+        );
+        assert_eq!(SESSION_ABSOLUTE_TIMEOUT.as_secs(), 28_800);
+        let name = attributes[0].split_once('=').unwrap().0.to_owned();
+        assert!(
+            name.starts_with("stellar_agent_approval_session_"),
+            "{name}"
+        );
+        assert!(
+            name.len() > "stellar_agent_approval_session_".len(),
+            "{name}"
+        );
+        names.push(name);
+    }
+    assert_ne!(
+        names[0], names[1],
+        "two listeners must not share a cookie name"
+    );
+
+    // The cookie of one listener does not open the other.
+    let cookie_a = format!("{}={}", names[0], "0".repeat(64));
+    let resp = b
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie_a))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// The secure form of a session cookie is the loopback cookie of the same
+/// session followed by `; Secure`. The loopback
+/// cookie keeps its exact bytes and carries no `Secure`.
+#[test]
+fn secure_session_cookie_adds_only_secure() {
+    for purpose in [SessionPurpose::Inbox, SessionPurpose::MainnetPresence] {
+        let token = OpaqueToken::generate();
+        let hex = token.to_hex();
+        let mut auth = AuthState::new(token, purpose);
+        let now = auth.now();
+        let session = auth.exchange_bootstrap(&hex, now).unwrap();
+        let loopback = auth.set_cookie_value(&session);
+        assert_eq!(
+            loopback,
+            format!(
+                "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800",
+                auth.cookie_name(),
+                session.session_id.to_hex()
+            )
+        );
+        assert!(!loopback.contains("Secure"), "{loopback}");
+        let secure = auth.with_secure_cookie().set_cookie_value(&session);
+        assert_eq!(secure, format!("{loopback}; Secure"));
+    }
+}
+
+/// The router holds a session one tick before the idle limit and refuses it
+/// exactly at the limit, on every route, for good.
+#[tokio::test]
+#[serial]
+async fn idle_expiry_boundary() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let h = Harness::new("idle-boundary");
+    let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let cookie = h.bootstrap().await;
+    let csrf = h.csrf_for(&nonce);
+    let tick = std::time::Duration::from_secs(1);
+
+    h.clock.advance(SESSION_IDLE_TIMEOUT - tick);
+    let resp = h
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    h.clock.advance(tick);
+    let resp = h
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = h
+        .router()
+        .oneshot(mutation(
+            &format!("/approval/{nonce}/approve"),
+            &cookie,
+            Some(&csrf),
+            Some(&h.proof()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(h.state.auth.lock().unwrap().session.is_none());
+    let store = PendingApprovalStore::open(h.store_path.clone()).unwrap();
+    assert!(store.get(&nonce).unwrap().attestation_blob_b64.is_none());
+}
+
+/// Background polls, cookie-only page loads, and refused mutations never
+/// record activity: the session still expires at the idle limit counted from
+/// the bootstrap exchange.
+#[tokio::test]
+#[serial]
+async fn polling_and_cookie_only_requests_do_not_extend_idle() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let h = Harness::new("idle-polling");
+    let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let cookie = h.bootstrap().await;
+    let csrf = h.csrf_for(&nonce);
+    let activity_csrf = h.csrf_for(crate::routes::SESSION_ACTIVITY_NONCE);
+    let poll = std::time::Duration::from_secs(2);
+
+    let mut elapsed = std::time::Duration::ZERO;
+    while elapsed + poll < SESSION_IDLE_TIMEOUT {
+        h.clock.advance(poll);
+        elapsed += poll;
+        let resp = h
+            .router()
+            .oneshot(cookie_get("/pending.json", &cookie))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "poll at {elapsed:?}");
+    }
+    for path in ["/inbox".to_owned(), format!("/approval/{nonce}")] {
+        let resp = h
+            .router()
+            .oneshot(cookie_get(&path, &cookie))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    }
+    let refused = [
+        mutation(
+            &format!("/approval/{nonce}/approve"),
+            &cookie,
+            Some(&csrf),
+            None,
+        ),
+        mutation("/session/activity", &cookie, Some(&activity_csrf), None),
+        mutation("/session/activity", &cookie, None, Some(&h.proof())),
+        mutation("/session/activity", &cookie, Some(&csrf), Some(&h.proof())),
+    ];
+    for req in refused {
+        let resp = h.router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    h.clock.advance(SESSION_IDLE_TIMEOUT - elapsed);
+    let resp = h
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `POST /session/activity` with the proof and its CSRF value answers `204`
+/// and moves the idle deadline; so does an authorized decision.
+#[tokio::test]
+#[serial]
+async fn activity_and_decisions_extend_idle() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let h = Harness::new("idle-activity");
+    let first = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let cookie = h.bootstrap().await;
+    let activity_csrf = h.csrf_for(crate::routes::SESSION_ACTIVITY_NONCE);
+    let tick = std::time::Duration::from_secs(1);
+
+    h.clock.advance(SESSION_IDLE_TIMEOUT - tick);
+    let resp = h
+        .router()
+        .oneshot(mutation(
+            "/session/activity",
+            &cookie,
+            Some(&activity_csrf),
+            Some(&h.proof()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(body_text(resp).await.is_empty());
+
+    h.clock.advance(SESSION_IDLE_TIMEOUT - tick);
+    let resp = h
+        .router()
+        .oneshot(mutation(
+            &format!("/approval/{first}/reject"),
+            &cookie,
+            Some(&h.csrf_for(&first)),
+            Some(&h.proof()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["status"], "rejected");
+
+    h.clock.advance(SESSION_IDLE_TIMEOUT - tick);
+    let resp = h
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    h.clock.advance(tick);
+    let resp = h
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Activity every ten minutes keeps the session only until the absolute
+/// limit: one tick before it the session holds, at it the session is gone.
+#[tokio::test]
+#[serial]
+async fn absolute_expiry_boundary() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let h = Harness::new("absolute-boundary");
+    let cookie = h.bootstrap().await;
+    let activity_csrf = h.csrf_for(crate::routes::SESSION_ACTIVITY_NONCE);
+    let step = std::time::Duration::from_secs(10 * 60);
+    let tick = std::time::Duration::from_secs(1);
+    let activity = |h: &Harness| {
+        mutation(
+            "/session/activity",
+            &cookie,
+            Some(&activity_csrf),
+            Some(&h.proof()),
+        )
+    };
+
+    let mut elapsed = std::time::Duration::ZERO;
+    while elapsed + step < SESSION_ABSOLUTE_TIMEOUT {
+        h.clock.advance(step);
+        elapsed += step;
+        let resp = h.router().oneshot(activity(&h)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "activity at {elapsed:?}"
+        );
+    }
+    h.clock.advance(SESSION_ABSOLUTE_TIMEOUT - elapsed - tick);
+    let resp = h.router().oneshot(activity(&h)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    h.clock.advance(tick);
+    let resp = h.router().oneshot(activity(&h)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = h
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// The bootstrap page's script is reachable before any session exists and
+/// serves the fixed bytes.
+#[tokio::test]
+#[serial]
+async fn session_bootstrap_js_is_served_without_a_session() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let h = Harness::new("bootstrap-js");
+    let req = Request::builder()
+        .uri("/static/session-bootstrap.js")
+        .header(header::HOST, HOST)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/javascript; charset=utf-8"
+    );
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(bytes.as_ref(), crate::web::SESSION_BOOTSTRAP_JS);
+}
+
+/// The bootstrap page keeps the listener's CSP and cache posture.
+#[tokio::test]
+#[serial]
+async fn bootstrap_page_keeps_the_security_headers() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let h = Harness::new("bootstrap-headers");
+    let req = Request::builder()
+        .uri(format!("/bootstrap/{}", h.bootstrap_hex))
+        .header(header::HOST, HOST)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router().oneshot(req).await.unwrap();
+    let headers = resp.headers();
+    let csp = headers
+        .get(header::CONTENT_SECURITY_POLICY)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let script_src: Vec<&str> = csp
+        .split(';')
+        .map(str::trim)
+        .filter(|directive| directive.starts_with("script-src"))
+        .collect();
+    assert_eq!(script_src, ["script-src 'self'"], "{csp}");
+    assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(headers.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+}
+
+/// Each request span records the matched route template: neither the
+/// bootstrap token, nor an approval nonce, nor the session proof an
+/// authorized mutation carries reaches the trace, and a request that matches
+/// no route records the fixed label.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn bootstrap_trace_redacts_token() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let h = Harness::new("bootstrap-trace");
+    let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let capture = crate::trace_capture::SpanCapture::install();
+
+    let cookie = h.bootstrap().await;
+    let proof = h.proof();
+    let replay = Request::builder()
+        .uri(format!("/bootstrap/{}", h.bootstrap_hex))
+        .header(header::HOST, HOST)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router().oneshot(replay).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = h
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = h
+        .router()
+        .oneshot(cookie_get(&format!("/approval/{nonce}"), &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = h
+        .router()
+        .oneshot(cookie_get(&format!("/unknown/{nonce}"), &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = h
+        .router()
+        .oneshot(mutation(
+            "/session/activity",
+            &cookie,
+            Some(&h.csrf_for(crate::routes::SESSION_ACTIVITY_NONCE)),
+            Some(&proof),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    assert_eq!(
+        capture.span_paths("approval_inbox_request"),
+        [
+            "/bootstrap/{token}",
+            "/bootstrap/{token}",
+            "/pending.json",
+            "/approval/{nonce}",
+            stellar_agent_loopback_http::request_trace::UNMATCHED_ROUTE_LABEL,
+            "/session/activity",
+        ],
+        "{:?}",
+        capture.lines()
+    );
+    for line in capture.lines() {
+        assert!(!line.contains(&h.bootstrap_hex), "token in trace: {line}");
+        assert!(!line.contains(&nonce), "nonce in trace: {line}");
+        assert!(!line.contains(&proof), "proof in trace: {line}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// What the page showed
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `#approval-data` island of the detail page of `nonce`.
+async fn detail_island(h: &Harness, cookie: &str, nonce: &str) -> serde_json::Value {
+    let req = Request::builder()
+        .uri(format!("/approval/{nonce}"))
+        .header(header::HOST, HOST)
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+    json_island(std::str::from_utf8(&bytes).unwrap(), "approval-data")
+}
+
+/// Posts an approve of `nonce` with `body`.
+async fn post_approve(
+    h: &Harness,
+    cookie: &str,
+    nonce: &str,
+    body: impl Into<Body>,
+) -> axum::response::Response {
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/approval/{nonce}/approve"))
+        .header(header::HOST, HOST)
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::COOKIE, cookie)
+        .header("x-stellar-approval-csrf", h.csrf_for(nonce))
+        .header("x-session-proof", h.proof())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.into())
+        .unwrap();
+    h.router().oneshot(req).await.unwrap()
+}
+
+fn digest_body(digest: &serde_json::Value) -> String {
+    serde_json::json!({ "view_digest": digest }).to_string()
+}
+
+#[tokio::test]
+#[serial]
+async fn an_approve_of_a_replaced_entry_answers_changed_consent() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let h = Harness::new("replaced-entry");
+    let cookie = h.bootstrap().await;
+    let entry = payment_entry(DEFAULT_TTL_MS);
+    let nonce = h.insert(entry.clone());
+    let shown = detail_island(&h, &cookie, &nonce).await["view_digest"].clone();
+    let path = h.store_path.clone();
+    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hook_fired = fired.clone();
+    crate::decision::wait_hook::install(move || {
+        hook_fired.set(true);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let before = format!("expires_at_unix_ms = {}", entry.expires_at_unix_ms);
+        let after = format!("expires_at_unix_ms = {}", entry.expires_at_unix_ms + 1);
+        assert_eq!(text.matches(&before).count(), 1);
+        std::fs::write(path, text.replace(&before, &after)).unwrap();
+    });
+    for _ in 0..2 {
+        assert_presence_changed(post_approve(&h, &cookie, &nonce, digest_body(&shown)).await).await;
+        assert_unattested(&h, &nonce);
+    }
+    assert!(fired.get());
+}
+
+async fn assert_presence_changed(resp: axum::response::Response) {
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"], "approval.presence_changed");
+    assert_eq!(
+        json["message"],
+        "The consent details have changed; reload the approval page and review them again."
+    );
+}
+
+fn assert_unattested(h: &Harness, nonce: &str) {
+    let store = PendingApprovalStore::open(h.store_path.clone()).unwrap();
+    assert!(store.get(nonce).unwrap().attestation_blob_b64.is_none());
+    drop(store);
+    let log = h.audit_bytes().unwrap_or_default();
+    assert!(
+        !String::from_utf8_lossy(&log).contains(r#""kind":"approval_attested""#),
+        "no consent row"
+    );
+}
+
+fn rule_entry(name_suffix: &str) -> PendingApproval {
+    let mut definition = fixtures::rule_proposal_snapshot();
+    definition.name.push_str(name_suffix);
+    PendingApproval::new_rule_proposal_pending(
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
+        "stellar:testnet".to_owned(),
+        definition,
+        "fixture summary".to_owned(),
+        uid(),
+        DEFAULT_TTL_MS,
+    )
+    .unwrap()
+}
+
+/// The detail page carries the view digest of the entry it renders, and
+/// none for an entry no surface can approve.
+#[tokio::test]
+#[serial]
+async fn the_detail_page_carries_the_digest_of_the_entry_it_renders() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let h = Harness::new("page-digest");
+    let cookie = h.bootstrap().await;
+    let entry = payment_entry(DEFAULT_TTL_MS);
+    let expected = approval_view_digest(&entry, &h.state.ctx.context.binding()).unwrap();
+    let nonce = h.insert(entry);
+    let island = detail_island(&h, &cookie, &nonce).await;
+    assert_eq!(island["approvable"], true);
+    assert_eq!(
+        island["view_digest"],
+        stellar_agent_core::hex::encode(&expected)
+    );
+
+    let mut inconsistent = payment_entry(DEFAULT_TTL_MS);
+    let ApprovalKind::PaymentSimulated {
+        envelope_xdr_b64, ..
+    } = &mut inconsistent.kind
+    else {
+        unreachable!()
+    };
+    *envelope_xdr_b64 = fixtures::payment_envelope(SOURCE_G, SOURCE_G, "XLM", 9, None, 100, 1);
+    let nonce = h.insert(inconsistent);
+    let island = detail_island(&h, &cookie, &nonce).await;
+    assert_eq!(island["view_digest"], serde_json::Value::Null);
+
+    let nonce = h.insert(payment_entry(1));
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let island = detail_island(&h, &cookie, &nonce).await;
+    assert_eq!(island["approvable"], false);
+    assert_eq!(island["view_digest"], serde_json::Value::Null);
+}
+
+/// The page renders one request, a same-user writer swaps in another valid
+/// one, and the approve the page sends refuses and attests nothing. A
+/// reload renders the current request, and its approve attests that one.
+#[tokio::test]
+#[serial]
+async fn an_entry_swapped_after_the_page_loaded_is_not_attested() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let payment_d1 = fixtures::payment_pending(
+        SOURCE_G,
+        DEST_G,
+        "XLM",
+        90_000_000,
+        None,
+        100,
+        1_234_567,
+        uid(),
+        DEFAULT_TTL_MS,
+    );
+    for (kind, d2, mut d1) in [
+        ("payment", payment_entry(DEFAULT_TTL_MS), payment_d1),
+        ("rule", rule_entry(""), rule_entry("-other")),
+    ] {
+        let h = Harness::new(&format!("page-swap-{kind}"));
+        let cookie = h.bootstrap().await;
+        let nonce = h.insert(d2);
+        let shown = detail_island(&h, &cookie, &nonce).await["view_digest"].clone();
+        assert!(shown.is_string(), "{kind}");
+
+        d1.approval_nonce.clone_from(&nonce);
+        {
+            let mut store = PendingApprovalStore::open(h.store_path.clone()).unwrap();
+            assert!(store.remove(&nonce).unwrap());
+            store
+                .insert(d1.clone(), timefmt::now_unix_ms().unwrap())
+                .unwrap();
+        }
+        let resp = post_approve(&h, &cookie, &nonce, digest_body(&shown)).await;
+        assert_presence_changed(resp).await;
+        assert_unattested(&h, &nonce);
+
+        let reloaded = detail_island(&h, &cookie, &nonce).await["view_digest"].clone();
+        assert_ne!(
+            reloaded, shown,
+            "{kind}: the reload renders the current entry"
+        );
+        let resp = post_approve(&h, &cookie, &nonce, digest_body(&reloaded)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{kind}");
+        let json = body_json(resp).await;
+        assert_eq!(json["status"], "attested", "{kind}");
+        let blob: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(json["attestation"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let binding = h.state.ctx.context.binding();
+        let expected = compute_attestation_v4(
+            &h.raw_key,
+            &binding,
+            &nonce,
+            &stellar_agent_core::approval::approval_view_subject(&d1, &binding).unwrap(),
+            &d1.process_uid,
+            &d1.attested_lifetime(),
+            &AttestedApprover::Local,
+        );
+        assert_eq!(
+            blob, expected,
+            "{kind}: the attestation binds the reloaded entry"
+        );
+    }
+}
+
+/// An approve without a well-formed digest of the current entry refuses.
+#[tokio::test]
+#[serial]
+async fn a_missing_or_malformed_view_digest_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let h = Harness::new("malformed-digest");
+    let cookie = h.bootstrap().await;
+    let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let shown = detail_island(&h, &cookie, &nonce).await["view_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for body in [
+        String::new(),
+        "{}".to_owned(),
+        r#"{"view_digest":null}"#.to_owned(),
+        format!(r#"{{"view_digest":"{}"}}"#, "zz".repeat(32)),
+        format!(r#"{{"view_digest":"{}"}}"#, &shown[..63]),
+        format!(r#"{{"view_digest":"{shown}","nonce":"{nonce}"}}"#),
+    ] {
+        let resp = post_approve(&h, &cookie, &nonce, body.clone()).await;
+        assert_presence_changed(resp).await;
+        assert_unattested(&h, &nonce);
+    }
+    let resp = post_approve(&h, &cookie, &nonce, digest_body(&shown.into())).await;
+    assert_eq!(body_json(resp).await["status"], "attested");
 }

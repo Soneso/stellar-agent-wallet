@@ -32,6 +32,16 @@
 //! happen before `submit` is called.  The REFUSALS (upgradable, pin, counts)
 //! are enforced here in submit — not delegated to the dispatch site.
 //!
+//! # Signed invocation tree
+//!
+//! The wallet signs the vault call this adapter built as the root of its
+//! authorization, never a root the simulation returns. A deposit declares, per
+//! vault asset, `transfer(from = wallet, to = vault, amount)` calls totaling at
+//! most that asset's `amounts_desired` entry; a withdraw declares no
+//! sub-invocations, since its asset transfers are the vault's to authorize.
+//! A simulated tree outside the declaration is refused before signing with
+//! `simulation.divergence.auth_contexts`.
+//!
 //! # Witness consumption
 //!
 //! [`DefindexVaultAdapter::submit`] consumes the [`SubmitWitness`] by logging,
@@ -50,9 +60,12 @@ use async_trait::async_trait;
 use stellar_agent_core::ContextRuleId;
 use stellar_agent_defi::adapter::{DefiAdapter, DefiAdapterCtx, DefiAdapterError, DefiPreview};
 use stellar_agent_defi::dispatch::SubmitWitness;
-use stellar_agent_smart_account::submit::{SubmitInvokeArgs, submit_signed_invoke};
+use stellar_agent_defi::scval::contract_strkey_to_sc_address;
+use stellar_agent_smart_account::submit::{
+    DeclaredSubInvocations, DeclaredTransfer, SubmitInvokeArgs, submit_signed_invoke,
+};
 
-use crate::abi::{VaultDepositArgs, VaultWithdrawArgs};
+use crate::abi::{VaultDepositArgs, VaultWithdrawArgs, WalletAssetStrategySet};
 use crate::scval::{args_to_vecm, encode_vault_deposit_args, encode_vault_withdraw_args};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -270,6 +283,14 @@ impl DefindexVaultAdapter {
         ctx: &DefiAdapterCtx<'_>,
         witness: SubmitWitness,
     ) -> Result<(), DefiAdapterError> {
+        let recorder = ctx.submission_recorder.ok_or_else(|| {
+            map_submit_invoke_error(
+                &stellar_agent_smart_account::SaError::IntentRecordUnavailable {
+                    class: "missing_recorder",
+                },
+            )
+        })?;
+
         // ── Step 1: Structural validation ────────────────────────────────────
         deposit_args
             .validate_structure()
@@ -362,6 +383,15 @@ impl DefindexVaultAdapter {
             build_invoke_contract_args(&vault_sc_addr, DEFINDEX_DEPOSIT_FN, deposit_scvals)?;
         let host_function = stellar_xdr::HostFunction::InvokeContract(invoke_args);
 
+        // ── Declared sub-invocations ─────────────────────────────────────────
+        // Any simulated subtree other than the deposit's transfers of the vault
+        // assets to the vault is refused before signing.
+        let declared_transfers = declared_deposit_transfers(
+            &deposit_args.vault_address,
+            &vault_assets,
+            &deposit_args.amounts_desired,
+        )?;
+
         let secondary_rpc_url = ctx
             .secondary_rpc
             .map(stellar_agent_network::StellarRpcClient::url);
@@ -386,6 +416,7 @@ impl DefindexVaultAdapter {
                 // stays `None`); any other rule would be refused without one.
                 .auth_rule_ids(&[ContextRuleId::new(0)])
                 .host_function(host_function)
+                .sub_invocations(DeclaredSubInvocations::TokenTransfers(&declared_transfers))
                 .signer(signer)
                 .primary_rpc_url(ctx.primary_rpc.url())
                 .maybe_secondary_rpc_url(secondary_rpc_url)
@@ -395,7 +426,7 @@ impl DefindexVaultAdapter {
                 .op_label(DEFINDEX_SUBMIT_OP_LABEL)
                 .emit_observability_logs(true)
                 .maybe_sequence_floor(ctx.sequence_floor)
-                .maybe_submission_recorder(ctx.submission_recorder)
+                .admission(stellar_agent_network::SigningAdmission::Recorded(recorder))
                 .build(),
         )
         .await;
@@ -413,9 +444,8 @@ impl DefindexVaultAdapter {
                     tx_hash_redacted = %tx_hash_redacted,
                     "DeFindex vault deposit: submit succeeded"
                 );
-                // Non-fatal allow-path value-audit row (no-op unless the caller
-                // threaded a writer + gate-derived legs into the context).
-                ctx.emit_value_action_submitted(&tx_hash_redacted, result.ledger, &request_id);
+                // The recorder wrote the pending row before the send; a
+                // reported success writes no further row.
                 Ok(())
             }
             Err(e) => {
@@ -444,6 +474,14 @@ impl DefindexVaultAdapter {
         ctx: &DefiAdapterCtx<'_>,
         witness: SubmitWitness,
     ) -> Result<(), DefiAdapterError> {
+        let recorder = ctx.submission_recorder.ok_or_else(|| {
+            map_submit_invoke_error(
+                &stellar_agent_smart_account::SaError::IntentRecordUnavailable {
+                    class: "missing_recorder",
+                },
+            )
+        })?;
+
         // ── Step 1: Structural validation ────────────────────────────────────
         withdraw_args
             .validate_structure()
@@ -557,6 +595,10 @@ impl DefindexVaultAdapter {
                 // stays `None`); any other rule would be refused without one.
                 .auth_rule_ids(&[ContextRuleId::new(0)])
                 .host_function(host_function)
+                // The withdraw's asset transfers move from the vault to the
+                // wallet and are the vault's to authorize: the wallet signs
+                // the `withdraw` call alone, with no sub-invocations.
+                .sub_invocations(DeclaredSubInvocations::None)
                 .signer(signer)
                 .primary_rpc_url(ctx.primary_rpc.url())
                 .maybe_secondary_rpc_url(secondary_rpc_url)
@@ -566,7 +608,7 @@ impl DefindexVaultAdapter {
                 .op_label(DEFINDEX_SUBMIT_OP_LABEL)
                 .emit_observability_logs(true)
                 .maybe_sequence_floor(ctx.sequence_floor)
-                .maybe_submission_recorder(ctx.submission_recorder)
+                .admission(stellar_agent_network::SigningAdmission::Recorded(recorder))
                 .build(),
         )
         .await;
@@ -584,9 +626,8 @@ impl DefindexVaultAdapter {
                     tx_hash_redacted = %tx_hash_redacted,
                     "DeFindex vault withdraw: submit succeeded"
                 );
-                // Non-fatal allow-path value-audit row (no-op unless the caller
-                // threaded a writer + gate-derived legs into the context).
-                ctx.emit_value_action_submitted(&tx_hash_redacted, result.ledger, &request_id);
+                // The recorder wrote the pending row before the send; a
+                // reported success writes no further row.
                 Ok(())
             }
             Err(e) => {
@@ -647,6 +688,53 @@ fn extract_submit_ctx<'a>(
     Ok((signer, network_passphrase, chain_id, timeout))
 }
 
+/// The sub-invocations a deposit authorizes under the vault call.
+///
+/// The vault's `deposit` calls `from.require_auth()` and moves each deposited
+/// asset with `transfer(from = wallet, to = vault, amount)`. The wallet
+/// authorizes, per vault asset, such transfers to the vault totaling at most
+/// the asset's `amounts_desired` entry.
+///
+/// # Errors
+///
+/// [`DefiAdapterError::InvalidArguments`] when `vault_assets` and
+/// `amounts_desired` differ in length, or an address is not a C-strkey.
+fn declared_deposit_transfers(
+    vault_address: &str,
+    vault_assets: &[WalletAssetStrategySet],
+    amounts_desired: &[i128],
+) -> Result<Vec<DeclaredTransfer>, DefiAdapterError> {
+    if vault_assets.len() != amounts_desired.len() {
+        return Err(DefiAdapterError::InvalidArguments {
+            reason: format!(
+                "{} desired amounts for {} vault assets",
+                amounts_desired.len(),
+                vault_assets.len()
+            ),
+        });
+    }
+    let vault = contract_strkey_to_sc_address(vault_address).map_err(|e| {
+        DefiAdapterError::InvalidArguments {
+            reason: format!("invalid vault_address: {e}"),
+        }
+    })?;
+    vault_assets
+        .iter()
+        .zip(amounts_desired)
+        .map(|(asset, amount)| {
+            Ok(DeclaredTransfer {
+                token: contract_strkey_to_sc_address(&asset.address).map_err(|e| {
+                    DefiAdapterError::InvalidArguments {
+                        reason: format!("invalid vault asset address: {e}"),
+                    }
+                })?,
+                to: Some(vault.clone()),
+                max_amount: *amount,
+            })
+        })
+        .collect()
+}
+
 fn build_invoke_contract_args(
     contract_sc_addr: &stellar_xdr::ScVal,
     fn_name: &str,
@@ -693,8 +781,9 @@ fn build_invoke_contract_args(
 /// rebuilding and re-submitting. A policy refusal keeps the criterion's own
 /// code, so the caller reads a refused cap rather than an endpoint failure.
 /// A mainnet refusal keeps the canonical `network.mainnet_write_forbidden`
-/// code. Every other failure is reported as a network failure, which moved
-/// nothing.
+/// code. A ledger witness refusal keeps its own code and carries no
+/// transaction, because nothing was signed. Every other failure is reported as
+/// a network failure, which moved nothing.
 fn map_submit_invoke_error(error: &stellar_agent_smart_account::SaError) -> DefiAdapterError {
     match error {
         stellar_agent_smart_account::SaError::MainnetWriteForbidden => {
@@ -718,6 +807,15 @@ fn map_submit_invoke_error(error: &stellar_agent_smart_account::SaError) -> Defi
             envelope_hash: envelope_hash.clone(),
             timeout_seconds: *timeout_seconds,
         },
+        refusal @ (stellar_agent_smart_account::SaError::IntentRecordUnavailable { .. }
+        | stellar_agent_smart_account::SaError::IntentBindingMismatch { .. }
+        | stellar_agent_smart_account::SaError::LedgerWitnessUnavailable { .. }
+        | stellar_agent_smart_account::SaError::LedgerWitnessMismatch { .. }) => {
+            DefiAdapterError::SigningRefusal {
+                wire_code: refusal.wire_code(),
+                message: refusal.to_string(),
+            }
+        }
         other => DefiAdapterError::Network {
             reason: format!("submit_signed_invoke failed: {other}"),
         },
@@ -737,6 +835,37 @@ mod tests {
     use crate::abi::{VaultDepositArgs, VaultWithdrawArgs};
     use stellar_agent_defi::pins::DefiContractPin;
     use stellar_agent_network::StellarRpcClient;
+
+    /// A deposit declares one transfer per vault asset, to the vault, bounded
+    /// by the asset's desired amount, in vault-asset order.
+    #[test]
+    fn a_deposit_declares_one_bounded_transfer_per_vault_asset_to_the_vault() {
+        let vault = "CCLV4H7WTLJQ7ATLHBBQV2WW3OINF3FOY5XZ7VPHZO7NH3D2ZS4GFSF6";
+        let assets = [
+            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+            "CB3TLW74NBIOT3BUWOZ3TUM6RFDF6A4GVIRUQRQZABG5KPOUL4JJOV2F",
+        ]
+        .map(|address| WalletAssetStrategySet {
+            address: address.to_owned(),
+            strategies: Vec::new(),
+        });
+        let declared = declared_deposit_transfers(vault, &assets, &[70, 0]).unwrap();
+        let vault_address = contract_strkey_to_sc_address(vault).unwrap();
+        assert_eq!(declared.len(), 2);
+        for (entry, (asset, amount)) in declared.iter().zip(assets.iter().zip([70, 0])) {
+            assert_eq!(
+                entry.token,
+                contract_strkey_to_sc_address(&asset.address).unwrap()
+            );
+            assert_eq!(entry.to.as_ref(), Some(&vault_address));
+            assert_eq!(entry.max_amount, amount);
+        }
+
+        assert!(matches!(
+            declared_deposit_transfers(vault, &assets, &[70]),
+            Err(DefiAdapterError::InvalidArguments { .. })
+        ));
+    }
 
     /// A refusal the spending window decided reaches the adapter surface as a
     /// policy denial, not as a network failure that moved nothing.
@@ -775,6 +904,39 @@ mod tests {
             ),
             "a failure that moved nothing is a network failure"
         );
+    }
+
+    /// A witness refusal keeps its wire code and reads as no network failure.
+    #[test]
+    fn a_witness_refusal_keeps_its_wire_code_through_the_adapter_mapping() {
+        for (error, code) in [
+            (
+                stellar_agent_smart_account::SaError::IntentBindingMismatch { field: "signers" },
+                "submission.intent_binding_mismatch",
+            ),
+            (
+                stellar_agent_smart_account::SaError::IntentRecordUnavailable {
+                    class: "missing_recorder",
+                },
+                "submission.intent_record_unavailable",
+            ),
+            (
+                stellar_agent_smart_account::SaError::LedgerWitnessUnavailable { reason: "fixed" },
+                "smart_account.ledger_witness_unavailable",
+            ),
+            (
+                stellar_agent_smart_account::SaError::LedgerWitnessMismatch { reason: "fixed" },
+                "simulation.divergence.ledger_skew",
+            ),
+        ] {
+            match map_submit_invoke_error(&error) {
+                DefiAdapterError::SigningRefusal { wire_code, message } => {
+                    assert_eq!(wire_code, code);
+                    assert_eq!(message, error.to_string());
+                }
+                other => panic!("expected a signing refusal, got {other:?}"),
+            }
+        }
     }
 
     /// A mainnet refusal keeps its own variant through the adapter mapping.
@@ -907,7 +1069,9 @@ mod tests {
         let adapter = DefindexVaultAdapter::new();
         let pin = test_pin();
         let rpc = test_rpc();
-        let ctx = DefiAdapterCtx::new("default", &pin, &rpc);
+        let mut ctx = DefiAdapterCtx::new("default", &pin, &rpc);
+        ctx.submission_recorder =
+            Some(&stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder);
         let args = deposit_args();
 
         // Use the registered "lend" verb to obtain a valid SubmitWitness.
@@ -937,7 +1101,9 @@ mod tests {
         let adapter = DefindexVaultAdapter::new();
         let pin = test_pin();
         let rpc = test_rpc();
-        let ctx = DefiAdapterCtx::new("default", &pin, &rpc);
+        let mut ctx = DefiAdapterCtx::new("default", &pin, &rpc);
+        ctx.submission_recorder =
+            Some(&stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder);
 
         // Use "lend" (registered verb) to get a valid SubmitWitness.
         let gate_result = dispatch_gate("lend", "test-req-2");

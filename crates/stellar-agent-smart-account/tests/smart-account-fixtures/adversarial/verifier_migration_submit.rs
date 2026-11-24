@@ -157,7 +157,11 @@ fn mock_signer_g() -> String {
 /// Verifier diversification: a migration compares each rule with its state
 /// row before anything is sent.
 #[tokio::test]
+#[serial_test::serial]
 async fn submit_refuses_the_first_step_without_a_state_row_before_any_rpc() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let server = MockServer::start().await;
 
     let signer_g = mock_signer_g();
@@ -190,11 +194,11 @@ async fn submit_refuses_the_first_step_without_a_state_row_before_any_rpc() {
     // both host functions, whose target is the smart account.
     let step = SignerMigrationStep::new_for_test(
         10,
-        "aabbccdd",
+        [0xaa; 32],
         dummy_host_function(&smart_account, "remove_signer"),
         dummy_host_function(&smart_account, "add_signer"),
     );
-    let rule = RuleMigration::new_for_test(1, "aabbccdd", vec![step]);
+    let rule = RuleMigration::new_for_test(1, [0xaa; 32], vec![step]);
     let plan = MigrationPlan::new_for_test(
         smart_account.clone(),
         [0x11u8; 32],

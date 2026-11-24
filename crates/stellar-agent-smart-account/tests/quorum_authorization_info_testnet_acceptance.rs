@@ -4,10 +4,10 @@
 //!
 //! - 2-of-3 quorum success.  Deploys a C-account with 3 G-key signers
 //!   at a 2-of-3 threshold rule; invokes `execute` via
-//!   [`collect_quorum_signatures`] with 2 qualifying signers; asserts the
+//!   [`plan_quorum_signatures`] with 2 qualifying signers; asserts the
 //!   transaction is accepted by the on-chain `__check_auth`.
 //!
-//! - 1-of-3 quorum failure (offline).  A [`collect_quorum_signatures`]
+//! - 1-of-3 quorum failure (offline).  A [`plan_quorum_signatures`]
 //!   call with only 1 signer against a 2-of-3 `AuthorizationInfo` returns
 //!   `QuorumError::GroupNotSatisfiedInAndCombinator` before any RPC round-trip.
 //!   The offline path asserts fail-closed semantics without a live contract
@@ -30,7 +30,7 @@
 //!
 //! The OpenZeppelin smart-account contract's on-chain `__check_auth` enforces
 //! the threshold at invocation time.  This test verifies the wallet-side
-//! `collect_quorum_signatures` produces entry sets that pass `__check_auth`.
+//! `plan_quorum_signatures` produces entry sets that pass `__check_auth`.
 //! Threshold orchestration is wallet-side only; the on-chain contract performs
 //! per-signer auth checks, not off-chain quorum collection.
 //!
@@ -62,7 +62,7 @@ use stellar_agent_smart_account::managers::auth_entry::test_helpers::{
     baseline_authorization_simulation, matching_envelope_context,
 };
 use stellar_agent_smart_account::managers::authorization::{
-    AuthorizationInfo, Combinator, QuorumError, SignerGroup, collect_quorum_signatures,
+    AuthorizationInfo, Combinator, QuorumError, SignerGroup, plan_quorum_signatures,
 };
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
@@ -138,18 +138,13 @@ fn fresh_deployer() -> (String, DeployerKeypair) {
 
 /// Funds a G-strkey via testnet Friendbot.
 ///
-/// Checks reachability only (the Friendbot 200 response); no balance threshold
+/// Panics when Friendbot does not fund the account; no balance threshold
 /// gates are applied.
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 200 for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// A testnet rule manager and its signers manager, both writing to one audit
@@ -160,7 +155,7 @@ async fn fund_via_friendbot(g_strkey: &str) {
 fn fresh_rule_manager() -> (ContextRuleManager, Arc<SignersManager>, TempDir) {
     let (manager, signers_manager, _audit_log_path, dir) = managers_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Duration::from_secs(TIMEOUT_SECS),
     );
     (manager, signers_manager, dir)
@@ -480,7 +475,7 @@ async fn install_multisigner_threshold_rule(
 
 // ── Offline quorum fail-closed (no RPC) ─────────────────────────────────
 
-/// `collect_quorum_signatures` returns
+/// `plan_quorum_signatures` returns
 /// `QuorumError::GroupNotSatisfiedInAndCombinator` when fewer than `threshold`
 /// qualifying signers are provided. This test runs offline (no network).
 ///
@@ -510,17 +505,23 @@ async fn q2_insufficient_signers_fails_before_rpc() {
 
     let auth_scaddr = ScAddress::Contract(ContractId(Hash([0u8; 32])));
     let function_name = ScSymbol::try_from("test_fn").expect("ScSymbol must encode");
-    let rule_id = ContextRuleId::new(1);
+    let rule_id = ContextRuleId::new(0);
 
     // Use test_helpers builders to construct the non_exhaustive simulation and
     // envelope types without struct literals; #[non_exhaustive] types cannot be
     // constructed via struct expressions in integration tests outside the crate.
-    // The simulation data is irrelevant here — collect_quorum_signatures returns
+    // Planning returns before reading the simulation data. It returns
     // InsufficientSignersInGroup before build_authorization_entry is called.
     let simulation = baseline_authorization_simulation(TESTNET_PASSPHRASE, CHAIN_ID, vec![rule_id]);
     let envelope = matching_envelope_context(&simulation);
 
-    let result = collect_quorum_signatures(
+    let (_, manager, _dir) = fresh_rule_manager();
+    let checked = manager
+        .check_signing_rules(&auth_scaddr, &[rule_id], "quorum-capacity")
+        .await
+        .unwrap();
+    let result = plan_quorum_signatures(
+        checked,
         &authz,
         &signers,
         auth_scaddr,
@@ -564,7 +565,7 @@ async fn q2_insufficient_signers_fails_before_rpc() {
 /// Deploys a C-account, installs a 2-of-3 threshold rule
 /// with three G-key signers, then:
 ///
-/// - invokes `set_threshold` via `collect_quorum_signatures` with
+/// - invokes `set_threshold` via `plan_quorum_signatures` with
 ///   2 signers; asserts the transaction is confirmed.
 /// - exercises the `SubmitInvokeArgs::authorization` path in
 ///   `submit_signed_invoke` for the same invocation shape.
@@ -586,6 +587,7 @@ async fn q2_insufficient_signers_fails_before_rpc() {
 #[tokio::test]
 #[serial]
 async fn q1_and_q3_two_of_three_quorum_invocation_accepted() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Provision: fund 4 accounts (bootstrap + signer1 + signer2 + signer3)
     //
     // ALL three quorum signers must have funded Stellar G-key accounts so that the
@@ -691,6 +693,9 @@ async fn q1_and_q3_two_of_three_quorum_invocation_accepted() {
 
     let result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(&sa_strkey)
             // auth_address: omit → defaults to None (uses target_contract)
             .auth_rule_ids(rule_ids.as_slice())
@@ -699,7 +704,7 @@ async fn q1_and_q3_two_of_three_quorum_invocation_accepted() {
             .maybe_authorization(Some(&authz))
             .signers(quorum_signers.as_slice())
             .primary_rpc_url(TESTNET_RPC_URL)
-            // secondary_rpc_url: omit → defaults to None
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(Duration::from_secs(TIMEOUT_SECS))

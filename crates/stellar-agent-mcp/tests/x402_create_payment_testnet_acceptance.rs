@@ -92,17 +92,12 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
 
 /// Funds a testnet account via Friendbot.
 ///
-/// Panics if the HTTP request fails or returns a non-2xx status.
+/// Panics when Friendbot does not fund the account.
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP GET must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 2xx for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
     eprintln!("funded {g_strkey} via Friendbot");
 }
 
@@ -161,6 +156,20 @@ fn build_test_server_with(
     entry
         .set_password(&s_strkey)
         .expect("keyring mock set_password must succeed");
+    // The identity record an enrollment stores beside the seed.
+    stellar_agent_network::keyring::write_keyring_string(
+        &stellar_agent_core::profile::schema::signer_identity_entry_ref(signer_ref),
+        &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .to_bytes(),
+            stellar_agent_core::profile::name::profile_name_for_approval(&profile),
+            profile.chain_id,
+        )
+        .render()
+        .expect("an agent record renders"),
+    )
+    .expect("set identity record");
 
     // Audit chain-root key. Signing verbs prove the keyed audit writer
     // acquirable before any signing (audit.chain_key_unavailable otherwise),
@@ -482,6 +491,10 @@ fn verify_auth_entry_signature(
 #[tokio::test]
 #[serial]
 async fn a6_create_payment_returns_signed_payload() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     let (recipient, _recipient_seed) = fresh_keypair();
     fund_via_friendbot(&g_strkey).await;
@@ -493,9 +506,12 @@ async fn a6_create_payment_returns_signed_payload() {
     let (capture, _guard) = LedgerCapture::install();
     let result = server
         .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+            approval_nonce: None,
+            approval_attestation: None,
             payment_required: native_requirements(&recipient, NATIVE_AMOUNT_STROOPS),
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             address: None,
+            business_id: None,
         })
         .await
         .expect("dispatch_gate must not return ErrorData for a valid chain_id");
@@ -541,6 +557,10 @@ async fn a6_create_payment_returns_signed_payload() {
 #[tokio::test]
 #[serial]
 async fn a6_create_payment_with_witness_passes() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     let (recipient, _recipient_seed) = fresh_keypair();
     fund_via_friendbot(&g_strkey).await;
@@ -559,9 +579,12 @@ async fn a6_create_payment_with_witness_passes() {
     let (capture, _guard) = LedgerCapture::install();
     let result = server
         .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+            approval_nonce: None,
+            approval_attestation: None,
             payment_required: native_requirements(&recipient, WITNESS_AMOUNT_STROOPS),
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             address: None,
+            business_id: None,
         })
         .await
         .expect("dispatch_gate must not return ErrorData for a valid chain_id");
@@ -634,6 +657,10 @@ async fn a6_create_payment_with_witness_passes() {
 #[tokio::test]
 #[serial]
 async fn a6_invalid_scheme_returns_error() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     fund_via_friendbot(&g_strkey).await;
     let server = build_test_server(&g_strkey, &seed, "x402-test-signer-scheme");
@@ -651,9 +678,12 @@ async fn a6_invalid_scheme_returns_error() {
 
     let result = server
         .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+            approval_nonce: None,
+            approval_attestation: None,
             payment_required: bad_requirements,
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             address: None,
+            business_id: None,
         })
         .await
         .expect("dispatch_gate must not raise ErrorData");
@@ -681,6 +711,10 @@ async fn a6_invalid_scheme_returns_error() {
 #[tokio::test]
 #[serial]
 async fn a6_chain_id_mismatch_returns_error_data() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     fund_via_friendbot(&g_strkey).await;
     let server = build_test_server(&g_strkey, &seed, "x402-test-signer-chain");
@@ -689,9 +723,12 @@ async fn a6_chain_id_mismatch_returns_error_data() {
 
     let error = server
         .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+            approval_nonce: None,
+            approval_attestation: None,
             payment_required: requirements_json,
             chain_id: "stellar:pubnet".to_owned(), // mismatch: profile is testnet
             address: None,
+            business_id: None,
         })
         .await
         .expect_err("chain_id mismatch must return Err(ErrorData) from dispatch_gate");

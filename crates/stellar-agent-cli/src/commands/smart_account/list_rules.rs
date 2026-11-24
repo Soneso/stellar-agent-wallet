@@ -176,8 +176,7 @@ pub struct ListRulesArgs {
 
     /// Output format: `json` (default) or `table`.
     ///
-    /// Table mode is deferred (`table` accepted by the flag parser but renders
-    /// the same JSON envelope until the human-readable table renderer ships).
+    /// `--output table` is accepted and renders the same JSON envelope.
     #[arg(long, default_value = "json", value_name = "FORMAT")]
     pub output: OutputFormat,
 }
@@ -195,14 +194,13 @@ pub struct ListRulesArgs {
 fn parse_max_scan_id(s: &str) -> Result<u32, String> {
     let n: u32 = s
         .parse()
-        .map_err(|_| format!("--max-scan-id: expected an integer, got '{s}'"))?;
+        .map_err(|_| "--max-scan-id must be an integer".to_owned())?;
     if n == 0 {
         return Err("--max-scan-id must be >= 1 (0 would scan no rule IDs)".to_owned());
     }
     if n > UPPER_BOUND_MAX_SCAN_ID {
         return Err(format!(
-            "--max-scan-id {n} exceeds the safety cap of {UPPER_BOUND_MAX_SCAN_ID}; \
-             raise this cap via UPPER_BOUND_MAX_SCAN_ID if truly needed"
+            "--max-scan-id exceeds the safety cap of {UPPER_BOUND_MAX_SCAN_ID}"
         ));
     }
     Ok(n)
@@ -334,7 +332,7 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved_profile) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved_profile.name);
+            let e = map_access_error(&error);
             return emit_error(&e);
         }
     };
@@ -357,9 +355,9 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
     let smart_account = match parse_c_strkey_to_smart_account(&args.account) {
         Ok(a) => a,
         Err(e) => {
-            return emit_error(&WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("--account: {e}"),
-            }));
+            return emit_error(&WalletError::Validation(ValidationError::address_check(
+                format!("--account: {e}"),
+            )));
         }
     };
 
@@ -411,9 +409,9 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
     let manager = match ContextRuleManager::new(config) {
         Ok(m) => m,
         Err(e) => {
-            return emit_error(&WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("ContextRuleManager construction: {e}"),
-            }));
+            return emit_error(&WalletError::Validation(ValidationError::address_check(
+                format!("ContextRuleManager construction: {e}"),
+            )));
         }
     };
 
@@ -436,11 +434,10 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
         Some(g) => g.clone(),
         None => {
             if context.chain_id.is_mainnet() {
-                return emit_error(&WalletError::Validation(ValidationError::AddressInvalid {
-                    input: "--source-account is required for mainnet enumeration; \
-                             pass a funded G-strkey (no signing is performed against it)"
-                        .to_owned(),
-                }));
+                return emit_error(&WalletError::Validation(ValidationError::address_check(
+                    "--source-account is required for mainnet enumeration; \
+                             pass a funded G-strkey (no signing is performed against it)",
+                )));
             }
             // Testnet: use the well-known interop deployer as the simulation source.
             INTEROP_DEPLOYER_G.to_owned()
@@ -585,7 +582,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn resolve_max_scan_id_takes_the_flag_then_the_profile_then_the_default() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_eq!(
             resolve_max_scan_id(&scan_args(Some(7)), &scan_profile(Some(300))),
             7
@@ -626,19 +627,17 @@ mod tests {
     fn parse_max_scan_id_rejects_above_upper_bound() {
         let above = (UPPER_BOUND_MAX_SCAN_ID + 1).to_string();
         let err = parse_max_scan_id(&above).expect_err("value above cap must be rejected");
-        assert!(
-            err.contains("exceeds the safety cap"),
-            "error must mention the safety cap; got: {err}"
+        assert_eq!(
+            err,
+            format!("--max-scan-id exceeds the safety cap of {UPPER_BOUND_MAX_SCAN_ID}")
         );
+        assert!(!err.contains(&above));
     }
 
     #[test]
     fn parse_max_scan_id_rejects_non_integer() {
         let err = parse_max_scan_id("abc").expect_err("non-integer must be rejected");
-        assert!(
-            err.contains("expected an integer"),
-            "error must mention the parse failure; got: {err}"
-        );
+        assert_eq!(err, "--max-scan-id must be an integer");
     }
 
     // ── JSON envelope shape ────────────────────────────────────────────────────

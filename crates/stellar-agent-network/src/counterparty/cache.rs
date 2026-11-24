@@ -749,7 +749,7 @@ fn load_hmac_key(
         }
     })?;
 
-    let raw = entry.get_password().map_err(|e| match e {
+    let raw = zeroize::Zeroizing::new(entry.get_password().map_err(|e| match e {
         keyring_core::Error::NoEntry => {
             // Omit service name from operator-visible error to avoid leaking
             // profile names in multi-profile setups.  Service-name detail goes
@@ -773,7 +773,7 @@ fn load_hmac_key(
                 detail: "keyring backend error retrieving entry".to_owned(),
             }
         }
-    })?;
+    })?);
 
     let key = base64_decode_key(&raw, service)?;
     refuse_owner_public_key(key.as_ref(), profile_name)?;
@@ -839,8 +839,20 @@ fn load_or_mint_hmac_key(
     // classification follow-up candidate): `NoEntry` triggers the lazy-mint,
     // every other cause is routed to debug tracing inside
     // `CounterpartyError::KeyringUnavailable`.
+    stellar_agent_core::profile::owner_key::refuse_policy_pin_coordinate(
+        key_ref,
+        "counterparty_cache_key_id",
+    )
+    .map_err(|error| CounterpartyError::KeyringUnavailable {
+        detail: error.to_string(),
+    })?;
     let service = &key_ref.service;
     refuse_owner_coordinate(key_ref)?;
+    stellar_agent_core::profile::owner_key::refuse_installation_key_coordinate(
+        key_ref,
+        "counterparty_cache_key_id",
+    )
+    .map_err(|_| CounterpartyError::InstallationKeyCoordinate)?;
     let entry = KeyringEntry::new(service, &key_ref.account).map_err(|e| {
         CounterpartyError::KeyringUnavailable {
             detail: format!("keyring entry open failed: {e}"),
@@ -850,6 +862,7 @@ fn load_or_mint_hmac_key(
     match entry.get_password() {
         // The load branch compares; a freshly minted random key is not.
         Ok(raw) => {
+            let raw = zeroize::Zeroizing::new(raw);
             let key = base64_decode_key(&raw, service)?;
             refuse_owner_public_key(key.as_ref(), profile_name)?;
             Ok(key)
@@ -861,7 +874,7 @@ fn load_or_mint_hmac_key(
                 "minting counterparty cache keyring entry"
             );
             let key = generate_hmac_key();
-            let encoded = base64_encode_key(key.as_ref());
+            let encoded = zeroize::Zeroizing::new(base64_encode_key(key.as_ref()));
             entry
                 .set_password(&encoded)
                 .map_err(|e| CounterpartyError::KeyringUnavailable {
@@ -893,27 +906,30 @@ fn base64_decode_key(
     service: &str,
 ) -> Result<zeroize::Zeroizing<[u8; HMAC_KEY_LEN]>, CounterpartyError> {
     use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded)
-        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(encoded))
-        .map_err(|_| {
-            // Do not embed the keyring service name (which carries the profile
-            // name) in the operator-visible detail.
-            tracing::debug!(
-                service = %service,
-                "keyring entry contains invalid base64"
-            );
-            CounterpartyError::KeyringUnavailable {
-                detail: "keyring entry contains invalid base64".to_owned(),
-            }
-        })?;
-    let arr: [u8; HMAC_KEY_LEN] =
-        bytes
-            .try_into()
-            .map_err(|_| CounterpartyError::KeyringUnavailable {
-                detail: "keyring entry has unexpected length (expected 32 bytes)".to_owned(),
-            })?;
-    Ok(zeroize::Zeroizing::new(arr))
+    let bytes = zeroize::Zeroizing::new(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .or_else(|_| base64::engine::general_purpose::STANDARD.decode(encoded))
+            .map_err(|_| {
+                // Do not embed the keyring service name (which carries the profile
+                // name) in the operator-visible detail.
+                tracing::debug!(
+                    service = %service,
+                    "keyring entry contains invalid base64"
+                );
+                CounterpartyError::KeyringUnavailable {
+                    detail: "keyring entry contains invalid base64".to_owned(),
+                }
+            })?,
+    );
+    if bytes.len() != HMAC_KEY_LEN {
+        return Err(CounterpartyError::KeyringUnavailable {
+            detail: "keyring entry has unexpected length (expected 32 bytes)".to_owned(),
+        });
+    }
+    let mut key = zeroize::Zeroizing::new([0u8; HMAC_KEY_LEN]);
+    key.copy_from_slice(&bytes);
+    Ok(key)
 }
 
 /// Base64-encodes an HMAC key for storage in the keyring.
@@ -1985,6 +2001,7 @@ mod tests {
         let matches = decoded.as_ref() == key;
         assert!(matches, "base64 round-trip produced unexpected bytes");
     }
+
     #[test]
     #[serial_test::serial]
     fn explicit_reference_reads_the_rotated_key() {
@@ -2259,5 +2276,45 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn keyring_lazy_mint_refuses_policy_pin_coordinate() {
+        let coordinate = KeyringEntryRef::new("custom", "default-PoLiCy-PiN");
+        let existing = base64_encode_key(&[0x5a; HMAC_KEY_LEN]);
+        for initial in [None, Some(existing.as_str())] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let entry = KeyringEntry::new(&coordinate.service, &coordinate.account).unwrap();
+            if let Some(value) = initial {
+                entry.set_password(value).unwrap();
+            }
+            let error = load_or_mint_hmac_key("pin-refusal", &coordinate).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("a policy pin changes only through a verified policy load")
+            );
+            assert_eq!(entry.get_password().ok().as_deref(), initial);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lazy_mint_refuses_installation_coordinate() {
+        let coordinate = KeyringEntryRef::new("StElLaR-AgEnT-ToOlSeTs", "pin-key");
+        let existing = base64_encode_key(&[0x5a; HMAC_KEY_LEN]);
+        for initial in [None, Some(existing.as_str())] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let entry = KeyringEntry::new(&coordinate.service, &coordinate.account).unwrap();
+            if let Some(value) = initial {
+                entry.set_password(value).unwrap();
+            }
+            assert!(matches!(
+                load_or_mint_hmac_key("installation-cache", &coordinate),
+                Err(CounterpartyError::InstallationKeyCoordinate)
+            ));
+            assert_eq!(entry.get_password().ok().as_deref(), initial);
+        }
     }
 }

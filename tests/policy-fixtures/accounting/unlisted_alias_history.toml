@@ -1,0 +1,10 @@
+version = 2
+scope = "profile:operator"
+sequence = 1
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "stellar:testnet" }
+criteria = [
+    { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = [], unlisted = { mode = "budget", per_tx_stroops = 100, per_period_stroops = 250, asset = "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", window = "1d" } },
+]
+decision = "allow"

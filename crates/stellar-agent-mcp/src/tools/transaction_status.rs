@@ -4,26 +4,55 @@
 //! This is how an agent resolves `submission.tx_timeout`. The submission was
 //! recorded before it was sent, so the wallet holds a receipt and, under a
 //! policy with a stateful criterion, a spending-window reservation for it;
-//! asking the chain what happened settles both. Re-simulating or resubmitting
-//! the same intent never does: the transaction may still apply, and the
-//! sequence it consumes may already be spent by it.
+//! asking the chain what happened records a reported success on both.
+//! Re-simulating or resubmitting the same intent never resolves it: the
+//! transaction may still apply, and the sequence it consumes may already be
+//! spent by it.
 //!
-//! The tool settles a submission by its receipt, or by its reservation when
-//! the receipt is missing, the way `stellar-agent tx status` does. A
-//! reservation released on chain evidence restores the missing receipt and
-//! writes the settled `value_action_failed` row under the evidence's code,
-//! which `record.release_code` reports. A hold the reconciliation could not
-//! settle is reported as `reservation`; one marked `operator_required` is
-//! resolved by the operator's `stellar-agent tx receipt clear`. No step sends
-//! the transaction again.
+//! The tool reconciles a submission by its receipt, or by its reservation when
+//! the receipt is missing, the way `stellar-agent tx status` does. A reported
+//! failure or missing transaction does not release possible spending, and a
+//! reported success writes no submitted row. A reservation ends once its
+//! accounting horizon has passed, with the outcome unknown. A pending or
+//! ambiguous `record` then carries `release_code`
+//! `submission.accounting_expired`, and a record with another status keeps its
+//! status and code. That expiry owes
+//! one `submission_accounting_expired` audit event, which the call delivers
+//! from the verified window state. The receipt is display data: `record`
+//! carries `settlement_evidence: "unavailable"`, and no receipt status writes
+//! an audit row. A hold that remains is reported as `reservation`. One marked
+//! `operator_required` ends at its accounting horizon when it has a time
+//! bound. Once its execution bound has passed, the operator's
+//! `stellar-agent tx receipt clear --acknowledge` clears an eligible receipt,
+//! and the bounded spend stays charged through the horizon. An untimed hold
+//! clears with `--acknowledge --acknowledge-unbounded`. No step sends the
+//! transaction again.
+//!
+//! For a managed mainnet attempt, `recovery` carries the same typed results
+//! as `stellar-agent tx status`. `retry_recovery`, default false, starts one
+//! new bounded evidence run for a stopped attempt and resets its run count
+//! to one. It never resubmits and authorizes no successor.
+//!
+//! On mainnet the lookup reconciles, recovers and releases only when the
+//! startup enablement record exists and the per-call freshness check of it
+//! succeeds, with the startup snapshot clients whose hosts that record binds.
+//! A failed check answers `network.mainnet_write_forbidden`, as the value
+//! tools do. Without a record the lookup runs none of those steps and answers
+//! from the stored state and the primary endpoint's lookup.
+//!
+//! `business_id` selects a mainnet operation by its business id, alone or
+//! with a `tx_hash` of one of its attempts. The selectors are resolved from
+//! the authenticated window before any recovery, and `operation` projects the
+//! stored record afterwards. On testnet the id is checked and echoed only.
 //!
 //! # Why a read tool is not read-only
 //!
-//! The lookup changes wallet state: a confirmed transaction turns its
-//! reservation into recorded spend and writes the value-action row the
-//! submission never got to write, and a transaction that can no longer apply
-//! releases its reservation. Both annotations say so, because the pairing is
-//! legal but unusual: `read_only_hint = false` because state changes, and
+//! The lookup changes wallet state: it records a reported success on the
+//! receipt and the reservation, and ends a reservation whose accounting
+//! horizon has passed. A reported failure leaves both as they were. An untimed
+//! reservation's receipt that already records another network answer keeps
+//! it. Both annotations say so, because the pairing is legal but unusual:
+//! `read_only_hint = false` because state changes, and
 //! `ToolValueKind::ReadOnly` because no value moves as a result of the call.
 
 use rmcp::{
@@ -33,11 +62,12 @@ use rmcp::{
 };
 use serde_json::json;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::profile::receipt::{
-    ReceiptStatus, ReceiptStore, ReleaseEvidence, SubmissionReceipt,
-};
+use stellar_agent_core::profile::receipt::{ReceiptStatus, ReleaseEvidence, SubmissionReceipt};
 use stellar_agent_mcp_macros::mcp_tool_router;
-use stellar_agent_network::policy_state::PersistedWindowStore;
+use stellar_agent_network::policy_state::{
+    BusinessId, OperationProjection, PersistedWindowStore, StatusSelectors,
+};
+use stellar_agent_network::submission_flow::{self, StatusFailure, StatusRequest, is_tx_hash};
 
 use crate::server::WalletServer;
 use crate::tools::common::business_error_result;
@@ -51,7 +81,22 @@ pub struct StellarTransactionStatusArgs {
 
     /// The transaction hash to reconcile, 64 lowercase hex characters. This is
     /// the `details.tx_hash` a `submission.tx_timeout` response carries.
-    pub tx_hash: String,
+    /// Optional when `business_id` is given.
+    #[serde(default)]
+    pub tx_hash: Option<String>,
+
+    /// The business id of a mainnet operation to report. With `tx_hash`,
+    /// both must name the same operation. On testnet it is checked for shape
+    /// and echoed, since testnet keeps no operation records.
+    #[serde(default)]
+    pub business_id: Option<String>,
+
+    /// Starts one new bounded recovery run for this hash's stopped mainnet
+    /// attempt, also before its retry time or after its runs are exhausted.
+    /// The run collects evidence only and never sends a transaction.
+    /// Defaults to false.
+    #[serde(default)]
+    pub retry_recovery: bool,
 }
 
 #[mcp_tool_router]
@@ -67,16 +112,36 @@ impl WalletServer {
     )]
     #[tool(
         name = "stellar_transaction_status",
-        description = "Reconcile one submitted transaction against the chain and settle the \
+        description = "Reconcile one submitted transaction against the chain and update the \
                        wallet's record of it. Pass the tx_hash from a submission.tx_timeout \
-                       response. A confirmed transaction records its spend and its value-action \
-                       row. One that can no longer apply releases its spending-window \
-                       reservation: record.status is then ambiguous and record.release_code \
-                       names the evidence (submission.sequence_consumed or \
-                       submission.time_bound_passed). A hold that remains is returned as \
-                       reservation {envelope_hash, operator_required}; operator_required means \
-                       only the operator's tx receipt clear resolves it. This is the only way to \
-                       resolve a timed-out submission: never re-simulate or resubmit, because \
+                       response. Endpoint success, failure, and absence are reports. Possible \
+                       spending remains charged through the later of the signed deadline and \
+                       the first success observation, plus every affected window; untimed \
+                       exposure requires explicit operator acknowledgement. \
+                       Accounting expiry leaves the outcome unknown, records \
+                       submission.accounting_expired in record.release_code of a pending or \
+                       ambiguous record, keeps any other status and code, and writes no failed \
+                       value-action row. record is display data: settlement_evidence is \
+                       unavailable, and settlement_decision_id only locates an accounting \
+                       decision. A hold that remains is returned as \
+                       reservation {envelope_hash, operator_required}; operator_required means no \
+                       endpoint answer resolves it. A time-bounded hold still ends at its \
+                       accounting horizon; otherwise only the operator's tx receipt clear \
+                       resolves it, with --acknowledge-unbounded as well for an untimed hold. \
+                       For a managed mainnet attempt, recovery carries each attempt's typed \
+                       result (Included, NeverApplicable or NeedsEvidence), retry class, \
+                       earliest_retry_ms and next_action. retry_recovery (default false) starts \
+                       one new bounded evidence run for a stopped attempt, also before its retry \
+                       time or after RetriesExhausted; it never resubmits and authorizes no \
+                       successor. \
+                       Select by tx_hash, business_id, or both naming one operation; neither \
+                       gives validation.usage_error. On mainnet an unknown business_id gives \
+                       operation.unknown, and operation carries the stored state, attempts, \
+                       last transition, hold and result, or null for an unrecorded hash. A \
+                       business_id without an exposed hash reads no network. On testnet a \
+                       business_id is only echoed. \
+                       This is the only way to resolve a timed-out submission: never \
+                       re-simulate or resubmit, because \
                        the transaction may still apply and its sequence may already be spent. \
                        read_only_hint=false (the wallet's record changes); the call moves no \
                        value. destructive_hint=false.",
@@ -87,218 +152,199 @@ impl WalletServer {
         Parameters(args): Parameters<StellarTransactionStatusArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let args_value = json!({ "chain_id": &args.chain_id });
-        let reconciliation_decision = match self
+        if let Err(error) = self
             .dispatch_gate("stellar_transaction_status", &args_value, &args.chain_id)
             .await
         {
-            Ok(outcome) => outcome.audit_decision(),
-            Err(error) => return error.into_result(),
-        };
+            return error.into_result();
+        }
 
-        if !is_tx_hash(&args.tx_hash) {
+        if args
+            .tx_hash
+            .as_deref()
+            .is_some_and(|hash| !is_tx_hash(hash))
+        {
             return Ok(business_error_result(
                 "validation.address_invalid",
                 "tx_hash must be 64 lowercase hex characters",
             ));
         }
+        let selectors =
+            match StatusSelectors::parse(args.tx_hash.as_deref(), args.business_id.as_deref()) {
+                Ok(selectors) => selectors,
+                Err(error) => return Ok(business_error_result(error.code(), error.message())),
+            };
+        if !self.profile.chain_id.is_mainnet()
+            && let (None, Some(business_id)) = (&selectors.tx_hash, &selectors.business_id)
+        {
+            return Ok(success_result(testnet_business_view(business_id)));
+        }
 
-        // The audit writer is acquired the same way every value verb acquires
-        // it: a reconciliation that confirms a submission writes the
-        // value-action row that submission never got to write, so the chain
-        // key has to be available before anything is settled.
         let profile_name = self.profile_name_for_approval();
-        let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
-            &self.profile,
-            &profile_name,
-            self.audit_binding,
-        ) {
-            Ok(writer) => writer,
-            Err(err) => {
-                let envelope = Envelope::<()>::err(&err);
-                let json = envelope
-                    .to_json_pretty()
-                    .unwrap_or_else(|_| String::from("{}"));
-                let mut result = CallToolResult::success(vec![Content::text(json)]);
-                result.is_error = Some(true);
-                return Ok(result);
-            }
+        let window = PersistedWindowStore::for_profile(&profile_name);
+        let target = match submission_flow::select_status(&self.profile, &window, &selectors) {
+            Ok(target) => target,
+            Err(error) => return Ok(status_error_result(error)),
         };
-
+        let Some(tx_hash) = target.tx_hash.as_deref() else {
+            return Ok(
+                match submission_flow::operation_projection(&self.profile, &window, &target) {
+                    Ok(operation) => {
+                        success_result(selected_view(&selectors, None, operation.as_ref()))
+                    }
+                    Err(error) => status_error_result(error),
+                },
+            );
+        };
+        // On mainnet the lookup settles only on the startup enablement record
+        // and a fresh check of it, with the startup snapshot clients.
+        let settle = match self.settlement_allowed() {
+            Ok(settle) => settle,
+            Err(refusal) => return Ok(refusal),
+        };
         let client = match self.context.primary_client() {
             Ok(client) => client,
-            Err(err) => return crate::tools::common::rpc_client_failure(&err),
-        };
-
-        let receipts = match ReceiptStore::open(&profile_name) {
-            Ok(store) => store,
-            Err(e) => {
-                return Ok(business_error_result(
-                    "submission.record_unavailable",
-                    format!("the submission receipt store could not be opened: {e}"),
-                ));
-            }
-        };
-
-        let receipt = match receipts.find_by_tx_hash(&args.tx_hash) {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(business_error_result(
-                    "submission.record_unavailable",
-                    format!("the submission receipt store could not be read: {e}"),
-                ));
-            }
-        };
-
-        let window = PersistedWindowStore::for_profile(&profile_name);
-        let held = match self.open_reservation_for(&window, &args.tx_hash) {
-            Ok(held) => held,
-            Err(result) => return Ok(result),
-        };
-        let envelope_hash = receipt
-            .as_ref()
-            .map(|r| r.envelope_hash.clone())
-            .or_else(|| held.as_ref().map(|r| r.id.clone()));
-
-        // The reconciliation pass settles this submission's reservation and
-        // its receipt together, with no budget: the agent asked about this
-        // transaction by name. A submission whose receipt is missing is
-        // settled by its authenticated reservation.
-        if let Some(envelope_hash) = &envelope_hash {
-            let Ok(now_ms) = stellar_agent_core::timefmt::now_unix_ms() else {
-                return Ok(business_error_result(
-                    "wallet.clock_error",
-                    "the system clock is unavailable",
-                ));
-            };
-            match window
-                .reconcile_one(
-                    &self.profile,
-                    &client,
-                    Some(&receipts),
-                    envelope_hash,
-                    now_ms,
-                )
-                .await
-            {
-                Ok(report) if report.receipt_write_failed > 0 => tracing::warn!(
-                    receipt_write_failed = report.receipt_write_failed,
-                    "stellar_transaction_status: reconciliation could not record the receipt"
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::debug!(
-                    error = ?e,
-                    "stellar_transaction_status: reconciliation pass failed; the record stands"
-                ),
-            }
-        }
-
-        if let Some(record) = &receipt
-            && record.approval_nonce.is_some()
-        {
-            let approval_dir = match self.resolve_approval_dir() {
-                Ok(dir) => dir,
-                Err(e) => {
-                    return Ok(business_error_result(
-                        "submission.record_unavailable",
-                        e.to_string(),
-                    ));
+            Err(err) => {
+                // An unreadable window file refuses before a client failure,
+                // as the window is read first.
+                if let Err(error) = window.pending_reservations(&self.profile) {
+                    return Ok(status_error_result(StatusFailure::WindowUnreadable(error)));
                 }
-            };
-            if let Err(e) = stellar_agent_network::submission_record::repair_approval_consumption(
-                &receipts,
-                &record.envelope_hash,
-                &approval_dir,
-                &profile_name,
-            ) {
-                return Ok(business_error_result(e.code(), e.message()));
-            }
-        }
-
-        // Report the chain's own answer alongside the settled record, so an
-        // agent sees both what happened and what the wallet now holds.
-        let chain = match client.get_transaction_status(&args.tx_hash).await {
-            Ok(s) => s,
-            Err(e) => {
-                return Ok(business_error_result(
-                    "network.rpc_unreachable",
-                    format!("the endpoint could not be asked about this transaction: {e}"),
-                ));
+                return crate::tools::common::rpc_client_failure(&err);
             }
         };
 
-        // Reconciliation can restore a receipt from the authenticated hold and
-        // can release the hold, so both are read again.
-        let reservation = match self.open_reservation_for(&window, &args.tx_hash) {
-            Ok(held) => held,
-            Err(result) => return Ok(result),
-        };
-        let settled = match receipts.find_by_tx_hash(&args.tx_hash) {
-            Ok(record) => record,
-            Err(e) => {
-                return Ok(business_error_result(
-                    "submission.record_unavailable",
-                    format!("the submission receipt store could not be read: {e}"),
-                ));
-            }
-        };
-
-        // A submission the chain has now answered for, or whose reservation
-        // was released on chain evidence, gets the value-action row it never
-        // got to write, carrying the legs the gate sized.
-        if let Some(record) = settled.as_ref() {
-            crate::tools::submission_record::write_settled_row(
+        let writer = || {
+            crate::tools::value_audit::require_value_audit_writer(
                 &self.profile,
                 &profile_name,
-                &audit_writer,
-                &record.envelope_hash,
-                &record.tx_hash,
-                &record.status,
-                record.release_code,
-                record.ledger.or(chain.ledger),
-                reconciliation_decision,
+                self.audit_binding,
+            )
+        };
+        let looked_up = if settle {
+            let oracle = self.settlement_oracle();
+            let request = status_request(
+                &args,
+                tx_hash,
+                &self.profile,
+                &profile_name,
+                &window,
+                &client,
+                oracle.as_ref(),
             );
-        }
-
-        let view = json!({
-            "tx_hash": args.tx_hash,
-            "chain_status": chain.status,
-            "ledger": chain.ledger,
-            "record": settled.as_ref().map(|record| {
-                let reservation_open = reservation
-                    .as_ref()
-                    .is_some_and(|held| held.id == record.envelope_hash);
-                receipt_view(record, reservation_open)
-            }),
-            "reservation": reservation.as_ref().map(|held| json!({
-                "envelope_hash": held.id,
-                "operator_required": held.operator_required,
-            })),
-        });
-        let envelope = Envelope::ok(view);
-        let json_out = envelope
-            .to_json_pretty()
-            .unwrap_or_else(|_| String::from("{}"));
-        Ok(CallToolResult::success(vec![Content::text(json_out)]))
+            submission_flow::transaction_status(request, || self.resolve_approval_dir(), writer)
+                .await
+        } else {
+            let request = status_request(
+                &args,
+                tx_hash,
+                &self.profile,
+                &profile_name,
+                &window,
+                &client,
+                None,
+            );
+            submission_flow::transaction_status_unsettled(
+                request,
+                || self.resolve_approval_dir(),
+                writer,
+            )
+            .await
+        };
+        let outcome = match looked_up {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(status_error_result(error)),
+        };
+        Ok(
+            match submission_flow::operation_projection(&self.profile, &window, &target) {
+                Ok(operation) => success_result(selected_view(
+                    &selectors,
+                    Some(status_view(tx_hash, &outcome)),
+                    operation.as_ref(),
+                )),
+                Err(error) => status_error_result(error),
+            },
+        )
     }
 }
 
-impl WalletServer {
-    /// The reservation the window file holds pending for `tx_hash`, or the
-    /// error result for a file that cannot be read.
-    fn open_reservation_for(
-        &self,
-        window: &PersistedWindowStore,
-        tx_hash: &str,
-    ) -> Result<Option<stellar_agent_network::policy_state::WindowReservation>, CallToolResult>
-    {
-        match window.pending_reservations(&self.profile) {
-            Ok(open) => Ok(open.into_iter().find(|r| r.tx_hash == tx_hash)),
-            Err(e) => Err(business_error_result(
-                "submission.record_unavailable",
-                format!("the spending-window file could not be read: {e:?}"),
-            )),
-        }
+fn success_result(view: serde_json::Value) -> CallToolResult {
+    let json_out = Envelope::ok(view)
+        .to_json_pretty()
+        .unwrap_or_else(|_| String::from("{}"));
+    CallToolResult::success(vec![Content::text(json_out)])
+}
+
+/// A testnet business-only call: the echoed id and the fixed null keys.
+fn testnet_business_view(business_id: &BusinessId) -> serde_json::Value {
+    json!({
+        "business_id": business_id,
+        "operation": null,
+        "chain": null,
+        "receipt": null,
+        "reservation": null,
+    })
+}
+
+/// The hash view, or null hash keys when no exposed hash was targeted, with
+/// the operation projection and any supplied business id.
+fn selected_view(
+    selectors: &StatusSelectors,
+    hash_view: Option<serde_json::Value>,
+    operation: Option<&OperationProjection>,
+) -> serde_json::Value {
+    let mut view = hash_view.unwrap_or_else(|| {
+        json!({
+            "tx_hash": null,
+            "chain_status": null,
+            "ledger": null,
+            "record": null,
+            "reservation": null,
+        })
+    });
+    view["operation"] = json!(operation);
+    if let Some(business_id) = &selectors.business_id {
+        view["business_id"] = json!(business_id);
     }
+    view
+}
+
+fn status_request<'a>(
+    args: &'a StellarTransactionStatusArgs,
+    tx_hash: &'a str,
+    profile: &'a stellar_agent_core::profile::schema::Profile,
+    profile_name: &'a str,
+    window: &'a PersistedWindowStore,
+    client: &'a stellar_agent_network::StellarRpcClient,
+    oracle: Option<&'a stellar_agent_network::StellarRpcClient>,
+) -> StatusRequest<'a> {
+    StatusRequest {
+        profile,
+        profile_name,
+        tx_hash,
+        window,
+        client,
+        oracle,
+        retry_recovery: args.retry_recovery,
+    }
+}
+
+/// The success payload; `recovery` appears only with managed results or a refusal.
+fn status_view(tx_hash: &str, outcome: &submission_flow::StatusOutcome) -> serde_json::Value {
+    let mut view = json!({
+        "tx_hash": tx_hash,
+        "chain_status": outcome.chain_status,
+        "ledger": outcome.ledger,
+        "record": outcome.record.as_ref().map(|record| receipt_view(record, outcome.reservation_open)),
+        "reservation": outcome.reservation.as_ref().map(|held| json!({
+            "envelope_hash": held.id,
+            "operator_required": held.operator_required,
+        })),
+    });
+    if let Some(recovery) = outcome.recovery.status_json() {
+        view["recovery"] = recovery;
+    }
+    view
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -313,14 +359,21 @@ impl WalletServer {
     }
 }
 
-/// Renders the wallet's settled record of a submission.
+/// Renders the wallet's record of a submission.
 ///
-/// `release_code` names the chain evidence on which reconciliation released
-/// the reservation of a submission whose outcome is unknown; it is `null`
-/// for a submission the chain answered for and for one whose retention
-/// window closed. It is how an agent tells those cases apart.
+/// The record is display data. `settlement_evidence` is always
+/// `"unavailable"`: no receipt field authenticates a settlement.
+/// `release_code` names a display observation or the accounting disposition
+/// of a submission whose outcome is unknown, such as
+/// `submission.accounting_expired` once its accounting horizon passed; it is
+/// not a chain outcome. `settlement_decision_id` locates the authenticated
+/// accounting decision a projection recorded; a copied identifier proves
+/// nothing. A reported failure or missing transaction does not release
+/// possible spending.
 fn receipt_view(receipt: &SubmissionReceipt, reservation_open: bool) -> serde_json::Value {
     json!({
+        "settlement_evidence": "unavailable",
+        "settlement_decision_id": receipt.settlement_decision_id,
         "reservation_open": reservation_open,
         "envelope_hash": receipt.envelope_hash,
         "status": receipt.status.label(),
@@ -338,33 +391,136 @@ fn receipt_view(receipt: &SubmissionReceipt, reservation_open: bool) -> serde_js
     })
 }
 
-/// Returns true when `value` is 64 lowercase hex characters.
-fn is_tx_hash(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+fn status_error_result(error: StatusFailure) -> CallToolResult {
+    match error {
+        StatusFailure::WindowUnreadable(e) => business_error_result(
+            e.submission_code(),
+            format!("the spending-window file could not be read: {e}"),
+        ),
+        StatusFailure::ReceiptStoreOpen { detail } => {
+            business_error_result("submission.record_unavailable", detail)
+        }
+        StatusFailure::ApprovalDirUnavailable(e) => {
+            business_error_result("submission.record_unavailable", e.to_string())
+        }
+        StatusFailure::ReceiptStoreRead(e) => business_error_result(
+            "submission.record_unavailable",
+            format!("the submission receipt store could not be read: {e}"),
+        ),
+        StatusFailure::ClockUnavailable(_) => {
+            business_error_result("wallet.clock_error", "the system clock is unavailable")
+        }
+        StatusFailure::ReconcileRefused(e) => {
+            business_error_result(e.submission_code(), e.to_string())
+        }
+        StatusFailure::RepairRefused(e) => business_error_result(e.code(), e.message()),
+        StatusFailure::ChainQueryFailed(e) => business_error_result(
+            "network.rpc_unreachable",
+            format!("the endpoint could not be asked about this transaction: {e}"),
+        ),
+        StatusFailure::SelectorRefused(e) => business_error_result(e.code(), e.message()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        reason = "test-only; panics acceptable in unit tests"
-    )]
+    #![allow(clippy::expect_used, reason = "test assertions")]
+    use super::StellarTransactionStatusArgs as Args;
+    use serde_json::json;
 
-    use super::*;
+    const HASH: &str = "abababababababababababababababababababababababababababababababab";
 
     #[test]
-    fn accepts_a_lowercase_64_hex_hash() {
-        assert!(is_tx_hash(&"ab".repeat(32)));
+    fn status_progress_refusal_contract() {
+        use stellar_agent_network::policy_state::WindowStoreError;
+        use stellar_agent_network::submission_flow::StatusFailure;
+        for error in [
+            WindowStoreError::ChainMismatch,
+            WindowStoreError::Invalid {
+                detail: "unreadable: 状態".to_owned(),
+            },
+        ] {
+            let code = error.submission_code();
+            let result = super::status_error_result(StatusFailure::WindowUnreadable(error));
+            let value: serde_json::Value =
+                serde_json::from_str(&result.content[0].as_text().expect("text").text)
+                    .expect("envelope");
+            assert_eq!(
+                value["error"]["code"], code,
+                "typed progress read code crosses MCP"
+            );
+            assert!(value.get("progress").is_none());
+        }
     }
 
+    /// The argument defaults to false, rejects other types and reaches the
+    /// library request; the payload is the shared recovery projection.
     #[test]
-    fn refuses_uppercase_wrong_length_and_non_hex() {
-        assert!(!is_tx_hash(&"AB".repeat(32)));
-        assert!(!is_tx_hash(&"ab".repeat(31)));
-        assert!(!is_tx_hash(&"zz".repeat(32)));
+    #[serial_test::serial]
+    fn status_recovery_result_and_retry_argument() {
+        use stellar_agent_network::policy_state::{
+            PersistedWindowStore, RecoveryRefusal, RecoveryReport,
+        };
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().expect("sandbox");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let parse = |value| serde_json::from_value::<Args>(value);
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "acct", "n-svc", "n-acct",
+        )
+        .with_noop_engine()
+        .build();
+        let window = PersistedWindowStore::for_profile("status-argument");
+        let client =
+            stellar_agent_network::StellarRpcClient::new("http://127.0.0.1:1").expect("client");
+        for (value, expected) in [
+            (
+                json!({"chain_id": "stellar:mainnet", "tx_hash": HASH}),
+                false,
+            ),
+            (
+                json!({"chain_id": "stellar:mainnet", "tx_hash": HASH, "retry_recovery": false}),
+                false,
+            ),
+            (
+                json!({"chain_id": "stellar:mainnet", "tx_hash": HASH, "retry_recovery": true}),
+                true,
+            ),
+        ] {
+            let args = parse(value).expect("arguments");
+            assert_eq!(args.retry_recovery, expected);
+            let request = super::status_request(&args, HASH, &profile, "p", &window, &client, None);
+            assert_eq!(request.retry_recovery, expected);
+        }
+        for wrong in [json!("true"), json!(1), json!(null)] {
+            assert!(
+                parse(
+                    json!({"chain_id": "stellar:mainnet", "tx_hash": HASH, "retry_recovery": wrong})
+                )
+                .is_err()
+            );
+        }
+        let mut recovery = RecoveryReport::default();
+        let outcome = |recovery| stellar_agent_network::submission_flow::StatusOutcome {
+            recovery,
+            progress: None,
+            chain_status: "UNKNOWN".to_owned(),
+            ledger: None,
+            record: None,
+            reservation: None,
+            reservation_open: false,
+        };
+        let view = super::status_view(HASH, &outcome(recovery.clone()));
+        assert!(view.get("recovery").is_none(), "unmanaged: {view}");
+        recovery.refusal = Some(RecoveryRefusal {
+            code: "submission.record_unavailable",
+            state_unavailable: true,
+        });
+        let view = super::status_view(HASH, &outcome(recovery.clone()));
+        assert_eq!(view["chain_status"], "UNKNOWN");
+        assert_eq!(view["recovery"], recovery.status_json().expect("refusal"));
+        assert_eq!(
+            view["recovery"]["refusal"],
+            json!({"code": "submission.record_unavailable", "state_unavailable": true})
+        );
     }
 }

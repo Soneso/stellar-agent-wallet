@@ -33,7 +33,11 @@ use super::rpc_mock_helpers::{
 /// `SignerSetDiverged`. The two-RPC agreement check prevents a compromised
 /// primary from suppressing the divergence signal.
 #[tokio::test]
+#[serial_test::serial]
 async fn stale_primary_current_secondary_returns_rpc_divergence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     // Write a 1-of-1 baseline (matches the stale primary view — this is the "suppression" attempt).

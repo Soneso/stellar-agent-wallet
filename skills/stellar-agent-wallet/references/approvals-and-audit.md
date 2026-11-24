@@ -1,9 +1,12 @@
 # Approvals and audit
 
+See [Mainnet configurations and scope](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 The guardrail loop that sits between an agent's tool call and any signing or
 network action: the policy engine, the operator-approval spine, attestations,
 and the hash-chained audit log. This file is self-contained; for the MCP tool
-surface that drives the simulate/commit handshake see `./mcp-tools.md`.
+surface that drives the simulate/commit handshake see [mcp-tools.md](mcp-tools.md).
 
 ## The model in one paragraph
 
@@ -11,8 +14,14 @@ Every gated tool/command invocation is evaluated by the active policy engine
 before any signature. Reads the decision needs, such as the source account, can
 run first. The engine returns Allow, Deny, or RequireApproval.
 Two-phase MCP actions hold approval requests in a per-profile pending store.
-Single-shot signing paths refuse approval decisions; see
+On testnet, single-shot CLI signing paths refuse approval decisions with
+`policy.approval_required`. On mainnet, full-mode CLI payment, claim, sponsored
+creation, and trustline commands run the passkey ceremony for RequireApproval; see
 [CLI signing coverage](cli-reference.md#signing-and-approval-coverage).
+The SEP-43 transaction tools store a pending approval for a single payment,
+path payment, account creation or trustline change. The attested repeat signs.
+The sign-only tool consumes the approval before it returns the signature, and
+its `opaque_payload_signed` row records `require_approval`.
 For MCP pay, create-account, trustline, and claim, simulation records pending
 approval when either tool in the pair requires it. The response returns an
 `approval_nonce`. The wallet owner runs
@@ -28,16 +37,17 @@ commit reads the recorded attestation from the store; the agent passes none.
 Transaction submissions, signed authorizations, approvals, and explicit
 key-management and lifecycle events enter a hash-chained audit log.
 MCP balance reads and payment simulations produce no automatic invocation row.
-Under V1, payment simulations can reconcile overdue reservations and write
-settlement audit rows.
+Under V1, payment simulations can reconcile overdue reservations and deliver
+owed accounting events.
 `stellar-agent audit verify` checks the log for tampering.
 
 Use these MCP pairs for agent payments, trustlines, and claims. The CLI serves
 reads, setup, and operator ceremonies. An agent limited to MCP cannot approve
 its own request. A process running as the operator's OS user holds the
 operator's authority; the wallet does not distinguish it from the operator.
-CLI approval checks the local OS identity; it reads consent from standard
-input or `--yes` and does not establish that a human confirmed.
+On testnet, CLI approval checks the local OS identity; it reads consent from
+standard input or `--yes` and does not establish that a human confirmed. On
+mainnet it refuses `--yes` and terminal input and runs the passkey ceremony.
 Same-user processes can read keyring entries on Linux (Secret Service) and
 Windows (Credential Manager). With the `headless-env` backend, any process that
 can read `STELLAR_AGENT_HEADLESS_KEYRING_KEY` can decrypt every entry, on any
@@ -49,14 +59,17 @@ platform. See the
 - Result envelope: `{ok, data, request_id}` on success, `{ok: false, error,
   request_id}` on failure, used by every command group including `profile`,
   `approve`, `audit`, `credentials`, and `toolsets`.
-- Exit code: `0` on success, `1` on any error.
+- Exit code: `0` on success, `1` on an error. Three `profile` commands add
+  codes: `profile policy-check` exits `3` or `65`, `profile apply-fragment` exits
+  `65` on a refusal, and `profile enable-mainnet --state` exits `3` when the
+  enablement is absent.
 - Amounts are decimal strings with a unit (for example `"10 XLM"`), never JSON
   numbers. Asset is `native`/`XLM` or `CODE:GISSUER`.
 - `chain_id` is the CAIP-2 id, `stellar:testnet` (default) or `stellar:mainnet`.
 - The `profile`, `credentials`, `approve`, and `audit` groups operate only on
   local state (TOML files and platform-keyring entries). None submits a
-  transaction, so the network flags and the mainnet-write gate do not apply to
-  them.
+  transaction. Profile selection and enablement still enforce their
+  mainnet-specific prerequisites.
 
 ## The policy engine
 
@@ -68,22 +81,83 @@ Each gated invocation is evaluated before it signs. Three decisions:
 | Deny | The call is refused, carrying a typed reason with a stable wire code. |
 | RequireApproval | The call is held pending an out-of-band operator approval. |
 
-The engine that runs is selected per profile in `[policy]`. Two structural rules
-apply on every surface: the default network is `stellar:testnet`. Every write or
-signing command structurally refuses `stellar:mainnet`
-(`network.mainnet_write_forbidden`), except MPP, which refuses with
-`mpp.network_forbidden`. This covers `--network` commands and the profile-driven
-write commands before any RPC call or signature. At the submit layer it covers
-both a declared mainnet passphrase and a known mainnet RPC URL, each with no RPC
-call at all. Meanwhile `stellar:mainnet` stays accepted for read-only commands.
-The submit layer additionally asks the endpoint which network it serves and
-binds the submission to that answer rather than to the declared network,
-verifying every signature on the envelope against it; see
-references/troubleshooting.md for those wire codes.
+The engine in `[policy]` governs policy evaluation.
+Default builds from this repository carry `mainnet-write`. Mainnet writes also need installation setup and sealed
+authorization. Signing and submission independently verify authority. The
+endpoint network binds every envelope signature. Reads retain their selection
+and key-scope checks.
+
+### Classic mainnet confirmation
+
+Testnet pending-approval attestations use version 4: approval kind, creation
+time, expiry, and the approver (the local operator or the remote operator
+credential the listener verified); an approval recorded under version 2 or 3
+needs fresh consent. A mainnet consent uses version 5 for an envelope subject
+and version 6 for an intent digest subject. Both bind a verified WebAuthn
+presence receipt from an approval credential in the owner-signed policy. `approval.attestation_invalid` covers missing coverage or
+a mismatched subject. MCP reports failed approval proofs as
+`policy.approval_required`.
+
+Without a signed approval origin, mainnet consent uses the localhost passkey page.
+Without a display, mainnet consent refuses unless `--open-by-operator` prints the URL.
+`--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
+The CLI prints the signed approval link without opening a browser or requiring a display.
+Ledger signing also requires this passkey ceremony.
+
+A localhost ceremony binds `127.0.0.1` and `[::1]` on one port before it
+creates any token, serves the same session on both, and closes both together.
+When either family cannot be held, the ceremony does not start.
+
+CLI Allow grants policy authority for 600 seconds from evaluation, without a
+passkey ceremony. RequireApproval runs a ceremony with its rule lifetime.
+A mainnet RequireApproval rule sets `ttl_secs` from 1 through 86,400 seconds;
+an unlisted approval escalation uses the default one-day lifetime.
+The presence challenge retains its separate 120-second bound.
+Pending browser pages show `Created <time>. Approve by <time> (in <duration>).`
+Only pending mainnet consent pages that render an intent add `After approval, the action must run within <window>.`
+The server renders the shorter of the entry lifetime and 900 seconds as whole minutes and seconds, such as `1 minute 40 seconds`.
+Detail pages and consent pages without an intent show only the approval deadline.
+Inbox rows say `approve within` before the remaining duration.
+Mainnet consent pages disable every available decision button after a final entry
+outcome. Cancellation also disables them in a one-shot session.
+Inbox cancellation shows the result and keeps Approve and Reject available for
+a new ceremony. Disabled buttons have half opacity and a not-allowed cursor.
+Retryable failures keep decisions available.
+On mainnet, classic MCP approvals expire at the shorter prepare/commit
+lifetime, with Allow contributing 600 seconds. Both names need matching rules.
+On a mainnet MCP server, Allow signs without an approval, and RequireApproval
+needs a verified approval. On mainnet a commit evaluates both names, and the
+stricter decision governs. On testnet the commit's own rule alone decides, so
+a commit rule needs its own `decision = "require_approval"` to require an
+approval.
+
+Authorization defaults to 120 seconds, bounded by approval expiry.
+Minted authorization holds count against window headroom. Consumption,
+invalidation, or expiry releases or converts them. Consumption is single-use
+within retained history and checks the policy pin under the state lock.
+
+On mainnet, CLI `approve` refuses `--yes` before store access in both builds
+with `approve.yes_refused_on_mainnet`. Testnet approvals keep the CLI y/n
+prompt, the local inbox, and the remote listener. CLI approval errors use
+`approval.*` codes.
+
+On testnet a live consumed approval or an approval held by a submission receipt
+uses `policy.approval_consumed`, and expired tombstones use
+`policy.approval_required`. On mainnet a repeated proof of a completed payment
+answers `policy.approval_required`; only a submission receipt or a proof of
+another operation answers `policy.approval_consumed`.
+Authorization consumption followed by a pre-send recording failure consumes
+the durable approval record and ends the operation unsent. A retry under the
+same `business_id` returns that stored outcome; a retry under another
+`business_id` refuses with `policy.approval_required`.
+After authorization refusal, obtain fresh preparation and approval. Unknown
+submission outcomes require reconciliation. Restart MCP after enablement or
+policy signing; a stale binding requires restart.
 
 ### Noop engine
 
-The binding gate used when no full engine is configured. Behavior is fixed:
+The policy boundary used when no full engine is configured. Behavior is fixed:
 
 | Profile | Tool | Result |
 |---|---|---|
@@ -122,7 +196,7 @@ Evaluation is **first-match, default-deny**:
 
 A Criterion is one typed check. Amount checks include per-transaction caps,
 approval-above thresholds, and per-period (windowed) caps. Other checks include
-rate limits, counterparty allowlists, and minimum-reserve guards.
+rate limits, asset allowlists, counterparty allowlists, and minimum-reserve guards.
 Counterparty allowlists match classic accounts, contract accounts, asset issuers,
 or resolved home domains. The `SEP10_IDENTITY` and `ONE_TIME_ADDRESS` kinds are
 reserved and are not evaluated.
@@ -149,7 +223,8 @@ refuses such a body with `sign_policy.policy_body_invalid`.
 The commit tool's rule is binding, so the example carries the criterion on both pay tools.
 The threshold applies to its configured asset.
 A payment in another asset passes it, as it passes `per_tx_cap`.
-Single-shot tools and multicall refuse an escalation with their existing approval-required refusal.
+Single-shot tools and multicall refuse an escalation with their approval-required refusal.
+The SEP-43 transaction tools carry the escalation of a single payment, path payment, account creation or trustline change to a pending approval.
 A bundle is sized per inner transfer.
 
 These payment rules allow up to 500 XLM without approval, request approval
@@ -177,8 +252,9 @@ Omit `per_tx_cap` from both rules to request approval above 500 XLM without
 a per-payment ceiling. Other failing criteria deny, including period caps.
 The MCP payment tool stores the pending request with a reason naming
 `approval_above` and its threshold. Operators approve through the CLI approvals
-commands, terminal, inbox, or remote approver. The CLI `pay` command returns
-`policy.approval_required` and directs the caller to MCP.
+commands, terminal, inbox, or remote approver. On testnet, the CLI `pay`
+command returns `policy.approval_required` and directs the caller to MCP. On
+mainnet, full-mode CLI `pay` runs the passkey ceremony for the escalation.
 
 `rate_limit` caps how many counted calls a rolling window holds:
 
@@ -191,29 +267,112 @@ integer within the `u32` range. A call is denied with
 `policy.deny.rate_limit_exceeded` when the window already holds `max_calls`
 counted calls.
 A submission counts when the wallet reserves it immediately before the send.
-An x402 or MPP payment counts when the wallet records its authorization, before
-it signs.
+A testnet x402 or MPP payment counts when the wallet records its authorization,
+before it signs. A mainnet x402 intent reserves headroom when it is minted and
+records the debit when it is consumed.
 The policy gate only reads the count, so simulations and read-only calls do not
 count.
 A call refused before its submission is reserved or its authorization is
 recorded does not count either.
 A recorded x402 or MPP authorization stays counted when a later step fails,
 such as signing or delivering the credential.
-For x402 that includes a refused endpoint identity check.
-A submission that fails on chain or is refused at the send stops counting.
-One without a confirmed outcome counts until reconciliation settles it or an
-operator clears its receipt with `tx receipt clear`.
-A confirmed submission leaves the window measured from the close time of the
-ledger that applied it.
-Without a usable close time in the confirmation, the reservation stays pending
-and keeps counting.
+For testnet x402 that includes a refused endpoint identity check. On mainnet
+the endpoint identity check runs before the intent is minted.
+A sent submission keeps counting whatever the endpoint reports, a failure on
+chain or a refusal at the send included.
+A time-bounded one counts through its accounting horizon: the later of its
+signed time bound and the first local success observation, plus the window's
+duration.
+A reported ledger close time does not backdate that horizon.
+An untimed one counts until an operator clears its receipt with
+`tx receipt clear --acknowledge --acknowledge-unbounded`.
+The classic envelopes the wallet builds on testnet carry no time bound, so
+each testnet submission counts until that clear. Classic mainnet envelopes
+carry a deadline of at most 120 seconds, which bounds their horizon.
 The count is kept per profile and window, in the profile's window-state store.
 Every `rate_limit` and `bundle_rate_limit` criterion of the profile with the
 same window reads one shared count, whichever rule carries it.
 Each criterion compares that shared count against its own `max_calls`.
+A reservation that is still open also counts in the profile's count of every
+other window: an untimed one until its receipt is cleared, a time-bounded one
+through the later of its own accounting horizon and its accounting start plus
+that window's duration. A confirmed call counts only in the window it was
+recorded under.
 `bundle_rate_limit` counts each inner call of a multicall bundle.
 
-MCP pay/create-account/trustline/claim commits and CLI `pay` and `claim` with `--sign-only` or `--submit-only` include envelope fees in `minimum_reserve`. A debit leaving only reserve plus margin refuses `policy.deny.minimum_reserve_breached`. Full CLI pipelines, `--build-only`, and MCP simulations count no fee.
+`minimum_reserve` counts the envelope fee with the debit. MCP pay/create-account/trustline/claim commits supply it, as do CLI `pay`, `claim`, sponsored `accounts create`, and `trustline` for the envelope they build. The required reserve is the account's reserve plus margin plus one base reserve for each trustline the call opens, two for a liquidity pool share trustline. A trustline the account read shows as held opens none, so removing it or changing its limit adds nothing; one the read cannot show counts as opened. The trustline commands judge the asset the transaction carries, the resolved `CODE:ISSUER`, whatever spelling the caller used. In SEP-43 signing, the `stellar_trustline_commit` rule judges each wallet-sourced pool share `ChangeTrust` as its own trustline operation, with or without other operations, and one with a limit of 0 opens nothing. Its leg carries no asset, so an `asset_allowlist` on that rule refuses it with `policy.deny.asset_not_allowlisted`. A balance after the debit and fee below that requirement refuses with `policy.deny.minimum_reserve_breached`; equality passes. MCP classic preparation selects the fee before the policy gate, so its `minimum_reserve` check counts `total_fee_stroops`. Its paired commit check counts the encoded envelope fee and can refuse preparation on mainnet.
+
+### Version 2 additions
+
+The four criteria additions below and the signed top-level `engine` selector
+require a `version = 2` document. A version 1 document refuses each criteria
+addition with `<feature> requires policy version 2`. It refuses an `engine`
+key as an unknown top-level key: `unknown key; the policy file accepts version,
+scope, contract_transfer_max_fee_stroops, rules, signature, owner_rotation`.
+The engine keeps the name V1
+and evaluates both versions. Every nested value is signed.
+
+- `counterparty_allowlist.unlisted` decides a debit to an unlisted recipient.
+  `mode = "deny"` is the default. `mode = "approval"` returns
+  `RequireApproval` with the reason `counterparty_allowlist: an unlisted
+  recipient requires approval` and the default one-day lifetime.
+  `mode = "budget"` allows within `per_tx_stroops` and `per_period_stroops`
+  over `window`, in `asset` (default `native`). Both bounds are inclusive.
+  On mainnet, excess requests per-payment approval with the same reason and
+  lifetime as approval mode. Approved spending counts in full. Every other
+  network refuses excess with `policy.deny.unlisted_budget_exceeded`.
+  A debit in another asset keeps the counterparty denial.
+- Approval and budget need `decision = "allow"`, and budget bounds must be
+  strictly below the rule's matching hard caps. A rule carries one table.
+  Tables in several rules must be equal, and then share one counter per asset
+  and window. Listed payments add nothing to it. Approval never lifts a hard
+  cap, rate limit, or total allocation. The spending summary reports
+  `unlisted_exhaustion = "approval"` on mainnet and `"deny"` elsewhere.
+  Classic and SAC spellings of one asset share that counter. Stored classic
+  and SAC spellings keep their bytes and count together after hydration. Re-signing
+  and restart preserve the rolling usage. Unlisted sums reject negative
+  contributors and overflow; approval cannot bypass those checks.
+- Only a verified unlisted debit reaches the mode. A missing destination, an
+  unverified domain, or a gated inflow keeps the counterparty denial. First
+  match still decides, and a later failing criterion of the same rule still
+  denies.
+- `total_budget` (`asset`, `max_stroops`, allow rules only) is an allocation
+  that never renews. It is bound to the canonical asset and to the digest of
+  the signed canonical bytes. `profile reset-window-state` keeps its usage. Excess
+  refuses `policy.deny.total_budget_exhausted`, and approval adds no capacity.
+- `balance_floor` (`min_stroops`) refuses unless balance minus reservations,
+  debit, and fee stays at or above the floor. It needs an observation at most
+  120,000 ms old and refuses `account.unread` or `account.stale` without one.
+  Provisional evaluation skips it; strict evaluation does not. Mainnet CLI
+  `pay`, `claim`, `trustline`, and `accounts create` and the MCP pay, claim,
+  create-account, trustline, and x402 tools read the operating balance and
+  reservations, so a breach refuses `account.floor_refused`. A floor that
+  passes refuses `account.unread` on every route while the window store lacks
+  the native coverage marker.
+- `memo_binding` (`bindings`, 1 to 64 distinct G destinations) requires the
+  exact memo `kind` and `value` (`text`, `id`, `hash`, `return`, or `any`) on
+  every debit to a bound destination or an M address over it. `any` refuses no
+  memo. Missing or malformed memo facts refuse `policy.deny.memo_binding_mismatch`.
+
+```toml
+version = 2
+scope = "profile:alice"
+sequence = 1
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "stellar:testnet" }
+criteria = [
+  { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"], unlisted = { mode = "budget", per_tx_stroops = 10_0000000, per_period_stroops = 50_0000000, window = "1d" } },
+  { kind = "per_tx_cap", asset = "native", max_stroops = 100_0000000 },
+  { kind = "total_budget", asset = "native", max_stroops = 1000_0000000 },
+  { kind = "memo_binding", bindings = [{ destination = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", kind = "id", value = "7" }] },
+]
+decision = "allow"
+```
+
+`profile sign-policy` gives a version 2 body the next sequence, so each
+signing starts a new total allocation. Signing identical version 1 bytes
+keeps the digest and its usage.
 
 A `HOME_DOMAIN` binding is evidence for one hour from its fetch. An entry
 whose fetch time lies more than five minutes in the future counts as expired.
@@ -248,7 +407,7 @@ tools, with the operator's `approve` step in between:
 
 Step 1 returns the nonce instead of executing. Step 3 presents the attestation
 blob as the `approval_attestation` argument of the matching `*_commit` tool.
-The attestation binds the specific envelope, so it authorises exactly one
+The attestation binds the specific envelope, so it authorizes exactly one
 transaction.
 
 ### What `approve --id <nonce> --profile <name>` returns
@@ -264,8 +423,20 @@ running MCP server or `approve serve` inbox held the audit writer and the row
 went to the audit outbox. That process appends it to the log before any process
 loads a signing key for the approved action. The command refuses and persists nothing
 beside a process that does not drain the outbox (`audit.writer_locked`), and on
-any other audit failure. After upgrading, restart a running MCP server and
-`approve serve`: `approve --id` refuses beside an older one.
+any other audit failure.
+A running MCP server also drains the outbox when it exits: on client EOF, on
+SIGINT or SIGTERM on Unix, and on Ctrl-C, Ctrl-Break, or console close on
+Windows. The exit drain waits at most two seconds for each writer's mutex; a
+writer still held keeps its rows queued for the next draining writer. A second
+shutdown signal or console event exits at once with exit code 3, and
+undelivered rows stay queued.
+
+Queued success exits zero and includes `audit_code: audit.outbox_queued`; Written omits `audit_code`.
+It returns immediately after persistence, without waiting for delivery.
+Legacy queues commit a count and chain head; owner queues authenticate tagged rows and commit delivered batches.
+Every mainnet approval kind enforces delivery: payment, which covers account creation, claim, trustline, and x402 payment.
+An enforced kind additionally requires exact Delivered evidence before use.
+For an enforced kind, recoverable delivery and evidence errors retry the existing grant without another ceremony.
 
 ```json
 {"ok":true,"data":{"approval_nonce":"ABCxyzNonce","attested":true,"process_uid":"501","expires_at_unix_ms":1717000000000,"approval_attestation":"q83vEjRWeJq83v...","audit":"written"},"request_id":"..."}
@@ -291,19 +462,26 @@ of pending entries:
   hard cap on pending entries (expired entries pruned first) and a default entry
   TTL of 24 hours.
 
-Entry kinds: `PaymentSimulated`, `TrustlineSimulated`, `ClaimSimulated`, `SignWithPasskey`,
-`RegisterPasskey`, `ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`,
-`RuleProposalSimulated` and `MppChargeSimulated`.
+Entry kinds: `X402Payment`, `PaymentSimulated`, `TrustlineSimulated`, `ClaimSimulated`,
+`SignWithPasskey`, `RegisterPasskey`, `ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`,
+`RuleProposalSimulated`, and `MppChargeSimulated`.
 `Rejected` and `Consumed` record resolved requests and cannot be approved.
 
 ### What `approve` does
 
 `stellar-agent approve --id <nonce> --profile <name>` loads the store and renders a
-wallet-controlled summary of the pending action. The summary is produced by the
-command from the stored, validated entry fields, never from anything the agent
-supplied, so the agent cannot influence what the operator sees (it cannot inject
-terminal-rendering content into the summary). The operator confirms at the
-terminal; the command then records the consent. Recording is one-shot: a nonce
+wallet-controlled summary of the pending action. For payments, trustlines and
+claims the summary is decoded from the stored transaction envelope, the bytes the
+attestation binds, and every value is rendered with control characters, line
+and paragraph separators and Unicode format characters (category Cf) shown as
+visible escapes, so the operator reads what is signed and memo text cannot
+rewrite the terminal. An entry whose envelope does not decode or does not match
+its stored digest, or an MPP charge whose shown terms do not match its
+authorization fingerprint, or a rule proposal whose stored digest is not the digest
+of what it shows, is shown as inconsistent and cannot be approved
+(`approval.entry_inconsistent`). On testnet the operator confirms at the
+terminal; the command then records the consent. On mainnet no prompt runs, and
+the command records the consent after a verified passkey assertion. Recording is one-shot: a nonce
 that is expired, of the wrong kind, or already attested is rejected. Approval is
 bound to the local user: the process uid recorded at create time is re-derived
 at approve time and must match, so a different local user cannot consent on the
@@ -313,11 +491,12 @@ Per kind:
 
 | Kind | What `approve` records |
 |---|---|
-| `PaymentSimulated` / `ClaimSimulated` / `TrustlineSimulated` | Computes the HMAC attestation over the envelope SHA-256 and persists it; returns `approval_attestation`. Each commit tool accepts its own approval kind. |
+| `PaymentSimulated` / `ClaimSimulated` / `TrustlineSimulated` | Refuses with `approval.entry_inconsistent`, before the consent row, unless the stored digest is the SHA-256 of the stored envelope and the envelope decodes. Then computes the HMAC attestation over that digest and persists it; returns `approval_attestation`. Each commit tool accepts its own approval kind. |
 | `TrustlineClawbackOptIn` | Computes a domain-separated HMAC over `(network, code, issuer)` and stores it; the trustline gate recomputes and verifies it. No `approval_attestation` returned. |
 | `ToolsetFirstInvokeGate` | Builds and persists a time-boxed toolset grant, then consumes (removes) the pending entry. Does not set an attestation blob on the entry. No `approval_attestation` returned. |
-| `RuleProposalSimulated` | Computes the HMAC attestation over `proposal_sha256` (the domain-separated digest of the FULL resolved rule definition), not an envelope hash; persists it and returns `approval_attestation`. A DEDICATED gate verifies it at commit. The envelope approval gate rejects this kind. |
+| `RuleProposalSimulated` | The shared HMAC binds the versioned proposal digest over the account, network, chain and the full displayed rule. Approval recomputes it and refuses inconsistent terms; otherwise it persists the attestation and returns `approval_attestation`. The rule commit gate verifies it. Before installation, the commit records the spent approval in the platform keyring beside the attestation key, so restoring the pending store does not re-arm it. The envelope approval gate rejects this kind. |
 | `MppChargeSimulated` | Attests the prepared artifact hash under the profile and chain binding; returns `approval_attestation`. |
+| `X402Payment` | Verifies the stored payment subject, then computes the HMAC attestation over it and persists it; returns `approval_attestation`. The subject binds the intent digest, the root invocation, and the home domain of an authenticated payment. |
 | `Consumed` | Already resolved; cannot be attested again. |
 
 For every kind the consent row is written first and is fatal: when it cannot be
@@ -328,15 +507,24 @@ validation is refused with `approval.already_attested`, `approval.rejected`, or
 
 The CLI summary and both inbox detail pages show the profile name, CAIP-2 chain id, endpoint authority, and enrolled signer.
 An enrollment placeholder appears as `(not enrolled)`.
-Payment, claim, and trustline rows show the envelope's effective source; an operation source overrides the transaction source.
-An undecodable envelope appears as `(undecodable envelope)`.
-A claim whose stored summary source differs also shows `Source (stored summary)`.
-Trustline summaries show the full holder account, asset code, issuer, limit,
-simulated fee, and sequence number.
+Classic intent pages show `Fee cap per operation (stroops)` with the explicit
+per-operation fee when chosen, otherwise the tighter profile or signed policy cap.
+Contract payment intent pages show `Total fee cap (stroops)` and a separate
+`Inclusion bid (stroops)` row.
+Payment, claim, and trustline summaries are decoded from the envelope the approval attests: every destination, amount, asset, memo, limit, balance id, fee, and sequence number shown is the envelope's.
+The effective source is the operation source when the operation has one, otherwise the transaction source.
+A SEP-43 transaction tool counts another source's operations only when that source's signer set lists the wallet key; this never makes a transaction of two or more operations approvable, and the approval binds the complete envelope.
+A claim names the balance by id only, so its asset and amount read `not part of the signed claim transaction`.
+Every value renders control characters as visible escapes such as `\u{1b}`.
+A request whose stored digest is not the digest of its stored envelope, whose envelope does not decode, or whose rule proposal digest does not match what it shows appears as `INCONSISTENT`, offers no approve action, and is refused with `approval.entry_inconsistent`.
+Trustline summaries show the holder account, asset code, issuer, limit,
+fee, and sequence number.
 The CLI names the action `trustline change (ChangeTrust)`.
 The CLI limit reads `unlimited`, `0 stroops (removes the trustline)`, or the exact
 stroop count and decimal asset amount.
 Both inboxes label it `TRUSTLINE` and offer `Approve trustline`.
+The detail headline reads `Remove <code> trustline` for a zero limit and
+`Add or change <code> trustline` otherwise. The issuer has its own row.
 
 ### The attestation
 
@@ -357,25 +545,40 @@ Lengths count UTF-8 bytes, encoded as big-endian `u32` with saturation at `u32::
 The 37-byte tag has no length prefix or NUL terminator; the digest is 32 bytes with no prefix.
 The tag separates this HMAC from every other use of the key.
 The profile name and CAIP-2 chain id make a blob unverifiable under another profile or chain.
-A layout change bumps the tag; blobs under the previous tag do not verify.
+A layout change bumps the tag; blobs under one tag do not verify under another.
+Pending approvals use version 4 of this input, under the tag `stellar-agent-approval-attestation:v4`: the fields above, then the approval's kind, creation time and expiry, then the approver.
+A testnet commit requires version 4. A mainnet commit requires version 5 or 6.
+An approval recorded under version 2 or 3 needs fresh consent.
 
 The length prefixes prevent boundary-collision attacks. The `envelope_sha256`
 slot binds the tag to the exact transaction envelope that will be signed. The
 `process_uid` (numeric OS uid on Unix) gives cross-account-on-host non-replay: a
 tag minted by one local user cannot be replayed by another.
 
-The MCP commit-path verifier recomputes the tag and compares it in constant
-time. It collapses the distinct internal outcomes (Expired, NotFound,
-AlreadyAttested, forged) into the single wire code `policy.approval_required`,
-so a caller cannot probe which state a nonce is in. The CLI `approve` path
+Off mainnet, the MCP commit-path verifier recomputes the tag and compares it in
+constant time. On mainnet it verifies the proof against the approval's durable
+record. A live rejection returns `policy.approval_rejected`. A live consumed
+testnet approval, an approval held by a submission receipt, or a mainnet proof
+of another operation returns `policy.approval_consumed`. A repeated mainnet
+proof of a completed payment returns `policy.approval_required`. Off mainnet, an
+entry whose stored payment destination is not a canonical G account or M
+address, or whose payment recovery binding is inconsistent, returns
+`approval.entry_inconsistent`. On mainnet a revoked
+approval returns `approval.revoked`, and a verified approval whose queued
+consent row has no exact Delivered evidence returns
+`approval.consent_undelivered`. Every other failure,
+such as an expired, missing, or forged approval, returns
+`policy.approval_required`, so a caller cannot probe which of those states a
+nonce is in. The CLI `approve` path
 surfaces distinguishable errors to the operator, who is the wallet owner.
 
 The attestation proves the keyring holder ran `approve`, not that a human
 clicked "yes" in an agent-controlled UI. An attacker who can write to the store
 file can delete a pending entry (a denial-of-service nuisance forcing
 re-approval) but cannot forge an attestation, because the HMAC key is in the
-keyring, not the file. Rotating the attestation key invalidates all outstanding
-pending approvals.
+keyring, not the file. After the attestation key rotates, attestations
+minted under the old key fail verification. Unattested pending requests can
+still be approved under the new key.
 
 ### `approve` command reference
 
@@ -386,18 +589,45 @@ a grant in the on-disk store).
 |---|---|---|---|
 | `--id <NONCE>` | yes (this form) | none | The approval nonce from the agent surface's simulate/build response. |
 | `--profile <NAME>` | no | `--profile`, then `STELLAR_AGENT_PROFILE`, then `default` | Profile whose attestation key and store to use. |
-| `--yes` | no | off | Non-interactive auto-approve. Bypasses the stdin prompt; the wallet-controlled summary is still printed for a visible record. For trusted automation and tests, not routine operator use. |
+| `--yes` | no | off | Non-interactive auto-approve on a testnet profile. Bypasses the stdin prompt; the wallet-controlled summary is still printed for a visible record. For trusted automation and tests, not routine operator use. A mainnet profile refuses it with `approve.yes_refused_on_mainnet`. |
+| `--open-by-operator` | no | off | Prints the local mainnet presence URL for the operator to open. A testnet profile or a signed-origin policy refuses it. Conflicts with `--yes`. |
 
-Interactively the command prints the summary and prompts `Approve? [y/N]:`;
+On testnet the command prints the summary and prompts `Approve? [y/N]:`;
 only `y`/`yes` (case-insensitive) consents, everything else (including empty
 input, `n`, EOF) denies. Exits `1` when the nonce is unknown, expired, already
 attested, created by a different local user, denied at the prompt, or on I/O
-error.
+error. On mainnet no prompt runs; the command waits for a verified passkey
+assertion.
 
 ```bash
 stellar-agent approve --id ABCxyzNonce --profile <name>
 stellar-agent approve --id ABCxyzNonce --profile myprofile --yes
 ```
+
+`stellar-agent approve revoke --id <nonce> --profile default` revokes an existing durable record.
+Mainnet approval preparation in the CLI and MCP opens a durable approval record; testnet preparation opens none.
+The command acts only on records that already exist.
+The profile owner can revoke a pending record at any time, also after its waiting expiry, and consumed records inside execution, including after inbox collection.
+The inbox's "Revoke approval" action requires an eligible pending entry and a live, unconsented pending durable record.
+Local actions require a session, per-entry CSRF, session proof and matching entry identity.
+Signed-origin actions also require a fresh assertion from a current-policy credential.
+A consumed record is revoked inside its window whatever the state of its operation.
+Revoked records, and consumed records whose window ended, return their view without writes or rows.
+Revocation sets the record's closure time to the revocation time and preserves consent, every other clock, operation history and accounting.
+A consent commit under a revoked record refuses with `approval.revoked`.
+It prevents every later mint at the durable check: first mints, unused-carrier remints, the payment mint under a used SEP-10 message authorization, and the x402 payload-release mint under a used Soroban intent authorization.
+It does not affect an authorization minted before it, which keeps its lifetime, or submissions already sent.
+
+The state commits before the `approval.revoked` row with event kind `approval_revoked`.
+Rows contain the durable record's kind, nonce prefix and origin; signed-origin rows add a credential pseudonym.
+Results contain no consent payload. Unknown nonces return `approval.not_found` and exit 1.
+Success exits 0. The optional `--output table` prints escaped fields on separate lines.
+Append failure states: "The approval record is revoked, but its audit row cannot be appended. Retrying does not repair the audit row."
+Retrying returns the revoked view without another facade call or audit append.
+
+`stellar-agent approve status <approval-id> --profile default` inspects one approval
+by its nonce and consumes nothing. It prints the JSON status view and exits `1`
+on a typed refusal, such as `approval.unknown` for a nonce it holds no entry for.
 
 `stellar-agent approve gc`: state-changing. Evicts every pending entry whose
 TTL has elapsed and reports the count. When `gc` is present, any `--id` is
@@ -406,9 +636,15 @@ ignored. Evicting zero entries is a success.
 | Flag | Required | Meaning |
 |---|---|---|
 | `--profile <NAME>` | no | Profile whose store to garbage-collect (same resolution as above). |
+| `--include-consumed` | no | Also evicts consumed entries before their TTL ends. Without it, only expired entries go. |
+
+`evicted_count` counts each removed entry once. Removing a consumed entry
+keeps replay protection: the submission receipt holds the spent nonce, so a
+commit that reuses it still fails with `policy.approval_consumed`.
 
 ```bash
 stellar-agent approve gc --profile default
+stellar-agent approve gc --profile default --include-consumed
 ```
 ```json
 {"ok":true,"data":{"profile":"default","evicted_count":3},"request_id":"..."}
@@ -421,19 +657,36 @@ the `approval_nonce` from the simulate/build response, wait for the operator
 to produce an `approval_attestation`, then call the matching `*_commit` tool
 with it. Three surfaces exist for the operator side of that handshake:
 
-- **CLI, one at a time**: `stellar-agent approve --id <NONCE> --profile <name>` (see the command reference), or
+- CLI, one at a time: `stellar-agent approve --id <NONCE> --profile <name>` (see the command reference), or
   `stellar-agent approve list` to enumerate every pending entry first
   (read-only; `--include-expired` also shows expired ones).
-- **Loopback web inbox**: `stellar-agent approve serve` binds a local HTTP
+- Loopback web inbox: `stellar-agent approve serve` binds a local HTTP
   server and opens a browser to the pending-approval queue, so the operator
   clicks Approve/Reject per entry without running `approve --id <nonce> --profile <name>` per nonce.
-- **Remote approval**: `stellar-agent approve serve --remote
+  The browser opens through a private redirect file, so the launcher never
+  receives the bootstrap URL. Approve and Reject require the session cookie,
+  an origin-scoped session proof, and a CSRF value. The inbox session expires
+  after 15 minutes without operator activity or 8 hours after bootstrap;
+  background polling does not extend it, and the operator restarts
+  `approve serve` for a new session.
+- Remote approval: `stellar-agent approve serve --remote
   --confirm-remote-exposure` binds a TLS-protected listener reachable from a
   device other than the wallet host, authenticated by a registered WebAuthn passkey. Use it when the agent runs on a headless machine. Every approve or
   reject additionally requires a fresh passkey assertion bound to the exact
   entry.
 
-None of this changes what the agent does or what an attestation proves. See
+Both inboxes approve only the request their page shows. When the pending
+request changed after the page loaded, the approve is refused with
+`approval.presence_changed` (HTTP 409) and nothing is attested; the operator
+reloads the page and reviews the request again.
+
+None of this changes what the agent does. The attestation also records who
+approved: the local operator, a remote operator credential on testnet, or an
+approval credential of the owner-signed policy on mainnet. A mainnet commit
+verifies the consent against the current signed policy. An approval from a
+credential that policy does not list, or bound to another policy, returns
+`policy.approval_required` and needs fresh consent. Revoking a remote operator
+credential changes no mainnet approval. See
 "The attestation" above. Setup for remote approval (the profile's
 `[remote_approval]` block, enrolling a passkey via `approve operator enroll`,
 the trust model, DNS requirements) is out of scope here; see
@@ -441,8 +694,8 @@ the trust model, DNS requirements) is out of scope here; see
 guide.
 
 A remote approve or reject is recorded in the audit log under
-`ApprovalAttestedRemote` / `ApprovalRejectedRemote` event kinds rather than
-the loopback `ApprovalAttested` / `ApprovalRejected` ones. This is the distinguishing detail when reading the audit log directly. Both remote kinds also carry
+`approval_attested_remote` / `approval_rejected_remote` event kinds rather than
+the loopback `approval_attested` / `approval_rejected` ones. This is the distinguishing detail when reading the audit log directly. Both remote kinds also carry
 `operator_credential_id_redacted`, a stable, non-reversible pseudonym for
 which passkey credential consented (the first 8 hex characters of
 `SHA-256(credential_id_b64url)`). Nothing else about the attestation or its
@@ -455,18 +708,26 @@ Toolset-routed payments use two distinct controls, and only one is suppressible.
 - The first-invoke gate fires the first time a toolset uses a signing-adjacent
   capability with no matching grant. It queues a one-time `ToolsetFirstInvokeGate`
   entry. Once the operator approves it, a time-boxed toolset grant is persisted
-  (default TTL 30 days) and matched on later invocations by toolset, capability,
-  destination, asset, an amount range, plus its TTL. The grant suppresses only
+  (default TTL 30 days). Later invocations match the grant by toolset,
+  installation, package version and digest, capability, destination, asset,
+  amount range, and expiry. The grant suppresses only
   the first-invoke re-prompt.
-- The per-action payment approval (`PaymentSimulated`) fires unconditionally on
-  every toolset-routed payment, and its attestation binds the actual executed
-  envelope. A forged or tampered grant can at most suppress a re-prompt; it
-  cannot bypass the per-action approval, because that approval is forced
-  regardless of any grant and is bound to the real transaction.
+- The per-action payment approval (`PaymentSimulated`) fires on a
+  toolset-routed payment when the stricter of the routed and outer policy
+  decisions requires approval. Its attestation binds the actual executed
+  envelope, or on mainnet the stored intent of a payment that `stellar_pay`
+  prepared.
+
+A matching grant requires a version 3 HMAC that verifies under the profile's
+attestation key and profile/chain binding. It must be unexpired, with a lifetime
+of at most 30 days, and issued no later than the current time and at or after
+the second following the current installation. An invalid install time honors
+no grant. Consent issued in the install second re-prompts once. A forged or
+edited grant suppresses nothing.
 
 ## The hash-chained audit log
 
-The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and write settlement audit rows.
+The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and deliver owed accounting events.
 
 The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor.
 
@@ -476,8 +737,8 @@ operation that acquired it later fails.
 A per-profile, append-only JSONL file records transaction submissions, signed
 authorizations, approvals, and explicit key-management and lifecycle events.
 MCP balance reads and payment simulations produce no automatic invocation row.
-Under V1, payment simulations can reconcile overdue reservations and write
-settlement audit rows. The writer is a per-profile singleton holding an
+Under V1, payment simulations can reconcile overdue reservations and deliver
+owed accounting events. The writer is a per-profile singleton holding an
 exclusive
 lock, appending with an fsync per line; a second opener is rejected. Files
 rotate at a size bound with a fixed number of rotated files retained.
@@ -490,26 +751,42 @@ never logged; only their key names are. Strkeys in a decision reason are redacte
 first-five-last-five and transaction hashes to first-eight-last-eight; the
 envelope hash is left intact (it is a SHA-256 digest carrying no user data).
 
-The log records `value_action_submitted` on every
-confirmed value-moving submit (carrying the gate-sized value legs) and
+The log records `value_action_pending` before every
+value-moving submit that runs with an audit writer (carrying the gate-sized
+value legs) and
 `keyring_key_written` on each key-writing profile command. It records
 `x402_payment_authorized`, with a passed cross-check witness when the payment
 required one, before a signed x402 authorization leaves the wallet
 in the RPC re-simulation. When that payment then fails, it records
 `x402_authorization_withheld` with the same request id and a `failure_stage`
-of `anchor_unavailable`, `resimulation`, `response_processing`, or `encoding`.
-At `anchor_unavailable`, the signed authorization stays in the wallet and the
-admitted spend remains recorded. MPP adds
+of `anchor_unavailable`, `resimulation`, `response_processing`, `encoding`,
+`payload_release`, or `terminal_approval`. At `anchor_unavailable`, the signed
+authorization stays in the wallet. On testnet, the admitted spend remains
+recorded. The `x402_payment_authorized` rows record the governing Allow or RequireApproval decision, the payment value leg, network, scheme, any required witness, and `signature_expiration_ledger`.
+That ledger bounds the signed authorization's validity. On mainnet, three
+consumption boundaries apply. The Message authorization of an authenticated
+payment is consumed before the SEP-10 signature. The payment intent is consumed
+before the signed simulation. The submit authorization is consumed before
+payload release. MPP adds
 `mpp_charge_authorized`, `mpp_authorization_withheld`, `mpp_receipt_observed`,
 and `mpp_settlement_reconciled`; these carry only hashes, redacted references,
 the exact policy-sized legs, and closed status labels, never a credential,
 challenge, receipt, XDR, or signature.
 
 `MppChargeSimulated` is a dedicated short-lived approval kind. It binds the
-authorization fingerprint, prepared artifact hash, profile, testnet, payer,
-transport authority/target, amount, token, recipient, simulated fee, and
-challenge expiry. Local and remote views redact payer/recipient. Prepare records
-the request when policy requires approval for prepare or charge commit. Commit
+authorization fingerprint and prepared artifact hash. Every surface checks the
+profile, payer, amount, token, recipient, and challenge expiry against the
+fingerprint, and the network against its passphrase digest; the commit checks
+the transport, authority, and target against the prepared request
+(`approval.entry_inconsistent`). The simulated fee reads `not bound to this
+approval`. A mismatch, or an entry without binding digests, makes the entry
+inconsistent; prepare the charge again. The `approve list` output and the
+local and remote inbox pages redact payer and recipient. The `approve --id`
+prompt prints both in full, with the token contract. MCP prepare records the
+request when policy requires approval for prepare or charge commit. CLI
+`mpp charge authorize` records one only when the prepare rule requires
+approval. When only the commit rule requires it, the CLI refuses with
+`mpp.approval_invalid` and records none. Commit
 re-evaluates its own tool name against current state and requires the matching
 attestation. An exhausted cap returns `policy.deny.per_period_cap_exceeded`.
 The loaded policy document stays fixed for the server's lifetime.
@@ -523,7 +800,7 @@ signing the chain root with the profile's audit key.
 
 ### The tip anchor
 
-The chain and the per-file `root_hmac` sidecars verify a PREFIX of the log, so
+The chain and the per-file `root_hmac` sidecars verify a prefix of the log, so
 restoring an older copy of the active file, or truncating it, leaves a log that
 still verifies. The tip anchor closes that: for each log PATH the keyring holds
 the active file's entry count, last-entry hash, and byte offset.
@@ -533,29 +810,40 @@ outside the log file. Anyone who can restore the keyring's own storage together
 with the log can restore an older state. With a headless keyring backend these
 entries are kept in a file on the same host. Anyone who can write that file can
 restore older entries or delete one, which needs no key material. A deleted
-binding is recorded again from the profile file at the next keyed use. Under
-`headless-dpapi` an owner entry still in the older form can be moved to another
-coordinate until a V1 verb or `enroll-owner-key` rewrites it.
+binding is recorded again from the profile file at the next keyed use. A
+deleted anchor is refused while anything shows it was written (see the table
+below). Mainnet readiness refuses a headless backend with
+`network.mainnet_keyring_backend_unsupported`, because a restored copy of its
+file can make a truncated log and its anchor agree.
 
 Every value-moving verb checks the anchor before signing, on every acquisition of
-the audit writer. Seven outcomes:
+the audit writer. Nine outcomes:
 
 | Log versus anchor | Result |
 |---|---|
 | The file at the log path is not the one the process already has open | Refuses `audit.tip_anchor_mismatch`; the cached writer is dropped so the next call reads the path afresh |
 | An anchor write in this process failed and its retry fails again | Refuses `audit.chain_key_unavailable` with `audit.tip_anchor_unavailable`, before the log is compared with the anchor |
 | Exactly the anchored tip | Proceeds |
-| Ahead of the anchor, anchored entry intact | Proceeds; the tail is absorbed and the anchor advances |
+| Ahead of the anchor, anchored entry intact, and entry tags not in force or every tail entry validly tagged | Proceeds; the tail is absorbed and the anchor advances |
+| Ahead of the anchor, entry tags in force, and a tail entry without a valid entry tag | Refuses `audit.tip_anchor_mismatch` with reason `unauthenticated_tail` |
 | Behind the anchor, or the anchored entry is not at the anchored offset | Refuses `audit.tip_anchor_mismatch` |
-| No anchor, file has entries, chain verifies | Adopts the current tip and records `audit_tip_anchored { reason: adopted }` |
-| No anchor, file empty | Proceeds; no anchor and no row until the first append |
+| No anchor, and a recorded audit binding, a chain-root sidecar, or an `audit_tip_anchored` row in the file shows one was written | Refuses `audit.tip_anchor_missing`, naming the evidence |
+| No anchor, file has entries, chain verifies, none of that evidence | Adopts the current tip and records `audit_tip_anchored { reason: adopted }` |
+| No anchor, file empty, no chain-root sidecar | Proceeds; no anchor and no row until the first append |
 
-The ahead-of-anchor case is ordinary, not an exception. Writers opened without
-the audit key append without moving the anchor: the CLI startup advisory, and
-the zero-config and read-only smart-account paths of a profile whose audit key
-is not minted. Adoption needs
-no operator action and is what happens on the first run after upgrading a wallet
-whose audit log predates the anchor. An adoption writes its row only for a
+Writers opened without the audit key append without moving the anchor. The
+zero-config and read-only smart-account paths use them when the profile's audit
+key does not load and the log shows no keying. An unkeyed open of a log that
+shows keying refuses with `audit.chain_key_unavailable`. The CLI startup
+advisory scans without a writer and acquires the profile's keyed writer only for
+a finding. Its unkeyed fallback applies only to a persisted profile whose audit
+key does not load and whose log shows no keying. The ahead-of-anchor case is the
+ordinary one for appends without an anchor. Adoption records the active tip on
+the first keyed use of a log that only unkeyed writers write. Keyed use also
+requires the whole retained history to verify. An archive without a root tag
+needs an operator history check and `profile rotate-audit-key` to re-sign it. A
+log with keyed history first needs `stellar-agent audit bind-carriers --profile
+<NAME>` with every wallet process stopped. An adoption writes its row only for a
 non-empty file.
 
 The anchor names a PATH, not a profile, so a changed `audit_log_path` or audit
@@ -566,7 +854,7 @@ key has an anchor coordinate of its own. The audit binding guards that change.
 For each persisted profile the keyring records the SHA-256 of its lexically
 normalized `audit_log_path` and its audit-key coordinate, at service
 `stellar-agent-auditbinding-<profile>`, account `default`. The first keyed use
-records it from the profile file. Before the audit key loads, every keyed audit
+records it from the profile file, once the audit key has loaded. Before the audit key loads, every keyed audit
 writer compares the profile with the record:
 
 | Record | Persisted profile | Synthesized zero-config profile |
@@ -578,11 +866,10 @@ writer compares the profile with the record:
 The refusal names the profile and the remedy, never a path or coordinate. It
 covers the value-moving verbs and tools, the read-only smart-account verbs,
 `approve --id <nonce>`, `approve serve`, `audit verify --profile`,
-`profile rotate-audit-key`, and `profile reset-window-state`. It
-creates nothing at the path the profile names. A command whose audit row is
-best effort skips the row and continues:
-`credentials add-passkey` and the other `profile`
-enroll and rotate verbs.
+`credentials add-passkey` (before its ceremony), `profile rotate-audit-key`,
+and `profile reset-window-state`. It creates nothing at the path the profile
+names. A command whose audit row is best effort skips the row and continues:
+the other `profile` enroll and rotate verbs.
 Not agent-recoverable: the operator establishes
 why the profile changed, then runs `stellar-agent audit reanchor --profile
 <NAME> --acknowledge-binding-change`. The zero-config profile has no profile
@@ -609,53 +896,156 @@ release of the reservation, a `value_action_failed` row under
 `submission.record_unavailable` that closes the pending row, and the removal of
 the receipt, each best-effort and logged. A resend that the reservation's
 duplicate check refuses after its row leaves that row open for the original
-submission's settlement. MPP's charge row keeps its existing flow. An x402
-refusal keeps the admitted spend.
+submission's settlement. On testnet,
+an x402 refusal keeps the admitted spend. On mainnet, a consumed payment intent
+retains its debit after a later failure. A refusal before the signature
+invalidates the open intent and releases its holds. After the signature, the
+claimed intent stays charged until it is consumed or leaves the spending
+windows.
+
+Before the wallet mints a Message authorization, it checks the consumer,
+verified policy and enablement, intent network, approval binding and lifetime,
+and audit readiness. The Message record binds the home domain, web-auth domain,
+server key, challenge digest, ephemeral key, policy, enablement, and approval.
+It reserves no value. Consuming the authorization returns a receipt. The
+receipt carries the bound facts and owns the audit lease. It moves into the
+payment proofs of the authenticated payment. The authenticated payment continues its used Message record with
+one Soroban intent. The intent permits one payload-release child under the same
+approval.
+
+A minted Message record is open. Successful consumption makes it used. Refused
+consumption attempts invalidation. An already settled record stays settled. If
+cleanup fails, the record remains open until expiry. The cleanup warning retains
+the primary refusal. Each authorization refusal emits one warn-level
+`mainnet authorization refused` entry with `path` and `precondition`. The MCP
+identity mapper does not log that refusal again. A failed cleanup after a
+refused Message consumption emits `mainnet authorization cleanup failed`. It is
+separate from the primary refusal.
+
+On mainnet, after release authorization is consumed, the tool consumes the pending approval.
+A failed or absent pending-record consume withholds the payload. The
+`payment withheld at terminal approval` prefix marks a refusal after the signed
+re-simulation. The x402 tombstone's `tx_hash` contains the lowercase
+final-envelope digest. The digest hashes the final envelope's base64 text,
+rather than a chain transaction. `approve list` shows it as
+`spent (X402Payment), payment digest <redacted digest>, outcome <outcome>`.
 
 For `audit.tip_anchor_unavailable`, restore keyring access and retry. A live
 writer repairs the anchor value it still owes; an honest same-generation tail
 is absorbed at keyed acquisition. A mismatch requires the acknowledging repair.
+The audit verbs `profile rotate-audit-key`, `audit reanchor`,
+`audit bind-carriers`, `audit acknowledge-outbox-loss`, and `audit verify`
+report a keyring refusal on this state under the keyring's `auth.*` code, such
+as `auth.keyring_platform_error`. Any other store failure keeps this sub-code.
+On those verbs this sub-code means a value the keyring holds for the log, the
+anchor or a companion entry, is unusable, not that the keyring is unreachable.
+Report it to the operator.
 
 An outage covering both the handoff and first new-file anchor leaves the anchor
 on the pre-handoff tip. After process exit, open and verify report a mismatch
 on the honest log; investigate and use `audit reanchor` to recover.
 
-Settlement and receipt-clear lookups walk retained files newest first, and a
-match leaves older files unvisited. Each visited file's own chain is verified;
-in a log with no archives the first row must chain from the zero hash. The
-eleventh rotation deletes the oldest archive. The lookup runs outside the
-writer lock: two reconciliations of one hash can both find an owed row, and a
-concurrent append that rotates the log can move the matching file out of the
-walk. When the settlement lookup cannot read the history, `tx status` and
-`stellar_transaction_status` log the error and write no settled row. Where
-the profile has an audit writer, `tx receipt clear` refuses with the verifier's
+Retention keeps ten archives plus the active file when pruning succeeds. Before
+each deletion, `<log>.pruned` records the successor's seed, the outgoing file's
+seed, and a count of pruned files. A keyed writer signs that marker.
+`audit verify` uses the marker to walk retained history and reports
+`pruned_prefix`; it refuses edits and deletions beyond that boundary.
+A keyed writer verifies every retained chain, bridge, root tag, entry tag and
+prune seed at open and every keyed acquisition. A failed check refuses
+value-moving verbs with `audit.chain_key_unavailable`, whose detail sub-code is
+`audit.history_unverified`. Readers check the oldest
+file's first link against that same seed, authenticating the marker when keyed.
+Each keyed acquisition reads every retained file. An archive without a
+chain-root tag refuses keyed use until the operator checks the history and
+runs `profile rotate-audit-key` to re-sign every file. An
+interrupted deletion keeps its outgoing seed available for verification. The
+writer prunes after the new active file exists, and a prune never fails the
+rotation. It deletes only archives of one fully validated chain that ends at
+the archive just rotated: every archive opens as a regular file within a read
+budget, every entry chains from the one before it, under a keyed writer every
+archive's first entry carries a chain-root tag that verifies under its key, and
+the just-rotated archive matches the seed and handoff the writer holds in
+memory. The oldest archive must chain from the seed the marker records for it,
+or from the zero seed when none exists; `audit verify` reads that start by the
+same rule. A log whose oldest archives or marker were removed outside the
+writer stalls pruning until the operator moves it aside and runs
+`audit reanchor --acknowledge-rollback` on a new log. A planted, edited, split,
+unreadable, or oversized file in that range stalls pruning until it is removed.
+The writer names each archive so it sorts after every existing one, also after
+the clock is set back, so a sibling placed under a later name precedes the next
+archive and stalls pruning too. An append whose row exceeds 1 MiB refuses with
+`audit.row_too_large` and never writes the row. A rotation handoff is always
+its file's last entry, keyed or unkeyed, and a rotation never renames over an
+existing file. A keyed open writes a missing chain-root tag for a file its
+anchor proves from byte 0 or that it adopts; an anchored file that fails the
+proof refuses with `audit.tip_anchor_mismatch`.
+A marker that does not parse, does not authenticate, or names neither
+boundary, a failed marker write, or a failed removal also stops the prune.
+Every stop logs a warning and keeps excess archives in place. Past 21 rotated
+files, `audit verify` refuses with `audit.too_many_rotated_files`, and a writer
+open carries that code as its detail sub-code.
+
+Receipt-clear lookups walk retained files newest first, and a match leaves
+older files unvisited. Each visited file's own chain is verified; in a log
+with no archives the first row must chain from the zero hash. The settlement
+lookup answers from an index the writer keeps of each envelope hash's latest
+settlement row. With a complete index, an unchanged file listing, and an
+unchanged tip, fresh or settled bytes read no row file. An owed hash reads
+its one pending row. Building the index walks at most every retained file,
+newest first, and a keyed writer builds it from the verification walk of
+each acquisition. Any listing change outside the writer discards the index,
+and a missing, replaced, or shortened active file refuses through the walk.
+The eleventh rotation deletes the oldest archive. Callers hold the writer guard
+during settlement and clear lookups. Accounting delivery retains it through
+append and acknowledgement. On testnet, `tx status` and
+`stellar_transaction_status` acquire the writer only to deliver an
+unacknowledged accounting event. On mainnet the recovery decision and the
+receipt repair take it as well. A receipt projection that is owed alone
+completes without the writer. When the writer cannot be acquired or the
+retained history does not verify, both still render their answer. The refusal
+is logged at WARN, and the obligation stays owed. On mainnet no recovery
+decision runs then: an attempt without a checked decision answers
+`chain_status: UNKNOWN` and `record.reservation_open: true`, and
+`recovery.refusal.code` names the writer refusal, such as
+`audit.chain_key_unavailable` for a writer another process holds. Where the profile has an audit writer, `tx receipt clear` refuses with the verifier's
 code, such as `audit.chain_broken` for a broken chain, and keeps the receipt.
 
 The anchor is written after the entry it covers is fsynced, so it is not
 continuous in time. Three states, differing in kind:
 
-- **Lagging**: between an entry's fsync and its anchor write, the anchor names
+- Lagging: between an entry's fsync and its anchor write, the anchor names
   the previous entry of this file. A rollback to that entry or later is
   absorbed; anything earlier is still refused. The anchor retries once
   immediately, then on the next append or keyed acquisition. After process
   exit, rollback to the previous anchor silently loses the unanchored tail.
-- **Off, nothing anchored yet**: until the first keyed append on a log path (a
-  new profile, a log written before the anchor existed). Adoption takes the file
+- Off, nothing anchored yet: until the first keyed append on a log path (a
+  new profile, or a log without an anchor). Adoption takes the file
   as it finds it. A changed `audit_log_path` is refused by the audit binding
   until it is acknowledged.
-- **Off, freshly rotated file**: from a rotation until the first append into
+- Off, freshly rotated file: from a rotation until the first append into
   the new file is anchored. Any prefix of that file is accepted if it chains
   from the archive's handoff.
 
 Entries already in an archive stay guarded in all three.
 
-What it does NOT do is detect forgery. The entry-to-entry chain hash is unkeyed,
-so an appended well-formed entry moves the tip forward and is accepted, exactly
-as an honest append is. The anchor detects rollback, truncation, and
-substitution, within the keyring scope stated above.
+The anchor alone does not detect forgery. The entry-to-entry chain hash is
+unkeyed, so an appended well-formed entry moves the tip forward, exactly as an
+honest append does. The anchor detects rollback, truncation, and substitution,
+within the keyring scope stated above. The entry tags detect appended forgeries:
+a keyed writer stores an `entry_tag`, an HMAC over each entry's hash under a key
+derived from the audit key, and the first keyed acquisition appends
+`audit_entry_tags_started`. Past that row an entry without a valid tag is
+refused by keyed writers (`audit.tip_anchor_mismatch`, reason
+`unauthenticated_tail`) and by `audit verify --profile`
+(`audit.entry_tag_invalid`), and the readers stop at the writer's verified tip.
+Code that can read the audit key, rows before the boundary row, `audit verify`
+without `--profile`, and zero-config logs stay outside that check. A writer
+without the audit key refuses a log that shows keying with
+`audit.chain_key_unavailable`.
 
 Recovery from a mismatch is `stellar-agent audit reanchor --profile <NAME>
---acknowledge-rollback`. Recovery from a changed binding is the same verb with
+--acknowledge-rollback`, with `--acknowledge-unauthenticated-tail` for an
+unauthenticated tail. Recovery from a changed binding is the same verb with
 `--acknowledge-binding-change`. Not agent-recoverable: the operator has to
 establish why the log or the profile changed before accepting it.
 
@@ -667,29 +1057,41 @@ persisted profile proves the audit writer is acquirable BEFORE the signing key
 is touched or a transaction is submitted. If the key was never minted (run
 `stellar-agent profile rotate-audit-key <name>`), the verb refuses
 `audit.chain_key_unavailable` instead of signing unaudited. This applies on
-both policy engines. It is distinct from the writer's post-confirm emission
-(the `value_action_submitted` row above), which stays non-fatal: the
-transaction has already committed by then, so refusing helps nobody.
-Read-only tools and the build/simulate stages of two-phase verbs never reach
-this pre-flight. `smart-account rules verify-pins`, `signers list`, and
-`signers refresh` record audit rows, so they reach it without loading a signer.
+both policy engines. The submission recorder writes the `value_action_pending`
+row above before the send, and a confirmed submission it records writes no
+further value-action outcome row.
+Read-only tools and the simulate steps of two-phase verbs never reach
+this pre-flight. `smart-account rules verify-pins`, `smart-account signers list`,
+and `smart-account signers refresh` record audit rows, so they reach it without loading a signer.
 The zero-config synthesized profile `pay`/`claim`/
 `accounts create` fall back to when no profile was NAMED and no `default.toml`
 exists stays fail-open for this specific check, matching its documented
 no-profile-required posture; a profile named through `--profile` or
 `STELLAR_AGENT_PROFILE` whose file does not exist is refused outright. The
-SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) runs the same
-pre-flight and records an `opaque_payload_signed` row when the signature is
-produced.
+four sign-only tools (`stellar_sep43_sign_transaction`,
+`stellar_sep43_sign_auth_entry`, `stellar_sep43_sign_message`, and
+`stellar_sep53_sign_message`) run the same pre-flight. Each records an
+`opaque_payload_signed` row when the signature is produced. A transaction or
+auth-entry row carries the allowed payment legs. An auth entry has no
+approval flow: an approval requirement of its tool rule or of the pay rule
+refuses with `policy.approval_required_unsupported`.
 
 ### `audit verify` command reference
 
 `stellar-agent audit verify <LOG_PATH>`: read-only. Walks the log oldest-first,
 follows rotation manifests across rotated files, and verifies the hash chain end to end. Each entry's recorded previous-hash matches the recomputed prior-entry hash. Each file's first entry chains correctly across the rotation boundary. Each rotation handoff names the actual next file (defeating file-substitution).
-When `--profile` is supplied it also verifies the chain-root HMAC sidecars;
-without it, only the hash chain is checked and `hmac_verified` is `false`.
+When `--profile` is supplied it also verifies the chain-root HMAC sidecars and
+the entry tag of every entry from the boundary row on; without it, only the hash
+chain is checked, and `hmac_verified` and `entry_tags_verified` are `false`.
+`hmac_verified` covers each file's first entry only. `entry_tags_verified` is
+`true` when tags are in force and every entry past the boundary carries a valid
+tag; `entry_tags_boundary` names the newest keyed start row as
+`{file, line, kind}`, or is `null`. A missing or wrong tag exits `1` with
+`audit.entry_tag_invalid`. `anchor.status` `"verified"` means the anchored entry
+is intact at the anchored offset and the file ends at or past it; entries past
+the anchor are authenticated only when `entry_tags_verified` is `true`.
 
-The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is
+The tip anchor is checked only when `--profile` is supplied and `<LOG_PATH>` is
 the log that profile configures, since the anchor names a path. Every other case
 reports `anchor.status` as `"not_checked"` with the reason and still verifies the
 chain in full. The check applies the same rule the writer applies, including
@@ -709,7 +1111,7 @@ Default log path by OS:
 
 | OS | Path |
 |---|---|
-| Linux | `~/.local/share/stellar-agent/audit/<profile>.jsonl` |
+| Linux | `${XDG_DATA_HOME:-$HOME/.local/share}/stellar-agent/audit/<profile>.jsonl` |
 | macOS | `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` |
 | Windows | `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` |
 
@@ -718,23 +1120,34 @@ a different user (such a directory could be used to substitute files or
 sidecars). Exits `0` when the chain is intact, `1` on any integrity violation, a
 path-contract failure, or an I/O error. Verification failures use a closed set
 of wire codes, for example `audit.chain_broken`, `audit.rotation_gap`,
-`audit.hmac_mismatch`, `audit.tip_anchor_mismatch`, with line and file detail
-kept out of the code.
+`audit.hmac_mismatch`, `audit.entry_tag_invalid`, `audit.tip_anchor_mismatch`,
+`audit.tip_anchor_missing`, with line and file detail kept out of the code.
+Warnings `entry_tags_absorbed`, `entries_quarantined`, and
+`entry_tags_rekeyed_at_open` report rows the boundary absorbed, rows a repair
+quarantined, and a rekey a keyed open appended.
 
-`outbox_pending` counts the consent, halt, and resume rows queued in the audit outbox beside the log (`<LOG_PATH>.outbox`) and not yet drained into it, read without taking the outbox lock. Queued rows sit outside the tip anchor until a draining writer appends them. A torn outbox adds an `outbox_torn_tail` warning and unparseable lines add `outbox_unparseable`. An unreadable outbox adds `outbox_unreadable` and omits `outbox_pending`, since no count is known. None of them changes the chain verdict.
+A `pruned_prefix` warning reports `first_file`, the oldest file walked, and
+`pruned_files`, the count in `<log>.pruned`. The marker seeds that file's first
+entry and is authenticated when an audit key is supplied. Verification checks
+every retained entry and bridge, and the warning leaves the verdict successful.
+
+`outbox_pending` counts complete queued consent, halt, and resume lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix, or a complete line past it, fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. Verification authenticates tagged rows, owner state, and both evidence files under the stored key. An unusable row fails with `audit.outbox_unusable`. Unusable evidence fails with `audit.outbox_evidence_unusable`. The outbox lock is taken through the carrier record, so the check also fails with `audit.carrier_replaced`, `audit.carriers_unbound`, or `audit.carrier_identity_unavailable`. It fails with `audit.outbox_rows_missing` when the retired generation's commitment changed. Under owner state, a dropped tail of queued rows that carry no reference, such as halt and resume rows, passes this check. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
+
+An `outbox_loss_acknowledged` warning names each loss acknowledgement's file, line, `expected_rows`, and `found_rows`. It leaves the chain verdict unchanged.
 
 ```bash
 stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --profile default
 ```
 ```json
-{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false,"anchor":{"status":"verified","reason":null},"outbox_pending":0},"request_id":"..."}
+{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"entry_tags_verified":true,"entry_tags_boundary":{"file":"default.jsonl","line":3,"kind":"audit_entry_tags_started"},"per_file":[],"warnings":[],"audit_writer_degraded":false,"anchor":{"status":"verified","reason":null},"outbox_pending":0},"request_id":"..."}
 ```
 
 ### `audit reanchor` command reference
 
 `stellar-agent audit reanchor --profile <NAME>` with `--acknowledge-rollback`,
 `--acknowledge-binding-change`, or both: the only way out of an
-`audit.tip_anchor_mismatch` or `audit.log_binding_changed` refusal.
+`audit.tip_anchor_mismatch`, `audit.tip_anchor_missing`, or
+`audit.log_binding_changed` refusal.
 Operator-only; an agent must never run it on its own initiative, because it
 accepts a log or a profile change that may have been tampered with.
 
@@ -743,12 +1156,28 @@ accepts a log or a profile change that may have been tampered with.
 | `--profile <NAME>` | yes | Profile whose configured log path identifies the anchor. |
 | `--acknowledge-rollback` | per the matrix below | Accept the log's current tip as authoritative. |
 | `--acknowledge-binding-change` | per the matrix below | Accept a log path or audit key that differs from the recorded binding. |
+| `--acknowledge-unauthenticated-tail` | with an unauthenticated tail | Keep the entries past the last authenticated entry and quarantine them. |
 
 | Recorded binding | Current path's anchor | Flags required | Rows appended |
 |---|---|---|---|
 | Equal or absent | Any | `--acknowledge-rollback` | `rollback_acknowledged` |
-| Changed or unreadable | Absent, or agrees with the log | `--acknowledge-binding-change` | `binding_changed` |
-| Changed or unreadable | Disagrees with the log, or cannot be parsed | Both | `rollback_acknowledged`, then `binding_changed` |
+| Changed or unreadable | Agrees, or absent without prior anchoring evidence | `--acknowledge-binding-change` | `binding_changed` |
+| Changed or unreadable | Disagrees, cannot be parsed, or absent with prior anchoring evidence | Both | `rollback_acknowledged`, then `binding_changed` |
+
+In every row, an active file that ends in entries without a valid entry tag, on
+a log whose tags are in force, also requires
+`--acknowledge-unauthenticated-tail`. The command appends
+`audit_entries_quarantined` directly after those entries, before its other
+rows, lists `unauthenticated_tail` first in `acknowledged`, and reports
+`quarantined_rows`; readers skip quarantined entries. Without such a tail the
+flag is ignored. A tail ending on a rotation handoff without a valid tag
+refuses with `internal.unexpected_state`, whose detail begins
+`audit.reanchor_failed` and names the line to remove.
+
+The first row covers a disagreeing anchor and a missing one
+(`audit.tip_anchor_missing`). In the binding-changed rows an absent anchor
+disagrees when a chain-root sidecar or an `audit_tip_anchored` row shows prior
+anchoring. Without evidence it agrees.
 
 A flag the matrix does not require is ignored. A missing flag changes nothing
 and exits `1` with `validation.acknowledgement_required`, naming the flag. With
@@ -757,18 +1186,74 @@ writes the current tip, bumps the current path's re-anchor counter once, and
 appends the rows, each carrying that count. `rollback_acknowledged`
 names the superseded anchor; `binding_changed` names the old path's anchor, or
 none when the record was unreadable. The new binding is stored last, and an
-absent binding is recorded after a rollback repair. It takes the audit writer's
-exclusive lock. While an MCP server holds that profile's writer, repair
-refuses with `audit.writer_locked`. Stop that server before a rollback repair. A binding change needs
+absent binding is recorded after a rollback repair. Recovery takes all three
+audit carriers with immediate try-locks and refuses with `audit.carriers_busy`
+when any is held. Stop an MCP server that holds that profile's writer before a
+rollback repair. A binding change needs
 no stop: a server running the edited profile refuses before it opens the new
 path, so it holds no lock there. A server still running the old profile refuses
 after the acknowledgement until it restarts.
 
-Queued consent, halt, and resume rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, or the condition an append refused on, such as `audit.io_error`.
+Queued consent, halt, and resume rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, `audit.outbox_rows_missing`, or the condition an append refused on, such as `audit.io_error`.
 
 ```json
-{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1,"acknowledged":["rollback"],"recorded_binding":"equal","previous_binding_anchor":null,"outbox_drained":0},"request_id":"..."}
+{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1,"acknowledged":["rollback"],"quarantined_rows":0,"recorded_binding":"equal","previous_binding_anchor":null,"outbox_drained":0},"request_id":"..."}
 ```
+
+### `audit acknowledge-outbox-loss --profile <NAME> --reason <TEXT>`
+
+Operator-only recovery for `audit.outbox_rows_missing`; an agent must not run it on its own initiative.
+Stop the process holding the profile's writer and inspect the queued rows first.
+`--reason` is required, non-empty, and recorded with the audit string bound.
+
+The command checks the tip anchor, checks that the loss holds and, when the committed prefix is intact, that every committed row parses and is an operator row.
+It then removes from the approval inbox every unexpired entry that holds an attestation or a recorded passkey assertion and is neither consumed nor rejected, and revokes every toolset grant.
+It writes no `revoked` state to a durable mainnet approval record.
+A mainnet consent whose queued audit row was lost still cannot authorize: before a signing key loads, the commit requires the row's exact Delivered evidence and refuses with `approval.consent_undelivered`.
+It records `audit_outbox_loss_acknowledged`, appends the committed prefix when it is intact and nothing otherwise, resets the commitment, and empties the outbox, discarding every other line.
+Under owner state, it appends the authenticated prefix, stores the owner item, and publishes the next generation line.
+A watch-only loss leaves the active queue unchanged.
+Approve affected actions again to record fresh consent.
+
+The result contains `profile`, `expected_rows`, `found_rows`, `drained`, `discarded`, `revoked_approvals`, and `revoked_grants`; `discarded` counts the complete lines dropped without being appended.
+A changed commitment of the outbox generation the last `audit bind-carriers` retired is a loss too, reported after any loss in the active queue: `expected_rows` is the rows that commitment held at retirement and `found_rows` the rows it holds now, and the acknowledgement resets the retired watch to the commitment it observed.
+No loss returns `audit.outbox_loss_not_found` without an acknowledgement, and a log rolled back behind its tip anchor returns `audit.tip_anchor_mismatch`. Recovery takes all three audit carriers with immediate try-locks and refuses with `audit.carriers_busy` when any is held.
+An intact committed row that does not parse, or that is not an operator row, returns `audit.outbox_unusable` before anything is revoked or written.
+A row that cannot append leaves the queue and commitment in place for inspection and retry.
+
+```bash
+stellar-agent audit acknowledge-outbox-loss --profile default --reason "Queue inspected; fresh approval required"
+```
+
+### `audit bind-carriers`
+
+```bash
+stellar-agent audit bind-carriers --profile <NAME>
+```
+
+Stop every wallet process before this operator-only command. It takes all
+three audit lock files with one try-lock each and refuses with
+`audit.carriers_busy` when any is held. It verifies the committed rows and
+the tagged rows after them, authenticates the evidence image, and copies the
+rows into a new outbox generation. It appends `audit_carriers_bound`,
+records all three carrier identities in the keyring, and renames the old outbox
+to `<log>.outbox.retired-g<G>`, or to `<log>.outbox.retired-g<G>.<n>` when an
+earlier binding already used that name.
+The result contains `profile`, `generation`, `carried_rows` and `retired_file`.
+`retired_file` is the retired file's name, or `null` when the log had no outbox
+file. When a retired file exists, keep it while investigating stale holders.
+A log with keyed history refuses keyed use with `audit.carriers_unbound` until
+this command runs once; a log without keyed evidence enrolls at its first keyed
+open. One run per keyed log is enough. Every later run on a bound log binds
+again: it advances `generation`, retires the current outbox under the next
+`retired-g<G>` name, and appends another `audit_carriers_bound` row. Replaced
+carriers refuse with `audit.carrier_replaced`. A staged
+generation refuses with `audit.carrier_binding_incomplete`; rerun this command
+to finish it.
+A `v0.1.0-alpha.13` build cannot open the log after this command, because it
+does not know the `audit_carriers_bound` row. The first keyed open of this
+build writes an `audit_entry_tags_started` row, which alpha.13 does not know
+either.
 
 ## The governance loop end to end
 
@@ -797,11 +1282,11 @@ The policy-file owner key is not rotated here. It is enrolled with `profile enro
 
 | Subcommand | Key kind | Effect on outstanding material |
 |---|---|---|
-| `profile rotate-attestation-key <NAME>` | 32-byte HMAC | All pending approvals invalidated; re-run the simulate-and-approve round trip. |
+| `profile rotate-attestation-key <NAME>` | 32-byte HMAC | Attestations minted under the old key fail verification; re-run the simulate-and-approve round trip for them. Unattested pending requests can still be approved under the new key. |
 | `profile rotate-audit-key <NAME>` | 32-byte HMAC | Re-signs every existing per-file chain-root sidecar with the new key; `audit verify <LOG_PATH> --profile <p>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds the writer. |
 | `profile rotate-nonce-key <NAME>` | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
 | `profile rotate-counterparty-key <NAME>` | 32-byte HMAC | Invalidates cached bindings. `counterparty refresh <domain>` rewrites one binding, and `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. |
-| `profile rotate-policy-state-key <NAME>` | 32-byte HMAC | Verifies the window-state store under the old key, then re-signs it under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved. A store that does not verify refuses the rotation; use `profile reset-window-state`. |
+| `profile rotate-policy-state-key <NAME>` | 32-byte HMAC | Verifies the window-state store under the old key, then re-signs it under the new key, so accumulated `per_period_cap` / `rate_limit` history and unlisted and total-budget usage are preserved. A store that does not verify refuses the rotation. Integrity failures and missing authenticated network provenance have no recovery verb; create a profile under a new name. Before rotation, file I/O failures refuse without changing state; retry after access is restored. |
 
 ```bash
 stellar-agent profile rotate-attestation-key default
@@ -809,3 +1294,65 @@ stellar-agent profile rotate-attestation-key default
 ```json
 {"ok":true,"data":{"profile":"default","rotated":true,"key_kind":"hmac_32_bytes"},"request_id":"..."}
 ```
+
+## Retained smart-account charges
+
+A bounded invocation charge closes when a later policy check or admission witnesses both profile endpoints above every authorization and envelope bound.
+
+A refused admission still commits the closures its witness establishes.
+
+Each queried window counts a closed charge through the later of its observation plus that window and its admitted accounting horizon.
+
+A closed intent record remains until more than one week has passed since its observation.
+
+Reset refuses while an intent remains open or retained. A closed and pruned intent does not block reset.
+
+An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
+
+When an intent is open and the profile stores no `secondary_rpc_url`, the intent view reports that retained intents cannot close and asks for one.
+
+When an intent is open and the stored endpoint configuration cannot load, the intent view reports that only stored endpoints that load close retained intents.
+
+### x402 owner approval
+
+Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network.
+On testnet, a clock reading before approval creation refuses the approval without consuming it.
+
+When the policy requires approval, the tool queues the payment and returns
+`data.approval` with the approval nonce. Nothing is signed.
+The owner approves with `stellar-agent approve`. The repeated call with
+`approval_nonce` and `approval_attestation` pays.
+Queueing reads no key and runs no SEP-10 exchange.
+
+The approval binds the network, asset, payer, payee including its mux id, and amount.
+The authenticated tool also binds the home domain.
+A call with changed terms or an expired approval answers `policy.approval_required`
+and signs nothing. Final verification follows attestation and payer-key reads,
+immediately before the signing primitive, with no intervening I/O or await.
+
+An approval releases at most one signed authorization.
+A failed or interrupted call can spend it without returning a payment payload.
+On testnet a repeated proof with a live spent tombstone answers `policy.approval_consumed`.
+An expired or pruned tombstone can answer `policy.approval_required`.
+On mainnet a repeated proof of a completed payment answers `policy.approval_required`; only a submission receipt or a proof of another operation answers `policy.approval_consumed`.
+The authorization expires within 60 ledgers of the paying call's simulation ledger.
+The protocol estimates five seconds per ledger.
+
+On mainnet, Allow without approval arguments pays in one call under policy authority.
+A supplied proof must verify, even under Allow.
+On testnet, Allow pays without owner approval and ignores supplied approval arguments for valid terms.
+Owner approval is required only when the policy requires it.
+
+Before testnet dispatch, a complete approval pair answers `policy.approval_required` for invalid network,
+asset, amount, or payee terms, including a W payee on an unsupported protocol.
+A later protocol refusal keeps `x402.muxed_contract_protocol_unsupported`.
+On testnet, without approval arguments, an address mismatch under RequireApproval
+answers `policy.approval_required_unsupported`. Nothing is queued or signed.
+On mainnet, an address mismatch refuses with `x402.invalid_payment_required`
+before the policy decision.
+
+The CLI labels spent x402 approvals with `payment digest`.
+On mainnet, this hashes the final envelope's base64 text.
+On testnet, this hashes the XDR vector of signed authorization entries.
+Testnet spends approval inside the transmit gate before its authorized audit row and signed RPC request.
+Mainnet retains its consumption after payload release authorization.

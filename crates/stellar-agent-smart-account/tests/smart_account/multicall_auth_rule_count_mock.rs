@@ -18,8 +18,9 @@ use stellar_agent_network::SoftwareSigningKey;
 use stellar_agent_smart_account::multicall::MULTICALL_WASM_SHA256;
 use stellar_agent_smart_account::{
     SaError,
-    submit::{MulticallCheck, SubmitInvokeArgs, submit_signed_invoke},
+    submit::{DeclaredSubInvocations, MulticallCheck, SubmitInvokeArgs, submit_signed_invoke},
 };
+use stellar_agent_test_support::second_loopback_host;
 use stellar_agent_test_support::signed_envelope::{
     account_id_for_seed, get_network_result, send_transaction_hash_hex,
 };
@@ -36,6 +37,15 @@ use crate::rpc_mock_helpers as rpc_helpers;
 const PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const SEED: [u8; 32] = [0x53; 32];
 
+/// The one inner call the simulated tree places under the router's `exec`.
+fn nested_call() -> InvokeContractArgs {
+    InvokeContractArgs {
+        contract_address: ScAddress::Contract(ContractId(Hash([0x55; 32]))),
+        function_name: ScSymbol("nested".try_into().unwrap()),
+        args: Default::default(),
+    }
+}
+
 struct Rpc(Arc<AtomicUsize>);
 
 impl Respond for Rpc {
@@ -47,7 +57,24 @@ impl Respond for Rpc {
                 json!({"id": "ab".repeat(32), "sequence": 1000, "protocolVersion": 27})
             }
             "getLedgerEntries" => {
-                rpc_helpers::build_ledger_entries_account(&account_id_for_seed(SEED))
+                let source = account_id_for_seed(SEED);
+                if body["params"]["keys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|key| key.as_str() == Some(rpc_helpers::account_key_xdr(&source).as_str()))
+                {
+                    rpc_helpers::build_ledger_entries_account(&source)
+                } else {
+                    let hash: [u8; 32] = hex::decode(MULTICALL_WASM_SHA256)
+                        .unwrap()
+                        .try_into()
+                        .unwrap();
+                    rpc_helpers::build_ledger_entries_contract_instance(
+                        &ScAddress::Contract(ContractId(Hash([0x54; 32]))),
+                        hash,
+                    )
+                }
             }
             "simulateTransaction" => {
                 let TransactionEnvelope::Tx(tx) = TransactionEnvelope::from_xdr_base64(
@@ -77,15 +104,7 @@ impl Respond for Rpc {
                         root_invocation: SorobanAuthorizedInvocation {
                             function: SorobanAuthorizedFunction::ContractFn(invoke.clone()),
                             sub_invocations: vec![SorobanAuthorizedInvocation {
-                                function: SorobanAuthorizedFunction::ContractFn(
-                                    InvokeContractArgs {
-                                        contract_address: ScAddress::Contract(ContractId(Hash(
-                                            [0x55; 32],
-                                        ))),
-                                        function_name: ScSymbol("nested".try_into().unwrap()),
-                                        args: Default::default(),
-                                    },
-                                ),
+                                function: SorobanAuthorizedFunction::ContractFn(nested_call()),
                                 sub_invocations: Default::default(),
                             }]
                             .try_into()
@@ -131,8 +150,14 @@ async fn submit(
     let target = stellar_strkey::Contract([0x54; 32]).to_string().to_string();
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
     let ids = vec![ContextRuleId::new(0); rule_count];
+    // The bundle declares the inner call the simulation places under `exec`,
+    // so the rule coverage of a two-context tree is what these tests reach.
+    let declared_calls = [nested_call()];
     let result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(&target)
             .auth_rule_ids(&ids)
             .host_function(HostFunction::InvokeContract(InvokeContractArgs {
@@ -140,8 +165,10 @@ async fn submit(
                 function_name: ScSymbol("exec".try_into().unwrap()),
                 args: Default::default(),
             }))
+            .sub_invocations(DeclaredSubInvocations::Calls(&declared_calls))
             .signer(&signer)
             .primary_rpc_url(&mock.uri())
+            .secondary_rpc_url(&second_loopback_host(&mock.uri()))
             .network_passphrase(PASSPHRASE)
             .chain_id("stellar:testnet")
             .timeout(Duration::from_secs(2))
@@ -159,7 +186,12 @@ async fn submit(
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn three_rules_for_two_contexts_are_refused_before_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (result, sends) = submit(3).await;
     assert_eq!(sends, 0);
     match result {
@@ -183,13 +215,23 @@ async fn three_rules_for_two_contexts_are_refused_before_send() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn one_rule_expands_across_two_contexts_and_reaches_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (result, sends) = submit(1).await;
     assert_eq!(sends, 1, "single rule must reach send: {result:?}");
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn two_rules_cover_two_contexts_and_reach_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (result, sends) = submit(2).await;
     assert_eq!(sends, 1, "exact coverage must reach send: {result:?}");
 }

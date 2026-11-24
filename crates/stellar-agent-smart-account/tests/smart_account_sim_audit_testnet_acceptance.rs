@@ -56,14 +56,9 @@ const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 /// Funds an account via testnet Friendbot.
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 200 for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Generates a fresh ed25519 keypair and returns `(g_strkey, signer)`.
@@ -112,7 +107,7 @@ fn fresh_manager() -> (ContextRuleManager, TempDir) {
     let timeout = Duration::from_secs(120);
     let signers_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Arc::clone(&audit_writer),
         audit_log_path,
         timeout,
@@ -120,7 +115,7 @@ fn fresh_manager() -> (ContextRuleManager, TempDir) {
     let manager = ContextRuleManager::new(
         rule_manager_config_for_tests(
             TESTNET_RPC_URL,
-            None,
+            Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
             signers_manager,
             audit_writer,
             timeout,
@@ -143,6 +138,7 @@ fn fresh_manager() -> (ContextRuleManager, TempDir) {
 /// byte-identity invariant.
 #[tokio::test]
 async fn sim_audit_happy_path_on_chain_submit() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Setup: fresh signer + deployer, Friendbot-fund both ───────────────
     let (signer_g, signer_box) = fresh_signer();
     // Fund the signer — it pays gas fees as source-account for all submissions.

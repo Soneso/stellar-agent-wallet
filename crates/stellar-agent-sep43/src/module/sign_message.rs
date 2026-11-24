@@ -15,7 +15,9 @@
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::signing::Signer;
 
-use crate::{address::validate_strkey, error::Sep43Error, signing::sign_message_bytes};
+use crate::address::validate_strkey;
+use crate::error::Sep43Error;
+use crate::signing::{refuse_mainnet, sign_message_bytes};
 
 /// Dispatches the SEP-43 `signMessage` method.
 ///
@@ -24,6 +26,8 @@ use crate::{address::validate_strkey, error::Sep43Error, signing::sign_message_b
 ///
 /// # Argument validation
 ///
+/// - A mainnet profile is refused at entry, before the signer is asked for
+///   its key → [`Sep43Error::MainnetSigningForbidden`].
 /// - If `network_passphrase` is `Some`, it must equal
 ///   `profile.network_passphrase`; mismatch → [`Sep43Error::InvalidNetworkPassphrase`].
 ///   The passphrase is a validation gate only: it is not mixed into the signed
@@ -34,6 +38,8 @@ use crate::{address::validate_strkey, error::Sep43Error, signing::sign_message_b
 ///
 /// # Errors
 ///
+/// - [`Sep43Error::MainnetSigningForbidden`]: the profile's network is
+///   mainnet.
 /// - [`Sep43Error::InvalidNetworkPassphrase`] — provided passphrase does not
 ///   match the profile's.
 /// - [`Sep43Error::InvalidAddress`] — provided `address` is not a valid strkey
@@ -53,19 +59,17 @@ pub async fn dispatch(
     network_passphrase: Option<&str>,
     address: Option<&str>,
 ) -> Result<serde_json::Value, Sep43Error> {
+    refuse_mainnet(&profile.network_passphrase)?;
+
     // Network-passphrase guard: fail-closed if the client supplies a mismatched
     // passphrase. The passphrase is not mixed into the signed bytes; this is a
     // caller-intent validation gate only.
     if let Some(provided) = network_passphrase
         && provided != profile.network_passphrase
     {
-        return Err(Sep43Error::InvalidNetworkPassphrase {
-            detail: format!(
-                "provided passphrase does not match profile: \
-                 expected {:?}, got {provided:?}",
-                profile.network_passphrase
-            ),
-        });
+        return Err(Sep43Error::network_passphrase_mismatch(
+            &profile.network_passphrase,
+        ));
     }
 
     // The optional address must name the key that will actually sign. This
@@ -92,7 +96,8 @@ pub async fn dispatch(
         }
     }
 
-    let (signature_b64, signer_address) = sign_message_bytes(message.as_bytes(), signer).await?;
+    let (signature_b64, signer_address) =
+        sign_message_bytes(message.as_bytes(), signer, &profile.network_passphrase).await?;
 
     Ok(serde_json::json!({
         "signedMessage": signature_b64,
@@ -121,7 +126,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_empty_message_returns_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = testnet_profile();
         let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
         let err = dispatch(&profile, &key, "", None, None).await.unwrap_err();
@@ -133,7 +142,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_nonempty_message_returns_signed_message() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
 
         let profile = testnet_profile();
@@ -152,7 +165,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_passphrase_none_succeeds() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
 
         // network_passphrase = None must not be treated as a mismatch.
@@ -168,7 +185,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_passphrase_correct_succeeds() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
 
         // network_passphrase = Some(<correct>) must pass the guard and sign.
@@ -190,7 +211,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_passphrase_mismatch_returns_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // network_passphrase = Some(<wrong>) must be rejected fail-closed before
         // any signing attempt.  Mirrors the equivalent test in sign_transaction.
         let profile = testnet_profile();
@@ -212,7 +237,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_invalid_address_arg_returns_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = testnet_profile();
         let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
         let err = dispatch(&profile, &key, "hello", None, Some("not-a-strkey"))
@@ -225,7 +254,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_address_matches_active_signer_ok() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
 
         // The address-validation success branch: provided address is a valid
@@ -258,7 +291,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_address_mismatch_returns_invalid_address() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The address-mismatch guard: a valid G-strkey arg that is NOT the
         // signer's own key must return InvalidAddress unconditionally.
         //
@@ -288,5 +325,64 @@ mod tests {
             "mismatched address must return InvalidAddress, got: {err:?}"
         );
         assert_eq!(err.sep43_code(), -3);
+    }
+
+    /// A mainnet profile is refused before the signer is asked for its key.
+    /// The call passes an address, the branch that reads the key before the
+    /// message primitive's own refusal.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatch_refuses_a_mainnet_profile_before_any_key_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let profile = Profile::builder_mainnet(
+            "https://rpc.example",
+            "svc",
+            "acct",
+            "nonce-svc",
+            "nonce-acct",
+        )
+        .build();
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([1u8; 32]);
+        let address = SoftwareSigningKey::new_from_bytes([1u8; 32])
+            .public_key()
+            .await
+            .unwrap()
+            .to_string();
+        let err = dispatch(&profile, &signer, "hello", None, Some(address.as_str()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Sep43Error::MainnetSigningForbidden { .. }),
+            "got: {err:?}"
+        );
+        assert_eq!(signer.public_key_calls(), 0);
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    /// The same call on testnet signs, so the refusal above is the network's.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatch_signs_on_testnet_with_an_address() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([1u8; 32]);
+        let address = SoftwareSigningKey::new_from_bytes([1u8; 32])
+            .public_key()
+            .await
+            .unwrap()
+            .to_string();
+        dispatch(
+            &testnet_profile(),
+            &signer,
+            "hello",
+            None,
+            Some(address.as_str()),
+        )
+        .await
+        .expect("testnet signs");
+        assert_eq!(signer.sign_calls(), 1);
     }
 }

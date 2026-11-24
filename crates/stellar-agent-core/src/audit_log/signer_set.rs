@@ -48,12 +48,11 @@ pub enum SignerSetCanonicalBodyError {
     ///
     /// This indicates a data-integrity problem in the stored [`SignerPubkey::External`]
     /// value. Callers that surface this error should propagate it as an audit-log
-    /// integrity error.
-    #[error("invalid External verifier_contract C-strkey '{strkey}': {source}")]
+    /// integrity error. The error holds no part of the refused address: its
+    /// source is the decoder's classification, which names no input.
+    #[error("External verifier_contract must be a valid contract C-strkey")]
     InvalidVerifierContract {
-        /// The C-strkey that failed to decode.
-        strkey: String,
-        /// The underlying strkey decode error.
+        /// The decoder's classification of the refusal.
         #[source]
         source: stellar_strkey::DecodeError,
     },
@@ -247,19 +246,8 @@ impl std::fmt::Debug for SignerPubkey {
 /// Returns [`SignerSetCanonicalBodyError::InvalidVerifierContract`] when
 /// `c_strkey` is not a valid C-strkey.
 pub fn canonical_scaddress(c_strkey: &str) -> Result<Vec<u8>, SignerSetCanonicalBodyError> {
-    let contract = stellar_strkey::Contract::from_string(c_strkey).map_err(|e| {
-        // Distinguish a G-strkey (Ed25519 account, wrong type) from a malformed
-        // C-strkey so callers can surface a more actionable error message.
-        // Redact the strkey to first-5-last-5 — the full strkey must not appear
-        // in rendered error messages.
-        let redacted = crate::observability::redact_strkey_first5_last5(c_strkey);
-        let strkey = if c_strkey.starts_with('G') {
-            format!("{redacted} (account G-strkey not accepted; expected contract C-strkey)")
-        } else {
-            redacted
-        };
-        SignerSetCanonicalBodyError::InvalidVerifierContract { strkey, source: e }
-    })?;
+    let contract = stellar_strkey::Contract::from_string(c_strkey)
+        .map_err(|source| SignerSetCanonicalBodyError::InvalidVerifierContract { source })?;
     let mut body = Vec::with_capacity(36);
     // 4-byte big-endian XDR discriminant for SC_ADDRESS_TYPE_CONTRACT = 1.
     // Stellar XDR SCAddressType, CONTRACT = 1; big-endian: [0x00, 0x00, 0x00, 0x01].
@@ -1797,21 +1785,60 @@ mod tests {
 
     // ── canonical_scaddress G-vs-C error message ──────────────────────────────
 
+    /// A well-formed G-strkey (an Ed25519 account) is refused as a verifier
+    /// contract with the fixed message; no fragment of it reaches the error's
+    /// renderings.
     #[test]
-    fn canonical_scaddress_rejects_g_strkey_with_descriptive_error() {
-        // A well-formed G-strkey (Ed25519 account) must be rejected with an
-        // error message indicating it is an account key, not a contract address.
+    fn canonical_scaddress_rejects_g_strkey_without_its_fragments() {
         let g_strkey = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
-        let err = canonical_scaddress(g_strkey);
-        assert!(err.is_err(), "G-strkey must return Err");
-        match err.unwrap_err() {
-            SignerSetCanonicalBodyError::InvalidVerifierContract { strkey, .. } => {
-                assert!(
-                    strkey.contains("account G-strkey not accepted"),
-                    "error must note G-strkey type: {strkey}"
-                );
+        let err = canonical_scaddress(g_strkey).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SignerSetCanonicalBodyError::InvalidVerifierContract { .. }
+            ),
+            "expected InvalidVerifierContract, got: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "External verifier_contract must be a valid contract C-strkey"
+        );
+        assert_no_address_fragment(&err, g_strkey);
+    }
+
+    /// A malformed C-strkey whose leading and trailing characters carry a
+    /// marker is refused with the fixed message and the decoder's
+    /// classification as the source; neither fragment reaches a rendering.
+    #[test]
+    fn canonical_scaddress_rejects_malformed_c_strkey_without_its_fragments() {
+        let malformed = format!("CMRKQ{}QMRKZ", "A".repeat(46));
+        let err = canonical_scaddress(&malformed).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "External verifier_contract must be a valid contract C-strkey"
+        );
+        let source = std::error::Error::source(&err).expect("the decoder classification");
+        assert!(
+            source
+                .downcast_ref::<stellar_strkey::DecodeError>()
+                .is_some()
+        );
+        assert_no_address_fragment(&err, &malformed);
+    }
+
+    /// Asserts that neither the first nor the last five characters of
+    /// `address` appear in the `Display` or `Debug` of `error` or of any
+    /// error in its source chain.
+    fn assert_no_address_fragment(error: &(dyn std::error::Error + 'static), address: &str) {
+        let first: String = address.chars().take(5).collect();
+        let last: String = address.chars().skip(address.chars().count() - 5).collect();
+        let mut current = Some(error);
+        while let Some(error) = current {
+            for rendering in [error.to_string(), format!("{error:?}")] {
+                assert!(!rendering.contains(&first), "{rendering}");
+                assert!(!rendering.contains(&last), "{rendering}");
             }
-            other => panic!("expected InvalidVerifierContract, got: {other:?}"),
+            current = error.source();
         }
     }
 

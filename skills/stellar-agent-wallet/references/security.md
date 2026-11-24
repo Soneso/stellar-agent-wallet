@@ -1,5 +1,8 @@
 # Security and safe operation
 
+See [Mainnet configurations and scope](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 The wallet evaluates policy on gated signing paths and enforces approvals on
 its two-phase MCP actions. Use those tools for agent payments, account creation,
 trustlines, and claims; the CLI serves reads, setup, and operator ceremonies.
@@ -9,7 +12,7 @@ Approval is cryptographically bound to the exact transaction. The audit log
 records transaction submissions, signed authorizations, approvals, and explicit
 key-management and lifecycle events. MCP balance reads add no audit rows. A payment
 simulation adds no invocation row; under V1 it can reconcile overdue
-reservations and write their settlement rows. MCP tools expose no signing seed
+reservations and deliver owed accounting events. MCP tools expose no signing seed
 or operator approval command. A process running as the operator's OS user holds
 the operator's authority; the wallet does not distinguish it from the operator.
 See the [trust model](../SKILL.md#overview) for the current limits.
@@ -17,7 +20,7 @@ This file describes the security
 model an operator should understand and the safe-operation rules an agent must
 follow. For the tool list and argument shapes see `./mcp-tools.md`.
 
-After name reconciliation, both binaries compare keyring entries with sibling
+After name reconciliation, the CLI and the MCP server compare keyring entries with sibling
 profile files in the same profiles directory. Mainnet conflicts refuse with
 `profile.key_scope_conflict`; testnet conflicts warn and keep the verb's behavior.
 The check includes wallet keys, provider credentials and derived entries.
@@ -25,20 +28,33 @@ Provider credentials may share with other provider credentials, but cannot share
 with wallet or derived entries. Two fields in one profile cannot name one entry,
 and the owner account must be `default`. Explicit wallet references must be set
 in the file; an out-of-scope overlay is a conflict.
+A mainnet profile's `policy_window_state_key_id` must name its default entry,
+`stellar-agent-policy-window-<name>` with account `default`, even when the file
+sets it explicitly. The policy pin and the mainnet enablement nonce sit beside
+that entry, so another entry would start from an empty pin and nonce.
 
 A copied profile file, including a backup in that directory, counts as a sibling.
 If this profile names a sibling's entry, give this profile its own entry.
 If the sibling claims this profile's canonical entry, correct the sibling file.
 Moving an enrolled reference orphans its stored key; enroll or rotate at the new
-entry before use. An unreadable sibling warns and is skipped on both chains.
+entry before use. An unreadable sibling warns and is skipped on both chains, except for message signing, which refuses it with `profile.key_scope_conflict` on every chain.
 An unreadable selected document or profiles directory refuses on mainnet and
 warns on testnet. `profile show` still displays the document for diagnosis.
 
 `profile reset-window-state` writes its `policy_window_state_reset` audit row,
 with the wiped accrual, before it mints a key, advances the generation or
 replaces the store. A reset whose row cannot be written does not happen.
+Reset requires `--owner-secret-env VAR` with the owner's seed whenever a policy
+pin, an enablement nonce, or an enrolled owner exists, on testnet and mainnet.
+The pin selects the owner first; without a pin, the enrolled owner signs. An
+enablement nonce without a pin refuses. Only ownerless state permits an
+unsigned reset. With the flag, the row records that owner's signature
+over the profile, chain, store digest, generations, bounded reason, request id
+and the store's challenge. The store verifies that signature under its lock
+before the row. Owner, pin and signature refusals write no reset row and change
+no store state.
 The `profile` section of `./cli-reference.md` describes the row, the refusals,
-the failure windows and the recovery.
+and the failure windows.
 
 The reset requires a current tip anchor before and after its row. If repair
 fails, `audit.chain_key_unavailable` carries `audit.tip_anchor_unavailable`,
@@ -59,8 +75,10 @@ describe an attempted reset that did not take effect.
   required by most MCP tools. Where it is omittable (the SEP-43 read tools) it
   defaults to the active profile's chain; the wallet's default network is
   `stellar:testnet`.
-- Writes and signing are testnet-only in this alpha; a write/sign on
-  `stellar:mainnet` is structurally refused with `network.mainnet_write_forbidden`.
+- Default builds from this repository carry `mainnet-write`. Mainnet writes
+  require installation setup. `allow` signs under policy authority, and
+  `require_approval` needs a verified approval. Excluded operations refuse with
+  their own codes.
 - A single-use nonce is minted by the wallet at simulation time and must be passed
   back unchanged at commit time. Do not generate, cache across restarts, reuse, or
   mutate it.
@@ -72,8 +90,14 @@ Every tool returns one envelope shape, with five success-path exceptions:
 `stellar_dex_quote`, `stellar_defindex_vault_deposit`, and
 `stellar_defindex_vault_withdraw` return a bare object carrying a `status`
 field. Their business errors use the envelope.
-Some refusals use the JSON-RPC error channel instead of the envelope: invalid
-arguments, a `chain_id` mismatch, and the toolset capability refusals.
+Arguments that do not match the tool's input schema (a missing or unknown
+field, or a field of the wrong type) return a tool result with
+`isError: true` and the text
+`<tool>: the arguments have a missing field or a field of the wrong type or value`.
+Some refusals use the JSON-RPC error channel instead of the envelope.
+Arguments that match the schema but fail a value check, and a `chain_id`
+mismatch, return JSON-RPC error -32602. The toolset capability refusals are
+JSON-RPC errors too.
 `toolset.first_invoke_approval_required` is a JSON-RPC error too, and its error
 data carries the `approval_nonce`.
 
@@ -90,6 +114,28 @@ data carries the `approval_nonce`.
 
 Wire codes are stable and closed-set. Treat the code as the contract; the message
 is human-facing detail and may change.
+
+## Dedicated wallet user
+
+A non-admin wallet account separates its files and platform keyring from
+operator processes. Root-owned wrappers constrain delegated commands and
+construct a clean environment. The fixed profile is `mainnet`.
+Wallet-user code can read keys while the keyring is unlocked.
+Unlock lasts until reboot or explicit lock; the operator unlocks after each boot.
+
+`profile policy-check` validates unsigned stdin without keyring or pin access.
+`--origin` exits 0 for local-only, 3 for a declared origin, and 65 for invalid input.
+Origin and certificate pin must appear together, including before signing.
+`profile apply-fragment` replaces allowed provisioning fields only after loader validation.
+Its final stderr line lists credential roles; refusal preserves the profile bytes.
+
+Mainnet approval offers `--open-by-operator` on serve, credential enrollment,
+and one-shot approval. It prints one single-use URL on stderr and creates
+no browser handoff. Presence verification, expiry, and enrollment codes remain required.
+An installed body declaring a signed origin refuses before ceremony resources
+with `approval.origin_signed_remote`, even before signing.
+
+See the [dedicated-user deployment page](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/dedicated-user.md) before granting the wrappers through sudoers.
 
 ## Self-custody and the platform keyring
 
@@ -115,29 +161,44 @@ The custody boundary is the keyring secret. An attacker who already holds the
 seed, nonce key, or HMAC keys is outside the threat model; everything below
 assumes those secrets stay in the keyring.
 
-## The unlock window: TTL-bounded, zeroize-on-drop, memory-locked
+## The unlock window: clock-checked seed access in a zeroize-on-drop home
 
 When a CLI command signs with a seed read from a `--*-secret-env` variable, the
 32-byte signing seed is loaded into a short unlock window. Keyring signers, the
 Ledger, and the MCP server never enter it. A keyring signer loads its key for
 each signature into a zeroize-on-drop buffer without a memory lock. The unlock
-window itself works as follows:
+window works as follows:
 
-- The seed is moved into a zeroize-on-drop buffer, and its backing page is pinned
-  in physical RAM via `mlock` (Linux/macOS) or `VirtualLock` (Windows). Pinning the
-  page keeps that buffer out of swap when pinning succeeds. The pin is eager: pages are populated and locked
-  at lock time, so there is no pre-first-fault swap-disclosure window.
-- The window is TTL-bounded. The default is 30 seconds; `wallet.unlock_ttl_seconds`
-  honors any value from 1 through 600 seconds. `ttl_seconds == 0` or `> 600` is
-  rejected, never clamped.
-- A background timer fires at the TTL and marks the wallet disposed.
-- On every exit path, including normal return, error propagation (`?`), and
-  panic-unwind, the seed is zeroized and the lock released.
+- The wallet allocates an isolated zeroed home, attempts the configured memory
+  lock, then copies the borrowed seed and builds its signing key in it.
+- The clock bounds wallet seed access and transfer. The default is 30 seconds;
+  `wallet.unlock_ttl_seconds` accepts 1 through 600 seconds and refuses other values.
+- When the lock succeeds, the seed and the signing key built from it stay in
+  one locked, zeroize-on-drop page while their wallet or signer holds them.
+  That page is not written to swap, but a hibernation image of the whole memory
+  still holds it. Drop zeroizes the key and seed before unlocking and freeing,
+  including on panic unwind.
+- The owner ceremony clears its parsing buffer before the signing operation
+  runs. Copies that the strkey parser, signing library, and compiler make while
+  a key is built or read or a signature is computed are not locked and are
+  zeroized where those libraries allow. The wallet does not claim that no copy of a seed
+  reaches swap.
+- Testnet environment signers keep the seed for the command, which can outlast
+  the TTL.
+- An exported seed stays in the environment of the process and of every process
+  the shell starts, for their whole life; copying and dropping it inside the
+  wallet does not erase it. Mainnet transaction signing refuses `--secret-env` and signs with
+  the enrolled seed in the keyring or with a Ledger that holds the enrolled key.
+  On Linux the CLI marks
+  itself non-dumpable before it starts any thread, so other processes of the same
+  user cannot read its memory or environment or attach to it; the shell that
+  exported the variable is not protected. On macOS and Windows the CLI sets no
+  such flag.
 
 The `mlock_required` posture in `[wallet]` controls what happens when pinning
 fails:
 
-| Value | Behaviour on `mlock` failure |
+| Value | Behavior on `mlock` failure |
 |-------|------------------------------|
 | `true` (default Linux/macOS) | Fail closed: unlock aborts, seed zeroed. |
 | `"warn"` (default Windows) | Proceed with unprotected memory; emit a warning. |
@@ -154,79 +215,74 @@ mlock_required = true       # default on Linux/macOS
 unlock_ttl_seconds = 30     # default; 1 through 600 honored
 ```
 
-CLI transaction signing copies the seed into an unpinned, zeroize-on-drop
-`SoftwareSigningKey` and disposes the window before returning the signer.
-The TTL does not bound that copy. `profile sign-policy` signs while the window
-is open. Keyring signers and Ledger signing do not use an unlock window.
+Operational implication for an agent: the window is short. Do not assume an unlock
+persists between unrelated calls; each signing action stands up its own bounded
+window.
 
-## The mainnet write gate (structurally read-only)
+## Mainnet authorization boundaries
 
-Two structural rules apply across all surfaces:
+Default builds from this repository carry `mainnet-write`. With the feature on, only a typed
+authorization issued for the action can satisfy the mainnet-write guard, and
+the binary attests its feature state. A build with `--no-default-features` has
+the feature off, and no code path in it can satisfy the guard.
+The guarantee has one precondition: the claim holds only under the dependency
+set pinned and verified by the release.
 
-1. The default network is `stellar:testnet`.
-2. Every write or signing command structurally refuses `stellar:mainnet` before
-   any RPC call or signing, with wire code `network.mainnet_write_forbidden`,
-   except MPP, which refuses with `mpp.network_forbidden`. `stellar:mainnet`
-   stays accepted for read-only commands.
+Builds with the feature on admit only configured operations. See the local
+[CLI](cli-reference.md#mainnet-write-behavior),
+[MCP](mcp-tools.md#classic-mainnet-authorization), and
+[policy](profiles-and-keys.md#mainnet-policy-body) references for setup.
+Policy evaluation alone grants no authority.
+The wallet's own signing paths sign mainnet payloads only under mainnet
+authorization. The library signers enforce it too: every `Signer`, the public
+keyring handle included, signs a mainnet transaction or Soroban authorization
+payload only under a mainnet authorization. Code running as the same OS user
+with access to a keyring entry can read its seed directly. The keyring entry
+is the custody boundary.
+Authorized signing and submission independently check sealed authority.
+Durable consumption precedes sending.
+A signer can run before verification rejects its signature.
 
-Mainnet writes are structurally refused regardless of the engine selected in
-`[policy]`. The Noop engine also applies these fixed policy decisions:
+| Profile | Noop policy decision |
+|---|---|
+| Testnet | Allow. |
+| Mainnet read | Allow. |
+| Mainnet destructive action | Refuse with `policy.engine_required`. |
 
-| Profile | Tool | Result |
-|---------|------|--------|
-| testnet | any | Allow |
-| mainnet | read-only (`destructive_hint = false`) | Allow |
-| mainnet | destructive | refused with `policy.engine_required` |
+Smart-account multicall independently requires V1 even on testnet.
+Mainnet selection requires an explicit profile. Writes require a dedicated
+nondefault profile and matching stored chain, endpoint, oracle host, and
+installation binding. The owner-signed policy names both the endpoint host and
+the oracle host, and a mainnet signature accepts a cross-check witness only
+from the signed oracle host. Of the witness inputs, the owner signs the oracle
+host and the per-asset cross-check thresholds; the oracle URL's scheme, path,
+and credentials and the oracle provider record are unsigned profile fields.
+Friendbot remains scoped to testnet and futurenet. MPP, smart-account writes,
+DeFi, pool submission, generic signing, and toolset rule creation are excluded on mainnet.
+On mainnet, `stellar_toolset_invoke` admits only its exact `stellar_pay` and `stellar_pay_commit` actions; every other toolset action refuses.
 
-A destructive tool on a mainnet profile cannot pass the Noop engine. New profiles
-default to V1, which verifies signed policies and evaluates typed criteria with
-first-match, default-deny rules.
-Enrolling a V1 owner key changes policy evaluation but does not enable mainnet
-writes.
+Prepare and commit probe the endpoint before action reads on their client.
+Submission checks the sending client again. The endpoint network binds every
+signature. `network.envelope_signed_for_mainnet` means verification fails under
+the endpoint network and succeeds under mainnet. The identity answer also
+carries the endpoint's protocol version. This release supports protocols 29
+and 30. Outside them, testnet and other networks log a warning. Ordinary
+submission refuses a mainnet endpoint before this rule. Authorized submission
+refuses it with `network.unsupported_protocol_version`.
 
-There are no consent-gated mainnet write exceptions: every write surface refuses
-mainnet structurally. Friendbot funding is scoped to `testnet` and `futurenet`
-and refuses `mainnet` with `network.friendbot_mainnet_forbidden`.
-
-The gate does not rest on the declared network alone. The classic payment,
-sponsored account creation, trustline, claim, and pool paths ask the RPC
-endpoint which network it serves before the first read whose answer they sign
-or gate on. They ask on the client that sends, and the MCP simulate tools ask
-on their own client. Before it sends, the submit layer asks again on the
-sending client.
-Both treat the answer as authoritative. An endpoint reporting mainnet is
-refused with `network.mainnet_write_forbidden` even when the caller declared
-testnet. An endpoint reporting a different network than declared is refused
-with `network.endpoint_network_mismatch`. An endpoint whose identity cannot be
-established within the timeout is refused with
-`network.endpoint_identity_unavailable`. An endpoint that answers the identity
-request with HTTP 401 or 403 is refused with `network.rpc_credential_refused`,
-without a retry. The same answer carries the endpoint's
-protocol version. This release supports protocols 29 and 30: outside them, testnet and
-other networks log a warning, and a mainnet endpoint is refused with
-`network.unsupported_protocol_version`. While mainnet writes are refused, a
-mainnet endpoint is refused with `network.mainnet_write_forbidden` first. The
-submit layer then verifies every signature on the envelope against the network
-the endpoint reported. An envelope with a signature made for mainnet is refused
-with `network.envelope_signed_for_mainnet`. One with a signature that verifies
-under neither network is refused with `network.envelope_signature_unverifiable`.
-An envelope without a signature, or a fee-bump whose outer or inner transaction
-carries none, is refused with `network.envelope_unsigned`. An envelope signed
-for one network therefore cannot be relayed onto another.
-
-Agent rule: if you receive `network.mainnet_write_forbidden`,
-`policy.engine_required`, or any of the network-binding codes above, the action
-is structurally blocked on that chain and nothing was sent. Switching `chain_id`
-to mainnet to retry a write will not work and is not a valid path; neither will
-pointing at a different RPC endpoint to get past a binding refusal. Surface the
-block to the operator.
+After authorization refusal, report the failed action to the operator.
+Do not switch networks, nor point at a different RPC endpoint to get past a
+binding refusal. A retry requires fresh preparation and fresh approval.
+After enablement or policy signing, restart the MCP server. Stale startup
+bindings require restart; missing authority names its prerequisite.
+A submission timeout has an unknown outcome and requires reconciliation.
 
 ## Arguments are never logged: only key names
 
 The audit log records the **argument key names** (`arg_keys`), never the argument
 values, at any log level. The same redaction discipline applies to wire output:
 
-- Strkeys (`G` / `C` / `T` / `M` / `P`) appearing in a decision reason are
+- Strkeys (`G`, `C`, `T`, `M`, `W`, and `P`) appearing in a decision reason are
   redacted to first-five-last-five, e.g. `GABCD...VWXYZ`.
 - Transaction hashes are redacted to first-eight-last-eight.
 - The `envelope_hash` is recorded unredacted because it is a SHA-256 digest
@@ -243,9 +299,16 @@ the text is cut at 200 characters. An error quotes the text.
 
 At the MCP boundary, account, strkey, and contract-id fields inside a deny reason
 are redacted before they cross the wire. Policy deny states that an attacker could
-otherwise probe are collapsed: the commit-path verifier maps the internal
-outcomes `Expired`, `NotFound`, and `AlreadyAttested` all onto the single wire
-code `policy.approval_required`, so a caller cannot tell which state a nonce is in.
+otherwise probe are collapsed. The commit-path verifier maps missing, expired,
+and invalid approvals onto `policy.approval_required`, so a caller cannot tell
+which of those states a nonce is in. A live rejection keeps `policy.approval_rejected`. A live consumed testnet
+approval, an approval held by a submission receipt, and a mainnet proof of
+another operation keep `policy.approval_consumed`. A repeated mainnet proof of a
+completed payment returns `policy.approval_required`. Off mainnet, an
+entry with a non-canonical payment destination or an inconsistent recovery
+binding keeps `approval.entry_inconsistent`. On mainnet, a revoked approval
+keeps `approval.revoked`. A verified approval whose queued consent row has no
+Delivered evidence keeps `approval.consent_undelivered`.
 
 Agent rule: do not depend on argument values appearing in the audit log; they do
 not. Correlate with `request_id`, the envelope hash, and `arg_keys`.
@@ -257,8 +320,9 @@ through a single-use replay window.
 
 - A nonce is 48 bytes, transmitted as URL-safe base64 with no padding (a 16-byte
   random salt plus a 32-byte HMAC tag). Treat it as an opaque token.
-- The HMAC binds the envelope, the tool name, the `chain_id`, an expiry, and a
-  per-process boot value. Change any of those and the nonce no longer verifies.
+- The HMAC binds the salt, the envelope, the tool name, the `chain_id`, an
+  expiry, and a per-process boot value. Change any of those and the nonce does
+  not verify.
 - It is single-use: presenting the same nonce twice is rejected.
 - It is fail-closed on restart: the per-process boot value is never persisted, so a
   nonce minted before a server restart is rejected (`HmacMismatch`) afterward.
@@ -286,10 +350,13 @@ operator approves it out-of-band:
 stellar-agent approve --id <nonce> --profile <name>
 ```
 
-`approve` renders a wallet-controlled summary (the destination G-strkey and asset
-are validated on deserialize so a hostile entry cannot inject terminal content),
-the operator confirms at the terminal, and the command records an HMAC-SHA256
-attestation. The attestation:
+`approve` renders a wallet-controlled summary (the destination G- or M-strkey and asset
+are validated on deserialize so a hostile entry cannot inject terminal content).
+On testnet the operator confirms at the terminal, and the command records an
+HMAC-SHA256 attestation. On mainnet a consent also needs a fresh WebAuthn
+assertion, with user presence and user verification, from an approval
+credential in the owner-signed policy; terminal input and the HMAC key alone
+record no mainnet consent. The local browser or the signed approval origin obtains the signed assertion. The attestation:
 
 - Is keyed by the profile's attestation key, which lives only in the keyring.
 - Binds the profile name, CAIP-2 chain id, approval nonce, envelope digest, and OS process uid under a versioned domain tag.
@@ -301,13 +368,14 @@ What this means for the threat model: the attestation proves the keyring holder
 ran `approve`. The agent's own UI is not a trust input. An attacker who can write
 to the store file can at most delete a pending entry (forcing re-approval, a
 denial-of-service nuisance) but cannot forge an attestation, because the HMAC key
-is in the keyring, not in the file. Rotating the attestation key invalidates all
-outstanding pending approvals; the operator must re-approve.
+is in the keyring, not in the file. After the attestation key rotates,
+attestations minted under the old key fail verification. Unattested pending
+requests can still be approved under the new key.
 
-Pending entries are kinded: `PaymentSimulated`, `TrustlineSimulated`, `ClaimSimulated`,
-`SignWithPasskey`, `RegisterPasskey`, `ToolsetFirstInvokeGate`,
-`TrustlineClawbackOptIn`, `RuleProposalSimulated`, `MppChargeSimulated`, `Rejected`,
-and `Consumed`. The store
+Pending entries are kinded: `PaymentSimulated`, `TrustlineSimulated`,
+`ClaimSimulated`, `SignWithPasskey`, `RegisterPasskey`, `ToolsetFirstInvokeGate`,
+`TrustlineClawbackOptIn`, `RuleProposalSimulated`, `MppChargeSimulated`, `X402Payment`,
+`Rejected`, and `Consumed`. The store
 holds a single exclusive lock, writes atomically with owner-only permissions, caps
 the number of pending entries, and applies a default entry TTL of 24 hours.
 
@@ -317,16 +385,21 @@ Toolset-routed payments use two distinct controls, and only one is suppressible:
 
 - The **first-invoke gate** (`ToolsetFirstInvokeGate`) fires the first time a
   toolset uses a signing-adjacent capability with no matching grant. Once approved,
-  a time-boxed grant (default TTL 30 days) is persisted and matched on later
-  invocations by toolset, capability, destination, asset, and an amount range. The
-  grant suppresses only the first-invoke re-prompt.
-- The **per-action payment approval** (`PaymentSimulated`) fires unconditionally on
-  every toolset-routed payment, and its attestation binds the actual executed
-  envelope.
+  a time-boxed grant (default TTL 30 days) is persisted. Later invocations match
+  the grant by toolset, installation, package version and digest, capability,
+  destination, asset, and amount range. The grant suppresses only the first-invoke re-prompt.
+- The **per-action payment approval** (`PaymentSimulated`) fires on a
+  toolset-routed payment when the stricter of the routed and outer policy
+  decisions requires approval. Its attestation binds the actual executed
+  envelope, or on mainnet the stored intent of a payment that `stellar_pay`
+  prepared.
 
-A forged or tampered grant can at most suppress a re-prompt; it cannot bypass the
-per-action approval, because that approval is forced regardless of any grant and is
-bound to the real transaction.
+A matching grant requires a version 3 HMAC that verifies under the profile's
+attestation key and profile/chain binding. It must be unexpired, with a lifetime
+of at most 30 days, and issued no later than the current time and at or after
+the second following the current installation. An invalid install time honors
+no grant. Consent issued in the install second re-prompts once. A forged or
+edited grant suppresses nothing.
 
 Agent rule: expect a gated action to pause for operator approval. Do not interpret
 a `RequireApproval` / `policy.approval_required` outcome as a failure to retry; it
@@ -339,7 +412,7 @@ The per-profile, append-only, hash-chained JSONL audit log records transaction
 submissions, signed authorizations, approvals, and explicit key-management and
 lifecycle events. MCP balance reads and payment simulations produce no automatic
 invocation row. Under V1, payment simulations can reconcile overdue reservations
-and write settlement audit rows.
+and deliver owed accounting events.
 The writer is a per-profile singleton
 holding an exclusive lock and appending with an fsync per line; a second opener is
 rejected. Files rotate at a size bound with a fixed number of rotated files
@@ -352,8 +425,9 @@ request id, the event kind, and the previous entry's hash. Each entry is
 hash-chained to the one before it; each file carries a root-HMAC sidecar signed
 with the profile's audit key.
 
-The log records `value_action_submitted` on every
-confirmed value-moving submit (carrying the gate-sized value legs) and
+The log records `value_action_pending` before every
+value-moving submit that runs with an audit writer (carrying the gate-sized
+value legs) and
 `keyring_key_written` on each key-writing profile command. It records
 `x402_payment_authorized`, with a passed cross-check witness when the payment
 required one, before a signed x402 authorization leaves the wallet
@@ -362,9 +436,17 @@ then fails. The configured RPC observes the signed x402 authorization.
 Approval and rejection rows are written before the decision takes effect.
 
 The `x402_authorization_withheld` stages are `anchor_unavailable`,
-`resimulation`, `response_processing`, and `encoding`. The transmit gate checks
-the anchor before and after its authorization row. At `anchor_unavailable`,
-the signature stays in the wallet and the previously admitted spend remains.
+`resimulation`, `response_processing`, `encoding`, `payload_release`, and
+`terminal_approval`. The transmit gate checks the anchor before and after its
+authorization row. At `anchor_unavailable`, the signature stays in the wallet.
+On testnet, the spend that policy admitted earlier in the call remains.
+
+On an admitted
+mainnet server, payload release additionally requires the consumed release
+authorization and, under `RequireApproval`, the consumed pending approval. For an authenticated payment, the ephemeral
+key signs the SEP-10 challenge and the wallet submits it to the web-auth server
+before the payment build. On mainnet, that submission follows the consumption of
+its Message authorization.
 
 MPP credentials follow a stricter one-shot rule. Durable state is atomically
 claimed before policy accounting or signer access; value budget is recorded
@@ -375,18 +457,16 @@ receipt recording, and independent transaction reconciliation. MPP is
 testnet-only and absent from toolset routing; its configured RPC sees signed
 authorization during mandatory re-simulation.
 
-Every value-moving signing verb loaded from a persisted profile proves the
-audit writer is acquirable BEFORE the signing key is touched or a transaction
-is submitted, refusing `audit.chain_key_unavailable` if the profile's audit
-chain-root key was never minted (`profile init` mints the keyring coordinate
-only; run `profile rotate-audit-key <name>` to mint the key). The zero-config
-synthesized profile `pay`/`claim`/`accounts create` fall back to when no
-profile was NAMED and no `default.toml` exists stays fail-open for this
-specific check. A profile named through `--profile` or `STELLAR_AGENT_PROFILE`
-whose file does not exist is refused outright (`profile.load_failed`), not
-replaced by that fallback, and a profile file whose owner-key coordinate names
-a DIFFERENT profile is refused with `profile.name_mismatch` rather than used to
-sign under a name it does not own. The SEP-43
+Every value-moving signing verb loaded from a persisted profile acquires the
+audit writer before it touches the signing key or submits a transaction. It
+refuses with `audit.chain_key_unavailable` if the profile's audit chain-root
+key was never minted. `profile init` mints the keyring coordinate only; run
+`profile rotate-audit-key <name>` to mint the key. `pay`, `claim`, and
+`accounts create` fall back to a synthesized profile when no profile is named
+and no `default.toml` exists. That profile stays fail-open for this check. A
+profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does
+not exist refuses with `profile.load_failed`. A profile file whose owner-key
+coordinate names another profile refuses with `profile.name_mismatch`. The SEP-43
 sign-only pair (`signTransaction`, `signAuthEntry`) runs the same pre-flight
 before signing. See [Troubleshooting](troubleshooting.md#audit-key-code).
 
@@ -397,7 +477,11 @@ stellar-agent audit verify <LOG_PATH> --profile <NAME>
 ```
 
 Verification checks per-entry chaining, cross-file rotation handoff (defeating
-file substitution), and, when an HMAC key is supplied, the root sidecar. Failures
+file substitution), and, when an HMAC key is supplied, the root sidecar. With
+`--profile`, it also checks each keyed entry's tag (`audit.entry_tag_invalid`)
+and the keyring tip anchor (`audit.tip_anchor_mismatch`,
+`audit.tip_anchor_missing`). See
+[`audit verify`](approvals-and-audit.md#audit-verify-command-reference). Failures
 use a closed set of wire codes, e.g. `audit.chain_broken`, `audit.rotation_gap`,
 `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`. A detected mid-rotation crash
 (`audit.partial_rotation`) is surfaced as an error and requires operator
@@ -415,10 +499,41 @@ input with secrets redacted. Do not include real secret seeds, private keys, or
 keyring secrets; a redacted strkey or a SHA-256 digest is enough to identify an
 affected account or envelope.
 
-In scope and of high interest: an agent escaping or bypassing the guardrails (for
-example executing a signing action that should have been denied, forced to
-approval, or recorded), or reaching `stellar:mainnet` for a write or signing
-action despite the structural refusal (outside the consent-gated exceptions). Out
+Report an agent bypassing the guardrails, including signing that policy denies,
+needs approval for, or that the audit log records.
+Unauthorized mainnet signing, payload release, or submission is also in scope. Out
 of scope: defects in your own keyring backend, OS, RPC endpoint, or anchor; and
 any issue that requires already holding the wallet's keyring secrets, since custody
-of those secrets is the security boundary.
+of those secrets is the security boundary. Two residues remain on mainnet. A
+same-user process that holds the attestation HMAC key can wrap a version 5 or 6
+record around a user-verified assertion that its own localhost page obtained.
+The owner seed admits approval credentials, so signing the policy on a host
+where same-user code runs exposes that seed.
+
+For code running as the same OS user, the owner of an enabled mainnet profile
+changes only with a statement signed by the previous owner. A verified policy
+load requires that statement for a new owner; no public function of a build
+without the `test-helpers` feature writes a pin the caller composes. The policy
+pin and the enablement nonce that carry this continuity sit at the profile's
+default window-state entry, and a mainnet profile that names another entry is
+refused.
+Raw deletion or replacement of the pin, enablement, and owner entry outside
+the wallet rests on the platform keyring.
+
+## Retained smart-account charges
+
+A bounded invocation charge closes when a later policy check or admission witnesses both profile endpoints above every authorization and envelope bound.
+
+Only the endpoints stored in the profile authorize charge closure. Endpoint overrides can bound signatures but cannot close charges.
+
+Environment variables and programmatic overlays do not change which endpoints authorize charge closure.
+
+A schedule charge closes when both endpoints, above every authorization expiration, report its operation done or unset.
+
+Intents without an authenticated purpose remain open. Calls whose authorization tree names `approve`, `increase_allowance` or `approve_for_all` retain their charges without closure by authorization expiry.
+
+Reset refuses while an intent remains open or retained. A closed and pruned intent does not block reset.
+
+Timelock envelopes carry an exact maximum ledger before signing. The maximum ledger is exclusive.
+
+Snapshots containing signed intents or intent links require version 9 or later. Total-budget intent legs require version 16 or later. Committed snapshots are written at version 18. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.

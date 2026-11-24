@@ -5,4 +5,4 @@ description: Reads the XLM balance of the configured Stellar account. Use when t
 
 ## Instructions
 
-Call the `stellar_get_balance` tool to retrieve the current XLM balance.
+Call the `stellar_balances` tool to retrieve the current XLM balance.

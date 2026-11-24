@@ -27,15 +27,16 @@
 //!
 //! # Approval-store note
 //!
-//! `WalletServer::persist_claim_pending_approval` (the internal helper
-//! `stellar_claim` calls when the policy engine requires approval) resolves
+//! `WalletServer::claim_pending_entry` and
+//! `WalletServer::insert_classic_pending` (the internal helpers
+//! `stellar_claim` calls when the policy engine requires approval) resolve
 //! the approval-store directory via `default_approval_dir()` unconditionally
 //! — it does not consult the `approval_dir_override` test hook that
 //! `verify_attestation_gate` honours. Driving the real persist path therefore
 //! means the pending-approval entry lands in the OS-conventional approval
 //! directory, not a per-test `tempfile::TempDir`. The happy-path commit
 //! removes its own entry on successful submission
-//! (`stellar_claim_commit_impl`'s post-submit cleanup), so no state survives
+//! (`stellar_claim_commit_impl`'s pre-send cleanup), so no state survives
 //! a passing run.
 //!
 //! Gated behind the `testnet-acceptance` feature flag:
@@ -63,7 +64,7 @@ use serial_test::serial;
 use stellar_agent_claimable::entry::fetch_claimable_balance_entry;
 use stellar_agent_claimable::id::BalanceId;
 use stellar_agent_core::approval::{
-    compute_attestation, envelope_sha256, process_uid_for_attestation,
+    compute_attestation_v4, envelope_sha256, process_uid_for_attestation,
 };
 use stellar_agent_core::policy::v1::{
     AccountIdentityView, AccountReservesView, CounterpartyCacheView, Sep10SessionView,
@@ -110,6 +111,33 @@ const PAST_ABSOLUTE_TIME_UNIX_SECS: i64 = 1_000_000;
 struct RequireApprovalEngine;
 
 impl PolicyEngine for RequireApprovalEngine {
+    fn record_confirmed_checked(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &stellar_agent_core::policy::v1::ValueClass,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.record_confirmed_checked(tool, profile, value)
+    }
+    fn size_unvalued_call(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        reason: stellar_agent_core::policy::v1::OpaqueReason,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine
+            .size_unvalued_call(tool, profile, reason, now_ms)
+    }
+    fn size_no_value(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::CheckedSizing, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.size_no_value(tool, profile, now_ms)
+    }
+
     fn evaluate(
         &self,
         _tool: &ToolDescriptor,
@@ -120,6 +148,7 @@ impl PolicyEngine for RequireApprovalEngine {
         _counterparty_cache: Option<&dyn CounterpartyCacheView>,
         _sep10_sessions: Option<&dyn Sep10SessionView>,
         _sep45_sessions: Option<&dyn Sep45SessionView>,
+        _now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         Ok(Decision::RequireApproval(ApprovalRequest::new(
             "claim-testnet-approval".into(),
@@ -143,14 +172,9 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 2xx for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Polls RPC until the freshly-funded account is queryable, tolerating
@@ -202,6 +226,20 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .expect("signer keyring entry")
         .set_password(&s_strkey)
         .expect("set signing key");
+    // The identity record an enrollment stores beside the seed.
+    stellar_agent_network::keyring::write_keyring_string(
+        &stellar_agent_core::profile::schema::signer_identity_entry_ref(signer_ref),
+        &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .to_bytes(),
+            stellar_agent_core::profile::name::profile_name_for_approval(profile),
+            profile.chain_id,
+        )
+        .render()
+        .expect("an agent record renders"),
+    )
+    .expect("set identity record");
 
     // Nonce key.
     let nonce_ref = &profile.mcp_nonce_key_alias;
@@ -219,8 +257,8 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .set_password(&attest_key_b64)
         .expect("set attestation key");
 
-    // Audit-log chain-root HMAC key, so the commit's post-submit
-    // `value_action_submitted` row is signed and lands.
+    // Audit-log chain-root HMAC key, so the commit's pre-send
+    // `value_action_pending` row is signed and lands.
     let audit_ref = &profile.audit_log_hash_chain_key_id;
     let audit_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x33u8; 32]);
     keyring_core::Entry::new(&audit_ref.service, &audit_ref.account)
@@ -280,6 +318,10 @@ async fn submit_testnet_signed_xdr(
 #[tokio::test]
 #[serial]
 async fn t1_claim_two_phase_happy_path() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (creator_g, creator_seed) = fresh_keypair();
@@ -344,6 +386,7 @@ async fn t1_claim_two_phase_happy_path() {
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             balance_id: balance_id_hex72.clone(),
             source_account: Some(claimant_g.clone()),
+            business_id: None,
         })
         .await
         .expect("simulate must succeed against a live, claimable balance");
@@ -401,7 +444,16 @@ async fn t1_claim_two_phase_happy_path() {
     // ── 2. Recompute the attestation blob exactly as `approve` would ───────────
     let uid = process_uid_for_attestation().expect("process uid");
     let sha = envelope_sha256(envelope_xdr.as_bytes());
-    let blob = compute_attestation(
+    let stored = stellar_agent_core::approval::PendingApprovalStore::open(
+        stellar_agent_core::profile::schema::default_approval_dir()
+            .expect("approval dir")
+            .join(format!("{}.toml", server.profile_name_for_approval())),
+    )
+    .expect("open approval store")
+    .get(&approval_nonce)
+    .expect("the approval request is persisted")
+    .clone();
+    let blob = compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new(
             &server.profile_name_for_approval(),
@@ -410,8 +462,25 @@ async fn t1_claim_two_phase_happy_path() {
         &approval_nonce,
         &sha,
         &uid,
+        &stored.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
+    // `approve` records the blob with its approver; the commit gate verifies
+    // the presented blob against that record. The store drops at the end of
+    // the statement, so the commit gate can open it.
+    stellar_agent_core::approval::PendingApprovalStore::open(
+        stellar_agent_core::profile::schema::default_approval_dir()
+            .expect("approval dir")
+            .join(format!("{}.toml", server.profile_name_for_approval())),
+    )
+    .expect("open approval store")
+    .record_attestation(
+        &approval_nonce,
+        blob,
+        stellar_agent_core::approval::AttestedApprover::Local,
+    )
+    .expect("record the local approval");
 
     // ── 3. Commit: gate verifies the attestation, signs, and submits on-chain ──
     let commit = server
@@ -419,11 +488,12 @@ async fn t1_claim_two_phase_happy_path() {
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             balance_id: balance_id_hex72.clone(),
             source_account: Some(claimant_g.clone()),
-            nonce,
-            expires_at_unix_ms,
-            envelope_xdr,
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: Some(approval_nonce),
             approval_attestation: Some(blob_b64),
+            business_id: None,
         })
         .await
         .expect("commit must pass the gate and submit on-chain");
@@ -443,17 +513,22 @@ async fn t1_claim_two_phase_happy_path() {
     );
 
     // #21 — the confirmed claim commit must have recorded a
-    // `value_action_submitted` row for `stellar_claim_commit`.
+    // `value_action_pending` row for `stellar_claim_commit`.
     let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(std::io::BufReader::new(
         std::fs::File::open(audit_dir.path().join("audit.jsonl")).expect("audit log after commit"),
     ))
     .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
     .collect();
     assert!(
+        audit_rows
+            .iter()
+            .all(|row| row["kind"] != "value_action_submitted")
+    );
+    assert!(
         audit_rows.iter().any(|row| {
-            row["kind"] == "value_action_submitted" && row["tool"] == "stellar_claim_commit"
+            row["kind"] == "value_action_pending" && row["tool"] == "stellar_claim_commit"
         }),
-        "claim commit must record a value_action_submitted row: {audit_rows:?}"
+        "claim commit must record a value_action_pending row: {audit_rows:?}"
     );
 
     // ── 4. On-chain effects: claimant credited, entry gone ─────────────────────
@@ -488,6 +563,10 @@ async fn t1_claim_two_phase_happy_path() {
 #[tokio::test]
 #[serial]
 async fn t2_predicate_expired_refused() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (creator_g, creator_seed) = fresh_keypair();
@@ -547,6 +626,7 @@ async fn t2_predicate_expired_refused() {
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             balance_id: balance_id_hex72,
             source_account: Some(claimant_g.clone()),
+            business_id: None,
         })
         .await
         .expect("the claim guard must return a tool-level error result, not an ErrorData");

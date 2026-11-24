@@ -6,11 +6,13 @@ Usage: ``check-workflow-invariants.py [repository-root]``
 
 Reads ``release.yml``, ``publish.yml``, ``notarize-smoke.yml``, ``labels.yml``,
 ``stale.yml``, ``triage.yml``, ``triage-review.yml``, ``triage-sweep.yml``,
-``welcome.yml``, ``coverage.yml``, and ``release-rehearsal.yml`` under
-``.github/workflows/``.
+``welcome.yml``, ``coverage.yml``, ``release-rehearsal.yml``, ``ci.yml``,
+``vendored-wasm.yml``, and ``changelog.yml``
+under ``.github/workflows/``.
 Also reads the composite action
-``.github/actions/macos-sign-notarize/action.yml`` and the release build
-scripts under ``.github/scripts/release/``. Needs PyYAML.
+``.github/actions/macos-sign-notarize/action.yml``, the shared build script
+``.github/scripts/release/build.sh``, and the host recipe
+``.github/scripts/release/check-host.sh``. Needs PyYAML.
 
 A job is credentialed when it references ``secrets.``, passes secrets to a
 reusable workflow, declares ``environment:``, or holds ``id-token: write``,
@@ -69,7 +71,8 @@ and comment lines skipped. The check fails when any of these holds:
   expression other than ``github.action_path``.
 - ``publish-tag-ref``: a ``publish.yml`` checkout uses a ref other than
   ``refs/tags/...`` or ``github.workflow_sha``, or a ``publish.yml`` job has
-  no ``refs/tags/`` checkout.
+  no ``refs/tags/`` checkout. The step-less ``vendored-wasm`` workflow call
+  is exempt; ``publish-wasm-gate`` governs it.
 - ``ancestry-check``: the ``release.yml`` preflight or a ``publish.yml`` job
   has no line whose first word is the path of ``check-ref-on-main.sh`` and
   that holds no shell operator. The step of that line sets ``if`` or
@@ -78,9 +81,39 @@ and comment lines skipped. The check fails when any of these holds:
 - ``coverage-trigger``: ``coverage.yml`` has no ``pull_request`` trigger, a
   ``paths`` or ``paths-ignore`` filter, no ``types`` list, or a list missing
   an event in ``COVERAGE_EVENTS``. The rule reports every missing event.
-- ``coverage-condition``: ``coverage.yml`` has no ``coverage`` job, or that
-  job's ``if`` is not a string equal to ``COVERAGE_CONDITION`` after the check
-  strips the surrounding whitespace and one enclosing ``${{ }}``.
+- ``coverage-condition``: ``coverage.yml`` lacks a job of ``COVERAGE_PARTS``
+  or the gate job ``coverage``. A part's ``if`` is not a string equal to
+  ``COVERAGE_CONDITION``, or the gate's ``if`` is not a string equal to
+  ``COVERAGE_GATE_CONDITION``, after the check strips the surrounding
+  whitespace and one enclosing ``${{ }}``. Or the gate is not named
+  ``coverage``.
+- ``coverage-split``: a ``run:`` line of ``coverage.yml`` that names
+  ``cargo llvm-cov`` or ``check-coverage.py`` differs from the two
+  measurement and two floor commands, runs in another job than its own, or
+  runs more than once there. The feature-off command belongs to
+  ``coverage-off``, the feature-on command to ``coverage-on``, and both
+  floors to ``coverage``. Or a part lacks an unconditional upload of its
+  ``COVERAGE_EXPORTS`` report after its measurement, with
+  ``if-no-files-found: error``.
+- ``coverage-gate``: the gate does not need exactly both parts. Its first
+  step sets ``if``, lacks a result check, or reads other than
+  ``COVERAGE_RESULT_ENV``. Its second and last steps do not reject a
+  cancelled run: ``if`` equal to ``cancelled()``, no ``continue-on-error``,
+  and ``exit 1`` as the only command. The last step does not follow both
+  floors, or another step sets ``if``. Or a report is not downloaded once,
+  unconditionally, from this run, before the first floor.
+- ``coverage-seed``: ``coverage.yml`` lacks a ``push`` trigger for both
+  ``COVERAGE_SEED_BRANCHES``, filters pushes by path, or lets later runs
+  cancel a running push. A newer pending run still replaces the older pending
+  run.
+- ``coverage-attempt``: an upload or download of ``coverage.yml`` names
+  another artifact than a ``COVERAGE_EXPORTS`` report, whose name ends in
+  ``${{ github.run_attempt }}``, or a download sets ``pattern`` or
+  ``merge-multiple``. The gate then reads only reports of its own attempt.
+- ``cache-save-if``: a ``Swatinem/rust-cache`` step, in any letter case, of
+  any ``*.yml`` or ``*.yaml`` workflow that ``pull_request`` or
+  ``pull_request_target`` triggers lacks ``save-if`` equal to
+  ``CACHE_SAVE_CONDITION`` after the check strips one enclosing ``${{ }}``.
 - ``rehearsal-credentials``: ``release-rehearsal.yml`` holds a credential. A
   job is credentialed as above. The workflow permissions, or a job's own
   permissions or the workflow's when it sets none, are anything but exactly
@@ -92,18 +125,141 @@ and comment lines skipped. The check fails when any of these holds:
   value other than a mapping, list, string, number, boolean, date or null.
   A double quote outside a single-quoted string is refused as well, because
   GitHub rejects one in an expression.
-- ``release-script-drift``: the scripts under ``.github/scripts/release/``
-  differ from the ``build`` job of ``release.yml``. The ``cargo build`` and
-  ``cross build`` lines of ``build.sh`` and of that job's ``run:`` blocks,
-  with ``${{ matrix.target }}`` read as ``"$TARGET"`` and whitespace
-  normalized, are not the same set, or the job has none. The body of
-  ``windows-perl.ps1`` or ``sodium.sh``, after its leading comment lines,
-  differs line for line from the ``run:`` block of the one step of that job
-  that writes ``OPENSSL_SRC_PERL`` or ``SODIUM_DIST_DIR`` to ``GITHUB_ENV``.
+
+A command below runs unconditionally when a logical line of a step equals
+it, outside any compound command and after no line that exits, returns, or
+turns off errexit, in a step whose shell is bash with errexit. No comment,
+prefix, operator, substitution, or variable can then skip the command or
+discard its status. In a step that names the command, a line before the
+call that leaves a quote, a substitution, a subshell, or a group open, that
+opens a heredoc, that ends in &&, ||, | or |& and so makes the next line
+conditional or piped, or that holds the command inside a longer line, is
+reported as unmodelled shell syntax under the rule that looks for the
+command. A function defined earlier in the step that shadows the counted
+command, as bash() { return 0; } does, makes the check count a call that
+runs the function.
+
+- ``release-shared-scripts``: a build job of ``release.yml`` or
+  ``release-rehearsal.yml`` does not call the shared Perl, sodium, and build
+  scripts once each, or ``build.sh`` does not run the environment guard on
+  its own checkout as its first command. The normalized logical lines of
+  ``build.sh`` differ from ``BUILD_BODY``, or those of the notarization
+  smoke's build step differ from ``SMOKE_BUILD``, or those of
+  ``copy-alias.sh`` differ from ``COPY_HELPER_BODY``: comments and blank lines
+  are dropped and each run of blanks collapses to one space.
+- ``signing-order``: ``sign-notarize.sh`` lacks the contiguous normalized
+  ``SIGN_BLOCK``, which signs and verifies ``stellar-agent``, derives the
+  alias from the signed file and packs both names; a codesign call other
+  than ``SIGN_LINE`` signs; or the script does not end with ``SIGN_FINAL``;
+  or the normalized logical lines of ``derive-alias.sh`` differ from
+  ``DERIVE_BODY``.
+- ``release-guard-order``: the build does not immediately follow the Perl
+  and sodium setup steps, so a command could follow their environment writes
+  unguarded.
+- ``release-packaged-gate``: ``hashes`` does not need ``verify-packaged``,
+  ``verify-packaged`` does not need ``preflight``, ``build``, and
+  ``sign-macos``, or a ``verify-packaged`` job of ``release.yml`` or
+  ``release-rehearsal.yml`` does not run ``ARCHIVE_CHECK`` unconditionally.
+- ``release-provenance-gate``: ``publish`` does not need
+  ``verify-provenance``, ``verify-provenance`` does not need ``preflight``,
+  ``provenance``, and ``hashes``, or it does not run each command of
+  ``PROVENANCE_CHECKS`` unconditionally.
+- ``publish-dry-gate``: the ``publish.yml`` publish job does not need
+  ``verify``, or in ``verify`` and the rehearsal's ``verify-crates`` the
+  packaging step does not create the start timestamp before it packages,
+  unconditionally, or the next step does not run the packaged marker check.
+- ``publish-install-gate``: ``verify-install`` does not need ``publish``, or
+  does not run the install check of the dispatched commit unconditionally.
+- ``release-check-unconditional``: a job of ``GUARDED_JOBS`` or one of its
+  steps sets ``if`` or ``continue-on-error``, or a step turns off errexit or
+  ends a line with ``|| true``, ``|| :``, or ``|| exit 0``. The publish
+  dispatch's verify_only condition and the Rosetta step's target condition
+  are the only exceptions.
+- ``verification-credentials``: a job of ``VERIFY_JOBS`` is credentialed as
+  above, has permissions other than exactly ``contents: read``, receives
+  ``GH_TOKEN`` or ``GITHUB_TOKEN`` from the workflow, job, or step
+  ``env``, or holds or inherits from the workflow ``env`` or ``defaults``
+  an expression that reads the ``secrets`` context, the workflow token, or
+  the ``github`` context other than by a named property, read as for
+  ``rehearsal-credentials``, which covers the rehearsal's inherited level.
+- ``release-verify-matrix``: a ``verify-packaged`` matrix of ``release.yml``
+  or ``release-rehearsal.yml`` differs from ``VERIFY_RUNNERS``, the job does
+  not run on ``${{ matrix.os }}``, the archive check does not take
+  ``TARGET`` from ``${{ matrix.target }}``, or the job's first step is not
+  the Rosetta check of the Intel macOS target.
+- ``release-cache``: a job of ``release.yml`` or ``release-rehearsal.yml``
+  uses ``Swatinem/rust-cache``, ``actions/cache``, or a sub-action of either,
+  in any letter case, or passes a ``cache`` input to an ``actions/setup-*``
+  action.
+- ``release-wasm-gate``: the release lacks an unconditional local
+  ``vendored-wasm`` workflow call without inputs or secrets, or ``hashes``
+  or ``publish`` does not need it, so signing, provenance, and publication
+  wait for the rebuild. The called workflow must declare ``workflow_call``.
+  Its cache guards must lead with
+  ``github.ref_type != 'tag' && !inputs.publication``. Each cache step
+  restores, or saves exactly on ``WASM_SAVE_CONDITION``, so only push and
+  schedule runs save. Its rebuild
+  must read both stellar-cli artifacts of its own run and use no cache. No
+  job or step of it sets ``continue-on-error``, and no step of ``check``,
+  ``rebuild``, or ``vendored-wasm`` suppresses a failure as for
+  ``release-check-unconditional``. ``rebuild`` runs exactly on
+  ``needs.check.outputs.rebuild == 'true'`` and its full-mode step
+  unconditionally. The ``vendored-wasm`` job runs on ``always()``, needs
+  exactly ``WASM_GATE_NEEDS``, and has one unconditional gate step that runs
+  ``WASM_GATE_CALL`` with ``WASM_GATE_ENV``.
+- ``publish-wasm-gate``: crate publication must need verification and a local
+  Wasm workflow call for the verified source SHA with publication enabled.
+  The call needs only verification, holds no secrets, and cannot continue on
+  error. Both jobs run exactly on ``${{ !inputs.verify_only }}``. The reusable
+  workflow declares the source and publication inputs, checks out that source
+  in each repository job, validates the publication checkout in its decide
+  step, and excludes publication runs from every cache.
+- ``release-vars``: an expression reads the ``vars`` context in
+  ``release.yml``, in a local reusable workflow it calls, or in the
+  ``action.yml`` of a local action it uses, followed through every local
+  ``uses:`` of a job or step, or such a local reference names no file in the
+  repository. The expressions are read as for ``rehearsal-credentials``, with
+  string literals masked. The release provenance records the ``vars`` context
+  as its parameters; this keeps a repository, organization, or environment
+  variable out of the release build.
+- ``release-publish-sums``: ``publish`` does not run the archive checksum
+  check unconditionally before the GitHub Release action.
+- ``release-toolchain``: ``RELEASE_TOOLCHAIN`` of ``release.yml`` or
+  ``release-rehearsal.yml`` differs from that of ``publish.yml``, or either
+  build job or the rehearsal's ``verify-crates`` does not install it and pin
+  ``RUSTUP_TOOLCHAIN`` between the install and the build or packaging.
+- ``ci-feature-jobs``: a job of ``CI_FEATURE_JOBS`` is missing, it or one of
+  its steps sets ``if`` or ``continue-on-error``, or it does not run each of
+  its commands unconditionally. A job of ``DOCS_ONLY_SKIPPED_JOBS`` instead
+  needs exactly ``changes`` and sets ``if`` to ``DOCS_ONLY_CONDITION`` within
+  at most one enclosing ``${{ }}``. The ``docs-tests`` job is missing, does
+  not need exactly ``changes``, sets ``if`` to anything but
+  ``DOCS_TESTS_CONDITION``, it or one of its steps sets ``continue-on-error``
+  or a step sets ``if``, or it does not run each of ``DOCS_TESTS_COMMANDS``
+  unconditionally; a job of ``CONDITIONED_FEATURE_JOBS`` is
+  missing, its ``if`` differs from its documented condition after the check
+  strips the surrounding whitespace and one enclosing ``${{ }}``, it sets
+  ``continue-on-error``, one of its steps sets ``if`` or
+  ``continue-on-error``, or it does not run each of its commands
+  unconditionally. A cancel rejection step of the coverage gate is exempt
+  from the step rule: ``if`` equal to ``cancelled()``, no
+  ``continue-on-error``, and ``exit 1`` as its only command. Or
+  ``check-host.sh`` does not run each command of
+  ``HOST_CHECKS`` unconditionally.
+- ``skill-archive``: ``release-contracts`` can be bypassed, or its skill
+  archive step is missing, duplicated, allowed to fail, uses another command,
+  or has a condition that differs from ``SKILL_ARCHIVE_CONDITION``.
+  Its effective shell must be unset or ``bash``.
+- ``apt-retries``: an ``apt-get`` call in any workflow's ``run:`` block lacks
+  ``-o Acquire::Retries=3``. Each call is checked separately; comments are ignored.
+- ``ci-triggers``: ``ci.yml`` lacks ``push`` or a ``pull_request`` branch list
+  containing ``main``, or adds an event that requires re-evaluating the archive condition.
+- ``changelog-check``: fragment validation or tests can be bypassed, or checkout lacks full history and the main ref.
+- ``changelog-guard``: integration changelog protection differs from its condition, event SHAs, shell, or command.
+- ``release-fragments``: preflight lacks the read-only pending-fragment check immediately after the version header check.
 """
 
 import fnmatch
-import itertools
 import pathlib
 import re
 import sys
@@ -115,7 +271,51 @@ except ImportError:
     sys.exit("check-workflow-invariants.py needs PyYAML (pip install PyYAML)")
 
 WORKFLOWS = ("release.yml", "publish.yml", "notarize-smoke.yml", "labels.yml", "stale.yml", "triage.yml",
-             "triage-review.yml", "triage-sweep.yml", "welcome.yml", "coverage.yml", "release-rehearsal.yml")
+             "triage-review.yml", "triage-sweep.yml", "welcome.yml", "coverage.yml", "release-rehearsal.yml",
+             "ci.yml", "vendored-wasm.yml", "changelog.yml")
+CHANGELOG_CONDITION = "github.event_name == 'pull_request' && github.base_ref == 'mainnet-write'"
+CHANGELOG_ARGS = 'guard --base "$BASE_SHA" --head "$HEAD_SHA" --main-ref refs/remotes/origin/main'
+CHANGELOG_GUARD = ('set -euo pipefail\n'
+                   'GUARD_ENTRY=$(git ls-tree "$BASE_SHA" -- .github/scripts/changelog.py)\n'
+                   'if [ -n "$GUARD_ENTRY" ]; then\n'
+                   '  git show "$BASE_SHA:.github/scripts/changelog.py" | python3 - ' + CHANGELOG_ARGS + '\n'
+                   'else\n'
+                   '  python3 .github/scripts/changelog.py ' + CHANGELOG_ARGS + '\n'
+                   'fi')
+CHANGELOG_FETCH = "git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main"
+PENDING_FRAGMENTS = ('set -euo pipefail\n'
+                     'PENDING=$(find changelog.d -mindepth 1 -maxdepth 1 ! -name README.md -print)\n'
+                     'test -z "$PENDING"')
+# GitHub resolves action names in any letter case.
+CACHE_ACTION = re.compile(r"(Swatinem/rust-cache|actions/cache)(/[\w.-]+)*@", re.IGNORECASE)
+RUST_CACHE_ACTION = re.compile(r"Swatinem/rust-cache(/[\w.-]+)*@", re.IGNORECASE)
+# A rust-cache step in a workflow that a pull request triggers saves only on
+# push runs, so a pull request run, also from a fork, restores only.
+CACHE_SAVE_CONDITION = "github.event_name == 'push'"
+# Only push and schedule runs save missing stellar-cli install roots; other
+# events never save.
+WASM_SAVE_CONDITION = ("github.ref_type != 'tag' && !inputs.publication && "
+                       "(github.event_name == 'push' || github.event_name == 'schedule') && "
+                       "steps.restore.outputs.cache-hit != 'true'")
+SETUP_ACTION = re.compile(r"actions/setup-[\w.-]+@", re.IGNORECASE)
+# The jobs of vendored-wasm.yml whose results the gate job reads, the gate
+# command, and the environment it reads them from. A tag run passes the gate
+# only after a rebuild, so the release's dependents wait for one.
+WASM_GATE_NEEDS = ["check", "rebuild", "stellar-cli-25", "stellar-cli-28"]
+WASM_GATE_CALL = ('bash .github/scripts/rebuild-vendored-wasm.sh --gate "$CHECK" "$REBUILD" "$CLI25" "$CLI28" '
+                  '"$REBUILD_JOB" "$REF_TYPE"')
+WASM_GATE_ENV = {
+    "CHECK": "${{ needs.check.result }}",
+    "REBUILD": "${{ needs.check.outputs.rebuild }}",
+    "CLI25": "${{ needs.stellar-cli-25.result }}",
+    "CLI28": "${{ needs.stellar-cli-28.result }}",
+    "REBUILD_JOB": "${{ needs.rebuild.result }}",
+    "REF_TYPE": "${{ inputs.publication && 'publication' || github.ref_type }}",
+}
+WASM_REBUILD_CONDITION = "needs.check.outputs.rebuild == 'true'"
+WASM_FULL_MODE = "rebuild-vendored-wasm.sh --repo-root"
+# Inputs that make actions/download-artifact read another run or repository.
+FOREIGN_ARTIFACT_INPUTS = ("run-id", "github-token", "repository")
 COMPOSITE = pathlib.PurePosixPath(".github/actions/macos-sign-notarize")
 SIGNING_JOBS = {("release.yml", "sign-macos"), ("notarize-smoke.yml", "sign")}
 TOOLCHAIN_ALLOWED = {("publish.yml", "publish")}
@@ -135,23 +335,291 @@ ANCESTRY_JOBS = {("release.yml", "preflight"), ("publish.yml", "verify"), ("publ
 # by a person or with an app token.
 COVERAGE_WORKFLOW = "coverage.yml"
 COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled", "unlabeled")
-# The coverage job measures on the schedule, on a dispatch, and on a pull
-# request whose labels include `coverage`.
+# The coverage jobs measure on a push, on the schedule, on a dispatch, and on
+# a pull request whose labels include `coverage`.
 COVERAGE_CONDITION = ("github.event_name != 'pull_request' || "
                       "contains(github.event.pull_request.labels.*.name, 'coverage')")
+# The gate job `coverage` runs after failed, cancelled, or skipped
+# measurements under the same label condition, so its check fails instead of
+# being skipped.
+COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_CONDITION})"
+COVERAGE_PARTS = ("coverage-off", "coverage-on")
+COVERAGE_GATE = "coverage"
+# Pushes to these branches seed the coverage caches. Later runs do not cancel
+# a running push. A newer pending run replaces the older pending run.
+COVERAGE_SEED_BRANCHES = ("mainnet-write", "main")
+COVERAGE_SEED_CANCEL = "github.event_name == 'pull_request'"
+COVERAGE_OFF_COMMAND = ("cargo llvm-cov --workspace --no-default-features --features "
+                        "test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json")
+COVERAGE_ON_COMMAND = ("cargo llvm-cov --workspace --features "
+                       "mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json "
+                       "--output-path cov-feature-on.json")
+COVERAGE_OFF_FLOORS = "python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off"
+COVERAGE_ON_FLOORS = "python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on"
+COVERAGE_MEASURES = {"coverage-off": COVERAGE_OFF_COMMAND, "coverage-on": COVERAGE_ON_COMMAND}
+# The artifact name and file of each part's report. The run attempt in the
+# name binds each report to the attempt that produced it, so the gate reads
+# only reports of its own attempt.
+COVERAGE_ATTEMPT = "${{ github.run_attempt }}"
+COVERAGE_EXPORTS = {"coverage-off": (f"cov-feature-off-{COVERAGE_ATTEMPT}", "cov-feature-off.json"),
+                    "coverage-on": (f"cov-feature-on-{COVERAGE_ATTEMPT}", "cov-feature-on.json")}
+# Download inputs that select reports by a pattern or merge several reports.
+COVERAGE_SELECTION_INPUTS = ("pattern", "merge-multiple")
+# The gate's first step reads both part results; the keys are quoted strings.
+COVERAGE_RESULT_ENV = {"OFF": "${{ needs.coverage-off.result }}", "ON": "${{ needs.coverage-on.result }}"}
+COVERAGE_RESULT_CHECKS = ('test "$OFF" = success', 'test "$ON" = success')
+# The gate steps that fail a cancelled run before and after the floors.
+COVERAGE_CANCEL_CONDITION = "cancelled()"
+COVERAGE_CANCEL_RUN = "exit 1"
 # The release rehearsal builds the release targets of any branch on a
 # dispatch. Its token reads the repository contents and nothing else, and no
 # expression of the workflow reads a secret or the workflow token.
 REHEARSAL_WORKFLOW = "release-rehearsal.yml"
 REHEARSAL_PERMISSIONS = {"contents": "read"}
-# The rehearsal requires the build lines and the Windows setup scripts to
-# equal those of the build job in release.yml. Each setup script copies the
-# run: block of the release build step that writes its variable to GITHUB_ENV;
-# the variable finds that step.
+# Shared release build and platform setup scripts.
 RELEASE_SCRIPTS = pathlib.PurePosixPath(".github/scripts/release")
 BUILD_SCRIPT = RELEASE_SCRIPTS / "build.sh"
-SETUP_SCRIPTS = (("OPENSSL_SRC_PERL", RELEASE_SCRIPTS / "windows-perl.ps1"),
-                 ("SODIUM_DIST_DIR", RELEASE_SCRIPTS / "sodium.sh"))
+HOST_SCRIPT = RELEASE_SCRIPTS / "check-host.sh"
+# The Perl and sodium setup calls and the build call that follows them.
+BUILD_CALLS = ("./.github/scripts/release/windows-perl.ps1",
+               "bash .github/scripts/release/sodium.sh",
+               'bash .github/scripts/release/build.sh "$TARGET"')
+BUILD_GUARD = ('python3 "$(dirname "${BASH_SOURCE[0]}")/../check-feature-discipline.py" '
+               '--env-guard "$(dirname "${BASH_SOURCE[0]}")/../../.."')
+# The reviewed body of build.sh, read as normalized logical lines: comments
+# and blank lines dropped, each run of blanks collapsed. It builds only the
+# canonical executable, copies it to the alias name with copy_alias, and
+# compares the bytes.
+BUILD_BODY = (
+    "set -euo pipefail",
+    BUILD_GUARD,
+    'if [ "$#" -ne 1 ]; then',
+    'echo "usage: build.sh <target>" >&2',
+    "exit 2",
+    "fi",
+    "TARGET=$1",
+    'case "$TARGET" in',
+    "'' | -* | *[!A-Za-z0-9_.-]*)",
+    "echo \"build.sh: invalid target '$TARGET'\" >&2",
+    "exit 2",
+    ";;",
+    "esac",
+    'cd "$(dirname "${BASH_SOURCE[0]}")/../../.."',
+    'if [ "$TARGET" = "aarch64-unknown-linux-gnu" ]; then',
+    'cross build --release --locked --target "$TARGET" --bin stellar-agent',
+    "else",
+    'cargo build --release --locked --target "$TARGET" --bin stellar-agent',
+    "fi",
+    "suffix=",
+    'case "$TARGET" in',
+    "*-windows-*) suffix=.exe ;;",
+    "esac",
+    'release="target/$TARGET/release"',
+    ". .github/scripts/release/copy-alias.sh",
+    'copy_alias "$release/stellar-agent$suffix" "$release/stellar-agent-mcp$suffix"',
+    'cmp "$release/stellar-agent$suffix" "$release/stellar-agent-mcp$suffix"',
+)
+# The reviewed run block of the notarization smoke build, normalized alike.
+SMOKE_BUILD = (
+    "set -euo pipefail",
+    "cargo build --release --locked --target aarch64-apple-darwin --bin stellar-agent",
+    "release=target/aarch64-apple-darwin/release",
+    ". .github/scripts/release/copy-alias.sh",
+    'copy_alias "$release/stellar-agent" "$release/stellar-agent-mcp"',
+    'cmp "$release/stellar-agent" "$release/stellar-agent-mcp"',
+)
+# The reviewed body of the copy helper that build.sh, check-host.sh,
+# verify-install.sh and the smoke build source, normalized alike: a new
+# mktemp file, a destination that is a regular file or absent, and a
+# rename(2) through perl that never follows a directory link.
+COPY_HELPER = RELEASE_SCRIPTS / "copy-alias.sh"
+COPY_HELPER_BODY = (
+    "copy_alias() {",
+    "local source=$1 destination=$2 temp",
+    'if [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then',
+    'echo "copy_alias: $destination is not a regular file" >&2',
+    "return 1",
+    "fi",
+    'temp=$(mktemp "$(dirname "$destination")/.stellar-agent-mcp.XXXXXX")',
+    'if ! cp -p "$source" "$temp" ||',
+    "! perl -e 'rename($ARGV[0], $ARGV[1]) or die \"copy_alias: $ARGV[1]: $!\\n\"' \"$temp\" \"$destination\"; then",
+    'rm -f -- "$temp"',
+    "return 1",
+    "fi",
+    "}",
+)
+# The reviewed body of derive-alias.sh, normalized alike: a canonical regular
+# file with one link, an alias that is a regular file or absent, a new mktemp
+# file, and a rename(2) through perl that never follows a directory link.
+DERIVE_SCRIPT = pathlib.PurePosixPath(".github/actions/macos-sign-notarize/derive-alias.sh")
+DERIVE_BODY = (
+    "set -euo pipefail",
+    "fail() {",
+    'echo "derive-alias: $*" >&2',
+    "exit 1",
+    "}",
+    "single_link_file() {",
+    '[ -f "$1" ] && [ ! -L "$1" ] && [ -n "$(/usr/bin/find "$1" -prune -links 1)" ]',
+    "}",
+    'if [ "$#" -ne 2 ]; then',
+    "echo 'usage: derive-alias.sh <dir> <suffix>' >&2",
+    "exit 2",
+    "fi",
+    "dir=${1%/}",
+    "suffix=$2",
+    'case "$suffix" in',
+    "'' | .exe) ;;",
+    "*)",
+    "echo \"derive-alias: unsupported suffix '$suffix'\" >&2",
+    "exit 2",
+    ";;",
+    "esac",
+    'canonical="$dir/stellar-agent$suffix"',
+    'alias="$dir/stellar-agent-mcp$suffix"',
+    'if [ -L "$canonical" ] || [ ! -f "$canonical" ]; then',
+    'fail "$canonical is not a regular file"',
+    "fi",
+    'single_link_file "$canonical" || fail "$canonical has more than one link"',
+    'if [ -L "$alias" ] || { [ -e "$alias" ] && [ ! -f "$alias" ]; }; then',
+    'fail "$alias is not a regular file"',
+    "fi",
+    'temp="$(/usr/bin/mktemp "$dir/.stellar-agent-mcp.XXXXXX")"',
+    "trap '/bin/rm -f \"$temp\"' EXIT",
+    '/bin/cp -p "$canonical" "$temp"',
+    "/usr/bin/perl -e 'rename($ARGV[0], $ARGV[1]) or die \"derive-alias: $ARGV[1]: $!\\n\"' \"$temp\" \"$alias\"",
+    "trap - EXIT",
+    'single_link_file "$alias" || fail "$alias is not a regular file with one link"',
+    '/usr/bin/cmp "$canonical" "$alias" || fail "$alias differs from $canonical"',
+)
+# The signing script signs the canonical executable only, verifies it, then
+# derives the alias from the signed file and packs both for notarization.
+# SIGN_BLOCK holds those lines with their neighbours, contiguous and
+# normalized; SIGN_FINAL is the closing verification of both names.
+SIGN_SCRIPT = pathlib.PurePosixPath(".github/actions/macos-sign-notarize/sign-notarize.sh")
+SIGN_LINE = ('/usr/bin/codesign --force --options runtime --timestamp --keychain "$KEYCHAIN" '
+             '--sign "$IDENTITY" "$BINARY_DIR/stellar-agent"')
+SIGN_BLOCK = (
+    "fi",
+    SIGN_LINE,
+    '/usr/bin/codesign --verify --strict --verbose=2 "$BINARY_DIR/stellar-agent"',
+    "/bin/bash \"${BASH_SOURCE[0]%/*}/derive-alias.sh\" \"$BINARY_DIR\" ''",
+    '/usr/bin/zip -j "$SUBMIT_ZIP" "$BINARY_DIR/stellar-agent" "$BINARY_DIR/stellar-agent-mcp"',
+    "printf '%s' \"$ASC_KEY_B64\" | /usr/bin/base64 -d >\"$ASC_KEY\"",
+)
+SIGN_FINAL = (
+    "for bin in stellar-agent stellar-agent-mcp; do",
+    '/usr/bin/codesign --verify --strict --verbose=2 "$BINARY_DIR/$bin"',
+    "done",
+)
+# The release targets and the runner that executes each one's archive: the
+# Intel macOS archive runs under Rosetta 2 on the Apple silicon runner.
+VERIFY_RUNNERS = {
+    "x86_64-unknown-linux-gnu": "ubuntu-24.04",
+    "aarch64-unknown-linux-gnu": "ubuntu-24.04-arm",
+    "x86_64-apple-darwin": "macos-26",
+    "aarch64-apple-darwin": "macos-26",
+    "x86_64-pc-windows-msvc": "windows-2025",
+}
+ROSETTA = {"run": "arch -x86_64 /usr/bin/true", "if": "matrix.target == 'x86_64-apple-darwin'"}
+ARCHIVE_CHECK = ('bash .github/scripts/release/verify-archive.sh archives "$VERSION" "$TARGET" '
+                 '"$EXPECTED_MAINNET_WRITE"')
+PROVENANCE_CHECKS = (
+    'python3 .github/scripts/check-provenance.py "provenance/stellar-agent-$VERSION.intoto.jsonl" '
+    'provenance/SHA256SUMS "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$GITHUB_REF"',
+    "cargo fetch --locked",
+    '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/check-feature-discipline.py')
+PACKAGE_START = "touch target/package-verification-start"
+PACKAGE_BUILD = "cargo package --workspace --locked"
+PACKAGE_CHECKS = {
+    "publish.yml": ('bash "$GITHUB_WORKSPACE/wf/.github/scripts/check-packaged-markers.sh" target '
+                    'target/package-verification-start "$EXPECTED_MAINNET_WRITE"'),
+    "release-rehearsal.yml": ('bash .github/scripts/check-packaged-markers.sh target '
+                              'target/package-verification-start "$EXPECTED_MAINNET_WRITE"'),
+}
+INSTALL_CHECK = ('bash "$GITHUB_WORKSPACE/wf/.github/scripts/release/verify-install.sh" "$TAG" '
+                 '"$EXPECTED_MAINNET_WRITE"')
+TOOLCHAIN_PIN = 'echo "RUSTUP_TOOLCHAIN=$RELEASE_TOOLCHAIN" >> "$GITHUB_ENV"'
+VERIFIED_SOURCE_CHECK = '[ "$(git -C src rev-parse HEAD)" = "$VERIFIED_SHA" ]'
+# The release checks, which no condition may skip and no command may ignore.
+GUARDED_JOBS = {"release.yml": ("verify-packaged", "verify-provenance", "hashes", "publish"),
+                "publish.yml": ("verify", "vendored-wasm", "publish", "verify-install"),
+                "release-rehearsal.yml": ("verify-packaged", "verify-crates")}
+# The verification jobs, which hold no credential.
+VERIFY_JOBS = (("release.yml", "verify-packaged"), ("release.yml", "verify-provenance"),
+               ("publish.yml", "verify"), ("publish.yml", "verify-install"),
+               ("release-rehearsal.yml", "verify-packaged"), ("release-rehearsal.yml", "verify-crates"))
+TOKEN_ENV = {"GH_TOKEN", "GITHUB_TOKEN"}
+SKILL_ARCHIVE_CONDITION = "github.base_ref != 'mainnet-write' && github.ref != 'refs/heads/mainnet-write'"
+# The feature jobs of ci.yml and the commands that define each of them. The
+# off jobs pass --no-default-features, which keeps mainnet-write off; the
+# binary packages enable it by default.
+CI_FEATURE_JOBS = {
+    "clippy": (
+        'cargo clippy --workspace --all-targets --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE" '
+        '-- -D warnings',),
+    "doc": ('cargo doc --workspace --no-deps --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE"',),
+    "test": (
+        "cargo test --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry",),
+    "feature-on-clippy": (
+        'cargo clippy --workspace --all-targets --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE" '
+        '-- -D warnings',),
+    "feature-on-doc": ('cargo doc --workspace --no-deps --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE"',),
+    "feature-on-test": (
+        "cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry",
+        "cargo check -p stellar-agent-network --features mainnet-write"),
+    "feature-discipline": (
+        "cargo fetch --locked",
+        '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/check-feature-discipline.py',
+        '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-feature-discipline.py --mutations',
+        "bash .github/scripts/test-check-binary-marker.sh",
+        "bash .github/scripts/test-release-checks.sh",
+        '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-provenance.py --mutations'),
+    "release-shape": ("bash .github/scripts/release/check-host.sh",),
+}
+# The feature jobs of ci.yml that skip a pull request into mainnet-write that
+# changes only documentation. Each needs only the changes job and runs under
+# DOCS_ONLY_CONDITION. On such a pull request the docs-tests job runs under
+# DOCS_TESTS_CONDITION instead and runs DOCS_TESTS_COMMANDS: the documentation
+# read check and the registry tests in the feature states of test and
+# feature-on-test.
+DOCS_ONLY_SKIPPED_JOBS = ("clippy", "doc", "test", "feature-on-clippy", "feature-on-doc", "feature-on-test",
+                          "release-shape")
+DOCS_ONLY_CONDITION = "!cancelled() && needs.changes.outputs.docs_only != 'true'"
+DOCS_TESTS_JOB = "docs-tests"
+DOCS_TESTS_CONDITION = "!cancelled() && needs.changes.outputs.docs_only == 'true'"
+DOCS_TESTS_COMMANDS = (
+    "python3 .github/scripts/check-docs-reads.py",
+    "python3 .github/scripts/run-docs-tests.py --no-default-features "
+    "--features test-helpers,test-hooks,test-loopback,verifier-registry",
+    "python3 .github/scripts/run-docs-tests.py "
+    "--features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry",
+)
+# The feature jobs of other workflows that run under a documented job
+# condition: for each workflow and job, that condition and the commands that
+# define the job.
+CONDITIONED_FEATURE_JOBS = {
+    (COVERAGE_WORKFLOW, "coverage-off"): (COVERAGE_CONDITION, (COVERAGE_OFF_COMMAND,)),
+    (COVERAGE_WORKFLOW, "coverage-on"): (COVERAGE_CONDITION, (COVERAGE_ON_COMMAND,)),
+    (COVERAGE_WORKFLOW, COVERAGE_GATE): (COVERAGE_GATE_CONDITION, (
+        COVERAGE_RESULT_CHECKS[0], COVERAGE_RESULT_CHECKS[1], COVERAGE_OFF_FLOORS, COVERAGE_ON_FLOORS)),
+}
+# The host recipe: the release build for the host target, which places the
+# stellar-agent-mcp copy, the byte comparison of both names and the marker
+# check of each; then the build of the CLI package alone, the copy of its
+# debug executable to the alias name with copy_alias, the byte comparison,
+# and the marker check of both debug names.
+HOST_ALIAS = "target/tmp/host-alias/stellar-agent-mcp"
+HOST_CHECKS = ('bash .github/scripts/release/build.sh "$target"',
+               'cmp "target/$target/release/stellar-agent" "target/$target/release/stellar-agent-mcp"',
+               'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent" on',
+               'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on',
+               "cargo build --locked -p stellar-agent-cli",
+               "mkdir -p target/tmp/host-alias",
+               ". .github/scripts/release/copy-alias.sh",
+               f"copy_alias target/debug/stellar-agent {HOST_ALIAS}",
+               f"cmp target/debug/stellar-agent {HOST_ALIAS}",
+               "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent on",
+               f"bash .github/scripts/check-binary-marker.sh {HOST_ALIAS} on")
 # For each job: the action that receives a credential, and the text of the
 # checks that earlier steps must hold. The third entry is the text of the
 # workspace code that reads the downloaded data. A clean-checkout check must
@@ -165,7 +633,7 @@ CREDENTIAL_GUARDS = {
     ("release.yml", "sign-macos"): (SIGNING_ACTION, ("validate-input.sh", CLEAN_CHECK), "validate-input.sh"),
     ("notarize-smoke.yml", "sign"): (SIGNING_ACTION, ("validate-input.sh", CLEAN_CHECK), "validate-input.sh"),
     ("publish.yml", "publish"): ("rust-lang/crates-io-auth-action", (
-        "check-ref-on-main.sh", "compare-crate-sums.py", CLEAN_CHECK, "rustc -V"), "compare-crate-sums.py"),
+        "check-ref-on-main.sh", "compare-crate-sums.py", CLEAN_CHECK, "rustc -V", VERIFIED_SOURCE_CHECK), "compare-crate-sums.py"),
 }
 
 RUNNER_TEMP_PATH = re.compile(r"^\$\{\{\s*runner\.temp\s*\}\}(/|$)")
@@ -177,32 +645,46 @@ SCRIPT_REF = re.compile(r"\.github/(?:scripts|actions)/[A-Za-z0-9_.-]+(?:/[A-Za-
 COMMAND_WORD = r"(?<![\w.-]){}[\"']?"
 # A cargo call up to its subcommand. Matching stops there, so every later
 # cargo call on the same line is found as well.
-CARGO_CALL = re.compile(COMMAND_WORD.format("cargo") + r"(?:\s+\+\S+)?\s+([^\s;&|)`]+)")
-CROSS_CALL = re.compile(COMMAND_WORD.format("cross") + r"(?:\s+\+\S+)?\s+[a-z]")
+CARGO_CALL = re.compile(COMMAND_WORD.format("cargo") + r"(?:[ \t]+\+[^ \t]+)?[ \t]+([^ \t;&|)`]+)")
+CROSS_CALL = re.compile(COMMAND_WORD.format("cross") + r"(?:[ \t]+\+[^ \t]+)?[ \t]+[a-z]")
 # Where the arguments of one command end: a shell operator, the end of a
 # command substitution or subshell, or a comment.
-ARGUMENTS_END = re.compile(r"[;&|)`]|(?<!\S)#")
+ARGUMENTS_END = re.compile(r"[;&|)`]|(?<![^ \t])#")
 ALLOWED_CARGO = {"metadata", "-V", "--version"}
+APT_GET_CALL = re.compile(COMMAND_WORD.format("apt-get") + r"(?=[ \t]|$)")
+APT_RETRIES = re.compile(r"(?:^|[ \t])-o[ \t]+Acquire::Retries=3(?=[ \t]|$)")
 NO_VERIFY_CARGO = {"package", "publish"}
 # A shell operator on a line that holds a check, which could chain the check,
 # skip it, or discard its result.
 SHELL_OPERATOR = re.compile(r"[;&|]")
+# The blanks that separate shell words.
+BLANKS = " \t"
 # The set builtin turning off errexit.
-ERREXIT_OFF = re.compile(r"(?<![\w-])set\s+(?:\+\w*e|\+o\s+errexit\b)")
+ERREXIT_OFF = re.compile(r"(?<![\w-])set[ \t]+(?:\+\w*e|\+o[ \t]+errexit\b)")
 # The ancestry script as the command of a line. Its path is the first word
 # with or without quotes and holds only directory names and variables. No
 # shell operator after it can chain or discard its result.
 ANCESTRY_CALL = re.compile(
-    r"""^\s*["']?(?:\$\{?[A-Za-z_]\w*\}?/|[\w.-]+/)*\.github/scripts/check-ref-on-main\.sh["']?(?:\s[^;&|]*)?$""")
-# A cargo build or cross build call, with the command word as in CARGO_CALL.
-BUILD_CALL = re.compile(COMMAND_WORD.format("(?:cargo|cross)") + r"(?:\s+\+\S+)?\s+build(?![\w-])")
-MATRIX_TARGET = re.compile(r"\$\{\{\s*matrix\.target\s*\}\}")
+    r"""^[ \t]*["']?(?:\$\{?[A-Za-z_]\w*\}?/|[\w.-]+/)*"""
+    r"""\.github/scripts/check-ref-on-main\.sh["']?(?:[ \t][^;&|]*)?$""")
+# A line that ends a check with an operator whose right side succeeds.
+SUPPRESSION = re.compile(r"\|\|[ \t]*(?:true\b|:(?=[ \t;]|$)|exit[ \t]+0\b)")
+# The runner and target expressions of a verification matrix leg.
+MATRIX_RUNNER = re.compile(r"^\$\{\{\s*matrix\.os\s*\}\}$")
+MATRIX_TARGET = re.compile(r"^\$\{\{\s*matrix\.target\s*\}\}$")
+# The words that open and close a shell compound command, and the end of a
+# line that closes the compound command it opens.
+COMPOUND_OPEN = {"if", "case", "while", "until", "for", "select", "{"}
+COMPOUND_CLOSE = {"fi", "esac", "done", "}"}
+COMPOUND_END = re.compile(r"(?:^|[; \t])(?:fi|esac|done|\})$")
 # A string literal of the expression syntax, whose text names no context.
 EXPRESSION_STRING = re.compile(r"'(?:[^']|'')*'")
 # A context name where a property chain starts. Expressions ignore case.
 SECRETS_CONTEXT = re.compile(r"(?<![\w.-])secrets(?![\w-])", re.IGNORECASE)
 GITHUB_CONTEXT = re.compile(r"(?<![\w.-])github(?![\w-])", re.IGNORECASE)
 NAMED_PROPERTY = re.compile(r"\s*\.\s*([A-Za-z_][\w-]*)")
+VARS_CONTEXT = re.compile(r"(?<![\w.-])vars(?![\w-])", re.IGNORECASE)
+WORKFLOW_DIR = pathlib.PurePosixPath(".github/workflows")
 
 
 class Checker:
@@ -211,6 +693,7 @@ class Checker:
         self.violations = []
         self.jobs_checked = 0
         self.docs = {}
+        self.unmodelled = set()
 
     def report(self, where, rule, message):
         self.violations.append(f"{where}: {rule}: {message}")
@@ -237,7 +720,7 @@ class Checker:
         a double quote outside a single-quoted string, an unfinished
         expression, and an unfinished string each raise ValueError.
         """
-        text = text or ""
+        text = "" if text is None else str(text)
         expressions = []
         position = 0
         while (start := text.find("${{", position)) != -1:
@@ -268,13 +751,33 @@ class Checker:
         return any(re.search(pattern, e) for e in Checker.expressions(str(value)))
 
     @staticmethod
+    def run_text(step):
+        """The text of a step's run: value; YAML can parse one as another
+        scalar type."""
+        return "" if step.get("run") is None else str(step["run"])
+
+    @staticmethod
     def logical_lines(text):
-        joined = re.sub(r"\\\n", " ", text or "")
-        return [line for line in joined.split("\n") if not line.lstrip().startswith("#")]
+        joined = re.sub(r"\\\n", " ", "" if text is None else str(text))
+        return [line for line in joined.split("\n") if not line.lstrip(BLANKS).startswith("#")]
 
     def runs(self, run, text):
         """Whether a run: block holds text on a line that is not a comment."""
         return run is not None and any(text in line for line in self.logical_lines(run))
+
+    @staticmethod
+    def unwrap_expression(value):
+        """A condition's text without surrounding blanks and one enclosing ${{ }}."""
+        text = str(value).strip()
+        if text.startswith("${{") and text.endswith("}}"):
+            text = text[3:-2].strip()
+        return text
+
+    def suppresses(self, step):
+        """Whether a step's run: block turns off errexit or ends a line with
+        an operator whose right side succeeds."""
+        run = self.run_text(step)
+        return bool(ERREXIT_OFF.search(run)) or any(SUPPRESSION.search(line) for line in self.logical_lines(run))
 
     @staticmethod
     def may_skip(step):
@@ -284,21 +787,21 @@ class Checker:
     def check_shell(self, where, text):
         for line in self.logical_lines(text):
             if CROSS_CALL.search(line):
-                self.report(where, "cred-compile", f"runs cross: {line.strip()}")
+                self.report(where, "cred-compile", f"runs cross: {line.strip(BLANKS)}")
             for match in CARGO_CALL.finditer(line):
                 sub = match.group(1).strip("\"'")
                 arguments = ARGUMENTS_END.split(line[match.end():], maxsplit=1)[0]
-                call = f"cargo {sub}{arguments}".strip()
+                call = f"cargo {sub}{arguments}".strip(BLANKS)
                 if sub in ALLOWED_CARGO:
                     continue
                 if sub in NO_VERIFY_CARGO:
-                    if "--no-verify" not in arguments.split():
+                    if "--no-verify" not in re.split(r"[ \t]+", arguments):
                         self.report(where, "cred-compile", f"cargo {sub} without --no-verify: {call}")
                     continue
                 self.report(where, "cred-compile", f"runs cargo {sub}: {call}")
 
     def check_referenced_files(self, where, text, seen):
-        for ref in SCRIPT_REF.findall(text or ""):
+        for ref in SCRIPT_REF.findall("" if text is None else str(text)):
             relative = pathlib.PurePosixPath(ref)
             if relative in seen:
                 continue
@@ -314,7 +817,7 @@ class Checker:
                 self.report(where, "cred-compile", f"names {relative}, which does not exist")
 
     def check_step_uses(self, where, uses, workflow, job_id):
-        if re.match(r"(Swatinem/rust-cache|actions/cache)(/[\w.-]+)*@", uses):
+        if CACHE_ACTION.match(uses):
             self.report(where, "cred-compile", f"uses {uses}")
         if re.search(r"rust-toolchain@", uses) and (workflow, job_id) not in TOOLCHAIN_ALLOWED:
             self.report(where, "cred-toolchain", f"installs a Rust toolchain ({uses})")
@@ -489,7 +992,7 @@ class Checker:
 
         if (workflow, job_id) in CREDENTIAL_GUARDS:
             self.check_credential_order(where, job, steps, *CREDENTIAL_GUARDS[(workflow, job_id)])
-        if workflow == "publish.yml" and tag_checkouts == 0:
+        if workflow == "publish.yml" and tag_checkouts == 0 and job_id != "vendored-wasm":
             self.report(where, "publish-tag-ref", "no checkout of refs/tags/...")
         if (workflow, job_id) in ANCESTRY_JOBS:
             if not ancestry_calls:
@@ -529,17 +1032,207 @@ class Checker:
                 self.report(workflow, "coverage-trigger", f"pull_request types lack {event}")
 
     def check_coverage_condition(self, workflow, jobs):
-        if "coverage" not in jobs:
-            self.report(workflow, "coverage-condition", "job coverage not found")
+        for name in COVERAGE_PARTS:
+            if name not in jobs:
+                self.report(workflow, "coverage-condition", f"job {name} not found")
+                continue
+            job = jobs[name]
+            condition = job.get("if") if isinstance(job, dict) else None
+            if isinstance(condition, str):
+                condition = self.unwrap_expression(condition)
+            if condition != COVERAGE_CONDITION:
+                self.report(workflow, "coverage-condition", f"{name} job runs without the label condition")
+        if COVERAGE_GATE not in jobs:
+            self.report(workflow, "coverage-condition", f"job {COVERAGE_GATE} not found")
             return
-        job = jobs["coverage"]
-        condition = job.get("if") if isinstance(job, dict) else None
-        if isinstance(condition, str):
-            condition = condition.strip()
-            if condition.startswith("${{") and condition.endswith("}}"):
-                condition = condition[3:-2].strip()
-        if condition != COVERAGE_CONDITION:
-            self.report(workflow, "coverage-condition", "coverage job runs without the label condition")
+        gate = jobs[COVERAGE_GATE] if isinstance(jobs[COVERAGE_GATE], dict) else {}
+        gate_condition = gate.get("if")
+        if isinstance(gate_condition, str):
+            gate_condition = self.unwrap_expression(gate_condition)
+        if gate_condition != COVERAGE_GATE_CONDITION:
+            self.report(workflow, "coverage-condition", "coverage gate runs without always() and the label condition")
+        if gate.get("name") != COVERAGE_GATE:
+            self.report(workflow, "coverage-condition", "coverage gate is not named coverage")
+
+    def check_coverage_split(self, workflow, jobs):
+        """Each measurement and floor command runs once, in its own job, and
+        each part uploads its report after its measurement."""
+        rule = "coverage-split"
+        owners = {COVERAGE_OFF_COMMAND: "coverage-off", COVERAGE_ON_COMMAND: "coverage-on",
+                  COVERAGE_OFF_FLOORS: COVERAGE_GATE, COVERAGE_ON_FLOORS: COVERAGE_GATE}
+        counts = {}
+        for name, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            for step in job.get("steps", []) or []:
+                for line in self.normalized(self.run_text(step)):
+                    if "cargo llvm-cov" not in line and "check-coverage.py" not in line:
+                        continue
+                    owner = owners.get(line)
+                    if owner is None:
+                        self.report(workflow, rule, f"unexpected coverage command in {name}: {line}")
+                    elif name != owner:
+                        self.report(workflow, rule, f"{line} runs in {name}, expected {owner}")
+                    else:
+                        counts[line] = counts.get(line, 0) + 1
+        for line, count in counts.items():
+            if count > 1:
+                self.report(workflow, rule, f"{owners[line]} has {count} occurrences of {line}, expected one")
+        for name, (artifact, path) in COVERAGE_EXPORTS.items():
+            job = jobs.get(name)
+            steps = (job.get("steps", []) or []) if isinstance(job, dict) else []
+            measured = [index for index, step in enumerate(steps)
+                        if COVERAGE_MEASURES[name] in self.normalized(self.run_text(step))]
+            uploads = []
+            for index, step in enumerate(steps):
+                options = step.get("with") or {}
+                if not str(step.get("uses") or "").startswith("actions/upload-artifact@") or "if" in step:
+                    continue
+                if options.get("name") != artifact or options.get("path") != path:
+                    continue
+                if options.get("if-no-files-found") != "error":
+                    continue
+                if not measured or index < measured[0]:
+                    continue
+                uploads.append(index)
+            if not uploads:
+                self.report(workflow, rule, f"{name} does not upload {artifact} after its measurement")
+
+    def check_coverage_gate(self, workflow, jobs):
+        """The gate needs both parts, checks their results first, rejects a
+        cancelled run before and after the floors, and floors only the
+        reports of its own run."""
+        rule = "coverage-gate"
+        gate = jobs.get(COVERAGE_GATE)
+        if not isinstance(gate, dict):
+            return
+        steps = gate.get("steps", []) or []
+
+        def rejects(step):
+            condition = step.get("if")
+            if not isinstance(condition, str) or self.unwrap_expression(condition) != COVERAGE_CANCEL_CONDITION:
+                return False
+            if "continue-on-error" in step:
+                return False
+            return self.normalized(self.run_text(step)) == [COVERAGE_CANCEL_RUN]
+
+        needs = gate.get("needs")
+        if not isinstance(needs, list) or set(map(str, needs)) != set(COVERAGE_PARTS):
+            self.report(workflow, rule, f"coverage gate needs {needs}, expected coverage-off and coverage-on")
+        first = steps[0] if steps else {}
+        if "if" in first or any(self.runs_line(first.get("run"), check)[0] < 0 for check in COVERAGE_RESULT_CHECKS):
+            self.report(workflow, rule, "coverage gate does not check the results first")
+        env = first.get("env")
+        if env != COVERAGE_RESULT_ENV:
+            self.report(workflow, rule, f"coverage gate result check reads {env}")
+        if len(steps) < 2 or not rejects(steps[1]):
+            self.report(workflow, rule, "coverage gate does not reject a cancelled run after its result check")
+        floors = [index for index, step in enumerate(steps)
+                  if any(self.runs_line(step.get("run"), command)[0] >= 0
+                         for command in (COVERAGE_OFF_FLOORS, COVERAGE_ON_FLOORS))]
+        if not (len(steps) > 2 and rejects(steps[-1]) and all(index < len(steps) - 1 for index in floors)):
+            self.report(workflow, rule, "coverage gate does not reject a cancelled run after its floors")
+        for index, step in enumerate(steps):
+            if index in (1, len(steps) - 1) and rejects(step):
+                continue
+            if "if" in step:
+                self.report(workflow, rule, f"coverage gate step {index + 1} runs under {step['if']}")
+        downloads = {}
+        for index, step in enumerate(steps):
+            if str(step.get("uses") or "").startswith("actions/download-artifact@"):
+                downloads.setdefault((step.get("with") or {}).get("name"), []).append((index, step))
+        first_floor = min(floors, default=len(steps))
+        for artifact, _ in COVERAGE_EXPORTS.values():
+            found = downloads.get(artifact, [])
+            if len(found) != 1 or "if" in found[0][1]:
+                self.report(workflow, rule, f"coverage gate does not download {artifact}")
+                continue
+            index, step = found[0]
+            options = step.get("with") or {}
+            for key in FOREIGN_ARTIFACT_INPUTS:
+                if key in options:
+                    self.report(workflow, rule, f"coverage gate downloads {artifact} with {key}")
+            if index > first_floor:
+                self.report(workflow, rule, f"coverage gate checks floors before downloading {artifact}")
+
+    def check_coverage_seed(self, workflow, doc):
+        """Pushes to both base branches run the workflow without a paths
+        filter. Later runs do not cancel a running push; a newer pending run
+        replaces the older pending run."""
+        rule = "coverage-seed"
+        triggers = doc.get("on", doc.get(True))
+        seeds = triggers if isinstance(triggers, dict) else {}
+        if "push" not in seeds:
+            self.report(workflow, rule, "push trigger is absent")
+        push = seeds.get("push")
+        push = push if isinstance(push, dict) else {}
+        branches = push.get("branches")
+        branches = branches if isinstance(branches, list) else []
+        for branch in COVERAGE_SEED_BRANCHES:
+            if branch not in branches:
+                self.report(workflow, rule, f"push branches lack {branch}")
+        if any(key in push for key in ("paths", "paths-ignore")):
+            self.report(workflow, rule, "push trigger has a paths filter")
+        concurrency = doc.get("concurrency")
+        cancel = concurrency.get("cancel-in-progress") if isinstance(concurrency, dict) else None
+        if not isinstance(cancel, str) or self.unwrap_expression(cancel) != COVERAGE_SEED_CANCEL:
+            self.report(workflow, rule, "later runs cancel a running push")
+
+    def check_coverage_attempt(self, workflow, jobs):
+        """Every upload and download of the workflow names a report of this
+        run attempt and selects it by that name alone."""
+        rule = "coverage-attempt"
+        names = {artifact for artifact, _ in COVERAGE_EXPORTS.values()}
+        for job_name, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            for index, step in enumerate(job.get("steps", []) or []):
+                uses = str(step.get("uses") or "")
+                download = uses.startswith("actions/download-artifact@")
+                if not download and not uses.startswith("actions/upload-artifact@"):
+                    continue
+                inputs = step.get("with") or {}
+                where = f"{job_name} step {index + 1}"
+                if inputs.get("name") not in names:
+                    self.report(workflow, rule, f"{where} transfers {inputs.get('name')}, not a report of this run attempt")
+                for key in COVERAGE_SELECTION_INPUTS:
+                    if download and key in inputs:
+                        self.report(workflow, rule, f"{where} downloads with {key}")
+
+    def check_cache_save_if(self):
+        """A rust-cache step of a workflow that a pull request triggers saves
+        only on push runs."""
+        directory = self.root / WORKFLOW_DIR
+        for source in sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")]):
+            if source.name in WORKFLOWS:
+                doc = self.docs.get(source.name)
+            else:
+                # apt-retries reports a file that does not parse.
+                try:
+                    doc = yaml.safe_load(source.read_text())
+                except (OSError, yaml.YAMLError):
+                    doc = None
+            if not isinstance(doc, dict):
+                continue
+            triggers = doc.get("on", doc.get(True))
+            if isinstance(triggers, dict):
+                events = set(triggers.keys())
+            elif isinstance(triggers, list):
+                events = {str(event) for event in triggers}
+            else:
+                events = {triggers}
+            if not events & {"pull_request", "pull_request_target"}:
+                continue
+            for name, job in (doc.get("jobs") or {}).items():
+                if not isinstance(job, dict):
+                    continue
+                for index, step in enumerate(job.get("steps", []) or []):
+                    if not RUST_CACHE_ACTION.match(str(step.get("uses") or "")):
+                        continue
+                    value = (step.get("with") or {}).get("save-if")
+                    if not isinstance(value, str) or self.unwrap_expression(value) != CACHE_SAVE_CONDITION:
+                        self.report(f"{source.name}:{name} step {index + 1}", "cache-save-if",
+                                    "rust-cache saves on pull request runs")
 
     @staticmethod
     def describe_permissions(permissions):
@@ -578,23 +1271,23 @@ class Checker:
         elif node is not None and not isinstance(node, (int, float, date)):
             raise ValueError(f"unsupported workflow node type: {type(node).__name__}")
 
-    def check_rehearsal_expressions(self, where, node):
+    def check_credential_expressions(self, where, node, rule):
         try:
             expressions = list(self.expression_values(node))
         except ValueError as err:
-            self.report(where, "rehearsal-credentials", str(err))
+            self.report(where, rule, str(err))
             return
         for expression in expressions:
             text = EXPRESSION_STRING.sub("''", expression)
             if SECRETS_CONTEXT.search(text):
-                self.report(where, "rehearsal-credentials", f"an expression reads secrets: {expression}")
+                self.report(where, rule, f"an expression reads secrets: {expression}")
             for context in GITHUB_CONTEXT.finditer(text):
                 name = NAMED_PROPERTY.match(text, context.end())
                 if name is None:
-                    self.report(where, "rehearsal-credentials",
+                    self.report(where, rule,
                                 f"an expression reads the github context other than by a named property: {expression}")
                 elif name.group(1).lower() == "token":
-                    self.report(where, "rehearsal-credentials", f"an expression reads the workflow token: {expression}")
+                    self.report(where, rule, f"an expression reads the workflow token: {expression}")
 
     def check_rehearsal_credentials(self, workflow, doc, jobs):
         workflow_permissions = doc.get("permissions")
@@ -604,7 +1297,7 @@ class Checker:
                         "expected exactly contents: read")
         for key, value in doc.items():
             if key != "jobs":
-                self.check_rehearsal_expressions(workflow, {key: value})
+                self.check_credential_expressions(workflow, {key: value}, "rehearsal-credentials")
         for job_id, job in jobs.items():
             where = f"{workflow}:{job_id}"
             if not isinstance(job, dict):
@@ -616,79 +1309,657 @@ class Checker:
                 self.report(where, "rehearsal-credentials",
                             f"effective permissions are {self.describe_permissions(permissions)}, "
                             "expected exactly contents: read")
-            self.check_rehearsal_expressions(where, {job_id: job})
+            self.check_credential_expressions(where, {job_id: job}, "rehearsal-credentials")
 
-    def read_script(self, relative):
+    def read_script(self, relative, rule):
         try:
             return (self.root / relative).read_text(errors="replace")
         except OSError as err:
-            self.report(str(relative), "release-script-drift", f"cannot be read: {err}")
+            self.report(str(relative), rule, f"cannot be read: {err}")
             return None
 
-    @staticmethod
-    def normalized(line):
-        return " ".join(line.split())
+    def job(self, workflow, name):
+        return (self.docs.get(workflow, {}).get("jobs") or {}).get(name)
 
     @staticmethod
-    def body_lines(text):
-        """Returns the lines of a script or run: block, without trailing
-        whitespace.
+    def line_syntax(line):
+        """Returns whether a line holds syntax the check does not model: an
+        open quote, substitution, subshell or group, a heredoc operator
+        outside quotes, or a closing &&, ||, | or |& that makes the next
+        line conditional or piped."""
+        quote, depth, backtick, group, heredoc, i = None, 0, False, 0, False, 0
+        while i < len(line):
+            char = line[i]
+            if char == "\\" and quote != "'":
+                i += 2
+                continue
+            if quote == "'":
+                quote = None if char == "'" else quote
+            elif line.startswith("$(", i):
+                depth += 1
+                i += 1
+            elif char == "`":
+                backtick = not backtick
+            elif quote == '"':
+                if char == '"':
+                    quote = None
+                elif char == ")" and depth:
+                    depth -= 1
+            elif char in "'\"":
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            elif char in "{}" and (i == 0 or line[i - 1] in " \t;&|") and line[i + 1:i + 2] in ("", " ", ";"):
+                group += 1 if char == "{" else -1
+            elif line.startswith("<<<", i):
+                i += 3
+                continue
+            elif line.startswith("<<", i):
+                heredoc = True
+            i += 1
+        joins = line.endswith(("&&", "||", "|", "|&"))
+        return bool(quote or depth or backtick or group or heredoc or joins)
 
-        The leading comment and blank lines and the trailing blank lines are
-        left out, so a script's header and a block's final newline do not
-        count.
+    def runs_line(self, run, command):
+        """Returns (position, problem) for command in a run: block.
+
+        position is the index of the logical line that runs command
+        unconditionally, else -1. The line must equal command after each
+        run of spaces and tabs is collapsed to one space, so no comment,
+        prefix, operator, substitution or variable can skip it or discard
+        its status, and no other character counts as a blank. A line
+        inside a compound command, or after a line that exits, returns or
+        turns off errexit, does not count. When the block names command, a
+        line before the call whose syntax the check does not model fails
+        closed: problem names the line that leaves a quote, a substitution,
+        a subshell or a group open, opens a heredoc, ends in an operator
+        that joins it to the next line, or holds command inside a longer
+        line, so a heredoc in such a block is refused. Otherwise
+        problem is None. Whether the block names command is read from the
+        same joined logical lines that the match reads.
         """
-        lines = [line.rstrip() for line in (text or "").split("\n")]
-        start = 0
-        while start < len(lines) and (not lines[start] or lines[start].lstrip().startswith("#")):
-            start += 1
-        end = len(lines)
-        while end > start and not lines[end - 1]:
-            end -= 1
-        return lines[start:end]
+        text = "" if run is None else str(run)
+        lines = [" ".join(re.split(r"[ \t]+", line.strip(BLANKS))) for line in self.logical_lines(text)]
+        names, depth = any(command in line for line in lines), 0
+        for position, line in enumerate(lines):
+            if not line:
+                continue
+            if line == command:
+                return (position if depth == 0 else -1), None
+            if names and (self.line_syntax(line) or command in line):
+                return -1, f"logical line {position + 1}: {line}"
+            word = line.split(" ")[0]
+            if ERREXIT_OFF.search(line) or (word in ("exit", "return") and depth == 0):
+                return -1, None
+            if word in COMPOUND_OPEN or line.endswith("{"):
+                if not COMPOUND_END.search(line):
+                    depth += 1
+            elif word in COMPOUND_CLOSE:
+                depth -= 1
+        return -1, None
 
-    def check_release_script_drift(self):
-        release = self.docs.get("release.yml")
-        if not isinstance(release, dict):
+    def effective_shell(self, workflow, name, step):
+        """The step shell overrides job defaults, which override workflow defaults."""
+        job = self.job(workflow, name) or {}
+        defaults = [((owner.get("defaults") or {}).get("run") or {}).get("shell")
+                    for owner in (job, self.docs[workflow])]
+        return step.get("shell") or defaults[0] or defaults[1]
+
+    def step_position(self, workflow, name, index, step, command, rule):
+        """Returns where step index of a job runs command unconditionally
+        under errexit, or -1, and reports syntax the check does not model."""
+        shell = self.effective_shell(workflow, name, step)
+        position, problem = self.runs_line(step.get("run"), command)
+        where = f"{workflow}:{name} step {index + 1}"
+        if problem and (where, problem) not in self.unmodelled:
+            self.unmodelled.add((where, problem))
+            self.report(where, rule, f"unmodelled shell syntax around {command}: {problem}")
+        return position if shell in (None, "bash") else -1
+
+    def runs_in_job(self, workflow, name, command, rule):
+        """Returns the index of the first step of a job that runs command
+        unconditionally, or -1."""
+        for index, step in enumerate((self.job(workflow, name) or {}).get("steps", [])):
+            if self.step_position(workflow, name, index, step, command, rule) >= 0:
+                return index
+        return -1
+
+    def needs(self, workflow, name, dependency, rule):
+        values = (self.job(workflow, name) or {}).get("needs", [])
+        values = [values] if isinstance(values, str) else values
+        if dependency not in values:
+            self.report(workflow, rule, f"{name} must need {dependency}")
+
+    def check_shared_build(self):
+        for workflow in ("release.yml", "release-rehearsal.yml"):
+            job = self.job(workflow, "build") or {}
+            steps = job.get("steps", [])
+            calls = [self.run_text(step).strip(BLANKS + "\n") for step in steps]
+            for call in BUILD_CALLS:
+                if calls.count(call) != 1:
+                    self.report(workflow, "release-shared-scripts", f"expected one call: {call}")
+            if BUILD_CALLS[-1] in calls:
+                index = calls.index(BUILD_CALLS[-1])
+                if calls[max(0, index - 2):index] != list(BUILD_CALLS[:-1]):
+                    self.report(workflow, "release-guard-order", "build must immediately follow Perl and sodium setup")
+                if self.may_skip(steps[index]) or self.may_skip(job):
+                    self.report(workflow, "release-check-unconditional", "build can be skipped")
+        script = self.read_script(BUILD_SCRIPT, "release-shared-scripts")
+        lines = list(self.logical_lines(script)) if script is not None else []
+        if lines[:2] != ["set -euo pipefail", BUILD_GUARD]:
+            self.report(str(BUILD_SCRIPT), "release-shared-scripts", "environment guard is not the first build action")
+        if script is not None and self.normalized(script) != list(BUILD_BODY):
+            self.report(str(BUILD_SCRIPT), "release-shared-scripts", "build operations differ from BUILD_BODY")
+        smoke = [step for step in (self.job("notarize-smoke.yml", "build") or {}).get("steps", [])
+                 if step.get("name") == "Build binaries"]
+        if len(smoke) != 1 or self.normalized(self.run_text(smoke[0])) != list(SMOKE_BUILD):
+            self.report("notarize-smoke.yml", "release-shared-scripts", "smoke build operations differ from SMOKE_BUILD")
+        helper = self.read_script(COPY_HELPER, "release-shared-scripts")
+        if helper is not None and self.normalized(helper) != list(COPY_HELPER_BODY):
+            self.report(str(COPY_HELPER), "release-shared-scripts", "copy operations differ from COPY_HELPER_BODY")
+        self.check_signing_order()
+
+    @classmethod
+    def normalized(cls, text):
+        """The logical lines of text without blank lines, each run of blanks
+        collapsed to one space."""
+        return [" ".join(re.split(r"[ \t]+", line.strip(BLANKS)))
+                for line in cls.logical_lines(text) if line.strip(BLANKS)]
+
+    def check_signing_order(self):
+        script = self.read_script(SIGN_SCRIPT, "signing-order")
+        if script is None:
             return
-        job = (release.get("jobs") or {}).get("build")
-        if not isinstance(job, dict):
-            self.report("release.yml", "release-script-drift", "no build job")
+        lines, block = self.normalized(script), list(SIGN_BLOCK)
+        if not any(lines[index:index + len(block)] == block for index in range(len(lines))):
+            self.report(str(SIGN_SCRIPT), "signing-order", "signing, derivation and packing differ from SIGN_BLOCK")
+        if [line for line in lines if "--sign" in line] != [SIGN_LINE]:
+            self.report(str(SIGN_SCRIPT), "signing-order", "a codesign call signs another file than stellar-agent")
+        if lines[-len(SIGN_FINAL):] != list(SIGN_FINAL):
+            self.report(str(SIGN_SCRIPT), "signing-order", "the script does not end by verifying both signatures")
+        derive = self.read_script(DERIVE_SCRIPT, "signing-order")
+        if derive is not None and self.normalized(derive) != list(DERIVE_BODY):
+            self.report(str(DERIVE_SCRIPT), "signing-order", "derivation operations differ from DERIVE_BODY")
+
+    def check_release_gates(self):
+        self.check_publish_wasm_gate()
+        self.needs("release.yml", "hashes", "verify-packaged", "release-packaged-gate")
+        for dependency in ("preflight", "build", "sign-macos"):
+            self.needs("release.yml", "verify-packaged", dependency, "release-packaged-gate")
+        for workflow in ("release.yml", "release-rehearsal.yml"):
+            if self.runs_in_job(workflow, "verify-packaged", ARCHIVE_CHECK, "release-packaged-gate") < 0:
+                self.report(workflow, "release-packaged-gate", "verify-packaged does not run the archive check unconditionally")
+        self.needs("release.yml", "publish", "verify-provenance", "release-provenance-gate")
+        for dependency in ("preflight", "provenance", "hashes"):
+            self.needs("release.yml", "verify-provenance", dependency, "release-provenance-gate")
+        for command in PROVENANCE_CHECKS:
+            if self.runs_in_job("release.yml", "verify-provenance", command, "release-provenance-gate") < 0:
+                self.report("release.yml", "release-provenance-gate", f"verify-provenance does not run unconditionally: {command}")
+        self.needs("publish.yml", "publish", "verify", "publish-dry-gate")
+        for workflow, name in (("publish.yml", "verify"), ("release-rehearsal.yml", "verify-crates")):
+            steps = (self.job(workflow, name) or {}).get("steps", [])
+            def runs(command):
+                return [i for i, step in enumerate(steps)
+                        if self.step_position(workflow, name, i, step, command, "publish-dry-gate") >= 0]
+            builds, checks = runs(PACKAGE_BUILD), runs(PACKAGE_CHECKS[workflow])
+            if len(builds) != 1 or len(checks) != 1 or checks[0] != builds[0] + 1:
+                self.report(workflow, "publish-dry-gate", "packaged marker check must immediately follow package verification")
+            if builds:
+                run = steps[builds[0]].get("run")
+                if not 0 <= self.runs_line(run, PACKAGE_START)[0] < self.runs_line(run, PACKAGE_BUILD)[0]:
+                    self.report(workflow, "publish-dry-gate", "package verification lacks the freshness timestamp")
+        self.needs("publish.yml", "verify-install", "publish", "publish-install-gate")
+        if self.runs_in_job("publish.yml", "verify-install", INSTALL_CHECK, "publish-install-gate") < 0:
+            self.report("publish.yml", "publish-install-gate", "verify-install does not run the install check unconditionally")
+
+    def check_unconditional(self):
+        for workflow, names in GUARDED_JOBS.items():
+            for name in names:
+                job = self.job(workflow, name)
+                if job is None:
+                    self.report(workflow, "release-check-unconditional", f"missing {name}")
+                    continue
+                allowed = workflow == "publish.yml" and name in ("publish", "vendored-wasm")
+                condition = str(job.get("if", "")).strip()
+                if "continue-on-error" in job or ("if" in job and not (allowed and condition == "${{ !inputs.verify_only }}")):
+                    self.report(workflow, "release-check-unconditional", f"{name} can be bypassed")
+                for step in job.get("steps", []):
+                    rosetta = step.get("run") == ROSETTA["run"] and step.get("if") == ROSETTA["if"]
+                    if "continue-on-error" in step or ("if" in step and not rosetta):
+                        self.report(workflow, "release-check-unconditional", f"{name} step can be bypassed")
+                    if self.suppresses(step):
+                        self.report(workflow, "release-check-unconditional", f"{name} suppresses failures")
+
+    def check_verification_credentials(self):
+        for workflow, name in VERIFY_JOBS:
+            job = self.job(workflow, name)
+            if job is None:
+                continue
+            where = f"{workflow}:{name}"
+            if self.credentialed(job, self.docs[workflow]) or job.get("permissions") != {"contents": "read"}:
+                self.report(where, "verification-credentials", "must be uncredentialed with contents: read")
+            self.check_credential_expressions(where, {name: job}, "verification-credentials")
+            # rehearsal-credentials reads every expression of the rehearsal.
+            if workflow != REHEARSAL_WORKFLOW:
+                inherited = {key: self.docs[workflow][key] for key in ("env", "defaults")
+                             if key in self.docs[workflow]}
+                self.check_credential_expressions(where, inherited, "verification-credentials")
+            environments = (self.docs[workflow].get("env"), job.get("env"),
+                            *(step.get("env") for step in job.get("steps", [])))
+            for env in environments:
+                for key in env or {}:
+                    if str(key).upper() in TOKEN_ENV:
+                        self.report(where, "verification-credentials", f"sets {key}")
+
+    def check_verify_matrix(self):
+        for workflow in ("release.yml", "release-rehearsal.yml"):
+            job = self.job(workflow, "verify-packaged") or {}
+            include = ((job.get("strategy") or {}).get("matrix") or {}).get("include") or []
+            legs = sorted(tuple(sorted(leg.items())) for leg in include if isinstance(leg, dict))
+            wanted = sorted((("os", runner), ("target", target)) for target, runner in VERIFY_RUNNERS.items())
+            if len(legs) != len(include) or legs != wanted:
+                self.report(workflow, "release-verify-matrix", "verify-packaged does not run each release target on its runner")
+            if not MATRIX_RUNNER.match(str(job.get("runs-on", "")).strip()):
+                self.report(workflow, "release-verify-matrix", "verify-packaged does not run on the runner of its matrix leg")
+            archive = [step for step in job.get("steps", [])
+                       if self.runs_line(step.get("run"), ARCHIVE_CHECK)[0] >= 0]
+            if any(not MATRIX_TARGET.match(str((step.get("env") or {}).get("TARGET", "")).strip())
+                   for step in archive):
+                self.report(workflow, "release-verify-matrix", "the archive check does not read TARGET from the matrix leg")
+            steps = job.get("steps") or [{}]
+            if steps[0].get("run") != ROSETTA["run"] or steps[0].get("if") != ROSETTA["if"]:
+                self.report(workflow, "release-verify-matrix", "the first verify-packaged step is not the Rosetta check")
+
+    def check_release_cache(self):
+        for workflow in ("release.yml", REHEARSAL_WORKFLOW):
+            for name, job in (self.docs.get(workflow, {}).get("jobs") or {}).items():
+                for step in job.get("steps", []):
+                    uses = step.get("uses") or ""
+                    if CACHE_ACTION.match(uses):
+                        self.report(f"{workflow}:{name}", "release-cache", f"uses {uses}")
+                    inputs = step.get("with") or {}
+                    if SETUP_ACTION.match(uses) and any(str(key).lower() == "cache" for key in inputs):
+                        self.report(f"{workflow}:{name}", "release-cache", f"passes a cache input to {uses}")
+
+    def check_publish_wasm_gate(self):
+        rule = "publish-wasm-gate"
+        workflow = "publish.yml"
+        publish = self.job(workflow, "publish") or {}
+        if not {"verify", "vendored-wasm"}.issubset(publish.get("needs", [])):
+            self.report(workflow, rule, "publish must need verify and vendored-wasm")
+        call = self.job(workflow, "vendored-wasm") or {}
+        if call.get("uses") != "./.github/workflows/vendored-wasm.yml":
+            self.report(workflow, rule, "vendored-wasm must call the local workflow")
+        if call.get("needs") not in ("verify", ["verify"]):
+            self.report(workflow, rule, "vendored-wasm must need exactly verify")
+        for name, job in (("publish", publish), ("vendored-wasm", call)):
+            if job.get("if") != "${{ !inputs.verify_only }}":
+                self.report(workflow, rule, f"{name} must run exactly on !inputs.verify_only")
+        if call.get("with") != {"source_sha": "${{ needs.verify.outputs.sha }}", "publication": True}:
+            self.report(workflow, rule, "vendored-wasm must pass exactly the verified source SHA and publication: true")
+        if any(key in call for key in ("secrets", "continue-on-error")):
+            self.report(workflow, rule, "vendored-wasm must set no secrets or continue-on-error")
+        workflow = "vendored-wasm.yml"
+        doc = self.docs.get(workflow, {})
+        triggers = doc.get("on", doc.get(True)) or {}
+        inputs = ((triggers.get("workflow_call") or {}).get("inputs") or {}) if isinstance(triggers, dict) else {}
+        for name, kind, default in (("source_sha", "string", ""), ("publication", "boolean", False)):
+            if inputs.get(name) != {"type": kind, "required": False, "default": default}:
+                self.report(workflow, rule, f"workflow_call must declare optional {name} with its type and default")
+        for name in ("check", "rebuild", "vendored-wasm"):
+            steps = (self.job(workflow, name) or {}).get("steps", [])
+            checkouts = [step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")]
+            if not checkouts or any((step.get("with") or {}).get("ref") != "${{ inputs.source_sha }}" for step in checkouts):
+                self.report(workflow, rule, f"{name} checkout must use inputs.source_sha")
+        steps = (self.job(workflow, "check") or {}).get("steps", [])
+        decide = next((step for step in steps if step.get("id") == "decide"), {})
+        env = decide.get("env") or {}
+        if env.get("PUBLICATION") != "${{ inputs.publication }}" or env.get("SOURCE_SHA") != "${{ inputs.source_sha }}":
+            self.report(workflow, rule, "decide must read PUBLICATION and SOURCE_SHA from inputs")
+        if '[ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]' not in self.run_text(decide):
+            self.report(workflow, rule, "decide must compare HEAD with SOURCE_SHA")
+        for name, job in (doc.get("jobs") or {}).items():
+            for step in job.get("steps", []):
+                if CACHE_ACTION.match(step.get("uses") or ""):
+                    guard = "github.ref_type != 'tag' && !inputs.publication"
+                    condition = self.unwrap_expression(step.get("if", ""))
+                    if condition != guard and not condition.startswith(guard + " && "):
+                        self.report(f"{workflow}:{name}", rule, f"cache guard must lead with {guard}")
+
+    def check_release_wasm_gate(self):
+        rule = "release-wasm-gate"
+        job = self.job("release.yml", "vendored-wasm") or {}
+        if job.get("uses") != "./.github/workflows/vendored-wasm.yml" or any(
+                key in job for key in ("if", "with", "secrets", "continue-on-error")):
+            self.report("release.yml", rule, "vendored-wasm must call the local workflow unconditionally without inputs or secrets")
+        self.needs("release.yml", "hashes", "vendored-wasm", rule)
+        self.needs("release.yml", "publish", "vendored-wasm", rule)
+        workflow = "vendored-wasm.yml"
+        doc = self.docs.get(workflow, {})
+        triggers = doc.get("on", doc.get(True))
+        if not isinstance(triggers, dict) or "workflow_call" not in triggers:
+            self.report(workflow, rule, "workflow_call is absent")
+        for name, job in (doc.get("jobs") or {}).items():
+            where = f"{workflow}:{name}"
+            if "continue-on-error" in job:
+                self.report(where, rule, f"{name} continues on error")
+            for index, step in enumerate(job.get("steps", [])):
+                if "continue-on-error" in step:
+                    self.report(where, rule, f"{name} step {index + 1} continues on error")
+                if name in ("check", "rebuild", "vendored-wasm") and self.suppresses(step):
+                    self.report(where, rule, f"{name} step {index + 1} suppresses failures")
+                if not CACHE_ACTION.match(step.get("uses") or ""):
+                    continue
+                if name == "rebuild":
+                    self.report(where, rule, "rebuild uses a cache")
+                condition = self.unwrap_expression(step.get("if", ""))
+                guard = "github.ref_type != 'tag' && !inputs.publication"
+                if condition != guard and not condition.startswith(guard + " && "):
+                    self.report(where, rule, f"cache guard must lead with {guard}")
+                uses = str(step.get("uses") or "")
+                if re.match(r"actions/cache/save@", uses, re.IGNORECASE):
+                    if condition != WASM_SAVE_CONDITION:
+                        self.report(where, rule, f"cache save must run exactly on {WASM_SAVE_CONDITION}")
+                elif not re.match(r"actions/cache/restore@", uses, re.IGNORECASE):
+                    self.report(where, rule, f"{name} step {index + 1} uses {uses}, which saves outside a save step")
+        self.check_wasm_rebuild(workflow, rule)
+        self.check_wasm_gate_job(workflow, rule)
+
+    def check_wasm_rebuild(self, workflow, rule):
+        job = self.job(workflow, "rebuild") or {}
+        if self.unwrap_expression(job.get("if", "")) != WASM_REBUILD_CONDITION:
+            self.report(workflow, rule, f"rebuild must run exactly on {WASM_REBUILD_CONDITION}")
+        steps = job.get("steps", [])
+        full = [step for step in steps if self.runs(step.get("run"), WASM_FULL_MODE)]
+        if not full or any("if" in step for step in full):
+            self.report(workflow, rule, "rebuild must rebuild and compare unconditionally")
+        for step in steps:
+            if not (step.get("uses") or "").startswith("actions/download-artifact@"):
+                continue
+            for key in FOREIGN_ARTIFACT_INPUTS:
+                if key in (step.get("with") or {}):
+                    self.report(workflow, rule, f"rebuild downloads an artifact with {key}")
+        for version in (25, 28):
+            artifact = f"vendored-wasm-stellar-cli-{version}"
+            if not any((step.get("uses") or "").startswith("actions/download-artifact@")
+                       and (step.get("with") or {}).get("name") == artifact
+                       and not self.may_skip(step) for step in steps):
+                self.report(workflow, rule, f"rebuild does not download {artifact} unconditionally")
+
+    def check_wasm_gate_job(self, workflow, rule):
+        job = self.job(workflow, "vendored-wasm") or {}
+        if self.unwrap_expression(job.get("if", "")) != "always()":
+            self.report(workflow, rule, "the vendored-wasm job must run on always()")
+        needs = job.get("needs", [])
+        needs = [needs] if isinstance(needs, str) else needs
+        if not isinstance(needs, list) or sorted(str(value) for value in needs) != WASM_GATE_NEEDS:
+            self.report(workflow, rule, f"the vendored-wasm job must need exactly {', '.join(WASM_GATE_NEEDS)}")
+        gates = [step for step in job.get("steps", []) if self.runs(step.get("run"), "rebuild-vendored-wasm.sh --gate")]
+        if len(gates) != 1 or "if" in gates[0]:
+            self.report(workflow, rule, "the vendored-wasm job must run one gate step unconditionally")
+        elif self.run_text(gates[0]).strip(BLANKS + "\n") != WASM_GATE_CALL:
+            self.report(workflow, rule, f"the gate step must run exactly: {WASM_GATE_CALL}")
+        if len(gates) == 1 and gates[0].get("env") != WASM_GATE_ENV:
+            self.report(workflow, rule, "the gate step must read each job result and the ref type from its expression")
+
+    def check_release_publish_sums(self):
+        rule = "release-publish-sums"
+        command = 'bash .github/scripts/release/verify-sums.sh "$RUNNER_TEMP/release"'
+        check = self.runs_in_job("release.yml", "publish", command, rule)
+        steps = (self.job("release.yml", "publish") or {}).get("steps", [])
+        releases = [i for i, step in enumerate(steps)
+                    if (step.get("uses") or "").startswith("softprops/action-gh-release@")]
+        if (check < 0 or self.may_skip(steps[check])
+                or self.may_skip(self.job("release.yml", "publish") or {})
+                or not releases or any(check >= release for release in releases)):
+            self.report("release.yml", rule, "publish must verify sums unconditionally before the release action")
+
+    def check_release_toolchain(self):
+        publish = (self.docs.get("publish.yml", {}).get("env") or {}).get("RELEASE_TOOLCHAIN")
+        for workflow in ("release.yml", REHEARSAL_WORKFLOW):
+            value = (self.docs.get(workflow, {}).get("env") or {}).get("RELEASE_TOOLCHAIN")
+            if publish is None or value != publish:
+                self.report(workflow, "release-toolchain", "RELEASE_TOOLCHAIN differs from publish.yml")
+        for workflow, name, command in ((REHEARSAL_WORKFLOW, "verify-crates", PACKAGE_BUILD),
+                                        ("release.yml", "build", BUILD_CALLS[-1]),
+                                        (REHEARSAL_WORKFLOW, "build", BUILD_CALLS[-1])):
+            job = self.job(workflow, name) or {}
+            installs = [i for i, step in enumerate(job.get("steps", []))
+                        if re.match(r"dtolnay/rust-toolchain@", step.get("uses") or "")
+                        and (step.get("with") or {}).get("toolchain") == "${{ env.RELEASE_TOOLCHAIN }}"
+                        and (name != "build" or (step.get("with") or {}).get("targets") == "${{ matrix.target }}")
+                        and not self.may_skip(step)]
+            pin = self.runs_in_job(workflow, name, TOOLCHAIN_PIN, "release-toolchain")
+            build = self.runs_in_job(workflow, name, command, "release-toolchain")
+            install = installs[0] if installs else -1
+            problem, action = ((f"{name} does not package with RELEASE_TOOLCHAIN", "packaging")
+                               if name == "verify-crates" else ("build does not compile with RELEASE_TOOLCHAIN", "build"))
+            if not installs:
+                self.report(workflow, "release-toolchain", f"{problem}: it installs another toolchain")
+            elif pin < 0 or self.may_skip(job["steps"][pin]):
+                self.report(workflow, "release-toolchain", f"{problem}: it does not pin RUSTUP_TOOLCHAIN")
+            elif not install < pin < build:
+                self.report(workflow, "release-toolchain",
+                            f"{problem}: RUSTUP_TOOLCHAIN is not pinned between the install and the {action}")
+
+    def check_changelog_workflow(self):
+        workflow, rule = "changelog.yml", "changelog-check"
+        doc = self.docs.get(workflow, {})
+        triggers = doc.get("on", doc.get(True))
+        triggers = triggers if isinstance(triggers, dict) else {}
+        if "push" not in triggers:
+            self.report(workflow, rule, "push trigger is absent")
+        if "pull_request" not in triggers:
+            self.report(workflow, rule, "pull_request trigger is absent")
+        events = ["opened", "synchronize", "reopened", "edited"]
+        if (set(triggers) - {"push", "pull_request"}
+                or triggers.get("push") is not None
+                or ("pull_request" in triggers and triggers["pull_request"] != {"types": events})):
+            self.report(workflow, rule, "event filters or types differ")
+        job = self.job(workflow, "changelog")
+        if job is None:
+            self.report(workflow, rule, "missing changelog job")
             return
-        where = "release.yml:build"
-        steps = [step for step in job.get("steps", []) or [] if isinstance(step, dict)]
-        release_lines = [self.normalized(MATRIX_TARGET.sub('"$TARGET"', line))
-                         for step in steps for line in self.logical_lines(step.get("run")) if BUILD_CALL.search(line)]
-        if not release_lines:
-            self.report(where, "release-script-drift", "runs no cargo build or cross build line")
-        script = self.read_script(BUILD_SCRIPT)
-        if script is not None:
-            script_lines = [self.normalized(line) for line in self.logical_lines(script) if BUILD_CALL.search(line)]
-            for line in release_lines:
-                if line not in script_lines:
-                    self.report(str(BUILD_SCRIPT), "release-script-drift", f"lacks the release build line: {line}")
-            for line in script_lines:
-                if line not in release_lines:
-                    self.report(str(BUILD_SCRIPT), "release-script-drift",
-                                f"build line not in the release build job: {line}")
-        for variable, relative in SETUP_SCRIPTS:
-            writers = [step for step in steps if isinstance(step.get("run"), str)
-                       and f"{variable}=" in step["run"] and "GITHUB_ENV" in step["run"]]
-            if len(writers) != 1:
-                self.report(where, "release-script-drift",
-                            f"{len(writers)} steps write {variable} to GITHUB_ENV, expected one")
+        if ("if" in job or "needs" in job or "continue-on-error" in job
+                or job.get("runs-on") != "ubuntu-24.04" or set(doc.get("jobs", {})) != {"changelog"}
+                or doc.get("permissions") != {"contents": "read"}
+                or job.get("permissions", {"contents": "read"}) != {"contents": "read"}):
+            self.report(workflow, rule, "changelog job can be bypassed or changes its execution contract")
+        steps = job.get("steps", [])
+
+        def named(name):
+            found = [(i, step) for i, step in enumerate(steps) if step.get("name") == name]
+            return found[0] if len(found) == 1 else (-1, {})
+
+        _, check = named("Check changelog fragments")
+        if not check:
+            self.report(workflow, rule, "missing fragment check step")
+        else:
+            if self.may_skip(check) or self.effective_shell(workflow, "changelog", check) not in (None, "bash"):
+                self.report(workflow, rule, "fragment check can be bypassed")
+            if self.run_text(check).strip() != "python3 .github/scripts/changelog.py check":
+                self.report(workflow, rule, "fragment check command differs")
+        _, test = named("Test changelog fragments")
+        if not test:
+            self.report(workflow, rule, "missing fragment test step")
+        elif (self.may_skip(test) or self.effective_shell(workflow, "changelog", test) not in (None, "bash")
+              or self.run_text(test).strip() != "python3 .github/scripts/test-changelog.py"):
+            self.report(workflow, rule, "fragment test can be bypassed or its command differs")
+        guard_index, guard = named("Protect integration changelog")
+        fetch_index, fetch = named("Fetch main for changelog protection")
+        checkouts = [(i, step) for i, step in enumerate(steps)
+                     if str(step.get("uses", "")).startswith("actions/checkout@")]
+        checkout_index, checkout = checkouts[0] if len(checkouts) == 1 else (-1, {})
+        options = checkout.get("with", {})
+        setup = [step for step in steps if str(step.get("uses", "")).startswith("actions/setup-python@")]
+        if (not checkout or self.may_skip(checkout) or options.get("fetch-depth") != 0
+                or "ref" in options or options.get("persist-credentials") is not False
+                or checkout.get("uses") != "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+                or len(setup) != 1 or self.may_skip(setup[0])
+                or setup[0].get("uses") != "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+                or str(setup[0].get("with", {}).get("python-version")) != "3.13"
+                or not fetch or self.may_skip(fetch) or fetch.get("shell") != "bash"
+                or self.run_text(fetch).strip() != CHANGELOG_FETCH
+                or self.step_position(workflow, "changelog", fetch_index, fetch, CHANGELOG_FETCH, rule) < 0
+                or not checkout_index < fetch_index
+                or (guard and fetch_index >= guard_index)):
+            self.report(workflow, rule, "checkout and main fetch must supply full history before the guard")
+        if not guard:
+            self.report(workflow, "changelog-guard", "missing integration guard")
+            return
+        condition = self.unwrap_expression(guard.get("if", ""))
+        if condition != CHANGELOG_CONDITION:
+            self.report(workflow, "changelog-guard", "integration guard condition differs")
+        expected_env = {"BASE_SHA": "${{ github.event.pull_request.base.sha }}",
+                        "HEAD_SHA": "${{ github.event.pull_request.head.sha }}"}
+        if guard.get("env") != expected_env:
+            self.report(workflow, "changelog-guard", "integration guard event SHAs differ")
+        if self.run_text(guard).strip() != CHANGELOG_GUARD:
+            self.report(workflow, "changelog-guard", "integration guard command differs")
+        if "continue-on-error" in guard or guard.get("shell") != "bash":
+            self.report(workflow, "changelog-guard", "integration guard shell or failure behavior differs")
+
+    def check_release_fragments(self):
+        workflow, rule = "release.yml", "release-fragments"
+        job = self.job(workflow, "preflight") or {}
+        steps = job.get("steps", [])
+        headers = [i for i, step in enumerate(steps) if step.get("name") == "Verify CHANGELOG version header exists"]
+        pending = [(i, step) for i, step in enumerate(steps)
+                   if step.get("name") == "Verify no pending changelog fragments"]
+        if (len(headers) != 1 or len(pending) != 1 or pending[0][0] != headers[0] + 1
+                or self.may_skip(job) or "needs" in job or self.may_skip(pending[0][1])
+                or pending[0][1].get("shell") != "bash"
+                or self.run_text(pending[0][1]).strip() != PENDING_FRAGMENTS):
+            self.report(workflow, rule, "pending fragments step must follow the version header check without bypasses")
+
+    def check_ci_feature_jobs(self):
+        for name, commands in CI_FEATURE_JOBS.items():
+            job = self.job("ci.yml", name)
+            if job is None:
+                self.report("ci.yml", "ci-feature-jobs", f"missing {name}")
                 continue
-            script = self.read_script(relative)
-            if script is None:
+            if name in DOCS_ONLY_SKIPPED_JOBS:
+                needs = job.get("needs")
+                documented = (isinstance(job.get("if"), str)
+                              and self.unwrap_expression(job["if"]) == DOCS_ONLY_CONDITION
+                              and needs in ("changes", ["changes"]))
+                if not documented or "continue-on-error" in job:
+                    self.report("ci.yml", "ci-feature-jobs", f"{name} can be bypassed")
+            elif "if" in job or "continue-on-error" in job:
+                self.report("ci.yml", "ci-feature-jobs", f"{name} can be bypassed")
+            for step in job.get("steps", []):
+                if "if" in step or "continue-on-error" in step:
+                    self.report("ci.yml", "ci-feature-jobs", f"{name} step can be bypassed")
+            for command in commands:
+                if self.runs_in_job("ci.yml", name, command, "ci-feature-jobs") < 0:
+                    self.report("ci.yml", "ci-feature-jobs", f"{name} does not run unconditionally: {command}")
+        job = self.job("ci.yml", DOCS_TESTS_JOB)
+        if job is None:
+            self.report("ci.yml", "ci-feature-jobs", f"missing {DOCS_TESTS_JOB}")
+        else:
+            documented = (isinstance(job.get("if"), str)
+                          and self.unwrap_expression(job["if"]) == DOCS_TESTS_CONDITION
+                          and job.get("needs") in ("changes", ["changes"]))
+            if not documented or "continue-on-error" in job:
+                self.report("ci.yml", "ci-feature-jobs", f"{DOCS_TESTS_JOB} can be bypassed")
+            for step in job.get("steps", []):
+                if "if" in step or "continue-on-error" in step:
+                    self.report("ci.yml", "ci-feature-jobs", f"{DOCS_TESTS_JOB} step can be bypassed")
+            for command in DOCS_TESTS_COMMANDS:
+                if self.runs_in_job("ci.yml", DOCS_TESTS_JOB, command, "ci-feature-jobs") < 0:
+                    self.report("ci.yml", "ci-feature-jobs",
+                                f"{DOCS_TESTS_JOB} does not run unconditionally: {command}")
+        for (workflow, name), (condition, commands) in CONDITIONED_FEATURE_JOBS.items():
+            job = self.job(workflow, name)
+            if job is None:
+                self.report(workflow, "ci-feature-jobs", f"missing {name}")
                 continue
-            pairs = itertools.zip_longest(self.body_lines(script), self.body_lines(writers[0]["run"]))
-            for number, (actual, expected) in enumerate(pairs, start=1):
-                if actual != expected:
-                    self.report(str(relative), "release-script-drift",
-                                f"body line {number} is {'no line' if actual is None else repr(actual)}, "
-                                f"the release step that writes {variable} has "
-                                f"{'no line' if expected is None else repr(expected)}")
-                    break
+            documented = isinstance(job.get("if"), str) and self.unwrap_expression(job["if"]) == condition
+            if not documented or "continue-on-error" in job:
+                self.report(workflow, "ci-feature-jobs", f"{name} can be bypassed")
+            for step in job.get("steps", []):
+                # The coverage gate's cancel rejections may run under cancelled() and only fail.
+                if ("if" in step or "continue-on-error" in step) and not (
+                        workflow == COVERAGE_WORKFLOW and name == COVERAGE_GATE
+                        and isinstance(step.get("if"), str)
+                        and self.unwrap_expression(step["if"]) == COVERAGE_CANCEL_CONDITION
+                        and "continue-on-error" not in step
+                        and self.normalized(self.run_text(step)) == [COVERAGE_CANCEL_RUN]):
+                    self.report(workflow, "ci-feature-jobs", f"{name} step can be bypassed")
+            for command in commands:
+                if self.runs_in_job(workflow, name, command, "ci-feature-jobs") < 0:
+                    self.report(workflow, "ci-feature-jobs", f"{name} does not run unconditionally: {command}")
+        script = self.read_script(HOST_SCRIPT, "ci-feature-jobs")
+        for command in HOST_CHECKS:
+            position, problem = self.runs_line(script, command) if script is not None else (0, None)
+            if problem:
+                self.report(str(HOST_SCRIPT), "ci-feature-jobs", f"unmodelled shell syntax around {command}: {problem}")
+            elif position < 0:
+                self.report(str(HOST_SCRIPT), "ci-feature-jobs", f"does not run unconditionally: {command}")
+
+    def check_skill_archive(self):
+        job = self.job("ci.yml", "release-contracts") or {}
+        steps = [step for step in job.get("steps", [])
+                 if step.get("name") == "Check the skill archive"]
+        if len(steps) != 1:
+            self.report("ci.yml", "skill-archive", "expected exactly one skill archive step")
+            return
+        step = steps[0]
+        shell = self.effective_shell("ci.yml", "release-contracts", step)
+        if self.may_skip(job) or "continue-on-error" in step or shell not in (None, "bash"):
+            self.report("ci.yml", "skill-archive", "skill archive check can be bypassed")
+        if self.unwrap_expression(step.get("if", "")) != SKILL_ARCHIVE_CONDITION:
+            self.report("ci.yml", "skill-archive", "skill archive condition differs from the integration branch exception")
+        if self.run_text(step).strip() != ".github/scripts/package-skill.sh --check":
+            self.report("ci.yml", "skill-archive", "skill archive command differs from package-skill.sh --check")
+
+    def check_ci_triggers(self):
+        doc = self.docs.get("ci.yml", {})
+        triggers = doc.get("on", doc.get(True))
+        if not isinstance(triggers, dict):
+            self.report("ci.yml", "ci-triggers", "expected push and pull_request triggers with branch filters")
+            return
+        for event in sorted(set(triggers) - {"push", "pull_request"}):
+            self.report("ci.yml", "ci-triggers",
+                        f"archive condition must be re-evaluated for the new event: {event}")
+        if "push" not in triggers:
+            self.report("ci.yml", "ci-triggers", "push trigger is absent")
+        pull_request = triggers.get("pull_request")
+        branches = pull_request.get("branches") if isinstance(pull_request, dict) else None
+        if not isinstance(branches, list) or "main" not in branches:
+            self.report("ci.yml", "ci-triggers", "pull_request branches must include main")
+
+    def check_apt_retries(self):
+        directory = self.root / WORKFLOW_DIR
+        for path in sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")]):
+            doc = self.docs.get(path.name) if path.name in WORKFLOWS else self.load(WORKFLOW_DIR / path.name)
+            if not isinstance(doc, dict):
+                continue
+            for name, job in (doc.get("jobs") or {}).items():
+                for index, step in enumerate(job.get("steps", [])):
+                    for line in self.logical_lines(self.run_text(step)):
+                        line = re.split(r"(?<![^ \t])#", line, maxsplit=1)[0]
+                        for match in APT_GET_CALL.finditer(line):
+                            arguments = ARGUMENTS_END.split(line[match.end():], maxsplit=1)[0]
+                            if not APT_RETRIES.search(arguments):
+                                self.report(f"{path.name}:{name} step {index + 1}", "apt-retries",
+                                            "apt-get call lacks -o Acquire::Retries=3")
+
+    def check_release_checks(self):
+        self.check_shared_build()
+        self.check_release_gates()
+        self.check_unconditional()
+        self.check_verification_credentials()
+        self.check_verify_matrix()
+        self.check_release_cache()
+        self.check_release_wasm_gate()
+        self.check_release_publish_sums()
+        self.check_release_toolchain()
+        self.check_ci_feature_jobs()
+        self.check_skill_archive()
+        self.check_ci_triggers()
 
     def check_workflow(self, workflow):
         doc = self.load(pathlib.PurePosixPath(".github/workflows") / workflow)
@@ -704,6 +1975,10 @@ class Checker:
         if workflow == COVERAGE_WORKFLOW:
             self.check_coverage_trigger(workflow, doc)
             self.check_coverage_condition(workflow, jobs)
+            self.check_coverage_split(workflow, jobs)
+            self.check_coverage_gate(workflow, jobs)
+            self.check_coverage_seed(workflow, doc)
+            self.check_coverage_attempt(workflow, jobs)
         if workflow == REHEARSAL_WORKFLOW:
             self.check_rehearsal_credentials(workflow, doc, jobs)
         for job_id, job in jobs.items():
@@ -720,11 +1995,79 @@ class Checker:
                     self.report(f"{relative} step {index + 1}", "composite-expression",
                                 f"run: holds ${{{{ {expression} }}}}")
 
+    @staticmethod
+    def local_references(doc):
+        """Yields the local uses: values of a workflow's jobs and steps or of
+        an action's steps."""
+        steps = []
+        for job in (doc.get("jobs") or {}).values():
+            if isinstance(job, dict):
+                yield job.get("uses")
+                steps.extend(job.get("steps") or [])
+        runs = doc.get("runs")
+        if isinstance(runs, dict):
+            steps.extend(runs.get("steps") or [])
+        for step in steps:
+            if isinstance(step, dict):
+                yield step.get("uses")
+
+    def resolve_local(self, reference):
+        """The file a local uses: value names: a workflow file, or the
+        action.yml or action.yaml of an action directory; None when it names
+        no file inside the repository."""
+        relative = pathlib.PurePosixPath(reference[2:])
+        if ".." in relative.parts:
+            return None
+        path = self.root / relative
+        if path.is_dir():
+            for name in ("action.yml", "action.yaml"):
+                if (path / name).is_file():
+                    return relative / name
+            return None
+        return relative if path.is_file() else None
+
+    def check_release_vars(self):
+        rule = "release-vars"
+        pending, seen = [WORKFLOW_DIR / "release.yml"], set()
+        while pending:
+            relative = pending.pop(0)
+            if relative in seen:
+                continue
+            seen.add(relative)
+            # A listed workflow that does not load is reported as unreadable once.
+            if relative.parent == WORKFLOW_DIR and relative.name in WORKFLOWS:
+                doc = self.docs.get(relative.name)
+            else:
+                doc = self.load(relative)
+            if not isinstance(doc, dict):
+                continue
+            try:
+                expressions = list(self.expression_values(doc))
+            except ValueError as err:
+                self.report(str(relative), rule, str(err))
+                expressions = []
+            for expression in expressions:
+                if VARS_CONTEXT.search(EXPRESSION_STRING.sub("''", expression)):
+                    self.report(str(relative), rule, f"an expression reads the vars context: {expression}")
+            for reference in self.local_references(doc):
+                if not isinstance(reference, str) or not reference.startswith("./"):
+                    continue
+                target = self.resolve_local(reference)
+                if target is None:
+                    self.report(str(relative), rule, f"local reference {reference} names no file")
+                else:
+                    pending.append(target)
+
     def run(self):
         for workflow in WORKFLOWS:
             self.check_workflow(workflow)
+        self.check_apt_retries()
+        self.check_cache_save_if()
         self.check_composite_expressions()
-        self.check_release_script_drift()
+        self.check_release_checks()
+        self.check_release_vars()
+        self.check_changelog_workflow()
+        self.check_release_fragments()
         return self.violations
 
 

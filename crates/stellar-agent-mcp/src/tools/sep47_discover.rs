@@ -41,7 +41,7 @@ pub struct Sep47DiscoverArgs {
 
     /// CAIP-2 chain identifier (e.g. `"stellar:testnet"`).
     ///
-    /// Used to resolve the active RPC endpoint from the profile.
+    /// Must match the loaded profile's `chain_id`. The endpoint comes from the profile.
     pub chain_id: String,
 }
 

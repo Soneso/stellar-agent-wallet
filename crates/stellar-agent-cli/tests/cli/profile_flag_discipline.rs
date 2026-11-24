@@ -76,7 +76,7 @@ const ALLOW_SET: &[AllowEntry] = &[];
 /// visibility class (say every `pub(crate)` field) would still clear a loose
 /// floor and report a clean tree. Adding or removing a profile-selecting
 /// subcommand is expected to move this number — update it in the same commit.
-const PROFILE_FIELDS: usize = 79;
+const PROFILE_FIELDS: usize = 92;
 
 /// Call-site shapes that substitute the literal `"default"` for an absent
 /// profile name, discarding the environment variable the flag left `None` for.
@@ -537,8 +537,9 @@ fn blank_char_or_skip_lifetime(out: &mut [u8], b: &[u8], i: usize) -> usize {
 }
 
 /// Blanks every `#[cfg(test)]` / `#[cfg(any(test, ...))]`-gated `mod` block
-/// (attributes through the brace-matched close), preserving newlines. Operates
-/// on already-cleaned source so brace matching is exact.
+/// (attributes through the brace-matched close), preserving newlines. The
+/// module may carry a visibility (`pub mod`, `pub(crate) mod`). Operates on
+/// already-cleaned source so brace matching is exact.
 fn strip_test_modules(cleaned: &str) -> String {
     let bytes = cleaned.as_bytes();
     let mut out = bytes.to_vec();
@@ -549,8 +550,7 @@ fn strip_test_modules(cleaned: &str) -> String {
     let lines: Vec<&str> = cleaned.lines().collect();
 
     for (li, line) in lines.iter().enumerate() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with("mod ") {
+        if !declares_module(line) {
             continue;
         }
         if !preceding_attrs_are_test_gated(&lines, li) {
@@ -580,6 +580,21 @@ fn strip_test_modules(cleaned: &str) -> String {
 
 /// Walks upward from the `mod` line over contiguous attribute / blank lines and
 /// reports whether any attribute gates on `test`.
+/// Whether `line` opens a module declaration, with or without a visibility.
+fn declares_module(line: &str) -> bool {
+    let mut rest = line.trim_start();
+    if let Some(after) = rest.strip_prefix("pub") {
+        rest = after.trim_start();
+        if rest.starts_with('(') {
+            let Some(close) = rest.find(')') else {
+                return false;
+            };
+            rest = rest[close + 1..].trim_start();
+        }
+    }
+    rest.starts_with("mod ")
+}
+
 fn preceding_attrs_are_test_gated(lines: &[&str], mod_line: usize) -> bool {
     let mut gated = false;
     let mut li = mod_line;
@@ -650,6 +665,7 @@ fn matching_brace(bytes: &[u8], open_idx: usize) -> Option<usize> {
 #[test]
 fn from_flag_is_confined_to_explicit_argument_boundaries() {
     let allowed = [
+        ("commands/profile/enable_mainnet.rs", "run_with_keyring"),
         (
             "commands/profile/rotate_nonce_key.rs",
             "run_with_dependencies",
@@ -663,15 +679,24 @@ fn from_flag_is_confined_to_explicit_argument_boundaries() {
             "commands/profile/rotate_counterparty_key.rs",
             "run_with_dependencies",
         ),
-        ("commands/profile/rotate_policy_state_key.rs", "run"),
-        ("commands/profile/reset_window_state.rs", "run"),
+        (
+            "commands/profile/rotate_policy_state_key.rs",
+            "run_with_dependencies",
+        ),
+        (
+            "commands/profile/reset_window_state.rs",
+            "run_with_dependencies",
+        ),
         ("commands/profile/reset_mpp_state.rs", "run"),
         ("commands/profile/halt.rs", "run_halt"),
         ("commands/profile/halt.rs", "run_resume"),
         ("commands/fees/stats.rs", "resolve_rpc_url"),
         ("commands/mpp.rs", "prune"),
         ("commands/audit/verify.rs", "resolve_profile_inputs"),
+        ("commands/audit/bind_carriers.rs", "run"),
         ("commands/audit/reanchor.rs", "load_profile"),
+        ("commands/audit/acknowledge_outbox_loss.rs", "load_profile"),
+        ("commands/approve/credential.rs", "run_enroll"),
     ];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
@@ -742,6 +767,14 @@ fn identifier_call(line: &str, needle: &str) -> bool {
     })
 }
 
+/// Every seed and Ledger resolver holds its signer to the enrolled identity.
+///
+/// The testnet-shaped resolvers call `require_enrolled_signer` after
+/// selecting the signer. The mainnet ceremony is held to the key the
+/// enrolled proof read before the confirmation: `ledger_signer` opens the
+/// Ledger against the enrolled source, and is the only resolver without the
+/// call. Mainnet reads no seed from the environment, so no mainnet resolver
+/// calls `resolve_software_signer_from_env`.
 #[test]
 fn every_seed_and_ledger_resolver_checks_enrollment() {
     use std::collections::BTreeSet;
@@ -784,11 +817,20 @@ fn every_seed_and_ledger_resolver_checks_enrollment() {
             }
         }
     }
+    let held_to_the_enrolled_proof = BTreeSet::from([(
+        "common/signer_ceremony.rs".to_owned(),
+        "ledger_signer".to_owned(),
+    )]);
+    assert!(
+        checks.is_disjoint(&held_to_the_enrolled_proof),
+        "the mainnet ceremony compares with the enrolled proof, not with a second fetch"
+    );
+    let expected: BTreeSet<_> = checks.union(&held_to_the_enrolled_proof).cloned().collect();
     assert_eq!(
-        resolvers, checks,
+        resolvers, expected,
         "each seed and Ledger resolver must check enrollment once after selecting the signer"
     );
-    assert_eq!(resolvers.len(), 6, "exact resolver inventory");
+    assert_eq!(resolvers.len(), 7, "exact resolver inventory");
 }
 
 #[test]
@@ -824,11 +866,48 @@ fn eager_keyring_signers_use_the_enrollment_helper() {
             1
         )])
     );
-    assert_eq!(
-        lazy,
-        BTreeMap::from([
-            ("stellar-agent-cli/commands/mpp.rs".to_owned(), 1),
-            ("stellar-agent-mcp/tools/mpp.rs".to_owned(), 1)
-        ])
-    );
+    let expected_lazy: BTreeMap<String, usize> = LAZY_KEYRING_SIGNER_SITES
+        .iter()
+        .map(|(key, count, reason)| {
+            assert!(!reason.is_empty(), "{key}: a lazy site states its reason");
+            ((*key).to_owned(), *count)
+        })
+        .collect();
+    assert_eq!(lazy, expected_lazy);
 }
+
+/// Every production site that builds a lazy keyring signer, with its count
+/// and the reason it reads the seed lazily instead of through the enrollment
+/// helper.
+const LAZY_KEYRING_SIGNER_SITES: &[(&str, usize, &str)] = &[
+    (
+        "stellar-agent-cli/commands/mpp.rs",
+        1,
+        "the MPP charge defers the seed read to its credential signature after the \
+         approval check",
+    ),
+    (
+        "stellar-agent-cli/common/signer_ceremony.rs",
+        1,
+        "the mainnet keyring signer is built after the authorization is minted, so \
+         the seed is read only then",
+    ),
+    (
+        "stellar-agent-mcp/tools/mpp.rs",
+        1,
+        "the MPP charge commit defers the seed read to its credential signature after \
+         the approval check",
+    ),
+    (
+        "stellar-agent-mcp/tools/submission_record.rs",
+        1,
+        "the mainnet classic commit reads the seed only inside authorized signing; the \
+         testnet branch keeps the enrollment helper",
+    ),
+    (
+        "stellar-agent-mcp/tools/x402_create_payment.rs",
+        1,
+        "the mainnet x402 payment reads the seed only inside authorized signing; the \
+         testnet path keeps the enrollment helper",
+    ),
+];

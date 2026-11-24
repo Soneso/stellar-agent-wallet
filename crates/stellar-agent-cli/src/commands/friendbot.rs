@@ -34,8 +34,7 @@ use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{InternalError, NetworkError, WalletError};
 use stellar_agent_core::profile::caip2::{Caip2, TESTNET_PASSPHRASE};
 use stellar_agent_network::{
-    FriendbotResult, default_friendbot_url, fund_with_friendbot, redact_url_userinfo,
-    validate_friendbot_url,
+    FriendbotResult, default_friendbot_url, fund_with_friendbot, validate_friendbot_url,
 };
 
 use crate::common::network::{EndpointUrlFlag, TESTNET_RPC_URL};
@@ -79,9 +78,7 @@ impl FromStr for FriendbotNetwork {
             "testnet" => Ok(Self::Testnet),
             "futurenet" => Ok(Self::Futurenet),
             "mainnet" => Ok(Self::Mainnet),
-            other => Err(format!(
-                "unknown network '{other}'; expected one of: testnet, futurenet, mainnet"
-            )),
+            _ => Err("unknown network; expected one of: testnet, futurenet, mainnet".to_owned()),
         }
     }
 }
@@ -224,10 +221,9 @@ pub async fn run(args: &FriendbotArgs) -> i32 {
         // envelope has the right category and exit code.  The friendbot URL is
         // a network endpoint; a non-allowlisted URL is surfaced as RpcUnreachable
         // with a diagnostic message describing the allow-list rejection.
-        // Redact any userinfo in the URL before placing it in the error envelope
-        // (defence-in-depth against audit-log secret leakage).
+        // The refused endpoint is described without any part of its value.
         let wallet_err = WalletError::Network(NetworkError::RpcUnreachable {
-            url: redact_url_userinfo(&friendbot_url),
+            url: "the friendbot endpoint".to_owned(),
             reason: err.to_string(),
         });
         let envelope = Envelope::<()>::err(&wallet_err);
@@ -387,6 +383,7 @@ mod tests {
     )]
 
     use super::*;
+    use stellar_agent_test_support::rejected_value::{assert_refusal_text, capture_refusal};
 
     /// Mainnet structural rejection fires at the `run` boundary.
     ///
@@ -502,5 +499,19 @@ mod tests {
         let hash = "abcd1234";
         let redacted = redact_tx_hash(hash);
         assert_eq!(redacted, "abcd1234");
+    }
+
+    #[test]
+    fn rejected_input_friendbot_network() {
+        capture_refusal(|| {
+            let error: Box<dyn std::error::Error> = FriendbotNetwork::from_str("CREDMARKER7")
+                .expect_err("unknown network")
+                .into();
+            assert_refusal_text(
+                error.as_ref(),
+                "unknown network; expected one of: testnet, futurenet, mainnet",
+            );
+            assert!(FriendbotNetwork::from_str("testnet").is_ok());
+        });
     }
 }

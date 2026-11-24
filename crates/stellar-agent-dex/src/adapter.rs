@@ -66,7 +66,10 @@ use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_defi::adapter::{DefiAdapter, DefiAdapterCtx, DefiAdapterError, DefiPreview};
 
 use stellar_agent_defi::dispatch::SubmitWitness;
-use stellar_agent_smart_account::submit::{SubmitInvokeArgs, submit_signed_invoke};
+use stellar_agent_defi::scval::contract_strkey_to_sc_address;
+use stellar_agent_smart_account::submit::{
+    DeclaredSubInvocations, DeclaredTransfer, SubmitInvokeArgs, submit_signed_invoke,
+};
 
 use crate::abi::{
     DEFAULT_DEADLINE_OFFSET_SECS, MAX_DEADLINE_OFFSET_SECS, MAX_PATH_LEN, MIN_PATH_LEN, TradeArgs,
@@ -287,6 +290,14 @@ impl DefiAdapter for DexSwapAdapter {
     ///   `locate_smart_account_auth_entry` to find the wallet's auth entry.
     /// - `.auth_rule_ids(&[ContextRuleId::new(0)])` — the OZ bootstrap rule
     ///   (installed at deploy) that authorises all operations.
+    /// - `.sub_invocations(TokenTransfers(..))`: transfers of the input token
+    ///   (`path[0]`) from the wallet, totaling at most `amount_in`, to
+    ///   recipients the router chooses.
+    ///
+    /// Rule 0 accepts any context, so the declaration is what bounds the
+    /// signed tree: `submit_signed_invoke` refuses a simulated root other than
+    /// the router call this adapter built, and any sub-invocation outside that
+    /// declaration, before anything is signed.
     ///
     /// # Errors
     ///
@@ -312,6 +323,14 @@ impl DefiAdapter for DexSwapAdapter {
         ctx: &DefiAdapterCtx<'_>,
         witness: SubmitWitness,
     ) -> Result<(), DefiAdapterError> {
+        let recorder = ctx.submission_recorder.ok_or_else(|| {
+            map_submit_invoke_error(
+                &stellar_agent_smart_account::SaError::IntentRecordUnavailable {
+                    class: "missing_recorder",
+                },
+            )
+        })?;
+
         // ── Fail-closed downcast ──────────────────────────────────────────
         let trade_args = args
             .downcast_ref::<TradeArgs>()
@@ -480,6 +499,11 @@ impl DefiAdapter for DexSwapAdapter {
             args: swap_args_vecm,
         });
 
+        // ── Declared sub-invocation ───────────────────────────────────────
+        // Any simulated subtree other than the router's transfer of the input
+        // token is refused before signing.
+        let declared_transfers = declared_input_transfer(&canonical_path, trade_args.amount_in)?;
+
         // ── Determine secondary RPC URL ────────────────────────────────────
         let secondary_rpc_url = ctx
             .secondary_rpc
@@ -520,6 +544,7 @@ impl DefiAdapter for DexSwapAdapter {
                 // stays `None`); any other rule would be refused without one.
                 .auth_rule_ids(&[ContextRuleId::new(0)])
                 .host_function(host_function)
+                .sub_invocations(DeclaredSubInvocations::TokenTransfers(&declared_transfers))
                 .signer(signer)
                 .primary_rpc_url(ctx.primary_rpc.url())
                 .maybe_secondary_rpc_url(secondary_rpc_url)
@@ -529,7 +554,7 @@ impl DefiAdapter for DexSwapAdapter {
                 .op_label(DEX_SUBMIT_OP_LABEL)
                 .emit_observability_logs(true)
                 .maybe_sequence_floor(ctx.sequence_floor)
-                .maybe_submission_recorder(ctx.submission_recorder)
+                .admission(stellar_agent_network::SigningAdmission::Recorded(recorder))
                 .build(),
         )
         .await;
@@ -538,35 +563,29 @@ impl DefiAdapter for DexSwapAdapter {
         let request_id = witness.request_id().to_owned();
         drop(witness); // consumed here — gate ran before this point
 
-        let result = match submit_result {
-            Ok(r) => r,
-            Err(e) => {
-                // Caller-side Err-arm discipline: record the failure as a
-                // SaRawInvocation row (non-fatal, no-op unless a writer was
-                // threaded in).
-                if let Some(writer) = ctx.audit_writer.as_ref() {
-                    let smart_account_redacted =
-                        stellar_agent_core::observability::redact_strkey_first5_last5(
-                            &trade_args.from_address,
-                        );
-                    stellar_agent_smart_account::submit::emit_sa_raw_invocation_failure(
-                        writer,
-                        &smart_account_redacted,
-                        &e,
-                        ctx.auth_rule_ids.map_or(1, |ids| ids.len() as u32),
-                        ctx.chain_id,
-                        &request_id,
+        if let Err(e) = submit_result {
+            // Caller-side Err-arm discipline: record the failure as a
+            // SaRawInvocation row (non-fatal, no-op unless a writer was
+            // threaded in).
+            if let Some(writer) = ctx.audit_writer.as_ref() {
+                let smart_account_redacted =
+                    stellar_agent_core::observability::redact_strkey_first5_last5(
+                        &trade_args.from_address,
                     );
-                }
-                return Err(map_submit_invoke_error(&e));
+                stellar_agent_smart_account::submit::emit_sa_raw_invocation_failure(
+                    writer,
+                    &smart_account_redacted,
+                    &e,
+                    ctx.auth_rule_ids.map_or(1, |ids| ids.len() as u32),
+                    ctx.chain_id,
+                    &request_id,
+                );
             }
-        };
+            return Err(map_submit_invoke_error(&e));
+        }
 
-        // Non-fatal allow-path value-audit row (no-op unless the caller threaded
-        // a writer + gate-derived legs into the context).
-        let tx_hash_redacted = stellar_agent_network::redact_tx_hash(&result.tx_hash);
-        ctx.emit_value_action_submitted(&tx_hash_redacted, result.ledger, &request_id);
-
+        // The recorder wrote the pending row before the send; a reported
+        // success writes no further row.
         Ok(())
     }
 }
@@ -578,8 +597,9 @@ impl DefiAdapter for DexSwapAdapter {
 /// rebuilding and re-submitting. A policy refusal keeps the criterion's own
 /// code, so the caller reads a refused cap rather than an endpoint failure.
 /// A mainnet refusal keeps the canonical `network.mainnet_write_forbidden`
-/// code. Every other failure is reported as a network failure, which moved
-/// nothing.
+/// code. A ledger witness refusal keeps its own code and carries no
+/// transaction, because nothing was signed. Every other failure is reported as
+/// a network failure, which moved nothing.
 fn map_submit_invoke_error(error: &stellar_agent_smart_account::SaError) -> DefiAdapterError {
     match error {
         stellar_agent_smart_account::SaError::MainnetWriteForbidden => {
@@ -603,6 +623,15 @@ fn map_submit_invoke_error(error: &stellar_agent_smart_account::SaError) -> Defi
             envelope_hash: envelope_hash.clone(),
             timeout_seconds: *timeout_seconds,
         },
+        refusal @ (stellar_agent_smart_account::SaError::IntentRecordUnavailable { .. }
+        | stellar_agent_smart_account::SaError::IntentBindingMismatch { .. }
+        | stellar_agent_smart_account::SaError::LedgerWitnessUnavailable { .. }
+        | stellar_agent_smart_account::SaError::LedgerWitnessMismatch { .. }) => {
+            DefiAdapterError::SigningRefusal {
+                wire_code: refusal.wire_code(),
+                message: refusal.to_string(),
+            }
+        }
         other => DefiAdapterError::Network {
             reason: format!("submit_signed_invoke failed: {other}"),
         },
@@ -612,6 +641,38 @@ fn map_submit_invoke_error(error: &stellar_agent_smart_account::SaError) -> Defi
 // ─────────────────────────────────────────────────────────────────────────────
 // Validation helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The transfers a swap authorizes under the router call.
+///
+/// The router moves the input token with `transfer(from = wallet, to = pair,
+/// amount_in)`. The pair is the router's choice, so the recipient stays open;
+/// the token is `canonical_path[0]`, and the transfers of it total at most the
+/// trade's `amount_in`.
+///
+/// # Errors
+///
+/// [`DefiAdapterError::InvalidArguments`] when the path is empty or its first
+/// entry is not a C-strkey.
+fn declared_input_transfer(
+    canonical_path: &[String],
+    amount_in: i128,
+) -> Result<[DeclaredTransfer; 1], DefiAdapterError> {
+    let input_token = canonical_path
+        .first()
+        .ok_or_else(|| DefiAdapterError::InvalidArguments {
+            reason: "swap path is empty".to_owned(),
+        })?;
+    let token = contract_strkey_to_sc_address(input_token).map_err(|e| {
+        DefiAdapterError::InvalidArguments {
+            reason: format!("input token address invalid: {e}"),
+        }
+    })?;
+    Ok([DeclaredTransfer {
+        token,
+        to: None,
+        max_amount: amount_in,
+    }])
+}
 
 /// Validates [`TradeArgs`] fields.
 ///
@@ -725,6 +786,34 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn submitting_without_a_recorder_refuses_before_network_io() {
+        use stellar_agent_defi::dispatch::{GateOutcome, dispatch_gate};
+        let adapter = DexSwapAdapter::new();
+        let pin = stellar_agent_defi::pins::DefiContractPin::new(
+            "trade",
+            "v1",
+            "default",
+            "stellar:testnet",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            [0; 32],
+            "fixture",
+        );
+        let rpc = stellar_agent_network::StellarRpcClient::new("http://127.0.0.1:1").unwrap();
+        let ctx = DefiAdapterCtx::new("default", &pin, &rpc);
+        let GateOutcome::Allow(witness) = dispatch_gate("trade", "no-recorder").unwrap() else {
+            panic!("registered trade");
+        };
+        let error = adapter.submit(&(), &ctx, witness).await.unwrap_err();
+        assert!(matches!(
+            error,
+            DefiAdapterError::SigningRefusal {
+                wire_code: "submission.intent_record_unavailable",
+                ..
+            }
+        ));
+    }
+
     /// A refusal the spending window decided reaches the adapter surface as a
     /// policy denial, not as a network failure that moved nothing.
     #[test]
@@ -765,6 +854,39 @@ mod tests {
         );
     }
 
+    /// A witness refusal keeps its wire code and reads as no network failure.
+    #[test]
+    fn a_witness_refusal_keeps_its_wire_code_through_the_adapter_mapping() {
+        for (error, code) in [
+            (
+                stellar_agent_smart_account::SaError::IntentBindingMismatch { field: "signers" },
+                "submission.intent_binding_mismatch",
+            ),
+            (
+                stellar_agent_smart_account::SaError::IntentRecordUnavailable {
+                    class: "missing_recorder",
+                },
+                "submission.intent_record_unavailable",
+            ),
+            (
+                stellar_agent_smart_account::SaError::LedgerWitnessUnavailable { reason: "fixed" },
+                "smart_account.ledger_witness_unavailable",
+            ),
+            (
+                stellar_agent_smart_account::SaError::LedgerWitnessMismatch { reason: "fixed" },
+                "simulation.divergence.ledger_skew",
+            ),
+        ] {
+            match map_submit_invoke_error(&error) {
+                DefiAdapterError::SigningRefusal { wire_code, message } => {
+                    assert_eq!(wire_code, code);
+                    assert_eq!(message, error.to_string());
+                }
+                other => panic!("expected a signing refusal, got {other:?}"),
+            }
+        }
+    }
+
     /// A mainnet refusal keeps its own variant through the adapter mapping.
     #[test]
     fn a_mainnet_refusal_keeps_its_variant_through_the_adapter_mapping() {
@@ -791,6 +913,31 @@ mod tests {
             ],
             deadline: Some(now + 300),
         }
+    }
+
+    #[test]
+    fn the_swap_declares_the_input_token_transfer_bounded_by_amount_in() {
+        let path = vec![
+            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_owned(),
+            "CB3TLW74NBIOT3BUWOZ3TUM6RFDF6A4GVIRUQRQZABG5KPOUL4JJOV2F".to_owned(),
+        ];
+        let [declared] = declared_input_transfer(&path, 1_234).unwrap();
+        assert_eq!(
+            declared.token,
+            contract_strkey_to_sc_address(&path[0]).unwrap(),
+            "the input token is the path's first entry"
+        );
+        assert_eq!(declared.to, None, "the router chooses the pair");
+        assert_eq!(declared.max_amount, 1_234);
+
+        assert!(matches!(
+            declared_input_transfer(&[], 1),
+            Err(DefiAdapterError::InvalidArguments { .. })
+        ));
+        assert!(matches!(
+            declared_input_transfer(&["native".to_owned()], 1),
+            Err(DefiAdapterError::InvalidArguments { .. })
+        ));
     }
 
     #[test]

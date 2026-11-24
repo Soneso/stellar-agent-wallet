@@ -107,3 +107,6 @@ fn warn_if_test_helpers_feature_disabled() {
          cargo test --features test-helpers --test smart_account wasm_pinning_adversarial_fixtures"
     );
 }
+
+#[path = "../smart-account-fixtures/adversarial/passkey_signing_revoked_verifier.rs"]
+mod passkey_signing_revoked_verifier;

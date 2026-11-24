@@ -565,14 +565,15 @@ impl VerifierRegistry {
             });
         }
 
-        let contents = std::fs::read_to_string(&path).map_err(|e| SaError::NetworksTomlIo {
-            source: e,
-            path: path.clone(),
-        })?;
+        let contents =
+            std::fs::read_to_string(&path).map_err(|e| SaError::NetworksTomlIo { source: e })?;
 
         let file: RegistryFile =
             toml::from_str(&contents).map_err(|e| SaError::NetworksTomlParse {
-                source: e,
+                position: stellar_agent_core::profile::toml_diagnostic::toml_error_position(
+                    &contents,
+                    e.span().map(|span| span.start),
+                ),
                 path: path.clone(),
             })?;
 
@@ -750,7 +751,6 @@ impl VerifierRegistry {
             // Different sha256 → refuse.
             return Err(SaError::WebAuthnVerifierSha256Drift {
                 network: network_passphrase.to_owned(),
-                recorded: existing.wasm_sha256.clone(),
                 attempted: wasm_sha256,
             });
         }
@@ -811,7 +811,6 @@ impl VerifierRegistry {
             }
             return Err(SaError::Ed25519VerifierSha256Drift {
                 network: network_passphrase.to_owned(),
-                recorded: existing.wasm_sha256.clone(),
                 attempted: wasm_sha256,
             });
         }
@@ -873,7 +872,6 @@ impl VerifierRegistry {
             }
             return Err(SaError::SpendingLimitPolicySha256Drift {
                 network: network_passphrase.to_owned(),
-                recorded: existing.wasm_sha256.clone(),
                 attempted: wasm_sha256,
             });
         }
@@ -920,7 +918,6 @@ impl VerifierRegistry {
             }
             return Err(SaError::SimpleThresholdPolicySha256Drift {
                 network: network_passphrase.to_owned(),
-                recorded: existing.wasm_sha256.clone(),
                 attempted: wasm_sha256,
             });
         }
@@ -967,7 +964,6 @@ impl VerifierRegistry {
             }
             return Err(SaError::WeightedThresholdPolicySha256Drift {
                 network: network_passphrase.to_owned(),
-                recorded: existing.wasm_sha256.clone(),
                 attempted: wasm_sha256,
             });
         }
@@ -1020,13 +1016,9 @@ impl VerifierRegistry {
                 std::io::ErrorKind::InvalidInput,
                 "registry path has no parent directory",
             ),
-            path: path.clone(),
         })?;
 
-        create_dir_0700(parent).map_err(|e| SaError::NetworksTomlIo {
-            source: e,
-            path: parent.to_path_buf(),
-        })?;
+        create_dir_0700(parent).map_err(|e| SaError::NetworksTomlIo { source: e })?;
 
         // Build the TOML file contents.  Fully-empty records (no contract slot
         // populated) are omitted so a transiently-created-then-emptied entry
@@ -1044,15 +1036,12 @@ impl VerifierRegistry {
             // toml::ser::Error does not implement std::io::Error; wrap as io::Error.
             SaError::NetworksTomlIo {
                 source: std::io::Error::other(e.to_string()),
-                path: path.clone(),
             }
         })?;
 
         // Atomic write: write to temp file, fsync, rename.
-        atomic_write_0600(path, toml_str.as_bytes()).map_err(|e| SaError::NetworksTomlIo {
-            source: e,
-            path: path.clone(),
-        })?;
+        atomic_write_0600(path, toml_str.as_bytes())
+            .map_err(|e| SaError::NetworksTomlIo { source: e })?;
 
         Ok(())
     }
@@ -1082,6 +1071,41 @@ fn unix_duration_to_ms(duration: Result<Duration, std::time::SystemTimeError>) -
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
+/// Returns the override path of `networks.toml` that both registry path
+/// resolvers honor, or `None` when no override applies.
+///
+/// A build with `test` or the `test-helpers` feature reads it through
+/// `sandboxed::read_override`, which accepts only a path inside a marked
+/// sandbox. Every other build reads it through [`read_override`].
+pub(crate) fn networks_toml_override() -> Option<PathBuf> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    use sandboxed::read_override;
+    read_override()
+}
+
+/// Returns the non-empty value of [`STELLAR_AGENT_NETWORKS_TOML_ENV`] as a
+/// path, or `None` when the variable is unset, empty, or not valid Unicode.
+#[cfg_attr(feature = "test-helpers", allow(dead_code))]
+fn read_override() -> Option<PathBuf> {
+    std::env::var(STELLAR_AGENT_NETWORKS_TOML_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The override reader of builds with `test` or the `test-helpers` feature.
+#[cfg(any(test, feature = "test-helpers"))]
+mod sandboxed {
+    /// Returns the [`super::STELLAR_AGENT_NETWORKS_TOML_ENV`] path only when
+    /// it lies inside a marked sandbox, so a test never reads or writes an
+    /// operator's registry.
+    pub(super) fn read_override() -> Option<std::path::PathBuf> {
+        stellar_agent_core::profile::schema::sandboxed_override(
+            super::STELLAR_AGENT_NETWORKS_TOML_ENV,
+        )
+    }
+}
+
 /// Resolves the canonical `networks.toml` registry path.
 ///
 /// The single derivation point for this file's path: [`VerifierRegistry::open`],
@@ -1093,7 +1117,7 @@ fn unix_duration_to_ms(duration: Result<Duration, std::time::SystemTimeError>) -
 /// # Resolution order
 ///
 /// 1. `STELLAR_AGENT_NETWORKS_TOML`, if set to a non-empty value, is used
-///    verbatim.
+///    verbatim in production; isolated builds honor it only inside a marked sandbox.
 /// 2. Otherwise, `<canonical_data_root>/networks.toml` — see
 ///    [`stellar_agent_core::profile::schema::canonical_data_root`] for the
 ///    per-platform root.
@@ -1103,23 +1127,23 @@ fn unix_duration_to_ms(duration: Result<Duration, std::time::SystemTimeError>) -
 /// Returns [`SaError::NetworksTomlIo`] if the env-var override is unset (or
 /// empty) and the canonical data root cannot be determined.
 pub fn default_networks_toml_path() -> Result<PathBuf, SaError> {
-    let env_override = std::env::var(STELLAR_AGENT_NETWORKS_TOML_ENV).ok();
+    let env_override =
+        networks_toml_override().and_then(|path| path.into_os_string().into_string().ok());
     default_networks_toml_path_with_override(env_override.as_deref())
 }
 
-/// Inner helper for [`default_networks_toml_path`] that takes the env-var
-/// value as a pure parameter.
+/// Inner helper for [`default_networks_toml_path`] that takes the override
+/// as a pure parameter.
 ///
-/// Split out so the env-var override branch is unit-testable without
-/// process-global env-var mutation (which is `unsafe fn` in Rust 2024 and
-/// incompatible with the crate's `#![forbid(unsafe_code)]`).  The outer
-/// function is a thin wrapper that reads `std::env::var` and forwards.
+/// The override branch is unit-testable here without process-global env-var
+/// mutation, which is `unsafe fn` in Rust 2024 and incompatible with the
+/// crate's `#![forbid(unsafe_code)]`. The outer function reads the override
+/// through [`networks_toml_override`], which never returns an empty path,
+/// and forwards it.
 fn default_networks_toml_path_with_override(
     env_override: Option<&str>,
 ) -> Result<PathBuf, SaError> {
-    if let Some(val) = env_override
-        && !val.is_empty()
-    {
+    if let Some(val) = env_override {
         return Ok(PathBuf::from(val));
     }
 
@@ -1129,7 +1153,6 @@ fn default_networks_toml_path_with_override(
                 std::io::ErrorKind::NotFound,
                 "cannot determine OS data directory; set STELLAR_AGENT_NETWORKS_TOML",
             ),
-            path: PathBuf::from("<data-dir>"),
         }
     })?;
 
@@ -1346,6 +1369,55 @@ mod tests {
         assert_eq!(t1, t2, "timestamp must be unchanged on AlreadyRecorded");
     }
 
+    /// Every deployment-pin refusal states the check for its fixed field and
+    /// holds the hash the registry recorded in no rendered form.
+    #[test]
+    fn deployment_pin_refusals_hold_no_recorded_hash() {
+        type Record =
+            fn(&mut VerifierRegistry, &str, String, String) -> Result<RecordOutcome, SaError>;
+        let cases: [(Record, &str); 5] = [
+            (
+                VerifierRegistry::record_webauthn_verifier,
+                "webauthn_verifier_wasm_sha256",
+            ),
+            (
+                VerifierRegistry::record_ed25519_verifier,
+                "ed25519_verifier_wasm_sha256",
+            ),
+            (
+                VerifierRegistry::record_spending_limit_policy,
+                "spending_limit_policy_wasm_sha256",
+            ),
+            (
+                VerifierRegistry::record_simple_threshold_policy,
+                "simple_threshold_policy_wasm_sha256",
+            ),
+            (
+                VerifierRegistry::record_weighted_threshold_policy,
+                "weighted_threshold_policy_wasm_sha256",
+            ),
+        ];
+        let recorded = "63726564".repeat(8);
+        for (record, field) in cases {
+            let (_guard, path) = temp_registry();
+            let mut reg = VerifierRegistry::open_at(path).expect("open");
+            record(&mut reg, testnet(), fake_address(), recorded.clone()).expect("first record");
+
+            let error = record(&mut reg, testnet(), fake_address(), alt_sha256())
+                .expect_err("a different hash must be refused");
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "{field} must match the binary vendored Wasm SHA-256 pin; verify the \
+                     deployment and correct the registry entry."
+                )
+            );
+            let forms = format!("{error:?}\n{}", serde_json::to_string(&error).unwrap());
+            assert!(!forms.contains(&recorded), "{forms}");
+        }
+    }
+
     /// Second `record_webauthn_verifier` with a different `wasm_sha256` returns
     /// `SaError::WebAuthnVerifierSha256Drift`.
     #[test]
@@ -1365,11 +1437,8 @@ mod tests {
                 err,
                 SaError::WebAuthnVerifierSha256Drift {
                     ref network,
-                    ref recorded,
                     ref attempted,
-                } if network == testnet()
-                    && recorded == &fake_sha256()
-                    && attempted == &alt_sha256()
+                } if network == testnet() && attempted == &alt_sha256()
             ),
             "unexpected error: {err:?}"
         );
@@ -1568,6 +1637,38 @@ mod tests {
         );
     }
 
+    /// A registry file whose malformed line holds a credential reports the
+    /// position only: the line is absent from the Display, the Debug, the
+    /// source chain and the serialized form.
+    #[test]
+    fn a_malformed_registry_line_is_reported_by_position_only() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+
+        let (_guard, path) = temp_registry();
+        std::fs::write(
+            &path,
+            format!(
+                "[networks.testnet]\nrpc_url = \"https://user:{CREDENTIAL_MARKER}@rpc.example\n"
+            ),
+        )
+        .expect("write");
+
+        let err = VerifierRegistry::open_at(path).expect_err("must fail");
+        assert!(
+            matches!(err, SaError::NetworksTomlParse { ref position, .. } if position.starts_with("line 2, column ")),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("networks.toml is not valid TOML: line 2, column "),
+            "{err}"
+        );
+        assert!(std::error::Error::source(&err).is_none());
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        let json = serde_json::to_string(&err).expect("serialize");
+        assert!(!json.contains(CREDENTIAL_MARKER), "{json}");
+    }
+
     /// `default_networks_toml_path_with_override(Some(path))` returns the
     /// env-supplied path verbatim, bypassing canonical-root resolution.
     ///
@@ -1589,74 +1690,107 @@ mod tests {
         );
     }
 
-    /// An empty env-var value must NOT be treated as an override to an empty
-    /// path; it falls through to the canonical default, matching
-    /// [`crate::multicall::MulticallRegistry::load`]'s own
-    /// override-emptiness check — the two are now required to agree since
-    /// both resolve `STELLAR_AGENT_NETWORKS_TOML`.
     #[test]
-    fn default_networks_toml_path_treats_empty_override_as_unset() {
-        match default_networks_toml_path_with_override(Some("")) {
-            Ok(path) => assert!(
-                path.ends_with("networks.toml"),
-                "empty override must fall through to the canonical default, got: {path:?}"
-            ),
-            Err(SaError::NetworksTomlIo { .. }) => {
-                // Acceptable on hosts with no resolvable data directory.
-            }
-            Err(e) => panic!("unexpected error: {e:?}"),
+    fn default_networks_toml_path_override_outside_a_sandbox_is_ignored() {
+        const EXPECTED: &str = "STELLAR_AGENT_TEST_NETWORKS_EXPECTED";
+        if let Some(expected) = std::env::var_os(EXPECTED) {
+            assert_eq!(
+                default_networks_toml_path().unwrap(),
+                PathBuf::from(expected),
+                "override must remain inside a marked sandbox"
+            );
+            return;
+        }
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let override_path = temporary.path().join("override.toml");
+        std::fs::write(&override_path, "").unwrap();
+        let probe = |selected: &std::path::Path, expected: &std::path::Path| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "verifiers::tests::default_networks_toml_path_override_outside_a_sandbox_is_ignored", "--nocapture"])
+                .env("STELLAR_AGENT_HOME", home.path())
+                .env(STELLAR_AGENT_NETWORKS_TOML_ENV, selected)
+                .env(EXPECTED, expected)
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        probe(&override_path, &home.path().join("networks.toml"));
+        stellar_agent_test_support::sandbox::mark_sandbox(temporary.path()).unwrap();
+        probe(&override_path, &override_path);
+        std::fs::create_dir(temporary.path().join("child")).unwrap();
+        probe(
+            &temporary.path().join("child/../override.toml"),
+            &home.path().join("networks.toml"),
+        );
+        #[cfg(unix)]
+        {
+            let link = temporary.path().join("linked.toml");
+            std::os::unix::fs::symlink(&override_path, &link).unwrap();
+            probe(&link, &home.path().join("networks.toml"));
         }
     }
 
-    /// `default_networks_toml_path_with_override(None)` falls through to the
-    /// canonical data root.  Best-effort: this depends on
-    /// [`stellar_agent_core::profile::schema::canonical_data_root`] being
-    /// resolvable on the test host.  When unresolvable (rare CI / container
-    /// environment), the function returns `NetworksTomlIo` — also a valid
-    /// outcome, so the test accepts either successful resolution (with the
-    /// expected per-platform shape) or that error.
+    /// A valid marked root resolves the registry through the public entry point.
     #[test]
+    #[serial_test::serial]
     fn default_networks_toml_path_falls_through_to_canonical_root() {
-        match default_networks_toml_path_with_override(None) {
-            Ok(path) => {
-                assert!(
-                    path.ends_with("networks.toml"),
-                    "canonical path must end with networks.toml, got: {path:?}"
-                );
-                #[cfg(target_os = "linux")]
-                {
-                    let expected_suffix = PathBuf::from("stellar-agent").join("networks.toml");
-                    assert!(
-                        path.ends_with(&expected_suffix),
-                        "Linux canonical path must be <data-root>/stellar-agent/networks.toml, got: {path:?}"
-                    );
-                }
-                #[cfg(target_os = "macos")]
-                {
-                    let expected_suffix =
-                        PathBuf::from("Soneso.stellar-agent").join("networks.toml");
-                    assert!(
-                        path.ends_with(&expected_suffix),
-                        "macOS canonical path must be <data-root>/Soneso.stellar-agent/networks.toml, got: {path:?}"
-                    );
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    let expected_suffix = PathBuf::from("Soneso")
-                        .join("stellar-agent")
-                        .join("data")
-                        .join("networks.toml");
-                    assert!(
-                        path.ends_with(&expected_suffix),
-                        "Windows canonical path must be <data-root>/Soneso/stellar-agent/data/networks.toml, got: {path:?}"
-                    );
-                }
-            }
-            Err(SaError::NetworksTomlIo { .. }) => {
-                // Acceptable on hosts with no resolvable data directory.
-            }
-            Err(e) => panic!("unexpected error: {e:?}"),
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let _override = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+            STELLAR_AGENT_NETWORKS_TOML_ENV,
+            None,
+        );
+        assert_eq!(
+            default_networks_toml_path().unwrap(),
+            sandbox.path().join("networks.toml")
+        );
+    }
+
+    /// The reader of builds without `test` and `test-helpers` returns a
+    /// non-empty override outside a marked sandbox, and reads an empty one as
+    /// unset. This build's shared reader ignores the same unmarked override.
+    #[test]
+    #[serial_test::serial]
+    fn read_override_returns_a_non_empty_value_without_a_sandbox() {
+        let temporary = tempfile::tempdir().unwrap();
+        let override_path = temporary.path().join("override.toml");
+        {
+            let _override = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+                STELLAR_AGENT_NETWORKS_TOML_ENV,
+                Some(override_path.as_os_str()),
+            );
+            assert_eq!(
+                read_override(),
+                Some(override_path.clone()),
+                "an override outside a marked sandbox must be used verbatim"
+            );
+            assert_eq!(
+                networks_toml_override(),
+                None,
+                "this build reads the override only inside a marked sandbox"
+            );
         }
+        let _empty = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+            STELLAR_AGENT_NETWORKS_TOML_ENV,
+            Some(std::ffi::OsStr::new("")),
+        );
+        assert_eq!(
+            read_override(),
+            None,
+            "an empty override must read as unset"
+        );
     }
 
     /// `persist()` creates a missing parent directory with mode `0700` on Unix.
@@ -1691,7 +1825,7 @@ mod tests {
     #[test]
     fn wire_code_round_trip_config_parse() {
         let err = SaError::NetworksTomlParse {
-            source: toml::from_str::<toml::Value>("bad = ").unwrap_err(),
+            position: "line 1, column 7".to_owned(),
             path: PathBuf::from("/tmp/networks.toml"),
         };
         assert_eq!(err.wire_code(), "sa.networks_toml_parse");

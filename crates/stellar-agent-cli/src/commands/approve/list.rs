@@ -7,12 +7,18 @@
 //!
 //! # Output (JSON envelope, default)
 //!
+//! `data` carries `pending` (non-tombstone entries), `resolved` (`Consumed`
+//! and `Rejected` tombstones, each keeping its `kind_name`), and
+//! `expired_count` (expired entries in the snapshot), alongside `profile`
+//! when a saved profile matches:
+//!
 //! ```json
 //! {
 //!   "ok": true,
 //!   "data": {
 //!     "profile": "default",
-//!     "pending": [ /* PendingApprovalView, one per entry */ ],
+//!     "pending": [ /* PendingApprovalView, non-tombstone entries */ ],
+//!     "resolved": [ /* PendingApprovalView, Consumed and Rejected tombstones */ ],
 //!     "expired_count": 1
 //!   },
 //!   "request_id": "..."
@@ -22,18 +28,18 @@
 //! # Output (`--output table`)
 //!
 //! One row per entry: nonce, kind, a one-line wallet-controlled summary, and
-//! the time remaining until expiry. Every rendered field is passed through
-//! [`sanitize_for_table`] — summary fields such as a payment memo are
-//! agent-influenced free text and must not be trusted with raw terminal
-//! output.
+//! the time remaining until expiry. Tombstone entries appear in a separate
+//! section headed `Resolved`. Every rendered field is passed through
+//! [`escape_for_terminal`]: summary values are decoded from an agent-built
+//! envelope and must not be trusted with raw terminal output.
 //!
 //! # `--include-expired`
 //!
-//! By default, expired entries are omitted from `pending` (they no longer
-//! grant approval and only remain on disk until the next `approve gc`).
-//! `expired_count` always reports the number of expired entries in the
-//! snapshot, regardless of this flag, so the operator can tell whether a
-//! `gc` is due even when expired entries are hidden.
+//! By default, expired entries are omitted from `pending` and `resolved`
+//! (they no longer grant approval and only remain on disk until the next
+//! `approve gc`). `expired_count` always reports the number of expired entries
+//! in the snapshot, regardless of this flag, so the operator can tell whether
+//! a `gc` is due even when expired entries are hidden.
 //!
 //! # Exit codes
 //!
@@ -52,7 +58,7 @@ use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{ApprovalFailure, ValidationError, WalletError};
 use stellar_agent_core::timefmt;
 
-use crate::common::render::{render_json, sanitize_for_table};
+use crate::common::render::{escape_for_terminal, render_json};
 use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
 /// Arguments for `stellar-agent approve list`.
@@ -75,20 +81,38 @@ pub struct ListArgs {
     #[arg(long, default_value_t = OutputFormat::DEFAULT, value_name = "FORMAT")]
     pub output: OutputFormat,
 
-    /// Include already-expired entries in `pending` instead of omitting them.
+    /// Include already-expired entries in `pending` and `resolved` instead of omitting them.
     #[arg(long = "include-expired")]
     pub include_expired: bool,
 }
 
 /// Success payload for the `approve list` JSON envelope.
+///
+/// Carries `pending` (non-tombstone entries), `resolved` (`Consumed` and
+/// `Rejected` tombstones, each keeping its `kind_name`), and `expired_count`
+/// (expired entries in the snapshot), plus `profile` when a saved profile
+/// matches.
 #[derive(Debug, Serialize)]
 struct ListData {
-    /// Profile the snapshot was taken from.
-    profile: String,
-    /// Pending entries, filtered per `--include-expired`.
+    /// Saved profile the snapshot was taken from; absent when the name
+    /// resolves to no saved profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+    /// Non-tombstone pending entries, filtered per `--include-expired`.
     pending: Vec<PendingApprovalView>,
+    /// Tombstone entries (`Consumed` and `Rejected`), filtered per `--include-expired`.
+    resolved: Vec<PendingApprovalView>,
     /// Count of expired entries in the snapshot, independent of the filter.
     expired_count: usize,
+}
+
+/// Returns `true` when `view` is a terminal tombstone rather than an entry
+/// awaiting a decision.
+fn is_tombstone(view: &PendingApprovalView) -> bool {
+    matches!(
+        view.summary,
+        ApprovalSummaryView::Consumed { .. } | ApprovalSummaryView::Rejected { .. }
+    )
 }
 
 /// Runs `stellar-agent approve list`.
@@ -112,7 +136,7 @@ pub async fn run(args: ListArgs) -> i32 {
     if let Err(reason) = validate_path_component_ascii_safe(&profile_name) {
         let err = WalletError::Validation(ValidationError::ConfigInvalid {
             component: "profile",
-            reason: format!("invalid profile name '{profile_name}': {reason}"),
+            reason: format!("the profile name is not a valid profile name: {reason}"),
         });
         render_json(&Envelope::<()>::err(&err));
         return 1;
@@ -148,22 +172,22 @@ pub async fn run(args: ListArgs) -> i32 {
 
     let snapshot = store.snapshot(now_ms);
     let expired_count = snapshot.iter().filter(|v| v.expired).count();
-    let pending: Vec<PendingApprovalView> = if args.include_expired {
-        snapshot
-    } else {
-        snapshot.into_iter().filter(|v| !v.expired).collect()
-    };
+    let (resolved, pending): (Vec<PendingApprovalView>, Vec<PendingApprovalView>) = snapshot
+        .into_iter()
+        .filter(|v| args.include_expired || !v.expired)
+        .partition(is_tombstone);
 
     tracing::debug!(
-        profile = %profile_name,
         pending_count = pending.len(),
+        resolved_count = resolved.len(),
         expired_count,
         "approval list completed"
     );
 
     let envelope = Envelope::ok(ListData {
-        profile: profile_name,
+        profile: super::common::saved_profile_name(profile_name),
         pending,
+        resolved,
         expired_count,
     });
     print_success(&envelope, args.output, now_ms);
@@ -174,26 +198,42 @@ pub async fn run(args: ListArgs) -> i32 {
 // Rendering
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn render_table(data: &ListData, now_ms: u64) -> String {
+    let mut lines = Vec::new();
+    if data.pending.is_empty() {
+        match &data.profile {
+            Some(profile) => lines.push(format!("No pending approvals for profile '{profile}'.")),
+            None => lines.push("No pending approvals.".to_owned()),
+        }
+    } else {
+        for view in &data.pending {
+            lines.push(render_pending_row(view, now_ms));
+        }
+    }
+    if !data.resolved.is_empty() {
+        lines.push(String::new());
+        lines.push("Resolved".to_owned());
+        for view in &data.resolved {
+            lines.push(render_pending_row(view, now_ms));
+        }
+    }
+    if data.expired_count > 0 {
+        lines.push(format!(
+            "({} expired entr{} not shown; run `approve gc` to clear)",
+            data.expired_count,
+            if data.expired_count == 1 { "y" } else { "ies" }
+        ));
+    }
+    lines.join("\n")
+}
+
 fn print_success(envelope: &Envelope<ListData>, format: OutputFormat, now_ms: u64) {
     match format {
         OutputFormat::Table =>
         {
             #[allow(clippy::print_stdout, reason = "CLI binary intentional user output")]
             if let Some(data) = &envelope.data {
-                if data.pending.is_empty() {
-                    println!("No pending approvals for profile '{}'.", data.profile);
-                } else {
-                    for view in &data.pending {
-                        println!("{}", render_pending_row(view, now_ms));
-                    }
-                }
-                if data.expired_count > 0 {
-                    println!(
-                        "({} expired entr{} not shown; run `approve gc` to clear)",
-                        data.expired_count,
-                        if data.expired_count == 1 { "y" } else { "ies" }
-                    );
-                }
+                println!("{}", render_table(data, now_ms));
             }
         }
         // `OutputFormat` is `#[non_exhaustive]`; unrecognised future variants
@@ -208,7 +248,7 @@ fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
         {
             #[allow(clippy::print_stdout, reason = "CLI binary intentional user output")]
             if let Some(err) = &envelope.error {
-                let safe_msg = sanitize_for_table(&err.message);
+                let safe_msg = escape_for_terminal(&err.message);
                 println!("Error: {} — {}", err.code, safe_msg);
             }
         }
@@ -222,14 +262,14 @@ fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
 /// so the displayed "expires in" duration is relative to the moment the
 /// snapshot was taken, not the entry's creation time.
 ///
-/// Every interpolated field passes through [`sanitize_for_table`] before
-/// being written — `summary_memo` and similar summary fields originate from
-/// simulate-time, potentially agent-influenced input and must not reach the
+/// Every interpolated field passes through [`escape_for_terminal`] before
+/// being written: the summary values are decoded from an agent-built
+/// envelope and the reason comes from the policy, so neither may reach the
 /// terminal unsanitised.
 fn render_pending_row(view: &PendingApprovalView, now_ms: u64) -> String {
-    let nonce = sanitize_for_table(&view.approval_nonce);
-    let kind = sanitize_for_table(view.kind_name);
-    let summary = sanitize_for_table(&render_summary_line(view));
+    let nonce = escape_for_terminal(&view.approval_nonce);
+    let kind = escape_for_terminal(view.kind_name);
+    let summary = escape_for_terminal(&render_summary_line(view));
     let expires_in = if view.expired {
         "expired".to_owned()
     } else {
@@ -238,9 +278,15 @@ fn render_pending_row(view: &PendingApprovalView, now_ms: u64) -> String {
     let reason = view
         .reason
         .as_deref()
-        .map(|reason| format!("  reason: {}", sanitize_for_table(reason)))
+        .map(|reason| format!("  reason: {}", escape_for_terminal(reason)))
         .unwrap_or_default();
     format!("{nonce}  {kind:<24}  {summary}{reason}  (expires in {expires_in})")
+}
+
+/// The base-account note of a muxed destination, or nothing without one.
+fn base_account_note(base: Option<&str>) -> String {
+    base.map(|base| format!(" (base account {base})"))
+        .unwrap_or_default()
 }
 
 /// Renders a one-line, non-secret summary for a [`PendingApprovalView`].
@@ -248,27 +294,54 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
     match &view.summary {
         ApprovalSummaryView::Payment {
             to,
+            to_base,
             amount_stroops,
             asset,
+            dest_asset: Some(dest_asset),
+            dest_amount_stroops: Some(dest_amount),
+            memo,
             ..
-        } => format!("pay {amount_stroops} stroops {asset} to {to}"),
+        } => format!(
+            "pay up to {amount_stroops} stroops {asset} to {to}{}, who receives at least \
+             {dest_amount} stroops {dest_asset}, memo {}",
+            base_account_note(to_base.as_deref()),
+            memo.display()
+        ),
+        ApprovalSummaryView::Payment {
+            to,
+            to_base,
+            amount_stroops,
+            asset,
+            memo,
+            ..
+        } => format!(
+            "pay {amount_stroops} stroops {asset} to {to}{}, memo {}",
+            base_account_note(to_base.as_deref()),
+            memo.display()
+        ),
         ApprovalSummaryView::Trustline {
             holder,
             asset_code,
             asset_issuer,
             limit_stroops,
+            memo,
             ..
         } => {
             let issuer = stellar_agent_core::approval::store::redact_g_strkey(asset_issuer);
             let limit = format_trustline_limit(*limit_stroops);
-            format!("trustline {asset_code}:{issuer} limit {limit} for {holder}")
+            format!(
+                "trustline {asset_code}:{issuer} limit {limit} for {holder}, memo {}",
+                memo.display()
+            )
         }
         ApprovalSummaryView::Claim {
             balance_id_strkey,
-            asset,
-            amount_stroops,
+            memo,
             ..
-        } => format!("claim {amount_stroops} stroops {asset} ({balance_id_strkey})"),
+        } => format!("claim {balance_id_strkey}, memo {}", memo.display()),
+        ApprovalSummaryView::Inconsistent {
+            original_kind_name, ..
+        } => format!("inconsistent {original_kind_name}: cannot be approved"),
         ApprovalSummaryView::SignWithPasskey {
             smart_account_redacted,
             rp_id,
@@ -281,10 +354,17 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
         } => format!("register passkey for {smart_account_redacted} (rp_id={rp_id})"),
         ApprovalSummaryView::ToolsetFirstInvokeGate {
             toolset_name,
+            install_id,
+            package_version,
+            package_shasum_short,
             capability,
-            destination_redacted,
+            destination,
+            destination_base,
             ..
-        } => format!("toolset '{toolset_name}' requests {capability} to {destination_redacted}"),
+        } => format!(
+            "toolset '{toolset_name}' {package_version} ({package_shasum_short}, install {install_id}) requests {capability} to {destination}{}",
+            base_account_note(destination_base.as_deref())
+        ),
         ApprovalSummaryView::TrustlineClawbackOptIn {
             code,
             issuer_redacted,
@@ -307,6 +387,23 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
         ApprovalSummaryView::Rejected { original_kind_name } => {
             format!("rejected ({original_kind_name})")
         }
+        // An x402 tombstone identifies the payment with a network-specific digest.
+        ApprovalSummaryView::Consumed {
+            original_kind_name,
+            tx_hash_redacted,
+            outcome,
+        } if original_kind_name == "X402Payment" => format!(
+            "spent ({original_kind_name}), payment digest {tx_hash_redacted}, outcome {outcome}"
+        ),
+        // A rule-proposal tombstone holds the proposal digest the operator
+        // attested, written before the install sends anything.
+        ApprovalSummaryView::Consumed {
+            original_kind_name,
+            tx_hash_redacted,
+            outcome,
+        } if original_kind_name == "RuleProposalSimulated" => format!(
+            "spent ({original_kind_name}), proposal digest {tx_hash_redacted}, outcome {outcome}"
+        ),
         ApprovalSummaryView::Consumed {
             original_kind_name,
             tx_hash_redacted,
@@ -347,19 +444,18 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
 
-    // ChangeTrust with transaction source [1; 32] and operation source [2; 32].
-    const CHANGE_TRUST_ENVELOPE: &str = concat!(
-        "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
-        "AAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAGAAAAAVVT",
-        "REMAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAR//////////wAAAAAAAAAA",
-    );
+    const SOURCE_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+    const DEST_G: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+    const USDC_ISSUER_G: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
     use serial_test::serial;
     use stellar_agent_core::approval::{
-        DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, process_uid_for_attestation,
+        DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, fixtures,
+        process_uid_for_attestation,
     };
     use stellar_agent_core::profile::schema::default_approval_dir;
     use stellar_agent_test_support::StellarAgentHomeGuard;
@@ -372,19 +468,17 @@ mod tests {
     }
 
     fn make_payment_entry(ttl_ms: u64) -> PendingApproval {
-        PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             1_000_000,
-            "XLM".to_owned(),
-            Some("hi".to_owned()),
+            Some("hi"),
             100,
             1,
             uid(),
             ttl_ms,
         )
-        .unwrap()
     }
 
     // ── format_expires_in ────────────────────────────────────────────────────
@@ -411,7 +505,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn list_run_empty_store_yields_empty_pending_and_exit_0() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         let dir = default_approval_dir().unwrap();
         assert_eq!(dir, home.path().join("approvals"));
@@ -424,14 +524,26 @@ mod tests {
             output: OutputFormat::Json,
             include_expired: false,
         };
+        crate::common::render::take_rendered_for_test();
         let code = run(args).await;
         assert_eq!(code, 0, "list on a not-yet-existing store must succeed");
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0]["data"]["pending"], serde_json::json!([]));
+        assert_eq!(rendered[0]["data"]["resolved"], serde_json::json!([]));
+        assert_eq!(rendered[0]["data"]["expired_count"], 0);
     }
 
     #[tokio::test]
     #[serial]
-    async fn list_run_populated_store_reports_payment_and_rejected_entries() {
-        let home = TempDir::new().unwrap();
+    async fn list_run_populated_store_separates_pending_from_tombstones() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         let dir = default_approval_dir().unwrap();
         assert_eq!(dir, home.path().join("approvals"));
@@ -439,17 +551,31 @@ mod tests {
         let path = dir.join(format!("{profile}.toml"));
 
         let now_ms = timefmt::now_unix_ms().unwrap();
+        let pending_nonce;
+        let rejected_nonce;
+        let consumed_nonce;
         {
             let mut store = PendingApprovalStore::open(path.clone()).unwrap();
-            store
-                .insert(make_payment_entry(DEFAULT_TTL_MS), now_ms)
-                .unwrap();
+            let pending_entry = make_payment_entry(DEFAULT_TTL_MS);
+            pending_nonce = pending_entry.approval_nonce.clone();
+            store.insert(pending_entry, now_ms).unwrap();
 
             let rejected_source = make_payment_entry(DEFAULT_TTL_MS);
-            let rejected_nonce = rejected_source.approval_nonce.clone();
+            rejected_nonce = rejected_source.approval_nonce.clone();
             store.insert(rejected_source, now_ms).unwrap();
             store
                 .reject(&rejected_nonce, now_ms, DEFAULT_TTL_MS)
+                .unwrap();
+
+            let consumed_source = make_payment_entry(DEFAULT_TTL_MS);
+            consumed_nonce = consumed_source.approval_nonce.clone();
+            store.insert(consumed_source, now_ms).unwrap();
+            store
+                .consume(
+                    &consumed_nonce,
+                    &"ab".repeat(32),
+                    stellar_agent_core::approval::ConsumedOutcome::Confirmed,
+                )
                 .unwrap();
         } // lock released
 
@@ -458,21 +584,46 @@ mod tests {
             output: OutputFormat::Json,
             include_expired: false,
         };
+        crate::common::render::take_rendered_for_test();
         let code = run(args).await;
         assert_eq!(code, 0);
 
-        // Re-open to inspect the shape via the same snapshot API the command uses.
-        let store = PendingApprovalStore::open(path).unwrap();
-        let views = store.snapshot(now_ms);
-        assert_eq!(views.len(), 2, "both entries must be present");
-        assert!(views.iter().any(|v| v.kind_name == "PaymentSimulated"));
-        assert!(views.iter().any(|v| v.kind_name == "Rejected"));
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1);
+        let data = &rendered[0]["data"];
+        let pending = data["pending"].as_array().unwrap();
+        assert!(
+            data["resolved"].is_array(),
+            "expected resolved array: {data}"
+        );
+        let resolved = data["resolved"].as_array().unwrap();
+        assert_eq!(pending.len(), 1, "only non-tombstone in pending: {data}");
+        assert_eq!(pending[0]["approval_nonce"], pending_nonce);
+        assert_eq!(pending[0]["kind_name"], "PaymentSimulated");
+        assert_eq!(resolved.len(), 2, "tombstones live in resolved: {data}");
+        assert!(
+            resolved
+                .iter()
+                .any(|v| v["approval_nonce"] == rejected_nonce && v["kind_name"] == "Rejected")
+        );
+        assert!(
+            resolved
+                .iter()
+                .any(|v| v["approval_nonce"] == consumed_nonce && v["kind_name"] == "Consumed")
+        );
+        assert_eq!(data["expired_count"], 0);
     }
 
     #[tokio::test]
     #[serial]
     async fn list_run_excludes_expired_unless_include_expired() {
-        let home = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         let dir = default_approval_dir().unwrap();
         assert_eq!(dir, home.path().join("approvals"));
@@ -483,15 +634,36 @@ mod tests {
         {
             let mut store = PendingApprovalStore::open(path.clone()).unwrap();
             store.insert(make_payment_entry(1), now_ms).unwrap(); // TTL=1ms
+            let consumed_entry = make_payment_entry(1);
+            let consumed_nonce = consumed_entry.approval_nonce.clone();
+            store.insert(consumed_entry, now_ms).unwrap();
+            store
+                .consume(
+                    &consumed_nonce,
+                    &"cd".repeat(32),
+                    stellar_agent_core::approval::ConsumedOutcome::Confirmed,
+                )
+                .unwrap();
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
 
+        crate::common::render::take_rendered_for_test();
         let args_default = ListArgs {
             profile: Some(profile.to_owned()),
             output: OutputFormat::Json,
             include_expired: false,
         };
         assert_eq!(run(args_default).await, 0);
+        let default_rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(
+            default_rendered[0]["data"]["pending"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            default_rendered[0]["data"]["resolved"],
+            serde_json::json!([])
+        );
+        assert_eq!(default_rendered[0]["data"]["expired_count"], 2);
 
         let args_include = ListArgs {
             profile: Some(profile.to_owned()),
@@ -499,14 +671,111 @@ mod tests {
             include_expired: true,
         };
         assert_eq!(run(args_include).await, 0);
+        let included_rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(
+            included_rendered[0]["data"]["pending"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            included_rendered[0]["data"]["resolved"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(included_rendered[0]["data"]["expired_count"], 2);
+    }
 
-        // Both invocations must succeed; the filtering behavior itself is
-        // covered directly against the snapshot filter logic below.
-        let store = PendingApprovalStore::open(path).unwrap();
-        let later_now = timefmt::now_unix_ms().unwrap();
-        let views = store.snapshot(later_now);
-        assert_eq!(views.len(), 1);
-        assert!(views[0].expired, "the sole entry must have expired by now");
+    #[test]
+    fn render_table_places_tombstones_under_resolved_heading() {
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        let pending_entry = make_payment_entry(DEFAULT_TTL_MS);
+        let now_ms = pending_entry.created_at_unix_ms;
+        store.insert(pending_entry, now_ms).unwrap();
+        let pending_view = store.snapshot(now_ms).remove(0);
+        let (consumed_view, _) = consumed_view(make_payment_entry(DEFAULT_TTL_MS));
+        let rejected_dir = TempDir::new().unwrap();
+        let mut rejected_store =
+            PendingApprovalStore::open(rejected_dir.path().join("default.toml")).unwrap();
+        let rejected_entry = make_payment_entry(DEFAULT_TTL_MS);
+        let rejected_nonce = rejected_entry.approval_nonce.clone();
+        rejected_store.insert(rejected_entry, now_ms).unwrap();
+        rejected_store
+            .reject(&rejected_nonce, now_ms, DEFAULT_TTL_MS)
+            .unwrap();
+        let rejected_view = rejected_store.snapshot(now_ms).remove(0);
+
+        let pending_only = render_table(
+            &ListData {
+                profile: Some("default".to_owned()),
+                pending: vec![pending_view.clone()],
+                resolved: vec![],
+                expired_count: 0,
+            },
+            now_ms,
+        );
+        assert!(!pending_only.contains("Resolved"), "{pending_only}");
+
+        let both = render_table(
+            &ListData {
+                profile: Some("default".to_owned()),
+                pending: vec![pending_view],
+                resolved: vec![consumed_view.clone(), rejected_view],
+                expired_count: 0,
+            },
+            now_ms,
+        );
+        assert!(
+            both.contains("\n\nResolved\n"),
+            "expected Resolved section heading: {both}"
+        );
+        let (before, after) = both.split_once("\n\nResolved\n").unwrap();
+        assert!(before.contains("PaymentSimulated"), "{before}");
+        assert!(!before.contains("spent (PaymentSimulated)"), "{before}");
+        assert!(!before.contains("rejected (PaymentSimulated)"), "{before}");
+        assert!(after.contains("spent (PaymentSimulated)"), "{after}");
+        assert!(after.contains("rejected (PaymentSimulated)"), "{after}");
+
+        let resolved_only = render_table(
+            &ListData {
+                profile: Some("default".to_owned()),
+                pending: vec![],
+                resolved: vec![consumed_view],
+                expired_count: 1,
+            },
+            now_ms,
+        );
+        assert!(
+            resolved_only.starts_with("No pending approvals for profile 'default'."),
+            "{resolved_only}"
+        );
+        assert!(resolved_only.contains("\n\nResolved\n"), "{resolved_only}");
+        assert!(
+            resolved_only.contains("(1 expired entry not shown; run `approve gc` to clear)"),
+            "{resolved_only}"
+        );
+
+        let unsaved_plural = render_table(
+            &ListData {
+                profile: None,
+                pending: vec![],
+                resolved: vec![],
+                expired_count: 2,
+            },
+            now_ms,
+        );
+        assert!(
+            unsaved_plural.starts_with("No pending approvals.\n"),
+            "{unsaved_plural}"
+        );
+        assert!(
+            unsaved_plural.contains("(2 expired entries not shown; run `approve gc` to clear)"),
+            "{unsaved_plural}"
+        );
     }
 
     // ── render_pending_row / render_summary_line ─────────────────────────────
@@ -541,24 +810,38 @@ mod tests {
     fn render_pending_row_sanitizes_memo_escape_sequences() {
         let dir = TempDir::new().unwrap();
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        let envelope = fixtures::payment_envelope(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            1_000,
+            Some("hello\x1b[31mworld"),
+            100,
+            1,
+        );
         let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            envelope.clone(),
+            envelope.as_bytes(),
+            DEST_G.to_owned(),
             1_000,
             "XLM".to_owned(),
-            Some("hello\x1b[31mworld".to_owned()),
+            None,
             100,
             1,
             uid(),
             DEFAULT_TTL_MS,
         )
-        .unwrap();
+        .unwrap()
+        .with_policy_request(
+            &stellar_agent_core::policy::ApprovalRequest::new(String::new(), 60)
+                .with_reason("review\x1b[2Kthis".to_owned()),
+        );
         store.insert(entry, 0).unwrap();
         let view = store.snapshot(0).into_iter().next().unwrap();
         // The row renderer must not embed the raw ESC byte anywhere.
         let row = render_pending_row(&view, 0);
-        assert!(!row.contains('\x1b'), "escape sequence must be sanitized");
+        assert!(!row.contains('\x1b'), "escape sequence must be escaped");
+        assert!(row.contains("review\\u{1b}[2Kthis"), "{row}");
     }
 
     #[test]
@@ -572,28 +855,23 @@ mod tests {
             let mut store = PendingApprovalStore::open(dir.path().join("trustline.toml")).unwrap();
             store
                 .insert(
-                    PendingApproval::new_trustline_pending(
-                        CHANGE_TRUST_ENVELOPE.to_owned(),
-                        CHANGE_TRUST_ENVELOPE.as_bytes(),
-                        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                        "USDC".to_owned(),
-                        "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+                    fixtures::trustline_pending(
+                        SOURCE_G,
+                        "USDC",
+                        USDC_ISSUER_G,
                         limit,
                         100,
                         42,
                         "1000".to_owned(),
                         DEFAULT_TTL_MS,
-                    )
-                    .unwrap(),
+                    ),
                     0,
                 )
                 .unwrap();
             let view = store.snapshot(0).remove(0);
             assert_eq!(
                 render_summary_line(&view),
-                format!(
-                    "trustline USDC:GBBD4...LFLA5 limit {shown} for GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-                )
+                format!("trustline USDC:GBBD4...LFLA5 limit {shown} for {SOURCE_G}, memo none")
             );
             let json = serde_json::to_value(&view).unwrap();
             assert_eq!(
@@ -607,7 +885,10 @@ mod tests {
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
         store.insert(make_payment_entry(DEFAULT_TTL_MS), 0).unwrap();
         let view = store.snapshot(0).into_iter().next().unwrap();
-        assert!(render_summary_line(&view).contains("pay"));
+        assert_eq!(
+            render_summary_line(&view),
+            format!("pay 1000000 stroops XLM to {DEST_G}, memo text \"hi\"")
+        );
 
         // Rejected tombstone
         let rejected_dir = TempDir::new().unwrap();
@@ -641,8 +922,13 @@ mod tests {
             format!("{body}\n[signature]\nowner_id = \"{owner}\"\nsig = \"{sig}\"\n"),
         )
         .unwrap();
-        let policy =
-            load_signed_policy(&policy_path, "shape", &key.verifying_key().to_bytes()).unwrap();
+        let policy = load_signed_policy(
+            &policy_path,
+            "shape",
+            &key.verifying_key().to_bytes(),
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+        )
+        .unwrap();
         let request = match &policy.rules[0].decision {
             Decision::RequireApproval(request) => Some(request),
             _ => None,
@@ -664,5 +950,693 @@ mod tests {
         let row = render_pending_row(view, now);
         assert!(row.contains("reason: Treasury review"), "{row}");
         assert!(row.contains("10m17s"), "{row}");
+    }
+
+    /// The tombstone view of `entry` after it is consumed with a 64-hex value
+    /// and a confirmed outcome.
+    fn consumed_view(entry: PendingApproval) -> (PendingApprovalView, String) {
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        let now_ms = entry.created_at_unix_ms;
+        let nonce = entry.approval_nonce.clone();
+        store.insert(entry, now_ms).unwrap();
+        let value = "ab".repeat(32);
+        assert!(
+            store
+                .consume(
+                    &nonce,
+                    &value,
+                    stellar_agent_core::approval::ConsumedOutcome::Confirmed
+                )
+                .unwrap()
+        );
+        let view = store.snapshot(now_ms).pop().unwrap();
+        let ApprovalSummaryView::Consumed {
+            tx_hash_redacted, ..
+        } = &view.summary
+        else {
+            panic!("{:?}", view.summary);
+        };
+        let redacted = tx_hash_redacted.clone();
+        (view, redacted)
+    }
+
+    /// A consumed x402 payment approval names its value as the payment digest.
+    #[test]
+    fn a_consumed_x402_approval_names_the_payment_digest() {
+        use stellar_xdr::{
+            AccountId, ContractId, Hash, InvokeContractArgs, PublicKey, ScAddress, ScVal,
+            SorobanAuthorizedFunction, SorobanAuthorizedInvocation, Uint256,
+        };
+        let root = SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([3; 32]))),
+                function_name: "transfer".try_into().unwrap(),
+                args: vec![
+                    ScVal::Address(ScAddress::Account(AccountId(
+                        PublicKey::PublicKeyTypeEd25519(Uint256([4; 32])),
+                    ))),
+                    ScVal::Address(ScAddress::Account(AccountId(
+                        PublicKey::PublicKeyTypeEd25519(Uint256([5; 32])),
+                    ))),
+                    ScVal::from(123i128),
+                ]
+                .try_into()
+                .unwrap(),
+            }),
+            sub_invocations: vec![].try_into().unwrap(),
+        };
+        let entry = PendingApproval::new_x402_pending(
+            &[7; 32],
+            &root,
+            Some("pay.example.org".to_owned()),
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let (view, redacted) = consumed_view(entry);
+        assert_eq!(
+            render_summary_line(&view),
+            format!("spent (X402Payment), payment digest {redacted}, outcome confirmed")
+        );
+    }
+
+    /// A consumed rule-proposal approval names its value as the proposal
+    /// digest.
+    #[test]
+    fn consumed_rule_proposal_names_its_value_as_the_proposal_digest() {
+        use stellar_agent_core::approval::{
+            ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
+        };
+        let entry = PendingApproval::new_rule_proposal_pending(
+            "CDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD".to_owned(),
+            "Test SDF Network ; September 2015".to_owned(),
+            "stellar:testnet".to_owned(),
+            ContextRuleProposalSnapshot::new(
+                RuleProposalContextType::Default,
+                "rule".to_owned(),
+                None,
+                vec![RuleProposalSigner::delegated(SOURCE_G.to_owned(), true)],
+                vec![],
+                vec![0],
+                false,
+                false,
+            ),
+            "rule".to_owned(),
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let (view, redacted) = consumed_view(entry);
+        assert_eq!(
+            render_summary_line(&view),
+            format!("spent (RuleProposalSimulated), proposal digest {redacted}, outcome confirmed")
+        );
+    }
+
+    /// Every other consumed approval keeps the transaction wording.
+    #[test]
+    fn a_consumed_payment_approval_keeps_the_transaction_wording() {
+        let (view, redacted) = consumed_view(make_payment_entry(DEFAULT_TTL_MS));
+        assert_eq!(
+            render_summary_line(&view),
+            format!("spent (PaymentSimulated) on {redacted}, outcome confirmed")
+        );
+    }
+    #[test]
+    fn approve_list_preserves_unicode_and_escapes_bidi_rule_names() {
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("list.toml")).unwrap();
+        use stellar_agent_core::approval::{
+            ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
+        };
+        let entry = PendingApproval::new_rule_proposal_pending(
+            "CDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD".to_owned(),
+            "Test SDF Network ; September 2015".to_owned(),
+            "stellar:testnet".to_owned(),
+            ContextRuleProposalSnapshot::new(
+                RuleProposalContextType::Default,
+                "rule".to_owned(),
+                None,
+                vec![RuleProposalSigner::delegated(SOURCE_G.to_owned(), true)],
+                vec![],
+                vec![0],
+                false,
+                false,
+            ),
+            "rule".to_owned(),
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        store.insert(entry, 0).unwrap();
+        let mut view = store.snapshot(0).remove(0);
+        for (name, shown) in [("café", "café"), ("rule\u{202e}", "rule\\u{202e}")] {
+            if let ApprovalSummaryView::RuleProposal {
+                summary_line,
+                definition,
+                ..
+            } = &mut view.summary
+            {
+                *summary_line = name.to_owned();
+                definition.name = name.to_owned();
+            }
+            view.reason = Some(name.to_owned());
+            let row = render_pending_row(&view, 0);
+            assert!(row.contains(&format!("{shown} on")), "{row}");
+            assert!(!row.contains('\u{202e}'));
+        }
+    }
+
+    #[test]
+    fn the_gate_summary_shows_version_shasum_and_install_id() {
+        let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
+            "my-toolset".to_owned(),
+            "a".repeat(32),
+            "1.2.3".to_owned(),
+            "d".repeat(64),
+            "sign-payment".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
+            "XLM".to_owned(),
+            0,
+            10,
+            stellar_agent_core::approval::process_uid_for_attestation().unwrap(),
+            60_000,
+        )
+        .unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store =
+            stellar_agent_core::approval::PendingApprovalStore::open(dir.path().join("test.toml"))
+                .unwrap();
+        let now = entry.created_at_unix_ms;
+        store.insert(entry, now).unwrap();
+        let view = store.snapshot(now).remove(0);
+        let line = render_summary_line(&view);
+        assert!(line.contains(&format!(
+            "toolset 'my-toolset' 1.2.3 ({}, install {}) requests sign-payment",
+            "d".repeat(12),
+            "a".repeat(32)
+        )));
+        assert!(!line.contains(&"d".repeat(13)));
+    }
+
+    /// SHA-256 of each pending row and summary line from fixed inputs.
+    fn rendered_list_outputs() -> Vec<String> {
+        use sha2::{Digest as _, Sha256};
+        const NOW: u64 = 1_700_000_000_000;
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("rows.toml")).unwrap();
+        let entries = [
+            fixtures::payment_pending(
+                SOURCE_G,
+                DEST_G,
+                "XLM",
+                1_000_000,
+                Some("hi"),
+                100,
+                1,
+                "1000".to_owned(),
+                600_000,
+            ),
+            fixtures::trustline_pending(
+                SOURCE_G,
+                "USDC",
+                USDC_ISSUER_G,
+                Some(5),
+                100,
+                42,
+                "1000".to_owned(),
+                600_000,
+            ),
+        ];
+        for (index, mut entry) in entries.into_iter().enumerate() {
+            entry.approval_nonce = format!("{index}").repeat(22);
+            entry.created_at_unix_ms = NOW;
+            entry.expires_at_unix_ms = NOW + 600_000;
+            store.insert(entry, NOW).unwrap();
+        }
+        store
+            .snapshot(NOW)
+            .iter()
+            .flat_map(|view| {
+                [
+                    render_pending_row(view, NOW + 1_000),
+                    render_summary_line(view),
+                ]
+            })
+            .map(|text| stellar_agent_core::hex::encode(&Sha256::digest(text.as_bytes())))
+            .collect()
+    }
+
+    /// The digests of [`rendered_list_outputs`] as the base tree renders them.
+    const BASE_LIST_OUTPUTS: &[&str] = &[
+        "187b3d08ab53185bbff73e3a0a7efd228db1acd34e48dbfceb787558b46b5778",
+        "e1be7985f1ecc8301ee9de9a756558519304e597c3e484e2cac0926fa0d94919",
+        "84709417b1bc89d97f0644226f85ad0b64b72fc6ad24735451468e0c0a24f36d",
+        "5c369cfacd99f2d6e5757faed755e35a931e9d00858bd2a2eb5328687bd7b042",
+    ];
+
+    #[test]
+    fn list_renderers_keep_base_bytes() {
+        assert_eq!(rendered_list_outputs(), BASE_LIST_OUTPUTS);
+    }
+
+    /// The owner sees the base. For a payment and a toolset grant to
+    /// M0 or M17, the approval UI, `approve list` and `approve run` show the
+    /// full M and a base account row; G payments and grants render without
+    /// one.
+    #[test]
+    #[serial_test::serial]
+    fn muxed_approval_shows_base_account() {
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        use stellar_agent_core::approval::view::ApprovalSummaryView;
+        let key = [0xAE; 32];
+        let g = format!("{}", stellar_strkey::ed25519::PublicKey(key));
+        let m = |id: u64| {
+            format!(
+                "{}",
+                stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+            )
+        };
+        let payment = |destination: &str| {
+            let mut builder = stellar_agent_network::builder::ClassicOpBuilder::new(
+                SOURCE_G,
+                41,
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                100,
+            );
+            builder
+                .payment(
+                    destination,
+                    stellar_agent_core::StellarAmount::from_stroops(2_500_000),
+                    &stellar_agent_network::builder::Asset::Native,
+                )
+                .map(|_| ())
+                .unwrap();
+            let envelope = builder.build().unwrap();
+            PendingApproval::new_payment_pending(
+                envelope.clone(),
+                envelope.as_bytes(),
+                destination.to_owned(),
+                2_500_000,
+                "XLM".to_owned(),
+                None,
+                100,
+                42,
+                uid(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap()
+        };
+        let gate = |destination: &str| {
+            PendingApproval::new_toolset_first_invoke_gate_pending(
+                "mux-tools".to_owned(),
+                "a".repeat(32),
+                "1.0.0".to_owned(),
+                "d".repeat(64),
+                "sign-payment".to_owned(),
+                destination.to_owned(),
+                "XLM".to_owned(),
+                0,
+                10,
+                uid(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap()
+        };
+        let context = {
+            let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+                "svc", "default", "nonce", "default",
+            )
+            .build();
+            stellar_agent_core::approval::ApprovalContext::from_profile("render-test", &profile)
+        };
+        let base_row = format!("Base account</div>\n      <div class=\"addr\">{g}</div>");
+        for (destination, muxed) in [(g.clone(), false), (m(0), true), (m(17), true)] {
+            for entry in [payment(&destination), gate(&destination)] {
+                let dir = TempDir::new().unwrap();
+                {
+                    let mut store =
+                        PendingApprovalStore::open(dir.path().join("mux.toml")).unwrap();
+                    store.insert(entry.clone(), 0).unwrap();
+                }
+                // The entry survives a reload of the store file.
+                let store = PendingApprovalStore::open(dir.path().join("mux.toml")).unwrap();
+                let view = store.snapshot(0).remove(0);
+                let base = match &view.summary {
+                    ApprovalSummaryView::Payment { to, to_base, .. } => {
+                        assert_eq!(to, &destination);
+                        to_base.clone()
+                    }
+                    ApprovalSummaryView::ToolsetFirstInvokeGate {
+                        destination: shown,
+                        destination_base,
+                        ..
+                    } => {
+                        assert_eq!(shown, &destination);
+                        destination_base.clone()
+                    }
+                    other => panic!("{other:?}"),
+                };
+                assert_eq!(base, muxed.then(|| g.clone()), "{destination}");
+
+                let html = stellar_agent_approval_ui::render_summary_html(&view);
+                let line = render_summary_line(&view);
+                let mut sink = Vec::new();
+                crate::commands::approve::run::write_summary(&entry, &context, &mut sink).unwrap();
+                let run = String::from_utf8(sink).unwrap();
+                if muxed {
+                    assert!(html.contains(&destination), "{html}");
+                    assert!(html.contains(&base_row), "{html}");
+                    assert!(line.contains(&destination), "{line}");
+                    assert!(line.contains(&format!("(base account {g})")), "{line}");
+                    assert!(run.contains(&destination), "{run}");
+                    assert!(
+                        run.contains(&format!("  Base account:      {g}\n")),
+                        "{run}"
+                    );
+                } else {
+                    assert!(!html.contains("Base account"), "{html}");
+                    assert!(!line.contains("base account"), "{line}");
+                    assert!(!run.contains("Base account"), "{run}");
+                }
+            }
+        }
+    }
+
+    use stellar_agent_core::approval::store::ApprovalKind;
+
+    /// The G account the consent cases name and its maximum-ID M address.
+    const CONSENT_G: &str = "GDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LCRG";
+    const CONSENT_MMAX: &str =
+        "MDK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5L7777777777774ZMO";
+
+    fn consent_context() -> stellar_agent_core::approval::ApprovalContext {
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "default", "nonce", "default",
+        )
+        .build();
+        stellar_agent_core::approval::ApprovalContext::from_profile("render-test", &profile)
+    }
+
+    fn gate_entry(toolset: &str, destination: &str) -> PendingApproval {
+        PendingApproval::new_toolset_first_invoke_gate_pending(
+            toolset.to_owned(),
+            "a".repeat(32),
+            "1.0.0".to_owned(),
+            "d".repeat(64),
+            "sign-payment".to_owned(),
+            destination.to_owned(),
+            "XLM".to_owned(),
+            0,
+            10,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap()
+    }
+
+    /// The stored view of `entry`, the page, the `approve list` line, and
+    /// the `approve` prompt.
+    fn rendered(entry: &PendingApproval) -> (PendingApprovalView, String, String, String) {
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("consent.toml")).unwrap();
+        store.insert(entry.clone(), 0).unwrap();
+        let view = store.snapshot(0).remove(0);
+        let html = stellar_agent_approval_ui::render_summary_html(&view);
+        let line = render_pending_row(&view, 0);
+        let mut sink = Vec::new();
+        crate::commands::approve::run::write_summary(entry, &consent_context(), &mut sink).unwrap();
+        (view, html, line, String::from_utf8(sink).unwrap())
+    }
+
+    /// A toolset grant to G or to the maximum-ID M shows the complete
+    /// address on the page, the list line, and the prompt; M shows its base
+    /// row and G shows none.
+    #[test]
+    #[serial_test::serial]
+    fn toolset_consent_shows_the_complete_destination() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (_, html, line, run) = rendered(&gate_entry("pay-tools", CONSENT_G));
+        assert!(
+            html.contains(&format!(
+                "Destination</div>\n      <div class=\"addr\">{CONSENT_G}</div>"
+            )),
+            "{html}"
+        );
+        assert!(!html.contains("GDK5L...5LCRG"), "{html}");
+        assert!(!html.contains("Base account"), "{html}");
+        assert!(
+            line.contains(&format!("requests sign-payment to {CONSENT_G}")),
+            "{line}"
+        );
+        assert!(!line.contains("base account"), "{line}");
+        assert!(
+            run.contains(&format!("  Destination:       {CONSENT_G}\n")),
+            "{run}"
+        );
+        assert!(!run.contains("Base account"), "{run}");
+
+        let (_, html, line, run) = rendered(&gate_entry("pay-tools", CONSENT_MMAX));
+        assert!(
+            html.contains(&format!(
+                "Destination</div>\n      <div class=\"addr\">{CONSENT_MMAX}</div>"
+            )),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "Base account</div>\n      <div class=\"addr\">{CONSENT_G}</div>"
+            )),
+            "{html}"
+        );
+        assert!(
+            line.contains(&format!("to {CONSENT_MMAX} (base account {CONSENT_G})")),
+            "{line}"
+        );
+        assert!(
+            run.contains(&format!("  Destination:       {CONSENT_MMAX}\n")),
+            "{run}"
+        );
+        assert!(
+            run.contains(&format!("  Base account:      {CONSENT_G}\n")),
+            "{run}"
+        );
+    }
+
+    /// Contract payments retain their full destination in the list and JSON.
+    #[test]
+    #[serial_test::serial]
+    fn contract_list_shows_the_complete_destination() {
+        let entry = fixtures::sac_payment_pending(
+            stellar_agent_core::profile::caip2::Caip2::Testnet,
+            stellar_agent_core::approval::IntentAsset::Native,
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = stellar_agent_core::approval::PendingApprovalStore::open(
+            dir.path().join("contract.toml"),
+        )
+        .unwrap();
+        store
+            .insert(entry.clone(), entry.created_at_unix_ms)
+            .unwrap();
+        let view = store.snapshot(entry.created_at_unix_ms).remove(0);
+        let line = render_pending_row(&view, entry.created_at_unix_ms);
+        assert!(
+            line.contains("CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ"),
+            "full contract destination"
+        );
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["summary"]["fee_stroops"], "500100");
+    }
+
+    /// A payment to the maximum-ID M shows its complete `to` and its base
+    /// row on the page, the list line, and the prompt.
+    #[test]
+    #[serial_test::serial]
+    fn payment_consent_shows_the_complete_destination() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            CONSENT_MMAX,
+            "XLM",
+            2_500_000,
+            None,
+            100,
+            42,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        );
+        let (view, html, line, run) = rendered(&entry);
+        let ApprovalSummaryView::Payment { to, to_base, .. } = &view.summary else {
+            panic!("{:?}", view.summary)
+        };
+        assert_eq!(to, CONSENT_MMAX);
+        assert_eq!(to_base.as_deref(), Some(CONSENT_G));
+        assert!(html.contains(CONSENT_MMAX), "{html}");
+        assert!(
+            html.contains(&format!(
+                "Base account</div>\n      <div class=\"addr\">{CONSENT_G}</div>"
+            )),
+            "{html}"
+        );
+        assert!(line.contains(CONSENT_MMAX), "{line}");
+        assert!(
+            line.contains(&format!("(base account {CONSENT_G})")),
+            "{line}"
+        );
+        assert!(run.contains(CONSENT_MMAX), "{run}");
+        assert!(
+            run.contains(&format!("  Base account:      {CONSENT_G}\n")),
+            "{run}"
+        );
+    }
+
+    /// A toolset request whose stored `destination` has a bad checksum, with
+    /// control and multibyte text, renders as inconsistent and escaped, stays
+    /// listable and rejectable, and refuses approval with
+    /// `approval.entry_inconsistent`. A payment whose stored `summary_to`
+    /// has a bad checksum shows the envelope's destination, never the stored
+    /// text, and refuses approval with the same code.
+    #[test]
+    #[serial_test::serial]
+    fn malformed_consent_terms_render_escaped() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        // Stores `entry`, replaces its one `from` with `to` in the stored
+        // file, and reopens the store.
+        fn stored_with(
+            dir: &TempDir,
+            entry: &PendingApproval,
+            from: &str,
+            to: &str,
+        ) -> PendingApprovalStore {
+            let path = dir.path().join("malformed.toml");
+            PendingApprovalStore::open(path.clone())
+                .unwrap()
+                .insert(entry.clone(), 0)
+                .unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(text.matches(from).count(), 1, "{text}");
+            std::fs::write(&path, text.replace(from, to)).unwrap();
+            PendingApprovalStore::open(path).unwrap()
+        }
+
+        // The toolset `destination` with a bad checksum.
+        let bad_g = format!("{}A", &CONSENT_G[..CONSENT_G.len() - 1]);
+        let gate = gate_entry("tools", CONSENT_G);
+        let dir = TempDir::new().unwrap();
+        let mut store = stored_with(&dir, &gate, CONSENT_G, &bad_g);
+        let loaded = store.get(&gate.approval_nonce).unwrap().clone();
+        let view = store.snapshot(0).remove(0);
+        assert!(
+            matches!(view.summary, ApprovalSummaryView::Inconsistent { .. }),
+            "{:?}",
+            view.summary
+        );
+        let html = stellar_agent_approval_ui::render_summary_html(&view);
+        assert!(!html.contains(&bad_g), "{html}");
+        let mut sink = Vec::new();
+        crate::commands::approve::run::write_summary(&loaded, &consent_context(), &mut sink)
+            .unwrap();
+        let run = String::from_utf8(sink).unwrap();
+        assert!(run.contains("INCONSISTENT"), "{run}");
+        assert_eq!(
+            stellar_agent_core::approval::verify_entry_terms(&loaded.kind)
+                .unwrap_err()
+                .code(),
+            "approval.entry_inconsistent"
+        );
+        assert!(
+            store
+                .reject(&gate.approval_nonce, 0, DEFAULT_TTL_MS)
+                .unwrap()
+        );
+        assert!(matches!(
+            store.snapshot(0).remove(0).summary,
+            ApprovalSummaryView::Rejected { .. }
+        ));
+
+        // The payment `summary_to` with a bad checksum.
+        let bad_m = format!("{}A", &CONSENT_MMAX[..CONSENT_MMAX.len() - 1]);
+        let payment = fixtures::payment_pending(
+            SOURCE_G,
+            CONSENT_MMAX,
+            "XLM",
+            2_500_000,
+            None,
+            100,
+            42,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        );
+        let dir = TempDir::new().unwrap();
+        let mut store = stored_with(&dir, &payment, CONSENT_MMAX, &bad_m);
+        let loaded = store.get(&payment.approval_nonce).unwrap().clone();
+        let view = store.snapshot(0).remove(0);
+        let ApprovalSummaryView::Payment { to, .. } = &view.summary else {
+            panic!("{:?}", view.summary)
+        };
+        assert_eq!(to, CONSENT_MMAX, "the view decodes the envelope");
+        let html = stellar_agent_approval_ui::render_summary_html(&view);
+        assert!(html.contains(CONSENT_MMAX), "{html}");
+        assert!(!html.contains(&bad_m), "{html}");
+        assert!(render_pending_row(&view, 0).contains(CONSENT_MMAX));
+        assert_eq!(
+            stellar_agent_core::approval::verify_stored_destination(&loaded.kind)
+                .unwrap_err()
+                .code(),
+            "approval.entry_inconsistent"
+        );
+        assert!(
+            store
+                .reject(&payment.approval_nonce, 0, DEFAULT_TTL_MS)
+                .unwrap()
+        );
+
+        // Control and multibyte text renders escaped on the page, the list
+        // line, and the prompt.
+        let hostile = "t<b>\u{e9}\u{1b}[31m\u{202e}";
+        let mut entry = gate_entry("tools", CONSENT_MMAX);
+        let (mut view, _, _, _) = rendered(&entry);
+        if let ApprovalSummaryView::ToolsetFirstInvokeGate { toolset_name, .. } = &mut view.summary
+        {
+            hostile.clone_into(toolset_name);
+        }
+        let html = stellar_agent_approval_ui::render_summary_html(&view);
+        assert!(html.contains("t&lt;b&gt;\u{e9}"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
+        assert!(html.contains(CONSENT_MMAX), "{html}");
+        let line = render_pending_row(&view, 0);
+        assert!(
+            !line.contains('\u{1b}') && !line.contains('\u{202e}'),
+            "{line:?}"
+        );
+        assert!(line.contains(CONSENT_MMAX), "{line}");
+        if let ApprovalKind::ToolsetFirstInvokeGate { toolset_name, .. } = &mut entry.kind {
+            hostile.clone_into(toolset_name);
+        }
+        let mut sink = Vec::new();
+        crate::commands::approve::run::write_summary(&entry, &consent_context(), &mut sink)
+            .unwrap();
+        let run = String::from_utf8(sink).unwrap();
+        assert!(
+            !run.contains('\u{1b}') && !run.contains('\u{202e}'),
+            "{run:?}"
+        );
+        assert!(run.contains(CONSENT_MMAX), "{run}");
     }
 }

@@ -43,7 +43,8 @@ pub use state::{
     authorization_fingerprint,
 };
 pub use store::{
-    MppAuthorizationStore, absent_state_approval_lookup_error, absent_state_lookup_error,
+    MppAuthorizationStore, MppStateReset, absent_state_approval_lookup_error,
+    absent_state_lookup_error,
 };
 
 /// Supported MPP payment method.

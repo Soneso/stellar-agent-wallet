@@ -44,7 +44,11 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial]
     fn dispatch_empty_account_returns_missing_address() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::Profile;
 
         // An empty account string causes resolve_active_address to return
@@ -59,7 +63,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn dispatch_g_strkey_account_returns_address_json() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::Profile;
 
         let profile = Profile::builder_testnet(
@@ -83,7 +91,11 @@ mod tests {
     // different input shapes (all resolve through resolve_active_address).
 
     #[test]
+    #[serial_test::serial]
     fn dispatch_c_strkey_account_returns_address_json() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::Profile;
 
         let c_strkey: String = stellar_strkey::Contract([0x03u8; 32])
@@ -96,7 +108,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn dispatch_m_strkey_account_returns_address_json() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::Profile;
 
         let m_strkey: String = stellar_strkey::ed25519::MuxedAccount {

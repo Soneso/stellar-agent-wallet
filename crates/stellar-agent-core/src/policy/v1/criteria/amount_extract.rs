@@ -94,8 +94,8 @@ pub(crate) fn resolve_pay_or_create_account_stroops(
             .map(|a| a.as_stroops())
             .map_err(|e| PolicyError::CriterionEvaluationFailed {
                 detail: format!(
-                    "{caller}: failed to parse legacy field '{legacy_key}' value \
-                     '{v}' for tool '{tool_name}': {e}"
+                    "{caller}: failed to parse legacy field '{legacy_key}' for tool \
+                     '{tool_name}': {e}"
                 ),
             })?;
         return Ok(Some(stroops));
@@ -196,9 +196,12 @@ mod tests {
                     error.to_string(),
                     format!(
                         "criterion evaluation failed: test: failed to parse legacy field 'amount' \
-                         value '100 {unit}' for tool '{tool}': amount '100 {unit}' \
-                         has unit '{unit}'; expected unit 'TST'"
+                         for tool '{tool}': the amount has the wrong unit; expected unit 'TST'"
                     )
+                );
+                assert!(
+                    !format!("{error:?}").contains(&format!("100 {unit}")),
+                    "{error:?}"
                 );
             }
         }

@@ -1,10 +1,66 @@
+pub mod child_process;
+#[cfg(feature = "testnet-acceptance")]
+pub mod payment_matrix;
 pub mod policy_mock;
+pub mod server_binary;
+pub mod source_contracts;
 pub mod v1_engine_mock;
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use rmcp::model::CallToolResult;
 use stellar_agent_test_support::signed_envelope::{TESTNET_PASSPHRASE, get_network_result};
+
+/// Signed testnet provenance for a synthetic payment-approval engine's isolated fixture.
+#[allow(dead_code, clippy::expect_used, reason = "shared test fixture")]
+pub fn payment_recovery_policy(
+    server: &stellar_agent_mcp::server::WalletServer,
+) -> stellar_agent_core::mainnet::verified_policy::VerifiedPolicy {
+    use stellar_agent_core::policy::v1::{
+        PolicyStateStore,
+        verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+    };
+    let dir = tempfile::tempdir().expect("fixture policy directory");
+    let path = dir.path().join("policy.toml");
+    let name = server.profile_name_for_approval();
+    let body = format!(
+        "version = 1\nscope = \"profile:{name}\"\n[[rules]]\nmatch = {{ tool = \"*\", chain = \"*\" }}\ncriteria = []\ndecision = \"allow\"\n"
+    );
+    let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+        "fixture", "signer", "fixture", "nonce",
+    )
+    .build();
+    let owner = ed25519_dalek::SigningKey::from_bytes(&[61; 32]);
+    std::fs::write(
+        &path,
+        stellar_agent_core::approval::mainnet_fixtures::signed_policy_text(&body, &owner),
+    )
+    .expect("signed fixture policy");
+    load_verified_policy(
+        &PolicyLoad {
+            path: &path,
+            profile: &profile,
+            profile_name: &name,
+            owner_pubkey: &owner.verifying_key().to_bytes(),
+            owner_source: OwnerKeySource::Keyring,
+            window_path: &dir.path().join("window"),
+        },
+        PolicyStateStore::new(),
+        PinMode::CompareOnly,
+    )
+    .expect("fixture signature verifies")
+}
+
+/// The toolset pin key the toolset suites tag their install records under and
+/// hand the server through `set_toolset_pin_key_for_test`.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+#[must_use]
+pub fn toolset_pin_key() -> stellar_agent_toolsets_runtime::PinKey {
+    stellar_agent_toolsets_runtime::PinKey::from_bytes(zeroize::Zeroizing::new([0x5a; 32]))
+}
 
 /// Passphrase of a third Stellar network — neither testnet nor mainnet.
 ///
@@ -68,18 +124,25 @@ impl EndpointNetwork {
 /// choice) breaks `AuditWriterRegistry`'s process-lifetime cache.
 const TEST_AUDIT_KEY_BYTES: [u8; 32] = [0x37_u8; 32];
 
-/// Per-process temp directory backing every `install_test_audit_key` call in
-/// a test binary — created once, reused by every test. As a `static`, this
-/// value is never dropped at process exit (Rust does not run destructors on
-/// statics), so the directory is NOT deleted by this binding; it is left for
-/// the OS temp-directory cleanup policy, same as any other leaked tempdir.
-static TEST_AUDIT_LOG_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+/// The audit log directories `install_test_audit_key` has handed out, each
+/// with the keyring store it was handed out under, the current one last.
+///
+/// One directory serves one keyring store: a test that installs a fresh mock
+/// store gets a fresh directory, and every later call under that store reuses
+/// it, also after the test deletes the audit key from it. Holding the store
+/// keeps its address from being reused by a later store. Earlier directories
+/// stay alive for the process, so a writer a finished test still references
+/// never loses its file. As a `static`, the list is never dropped, and the
+/// directories are left for the OS temp-directory cleanup policy.
+static TEST_AUDIT_LOG_DIRS: Mutex<Vec<(Arc<keyring_core::CredentialStore>, tempfile::TempDir)>> =
+    Mutex::new(Vec::new());
 
-/// Redirects `profile.audit_log_path` to a per-process temp directory and
-/// seeds a fixed 32-byte audit chain-root HMAC key at the profile's
-/// `audit_log_hash_chain_key_id` keyring coordinate, under the process-global
-/// mock keyring store (`stellar_agent_test_support::keyring_mock::install`
-/// must already be installed by the caller).
+/// Redirects `profile.audit_log_path` into the audit log directory of the
+/// current mock keyring and seeds a fixed 32-byte audit chain-root HMAC key at
+/// the profile's `audit_log_hash_chain_key_id` keyring coordinate, under the
+/// process-global mock keyring store
+/// (`stellar_agent_test_support::keyring_mock::install` must already be
+/// installed by the caller).
 ///
 /// Every full commit/submit round-trip test needs this: `require_value_audit_writer`
 /// refuses BEFORE the signer is loaded or the transaction is submitted unless
@@ -87,25 +150,24 @@ static TEST_AUDIT_LOG_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 /// `install_test_nonce_key`'s per-test seeding pattern for the nonce mint's
 /// HMAC key.
 ///
-/// # Why a FIXED path and a FIXED key, not a fresh tempdir/random key per test
+/// # One log per keyring, a fixed key
 ///
-/// `AuditWriterRegistry` is a process-global cache keyed by profile name
-/// (`stellar-agent-core::audit_log::writer`): the FIRST call for a given
-/// profile name in this test binary's process pins the `(log_path, hmac_key)`
-/// pair for every later call with that same profile name — a later call
-/// presenting a different path or key fails closed
-/// (`WriterError::PathMismatch` / `HmacKeyMismatch`), which this crate's
-/// `require_value_audit_writer` maps to the SAME `audit.chain_key_unavailable`
-/// refusal as a genuinely-missing key. Since every test built on
-/// `testnet_profile_with_rpc`-style helpers shares the same signer account
-/// (hence the same profile name), every test in one binary that reaches the
-/// audit pre-flight MUST present the identical path and key regardless of
-/// which test happens to run first under `#[serial]` — a per-test tempdir or
-/// random key reproduces the exact registry collision this function exists to
-/// avoid. Redirecting to a temp directory (rather than the real
-/// `canonical_data_root()` default, which `default_audit_log_path_for` does
-/// NOT gate behind `STELLAR_AGENT_HOME`) also keeps these tests from writing a
-/// real file under the developer's or CI runner's actual home directory.
+/// The keyring holds a log's tip anchor and audit binding beside its key, and
+/// the platform keyring keeps them for as long as the log exists. A log that
+/// outlives the keyring entries describing it is a log whose anchor was
+/// deleted, which every keyed writer refuses with `audit.tip_anchor_missing`.
+/// So under a keyring store this function has not seen (the caller installed
+/// a fresh one) the profile gets a fresh log directory, and the process-global
+/// `AuditWriterRegistry` entry for its profile name is dropped, since that
+/// cache pins `(log_path, hmac_key)` per profile name and a later call
+/// presenting a different path fails closed (`WriterError::PathMismatch`).
+/// Under the same keyring the directory, and so the path, stays the same for
+/// every call. The key is fixed so a cached writer never sees a different
+/// fingerprint (`WriterError::HmacKeyMismatch`). Redirecting to a temp
+/// directory (rather than the real `canonical_data_root()` default, which
+/// `default_audit_log_path_for` does NOT gate behind `STELLAR_AGENT_HOME`)
+/// also keeps these tests from writing a real file under the developer's or
+/// CI runner's actual home directory.
 #[allow(
     dead_code,
     reason = "shared across integration-test binaries; unused in some"
@@ -113,11 +175,24 @@ static TEST_AUDIT_LOG_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 pub fn install_test_audit_key(profile: &mut stellar_agent_core::profile::schema::Profile) {
     use base64::Engine as _;
 
-    let dir =
-        TEST_AUDIT_LOG_DIR.get_or_init(|| tempfile::tempdir().expect("tempdir for audit log"));
+    let store = keyring_core::get_default_store().expect("a mock keyring store is installed");
+    let mut dirs = TEST_AUDIT_LOG_DIRS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let same_store = dirs
+        .last()
+        .is_some_and(|(current, _)| Arc::ptr_eq(current, &store));
+    if !same_store {
+        stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(
+            &stellar_agent_core::profile::name::profile_name_for_approval(profile),
+        );
+        dirs.push((store, tempfile::tempdir().expect("tempdir for audit log")));
+    }
+    let (_, dir) = dirs.last().expect("a current audit log directory");
     profile.audit_log_path = dir
         .path()
         .join(format!("{}.jsonl", profile.mcp_signer_default.account));
+    drop(dirs);
 
     let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(TEST_AUDIT_KEY_BYTES);
     let coord = &profile.audit_log_hash_chain_key_id;
@@ -246,8 +321,8 @@ pub fn polled_tx_hash(request: &wiremock::Request) -> String {
 /// receipt already holds. Every test that commits holds one of these, and
 /// `#[serial]` is what makes the process-wide override safe.
 pub struct IsolatedDataRoot {
-    _dir: tempfile::TempDir,
     _guard: stellar_agent_test_support::StellarAgentHomeGuard,
+    _dir: stellar_agent_test_support::sandbox::StateSandbox,
 }
 
 /// Installs a fresh data root for the lifetime of the returned guard.
@@ -261,7 +336,14 @@ pub struct IsolatedDataRoot {
     reason = "shared across integration-test binaries; unused in some"
 )]
 pub fn isolated_data_root() -> IsolatedDataRoot {
-    let dir = tempfile::tempdir().expect("temporary data root");
+    let dir =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("temporary data root");
+    assert!(
+        dir.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let guard = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
     IsolatedDataRoot {
         _dir: dir,
@@ -437,7 +519,7 @@ impl wiremock::Respond for TimeoutRpc {
                     "oldestLedger": 1,
                 }),
             },
-            _ => serde_json::json!({}),
+            other => operational_result(other).unwrap_or_else(|| serde_json::json!({})),
         };
 
         let template = wiremock::ResponseTemplate::new(200)
@@ -489,6 +571,137 @@ impl wiremock::Respond for RpcErrorAnswer {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "error": {"code": -32000, "message": self.message},
+            }))
+            .insert_header("content-type", "application/json")
+    }
+}
+
+/// The answer of a healthy endpoint whose latest ledger closed at the time of
+/// the request, to the `getHealth` or `getLedgers` request of the operational
+/// check a prepare tool runs; `None` for every other method.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+#[must_use]
+pub fn operational_result(rpc_method: &str) -> Option<serde_json::Value> {
+    match rpc_method {
+        "getHealth" => Some(health_result("healthy")),
+        "getLedgers" => Some(ledgers_result(0)),
+        _ => None,
+    }
+}
+
+/// A `getHealth` answer reporting `status` with latest ledger
+/// [`OPERATIONAL_LATEST_LEDGER`].
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+#[must_use]
+pub fn health_result(status: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": status,
+        "latestLedger": OPERATIONAL_LATEST_LEDGER,
+        "oldestLedger": 1,
+        "ledgerRetentionWindow": OPERATIONAL_LATEST_LEDGER - 1,
+    })
+}
+
+/// A `getLedgers` answer whose latest ledger [`OPERATIONAL_LATEST_LEDGER`]
+/// closed `age_secs` seconds before the call.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+#[must_use]
+pub fn ledgers_result(age_secs: u64) -> serde_json::Value {
+    let now = stellar_agent_core::timefmt::now_unix_ms().expect("test clock") / 1000;
+    serde_json::json!({
+        "latestLedger": OPERATIONAL_LATEST_LEDGER,
+        "latestLedgerCloseTime": (now - age_secs).to_string(),
+        "oldestLedger": 1,
+        "oldestLedgerCloseTime": 1,
+        "cursor": OPERATIONAL_LATEST_LEDGER.to_string(),
+        "ledgers": [],
+    })
+}
+
+/// The latest ledger the operational answers of [`operational_result`]
+/// name.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub const OPERATIONAL_LATEST_LEDGER: u32 = 1001;
+
+/// Asserts that a prepare result's `data` carries the `operational` object of
+/// an endpoint answering with [`operational_result`]: its latest ledger, the
+/// close time, and a lag within the readiness bound that matches the close
+/// time against the test clock.
+///
+/// # Panics
+///
+/// Panics when the object is missing or names other values.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub fn assert_operational_reported(data: &serde_json::Value) {
+    let operational = &data["operational"];
+    assert_eq!(
+        operational["latest_ledger"],
+        serde_json::json!(OPERATIONAL_LATEST_LEDGER),
+        "{data}"
+    );
+    assert!(operational["close_time_unix"].is_u64(), "{data}");
+    assert!(operational["close_lag_seconds"].is_u64(), "{data}");
+    let close = operational["close_time_unix"]
+        .as_u64()
+        .expect("close_time_unix is a number");
+    let lag = operational["close_lag_seconds"]
+        .as_u64()
+        .expect("close_lag_seconds is a number");
+    let now = stellar_agent_core::timefmt::now_unix_ms().expect("test clock") / 1000;
+    assert!(lag <= 60, "{data}");
+    assert!(close + lag <= now && now - (close + lag) <= 60, "{data}");
+}
+
+/// Answers every `getHealth` and `getLedgers` request on `server` as a
+/// healthy endpoint whose latest ledger closed at the time of the request,
+/// ahead of the server's other mocks.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub async fn mount_ready_endpoint(server: &wiremock::MockServer) {
+    for rpc_method in ["getHealth", "getLedgers"] {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({ "method": rpc_method }),
+            ))
+            .respond_with(ReadyAnswer(rpc_method))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+}
+
+/// Answers the operational read it names with [`operational_result`], under
+/// the request's own id.
+struct ReadyAnswer(&'static str);
+
+impl wiremock::Respond for ReadyAnswer {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let req_id = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .ok()
+            .and_then(|body| body.get("id").cloned())
+            .unwrap_or_else(|| serde_json::json!(1));
+        wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": operational_result(self.0),
             }))
             .insert_header("content-type", "application/json")
     }
@@ -575,6 +788,52 @@ pub fn own_signer_account(prefix: &str) -> String {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     format!("{prefix}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Stores the identity record an enrollment writes beside the signer seed at
+/// (`service`, `account`): an owner-free testnet record for the agent key of
+/// `seed`, naming profile `account`, the name `Profile::builder_testnet`
+/// derives from its signer account.
+///
+/// # Panics
+///
+/// Panics if the record cannot be written.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub fn store_signer_identity(service: &str, account: &str, seed: [u8; 32]) {
+    store_named_signer_identity(account, service, account, seed);
+}
+
+/// [`store_signer_identity`] for a profile named `name`, as
+/// `Profile::builder_testnet_named` builds it.
+///
+/// # Panics
+///
+/// Panics if the record cannot be written.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub fn store_named_signer_identity(name: &str, service: &str, account: &str, seed: [u8; 32]) {
+    use stellar_agent_core::profile::{
+        caip2::Caip2,
+        schema::{KeyringEntryRef, signer_identity_entry_ref},
+        signer_identity::SignerIdentityRecord,
+    };
+    let record = SignerIdentityRecord::agent(
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes(),
+        name,
+        Caip2::Testnet,
+    );
+    stellar_agent_network::keyring::write_keyring_string(
+        &signer_identity_entry_ref(&KeyringEntryRef::new(service, account)),
+        &record.render().expect("an agent record renders"),
+    )
+    .expect("the identity record is written");
 }
 
 /// A testnet profile with the `Noop` engine under `account`, with the test
@@ -848,4 +1107,43 @@ pub async fn assert_credential_refusals(
         vec![("getNetwork".to_owned(), false); count],
         "each refused tool made the identity request alone"
     );
+}
+/// Counts local cache acquisitions without remote resolution.
+#[derive(Default)]
+#[allow(
+    dead_code,
+    reason = "shared test module also builds in transport-only targets"
+)]
+pub struct CountingCounterpartyCache(std::sync::atomic::AtomicUsize);
+
+#[allow(
+    dead_code,
+    reason = "shared test module also builds in transport-only targets"
+)]
+impl CountingCounterpartyCache {
+    /// Number of completed local cache acquisitions.
+    pub fn reads(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::panic, reason = "unexpected remote reads fail the fixture")]
+impl stellar_agent_network::CounterpartyResolver for CountingCounterpartyCache {
+    async fn refresh(
+        &self,
+        _: &str,
+    ) -> Result<stellar_agent_network::StellarTomlBinding, stellar_agent_network::CounterpartyError>
+    {
+        panic!("policy evaluation does not refresh remote documents")
+    }
+    async fn list_cached(
+        &self,
+    ) -> Result<
+        Vec<stellar_agent_network::StellarTomlBinding>,
+        stellar_agent_network::CounterpartyError,
+    > {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Vec::new())
+    }
 }

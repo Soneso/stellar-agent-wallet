@@ -1,5 +1,8 @@
 # MPP internals
 
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This page owns maintainer detail for the testnet sponsored Machine Payments
 Protocol charge path. User behavior and host duties are documented in
 [Agent payments with MPP](../agent-payments.md).
@@ -9,17 +12,17 @@ Protocol charge path. User behavior and host duties are documented in
 The implemented wire contract follows the released `@stellar/mpp` 0.7.1
 HTTP/native-MCP challenge, credential, and receipt shapes. Stellar execution is
 one SEP-41 token `transfer` authorization signed with the existing SEP-43
-Ed25519 preimage machinery. The Rust `mpp-rs`, `mppx`, and Stellar MPP SDK
-repositories are research references, not runtime dependencies.
+Ed25519 preimage machinery. The crate has no MPP SDK runtime dependency;
+`MPP_TYPESCRIPT_SDK_PIN` records the `@stellar/mpp` 0.7.1 wire shapes it follows.
 
 `stellar-agent-mpp` owns strict parsing and execution. It depends on core for
 policy/approval/profile types, network for signer and keyring boundaries, and
-SEP-43 for authorization signing. Shared SEP-41 transfer construction remains in
-`stellar-agent-x402::sac_transfer`/the extracted network-facing builder so x402
-and MPP do not diverge on transfer argument encoding.
+SEP-43 for authorization signing. x402 and MPP both build the transfer with
+`stellar_agent_network::sep41::build_sep41_transfer_invoke`, so their transfer
+argument encoding cannot diverge.
 
-The crate is publish tier 5: it must be published after `stellar-agent-sep43`
-and before the tier-6 CLI and MCP binaries. Validate the complete DAG with:
+The crate is publish tier 5. It is published after `stellar-agent-sep43`, before
+the tier 6 MCP library and the tier 7 CLI. Validate the complete DAG with:
 
 ```bash
 bash .github/scripts/publish-crates.sh --check
@@ -37,13 +40,15 @@ bash .github/scripts/test-publish-crates-check.sh
 | `sponsored` | Zero-source prepare simulation, auth-entry inspection, signing, mandatory re-simulation, final envelope inspection. |
 | `credential` | HTTP `Payment` or native MCP credential encoding. |
 | `state` | Authorization fingerprint, record invariants, lifecycle graph. |
-| `store` | Per-profile HMAC file, locking, atomic replace, replay lookup and retention. |
-| `service` | Shared CLI/MCP prepare, approval, commit and delivery gates. |
+| `store` | Per-profile HMAC file, locking, atomic replace, replay lookup, and retention. |
+| `service` | Shared CLI/MCP prepare, approval, commit, and delivery gates. |
 | `receipt` | Strict trusted-host receipt parsing and digesting. |
 | `reconcile` | Final RPC lookup and independent direct/fee-bump envelope and signature verification. |
+| `error` | Stable, redacted error codes for the CLI and MCP adapters. |
+| `limits` | Named limits for untrusted inputs and outputs. |
 
-CLI adaptation is `stellar-agent-cli/src/commands/mpp.rs`. MCP schemas and tools
-are in `stellar-agent-mcp/src/tools/mpp.rs`. Do not duplicate parser, policy,
+CLI adaptation is `crates/stellar-agent-cli/src/commands/mpp.rs`. MCP schemas and tools
+are in `crates/stellar-agent-mcp/src/tools/mpp.rs`. Do not duplicate parser, policy,
 fingerprint, signing, or state-machine logic in either binary.
 
 ## Supported flow
@@ -68,13 +73,13 @@ result values, and transaction data; the wallet decodes those fields with
 the encoded input size.
 
 Reconciliation reads `getTransaction` raw through the wallet's
-`StellarRpcClient::get_transaction_raw`. Status, ledger and transaction hash
+`StellarRpcClient::get_transaction_raw`. Status, ledger, and transaction hash
 are taken as received, and the wallet decodes the envelope itself with
 `untrusted_decode_limits(encoded.len())`, bounding depth to 500 and length to
 the encoded input size. An envelope that does not decode is refused as
 `mpp.reconciliation_unavailable`. The result meta is never decoded, so an
 answer whose meta the wallet's XDR cannot decode still reconciles. Of the
-typed calls the wallet still makes through `stellar-rpc-client`, only
+typed calls the wallet makes through `stellar-rpc-client 30.0.0`, only
 `sendTransaction` decodes XDR inside the client, for its error result, bounded
 in depth to 500 with no length bound. The test at
 `crates/stellar-agent-mpp/tests/rpc_decode_boundary.rs` holds the inventory of
@@ -87,26 +92,43 @@ bump reinspects them.
 `authorization_fingerprint` is SHA-256 over the versioned domain plus
 length-prefixed profile name, network-passphrase digest, payer, normalized
 context digest, exact challenge digest, method, intent, sponsored-pull mode,
-canonical amount, token contract, recipient, and effective expiry. The opaque
+canonical amount, token contract, recipient, and stored expiry. The opaque
 authorization ID contains a prefix of this digest; the full digest remains in
 authenticated state.
 
+Replay matching uses SHA-256 over `stellar-agent-mpp-challenge:v1\0` and the
+length-prefixed payer, request-context digest, and exact challenge digest.
+These values come from the stored prepared charge. The challenge digest covers
+the challenge's own `expires`; the expiry a record stores is not an input.
+The store prefers a live `prepared`, `approval_pending`, or `ready` match;
+otherwise it returns the most recently created match. Consumed matches refuse
+insertion. Repeated prepare reuses the stored authorization and pending approval.
+
 `MppChargeSimulated` binds the full authorization fingerprint and prepared
-artifact hash plus operator-visible profile, network, payer, transport,
-authority, target, amount, token, recipient, challenge expiry and simulated fee.
-Its attestation uses the prepared artifact hash and the normal approval nonce
-and process-identity binding. Its lifetime is capped at five minutes and by the
-challenge expiry. Local and remote approval views redact payer and recipient and
-never render XDR, credentials, challenge bodies, or raw context parameters.
+artifact hash. The entry also stores three digests: the request context, the
+network passphrase, and the exact challenge. Every surface uses them to check
+the displayed profile, payer, amount, token, recipient, and expiry against the
+fingerprint. An entry without them refuses with `approval.entry_inconsistent`.
+The operator-visible terms are profile, network, payer, transport,
+authority, target, amount, token, recipient, challenge expiry, and simulated fee.
+Its attestation covers the SHA-256 of the domain `stellar-agent-mpp-approval:v1\0`,
+the authorization fingerprint, and the prepared artifact hash. It also carries
+the normal approval nonce and process-identity binding. Its lifetime is capped at five minutes and by the
+challenge expiry. The `approve list` output and the local and
+remote inbox pages redact payer and recipient. The `approve --id` prompt prints
+both in full, with the token contract. No approval view renders XDR,
+credentials, challenge bodies, or raw context parameters.
 
 ## Durable state
 
 The per-profile file is below the canonical data root in `mpp/`; its filename is
-the SHA-256 of the profile name. A dedicated 32-byte HMAC key occupies keyring
+the hex SHA-256 of the profile name plus `.state`. A dedicated 32-byte HMAC key occupies keyring
 service `stellar-agent-mpp-state-<profile>`, account `default`. The monotonic
-counter occupies the same service, account `default-generation`. Version 2 JSON
-includes a `generation` and is prefixed by HMAC-SHA256 over a domain and body.
-The counter is trusted independently of the state file.
+committed counter occupies the same service, account `default-generation`.
+The intent counter occupies `default-generation-intent` and records the highest
+generation assigned to authenticated bytes. Both counters are trusted
+independently of the state file. Version 2 JSON includes a `generation` and is
+prefixed by HMAC-SHA256 over a domain and body.
 
 `open_for_prepare` provisions generation zero and a state key under the store
 lock for a new profile. Only a proven absent key may be minted; keyring access
@@ -119,51 +141,169 @@ the state key is also missing.
 Every read checks non-symlink regular-file shape, size, HMAC in constant time,
 schema version, equality with the keyring generation, record count,
 reconstructed prepared-artifact semantics, lifecycle invariants, and uniqueness
-of authorization IDs, fingerprints and approval nonces. When the counter is
+of authorization IDs, fingerprints, and approval nonces. When the counter is
 proven absent by the keyring, opening adopts a verifying snapshot under the
 store lock. It records `mpp_state_adopted` with the profile and generation before
 anchoring. Only version 1, which has no generation, is adopted; it is rewritten
-as version 2 at generation one with all records preserved. A version 2 file is
-published only after its counter, so one with an absent counter refuses as an
-invalid anchor. Generation zero remains reserved for an unwritten store. A
-present counter, an unverifiable file, or a keyring access error cannot trigger
-adoption. A state key with neither counter nor file refuses the same way; it
-holds no history, and reset recovers it without discarding records.
+as version 2 at generation one with all records preserved. An adoption
+interrupted at intent one before publication leaves the version 1 file,
+and the next open adopts at generation two, above that reservation. If this
+resumed adoption stops before publication, opening refuses: intent two cannot
+be told apart from anchor removal. Move the state file out of the MPP state
+directory and run the reset to discard.
+A write that publishes while the committed counter is absent, an adoption or a
+discarding reset, and stops before its commit leaves a version 2 file whose
+generation equals the intent; the next open commits that generation through the
+guarded commit. Every other store holds its committed counter before its first
+version 2 snapshot, so any other version 2 file with an absent counter, or a
+version 1 file beside any other intent, refuses as an invalid anchor.
+Generation zero remains reserved for an unwritten store. A present counter, an
+unverifiable file, or a keyring access error cannot trigger adoption. A state
+key with neither counter nor file refuses the same way. The invalid-anchor
+refusal names a discarding reset, the one recovery for these states.
 Concurrent opens share the lock, and an anchored read emits no adoption row.
 
-Mutation holds a sibling-file cross-process lock, increments the generation
-with overflow checking, and advances the keyring counter before writing any
-authenticated snapshot, including temporary files. It then writes, flushes,
-atomically renames, and synchronizes the parent directory. A failure after the
-counter advances leaves a mismatch and refuses further use; generations are
-never reused for an abandoned snapshot. Reads never reset or lower the counter.
-Immediately before advancing, a write re-reads the counter. If another writer
-has moved it, the write refuses with `mpp.state_unavailable` and a message
-asking for a retry, and the other writer's snapshot stays in place.
+Mutation holds the sibling state lock across preparation, reservation,
+publication, and commit. Its namespace is the canonical state path plus `.lock`.
+The OS lock excludes separate open file descriptions or handles, including
+other processes. Dropping the guard unlocks it; process exit releases the handle.
+
+The guard retains its path and handle. Acquisition, atomic snapshot replacement,
+and every counter write check that the path still names the held regular file.
+Unix checks device and inode against no-follow metadata. Windows opens with
+read and write sharing only, preventing deletion or renaming while held.
+Windows also checks regular-file metadata and creation time through an opened
+path, refusing inaccessible paths and reparse points.
+
+Counter updates are guarded read-compare-writes. The keyring supplies ordinary
+reads and writes; exclusion comes from the verified state lock. A reservation
+chooses one plus the maximum committed counter and intent, with checked overflow.
+It requires both counters to hold exactly the values observed during
+preparation, and the proposed generation strictly exceeds each valid one.
+Adoption requires an absent committed counter. Initialization writes zero only
+while both counters remain absent; a counter that appears refuses with the retry
+message, and a leftover intent refuses as an invalid anchor.
+
+The write reserves the generation in the intent, syncs a temporary snapshot,
+rechecks lock identity, atomically replaces the snapshot, and syncs its directory.
+Commit verifies the authenticated publication, re-reads both counters, and
+requires the exact expected committed value and an intent equal to its target.
+Every counter write goes through one guarded setter. It checks lock identity
+immediately before the keyring write and again after it. A path that changed in
+between refuses with a message saying the update is not confirmed, and the store
+logs it at warn level. Outside the limit below, neither counter decreases, an
+equal competing target never counts as success, and a losing writer returns the
+concurrent-update retry message without replacing the winning snapshot. Failure
+before publication in an ordinary mutation keeps acknowledged records readable
+and prevents reuse of the reserved generation.
+
+A read rejects a snapshot below the committed counter before record lookup.
+Equality requires valid format, HMAC, and records. A higher snapshot requires
+an exact matching intent and completes through the same guarded commit checks.
+A missing file reads as empty only at committed generation zero.
+
+On Unix, three windows remain after the final identity check. Each needs an
+actor with write access to the state directory who replaces the lock path with
+timing inside the window, which lets a second writer take the lock. Windows
+denies deleting or renaming the held lock path, so none of the windows exists
+there.
+
+- Between the identity check before a counter write and the keyring write, the
+  stale writer's value can overwrite a newer one. A lowered committed counter
+  lets a restored older snapshot pass reads, which loses the replay records
+  written after it. The check after the write reports the update as not
+  confirmed but cannot undo it.
+- Between the identity check before the atomic replacement and the rename, the
+  stale writer's snapshot can overwrite a newer committed one. Reads then refuse
+  it as rolled back, and a reset carries it without reporting a stale carry,
+  because it sits only one generation below the committed counter. The newer
+  writer's replay records are lost.
+- Between the identity check before a state-key rotation and the rotation, the
+  stale writer can replace the key. This covers the discarding reset and the
+  key mint on first open. The newer writer's snapshot survives as bytes but no
+  longer authenticates, so every open refuses, and only a discarding reset
+  recovers. The newer writer's replay records are lost.
 
 Deletion or generation mismatch returns `mpp.state_unavailable` with a message
 identifying the state as rolled back and naming `profile reset-mpp-state`.
 
 `stellar-agent profile reset-mpp-state <NAME> --acknowledge --reason <REASON>`
-recovers refused state. Under the store lock it writes `mpp_state_reset` with
-the profile, discarded generation, and bounded reason; rotates the state HMAC
-key; removes the file and synchronizes its directory; and sets the counter to
-zero. A missing or malformed counter is represented by a null discarded
-generation. Keyring access errors and audit failures refuse without resetting.
-The audit row records the operator's request even if a later reset step fails.
-The command can be retried with acknowledgement after a partial failure.
+recovers refused state. Under the store lock it reads the state, then writes
+`mpp_state_reset` with the profile, discarded generation, carried generation,
+stale flag, and bounded reason, and only then mutates. An inaccessible counter
+refuses before the audit row. A carry needs a valid committed counter and an
+intent that is absent or valid, because only they bound the generations the
+retained key sealed. A file that authenticates beside an absent or malformed
+committed counter, or a malformed intent, therefore refuses before the audit
+row. That refusal names the one recovery, a discarding reset: move the state
+file out of the MPP state directory and rerun the reset. An absent or malformed
+committed counter is recorded as a null discarded generation. The row omits the
+carried generation when the reset discards, and the stale flag when it is false.
 
-Reset discards every prepared, authorized, indeterminate and settled replay
-marker. A charge settled before reset is no longer recognized as settled. The
-fresh key invalidates snapshots from discarded history even when a new store
-reuses their generation numbers; profile handles check that their cached key
-still matches the keyring before reading or writing. The first prepare after
-reset starts from an empty store. There is no automatic reset on read failure.
+The reset discards only when no snapshot can authenticate: the state key is
+missing, malformed, or equal to an owner public key, or the file is missing, a
+symlink, oversized, or fails its HMAC, parse, or record checks. A keyring access
+error, an I/O error, or a state path that is not a regular file refuses the
+reset before its audit row, and nothing changes.
 
-Filesystem rollback cannot restore older protected history while the keyring
-remains trusted. Access to the keyring, which also holds the HMAC key, is outside
-this boundary; a filesystem-backed keyring needs independent protection from
-state-file rollback.
+When the state key authenticates the file, reset keeps every record and the
+prune watermark. It closes `prepared`, `approval_pending`, and `ready` records
+as `expired_unresolved`, with an update time at least as recent as their last
+update. All other statuses survive. Reset publishes the carried history above
+the maximum committed counter, intent, and authenticated snapshot generation
+through the guarded write path. Both counters retain their high-water marks.
+The state key stays unchanged, and older snapshots fall below the committed
+counter. Existing handles can read the carried history. Retrying a partial reset carries
+authenticated history again.
+
+The carried snapshot is the one on disk. No write leaves the file more than one
+generation below the committed counter, so a larger gap proves a rollback. The
+reset still carries that file, reports `stale_carry`, and raises the watermark
+to the reset time plus the 360-second challenge lifetime cap. A record written
+after the carried snapshot belongs to a challenge prepared before the reset.
+Admission holds that challenge's own expiry within the cap of its prepare, so
+the challenge refuses with `mpp.challenge_expired` while it can still be live.
+A challenge with a later expiry is a different challenge.
+
+When no snapshot authenticates, reset rotates the state key and retains every
+valid counter. Guarded atomic replacement publishes an empty snapshot strictly
+above their maximum with the same raised watermark, then syncs the directory.
+An absent or malformed counter does not block this path: the guarded writes
+replace it while it holds exactly the observed value. Malformed values include
+non-UTF-8 bytes, which the comparisons retain exactly. The fresh key leaves no
+earlier snapshot that authenticates.
+
+A discard interrupted after key rotation and before publication leaves no
+snapshot that authenticates under the new key. Opening refuses; rerunning the
+reset completes the discard.
+A discard under a malformed committed counter interrupted after publication
+refuses on open with the anchor error. Reset refuses the authenticated carry.
+Move the state file out of the MPP state directory and rerun the reset to
+discard. With an absent or valid committed counter, a publication whose intent
+names the snapshot completes on open through the guarded commit.
+
+A discarding reset removes every replay marker; a settled charge loses its settled
+status. The fresh key invalidates snapshots of discarded history, and
+profile handles check their cached key against the keyring before reading or
+writing. The result reports `carried_records`, `carried_generation`,
+`stale_carry`, `discarded_generation`, and a one-line `warnings` entry for a
+stale carry. Audit failures and keyring access failures reading either counter
+refuse before mutation. The audit row records the request even when a later step
+fails. There is no automatic reset on read failure.
+
+The recovery verb is `profile reset-mpp-state`, and it never infers a
+trusted counter from a state file. Outside the automatic adoption and
+publication completion cases above, a missing or malformed counter needs a
+discarding reset, which loses replay history; no counter-repair verb exists.
+
+Filesystem rollback cannot pass a read while the keyring remains trusted: every
+read compares the snapshot generation with the committed counter. The reset
+carries whichever snapshot authenticates under the retained key, so a same-user
+rollback of the state file before a reset loses the records written after that
+snapshot. The reset reports the carry as stale whenever the committed counter
+proves the rollback. Access to the keyring, which also holds the HMAC key, is
+outside this boundary; a filesystem-backed keyring needs independent protection
+from state-file rollback.
 
 The store never persists a credential, signature output, raw receipt, or exact
 transaction hash. It retains only the prepared unsigned artifact needed for one
@@ -182,8 +322,11 @@ authorizing -> refused|failed|indeterminate
 delivery_pending -> authorized_withheld
 ```
 
-Prepare records a pending approval when policy requires approval for either
-`stellar_mpp_charge_prepare` or `stellar_mpp_charge_commit`. Its lifetime stays
+MCP prepare records a pending approval when policy requires approval for either
+`stellar_mpp_charge_prepare` or `stellar_mpp_charge_commit`. CLI
+`mpp charge authorize` records one only when the prepare rule requires approval.
+When only the commit rule requires it, the CLI refuses with
+`mpp.approval_invalid` and records none. The approval's lifetime stays
 bounded by the challenge expiry. Commit re-evaluates its own tool name against
 current state and can still deny an approved request. An exhausted cap returns
 `policy.deny.per_period_cap_exceeded`. The loaded policy document stays fixed
@@ -193,11 +336,25 @@ Terminal states are `settled`, `failed`, `refused`, `expired_unresolved`,
 `authorized_withheld`, and `indeterminate`. No terminal state transitions or
 signs again. Status derives expiry without mutating state. Explicit audited
 prune persists eligible expiry markers and removes terminal records only after
-30 days; it never removes `indeterminate`.
+30 days; it never removes `indeterminate`. Prune retains the largest removed
+expiry as `pruned_through`. A challenge with no identity match and an expiry at
+or below this watermark refuses with `mpp.challenge_expired`, and the refusal
+names the replay horizon and asks for a fresh challenge. An advanced prune clock
+alone does not raise the watermark past the removed records' own expiries. A
+reset that discards history or carries a stale snapshot raises it to the reset
+time plus the challenge lifetime cap.
 
-A failure after signer access begins becomes `indeterminate` unless the
-credential is known to exist, in which case a final-gate failure becomes
-`authorized_withheld`. Policy accounting ambiguity is also conservative:
+The watermark is an additive version 2 field, omitted when zero. Older binaries
+ignore it and drop it on their next write. Admission requires an `expires` at
+most six minutes past the prepare and never defaults or clips it, so a
+challenge's expiry is fixed and a pruned challenge stays refused. Under a
+correct clock admission already refuses an expired challenge, so on the prune
+route this watermark covers a host clock that stepped back. A payee can issue
+a fresh challenge at any time.
+
+A failure after signer access begins and before `delivery_pending` is stored
+becomes `indeterminate`, a credential encoding failure included. A final-gate
+failure after `delivery_pending` becomes `authorized_withheld`. Policy accounting ambiguity is also conservative:
 budget is treated as consumed and signing does not proceed. A typed policy
 refusal writes no window usage: the authorization becomes `refused`, and its
 withheld row records `policy_refusal` with the budget unconsumed. When the
@@ -224,9 +381,10 @@ happened.
 
 ## Audit and redaction
 
-The four typed events are `MppChargeAuthorized`,
-`MppAuthorizationWithheld`, `MppReceiptObserved`, and
-`MppSettlementReconciled`. Authorization audit append is a mandatory delivery
+The four typed charge events are `mpp_charge_authorized`,
+`mpp_authorization_withheld`, `mpp_receipt_observed`, and
+`mpp_settlement_reconciled`. State adoption and reset write `mpp_state_adopted`
+and `mpp_state_reset`. Authorization audit append is a mandatory delivery
 gate. Withheld audit is best-effort after the primary failure: the primary
 error is returned unchanged, and a withheld row that cannot be written is
 logged at `error` with its code. Receipt and
@@ -237,7 +395,7 @@ the bounded reason SHA-256.
 Never place raw challenges, request bodies, credentials, receipts, prepared or
 signed XDR, signatures, full transaction hashes, key values, or sensitive URLs
 in `Debug`, errors, logs, metrics, snapshots, or audit fields. The operator-
-facing approval summary, prepare preview, and status views display the HTTP
+facing approval summary and prepare preview display the HTTP
 target as origin plus path only; the query and fragment are stripped for
 display while the full canonical resource stays bound in the context digest
 and the authorization fingerprint.
@@ -284,12 +442,12 @@ The serialized acceptance driver owns registration and reports any skip marker.
 
 Apply the general [review checklist](review-checklist.md), then verify:
 
-- all mainnet paths fail before state, RPC, keyring and signing;
+- all mainnet paths fail before state, RPC, keyring, and signing;
 - prepare has no signer capability and commit accepts no replacement terms;
 - every post-claim failure has an unambiguous no-retry state;
-- value effects are identical at policy preview, accounting and audit;
+- value effects are identical at policy preview, accounting, and audit;
 - no credential can be returned twice, including concurrent CLI/MCP commits;
 - host receipt observation remains independent from verified ledger outcome;
 - all public docs and skill references retain the testnet, sponsored-pull,
-  G-account and credential-only boundary; and
+  G-account, and credential-only boundary; and
 - MPP remains absent from toolset routing.

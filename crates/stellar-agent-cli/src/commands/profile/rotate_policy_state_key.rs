@@ -30,18 +30,16 @@
 //! under the NEW key, at which point it becomes indistinguishable from
 //! genuine history. The pre-rotation verification step closes this: the
 //! command reads the CURRENT store file and confirms its tag under the OLD
-//! key BEFORE that key is destroyed. A mismatch aborts the rotation entirely
-//! — the old key is never destroyed, and the command directs the operator to
-//! `profile reset-window-state` instead (a tampered file cannot be recovered
-//! by rotation; it can only be discarded). A store file that exists but whose
-//! OLD key was never minted (no keyring entry at all) is equally refused: it
-//! cannot have been signed by any legitimate key, so there is nothing to
-//! verify it against.
+//! key before rotation. A mismatch aborts rotation and preserves the old key.
+//! No verb recovers such state; create a profile under a new name.
+//! A missing key beside an existing file also refuses. The scope check requires
+//! authenticated provenance, including a matching protected generation.
 //!
-//! Re-signing before persisting the new key would leave the file signed by a
-//! key the keyring no longer holds. If re-signing fails after the new key is
-//! persisted, re-running the command converges: the re-sign step recomputes
-//! the tag deterministically from the (unchanged) body bytes.
+//! The new key is persisted to the keyring before the store file is re-signed
+//! so the keyring holds the key used for signing. A re-signing failure after
+//! persistence leaves a file the new key does not authenticate, so the next
+//! rotation refuses it.
+//! No verb recovers such state; create a profile under a new name.
 //!
 //! # Output (JSON envelope)
 //!
@@ -69,13 +67,15 @@ use serde::Serialize;
 use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::WalletError;
-use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::profile::owner_key;
+use stellar_agent_core::profile::{Profile, ResolvedProfileName, loader};
 use stellar_agent_network::keyring::{init_platform_keyring_store, load_hmac_key_32};
 use stellar_agent_network::policy_state::{POLICY_STATE_KEY_FIELD, PersistedWindowStore};
 use uuid::Uuid;
 
-use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
+use crate::common::profile_access::{
+    injected_profile_load, profile_access_envelope, reconcile_loaded_profile,
+};
 use crate::common::render;
 
 use super::audit_emit::emit_keyring_key_written;
@@ -141,20 +141,38 @@ struct RotatePolicyStateKeyData {
 ///
 /// Never panics.
 pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
+    run_with_dependencies(args, injected_profile_load, init_platform_keyring_store).await
+}
+
+/// Runs the rotation with profile loading and keyring initialization supplied.
+async fn run_with_dependencies(
+    args: &RotatePolicyStateKeyArgs,
+    load_profile: impl FnOnce(&str) -> Result<Profile, loader::ProfileLoadError>,
+    init_keyring: impl FnOnce() -> Result<(), WalletError>,
+) -> i32 {
     // ── Step 0: load the profile FIRST so a nonexistent profile never
     // reaches the keyring init.
-    let profile = match load_profile_reconciled(&ResolvedProfileName::from_flag(
-        args.profile_name(),
-    )) {
+    let profile = match reconcile_loaded_profile(
+        load_profile(args.profile_name()),
+        &ResolvedProfileName::from_flag(args.profile_name()),
+    ) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %args.profile_name(), error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e, args.profile_name()));
+            tracing::debug!(error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e));
             return 1;
         }
     };
 
-    if let Err(e) = init_platform_keyring_store() {
+    if let Err(e) = owner_key::refuse_installation_key_coordinate(
+        &profile.policy_window_state_key_id,
+        POLICY_STATE_KEY_FIELD,
+    ) {
+        render::render_json(&Envelope::err(&e));
+        return 1;
+    }
+
+    if let Err(e) = init_keyring() {
         render::render_json(&Envelope::err(&e));
         return 1;
     }
@@ -179,52 +197,9 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
             return 1;
         }
     };
-    match old_key {
-        Some(old_key) => {
-            if let Err(e) = store.verify_tag(&old_key) {
-                tracing::error!(
-                    error = ?e,
-                    "policy-state key rotation refused: the store file did not verify under \
-                     the current key; rotating would launder a tampered file — run \
-                     `profile reset-window-state` instead"
-                );
-                let err = WalletError::Internal(
-                    stellar_agent_core::error::InternalError::UnexpectedState {
-                        detail: format!(
-                            "policy_window_state.pre_rotation_verify_failed: {e}; the store \
-                             file did not verify under the current key — rotation refused; \
-                             run `profile reset-window-state {} --reason <reason>` to recover",
-                            args.profile_name()
-                        ),
-                    },
-                );
-                render::render_json(&Envelope::err(&err));
-                return 1;
-            }
-        }
-        None if store.exists() => {
-            // A store file exists but no key was ever minted for this
-            // profile — it cannot have been signed legitimately.
-            tracing::error!(
-                "policy-state key rotation refused: a store file exists but no key was ever \
-                 minted for this profile; run `profile reset-window-state` instead"
-            );
-            let err =
-                WalletError::Internal(stellar_agent_core::error::InternalError::UnexpectedState {
-                    detail: format!(
-                        "policy_window_state.pre_rotation_verify_failed: store file exists \
-                         with no minted key — rotation refused; run \
-                         `profile reset-window-state {} --reason <reason>` to recover",
-                        args.profile_name()
-                    ),
-                });
-            render::render_json(&Envelope::err(&err));
-            return 1;
-        }
-        None => {
-            // No old key, no store file: genuinely the first-ever rotation
-            // for this profile. Nothing to verify; proceed.
-        }
+    if let Err(error) = verify_before_rotation(&store, &profile, old_key.as_deref()) {
+        render::render_json(&Envelope::err(&error));
+        return 1;
     }
 
     // ── Step 2: persist the new key (destroys the old key).
@@ -241,19 +216,17 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
         Err(e) => {
             tracing::error!(
                 error = %e,
-                "policy-state key rotated but could not be reloaded to re-sign the store; \
-                 re-run rotate-policy-state-key to converge"
+                "policy-state key rotated but could not be reloaded to re-sign the store"
             );
             render::render_json(&Envelope::err(&e));
             return 1;
         }
     };
     let store = PersistedWindowStore::for_profile(args.profile_name());
-    if let Err(e) = store.resign(&new_key) {
+    if let Err(e) = store.resign(&profile, &new_key) {
         tracing::error!(
             error = ?e,
-            "policy-state key rotated but store re-sign failed; \
-             re-run rotate-policy-state-key to converge"
+            "policy-state key rotated but store re-sign failed"
         );
         let err =
             WalletError::Internal(stellar_agent_core::error::InternalError::UnexpectedState {
@@ -285,6 +258,38 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
         key_kind: "hmac_32_bytes",
     }));
     0
+}
+
+/// Checks the old tag before provenance so tampering keeps its rotation diagnostic.
+fn verify_before_rotation(
+    store: &PersistedWindowStore,
+    profile: &stellar_agent_core::profile::schema::Profile,
+    old_key: Option<&[u8; 32]>,
+) -> Result<(), WalletError> {
+    if let Some(key) = old_key {
+        store.verify_tag(key).map_err(|error| {
+            WalletError::Internal(stellar_agent_core::error::InternalError::UnexpectedState {
+                detail: error.with_recovery_notice(format!(
+                    "policy_window_state.pre_rotation_verify_failed: {error}; rotation refused before changing the key"
+                )),
+            })
+        })?;
+    }
+    store
+        .require_chain_scope(
+            profile,
+            &stellar_agent_network::policy_state::ChainScope::for_chain(profile.chain_id),
+        )
+        .map_err(|error| {
+            if let Some(refusal) = error.chain_validation_error() {
+                return WalletError::Validation(refusal);
+            }
+            WalletError::Submission(
+                stellar_agent_core::error::SubmissionError::RecordUnavailable {
+                    detail: error.to_string(),
+                },
+            )
+        })
 }
 
 /// Loads the old window-state key for the pre-rotation verify.
@@ -365,15 +370,20 @@ mod tests {
     // Defensive #[serial] — see enroll_signer.rs for full rationale; the
     // test binary observes a flaky race during parallel execution that
     // clobbers sibling #[serial] keyring tests' mock store.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn rotate_policy_state_key_nonexistent_profile_returns_exit_1() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let args = RotatePolicyStateKeyArgs {
             name: Some("__nonexistent_rotate_policy_state_key__".to_owned()),
             profile: None,
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
+        fixture.assert_refusal(
+            Some("validation.profile_not_found"),
+            &["the requested profile was not found"],
+        );
     }
 
     fn put_raw(entry_ref: &stellar_agent_core::profile::schema::KeyringEntryRef, value: &str) {
@@ -389,6 +399,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_old_key_load_refuses_the_owner_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let name = "rotate-window-owner";
@@ -416,6 +429,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_old_key_load_refuses_a_g_strkey_and_an_owner_coordinate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let name = "rotate-window-strkey";
         let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
@@ -451,5 +467,225 @@ mod tests {
             .get_password()
             .unwrap_err();
         assert!(matches!(pending, keyring_core::Error::PlatformFailure(_)));
+    }
+
+    /// Installation coordinates refuse on testnet before the keyring opens.
+    #[tokio::test]
+    #[serial]
+    async fn installation_coordinate_refuses_without_writing() {
+        crate::common::installation_key_fixture::assert_installation_profile_refusal(
+            |profile| &mut profile.policy_window_state_key_id,
+            async |fixture, profile, name| {
+                let args = RotatePolicyStateKeyArgs {
+                    name: Some(name.to_owned()),
+                    profile: None,
+                };
+                run_with_dependencies(&args, |_| Ok(profile.clone()), || fixture.init()).await
+            },
+        )
+        .await;
+    }
+    fn rotation_fixture() -> (
+        stellar_agent_test_support::sandbox::StateSandbox,
+        stellar_agent_core::profile::schema::Profile,
+        PersistedWindowStore,
+    ) {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+            "rotate-scope",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let store = PersistedWindowStore::at_path(dir.path().join("policy/rotate-scope.window"));
+        store.record_and_persist(&profile, &[]).unwrap();
+        (dir, profile, store)
+    }
+
+    async fn assert_rotation_refuses(
+        path: &std::path::Path,
+        profile: &stellar_agent_core::profile::schema::Profile,
+        store: &PersistedWindowStore,
+    ) -> WalletError {
+        let read = |entry: &stellar_agent_core::profile::schema::KeyringEntryRef| {
+            keyring_core::Entry::new(&entry.service, &entry.account)
+                .unwrap()
+                .get_password()
+                .ok()
+        };
+        let key = read(&profile.policy_window_state_key_id);
+        let generation_entry = stellar_agent_core::profile::schema::KeyringEntryRef::new(
+            &profile.policy_window_state_key_id.service,
+            format!("{}-generation", profile.policy_window_state_key_id.account),
+        );
+        let generation = read(&generation_entry);
+        let before = std::fs::read(path).ok();
+        let old_key = load_old_key(profile, "rotate-scope").unwrap();
+        let error = verify_before_rotation(store, profile, old_key.as_deref()).unwrap_err();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(
+            path.parent().unwrap().parent().unwrap(),
+        );
+        let args = RotatePolicyStateKeyArgs {
+            name: Some("rotate-scope".to_owned()),
+            profile: None,
+        };
+        assert_eq!(
+            run_with_dependencies(&args, |_| Ok(profile.clone()), || Ok(())).await,
+            1
+        );
+        assert_eq!(std::fs::read(path).ok(), before);
+        assert_eq!(read(&profile.policy_window_state_key_id), key);
+        assert_eq!(read(&generation_entry), generation);
+        error
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rotation_with_a_loadable_key_checks_scope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, mut profile, store) = rotation_fixture();
+        profile.chain_id = stellar_agent_core::profile::caip2::Caip2::Mainnet;
+        assert_eq!(
+            assert_rotation_refuses(
+                &dir.path().join("policy/rotate-scope.window"),
+                &profile,
+                &store
+            )
+            .await
+            .code(),
+            "policy.window_chain_mismatch"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rotation_with_an_unloadable_key_and_file_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, profile, store) = rotation_fixture();
+        put_raw(&profile.policy_window_state_key_id, "invalid-key");
+        assert_eq!(
+            assert_rotation_refuses(
+                &dir.path().join("policy/rotate-scope.window"),
+                &profile,
+                &store
+            )
+            .await
+            .code(),
+            "submission.record_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rotation_without_key_or_file_refuses_protected_history() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, profile, store) = rotation_fixture();
+        std::fs::remove_file(dir.path().join("policy/rotate-scope.window")).unwrap();
+        keyring_core::Entry::new(
+            &profile.policy_window_state_key_id.service,
+            &profile.policy_window_state_key_id.account,
+        )
+        .unwrap()
+        .delete_credential()
+        .unwrap();
+        assert_eq!(
+            assert_rotation_refuses(
+                &dir.path().join("policy/rotate-scope.window"),
+                &profile,
+                &store
+            )
+            .await
+            .code(),
+            "submission.record_unavailable"
+        );
+    }
+
+    /// Rotation passes with nothing recorded yet, and on a verified file it
+    /// leaves the store readable under the new key alone.
+    #[tokio::test]
+    #[serial]
+    async fn rotation_passes_on_first_use_and_on_a_verified_file() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let fresh = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+            "rotate-first-use",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .build();
+        let absent = PersistedWindowStore::at_path(empty.path().join("rotate-first-use.window"));
+        verify_before_rotation(&absent, &fresh, None).unwrap();
+
+        let (dir, profile, store) = rotation_fixture();
+        let old_key = load_old_key(&profile, "rotate-scope").unwrap().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let args = RotatePolicyStateKeyArgs {
+            name: Some("rotate-scope".to_owned()),
+            profile: None,
+        };
+        assert_eq!(
+            run_with_dependencies(&args, |_| Ok(profile.clone()), || Ok(())).await,
+            0
+        );
+        let new_key = load_old_key(&profile, "rotate-scope").unwrap().unwrap();
+        assert_ne!(new_key.as_slice(), old_key.as_slice());
+        store.verify_tag(&new_key).unwrap();
+        assert!(store.verify_tag(&old_key).is_err());
+        store
+            .load_into(
+                "rotate-scope",
+                &profile,
+                &stellar_agent_core::policy::v1::criteria::state_store::PolicyStateStore::new(),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rotation_checks_the_tag_before_scope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, mut profile, store) = rotation_fixture();
+        profile.chain_id = stellar_agent_core::profile::caip2::Caip2::Mainnet;
+        let mut bytes = std::fs::read(dir.path().join("policy/rotate-scope.window")).unwrap();
+        bytes[0] ^= 1;
+        std::fs::write(dir.path().join("policy/rotate-scope.window"), bytes).unwrap();
+        let error = assert_rotation_refuses(
+            &dir.path().join("policy/rotate-scope.window"),
+            &profile,
+            &store,
+        )
+        .await;
+        assert_eq!(error.code(), "internal.unexpected_state");
+        assert!(
+            error
+                .to_string()
+                .contains("policy_window_state.pre_rotation_verify_failed")
+                && error
+                    .to_string()
+                    .contains("rotation refused before changing the key")
+        );
     }
 }

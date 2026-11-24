@@ -35,10 +35,8 @@
 //!
 //! # Per-rule wasm-hash drift
 //!
-//! Advisory: the current implementation accepts any hash in
-//! `THRESHOLD_POLICY_WASM_HASHES` at identification time and logs every
-//! observed hash at `debug!`.  Per-rule hash drift is promoted to a typed
-//! error by the verifier-wasm-hash-pinning enforcement layer.
+//! Identification checks the threshold-policy allowlist. Signing separately
+//! checks the rule's pin.
 //!
 /// SHA-256 allowlist for audited threshold-policy WASM deployments.
 ///

@@ -1,8 +1,8 @@
 ---
 name: stellar-agent-wallet
-description: Operate the Stellar Agent Wallet through MCP tools for agent payments, account creation, trustlines, and claims with two-phase operator approval. Use the CLI for reads, setup, and operator ceremonies; CLI signing exceptions have separate policy and on-chain checks. Use when an agent needs Stellar account state, XLM or asset payments, smart-account governance, DeFi, SEP, x402, or sponsored MPP charges. Covers signed policy limits, shell access and approval authority, chain_id, the JSON result envelope, and the mainnet write refusal. The audit log records submissions, signed authorizations, approvals, and explicit key-management and lifecycle events. Approval is available through the operator's CLI, local inbox, or remote approver.
+description: Operate the Stellar Agent Wallet through MCP tools for agent payments, account creation, trustlines, and claims with two-phase operator approval. Use the CLI for reads, setup, and operator ceremonies; CLI signing exceptions have separate policy and on-chain checks. Use when an agent needs Stellar account state, XLM or asset payments, smart-account governance, DeFi, SEP, x402, or sponsored MPP charges. Covers signed policy limits, shell access and approval authority, chain_id, the JSON result envelope, and configured mainnet authorization. The audit log records submissions, signed authorizations, approvals, and explicit key-management and lifecycle events. Testnet approval is available through the operator's CLI, local inbox, or remote approver; mainnet consent requires an owner-pinned passkey through the local browser or signed-origin HTTPS listener.
 license: Apache-2.0
-compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.13 public alpha; install from crates.io with a pinned version, for example cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13, or build from source). Targets Stellar testnet (default) and mainnet.
+compatibility: Requires the stellar-agent executable, which also runs the stellar-agent-mcp server (v0.1.0-alpha.13 public alpha; install from crates.io with a pinned version, for example cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13, or build from source). Targets Stellar testnet (default) and mainnet.
 metadata:
   version: "0.4.11"
   wallet_version: "0.1.0-alpha.13"
@@ -11,6 +11,9 @@ metadata:
 # Stellar Agent Wallet
 
 ## Overview
+
+See [Mainnet configurations and scope](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
 
 The Stellar Agent Wallet is a self-custodial Stellar wallet for AI agents. It has
 two surfaces over one shared core:
@@ -24,16 +27,17 @@ Both surfaces share the **policy engine**, **operator-approval spine**, and
 **tamper-evident audit log**. The log records transaction submissions, signed
 authorizations, approvals, and explicit key-management and lifecycle events.
 MCP balance reads and payment simulations produce no automatic invocation row.
-Under V1, payment simulations can reconcile overdue reservations and write
-settlement audit rows. Route payments, account creation, trustlines, and claims
+Under V1, payment simulations can reconcile overdue reservations and deliver
+owed accounting events. Route payments, account creation, trustlines, and claims
 through MCP's paired tools, where the pending-store approval loop exists.
 Leave operator approvals and key ceremonies to the operator.
 
 An MCP-only agent receives no operator approval tool. A process that runs as
 the operator's OS user holds the operator's authority; the wallet does not
 distinguish it from the operator.
-CLI approval checks the local OS identity; it reads consent from standard
-input or `--yes` and does not establish that a human confirmed.
+On testnet, CLI approval checks the local OS identity; it reads consent from
+standard input or `--yes` and does not establish that a human confirmed. On
+mainnet it refuses `--yes` and terminal input and runs the passkey ceremony.
 Shell permission rules are guard rails for a cooperative agent, not a boundary.
 
 For an MCP-only agent, signed limits apply where V1 is evaluated, and approval
@@ -41,9 +45,15 @@ never lifts a cap. Delegated execution runs through the CLI's operator
 authority under the agent key's on-chain rules. Other CLI signing paths have
 separate checks; see
 [CLI signing coverage](references/cli-reference.md#signing-and-approval-coverage).
-Owner key re-enrollment needs no previous seed. The profile's `[policy] engine`
-and `policy_owner_key_id` fields are unsigned. The halt marker has no MAC, and
-`profile reset-window-state` requires no owner signature.
+Owner key re-enrollment needs no previous seed while the installation holds no
+policy pin or mainnet enablement nonce. Replacing an owner protected by these
+continuity records requires a rotation statement signed by the pinned owner.
+The profile's `policy_owner_key_id` field is unsigned. The profile's
+`[policy] engine` must match the engine the owner-signed policy selects.
+The halt marker has no MAC. `profile reset-window-state` needs the owner's
+signature when a policy pin or an enrolled owner exists, on every network.
+These rules bind the wallet's commands; deleting or
+rewriting keyring entries outside the wallet rests on the platform keyring.
 Same-user processes can read keyring entries on Linux (Secret Service) and
 Windows (Credential Manager). With the `headless-env` backend, any process that
 can read `STELLAR_AGENT_HEADLESS_KEYRING_KEY` can decrypt every entry, on any
@@ -57,25 +67,35 @@ a central server.
 
 ## Installation
 
-This is a public alpha. Install the two binaries from crates.io — while only
+This is a public alpha. Install the one package from crates.io. While only
 prerelease versions are published, the version must be spelled out:
 
 ```bash
-# Prebuilt binaries (fetched from the GitHub release archive):
-cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
+# Prebuilt binary (fetched from the GitHub release archive):
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13
 # Or build from the published sources:
-cargo install --locked stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
+cargo install --locked stellar-agent-cli@0.1.0-alpha.13
 ```
 
-`--locked` builds with the `Cargo.lock` published in each crate. With the
+`--locked` builds with the `Cargo.lock` published in the crate. With the
 strategy flag, binstall installs only this repository's release archive and
 fails on a host for which none exists; use `cargo install --locked` there.
 
-Building from a clone of the release tag also works
-(`cargo build --release --locked -p stellar-agent-cli -p stellar-agent-mcp`
-produces `target/release/stellar-agent` and `target/release/stellar-agent-mcp`).
+Both commands install the `stellar-agent` executable, which also runs the MCP
+server: as `stellar-agent mcp serve`, or when it runs under the file name
+`stellar-agent-mcp`. The stanza below starts that name, so copy the
+executable next to the installed one:
 
-Point your MCP client at the server binary:
+```bash
+cp ~/.cargo/bin/stellar-agent ~/.cargo/bin/stellar-agent-mcp
+```
+
+Building from a clone of the release tag also works:
+`cargo build --release --locked -p stellar-agent-cli` produces
+`target/release/stellar-agent`; copy it to `target/release/stellar-agent-mcp`
+the same way. The direct release archives already hold both names.
+
+Point your MCP client at the server name:
 
 ```json
 {
@@ -90,12 +110,13 @@ Point your MCP client at the server binary:
 
 The server serves the `default` profile unless another is named: pass
 `"args": ["--profile", "alice"]`, or set `STELLAR_AGENT_PROFILE` in the
-environment the client spawns it with. The flag wins over the variable. The
-selected profile binds at startup and stays bound; keys are resolved from the
+environment the client spawns it with. The flag wins over the variable. A
+mainnet profile loads only with `--profile <NAME>`, including `--profile
+default`; `STELLAR_AGENT_PROFILE` never selects one. The selected profile binds at startup and stays bound; keys are resolved from the
 platform keyring that profile names. After connecting, the client issues
 `initialize`, then
 `tools/list` and `resources/list`. The schemas returned by `tools/list` are the
-authoritative argument contract — prefer them over any example here.
+authoritative argument contract. Prefer them over any example here.
 
 ## 1. Core conventions
 
@@ -112,8 +133,14 @@ Every tool returns the same JSON envelope, with five success-path exceptions:
 `stellar_defindex_vault_withdraw` return a bare object carrying a `status`
 field on success; their business errors use the envelope.
 
-Some refusals use the JSON-RPC error channel instead of the envelope: invalid
-arguments, a `chain_id` mismatch, and the toolset capability refusals.
+Arguments that do not match the tool's input schema (a missing or unknown
+field, or a field of the wrong type) return a tool result with
+`isError: true` and the text
+`<tool>: the arguments have a missing field or a field of the wrong type or value`.
+Some refusals use the JSON-RPC error channel instead of the envelope.
+Arguments that match the schema but fail a value check, and a `chain_id`
+mismatch, return JSON-RPC error -32602. The toolset capability refusals are
+JSON-RPC errors too.
 `toolset.first_invoke_approval_required` is a JSON-RPC error too, and its error
 data carries the `approval_nonce`.
 
@@ -121,27 +148,28 @@ On failure, `ok` is `false` and `error` carries a stable wire `code` (such as
 `policy.deny.<reason>`, `policy.approval_required`, or `policy.engine_required`)
 instead of `data`. Branch on `ok`; use `code` for control flow, never the human
 message. `request_id` correlates the call with the audit log. Every business
-error uses this envelope — domain refusals, policy and approval outcomes,
+error uses this envelope: domain refusals, policy and approval outcomes,
 keyring and signing failures, submit failures, and the SEP-53, x402, and DeFi
 verbs alike; codes follow a `<family>.<reason>` convention (for example
 `sep53.sign_failed`, `nonce.mint_failed`).
 
-The six `stellar_sep43_*` tools use this same standard envelope: the SEP-43
-raw protocol payload (`{ address }`, `{ signedTxXdr, signerAddress }`, and so
-on) is carried inside `data` on success, and failures surface as
-`{ ok: false, error: { code, message } }` with dotted `sep43.*` codes (for
-example `sep43.invalid_xdr`, `sep43.invalid_network_passphrase`); the
-structural mainnet-signing refusal carries the canonical
-`network.mainnet_write_forbidden` code shared with every signing surface. Do
+The six `stellar_sep43_*` tools use this same standard envelope.
+The SEP-43 raw protocol payload, such as `{ address }`, appears inside `data`
+on success. Failures use `{ ok: false, error: { code, message } }` with dotted
+`sep43.*` codes, including `sep43.invalid_xdr` and `sep43.invalid_network_passphrase`.
+Wallet entry guards report structural mainnet signing refusal with
+`network.mainnet_write_forbidden`. Do
 not expect the raw SEP-43 `{ code, message }` numeric-code object at the top
 level. See references/protocols.md for the per-tool payloads and the full
 wire-code table.
 
 ### chain_id
 
-Every tool requires a `chain_id` argument — the CAIP-2 chain id (`stellar:testnet`
-or `stellar:mainnet`) — that must match the active profile. Exceptions:
-`stellar_x402_parse_receipt` and `stellar_toolset_list` take none; the two SEP-43
+Every tool requires a `chain_id` argument, the CAIP-2 chain id (`stellar:testnet`
+or `stellar:mainnet`), that must match the active profile. Exceptions:
+`stellar_x402_parse_receipt` and `stellar_toolset_list` take none.
+`stellar_signed_intents_list` and `stellar_approval_status` take none and refuse
+one as an unknown field. The two SEP-43
 read tools make it optional; `stellar_toolset_invoke` accepts an optional `chain_id`
 it forwards to the routed tool. The five `stellar_mpp_*` tools reject a `chain_id`
 field as unknown and act on the chain of the server's profile.
@@ -172,13 +200,13 @@ Read budget fields before transfers near a cap. `in_window_spent` and
 make submission fail `SpendingLimitExceeded`. See
 [references/smart-accounts.md](references/smart-accounts.md).
 
-## 3. Sending a payment — the two-phase pattern
+## 3. Sending a payment: the two-phase pattern
 
-Fund-moving classic verbs split into a **build** call and a **commit** call. This
+Fund-moving classic verbs split into a **simulate** call and a **commit** call. This
 is the core safe pattern; it also applies to `stellar_create_account` and
 `stellar_trustline` (each paired with a `*_commit`).
 
-**Step 1 — build.** `stellar_pay` builds an unsigned envelope, runs the SEP-29
+**Step 1: simulate.** `stellar_pay` builds an unsigned envelope, runs the SEP-29
 memo check, and mints a single-use nonce. Nothing is signed.
 
 ```json
@@ -193,7 +221,7 @@ memo check, and mints a single-use nonce. Nothing is signed.
 
 It returns `envelope_xdr`, `nonce`, and `expires_at_unix_ms`.
 
-**Step 2 — commit.** `stellar_pay_commit` re-derives the authoritative
+**Step 2: commit.** `stellar_pay_commit` re-derives the authoritative
 destination, asset, and amount from the envelope, verifies the nonce, signs from
 the keyring, and submits.
 
@@ -217,21 +245,27 @@ On success `data` carries `tx_hash` and `ledger`.
 For pay, create-account, trustline, and claim, the simulate call records a pending
 approval when policy requires approval for either the simulate tool or its paired
 commit tool. It returns an `approval` block with `approval_nonce`, `profile`, and
-`chain_id`. Toolset-routed payments also require operator approval at commit. The
+`chain_id`. A toolset-routed payment also requires operator approval at commit
+when the routed payment rule or the outer toolset rule requires approval, or
+when no matching first-invoke grant exists. The
 handshake:
 
 1. The operator consents out-of-band with `stellar-agent approve --id
    <approval_nonce> --profile <name>` at a terminal, `approve list` / `approve serve` (a local
    web inbox), or `approve serve --remote` (a TLS-protected, passkey-authenticated
-   inbox for a device other than the wallet host). The operator reviews the
+   inbox for a device other than the wallet host). On mainnet without a signed
+   approval origin, the command and the local inbox take a passkey assertion on
+   the local approval page. With one, the command prints the signed approval
+   link, and remote approval runs only at that origin. The operator reviews the
    wallet-rendered summary before consenting. See
    `references/approvals-and-audit.md` for all three surfaces.
-2. That step returns an `approval_attestation` — an HMAC blob bound to that
+2. That step returns an `approval_attestation`, an HMAC blob bound to that
    exact envelope. The operator relays it to you.
 3. Re-invoke `stellar_pay_commit` with `approval_nonce` and `approval_attestation`
    added. The wallet verifies the attestation, then signs and submits.
 
-MCP exposes no attestation-minting tool. On `policy.approval_required`, ask the
+MCP mints no attestation. `stellar_approval_status` inspects an approval by its
+nonce without consuming it. On `policy.approval_required`, ask the
 operator to approve, then retry the commit with the attestation. Do not invoke
 CLI approval yourself or retry blindly.
 
@@ -246,7 +280,7 @@ MPP prepare records a request when policy requires approval for prepare or
 account; `stellar_trustline` / `stellar_trustline_commit` add or change a
 trustline. `stellar_claim` / `stellar_claim_commit` claim a Stellar claimable
 balance the agent already holds the id of, behind claimant/predicate/trustline
-guards. All three pairs follow the same two-phase build-then-commit pattern as
+guards. All three pairs follow the same two-phase simulate-then-commit pattern as
 payments. See `references/cli-reference.md` and `references/mcp-tools.md`.
 
 ## 5. Smart-account governance
@@ -267,8 +301,8 @@ the smart account. See
 `references/smart-accounts.md`.
 
 You can also PROPOSE a new rule yourself via `stellar_rule_create` /
-`stellar_rule_create_commit` instead of asking the operator to run the CLI —
-you resolve and simulate the definition, but the rule installs only after the
+`stellar_rule_create_commit` instead of asking the operator to run the CLI.
+You resolve and simulate the definition, but the rule installs only after the
 operator attests to the exact definition you proposed. See
 `references/mcp-tools.md#agent-proposed-context-rules`.
 
@@ -287,7 +321,12 @@ SEP-7 URI parsing, SEP-10 web auth through the x402 identity gate, SEP-24/6
 transfer hand-off, SEP-43 wallet signing (`get_address`, `get_network`, `sign_transaction`, `sign_auth_entry`,
 `sign_message`, `sign_and_submit_transaction`), SEP-47/48 contract discovery, and
 SEP-53 signed messages. SEP-45 is library-only, with no CLI command or MCP tool.
-The wallet also signs x402 v2 Exact Stellar agent payments and testnet sponsored MPP charges. MPP uses
+The wallet also signs x402 v2 Exact Stellar agent payments and testnet
+sponsored MPP charges.
+Builds with default features carry `mainnet-write`; a `--no-default-features`
+build omits it. Both x402 payment tools support approved mainnet payments
+in these builds. Authenticated payments bind their SEP-10 identity operation
+to the payment approval. MPP uses
 `stellar_mpp_charge_prepare` then one `stellar_mpp_charge_commit`; the trusted
 host sends the returned credential to the exact bound HTTP or MCP request. See
 `references/protocols.md`.
@@ -295,11 +334,13 @@ host sends the returned credential to the exact bound HTTP or MCP request. See
 ## 8. The wallet's toolsets feature
 
 Separately from this knowledge skill, the wallet has a built-in **toolsets**
-feature: a signed, installed package that grants an agent a narrow, wallet-enforced
-set of capabilities (least privilege). It is the opposite of this skill — it
-restricts what an agent may do rather than teaching it. Drive installed toolsets
-with `stellar_toolset_list` and `stellar_toolset_invoke`. See
-`references/toolsets-feature.md`.
+feature: a signed, installed package that declares a narrow set of capabilities
+the toolset dispatcher routes for an agent. It is the opposite of this skill: it
+narrows what the dispatcher routes rather than teaching. It does not restrict the
+other tools the server exposes; the operator policy and approvals bound every call.
+Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke`
+(a destructive tool). Enabled mainnet setup admits exact payment preparation and
+commit actions. See `references/toolsets-feature.md`.
 
 ## 9. Safety model
 
@@ -312,14 +353,23 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   `halted`. On either code, stop and report the message to the operator. Never
   run `stellar-agent profile resume` yourself, and do not retry under another
   profile; the halt is the operator's decision.
-- On `stellar:mainnet` read-only tools work. The DeFi, sign-and-submit, commit,
-  and rule-commit tools refuse a mainnet profile at handler entry with
-  `network.mainnet_write_forbidden`, before the policy gate and any RPC call. A
-  profile on the Noop engine refuses the other destructive tools on mainnet with
-  `policy.engine_required`. Below the policy layer, the network layer
-  structurally refuses every mainnet write with `network.mainnet_write_forbidden`
-  regardless of engine or keys. No configuration unlocks mainnet writes in this
-  alpha.
+- Builds with default features carry `mainnet-write`, and `--version` reports
+  the compiled state. The four classic full-mode CLI operations sign `Allow` without
+  a passkey ceremony; `RequireApproval` runs one. Setup and policy minimums remain required.
+  Classic MCP commits require operator setup; `Allow` signs without an
+  approval, and `RequireApproval` needs a verified approval. See
+  [profiles and keys](references/profiles-and-keys.md#mainnet-policy-body) and
+  [classic MCP authorization](references/mcp-tools.md#classic-mainnet-authorization).
+  Mainnet reads retain selection, key-scope, and policy requirements.
+  Noop refuses destructive mainnet decisions with `policy.engine_required`.
+  Policy evaluation alone grants no signing authority. Signing and submission
+  independently check sealed authorization. Smart-account writes, DeFi, pool
+  submission, MPP, generic signing, and toolset rule creation are excluded on
+  mainnet.
+  Mainnet writes move real funds, and the operator uses the wallet at their
+  own risk. Before the first mainnet write of a session, confirm that
+  the operator intends mainnet, and suggest a testnet run and a small amount.
+
 - `profile.key_scope_conflict` refuses mainnet startup or CLI reconciliation
   for shared or invalid key scope; testnet logs a warning. Do not retry under
   another profile. Follow the named recovery in
@@ -331,40 +381,61 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   ask the same question earlier, before the first read whose answer they sign
   or gate on. They ask on the client that sends, and the MCP simulate tools ask
   on their own client.
-  Seven codes carry those refusals:
+  Eight codes carry those refusals:
   - `network.endpoint_network_mismatch`: the endpoint serves a different
     network than declared.
   - `network.endpoint_identity_unavailable`: the endpoint identity cannot be
     established in time.
+  - `network.pre_send_timeout`: the submit layer's identity probe or
+    signer-set read did not answer within the 30-second pre-send budget, and
+    nothing was sent.
   - `network.rpc_credential_refused`: the endpoint answered a
     request with HTTP 401 or 403, or the stored RPC credential is unusable.
   - `network.unsupported_protocol_version`: a mainnet endpoint reports a version
-    outside the supported range. While mainnet writes are refused, a mainnet
-    endpoint is refused before this check.
-  - `network.envelope_signed_for_mainnet`: a signature verifies only on mainnet.
+    outside the supported range. Authorized mainnet paths enforce this check.
+  - `network.envelope_signed_for_mainnet`: a signature fails under the endpoint
+    network but verifies under mainnet.
   - `network.envelope_signature_unverifiable`: a signature does not verify.
   - `network.envelope_unsigned`: a required signature set is empty.
+
+  `network.endpoint_not_ready` reports an endpoint that is not healthy or whose
+  latest ledger closed more than 60 seconds from the host clock. The classic MCP
+  prepare tools and the CLI `pay`, `claim`, sponsored `accounts create`, and
+  `trustline` verbs check this before they sign, so nothing was sent. Report
+  the reason to the operator; do not switch to a different endpoint on your own.
 
   `network.witness_unavailable` separately reports an unavailable required oracle
   witness for all four classic MCP commits and CLI `pay`, `claim`, sponsored
   `accounts create`, `trustline`, and sending `pool init` paths. The x402
   payment tools are covered by a second simulation on the oracle, which
-  simulates the same unsigned transfer before the payer signs.
+  simulates and compares the same unsigned transfer before the payer signs.
+  Mainnet x402 witnesses use the signed policy's threshold, which a profile
+  threshold can only lower.
   Opaque staged envelopes and the SEP-43 signing tools remain uncovered.
   `fees.percentile_exceeds_cap` and
   `validation.mainnet_fee_cap_required` report the classic fee cap.
   See references/troubleshooting.md.
-- These tools refuse `stellar:mainnet` structurally at handler entry with
-  `network.mainnet_write_forbidden`, before the policy gate and regardless of
-  engine:
+- These tools refuse `stellar:mainnet` at handler entry with
+  `network.mainnet_write_forbidden`, before the policy gate. The refusal holds
+  in every build, except for the six tools named after the list:
   - the sign-only tools: the SEP-43 sign verbs, SEP-53 `sign_message`, and the
     two x402 payment tools;
   - `stellar_sep43_sign_and_submit_transaction` and the DeFi tools;
-  - the commit tools, `stellar_rule_create_commit`, and the toolset signing
-    actions.
+  - the commit tools and `stellar_rule_create_commit`.
+
+  Both x402 payment tools, `stellar_x402_create_payment` and
+  `stellar_x402_authenticated_payment`, and the four classic commits depend on
+  the feature. With the feature off, they refuse at entry with the same code.
+  Builds with the feature on admit them after setup, as
+  [classic MCP authorization](references/mcp-tools.md#classic-mainnet-authorization)
+  describes. Enabled setup also admits the exact toolset payment pair; toolset
+  rule creation remains excluded. On an admitted mainnet server, an x402 payment
+  under Allow returns the payment in one call. Under RequireApproval it takes
+  two calls.
 - Every MPP tool refuses `stellar:mainnet` at handler entry with
-  `mpp.network_forbidden`. Branch on all three codes when handling a mainnet
-  refusal.
+  `mpp.network_forbidden`. Branch on all three codes,
+  `network.mainnet_write_forbidden`, `policy.engine_required`, and
+  `mpp.network_forbidden`, when handling a mainnet refusal.
 - Raw argument values are never written to the audit log, only key names.
   Typed value events retain each leg's amount, asset, and redacted destination. The
   operator verifies the chain with
@@ -374,16 +445,16 @@ See `references/security.md` and `references/approvals-and-audit.md`.
 
 ## Reference Documentation
 
-- [CLI reference](./references/cli-reference.md) — the full `stellar-agent` command surface
-- [MCP tools](./references/mcp-tools.md) — the `stellar-agent-mcp` tool catalog with arguments
-- [Profiles and keys](./references/profiles-and-keys.md) — profile schema, the keyring, key rotation
-- [Approvals and audit](./references/approvals-and-audit.md) — policy engine, the approval spine, the audit log
-- [Smart accounts](./references/smart-accounts.md) — OpenZeppelin governance: rules, signers, passkeys, timelock, multicall
-- [DeFi](./references/defi.md) — Soroswap, DeFindex, and the channel pool
-- [Protocols](./references/protocols.md) — SEP coverage and x402 agent payments
-- [Toolsets feature](./references/toolsets-feature.md) — the wallet's capability-isolation packages
-- [Troubleshooting](./references/troubleshooting.md) — wire and error codes
-- [Security](./references/security.md) — the security model and safe operation
+- [CLI reference](./references/cli-reference.md): the full `stellar-agent` command surface
+- [MCP tools](./references/mcp-tools.md): the `stellar-agent-mcp` tool catalog with arguments
+- [Profiles and keys](./references/profiles-and-keys.md): profile schema, the keyring, key rotation
+- [Approvals and audit](./references/approvals-and-audit.md): policy engine, the approval spine, the audit log
+- [Smart accounts](./references/smart-accounts.md): OpenZeppelin governance, with rules, signers, passkeys, timelock, multicall
+- [DeFi](./references/defi.md): Soroswap, DeFindex, and the channel pool
+- [Protocols](./references/protocols.md): SEP coverage and x402 agent payments
+- [Toolsets feature](./references/toolsets-feature.md): the wallet's capability-isolation packages
+- [Troubleshooting](./references/troubleshooting.md): wire and error codes
+- [Security](./references/security.md): the security model and safe operation
 
 ## Common Pitfalls
 
@@ -399,7 +470,7 @@ with a unit), not a JSON number. `asset` is `"native"` or `"XLM"` for XLM, or
 ```
 
 **Build does not move funds; commit does.** `stellar_pay` only simulates and mints
-a nonce — it signs nothing. Funds move only when `stellar_pay_commit` succeeds.
+a nonce. It signs nothing. Funds move only when `stellar_pay_commit` succeeds.
 Do not treat a successful `stellar_pay` as a sent payment.
 
 **The envelope is authoritative at commit.** `stellar_pay_commit` decodes the
@@ -419,41 +490,35 @@ reconcile the transaction. Keep credential and receipt values out of logs.
 must approve and relay the `approval_attestation`. Retrying the commit unchanged
 will keep failing.
 
-**Mainnet writes are refused in this alpha.** Expect
-`network.mainnet_write_forbidden` at handler entry from the DeFi,
-sign-and-submit, commit, rule-commit, and sign-only tools, before the policy
-gate. The network layer refuses every mainnet write with the same code,
-regardless of engine or keys. No configuration unlocks mainnet writes. MPP tools
-refuse with `mpp.network_forbidden`. A profile on the Noop engine refuses the
-other destructive tools on mainnet with `policy.engine_required`. Branch on all
-three codes for mainnet refusals.
+**Mainnet actions require operator setup and approval.** Mainnet consent
+requires a verified passkey assertion from an approval credential in the
+owner-signed policy. The operator approves through the local browser or at
+the signed approval origin.
+Never attempt the approval yourself. The version marker
+reports compiled state. `network.mainnet_write_forbidden` identifies an excluded
+operation, a feature-off build, or a missing admitted context. Resolver gaps
+use `network.mainnet_authorization_refused`. Policy denials retain `policy.deny.*`,
+and balance floor denials retain `account.*`.
+Report authorization refusal to the operator. Do not switch networks. A retry
+needs fresh preparation and approval. Restart MCP after enablement or policy
+signing; stale startup bindings report the restart requirement.
 
-**The endpoint decides which network you are on, not `chain_id`.** The submit
-layer asks the RPC endpoint which network it serves and binds the submission to
-that answer. An endpoint serving a different network than the profile declares
-is `network.endpoint_network_mismatch`; an endpoint whose identity cannot be
-established in time is `network.endpoint_identity_unavailable`; one that
-answers the identity request with HTTP 401 or 403 is
-`network.rpc_credential_refused`. The same answer
-carries the endpoint's protocol version: this release supports protocols 29 and 30.
-Outside them, testnet logs a warning and continues; on mainnet the rule refuses
-with `network.unsupported_protocol_version`, which a mainnet endpoint never
-reaches while mainnet writes are refused. Signatures are
-then checked against the network the endpoint reported: an envelope signed for
-mainnet is `network.envelope_signed_for_mainnet`, one whose signatures verify
-under neither that network nor mainnet is
-`network.envelope_signature_unverifiable`, and an
-envelope with no signature, or a fee-bump whose outer or inner transaction
-has none, is `network.envelope_unsigned`. The four classic simulate tools and
-their commit tools check the endpoint before their first read, and a simulate
-against an endpoint reporting mainnet is refused with
-`network.mainnet_write_forbidden`. A commit checks before the single-use nonce
-is burned, so a refusal at that check leaves the nonce usable. A refusal by the
-submit layer's own check, after the nonce is consumed, does not.
+**The endpoint binds the network.** Prepare and commit probe the client before
+its first action read. Submission checks it again before send. A network
+mismatch uses `network.endpoint_network_mismatch`; unavailable identity uses
+`network.endpoint_identity_unavailable`. A read before the send that outlasts
+the 30-second pre-send budget uses `network.pre_send_timeout`, and nothing is
+sent. A prepare refuses an endpoint that is
+not healthy or not current with `network.endpoint_not_ready`, and its result
+names the observed ledger as `operational`. Credential refusals use
+`network.rpc_credential_refused`. Authorized mainnet operations require protocol 29 or 30.
+Signatures must verify under the endpoint network. See
+[network-binding codes](references/troubleshooting.md#network-binding-codes-submit-layer).
+A submission timeout requires reconciliation, not a new payment attempt.
 
 **Branch on `ok` and the error `code`, not the message.** The human message text
 is not a stable contract; the wire `code` is.
 
 **The toolsets feature is not this skill.** `stellar_toolset_list` /
-`stellar_toolset_invoke` drive the wallet's capability-restriction packages, a
-runtime permission mechanism — not downloadable knowledge like this skill.
+`stellar_toolset_invoke` drive the wallet's capability packages, which narrow what
+the toolset dispatcher routes; they are not downloadable knowledge like this skill.

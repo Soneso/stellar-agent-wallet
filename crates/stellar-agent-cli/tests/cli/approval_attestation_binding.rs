@@ -1,5 +1,11 @@
 //! The approve binary binds attestations to the selected profile and network
 //! and reports approval refusals without persisting consent.
+//!
+//! On mainnet the binary refuses `--yes` before the approval store is
+//! opened. Without it, with the owner-signed policy in place, the approval
+//! reaches the browser boundary and, with no browser, refuses with
+//! `approval.presence_browser_required`: terminal input is no consent.
+//! Either way the pending file stays byte-identical.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -9,7 +15,7 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serial_test::serial;
-use std::{process::Command, sync::Arc};
+use std::sync::Arc;
 use stellar_agent_core::{
     approval::{
         AttestationBinding, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, envelope_sha256,
@@ -20,6 +26,7 @@ use stellar_agent_core::{
         schema::{KeyringEntryRef, Profile},
     },
 };
+use stellar_agent_test_support::source_order::assert_called_between;
 use stellar_xdr::{
     Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
     SequenceNumber, Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope,
@@ -37,7 +44,7 @@ enum ApprovalCase {
 }
 
 fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let home = dir.path();
     let name = if mainnet {
         "treasury-mainnet"
@@ -66,10 +73,14 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
         )
         .rpc_url(rpc_url)
     };
-    let mut profile = builder
-        .audit_log_path(home.join("audit").join("approval.jsonl"))
-        .with_noop_engine()
-        .build();
+    let builder = builder.audit_log_path(home.join("audit").join("approval.jsonl"));
+    let mut profile = if mainnet {
+        let mut profile = builder.build();
+        stellar_agent_core::approval::mainnet_fixtures::set_fixture_oracle(&mut profile);
+        profile
+    } else {
+        builder.with_noop_engine().build()
+    };
     profile.attestation_key_id = KeyringEntryRef::default_attestation_key(name);
     save_new_to_dir(name, &profile, &home.join("profiles")).unwrap();
     let protection_key = [7_u8; 32];
@@ -98,6 +109,9 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
     .unwrap()
     .set_password(&URL_SAFE_NO_PAD.encode([0x24_u8; 32]))
     .unwrap();
+    if mainnet {
+        crate::mainnet_presence::sign_presence_policy(home, name, &profile);
+    }
     let transaction_source = MuxedAccount::Ed25519(Uint256([2; 32]));
     let operation_source = MuxedAccount::Ed25519(Uint256([3; 32]));
     let operation_source_strkey = stellar_strkey::ed25519::PublicKey([3; 32]).to_string();
@@ -170,6 +184,12 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
         .unwrap();
     }
     entry.approval_nonce = format!("-{}", &entry.approval_nonce[1..]);
+    if mainnet {
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home);
+        crate::approval_fixture::initialize_consent_scope(&profile, name);
+        crate::approval_fixture::open_record(name, &profile, &entry);
+    }
+    let log_before = std::fs::read(&profile.audit_log_path).ok();
     let nonce = entry.approval_nonce.clone();
     let mut approvals =
         PendingApprovalStore::open(home.join("approvals").join(format!("{name}.toml"))).unwrap();
@@ -177,12 +197,18 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
         .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
         .unwrap();
     drop(approvals);
+    let pending_path = home.join("approvals").join(format!("{name}.toml"));
+    let pending_before = std::fs::read(&pending_path).unwrap();
     let requested_nonce = if matches!(case, ApprovalCase::UnknownNonce) {
         "AAAAAAAAAAAAAAAAAAAAAA"
     } else {
         &nonce
     };
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    let mut command = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child");
     command.args(["approve", "--id", requested_nonce, "--profile", name]);
     if !matches!(case, ApprovalCase::ClosedStdin) {
         command.arg("--yes");
@@ -195,15 +221,20 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
             "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
             URL_SAFE_NO_PAD.encode(protection_key),
         )
+        .env(crate::mainnet_presence::NO_BROWSER_ENV, "1")
         .env_remove("STELLAR_AGENT_PROFILE")
         .output()
         .expect("approve binary runs");
     let stderr = String::from_utf8(output.stderr).unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let expected_code = match case {
-        ApprovalCase::UnknownNonce => Some("approval.not_found"),
-        ApprovalCase::ClosedStdin => Some("approval.denied"),
-        ApprovalCase::Attest | ApprovalCase::Trustline => None,
+    let expected_code = match (mainnet, case) {
+        (true, ApprovalCase::Attest | ApprovalCase::Trustline | ApprovalCase::UnknownNonce) => {
+            Some("approve.yes_refused_on_mainnet")
+        }
+        (true, ApprovalCase::ClosedStdin) => Some("approval.presence_browser_required"),
+        (false, ApprovalCase::UnknownNonce) => Some("approval.not_found"),
+        (false, ApprovalCase::ClosedStdin) => Some("approval.denied"),
+        (false, ApprovalCase::Attest | ApprovalCase::Trustline) => None,
     };
     if let Some(expected_code) = expected_code {
         assert_eq!(
@@ -218,7 +249,18 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
                 .expect("read pending approval");
         let pending = approvals.get(&nonce).expect("entry remains pending");
         assert!(pending.attestation_blob_b64.is_none());
-        assert!(!profile.audit_log_path.exists());
+        assert_eq!(
+            std::fs::read(&profile.audit_log_path).ok(),
+            log_before,
+            "the refusal writes no audit row"
+        );
+        if mainnet {
+            assert_eq!(
+                std::fs::read(&pending_path).unwrap(),
+                pending_before,
+                "the mainnet refusal leaves the pending file untouched"
+            );
+        }
         return;
     }
     assert!(output.status.success(), "stdout={stdout}; stderr={stderr}");
@@ -237,12 +279,21 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
         .unwrap()
         .try_into()
         .unwrap();
+    let attested = PendingApprovalStore::open(home.join("approvals").join(format!("{name}.toml")))
+        .expect("read attested approval")
+        .get(&nonce)
+        .expect("the attested request is persisted")
+        .clone();
+    let scope = attested
+        .attestation_scope()
+        .expect("the attested request names a readable attestation layout");
     assert!(verify_attestation(
         &key,
         &AttestationBinding::new(name, profile.chain_id.caip2_str()),
         &nonce,
         &envelope_sha256(envelope.as_bytes()),
         &uid,
+        &scope,
         &blob
     ));
     assert_eq!(json["data"]["audit"], "written", "{stdout}");
@@ -279,8 +330,29 @@ fn approve_binary_testnet_binding_and_summary() {
 
 #[test]
 #[serial]
-fn approve_binary_mainnet_binding_and_summary() {
+fn approve_binary_mainnet_refuses_yes() {
     approve_binary_case(true, ApprovalCase::Attest);
+}
+
+#[cfg(feature = "test-helpers")]
+#[test]
+#[serial]
+fn approve_binary_mainnet_without_yes_requires_a_browser() {
+    approve_binary_case(true, ApprovalCase::ClosedStdin);
+}
+
+/// The mainnet rule is applied after the profile is loaded and before the
+/// approval store is opened, so a refusal never touches the pending file.
+#[test]
+fn the_mainnet_approve_rule_runs_before_the_store_opens() {
+    assert_called_between(
+        "commands/approve/run.rs",
+        include_str!("../../src/commands/approve/run.rs"),
+        "pub async fn run(",
+        "load_profile_reconciled(",
+        "mainnet_approve_rule(",
+        "open_with_retry(",
+    );
 }
 
 #[test]

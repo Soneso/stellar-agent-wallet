@@ -78,6 +78,77 @@ pub fn account_id_for_seed(seed: [u8; 32]) -> String {
     )
 }
 
+/// Builds a testnet transaction that opens a USD trustline and funds it.
+/// Both supplied accounts must already exist. The issuer pays the fee and
+/// uses `issuer_sequence`; the recipient signs its ChangeTrust operation.
+///
+/// # Panics
+/// Panics if fixture XDR values cannot be encoded.
+#[must_use]
+#[allow(clippy::unwrap_used, reason = "fixed test fixture XDR shapes")]
+pub fn funded_issued_payment_envelope(
+    recipient_seed: [u8; 32],
+    issuer_seed: [u8; 32],
+    issuer_sequence: i64,
+) -> (String, String) {
+    use stellar_xdr::{AlphaNum4, AssetCode4, ChangeTrustAsset, ChangeTrustOp};
+    let recipient = public_key_for_seed(recipient_seed);
+    let issuer = public_key_for_seed(issuer_seed);
+    let credit = AlphaNum4 {
+        asset_code: AssetCode4(*b"USD\0"),
+        issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(issuer))),
+    };
+    let transaction = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(issuer)),
+        fee: 200_000,
+        seq_num: SequenceNumber(issuer_sequence),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![
+            Operation {
+                source_account: Some(MuxedAccount::Ed25519(Uint256(recipient))),
+                body: OperationBody::ChangeTrust(ChangeTrustOp {
+                    line: ChangeTrustAsset::CreditAlphanum4(credit.clone()),
+                    limit: 10_000_000_000,
+                }),
+            },
+            Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: MuxedAccount::Ed25519(Uint256(recipient)),
+                    asset: Asset::CreditAlphanum4(credit),
+                    amount: 1_000_000_000,
+                }),
+            },
+        ]
+        .try_into()
+        .unwrap(),
+        ext: TransactionExt::V0,
+    };
+    let hash = payload_hash(
+        TESTNET_PASSPHRASE,
+        &TransactionSignaturePayloadTaggedTransaction::Tx(transaction.clone()),
+    );
+    let signatures = [issuer_seed, recipient_seed].map(|seed| {
+        let key = SigningKey::from_bytes(&seed);
+        let bytes = key.verifying_key().to_bytes();
+        DecoratedSignature {
+            hint: SignatureHint(bytes[28..].try_into().unwrap()),
+            signature: Signature(key.sign(&hash).to_bytes().to_vec().try_into().unwrap()),
+        }
+    });
+    let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: transaction,
+        signatures: signatures.to_vec().try_into().unwrap(),
+    })
+    .to_xdr_base64(Limits::none())
+    .unwrap();
+    (
+        format!("USD:{}", account_id_for_seed(issuer_seed)),
+        envelope,
+    )
+}
+
 /// Returns a `getNetwork` JSON-RPC result body reporting `passphrase`.
 ///
 /// The body reports protocol version 29, a version the wallet supports, so a
@@ -242,17 +313,20 @@ impl SignedTestEnvelope {
 
 /// Builds a [`SignedTestEnvelope`].
 ///
-/// Defaults: sequence 1, a single native payment to a fixed destination, one
-/// signature by the source account's own key under the testnet passphrase, and
-/// a ledger body reporting every source account with no extra signers.
+/// Defaults: sequence 1, no time bounds, a single native payment to a fixed
+/// destination, one signature by the source account's own key under the
+/// testnet passphrase, and a ledger body reporting every source account with
+/// no extra signers.
 pub struct SignedTestEnvelopeBuilder {
     source_seed: [u8; 32],
     sequence: i64,
+    time_bounds: Option<(u64, u64)>,
     destination: [u8; 32],
     amount_stroops: i64,
     network_passphrase: String,
     operation_source: Option<[u8; 32]>,
     muxed_source_id: Option<u64>,
+    muxed_destination_id: Option<u64>,
     claim_balance_id: Option<[u8; 32]>,
     fee_bump_source: Option<[u8; 32]>,
     inner_signatures: Option<Vec<SignatureSpec>>,
@@ -272,11 +346,13 @@ impl SignedTestEnvelopeBuilder {
         Self {
             source_seed,
             sequence: 1,
+            time_bounds: None,
             destination: strkey_bytes(DEFAULT_DESTINATION),
             amount_stroops: DEFAULT_AMOUNT_STROOPS,
             network_passphrase: TESTNET_PASSPHRASE.to_owned(),
             operation_source: None,
             muxed_source_id: None,
+            muxed_destination_id: None,
             claim_balance_id: None,
             fee_bump_source: None,
             inner_signatures: None,
@@ -292,6 +368,13 @@ impl SignedTestEnvelopeBuilder {
         self
     }
 
+    /// Sets the transaction's minimum and maximum Unix time in seconds.
+    #[must_use]
+    pub fn time_bounds(mut self, min_time: u64, max_time: u64) -> Self {
+        self.time_bounds = Some((min_time, max_time));
+        self
+    }
+
     /// Makes the transaction source a muxed account (`M...`) carrying `id`
     /// over the same underlying `G...` account.
     ///
@@ -301,6 +384,15 @@ impl SignedTestEnvelopeBuilder {
     #[must_use]
     pub fn muxed_source_id(mut self, id: u64) -> Self {
         self.muxed_source_id = Some(id);
+        self
+    }
+
+    /// Makes the payment destination a muxed account (`M...`) carrying `id`
+    /// over the same destination key. [`SignedTestEnvelope::destination`]
+    /// then returns the `M...` strkey.
+    #[must_use]
+    pub fn muxed_destination_id(mut self, id: u64) -> Self {
+        self.muxed_destination_id = Some(id);
         self
     }
 
@@ -464,7 +556,13 @@ impl SignedTestEnvelopeBuilder {
                 balance_id: ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash(balance_id)),
             }),
             None => OperationBody::Payment(PaymentOp {
-                destination: MuxedAccount::Ed25519(Uint256(self.destination)),
+                destination: match self.muxed_destination_id {
+                    Some(id) => MuxedAccount::MuxedEd25519(stellar_xdr::MuxedAccountMed25519 {
+                        id,
+                        ed25519: Uint256(self.destination),
+                    }),
+                    None => MuxedAccount::Ed25519(Uint256(self.destination)),
+                },
                 asset: Asset::Native,
                 amount: self.amount_stroops,
             }),
@@ -486,7 +584,14 @@ impl SignedTestEnvelopeBuilder {
             },
             fee: 100,
             seq_num: SequenceNumber(self.sequence),
-            cond: Preconditions::None,
+            cond: self
+                .time_bounds
+                .map_or(Preconditions::None, |(min_time, max_time)| {
+                    Preconditions::Time(stellar_xdr::TimeBounds {
+                        min_time: stellar_xdr::TimePoint(min_time),
+                        max_time: stellar_xdr::TimePoint(max_time),
+                    })
+                }),
             memo: Memo::None,
             operations: vec![operation]
                 .try_into()
@@ -601,7 +706,16 @@ impl SignedTestEnvelopeBuilder {
             source: source_strkey,
             source_seed: self.source_seed,
             sequence: self.sequence,
-            destination: format!("{}", stellar_strkey::ed25519::PublicKey(self.destination)),
+            destination: match self.muxed_destination_id {
+                Some(id) => format!(
+                    "{}",
+                    stellar_strkey::ed25519::MuxedAccount {
+                        ed25519: self.destination,
+                        id,
+                    }
+                ),
+                None => format!("{}", stellar_strkey::ed25519::PublicKey(self.destination)),
+            },
             envelope_xdr,
             tx_hash_hex,
             ledger_entries_result: ledger_entries_result(&ledger_accounts),
@@ -768,7 +882,7 @@ fn strkey_bytes(strkey: &str) -> [u8; 32] {
 }
 
 /// Lowercase hex encoding.
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes
         .iter()
         .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {

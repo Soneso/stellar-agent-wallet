@@ -16,8 +16,11 @@
 //! The recorded amount is `i128`, exact across the full range a token
 //! quantity or an aggregated per-period stroop total can take (a Soroban SAC
 //! transfer, or a rolling-window sum across many legs, can exceed
-//! `i64::MAX`). `query_window` sums entries with `i128::saturating_add`; the
-//! call-count field stays `u32` (call counts never approach that range).
+//! `i64::MAX`). `query_window` sums the amounts of every bucket, including the
+//! retained fallback totals, with checked addition and refuses an overflow
+//! with `StateStoreError::SumOverflow`. An `unlisted:` bucket also refuses a
+//! negative contributor with `StateStoreError::NegativeAmount`. The call-count
+//! field stays `u32` and saturates.
 //!
 //! # Sliding-window API pattern
 //!
@@ -44,7 +47,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
-use crate::policy::DenyReason;
+use crate::policy::{DenyReason, PolicyError, UnlistedBound};
+use crate::wallet::WalletLifecycleError;
 
 /// Maximum tolerated future clock skew for host-dated pending entries, in milliseconds.
 pub const CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
@@ -160,6 +164,26 @@ pub enum WindowLimit {
         /// The calls the window admits.
         max_calls: u32,
     },
+    /// The rolling-window bound of an unlisted-recipient budget, as the
+    /// `unlisted` table of a `counterparty_allowlist` configures it.
+    Unlisted {
+        /// The budget asset identifier, as its denial names it.
+        asset: String,
+        /// The window label (e.g. `"1d"`).
+        window: String,
+        /// The aggregate stroops the window admits for unlisted recipients.
+        max_stroops: i128,
+    },
+    /// A non-renewing total allocation, as `total_budget` configures it.
+    ///
+    /// Its entries carry the policy digest as their epoch, and time never
+    /// releases them.
+    Total {
+        /// The asset identifier, as its denial names it.
+        asset: String,
+        /// The total allocation of the signed policy.
+        max_stroops: i128,
+    },
 }
 
 /// One window record a call contributes, with the limit that governs it.
@@ -195,6 +219,7 @@ pub struct WindowEntry {
     timestamp_ms: u64,
     amount: i128,
     limit: WindowLimit,
+    epoch: Option<[u8; 32]>,
 }
 
 impl WindowEntry {
@@ -203,6 +228,8 @@ impl WindowEntry {
     /// `amount` is the stroop total for an amount bucket and `1` for a
     /// call-count bucket, matching what the criterion appends to the
     /// in-memory store.
+    ///
+    /// The entry carries no epoch; [`Self::with_epoch`] sets one.
     #[must_use]
     pub fn new(key: StateKey, timestamp_ms: u64, amount: i128, limit: WindowLimit) -> Self {
         Self {
@@ -210,7 +237,46 @@ impl WindowEntry {
             timestamp_ms,
             amount,
             limit,
+            epoch: None,
         }
+    }
+
+    /// Returns the entry with `epoch` set.
+    ///
+    /// A total-budget entry carries the digest of the signed policy that sized
+    /// it. Accounting counts it against that policy's allocation only, and
+    /// regardless of its age.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::policy::v1::criteria::state_store::{
+    ///     StateKey, WindowEntry, WindowLimit,
+    /// };
+    ///
+    /// let entry = WindowEntry::new(
+    ///     StateKey::new("operator", 1, "total:native", 0),
+    ///     1_000,
+    ///     5,
+    ///     WindowLimit::Total {
+    ///         asset: "native".to_owned(),
+    ///         max_stroops: 10,
+    ///     },
+    /// )
+    /// .with_epoch(Some([7; 32]));
+    /// assert_eq!(entry.epoch(), Some([7; 32]));
+    /// ```
+    #[must_use]
+    pub fn with_epoch(mut self, epoch: Option<[u8; 32]>) -> Self {
+        self.epoch = epoch;
+        self
+    }
+
+    /// Returns the policy digest a total-budget entry counts against, or
+    /// `None` for a windowed entry.
+    #[must_use]
+    pub fn epoch(&self) -> Option<[u8; 32]> {
+        self.epoch
     }
 
     /// Returns the bucket this entry accumulates into.
@@ -241,9 +307,10 @@ impl WindowEntry {
     /// already holds `used_stroops` across `calls` entries, or `None` when the
     /// window admits it.
     ///
-    /// The comparison is the gate's own: an amount entry is refused when
-    /// `used_stroops + amount > max_stroops`, a count entry when
-    /// `calls + 1 > max_calls`.
+    /// The comparison is the gate's own: an amount, unlisted, or total entry
+    /// is refused when `used_stroops + amount > max_stroops`, a count entry
+    /// when `calls + 1 > max_calls`. For a total entry `used_stroops` is the
+    /// use within the entry's epoch.
     ///
     /// # Examples
     ///
@@ -272,8 +339,10 @@ impl WindowEntry {
                 window,
                 max_stroops,
             } => {
-                let would_use = used_stroops.saturating_add(self.amount);
-                (would_use > *max_stroops).then(|| DenyReason::PerPeriodCapExceeded {
+                let exceeds = used_stroops
+                    .checked_add(self.amount)
+                    .is_none_or(|would_use| would_use > *max_stroops);
+                exceeds.then(|| DenyReason::PerPeriodCapExceeded {
                     asset: asset.clone(),
                     window: window.clone(),
                     max_stroops: *max_stroops,
@@ -290,8 +359,135 @@ impl WindowEntry {
                     calls_in_window: calls,
                 })
             }
+            WindowLimit::Unlisted {
+                asset, max_stroops, ..
+            } => used_stroops
+                .checked_add(self.amount)
+                .is_none_or(|sum| sum > *max_stroops)
+                .then(|| DenyReason::UnlistedBudgetExceeded {
+                    asset: asset.clone(),
+                    bound: UnlistedBound::PerPeriod,
+                    max_stroops: *max_stroops,
+                    attempted_stroops: self.amount,
+                }),
+            // An overflowing sum exceeds every allocation, so it refuses.
+            WindowLimit::Total { asset, max_stroops } => used_stroops
+                .checked_add(self.amount)
+                .is_none_or(|would_use| would_use > *max_stroops)
+                .then(|| DenyReason::TotalBudgetExhausted {
+                    asset: asset.clone(),
+                    max_stroops: *max_stroops,
+                    remaining_stroops: max_stroops.saturating_sub(used_stroops).max(0),
+                }),
         }
     }
+
+    /// Refuses an unrepresentable amount sum under this entry's governing limit.
+    /// No usage total is invented for the diagnostic. Count-only buckets have
+    /// no amount limit and retain a typed evaluation failure.
+    #[must_use]
+    pub fn overflow_refusal(&self) -> DenyReason {
+        match &self.limit {
+            WindowLimit::Amount {
+                asset,
+                window,
+                max_stroops,
+            } => DenyReason::PerPeriodCapOverflow {
+                asset: asset.clone(),
+                window: window.clone(),
+                max_stroops: *max_stroops,
+            },
+            WindowLimit::Unlisted {
+                asset, max_stroops, ..
+            } => DenyReason::UnlistedBudgetOverflow {
+                asset: asset.clone(),
+                bound: UnlistedBound::PerPeriod,
+                max_stroops: *max_stroops,
+            },
+            WindowLimit::Total { asset, max_stroops } => DenyReason::TotalBudgetExhausted {
+                asset: asset.clone(),
+                max_stroops: *max_stroops,
+                remaining_stroops: 0,
+            },
+            WindowLimit::Count { .. } => DenyReason::EvaluationError {
+                detail: StateStoreError::SumOverflow.to_string(),
+            },
+        }
+    }
+}
+
+/// Composes the holds of two evaluations of the same payment.
+///
+/// `None` preserves the routed entries exactly, including repeated criteria.
+/// `Some` matches occurrences across the two vectors only: each outer entry
+/// pairs with the first unpaired routed entry of the same complete key and
+/// epoch, which keeps one debit and the tighter compatible limit. Each vector
+/// keeps its own multiplicity, so a key repeated in either input keeps the
+/// larger count, and the composed admission is never looser than either
+/// input's own. Routed entries keep their order; unpaired outer entries
+/// follow in outer order. Equal caps retain the routed entry's labels. Each
+/// descriptor must be sized with its own evaluated recipient class.
+///
+/// # Errors
+/// Returns [`PolicyError::Internal`] for inconsistent amounts, timestamps,
+/// limit variants, or count entries that do not represent one call.
+pub fn compose_window_entries(
+    routed: &[WindowEntry],
+    outer: Option<&[WindowEntry]>,
+) -> Result<Vec<WindowEntry>, PolicyError> {
+    let Some(outer) = outer else {
+        return Ok(routed.to_vec());
+    };
+    let inconsistent = || PolicyError::Internal {
+        detail: "inconsistent holds for one payment".to_owned(),
+    };
+    if routed
+        .iter()
+        .chain(outer)
+        .any(|entry| matches!(entry.limit, WindowLimit::Count { .. }) && entry.amount != 1)
+    {
+        return Err(inconsistent());
+    }
+    let mut composed = routed.to_vec();
+    let mut paired = vec![false; routed.len()];
+    for entry in outer {
+        let shared = (0..routed.len()).find(|&index| {
+            !paired[index]
+                && composed[index].key == entry.key
+                && composed[index].epoch == entry.epoch
+        });
+        let Some(index) = shared else {
+            composed.push(entry.clone());
+            continue;
+        };
+        paired[index] = true;
+        let current = &mut composed[index];
+        if current.amount != entry.amount || current.timestamp_ms != entry.timestamp_ms {
+            return Err(inconsistent());
+        }
+        let tighter = match (&current.limit, &entry.limit) {
+            (
+                WindowLimit::Amount { max_stroops: a, .. },
+                WindowLimit::Amount { max_stroops: b, .. },
+            ) => b < a,
+            (WindowLimit::Count { max_calls: a, .. }, WindowLimit::Count { max_calls: b, .. }) => {
+                b < a
+            }
+            (
+                WindowLimit::Unlisted { max_stroops: a, .. },
+                WindowLimit::Unlisted { max_stroops: b, .. },
+            ) => b < a,
+            (
+                WindowLimit::Total { max_stroops: a, .. },
+                WindowLimit::Total { max_stroops: b, .. },
+            ) => b < a,
+            _ => return Err(inconsistent()),
+        };
+        if tighter {
+            current.limit = entry.limit.clone();
+        }
+    }
+    Ok(composed)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -352,11 +548,26 @@ struct StateEntry {
     timestamp_ms: u64,
     amount: i128,
     pending: bool,
+    exposure: Option<Exposure>,
+    /// The policy digest a total-budget entry counts against. Retention keeps
+    /// every entry that carries one.
+    epoch: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone)]
+struct Exposure {
+    reservation_id: String,
+    accounting_at_ms: Option<u64>,
+    accounting_until_ms: Option<u64>,
 }
 
 /// Error variants for [`PolicyStateStore`] operations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StateStoreError {
+    /// An accounting duration or horizon exceeds its representation.
+    #[error("signed intent horizon overflows")]
+    HorizonOverflow,
+
     /// The state store lock is poisoned (internal invariant violation).
     #[error("state store lock poisoned: {detail}")]
     LockPoisoned {
@@ -378,6 +589,38 @@ pub enum StateStoreError {
         /// The wall-clock time at the moment of detection in unix-milliseconds.
         now_ms: u64,
     },
+
+    /// The amounts of one total-budget epoch, or of one unlisted-recipient
+    /// window, overflow their sum.
+    #[error("the spending sum overflows")]
+    SumOverflow,
+
+    /// An unlisted-recipient window holds a negative amount.
+    #[error("the unlisted-recipient window holds a negative amount")]
+    NegativeAmount,
+}
+
+/// Checks inclusive exposure accounting for the queried window.
+///
+/// # Errors
+/// Refuses a duration or horizon that overflows milliseconds.
+pub fn exposure_is_live(
+    accounting_at_ms: Option<u64>,
+    accounting_until_ms: Option<u64>,
+    window_secs: u64,
+    now_ms: u64,
+) -> Result<bool, StateStoreError> {
+    let duration = window_secs
+        .checked_mul(1000)
+        .ok_or(StateStoreError::HorizonOverflow)?;
+    let Some(at) = accounting_at_ms else {
+        return Ok(true);
+    };
+    let until = at
+        .checked_add(duration)
+        .ok_or(StateStoreError::HorizonOverflow)?
+        .max(accounting_until_ms.unwrap_or(0));
+    Ok(now_ms <= until)
 }
 
 impl PolicyStateStore {
@@ -413,6 +656,10 @@ impl PolicyStateStore {
     ///   previous panic.
     /// - [`StateStoreError::ClockSkewExceeded`] — a pending entry is more than 30
     ///   seconds in the future relative to `now_ms`.
+    /// - [`StateStoreError::SumOverflow`]: the checked sum of a bucket's
+    ///   amounts, including the retained fallback totals, overflows.
+    /// - [`StateStoreError::NegativeAmount`]: an `unlisted:` bucket holds a
+    ///   negative contributor.
     ///
     /// # Examples
     ///
@@ -442,33 +689,103 @@ impl PolicyStateStore {
                 detail: e.to_string(),
             })?;
 
-        let deque = guard.entry(key.clone()).or_default();
-
-        let window_ms = key.window_secs.saturating_mul(1_000);
-        let cutoff = now_ms.saturating_sub(window_ms);
         let future_limit = now_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
-
-        // Check for clock-skew violations before eviction so we surface the
-        // error before silently discarding future entries.
-        for entry in deque.iter() {
-            let ts = entry.timestamp_ms;
-            if entry.pending && ts > future_limit {
-                return Err(StateStoreError::ClockSkewExceeded {
-                    entry_ts_ms: ts,
-                    now_ms,
-                });
+        let matching = |stored: &StateKey| {
+            stored.profile_name == key.profile_name
+                && stored.scope_specificity == key.scope_specificity
+                && stored.bucket == key.bucket
+        };
+        let exact_ids: std::collections::HashSet<String> = guard
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                entry
+                    .exposure
+                    .as_ref()
+                    .map(|exposure| exposure.reservation_id.clone())
+            })
+            .collect();
+        // Every bucket checks its sum; unlisted buckets also reject negative amounts.
+        let checked = key.bucket.starts_with("unlisted:");
+        let add = |total: i128, amount: i128| {
+            if checked {
+                if amount < 0 {
+                    return Err(StateStoreError::NegativeAmount);
+                }
+                total
+                    .checked_add(amount)
+                    .ok_or(StateStoreError::SumOverflow)
+            } else {
+                total
+                    .checked_add(amount)
+                    .ok_or(StateStoreError::SumOverflow)
             }
-        }
-
-        // Pending entries hold headroom until settlement. Confirmed entries
-        // age from ledger close time, which need not follow insertion order.
-        deque.retain(|entry| entry.pending || entry.timestamp_ms >= cutoff);
-
+        };
+        let mut fallback: HashMap<(&str, u64), (i128, u32)> = HashMap::new();
         let mut sum: i128 = 0;
         let mut count: u32 = 0;
-        for entry in deque.iter() {
-            sum = sum.saturating_add(entry.amount);
-            count = count.saturating_add(1);
+        for (stored_key, deque) in guard.iter() {
+            if !matching(stored_key) {
+                continue;
+            }
+            for entry in deque {
+                if entry.pending && entry.timestamp_ms > future_limit {
+                    return Err(StateStoreError::ClockSkewExceeded {
+                        entry_ts_ms: entry.timestamp_ms,
+                        now_ms,
+                    });
+                }
+                let live = if let Some(exposure) = &entry.exposure {
+                    exposure_is_live(
+                        exposure.accounting_at_ms,
+                        exposure.accounting_until_ms,
+                        key.window_secs,
+                        now_ms,
+                    )?
+                } else {
+                    stored_key == key
+                        && (entry.pending
+                            || entry.timestamp_ms
+                                >= now_ms.saturating_sub(key.window_secs.saturating_mul(1000)))
+                };
+                if !live {
+                    continue;
+                }
+                if stored_key != key {
+                    if let Some(exposure) = &entry.exposure
+                        && !exact_ids.contains(&exposure.reservation_id)
+                    {
+                        let total = fallback
+                            .entry((&exposure.reservation_id, stored_key.window_secs))
+                            .or_default();
+                        total.0 = add(total.0, entry.amount)?;
+                        total.1 = total.1.saturating_add(1);
+                    }
+                } else {
+                    sum = add(sum, entry.amount)?;
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        let mut retained: HashMap<&str, (i128, u32)> = HashMap::new();
+        for ((id, _), total) in fallback {
+            let maximum = retained.entry(id).or_default();
+            maximum.0 = maximum.0.max(total.0);
+            maximum.1 = maximum.1.max(total.1);
+        }
+        for total in retained.values() {
+            sum = add(sum, total.0)?;
+            count = count.saturating_add(total.1);
+        }
+        for (stored_key, deque) in guard.iter_mut() {
+            deque.retain(|entry| {
+                entry.epoch.is_some()
+                    || entry.exposure.is_some()
+                    || entry.pending
+                    || entry.timestamp_ms
+                        >= now_ms.saturating_sub(stored_key.window_secs.saturating_mul(1000))
+            });
         }
 
         Ok((sum, count))
@@ -518,6 +835,120 @@ impl PolicyStateStore {
         self.append_entry(key, timestamp_ms, amount_or_count, true)
     }
 
+    /// Appends conservative exposure with a separate accounting horizon.
+    ///
+    /// Missing accounting time means indefinite exposure. A changed window cannot
+    /// shorten the admitted horizon; future execution bounds are not clock skew.
+    ///
+    /// # Errors
+    /// Returns [`StateStoreError::LockPoisoned`] if the mutex is poisoned.
+    pub fn append_exposure(
+        &self,
+        key: &StateKey,
+        timestamp_ms: u64,
+        amount: i128,
+        reservation_id: &str,
+        accounting_at_ms: Option<u64>,
+        accounting_until_ms: Option<u64>,
+    ) -> Result<(), StateStoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|error| StateStoreError::LockPoisoned {
+                detail: error.to_string(),
+            })?;
+        guard.entry(key.clone()).or_default().push_back(StateEntry {
+            timestamp_ms,
+            amount,
+            pending: true,
+            exposure: Some(Exposure {
+                reservation_id: reservation_id.to_owned(),
+                accounting_at_ms,
+                accounting_until_ms,
+            }),
+            epoch: None,
+        });
+        Ok(())
+    }
+
+    /// Appends a confirmed total-budget entry that counts against `epoch`.
+    ///
+    /// The entry never ages out: [`Self::query_epoch`] counts it regardless of
+    /// time, and retention keeps it.
+    ///
+    /// # Errors
+    /// Returns [`StateStoreError::LockPoisoned`] if the mutex is poisoned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+    ///
+    /// let store = PolicyStateStore::new();
+    /// let key = StateKey::new("operator", 1, "total:native", 0);
+    /// store.append_epoch(&key, 1_000, 40, [1; 32]).unwrap();
+    /// assert_eq!(store.query_epoch(&key, [1; 32]).unwrap(), (40, 1));
+    /// assert_eq!(store.query_epoch(&key, [2; 32]).unwrap(), (0, 0));
+    /// ```
+    pub fn append_epoch(
+        &self,
+        key: &StateKey,
+        timestamp_ms: u64,
+        amount: i128,
+        epoch: [u8; 32],
+    ) -> Result<(), StateStoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|error| StateStoreError::LockPoisoned {
+                detail: error.to_string(),
+            })?;
+        guard.entry(key.clone()).or_default().push_back(StateEntry {
+            timestamp_ms,
+            amount,
+            pending: false,
+            exposure: None,
+            epoch: Some(epoch),
+        });
+        Ok(())
+    }
+
+    /// Returns `(sum_of_amounts, count_of_entries)` of the entries under
+    /// exactly `key` that carry `epoch`, pending or confirmed, regardless of
+    /// their age.
+    ///
+    /// Entries of another epoch, entries without an epoch, and entries under
+    /// any other key never count. The allocation follows the signed body
+    /// digest: another digest starts at zero, and the same digest keeps its
+    /// charge. Assigning a new sequence changes the body digest.
+    ///
+    /// # Errors
+    /// Returns [`StateStoreError::LockPoisoned`] if the mutex is poisoned, and
+    /// [`StateStoreError::SumOverflow`] when the epoch's amounts overflow.
+    pub fn query_epoch(
+        &self,
+        key: &StateKey,
+        epoch: [u8; 32],
+    ) -> Result<(i128, u32), StateStoreError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|error| StateStoreError::LockPoisoned {
+                detail: error.to_string(),
+            })?;
+        let mut sum: i128 = 0;
+        let mut count: u32 = 0;
+        for entry in guard.get(key).into_iter().flatten() {
+            if entry.epoch == Some(epoch) {
+                sum = sum
+                    .checked_add(entry.amount)
+                    .ok_or(StateStoreError::SumOverflow)?;
+                count = count.saturating_add(1);
+            }
+        }
+        Ok((sum, count))
+    }
+
     fn append_entry(
         &self,
         key: &StateKey,
@@ -536,6 +967,8 @@ impl PolicyStateStore {
             timestamp_ms,
             amount: amount_or_count,
             pending,
+            exposure: None,
+            epoch: None,
         });
 
         Ok(())
@@ -591,6 +1024,10 @@ impl Default for PolicyStateStore {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[path = "state_store_composition_tests.rs"]
+mod composition_tests;
+
+#[cfg(test)]
 mod tests {
     #![allow(
         clippy::unwrap_used,
@@ -600,6 +1037,31 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn intent_horizons_survive_window_lengthening() {
+        use super::super::per_period_cap::MAX_SUPPORTED_WINDOW_SECS;
+        let store = PolicyStateStore::new();
+        let short = StateKey::new("intent", 1, "native", 60);
+        let long = StateKey::new("intent", 1, "native", MAX_SUPPORTED_WINDOW_SECS);
+        let t = 1_000_000;
+        store
+            .append_exposure(&short, t, 9, "intent-one", Some(t), Some(t + 60_000))
+            .unwrap();
+        assert_eq!(store.query_window(&short, t + 60_000).unwrap(), (9, 1));
+        assert_eq!(store.query_window(&short, t + 60_001).unwrap(), (0, 0));
+        let retained = t + MAX_SUPPORTED_WINDOW_SECS * 1000;
+        assert_eq!(store.query_window(&long, retained).unwrap(), (9, 1));
+        assert_eq!(store.query_window(&long, retained + 1).unwrap(), (0, 0));
+        assert_eq!(
+            exposure_is_live(Some(u64::MAX), None, 60, 0),
+            Err(StateStoreError::HorizonOverflow)
+        );
+        assert_eq!(
+            exposure_is_live(None, None, u64::MAX, 0),
+            Err(StateStoreError::HorizonOverflow)
+        );
+    }
 
     fn key() -> StateKey {
         StateKey::new("alice", 2, "native", 3_600)
@@ -905,4 +1367,173 @@ mod tests {
         assert_eq!(sum, expected);
         assert_eq!(count, 3);
     }
+
+    /// Amount and unlisted entries refuse overflow while preserving equality.
+    #[test]
+    fn a_window_entry_refuses_an_overflowing_sum() {
+        for (limit, code) in [
+            (
+                WindowLimit::Amount {
+                    asset: "native".into(),
+                    window: "1h".into(),
+                    max_stroops: i128::MAX,
+                },
+                "policy.deny.per_period_cap_exceeded",
+            ),
+            (
+                WindowLimit::Unlisted {
+                    asset: "native".into(),
+                    window: "1h".into(),
+                    max_stroops: i128::MAX,
+                },
+                "policy.deny.unlisted_budget_exceeded",
+            ),
+        ] {
+            let entry = WindowEntry::new(
+                StateKey::new("operator", 1, "native", 3600),
+                1000,
+                1,
+                limit.clone(),
+            );
+            assert_eq!(
+                entry.refusal(i128::MAX, 0).map(|reason| reason.wire_code()),
+                Some(code)
+            );
+            assert!(entry.refusal(i128::MAX - 1, 0).is_none());
+            let maximum = WindowEntry::new(entry.key().clone(), 1000, i128::MAX, limit.clone());
+            assert!(maximum.refusal(0, 0).is_none());
+            let zero = WindowEntry::new(entry.key().clone(), 1000, 0, limit);
+            assert!(zero.refusal(i128::MAX, 0).is_none());
+        }
+    }
+
+    /// A total entry whose addition to the used amount overflows refuses.
+    #[test]
+    fn a_total_entry_refuses_overflow() {
+        let entry = WindowEntry::new(
+            StateKey::new("alice", 1, "total:native", 0),
+            1_000,
+            1,
+            WindowLimit::Total {
+                asset: "native".to_owned(),
+                max_stroops: i128::MAX,
+            },
+        )
+        .with_epoch(Some([1; 32]));
+        assert!(
+            matches!(
+                entry.refusal(i128::MAX, 0),
+                Some(DenyReason::TotalBudgetExhausted { .. })
+            ),
+            "an overflowing total admits"
+        );
+        assert!(entry.refusal(i128::MAX - 1, 0).is_none());
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+thread_local! {
+    static QUERY_TIME: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restores the current thread's policy clock when the fixture ends.
+#[cfg(any(test, feature = "test-helpers"))]
+pub struct QueryTimeGuard {
+    previous: Option<u64>,
+    thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl QueryTimeGuard {
+    /// Advances the current thread's controlled policy time.
+    pub fn set(&self, milliseconds: u64) {
+        QUERY_TIME.set(Some(milliseconds));
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for QueryTimeGuard {
+    fn drop(&mut self) {
+        QUERY_TIME.set(self.previous);
+    }
+}
+
+/// Controls policy evaluation time on the calling test thread.
+#[cfg(any(test, feature = "test-helpers"))]
+#[must_use]
+pub fn set_query_time_for_test(milliseconds: u64) -> QueryTimeGuard {
+    QueryTimeGuard {
+        previous: QUERY_TIME.replace(Some(milliseconds)),
+        thread: std::marker::PhantomData,
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+thread_local! {
+    static POLICY_CLOCK_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restores the current thread's policy clock to working order when the
+/// fixture ends.
+#[cfg(any(test, feature = "test-helpers"))]
+pub struct PolicyClockErrorGuard {
+    previous: bool,
+    thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for PolicyClockErrorGuard {
+    fn drop(&mut self) {
+        POLICY_CLOCK_ERROR.set(self.previous);
+    }
+}
+
+/// Makes [`policy_now_ms`] fail on the calling test thread while the guard
+/// lives. The failure takes precedence over [`set_query_time_for_test`].
+#[cfg(any(test, feature = "test-helpers"))]
+#[must_use]
+pub fn set_policy_clock_error_for_test() -> PolicyClockErrorGuard {
+    PolicyClockErrorGuard {
+        previous: POLICY_CLOCK_ERROR.replace(true),
+        thread: std::marker::PhantomData,
+    }
+}
+
+/// Samples the policy evaluation instant in Unix milliseconds.
+///
+/// Every policy evaluation reads time exactly once, through this function or
+/// through an instant its caller supplies, and hands that one sample to every
+/// criterion. A criterion never reads the clock itself, so one evaluation
+/// cannot observe two instants.
+///
+/// Test builds honor `set_policy_clock_error_for_test` first and then
+/// `set_query_time_for_test` on the calling thread.
+///
+/// # Errors
+///
+/// Returns [`WalletLifecycleError::ClockError`] when the system clock is
+/// before the Unix epoch or its millisecond count overflows `u64`.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::policy_now_ms;
+///
+/// let now = policy_now_ms().expect("system clock should be valid");
+/// assert!(now > 0);
+/// ```
+pub fn policy_now_ms() -> Result<u64, WalletLifecycleError> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    {
+        if POLICY_CLOCK_ERROR.get() {
+            return Err(WalletLifecycleError::ClockError {
+                detail: "policy clock unavailable (test injection)".to_owned(),
+                source: None,
+            });
+        }
+        if let Some(now) = QUERY_TIME.get() {
+            return Ok(now);
+        }
+    }
+    crate::timefmt::now_unix_ms()
 }

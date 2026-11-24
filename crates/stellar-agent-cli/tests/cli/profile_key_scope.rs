@@ -7,13 +7,12 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
 
 const ACCOUNT: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
-fn shared_home(mainnet: bool) -> tempfile::TempDir {
-    let home = tempfile::tempdir().unwrap();
+fn shared_home(mainnet: bool) -> stellar_agent_test_support::sandbox::StateSandbox {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     for name in ["alice", "bob"] {
         let signer = KeyringEntryRef::default_signer(name);
         let nonce = KeyringEntryRef::default_nonce(name);
@@ -50,19 +49,23 @@ fn shared_home(mainnet: bool) -> tempfile::TempDir {
 }
 
 fn run(home: &Path, args: &[&str]) -> (i32, serde_json::Value, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(args)
-        .env("STELLAR_AGENT_HOME", home)
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env(
-            "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
-            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
-        )
-        .env("STELLAR_AGENT_LOG", "info")
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env_remove("STELLAR_AGENT_RPC_URL")
-        .output()
-        .unwrap();
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child")
+    .args(args)
+    .env("STELLAR_AGENT_HOME", home)
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env(
+        "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    )
+    .env("STELLAR_AGENT_LOG", "info")
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env_remove("STELLAR_AGENT_RPC_URL")
+    .output()
+    .unwrap();
     let text = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let value =
@@ -98,14 +101,18 @@ fn shared_entry_refusal_reaches_typed_and_raw_envelopes() {
             "{value}"
         );
         let message = value["error"]["message"].as_str().unwrap();
-        for part in [
-            "attestation_key_id",
-            "stellar-agent-attestation-alice/default",
-            "bob",
-            "correct that profile's file",
-        ] {
-            assert!(message.contains(part), "{message}");
-        }
+        // The refusal names the field, the sibling and the recovery, never
+        // the shared keyring coordinate.
+        assert_eq!(
+            message,
+            "profile 'alice': its entry for attestation_key_id is also named by profile 'bob' as \
+             attestation_key_id; correct that profile's file, this entry is the default for this \
+             profile's name"
+        );
+        assert!(
+            !message.contains("stellar-agent-attestation-alice"),
+            "{message}"
+        );
     }
 }
 

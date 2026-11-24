@@ -19,6 +19,7 @@ use serde::Serialize;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_core::profile::schema::default_policy_dir;
+use stellar_agent_core::profile::toml_diagnostic::toml_error_position;
 use stellar_agent_network::StellarTomlResolver;
 use stellar_agent_network::counterparty::CounterpartyResolver as _;
 use stellar_agent_network::counterparty::cache::DEFAULT_TTL;
@@ -36,6 +37,7 @@ pub(crate) struct WarmUpArgs {
     /// Profile name whose counterparty allowlist should be refreshed.
     ///
     /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    /// A mainnet profile must be named with this flag.
     #[arg(long = "profile", value_name = "NAME")]
     pub(crate) profile: Option<String>,
 }
@@ -86,7 +88,10 @@ fn warm_up_envelope(profile: &str, entries: Vec<WarmUpEntry>) -> Envelope<WarmUp
 fn extract_home_domain_allowlist_from_policy_toml(body: &str) -> Result<Vec<String>, WalletError> {
     let doc: DocumentMut = body.parse().map_err(|e: toml_edit::TomlError| {
         WalletError::Internal(InternalError::UnexpectedState {
-            detail: format!("policy TOML parse failed: {e}"),
+            detail: format!(
+                "policy body must be valid TOML; syntax error at {}",
+                toml_error_position(body, e.span().map(|span| span.start))
+            ),
         })
     })?;
     let mut domains = BTreeSet::new();
@@ -150,8 +155,8 @@ pub async fn run(args: &WarmUpArgs) -> i32 {
     let profile = match load_profile_reconciled(&resolved_profile) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e, &profile_name));
+            tracing::debug!(error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e));
             return 1;
         }
     };
@@ -245,10 +250,11 @@ pub async fn run(args: &WarmUpArgs) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, reason = "test-only")]
+    #![allow(clippy::unwrap_used, clippy::expect_used, reason = "test-only")]
 
     use super::*;
     use clap::Parser;
+    use stellar_agent_test_support::rejected_value::{assert_refusal_text, capture_refusal};
 
     #[derive(Debug, Parser)]
     struct WarmUpArgsHarness {
@@ -346,5 +352,18 @@ criteria = [
             extract_home_domain_allowlist_from_policy_toml(body).unwrap(),
             vec!["INVALID.example"],
         );
+    }
+
+    #[test]
+    fn rejected_input_policy_toml_helper() {
+        capture_refusal(|| {
+            let error = extract_home_domain_allowlist_from_policy_toml("CREDMARKER7 = [")
+                .expect_err("invalid policy TOML");
+            assert_eq!(error.code(), "internal.unexpected_state");
+            assert_refusal_text(
+                &error,
+                "unexpected internal state: policy body must be valid TOML; syntax error at line 1, column 16",
+            );
+        });
     }
 }

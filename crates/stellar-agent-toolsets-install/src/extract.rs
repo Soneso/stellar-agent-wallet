@@ -88,11 +88,11 @@ pub(crate) fn extract_to_staging(
     let mut total_bytes_read: usize = 0;
     let mut top_level_dir: Option<String> = None;
 
-    let entries = archive.entries().map_err(ToolsetInstallError::from_io)?;
+    let entries = archive.entries().map_err(|_| invalid_tar_header())?;
 
     for entry_result in entries {
         #[allow(unused_mut)]
-        let mut entry = entry_result.map_err(ToolsetInstallError::from_io)?;
+        let mut entry = entry_result.map_err(|_| invalid_tar_header())?;
 
         // ── Step 1: Type check FIRST ─────────────────────────────────────────
         let entry_type = entry.header().entry_type();
@@ -169,27 +169,13 @@ pub(crate) fn extract_to_staging(
             None => {
                 // First entry's top-level component.
                 if top_component != package_name {
-                    return Err(ToolsetInstallError::ArchiveBadTopLevel {
-                        detail: stellar_agent_toolsets::sanitise_display(
-                            &format!(
-                                "top-level directory '{top_component}' != package name '{package_name}'"
-                            ),
-                            256,
-                        ),
-                    });
+                    return Err(bad_top_level());
                 }
                 top_level_dir = Some(top_component.clone());
             }
             Some(expected) => {
                 if &top_component != expected {
-                    return Err(ToolsetInstallError::ArchiveBadTopLevel {
-                        detail: stellar_agent_toolsets::sanitise_display(
-                            &format!(
-                                "multiple top-level directories: '{expected}' and '{top_component}'"
-                            ),
-                            256,
-                        ),
-                    });
+                    return Err(bad_top_level());
                 }
             }
         }
@@ -205,21 +191,14 @@ pub(crate) fn extract_to_staging(
 
         if !is_ascii_only_entry_name(normalised_str) {
             return Err(ToolsetInstallError::ArchiveEntryNameInvalid {
-                detail: stellar_agent_toolsets::sanitise_display(
-                    &format!(
-                        "entry name contains non-ASCII characters (ASCII-only gate): '{normalised_str}'"
-                    ),
-                    256,
-                ),
+                detail: "entry names must contain only ASCII characters".to_owned(),
             });
         }
 
         // Collision detection on the ASCII-lowercased key.
         let collision_key = normalised_str.to_ascii_lowercase();
         if !seen_names.insert(collision_key) {
-            return Err(ToolsetInstallError::ArchiveDuplicateEntry {
-                entry_name: stellar_agent_toolsets::sanitise_display(normalised_str, 256),
-            });
+            return Err(ToolsetInstallError::ArchiveDuplicateEntry);
         }
 
         // ── Step 5: Entry count cap ───────────────────────────────────────────
@@ -233,14 +212,7 @@ pub(crate) fn extract_to_staging(
         // A regular file at the top level is rejected immediately.
         let component_count_check = normalised.components().count();
         if component_count_check == 1 && entry_type == EntryType::Regular {
-            return Err(ToolsetInstallError::ArchiveBadTopLevel {
-                detail: stellar_agent_toolsets::sanitise_display(
-                    &format!(
-                        "top-level entry '{normalised_str}' is a regular file; expected a directory"
-                    ),
-                    256,
-                ),
-            });
+            return Err(bad_top_level());
         }
 
         let dest_path = staging_dir.join(&normalised);
@@ -374,16 +346,28 @@ fn check_not_symlink_leaf(path: &Path) -> Result<(), ToolsetInstallError> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             Err(ToolsetInstallError::ToolsetsRootInvalid {
-                detail: stellar_agent_toolsets::sanitise_display(
-                    &format!(
-                        "toolsets root '{}' is a symlink leaf; refusing for security",
-                        path.display()
-                    ),
-                    256,
-                ),
+                detail: "the toolsets root must be a real directory; correct --toolsets-dir"
+                    .to_owned(),
             })
         }
         Ok(_) | Err(_) => Ok(()), // Non-existent or other error: fine, will be created/handled later.
+    }
+}
+
+/// The refusal of a header the tar reader cannot parse.
+///
+/// The reader's own error quotes the header bytes, so it stays out.
+fn invalid_tar_header() -> ToolsetInstallError {
+    ToolsetInstallError::Io {
+        detail: "archive entry header must be a valid tar header".to_owned(),
+    }
+}
+
+/// The refusal of an archive whose top level is not the package directory.
+fn bad_top_level() -> ToolsetInstallError {
+    ToolsetInstallError::ArchiveBadTopLevel {
+        detail: "the archive must contain exactly one top-level directory named after the package"
+            .to_owned(),
     }
 }
 
@@ -428,14 +412,10 @@ fn lexical_normalise_and_check(path_str: &str) -> Result<PathBuf, ToolsetInstall
                 }
             }
             Component::ParentDir => {
-                return Err(ToolsetInstallError::ArchivePathTraversal {
-                    entry_name: stellar_agent_toolsets::sanitise_display(path_str, 256),
-                });
+                return Err(ToolsetInstallError::ArchivePathTraversal);
             }
             Component::RootDir | Component::Prefix(_) => {
-                return Err(ToolsetInstallError::ArchivePathTraversal {
-                    entry_name: stellar_agent_toolsets::sanitise_display(path_str, 256),
-                });
+                return Err(ToolsetInstallError::ArchivePathTraversal);
             }
         }
     }
@@ -889,7 +869,7 @@ mod tests {
     fn dotdot_rejected() {
         let err = lexical_normalise_and_check("my-toolset/../etc/passwd").unwrap_err();
         assert!(
-            matches!(err, ToolsetInstallError::ArchivePathTraversal { .. }),
+            matches!(err, ToolsetInstallError::ArchivePathTraversal),
             "expected ArchivePathTraversal, got: {err:?}"
         );
     }
@@ -898,7 +878,7 @@ mod tests {
     fn absolute_path_rejected() {
         let err = lexical_normalise_and_check("/etc/passwd").unwrap_err();
         assert!(
-            matches!(err, ToolsetInstallError::ArchivePathTraversal { .. }),
+            matches!(err, ToolsetInstallError::ArchivePathTraversal),
             "expected ArchivePathTraversal, got: {err:?}"
         );
     }
@@ -910,7 +890,7 @@ mod tests {
         assert!(matches!(
             err,
             ToolsetInstallError::ArchiveEntryNameInvalid { .. }
-                | ToolsetInstallError::ArchivePathTraversal { .. }
+                | ToolsetInstallError::ArchivePathTraversal
         ));
     }
 

@@ -7,11 +7,11 @@
 //! # Canonical JSON
 //!
 //! The hash chain is computed over
-//! `SHA-256(canonical_json(entry without previous_entry_hash) || previous_entry_hash)`.
+//! `SHA-256(canonical_json(entry without previous_entry_hash and entry_tag) || previous_entry_hash)`.
 //! "Canonical JSON" here means the entry serialised with fields in a fixed
 //! insertion order using `serde_json::to_vec` (struct field order is
 //! declaration order in Rust, which is stable).  The `previous_entry_hash`
-//! field is excluded from the hash-input body.
+//! and `entry_tag` fields are excluded from the hash-input body.
 //!
 //! # Canonical-form contract
 //!
@@ -23,7 +23,10 @@
 //!
 //! The `previous_entry_hash` field is set to `""` (empty string) in the
 //! hash-input body so the hash does not depend on itself.  An empty string is
-//! the canonical sentinel; JSON `null` is NOT used.
+//! the canonical sentinel; JSON `null` is NOT used. The `entry_tag` field is
+//! absent from the hash-input body: it is computed over the entry hash, and
+//! leaving it out keeps every hash the same whether or not an entry is
+//! tagged.
 //!
 //! # First-entry-per-file rule
 //!
@@ -45,9 +48,11 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(test, feature = "test-helpers"))]
+use super::schema::ExecutableRefPinFirst8;
 use super::schema::{
-    ContractKind, EventKind, ExecutableRefPin, KeyPurpose, PinsUpdateReason, PolicyDecision,
-    ValueLegRecord, VerifierAdvisoryKind, executable_refs_or_empty,
+    ContractKind, EventKind, ExecutableRefPin, KeyPurpose, MainnetPresenceAudit, PinsUpdateReason,
+    PolicyDecision, ValueLegRecord, VerifierAdvisoryKind, WasmHashPin, executable_refs_or_empty,
 };
 use crate::error::ValidationError;
 use crate::observability::RedactedStrkey;
@@ -68,6 +73,10 @@ pub const MAX_ENTRY_BYTES: usize = 4096;
 /// reached.  If `arg_keys.len() > MAX_ARG_KEYS`, excess keys are dropped and
 /// `arg_keys_truncated` is set accordingly.
 pub const MAX_ARG_KEYS: usize = 64;
+
+/// The chain outcome a `submission_accounting_expired` row records: accounting
+/// expiry establishes no transaction outcome.
+pub const ACCOUNTING_EXPIRY_CHAIN_OUTCOME: &str = "unknown";
 
 /// Intentionally-lax RFC 3339 timestamp prefix check, used inside
 /// `debug_assert!` only (release builds compile this away).
@@ -202,7 +211,7 @@ impl NewToolInvocation {
 ///
 /// where `canonical_json_body` is the JSON serialisation of the entry with the
 /// `previous_entry_hash` field set to `""` (empty string — excluded from the
-/// hash-input body).
+/// hash-input body) and without the `entry_tag` field.
 ///
 /// The very first file's first entry uses
 /// `previous_entry_hash = SHA-256(zero_block)` (32 zero bytes).
@@ -322,8 +331,21 @@ pub struct AuditEntry {
     /// handoff entry in the preceding file (the cross-file chain bridge).
     ///
     /// This field is EXCLUDED from the hash-input body (set to `""` before
-    /// computing the current entry's hash).  See `AuditEntry::canonical_json_body`.
+    /// computing the current entry's hash), and so is [`Self::entry_tag`].
+    /// See `AuditEntry::canonical_json_body`.
     pub previous_entry_hash: String,
+
+    /// Keyed entry tag over this entry's chain hash, written by a writer that
+    /// holds the profile's audit key.
+    ///
+    /// Format: `sha256:<hex>`; see
+    /// [`compute_entry_tag`](super::chain::compute_entry_tag). Absent from
+    /// the JSON when `None`. The tag is EXCLUDED from the hash-input body
+    /// entirely, never written as `""`, so it changes no entry hash. A valid
+    /// tag authenticates this entry and, through its hash, every entry
+    /// before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_tag: Option<String>,
 }
 
 impl AuditEntry {
@@ -360,6 +382,7 @@ impl AuditEntry {
             // The writer populates this field on append; this constructor
             // leaves it as empty string.  See AuditWriter::write_entry.
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -436,6 +459,7 @@ impl AuditEntry {
             // The writer populates this field on append; this constructor
             // leaves it as empty string.  See AuditWriter::write_entry.
             previous_entry_hash: String::new(),
+            entry_tag: None,
         })
     }
 
@@ -444,6 +468,10 @@ impl AuditEntry {
     /// Written as the last entry in the outgoing log file before rotation.
     /// `audit verify` uses `next_file_name` to follow rotation boundaries.
     ///
+    /// `entry_tags` records that entry tags are in force when the handoff is
+    /// written; every later file then carries them. A handoff with `false`
+    /// serializes without the field.
+    ///
     /// The `previous_entry_hash` field is initialised to an empty string.
     /// [`AuditWriter::rotate`](super::writer::AuditWriter) sets this field
     /// directly before serialising the handoff entry.
@@ -451,6 +479,7 @@ impl AuditEntry {
     pub fn new_rotation_handoff(
         next_file_name: impl Into<String>,
         request_id: impl Into<String>,
+        entry_tags: bool,
     ) -> Self {
         let next = next_file_name.into();
         Self {
@@ -467,10 +496,12 @@ impl AuditEntry {
             request_id: request_id.into(),
             event_kind: EventKind::AuditRotationHandoff {
                 next_file_name: next,
+                entry_tags,
             },
             // The writer populates this field on append; this constructor
             // leaves it as empty string.  See AuditWriter::write_entry.
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -509,6 +540,7 @@ impl AuditEntry {
             // The writer populates this field on append; this constructor
             // leaves it as empty string.  See AuditWriter::write_entry.
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -560,6 +592,7 @@ impl AuditEntry {
                 result,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -618,18 +651,19 @@ impl AuditEntry {
                 ledger,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
-    /// Constructs a `SaContextRuleCreated` audit entry.
+    /// Constructs a `SaContextRuleCreatedV2` audit entry, the pin record a
+    /// rule install writes.
     ///
     /// Emitted from `ContextRuleManager::install_rule`.
     ///
+    /// The hash lists carry every pinned hash in full.
     /// `pinned_verifier_executable_refs` and `pinned_policy_executable_refs`
-    /// are aligned by position with the corresponding first-8 lists. A list
-    /// whose entries are all `None` is recorded as empty, so rows for rules
-    /// without an external-reference contract keep the shape older readers
-    /// know.
+    /// are aligned by position with the corresponding hash lists; a list
+    /// whose entries are all `None` is recorded as empty.
     ///
     /// # Redaction
     ///
@@ -641,6 +675,140 @@ impl AuditEntry {
     #[allow(
         clippy::too_many_arguments,
         reason = "irreducible audit-field set; mirrors new_sa_signer_set_baselined shape"
+    )]
+    pub fn new_sa_context_rule_created_v2(
+        smart_account: impl Into<String>,
+        rule_id: u32,
+        context_type: impl Into<String>,
+        signers_count: u32,
+        policies_count: u32,
+        valid_until: Option<u32>,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+        pinned_verifier_wasm_hashes: Vec<WasmHashPin>,
+        pinned_policy_wasm_hashes: Vec<WasmHashPin>,
+        mutable_override: bool,
+        unknown_override: bool,
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
+    ) -> Self {
+        Self::pin_row(
+            "sa.context_rule_created",
+            chain_id,
+            request_id,
+            EventKind::SaContextRuleCreatedV2 {
+                smart_account: smart_account.into(),
+                rule_id,
+                context_type: context_type.into(),
+                signers_count,
+                policies_count,
+                valid_until,
+                pinned_verifier_wasm_hashes,
+                pinned_policy_wasm_hashes,
+                mutable_override,
+                unknown_override,
+                pinned_verifier_executable_refs: executable_refs_or_empty(
+                    pinned_verifier_executable_refs,
+                ),
+                pinned_policy_executable_refs: executable_refs_or_empty(
+                    pinned_policy_executable_refs,
+                ),
+            },
+        )
+    }
+
+    /// Constructs a `SaContextRulePinsUpdatedV2` audit entry.
+    ///
+    /// Emitted by `smart-account migrate-verifier`, `signers add` /
+    /// `signers batch-add`, `signers refresh` and `rules add-policy` /
+    /// `rules remove-policy` after a wallet mutation changed the live
+    /// verifier or policy set of a rule that already has a complete pin
+    /// record. The row carries the rule's whole pin record with full hashes;
+    /// the drift check reads the newest pin row as the record.
+    ///
+    /// The executable-reference lists are aligned by position with the hash
+    /// lists; a list whose entries are all `None` is recorded as empty.
+    ///
+    /// # Redaction
+    ///
+    /// `smart_account` MUST be pre-redacted at the call site to first-5-last-5
+    /// form via `redact_strkey_first5_last5`.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "irreducible audit-field set; mirrors new_sa_context_rule_created_v2"
+    )]
+    pub fn new_sa_context_rule_pins_updated_v2(
+        smart_account: impl Into<String>,
+        rule_id: u32,
+        reason: PinsUpdateReason,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+        pinned_verifier_wasm_hashes: Vec<WasmHashPin>,
+        pinned_policy_wasm_hashes: Vec<WasmHashPin>,
+        mutable_override: bool,
+        unknown_override: bool,
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
+    ) -> Self {
+        Self::pin_row(
+            "sa.context_rule_pins_updated",
+            chain_id,
+            request_id,
+            EventKind::SaContextRulePinsUpdatedV2 {
+                smart_account: smart_account.into(),
+                rule_id,
+                pinned_verifier_wasm_hashes,
+                pinned_policy_wasm_hashes,
+                mutable_override,
+                unknown_override,
+                pinned_verifier_executable_refs: executable_refs_or_empty(
+                    pinned_verifier_executable_refs,
+                ),
+                pinned_policy_executable_refs: executable_refs_or_empty(
+                    pinned_policy_executable_refs,
+                ),
+                reason,
+            },
+        )
+    }
+
+    /// The common envelope of the pin rows: an allowed entry carrying `kind`.
+    fn pin_row(
+        tool: &str,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+        kind: EventKind,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.to_owned(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: kind,
+            previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
+    /// Constructs a version-1 `SaContextRuleCreated` audit entry, whose pin
+    /// lists hold first-8 projections.
+    ///
+    /// Available to tests only: it builds the version-1 rows that existing
+    /// logs hold, for compatibility fixtures. Production code writes
+    /// [`Self::new_sa_context_rule_created_v2`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "irreducible audit-field set; mirrors new_sa_context_rule_created_v2"
     )]
     pub fn new_sa_context_rule_created(
         smart_account: impl Into<String>,
@@ -655,22 +823,14 @@ impl AuditEntry {
         pinned_policy_wasm_hashes_first8: Vec<String>,
         mutable_override: bool,
         unknown_override: bool,
-        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
-        pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
     ) -> Self {
-        Self {
-            ts: current_iso8601_utc(),
-            tool: "sa.context_rule_created".to_owned(),
-            chain_id: chain_id.into_optional_chain_id(),
-            arg_keys: vec![],
-            arg_keys_truncated: None,
-            truncated: false,
-            envelope_hash: None,
-            nonce_id: None,
-            policy_decision: PolicyDecision::Allow,
-            decision_reason: None,
-            request_id: request_id.into(),
-            event_kind: EventKind::SaContextRuleCreated {
+        Self::pin_row(
+            "sa.context_rule_created",
+            chain_id,
+            request_id,
+            EventKind::SaContextRuleCreated {
                 smart_account: smart_account.into(),
                 rule_id,
                 context_type: context_type.into(),
@@ -688,31 +848,19 @@ impl AuditEntry {
                     pinned_policy_executable_refs,
                 ),
             },
-            previous_entry_hash: String::new(),
-        }
+        )
     }
 
-    /// Constructs a `SaContextRulePinsUpdated` audit entry.
+    /// Constructs a version-1 `SaContextRulePinsUpdated` audit entry, whose
+    /// pin lists hold first-8 projections.
     ///
-    /// Emitted by `smart-account migrate-verifier`, `signers add` /
-    /// `signers batch-add` and `rules add-policy` / `rules remove-policy`
-    /// after a wallet mutation changed the live verifier or policy set of a
-    /// rule that already has a pin record. The row carries the
-    /// rule's whole pin record; the drift check reads the newest
-    /// `SaContextRuleCreated` or `SaContextRulePinsUpdated` row as the pin.
-    ///
-    /// The executable-reference lists are aligned by position with the
-    /// first-8 lists; a list whose entries are all `None` is recorded as
-    /// empty, as on `SaContextRuleCreated`.
-    ///
-    /// # Redaction
-    ///
-    /// `smart_account` MUST be pre-redacted at the call site to first-5-last-5
-    /// form via `redact_strkey_first5_last5`.
+    /// Available to tests only, for compatibility fixtures. Production code
+    /// writes [`Self::new_sa_context_rule_pins_updated_v2`].
+    #[cfg(any(test, feature = "test-helpers"))]
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
-        reason = "irreducible audit-field set; mirrors new_sa_context_rule_created"
+        reason = "irreducible audit-field set; mirrors new_sa_context_rule_created_v2"
     )]
     pub fn new_sa_context_rule_pins_updated(
         smart_account: impl Into<String>,
@@ -724,22 +872,14 @@ impl AuditEntry {
         pinned_policy_wasm_hashes_first8: Vec<String>,
         mutable_override: bool,
         unknown_override: bool,
-        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
-        pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
     ) -> Self {
-        Self {
-            ts: current_iso8601_utc(),
-            tool: "sa.context_rule_pins_updated".to_owned(),
-            chain_id: chain_id.into_optional_chain_id(),
-            arg_keys: vec![],
-            arg_keys_truncated: None,
-            truncated: false,
-            envelope_hash: None,
-            nonce_id: None,
-            policy_decision: PolicyDecision::Allow,
-            decision_reason: None,
-            request_id: request_id.into(),
-            event_kind: EventKind::SaContextRulePinsUpdated {
+        Self::pin_row(
+            "sa.context_rule_pins_updated",
+            chain_id,
+            request_id,
+            EventKind::SaContextRulePinsUpdated {
                 smart_account: smart_account.into(),
                 rule_id,
                 pinned_verifier_wasm_hashes_first8,
@@ -754,8 +894,7 @@ impl AuditEntry {
                 ),
                 reason,
             },
-            previous_entry_hash: String::new(),
-        }
+        )
     }
 
     /// Constructs a `SaContextRuleDeleted` audit entry.
@@ -790,6 +929,7 @@ impl AuditEntry {
                 rule_id,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -830,6 +970,7 @@ impl AuditEntry {
                 audit_request_id: rid,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -870,6 +1011,7 @@ impl AuditEntry {
                 audit_request_id: rid,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -911,6 +1053,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -952,6 +1095,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -999,6 +1143,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1056,6 +1201,7 @@ impl AuditEntry {
                 snapshot_version,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1112,6 +1258,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1170,6 +1317,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1287,6 +1435,7 @@ impl AuditEntry {
             request_id: request_id.into(),
             event_kind,
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1342,6 +1491,7 @@ impl AuditEntry {
                 executable_tag: executable_ref.map(|pin| pin.tag.clone()),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1393,6 +1543,7 @@ impl AuditEntry {
                 observed_hash_first8: observed_hash_first8.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1446,6 +1597,7 @@ impl AuditEntry {
                 observed_executable,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1497,6 +1649,7 @@ impl AuditEntry {
                 observed_executable,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1546,6 +1699,7 @@ impl AuditEntry {
                 tx_hash_redacted: tx_hash_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1600,6 +1754,7 @@ impl AuditEntry {
                 override_acknowledged_at,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1647,6 +1802,7 @@ impl AuditEntry {
                 advised_status,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1698,6 +1854,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1744,6 +1901,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1806,6 +1964,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1852,6 +2011,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1900,6 +2060,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1946,6 +2107,7 @@ impl AuditEntry {
                 status: status.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2032,6 +2194,7 @@ impl AuditEntry {
                 result: result.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2077,6 +2240,7 @@ impl AuditEntry {
                 inner_count,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2127,12 +2291,14 @@ impl AuditEntry {
                 transaction_hash_redacted: transaction_hash_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
     /// Constructs a `ValueActionSubmitted` audit entry.
     ///
-    /// Emitted after a value-moving verb's on-chain submit confirms. `legs`
+    /// Tests that build retained logs for the readers use this constructor;
+    /// the wallet's submit and reconciliation paths write no such row. `legs`
     /// MUST be built from the SAME `ValueEffects` the policy gate sized — the
     /// single-derivation invariant. `transaction_hash_redacted` MUST be
     /// pre-redacted to first-8-last-8 at the call site; `legs` destinations are
@@ -2177,6 +2343,7 @@ impl AuditEntry {
                 ledger,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2229,19 +2396,59 @@ impl AuditEntry {
                 transaction_hash_redacted: transaction_hash_redacted.into(),
                 source_redacted: source_redacted.into(),
                 sequence,
+                policy_digest: None,
+                rule_index: None,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
+    }
+
+    /// Returns `self` with the mainnet policy provenance recorded.
+    ///
+    /// A `value_action_pending` row records the policy digest and the rule
+    /// index; an `x402_payment_authorized` row records the digest, the policy
+    /// sequence, the rule index and the evaluation instant. The digest is
+    /// written as 64 lowercase hex characters. Every other row kind carries no
+    /// provenance and is returned unchanged.
+    #[must_use]
+    pub fn with_provenance(
+        mut self,
+        provenance: &crate::mainnet::decision::MainnetProvenance,
+    ) -> Self {
+        match &mut self.event_kind {
+            EventKind::ValueActionPending {
+                policy_digest,
+                rule_index,
+                ..
+            } => {
+                *policy_digest = Some(crate::hex::encode(&provenance.policy_digest));
+                *rule_index = Some(provenance.rule_index);
+            }
+            EventKind::X402PaymentAuthorized {
+                policy_digest,
+                policy_sequence,
+                rule_index,
+                evaluated_at_ms,
+                ..
+            } => {
+                *policy_digest = Some(crate::hex::encode(&provenance.policy_digest));
+                *policy_sequence = Some(provenance.policy_sequence);
+                *rule_index = Some(provenance.rule_index);
+                *evaluated_at_ms = Some(provenance.evaluated_at_ms);
+            }
+            _ => {}
+        }
+        self
     }
 
     /// Constructs a `ValueActionFailed` audit entry.
     ///
-    /// Emitted where a recorded submission reached a definitive negative
-    /// answer: the send step refused the bytes, the poll reported the
-    /// transaction applied and failed, or reconciliation released its
-    /// reservation on chain evidence. It also closes the pending row of a
-    /// submission refused before the send. `code` is the stable wire code of
-    /// that answer: the refusal's code, or the evidence's code for a release.
+    /// Emitted where a recorded submission never left the wallet: it closes
+    /// the pending row of a submission the recorder refused before the send,
+    /// and of a pool attempt proven never transmitted. No endpoint answer
+    /// emits it. `code` is the stable wire code of the local refusal, or the
+    /// pool's not-transmitted code.
     /// `transaction_hash_redacted` MUST be pre-redacted to first-8-last-8 at
     /// the call site.
     #[must_use]
@@ -2280,19 +2487,205 @@ impl AuditEntry {
                 code: code.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
+    /// Constructs a `SubmissionAccountingExpired` audit entry.
+    ///
+    /// Emitted by accounting audit delivery for one authenticated accounting
+    /// expiry. Every value comes from verified spending-window state: the
+    /// chain, the reservation identifier carried in the outer
+    /// `envelope_hash`, the decision identifier, the committing generation and
+    /// the two checked timestamps. `code` is fixed to
+    /// `submission.accounting_expired` and `chain_outcome` to `unknown`.
+    /// `transaction_hash_redacted` MUST be pre-redacted to first-8-last-8 at
+    /// the call site.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the row names the authenticated decision and the outer entry's identity"
+    )]
+    pub fn new_submission_accounting_expired(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        reservation_id: impl Into<String>,
+        decision_id: impl Into<String>,
+        generation: u64,
+        transaction_hash_redacted: impl Into<String>,
+        observed_at_ms: u64,
+        accounting_until_ms: u64,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: Some(reservation_id.into()),
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::SubmissionAccountingExpired {
+                decision_id: decision_id.into(),
+                generation,
+                transaction_hash_redacted: transaction_hash_redacted.into(),
+                observed_at_ms,
+                accounting_until_ms,
+                code: crate::profile::receipt::ACCOUNTING_EXPIRED_CODE.to_owned(),
+                chain_outcome: ACCOUNTING_EXPIRY_CHAIN_OUTCOME.to_owned(),
+            },
+            previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
+    /// Constructs an `OperationTransition` audit entry.
+    ///
+    /// Emitted by the operation store before it commits a state step or an
+    /// attempt's exposure. `operation_id` and `commit_id` are lowercase
+    /// hexadecimal; `step` is the entered state's wire name or `"expose"`.
+    /// `request_id` stays on the outer entry.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the row names the step and the outer entry's identity"
+    )]
+    pub fn new_operation_transition(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        operation_id: impl Into<String>,
+        attempt_index: Option<u32>,
+        from_state: Option<String>,
+        step: impl Into<String>,
+        commit_id: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::OperationTransition {
+                operation_id: operation_id.into(),
+                attempt_index,
+                from_state,
+                step: step.into(),
+                commit_id: commit_id.into(),
+                evidence_digest: None,
+                primary_ledger: None,
+                witness_ledger: None,
+                release_code: None,
+            },
+            previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
+    /// Adds the deciding facts of a recovery transition to an
+    /// `OperationTransition` entry: the evidence digest as lowercase
+    /// hexadecimal, both deciding ledgers and the projected release code.
+    /// Every other entry is returned unchanged.
+    #[must_use]
+    pub fn with_recovery_decision(
+        mut self,
+        digest: impl Into<String>,
+        ledgers: (u32, u32),
+        code: Option<&str>,
+    ) -> Self {
+        if let EventKind::OperationTransition {
+            evidence_digest,
+            primary_ledger,
+            witness_ledger,
+            release_code,
+            ..
+        } = &mut self.event_kind
+        {
+            *evidence_digest = Some(digest.into());
+            *primary_ledger = Some(ledgers.0);
+            *witness_ledger = Some(ledgers.1);
+            *release_code = code.map(str::to_owned);
+        }
+        self
+    }
+
+    /// Constructs an `OperationEvidence` audit entry.
+    ///
+    /// Emitted by the operation store before it commits evidence rows or an
+    /// attempt's first sequence release. `release` carries the primary and
+    /// witness release ledgers and the minimum close time when the commit
+    /// records the release. Digests are lowercase hexadecimal; the row holds
+    /// no endpoint URL. `request_id` stays on the outer entry.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the row names the evidence range, the release and the outer entry's identity"
+    )]
+    pub fn new_operation_evidence(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        operation_id: impl Into<String>,
+        attempt_index: u32,
+        rows: Vec<super::schema::OperationEvidenceRow>,
+        release: Option<(u32, u32, u64)>,
+        commit_id: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        let evidence_seqs = match (rows.first(), rows.last()) {
+            (Some(first), Some(last)) => Some(super::schema::EvidenceSeqRange {
+                first: first.evidence_seq,
+                last: last.evidence_seq,
+            }),
+            _ => None,
+        };
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::OperationEvidence {
+                operation_id: operation_id.into(),
+                attempt_index,
+                evidence_seqs,
+                rows,
+                sequence_released: release.is_some(),
+                primary_ledger: release.map(|(primary, _, _)| primary),
+                witness_ledger: release.map(|(_, witness, _)| witness),
+                min_close_time_ms: release.map(|(_, _, close)| close),
+                commit_id: commit_id.into(),
+            },
+            previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
     /// Constructs a `SubmissionReceiptCleared` audit entry.
     ///
-    /// Emitted by `tx receipt clear --acknowledge`. `cleared_from` names the
-    /// receipt status the clear replaced, and `reservation_released` records
-    /// whether a spending-window reservation was released with it.
-    /// `evidence` is the wire code of the chain evidence on which
-    /// reconciliation released the reservation, and `None` when the outcome
-    /// is unknown. `transaction_hash_redacted` MUST be pre-redacted to
-    /// first-8-last-8 at the call site; `envelope_hash` carries the full
-    /// envelope hash the operator addressed.
+    /// Emitted by `tx receipt clear --acknowledge`. `cleared_from` names the receipt status the
+    /// clear replaced, and `reservation_released` records whether a spending-window reservation
+    /// was released with it. `evidence` is the wire code of the accounting disposition the receipt
+    /// carries, or of the endpoint's current answer where the receipt of an untimed hold keeps its
+    /// recorded network answer, and `None` otherwise. `unbounded_exposure` records that the
+    /// operator acknowledged untimed bytes that can still apply after their spend stops counting.
+    /// `transaction_hash_redacted` MUST be pre-redacted to first-8-last-8 at the call site;
+    /// `envelope_hash` carries the full envelope hash the operator addressed.
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
@@ -2304,6 +2697,7 @@ impl AuditEntry {
         transaction_hash_redacted: impl Into<String>,
         cleared_from: impl Into<String>,
         reservation_released: bool,
+        unbounded_exposure: bool,
         evidence: Option<String>,
         envelope_hash: Option<String>,
         request_id: impl Into<String>,
@@ -2324,16 +2718,20 @@ impl AuditEntry {
                 transaction_hash_redacted: transaction_hash_redacted.into(),
                 cleared_from: cleared_from.into(),
                 reservation_released,
+                unbounded_exposure,
                 evidence,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
     /// Constructs an opaque `ValueActionSubmitted` audit entry.
     ///
-    /// Emitted after a raw sign-and-submit that the policy could not size (an
+    /// Describes a raw sign-and-submit that the policy could not size (an
     /// opaque-sign surface such as `stellar_sep43_sign_and_submit_transaction`).
+    /// The wallet's submit and reconciliation paths write no such row: the
+    /// submission recorder writes the pending row before the send.
     /// `legs` is empty and `opaque_reason` carries the policy opaque-reason's
     /// stable string form — legs are never fabricated for an envelope the policy
     /// could not size. The outer entry's `envelope_hash` identifies what was
@@ -2376,17 +2774,18 @@ impl AuditEntry {
                 ledger,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
     /// Constructs an `OpaquePayloadSigned` audit entry.
     ///
-    /// Emitted at the point a SEP-43 sign-only tool produces a signature the
-    /// caller broadcasts externally — the wallet never observes a submit, so
-    /// this row records that the signature EXISTS, not that anything
-    /// confirmed. `payload_sha256_redacted` MUST be pre-redacted
-    /// (first-8-last-8 of the hex digest) at the call site; the signature and
-    /// payload are never recorded.
+    /// Records a signature the caller can broadcast externally, with optional
+    /// evaluated legs in signed operation order. The row does not prove settlement.
+    /// `payload_sha256_redacted` must contain only the first and last eight digest
+    /// characters. The signature and payload are never recorded.
+    /// `policy_decision` is `RequireApproval` for a signature an approval
+    /// released.
     #[must_use]
     pub fn new_opaque_payload_signed(
         tool: impl Into<String>,
@@ -2394,6 +2793,8 @@ impl AuditEntry {
         payload_sha256_redacted: impl Into<String>,
         signer_redacted: RedactedStrkey,
         request_id: impl Into<String>,
+        legs: Vec<ValueLegRecord>,
+        policy_decision: PolicyDecision,
     ) -> Self {
         Self {
             ts: current_iso8601_utc(),
@@ -2404,14 +2805,16 @@ impl AuditEntry {
             truncated: false,
             envelope_hash: None,
             nonce_id: None,
-            policy_decision: PolicyDecision::Allow,
+            policy_decision,
             decision_reason: None,
             request_id: request_id.into(),
             event_kind: EventKind::OpaquePayloadSigned {
                 payload_sha256_redacted: payload_sha256_redacted.into(),
                 signer_redacted,
+                legs,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2422,7 +2825,8 @@ impl AuditEntry {
     /// sized.
     /// `network` and `scheme` are non-secret settle identifiers; no signature,
     /// token, or secret is recorded. `policy_decision` carries the gate's
-    /// actual decision (`Allow` on this path).
+    /// actual decision (`Allow` on this path). `signature_expiration_ledger`
+    /// is the last ledger at which the signed authorization is valid on chain.
     #[must_use]
     #[allow(clippy::too_many_arguments, reason = "flat audit-field constructor")]
     pub fn new_x402_payment_authorized(
@@ -2434,6 +2838,7 @@ impl AuditEntry {
         policy_decision: PolicyDecision,
         request_id: impl Into<String>,
         witness: Option<super::schema::CrossCheckRecord>,
+        signature_expiration_ledger: Option<u32>,
     ) -> Self {
         Self {
             ts: current_iso8601_utc(),
@@ -2452,11 +2857,17 @@ impl AuditEntry {
             // hash-chained rows.
             event_kind: EventKind::X402PaymentAuthorized {
                 witness,
+                signature_expiration_ledger,
                 legs,
                 network: super::schema::bound_recorded_str(&network.into()),
                 scheme: super::schema::bound_recorded_str(&scheme.into()),
+                policy_digest: None,
+                policy_sequence: None,
+                rule_index: None,
+                evaluated_at_ms: None,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2499,6 +2910,7 @@ impl AuditEntry {
                 failure_stage: super::schema::bound_recorded_str(&failure_stage.into()),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2543,6 +2955,7 @@ impl AuditEntry {
                 approval_present,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2582,6 +2995,7 @@ impl AuditEntry {
                 policy_budget_consumed,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2619,6 +3033,7 @@ impl AuditEntry {
                 claimed_status: super::schema::bound_recorded_str(&claimed_status.into()),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2654,6 +3069,7 @@ impl AuditEntry {
                 verified_outcome: super::schema::bound_recorded_str(&verified_outcome.into()),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2695,6 +3111,44 @@ impl AuditEntry {
                 public_address,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
+    /// Constructs a `SignerIdentityEnrolled` audit entry.
+    ///
+    /// Emitted after `profile enroll-signer` writes the enrolled signer's
+    /// identity record. Like the key-writing rows it is not policy-gated, so
+    /// `policy_decision` is `Allow`, and it carries no `chain_id`.
+    #[must_use]
+    pub fn new_signer_identity_enrolled(
+        tool: impl Into<String>,
+        keyring_service: impl Into<String>,
+        keyring_entry: impl Into<String>,
+        public_address: RedactedStrkey,
+        role: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::SignerIdentityEnrolled {
+                keyring_service: keyring_service.into(),
+                keyring_entry: keyring_entry.into(),
+                public_address,
+                role: role.into(),
+            },
+            previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2710,8 +3164,9 @@ impl AuditEntry {
         request_id: impl Into<String>,
         chain_id: impl Into<String>,
         wiped: crate::audit_log::schema::WipedAccrualRecord,
+        owner_authorization: Option<crate::audit_log::schema::WindowResetAuthorization>,
     ) -> Self {
-        use crate::audit_log::schema::bound_recorded_str;
+        use crate::audit_log::schema::bound_window_reset_reason;
         let reason = reason.into();
         Self {
             ts: current_iso8601_utc(),
@@ -2727,10 +3182,12 @@ impl AuditEntry {
             request_id: request_id.into(),
             event_kind: EventKind::PolicyWindowStateReset {
                 profile: profile.into(),
-                reason: bound_recorded_str(&reason),
+                reason: bound_window_reset_reason(&reason),
                 wiped: Some(wiped),
+                owner_authorization,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2760,6 +3217,7 @@ impl AuditEntry {
                 reason: reason.map(crate::audit_log::schema::bound_recorded_str),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2787,6 +3245,7 @@ impl AuditEntry {
                 was_halted,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2814,14 +3273,22 @@ impl AuditEntry {
                 generation,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
     /// Records an acknowledged MPP reset request before state mutation.
+    ///
+    /// `carried_generation` is the generation of the authenticated snapshot
+    /// the reset carries, `None` when it discards the history, and
+    /// `stale_carry` whether the committed counter proves that snapshot older
+    /// than the last committed one.
     #[must_use]
     pub fn new_mpp_state_reset(
         profile: impl Into<String>,
         discarded_generation: Option<u64>,
+        carried_generation: Option<u64>,
+        stale_carry: bool,
         reason: &str,
         request_id: impl Into<String>,
     ) -> Self {
@@ -2840,9 +3307,83 @@ impl AuditEntry {
             event_kind: EventKind::MppStateReset {
                 profile: profile.into(),
                 discarded_generation,
+                carried_generation,
+                stale_carry,
                 reason: crate::audit_log::schema::bound_recorded_str(reason),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
+    /// Constructs the record of a carrier binding.
+    ///
+    /// Written by `audit bind-carriers` before it records the carriers:
+    /// `carried_rows` committed operator rows move from `previous_generation`
+    /// to `generation`, and the previous outbox is retired to `retired_file`.
+    #[must_use]
+    pub fn new_audit_carriers_bound(
+        generation: u64,
+        previous_generation: u64,
+        carried_rows: u64,
+        retired_file: Option<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "audit.bind_carriers".to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            event_kind: EventKind::AuditCarriersBound {
+                generation,
+                previous_generation,
+                carried_rows,
+                retired_file,
+            },
+            previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
+    /// Constructs the forensic record of an acknowledged outbox loss.
+    #[must_use]
+    pub fn new_audit_outbox_loss_acknowledged(
+        expected_rows: u64,
+        found_rows: u64,
+        reason: &str,
+        revoked_approvals: usize,
+        revoked_grants: usize,
+    ) -> Self {
+        let bounded_reason = super::schema::bound_recorded_str(reason);
+        let truncated = bounded_reason != reason;
+        let reason = bounded_reason;
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "audit.acknowledge_outbox_loss".to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            event_kind: EventKind::AuditOutboxLossAcknowledged {
+                expected_rows,
+                found_rows,
+                reason,
+                revoked_approvals,
+                revoked_grants,
+            },
+            previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2885,6 +3426,81 @@ impl AuditEntry {
             // The writer populates this field on append; this constructor
             // leaves it as empty string.  See AuditWriter::write_entry.
             previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
+    /// Constructs the `audit_entry_tags_started` boundary row.
+    ///
+    /// Written by the audit writer itself under the fixed tool label
+    /// `audit.entry_tags_started`. `anchored_count` is the stored anchor's
+    /// entry count the acquisition found, zero for an adoption, and
+    /// `absorbed_count` the entries it took in past that anchor without tags.
+    #[must_use]
+    pub fn new_audit_entry_tags_started(
+        anchored_count: u64,
+        absorbed_count: u64,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self::new_audit_substrate_row(
+            "audit.entry_tags_started",
+            EventKind::AuditEntryTagsStarted {
+                anchored_count,
+                absorbed_count,
+            },
+            request_id.into(),
+        )
+    }
+
+    /// Constructs the `audit_entry_tags_rekeyed` row, written under the fixed
+    /// tool label `audit.entry_tags_rekeyed` and tagged under the new key.
+    #[must_use]
+    pub fn new_audit_entry_tags_rekeyed(
+        cause: crate::audit_log::schema::EntryTagsRekeyCause,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self::new_audit_substrate_row(
+            "audit.entry_tags_rekeyed",
+            EventKind::AuditEntryTagsRekeyed { cause },
+            request_id.into(),
+        )
+    }
+
+    /// Constructs the `audit_entries_quarantined` row, written under the
+    /// fixed tool label `audit.entries_quarantined`, covering the
+    /// `quarantined_count` entries directly before it in its file.
+    #[must_use]
+    pub fn new_audit_entries_quarantined(
+        quarantined_count: u64,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self::new_audit_substrate_row(
+            "audit.entries_quarantined",
+            EventKind::AuditEntriesQuarantined { quarantined_count },
+            request_id.into(),
+        )
+    }
+
+    /// A row the audit substrate writes on its own account: no chain, no
+    /// arguments, an `allow` decision, and the fixed `tool` label.
+    fn new_audit_substrate_row(tool: &str, event_kind: EventKind, request_id: String) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id,
+            event_kind,
+            // The writer populates this field on append; this constructor
+            // leaves it as empty string.  See AuditWriter::write_entry.
+            previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2933,6 +3549,7 @@ impl AuditEntry {
                 return_scval_b64_prefix,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2992,6 +3609,7 @@ impl AuditEntry {
                 bundle_tx_hash_redacted,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3033,6 +3651,7 @@ impl AuditEntry {
                 wasm_sha256: wasm_sha256.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3079,6 +3698,7 @@ impl AuditEntry {
                 refusal_reason: refusal_reason.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3119,6 +3739,7 @@ impl AuditEntry {
                 prior_wasm_sha256: prior_wasm_sha256.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3207,6 +3828,7 @@ impl AuditEntry {
                 load_warnings_truncated: warnings_truncated_by_cap,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         };
 
         // Post-serialisation size guard.
@@ -3307,6 +3929,7 @@ impl AuditEntry {
                 audit_request_id: request_id,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3346,6 +3969,7 @@ impl AuditEntry {
                 audit_request_id: request_id,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3385,6 +4009,7 @@ impl AuditEntry {
                 audit_request_id: request_id,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3439,6 +4064,7 @@ impl AuditEntry {
                 audit_request_id: request_id,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3475,6 +4101,7 @@ impl AuditEntry {
                 index,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3515,6 +4142,7 @@ impl AuditEntry {
                 outcome: outcome.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3561,6 +4189,7 @@ impl AuditEntry {
                 ledger,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3598,8 +4227,56 @@ impl AuditEntry {
                 envelope_sha256_hex,
                 nonce_prefix: nonce_prefix8(approval_nonce),
                 origin: origin.into(),
+                mainnet_presence: None,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
+    /// Constructs the `ApprovalAttested` audit entry of a mainnet consent.
+    ///
+    /// As [`Self::new_approval_attested`], plus the full CAIP-2 `chain_id`
+    /// and the verified ceremony's [`MainnetPresenceAudit`]. `request_id` is
+    /// the consent request ID the challenge bound, so the row and the
+    /// receipt name the same ceremony.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one audit row: each argument is a distinct recorded field"
+    )]
+    pub fn new_mainnet_approval_attested(
+        approval_kind: impl Into<String>,
+        gated_tool: impl Into<String>,
+        envelope_sha256_hex: Option<String>,
+        approval_nonce: &str,
+        origin: impl Into<String>,
+        request_id: impl Into<String>,
+        chain_id: impl Into<String>,
+        presence: MainnetPresenceAudit,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "approval.attested".to_owned(),
+            chain_id: Some(chain_id.into()),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::ApprovalAttested {
+                approval_kind: approval_kind.into(),
+                gated_tool: gated_tool.into(),
+                envelope_sha256_hex,
+                nonce_prefix: nonce_prefix8(approval_nonce),
+                origin: origin.into(),
+                mainnet_presence: Some(presence),
+            },
+            previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3634,6 +4311,41 @@ impl AuditEntry {
                 origin: origin.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
+    /// Records revocation with a nonce prefix and optional signed-origin attribution.
+    #[must_use]
+    pub fn new_approval_revoked(
+        approval_kind: impl Into<String>,
+        approval_nonce: &str,
+        origin: crate::approval::Surface,
+        operator_credential_id: Option<&str>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "approval.revoked".to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::ApprovalRevoked {
+                approval_kind: approval_kind.into(),
+                nonce_prefix: nonce_prefix8(approval_nonce),
+                origin: origin.as_str().to_owned(),
+                operator_credential_id_redacted: operator_credential_id
+                    .filter(|_| origin == crate::approval::Surface::ServeRemote)
+                    .map(pseudonymize_credential_id),
+            },
+            previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3678,6 +4390,7 @@ impl AuditEntry {
                 ),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3716,13 +4429,16 @@ impl AuditEntry {
                 ),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
     /// Returns the canonical JSON bytes used as the hash-input body.
     ///
     /// The `previous_entry_hash` field is set to `""` (empty string) in the
-    /// hash-input body so the hash does not depend on itself.
+    /// hash-input body so the hash does not depend on itself, and the
+    /// `entry_tag` field is left out of it, because the tag is computed over
+    /// the hash.
     ///
     /// # Errors
     ///
@@ -3736,7 +4452,10 @@ impl AuditEntry {
     /// Writes the canonical JSON bytes used as the hash-input body.
     ///
     /// The `previous_entry_hash` field is set to `""` (empty string) in the
-    /// hash-input body so the hash does not depend on itself.
+    /// hash-input body so the hash does not depend on itself. The `entry_tag`
+    /// field is left out of the body entirely: it is `None` there, which
+    /// serializes as no field at all, so an entry hashes the same with or
+    /// without its tag.
     ///
     /// # Errors
     ///
@@ -3746,9 +4465,10 @@ impl AuditEntry {
         &self,
         writer: &mut W,
     ) -> Result<(), serde_json::Error> {
-        // Clone and set previous_entry_hash to empty string for body computation.
+        // Clone; blank the predecessor hash and drop the tag for the body.
         let mut body = self.clone();
         body.previous_entry_hash = String::new();
+        body.entry_tag = None;
         serde_json::to_writer(writer, &body)
     }
 
@@ -4097,6 +4817,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn revocation_constructor_redacts_the_nonce_and_credential() {
+        use crate::approval::Surface;
+        for origin in [Surface::Cli, Surface::Serve, Surface::ServeRemote] {
+            let entry = AuditEntry::new_approval_revoked(
+                "PaymentSimulated",
+                "abcdefgh-secret",
+                origin,
+                Some("fixture-credential"),
+                "request",
+            );
+            let value = serde_json::to_value(&entry).unwrap();
+            assert_eq!(value["tool"], "approval.revoked");
+            assert_eq!(value["nonce_prefix"], "abcdefgh");
+            if origin == Surface::ServeRemote {
+                assert_eq!(
+                    value["operator_credential_id_redacted"],
+                    pseudonymize_credential_id("fixture-credential")
+                );
+            } else {
+                assert!(value.get("operator_credential_id_redacted").is_none());
+            }
+            for field in [
+                "attestation",
+                "assertion",
+                "nonce_id",
+                "envelope_hash",
+                "chain_id",
+            ] {
+                assert!(
+                    value.get(field).is_none_or(serde_json::Value::is_null),
+                    "{field}"
+                );
+            }
+        }
+    }
+
     /// Known-answer tests (KATs) pinning exact canonical body bytes for every
     /// current [`EventKind`] variant plus max-size edge cases.
     ///
@@ -4185,6 +4942,7 @@ mod tests {
         let mut rotation_handoff = AuditEntry::new_rotation_handoff(
             "default.jsonl.20260429T000000000",
             "req-kat-rotation",
+            false,
         );
         fix_kat_ts(&mut rotation_handoff);
 
@@ -4318,6 +5076,230 @@ mod tests {
             prev.as_str().unwrap_or("x").is_empty(),
             "canonical body previous_entry_hash must be empty string, got: {prev:?}"
         );
+    }
+
+    /// The entry fields a build without entry tags parses: every field of
+    /// [`AuditEntry`] except `entry_tag`, with the same serde attributes and
+    /// the flattened, internally tagged [`EventKind`].
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct ReleasedEntry {
+        ts: String,
+        tool: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        chain_id: Option<String>,
+        arg_keys: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arg_keys_truncated: Option<usize>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        envelope_hash: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nonce_id: Option<String>,
+        policy_decision: PolicyDecision,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decision_reason: Option<String>,
+        request_id: String,
+        #[serde(flatten)]
+        event_kind: EventKind,
+        previous_entry_hash: String,
+    }
+
+    /// Chains `entry` onto the zero block and tags it, as a keyed writer does.
+    fn tagged(mut entry: AuditEntry) -> (AuditEntry, String) {
+        use crate::audit_log::chain::{
+            ZERO_BLOCK_HASH, compute_entry_hash, compute_entry_tag, derive_entry_tag_key,
+        };
+        entry.previous_entry_hash = ZERO_BLOCK_HASH.to_owned();
+        let hash =
+            compute_entry_hash(&entry.canonical_json_body().unwrap(), ZERO_BLOCK_HASH).unwrap();
+        let key = derive_entry_tag_key(&[0x5a; 32]);
+        entry.entry_tag = Some(compute_entry_tag(&key, &hash).unwrap());
+        (entry, hash)
+    }
+
+    /// The accounting-expiry row carries the authenticated identity on the
+    /// outer entry and fixes its code and chain outcome.
+    #[test]
+    fn the_accounting_expiry_row_fixes_its_code_and_outcome() {
+        let entry = AuditEntry::new_submission_accounting_expired(
+            "stellar-agent accounting delivery",
+            "stellar:testnet",
+            "aa".repeat(32),
+            "bb".repeat(32),
+            7,
+            "abcd...1234",
+            1_000,
+            900,
+            "deliver",
+        );
+        assert_eq!(
+            entry.envelope_hash.as_deref(),
+            Some("aa".repeat(32).as_str())
+        );
+        assert_eq!(entry.chain_id.as_deref(), Some("stellar:testnet"));
+        assert_eq!(entry.policy_decision, PolicyDecision::Allow);
+        let EventKind::SubmissionAccountingExpired {
+            decision_id,
+            generation,
+            transaction_hash_redacted,
+            observed_at_ms,
+            accounting_until_ms,
+            code,
+            chain_outcome,
+        } = &entry.event_kind
+        else {
+            panic!("an accounting-expiry row is expected");
+        };
+        assert_eq!(decision_id, &"bb".repeat(32));
+        assert_eq!(*generation, 7);
+        assert_eq!(transaction_hash_redacted, "abcd...1234");
+        assert_eq!((*observed_at_ms, *accounting_until_ms), (1_000, 900));
+        assert_eq!(code, "submission.accounting_expired");
+        assert_eq!(chain_outcome, "unknown");
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["kind"], "submission_accounting_expired");
+    }
+
+    #[test]
+    fn the_clear_row_records_the_unbounded_exposure() {
+        use crate::audit_log::chain::{
+            compute_entry_hash, compute_entry_tag, derive_entry_tag_key,
+        };
+        let row = |exposure| {
+            AuditEntry::new_submission_receipt_cleared(
+                "tx receipt clear",
+                "stellar:mainnet",
+                "abcd...1234",
+                "pending",
+                true,
+                exposure,
+                None,
+                None,
+                "clear",
+            )
+        };
+        let json = serde_json::to_value(row(true)).unwrap();
+        assert_eq!(json["unbounded_exposure"], true);
+        let (untimed, hash) = tagged(row(false));
+        let json = serde_json::to_string(&untimed).unwrap();
+        assert!(!json.contains("unbounded_exposure"));
+        let decoded: AuditEntry = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded.event_kind,
+            EventKind::SubmissionReceiptCleared {
+                unbounded_exposure: false,
+                ..
+            }
+        ));
+        let verified = compute_entry_hash(
+            &decoded.canonical_json_body().unwrap(),
+            &decoded.previous_entry_hash,
+        )
+        .unwrap();
+        assert_eq!(verified, hash);
+        assert_eq!(
+            decoded.entry_tag,
+            Some(compute_entry_tag(&derive_entry_tag_key(&[0x5a; 32]), &verified).unwrap())
+        );
+
+        // The flag is inside the authenticated body: a row whose exposure is
+        // flipped to false hashes differently and fails its keyed tag.
+        let (exposed, exposed_hash) = tagged(row(true));
+        let mut tampered = exposed.clone();
+        let EventKind::SubmissionReceiptCleared {
+            unbounded_exposure, ..
+        } = &mut tampered.event_kind
+        else {
+            panic!("a clear row is expected");
+        };
+        *unbounded_exposure = false;
+        let tampered_hash = compute_entry_hash(
+            &tampered.canonical_json_body().unwrap(),
+            &tampered.previous_entry_hash,
+        )
+        .unwrap();
+        assert_ne!(tampered_hash, exposed_hash);
+        assert_ne!(
+            tampered.entry_tag,
+            Some(compute_entry_tag(&derive_entry_tag_key(&[0x5a; 32]), &tampered_hash).unwrap()),
+            "the keyed tag of the exposed row does not verify the tampered one"
+        );
+    }
+
+    #[test]
+    fn a_released_reader_parses_a_tagged_line() {
+        use crate::audit_log::chain::compute_entry_hash;
+        let rows = [
+            make_entry(),
+            AuditEntry::new_value_action_failed(
+                "stellar_pay",
+                Some("stellar:testnet".to_owned()),
+                vec![],
+                "6ba7aaac...69060003",
+                "tx_failed",
+                PolicyDecision::Allow,
+                Some("sha256:abcdef01".to_owned()),
+                None,
+                None,
+                "req-failed",
+            ),
+            AuditEntry::new_approval_attested(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                "ABCDEFGHIJKLMNOPQRSTUV",
+                "cli",
+                "req-attested",
+            ),
+        ];
+        for row in rows {
+            let (entry, hash) = tagged(row);
+            let line = serde_json::to_string(&entry).unwrap();
+            assert!(line.contains("\"entry_tag\":\"sha256:"), "{line}");
+            let mut released: ReleasedEntry = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("a released reader parses {}: {e}", entry.tool));
+            let previous = std::mem::take(&mut released.previous_entry_hash);
+            let released_body = serde_json::to_vec(&released).unwrap();
+            assert_eq!(
+                released_body,
+                entry.canonical_json_body().unwrap(),
+                "a released reader re-serializes {} to the canonical body",
+                entry.tool
+            );
+            assert_eq!(compute_entry_hash(&released_body, &previous).unwrap(), hash);
+        }
+    }
+
+    #[test]
+    fn the_tag_is_outside_the_canonical_body() {
+        use crate::audit_log::chain::compute_entry_hash;
+        let (tagged_entry, hash) = tagged(make_entry());
+        let mut untagged = tagged_entry.clone();
+        untagged.entry_tag = None;
+        assert_eq!(
+            tagged_entry.canonical_json_body().unwrap(),
+            untagged.canonical_json_body().unwrap()
+        );
+        assert!(
+            !String::from_utf8(tagged_entry.canonical_json_body().unwrap())
+                .unwrap()
+                .contains("entry_tag"),
+            "the body carries no entry_tag field at all"
+        );
+        assert_eq!(
+            compute_entry_hash(
+                &untagged.canonical_json_body().unwrap(),
+                &untagged.previous_entry_hash
+            )
+            .unwrap(),
+            hash
+        );
+        let tagged_line = serde_json::to_vec(&tagged_entry).unwrap();
+        let untagged_line = serde_json::to_vec(&untagged).unwrap();
+        assert_eq!(tagged_line.len(), untagged_line.len() + 86);
+        let back: AuditEntry = serde_json::from_slice(&tagged_line).unwrap();
+        assert_eq!(back.entry_tag, tagged_entry.entry_tag);
     }
 
     #[test]
@@ -4485,7 +5467,7 @@ mod tests {
 
     #[test]
     fn rotation_handoff_entry_has_event_kind() {
-        let entry = AuditEntry::new_rotation_handoff("default.jsonl.20260428", "req");
+        let entry = AuditEntry::new_rotation_handoff("default.jsonl.20260428", "req", false);
         assert_eq!(entry.tool, "audit.rotation_handoff_to");
         assert!(matches!(
             entry.event_kind,
@@ -7467,10 +8449,10 @@ mod tests {
     /// empty; a list with a `Some` entry is recorded unchanged.
     #[test]
     fn sa_context_rule_created_records_all_none_executable_refs_empty() {
-        use crate::audit_log::schema::ExecutableRefPin;
+        use crate::audit_log::schema::ExecutableRefPinFirst8;
         use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
 
-        let pin = ExecutableRefPin::new(
+        let pin = ExecutableRefPinFirst8::new(
             &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
             &ScString(b"v1".to_vec().try_into().expect("tag fits")),
             &[0xcdu8; 32],
@@ -7509,9 +8491,10 @@ mod tests {
     /// outer entry, and round-trips through JSON.
     #[test]
     fn sa_context_rule_pins_updated_constructor_plumbs_fields() {
+        use crate::audit_log::schema::ExecutableRefPinFirst8;
         use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
 
-        let pin = ExecutableRefPin::new(
+        let pin = ExecutableRefPinFirst8::new(
             &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
             &ScString(b"v2".to_vec().try_into().expect("tag fits")),
             &[0xcdu8; 32],
@@ -7570,6 +8553,127 @@ mod tests {
         let back: AuditEntry = serde_json::from_str(&json).expect("must deserialise");
         assert_eq!(back.event_kind, entry.event_kind);
         assert_eq!(back.request_id, "req-pins-updated");
+    }
+
+    /// The version-2 constructors keep every byte of every pinned hash and
+    /// reference pin: two hashes sharing their first eight bytes stay
+    /// distinct through construction, serialization and parsing.
+    #[test]
+    fn version_2_pin_constructors_keep_all_32_bytes() {
+        use crate::audit_log::schema::WasmHashPin;
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
+
+        let pinned = [0x42u8; 32];
+        let mut twin = pinned;
+        twin[8..].fill(0x43);
+        let pin = ExecutableRefPin::new(
+            &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+            &ScString(b"v1".to_vec().try_into().expect("tag fits")),
+            &twin,
+        )
+        .expect("pin builds");
+
+        let created = AuditEntry::new_sa_context_rule_created_v2(
+            "CDABC...12345",
+            3u32,
+            "default",
+            2u32,
+            1u32,
+            None,
+            "stellar:testnet",
+            "req-crc-v2",
+            vec![WasmHashPin::new(pinned), WasmHashPin::new(twin)],
+            vec![WasmHashPin::new(twin)],
+            true,
+            false,
+            vec![None, Some(pin.clone())],
+            vec![None],
+        );
+        assert_eq!(created.tool, "sa.context_rule_created");
+        let back: AuditEntry =
+            serde_json::from_str(&serde_json::to_string(&created).unwrap()).unwrap();
+        let EventKind::SaContextRuleCreatedV2 {
+            pinned_verifier_wasm_hashes,
+            pinned_policy_wasm_hashes,
+            pinned_verifier_executable_refs,
+            pinned_policy_executable_refs,
+            mutable_override,
+            ..
+        } = &back.event_kind
+        else {
+            panic!(
+                "expected SaContextRuleCreatedV2; got: {:?}",
+                back.event_kind
+            );
+        };
+        assert_eq!(pinned_verifier_wasm_hashes[0].as_bytes(), &pinned);
+        assert_eq!(pinned_verifier_wasm_hashes[1].as_bytes(), &twin);
+        assert_eq!(pinned_policy_wasm_hashes[0].as_bytes(), &twin);
+        assert_eq!(
+            pinned_verifier_executable_refs,
+            &vec![None, Some(pin.clone())]
+        );
+        assert!(pinned_policy_executable_refs.is_empty());
+        assert!(*mutable_override);
+
+        let updated = AuditEntry::new_sa_context_rule_pins_updated_v2(
+            "CDABC...12345",
+            3u32,
+            PinsUpdateReason::PolicyRemoved,
+            "stellar:testnet",
+            "req-pins-v2",
+            vec![WasmHashPin::new(twin)],
+            vec![],
+            false,
+            true,
+            vec![Some(pin.clone())],
+            vec![],
+        );
+        assert_eq!(updated.tool, "sa.context_rule_pins_updated");
+        assert_eq!(updated.request_id, "req-pins-v2");
+        let back: AuditEntry =
+            serde_json::from_str(&serde_json::to_string(&updated).unwrap()).unwrap();
+        let EventKind::SaContextRulePinsUpdatedV2 {
+            pinned_verifier_wasm_hashes,
+            pinned_verifier_executable_refs,
+            unknown_override,
+            reason,
+            ..
+        } = &back.event_kind
+        else {
+            panic!(
+                "expected SaContextRulePinsUpdatedV2; got: {:?}",
+                back.event_kind
+            );
+        };
+        assert_eq!(pinned_verifier_wasm_hashes[0].as_bytes(), &twin);
+        assert_eq!(
+            pinned_verifier_executable_refs[0]
+                .as_ref()
+                .unwrap()
+                .resolved_hash
+                .as_bytes(),
+            &twin
+        );
+        assert!(*unknown_override);
+        assert_eq!(*reason, PinsUpdateReason::PolicyRemoved);
+    }
+
+    /// A version-1 pin row as existing logs hold it parses and serializes
+    /// back to the same bytes, so its chain digest is unchanged.
+    #[test]
+    fn version_1_pin_rows_keep_their_canonical_bytes() {
+        let created = r#"{"ts":"2026-04-29T00:00:00.000Z","tool":"sa.context_rule_created","chain_id":"stellar:testnet","arg_keys":[],"policy_decision":"allow","request_id":"req-v1","kind":"sa_context_rule_created","smart_account":"CDABC...12345","rule_id":4,"context_type":"default","signers_count":1,"policies_count":1,"pinned_verifier_wasm_hashes_first8":["4242424242424242"],"pinned_policy_wasm_hashes_first8":["1111111111111111"],"mutable_override":true,"pinned_verifier_executable_refs":[{"owner_redacted":"CAAAA...ABSC4","tag":"v1","ref_key_hex":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","resolved_hash_first8":"4242424242424242"}],"previous_entry_hash":""}"#;
+        let updated = r#"{"ts":"2026-04-29T00:00:00.000Z","tool":"sa.context_rule_pins_updated","chain_id":"stellar:testnet","arg_keys":[],"policy_decision":"allow","request_id":"req-v1","kind":"sa_context_rule_pins_updated","smart_account":"CDABC...12345","rule_id":4,"pinned_verifier_wasm_hashes_first8":["4242424242424242"],"pinned_policy_wasm_hashes_first8":[],"mutable_override":false,"unknown_override":true,"reason":"signer_added","previous_entry_hash":""}"#;
+        for line in [created, updated] {
+            let entry: AuditEntry = serde_json::from_str(line).unwrap();
+            assert!(matches!(
+                entry.event_kind,
+                EventKind::SaContextRuleCreated { .. } | EventKind::SaContextRulePinsUpdated { .. }
+            ));
+            assert_eq!(serde_json::to_string(&entry).unwrap(), line);
+            assert_eq!(entry.canonical_json_body().unwrap(), line.as_bytes());
+        }
     }
 
     #[test]
@@ -7631,7 +8735,7 @@ mod tests {
         let entries = vec![
             make_entry(),
             AuditEntry::new_mlock_failed("p", "E", Some(1), "req"),
-            AuditEntry::new_rotation_handoff("file.jsonl.20260101T000000000", "req"),
+            AuditEntry::new_rotation_handoff("file.jsonl.20260101T000000000", "req", false),
             AuditEntry::new_plugin_invoked("plug", 0, PolicyDecision::Allow, 0, "req").unwrap(),
             AuditEntry::new_channel_acquired("C...X", 0, "req"),
             AuditEntry::new_channel_released("C...X", 0, "success", "req"),
@@ -7678,6 +8782,7 @@ mod tests {
             oversized,
             crate::audit_log::schema::PolicyDecision::Allow,
             "req-1",
+            None,
             None,
         );
         let EventKind::X402PaymentAuthorized {
@@ -7733,6 +8838,7 @@ mod tests {
                 amount: Some(10_000_000),
                 asset: Some("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned()),
                 destination_redacted: Some("GAAAA...AAAWHF".to_owned()),
+                destination_sha256: None,
             }],
             RedactedStrkey::from_already_redacted("GABCD...VWXYZ"),
             true,
@@ -7771,5 +8877,191 @@ mod tests {
         assert!(!json.contains("Payment ey"));
         assert!(!json.contains("AAAAAgAAA"));
         assert!(!json.contains(&"x".repeat(RECORDED_STR_MAX + 1)));
+    }
+
+    /// A fixed `value_action_pending` row and a fixed `x402_payment_authorized`
+    /// row serialize to exact texts, and each text reads back and serializes to
+    /// the same bytes, which the audit chain's body hash requires.
+    #[test]
+    fn pending_and_x402_rows_serialize_unchanged() {
+        let leg = |action, asset: &str| ValueLegRecord {
+            action,
+            amount: Some(1_250_000),
+            asset: Some(asset.to_owned()),
+            destination_redacted: Some("GABCD...WXYZ2".to_owned()),
+            destination_sha256: None,
+        };
+        let mut pending = AuditEntry::new_value_action_pending(
+            "stellar_pay",
+            "stellar:mainnet",
+            vec![leg(crate::audit_log::ValueActionKind::Payment, "native")],
+            "aaaaaaaa...bbbbbbbb",
+            "GSRCE...ABCDE",
+            42,
+            PolicyDecision::RequireApproval,
+            Some("ab".repeat(32)),
+            None,
+            Some("approval-nonce".to_owned()),
+            "req-pending",
+            None,
+        );
+        pending.ts = "2026-01-02T03:04:05.006Z".to_owned();
+        let mut x402 = AuditEntry::new_x402_payment_authorized(
+            "stellar_x402_create_payment",
+            "stellar:mainnet",
+            vec![leg(
+                crate::audit_log::ValueActionKind::X402Payment,
+                "CTOKEN",
+            )],
+            "stellar:mainnet",
+            "exact",
+            PolicyDecision::Allow,
+            "req-x402",
+            None,
+            Some(1_060),
+        );
+        x402.ts = "2026-01-02T03:04:05.007Z".to_owned();
+        let expected_pending = concat!(
+            r#"{"ts":"2026-01-02T03:04:05.006Z","tool":"stellar_pay","chain_id":"stellar:mainnet","#,
+            r#""arg_keys":[],"envelope_hash":"abababababababababababababababababababababababababababababababab","#,
+            r#""policy_decision":"require_approval","request_id":"req-pending","#,
+            r#""kind":"value_action_pending","approval_nonce":"approval-nonce","#,
+            r#""legs":[{"action":"payment","amount":"1250000","asset":"native","#,
+            r#""destination_redacted":"GABCD...WXYZ2"}],"#,
+            r#""transaction_hash_redacted":"aaaaaaaa...bbbbbbbb","source_redacted":"GSRCE...ABCDE","#,
+            r#""sequence":42,"previous_entry_hash":""}"#,
+        );
+        let expected_x402 = concat!(
+            r#"{"ts":"2026-01-02T03:04:05.007Z","tool":"stellar_x402_create_payment","#,
+            r#""chain_id":"stellar:mainnet","arg_keys":[],"policy_decision":"allow","#,
+            r#""request_id":"req-x402","kind":"x402_payment_authorized","#,
+            r#""signature_expiration_ledger":1060,"#,
+            r#""legs":[{"action":"x402_payment","amount":"1250000","asset":"CTOKEN","#,
+            r#""destination_redacted":"GABCD...WXYZ2"}],"#,
+            r#""network":"stellar:mainnet","scheme":"exact","previous_entry_hash":""}"#,
+        );
+        for (entry, expected) in [(&pending, expected_pending), (&x402, expected_x402)] {
+            let json = serde_json::to_string(entry).unwrap();
+            assert_eq!(json, expected);
+            let back: AuditEntry = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+    }
+
+    fn provenance_rows() -> (AuditEntry, AuditEntry) {
+        let leg = |action| ValueLegRecord {
+            action,
+            amount: Some(5),
+            asset: Some("native".to_owned()),
+            destination_redacted: None,
+            destination_sha256: None,
+        };
+        let pending = AuditEntry::new_value_action_pending(
+            "stellar_pay",
+            "stellar:mainnet",
+            vec![leg(crate::audit_log::ValueActionKind::Payment)],
+            "aaaaaaaa...bbbbbbbb",
+            "GSRCE...ABCDE",
+            7,
+            PolicyDecision::Allow,
+            None,
+            None,
+            None,
+            "req-pending",
+            None,
+        );
+        let x402 = AuditEntry::new_x402_payment_authorized(
+            "stellar_x402_create_payment",
+            "stellar:mainnet",
+            vec![leg(crate::audit_log::ValueActionKind::X402Payment)],
+            "stellar:mainnet",
+            "exact",
+            PolicyDecision::Allow,
+            "req-x402",
+            None,
+            None,
+        );
+        (pending, x402)
+    }
+
+    /// `with_provenance` adds the digest and rule index to a pending row and
+    /// the four provenance fields to an x402 row, in their JSON forms, and
+    /// leaves every other row kind unchanged.
+    #[test]
+    fn with_provenance_records_the_policy_provenance() {
+        let provenance = crate::mainnet::decision::MainnetProvenance {
+            policy_digest: [0xab; 32],
+            policy_sequence: 12,
+            rule_index: 3,
+            evaluated_at_ms: 1_700_000_000_123,
+        };
+        let digest = "ab".repeat(32);
+        let (pending, x402) = provenance_rows();
+        let pending = serde_json::to_value(pending.with_provenance(&provenance)).unwrap();
+        assert_eq!(pending["policy_digest"], serde_json::json!(digest));
+        assert_eq!(pending["rule_index"], serde_json::json!(3));
+        assert!(pending.get("policy_sequence").is_none());
+        assert!(pending.get("evaluated_at_ms").is_none());
+        let x402 = serde_json::to_value(x402.with_provenance(&provenance)).unwrap();
+        assert_eq!(x402["policy_digest"], serde_json::json!(digest));
+        assert_eq!(x402["policy_sequence"], serde_json::json!(12));
+        assert_eq!(x402["rule_index"], serde_json::json!(3));
+        assert_eq!(
+            x402["evaluated_at_ms"],
+            serde_json::json!(1_700_000_000_123_u64)
+        );
+
+        let other = AuditEntry::new_value_action_failed(
+            "stellar_pay",
+            "stellar:mainnet",
+            vec![],
+            "aaaaaaaa...bbbbbbbb",
+            "submission.refused",
+            PolicyDecision::Allow,
+            None,
+            None,
+            None,
+            "req-failed",
+        );
+        let before = serde_json::to_string(&other).unwrap();
+        assert_eq!(
+            serde_json::to_string(&other.with_provenance(&provenance)).unwrap(),
+            before
+        );
+    }
+
+    /// Rows written without provenance load with every provenance field
+    /// absent and reserialize without them.
+    #[test]
+    fn legacy_rows_load_without_provenance() {
+        let (pending, x402) = provenance_rows();
+        for entry in [pending, x402] {
+            let json = serde_json::to_string(&entry).unwrap();
+            let back: AuditEntry = serde_json::from_str(&json).unwrap();
+            match &back.event_kind {
+                EventKind::ValueActionPending {
+                    policy_digest,
+                    rule_index,
+                    ..
+                } => {
+                    assert!(policy_digest.is_none());
+                    assert!(rule_index.is_none());
+                }
+                EventKind::X402PaymentAuthorized {
+                    policy_digest,
+                    policy_sequence,
+                    rule_index,
+                    evaluated_at_ms,
+                    ..
+                } => {
+                    assert!(policy_digest.is_none());
+                    assert!(policy_sequence.is_none());
+                    assert!(rule_index.is_none());
+                    assert!(evaluated_at_ms.is_none());
+                }
+                other => panic!("unexpected row kind {other:?}"),
+            }
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
     }
 }

@@ -22,7 +22,7 @@ path = "src/main.rs"
 # cargo-binstall 1.8.0 and later, turns off the third-party binary host and the
 # source build, so binstall fails when no such archive exists; `cargo install
 # --locked` or a source build applies there. binstall checks the download over
-# TLS only, with no signature; the README "Verifying a release" section covers
+# TLS only, with no signature; docs/verifying-releases.md covers
 # signature and provenance checks.
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/stellar-agent-{ version }-{ target }.tar.xz"
@@ -36,6 +36,7 @@ pkg-fmt = "zip"
 
 [dependencies]
 stellar-agent-core = { workspace = true }
+stellar-agent-mcp = { workspace = true }
 stellar-agent-network = { workspace = true }
 stellar-agent-mpp = { workspace = true }
 # DeFindex vault adapter — `vault` subcommand.
@@ -74,6 +75,7 @@ stellar-agent-approval-remote = { workspace = true }
 stellar-strkey = { workspace = true }
 # XDR envelope signing — TransactionEnvelope, SEP-23 payload (pay.rs).
 stellar-xdr = { workspace = true }
+stellar-agent-xdr-limits = { workspace = true }
 # SHA-256 of the SEP-23 signing payload (pay.rs).
 sha2 = { workspace = true }
 # Zeroizing<[u8; 32]> when constructing SoftwareSigningKey (pay.rs).
@@ -95,7 +97,8 @@ uuid = { workspace = true }
 base64 = { workspace = true }
 # hex decode for --signer-key-data (smart-account signers --signer-external path).
 hex = { workspace = true }
-# Browser launch for the passkey-registration handoff (credentials/add_passkey.rs).
+# Browser launch for the loopback handoffs, through the private redirect file
+# of common/private_open.rs.
 webbrowser = { workspace = true }
 # WebAuthn bridge for the passkey-registration ceremony.
 stellar-agent-webauthn-bridge = { workspace = true }
@@ -111,9 +114,30 @@ tempfile = { workspace = true }
 # (profile/enroll_rpc_credential.rs).
 rpassword = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Raw prctl(2) that marks the CLI process non-dumpable before its async runtime
+# starts (process_hardening.rs).
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# The current-user-only directory that holds the private browser redirect file
+# (common/private_open.rs).
+stellar-agent-windows-identity = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+# Native child cleanup sends SIGINT on Unix.
+libc = { workspace = true }
+
 [dev-dependencies]
+# Independent TLS fixtures for signed-origin binary ceremonies.
+stellar-agent-approval-remote = { path = "../stellar-agent-approval-remote", features = ["test-helpers"] }
+# test-helpers exposes the enrollment test support: a software registrar and
+# a loopback client that drives the interactive enrollment server.
+stellar-agent-approval-ui = { path = "../stellar-agent-approval-ui", features = ["test-helpers"] }
 # WalletServer::call_stellar_pay for the CLI and MCP policy parity test.
-stellar-agent-mcp = { path = "../stellar-agent-mcp", features = ["test-helpers"] }
+stellar-agent-mcp = { path = "../stellar-agent-mcp", default-features = false, features = ["test-helpers"] }
+# Authenticate a raw policy window-state body in the reset refusal test.
+hmac = { workspace = true }
 # Build signed toolset .tar.gz fixtures in the install tests.
 flate2 = { workspace = true }
 tar = { workspace = true }
@@ -126,7 +150,7 @@ stellar-baselib = { workspace = true }
 reqwest = { workspace = true }
 # #[tokio::test] async runtime for the claim testnet-acceptance test (the
 # production [dependencies] entry only enables rt-multi-thread).
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # parse_capability_value_pub + CapabilitySet in tests.
 stellar-agent-toolsets = { path = "../stellar-agent-toolsets", features = ["test-helpers"] }
 # build_attestation_preimage in the install tests.
@@ -172,16 +196,23 @@ toml = { workspace = true }
 syn = { workspace = true, features = ["visit"] }
 
 [features]
+# On by default, so release, cargo install and source builds carry it, and
+# --version reports its state. --no-default-features builds without it.
+default = ["mainnet-write"]
+# Enables mainnet-write in core, network, and the server.
+mainnet-write = ["stellar-agent-core/mainnet-write", "stellar-agent-network/mainnet-write", "stellar-agent-mcp/mainnet-write"]
+
 # Exposes test-only helpers (e.g. run_startup_advisory_with_allowlist) under a
 # feature gate. Enabled in the [dev-dependencies] of consumers that need the
 # injection API.
-test-helpers = []
+test-helpers = ["stellar-agent-mcp/test-helpers", "stellar-agent-core/test-helpers"]
+live-platform-keyring = ["test-helpers", "stellar-agent-network/live-platform-keyring"]
 # Gate end-to-end testnet acceptance tests that require a live Friendbot + RPC.
 # These tests are NOT run under default `cargo test`; invoke with:
-#   cargo test -p stellar-agent-cli --features testnet-acceptance \
+#   cargo test -p stellar-agent-cli --no-default-features --features testnet-acceptance \
 #     --test claim_testnet_acceptance
-# This feature is CI/dev-only and MUST NOT be enabled in any release-artefact
-# feature set.
+# D13 in check-feature-discipline.py keeps this CI/dev-only feature out of
+# every product feature set.
 #
 # Forwards `test-helpers` (this crate's own gate on
 # `commands::policy_engine::owner_pubkey_raw`'s file-based owner-PUBLIC-key

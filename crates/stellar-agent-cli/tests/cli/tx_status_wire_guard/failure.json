@@ -1,0 +1,1 @@
+{"ok":false,"error":{"code":"network.rpc_unreachable","message":"RPC endpoint 'RPC_URL' is unreachable: getTransaction failed: \"ErrorObject { code: InvalidRequest, message: \\\"wire guard failure\\\", data: None }\""},"request_id":"REQUEST_ID"}

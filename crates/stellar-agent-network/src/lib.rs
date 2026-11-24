@@ -35,6 +35,12 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+#[cfg(feature = "mainnet-write")]
+const _: () = assert!(
+    stellar_agent_core::build_info::MAINNET_WRITE,
+    "the mainnet-write feature of stellar-agent-network requires stellar-agent-core/mainnet-write"
+);
+
 pub mod account;
 pub mod builder;
 pub mod client;
@@ -47,12 +53,21 @@ pub mod fee_bump_retry;
 pub mod fees;
 pub mod friendbot;
 pub mod idempotent_submit;
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod intent_view_test_helpers;
 pub mod keyring;
+pub mod mainnet;
 pub mod memo;
+pub mod operation_entry;
+pub mod operational;
+pub mod policy_engine;
 pub mod policy_state;
 pub mod policy_view;
 #[cfg(test)]
 mod poll_test_support;
+
+#[cfg(test)]
+mod muxed_destination_tests;
 pub mod redact;
 pub mod retry;
 pub mod rpc_endpoint;
@@ -61,6 +76,7 @@ pub mod sep41;
 pub mod sequence_floor;
 pub mod signing;
 pub mod simulation_audit;
+pub mod submission_flow;
 pub mod submission_record;
 pub mod submit;
 mod transaction_record;
@@ -79,24 +95,28 @@ pub use redact::{
 };
 
 pub use account::{
-    AccountView, AssetView, BASE_RESERVE_STROOPS, BalanceView, SignerView, ThresholdsView,
-    fetch_account, fetch_data_entry, fetch_trustline_entry,
+    AccountView, AssetType, AssetView, BASE_RESERVE_STROOPS, BalanceView, SignerView,
+    ThresholdsView, fetch_account, fetch_account_observed, fetch_data_entry, fetch_trustline_entry,
 };
 pub use builder::{Asset, ClassicOpBuilder};
-pub use client::{StellarRpcClient, TransactionStatusView};
-pub use context::NetworkContext;
+pub use client::{
+    ObservedTransaction, PreparedSigningLedgerRead, StellarRpcClient, TransactionStatusView,
+};
+pub use context::{MainnetEndpointFlags, MainnetWriteContext, NetworkContext};
 pub use endpoint_identity::{
-    EndpointIdentity, SUPPORTED_PROTOCOL_VERSIONS, check_protocol_version,
+    EndpointIdentity, MUXED_CONTRACT_MIN_PROTOCOL, MainnetOracle, MuxedContractAdmission,
+    SUPPORTED_PROTOCOL_VERSIONS, SigningLedgerObservation, check_protocol_version,
 };
 pub use fee_bump::{FeeBumpError, build_and_sign_fee_bump};
 pub use fee_bump_retry::submit_fee_bump_idempotent;
 #[cfg(any(test, feature = "test-loopback"))]
 pub use fees::validate_rpc_url_allowing_loopback;
 pub use fees::{
-    ALLOWED_RPC_HOSTS, CLASSIC_SINGLE_OPERATION_COUNT, ClassicFeeChoice, ClassicFeeSelection,
-    FeeDistribution, FeePercentile, FeeStatsView, RpcUrlError, check_built_fee_cap,
-    check_classic_fee_cap, classic_fee_source, fetch_fee_stats, parse_classic_fee_choice,
-    resolve_classic_fee_selection, validate_rpc_url,
+    CLASSIC_SINGLE_OPERATION_COUNT, ClassicFeeChoice, ClassicFeeSelection, FeeDistribution,
+    FeePercentile, FeeStatsView, RpcUrlError, check_built_fee_cap, check_classic_fee_cap,
+    check_contract_transfer_fee_cap, classic_fee_source, classic_fee_source_for_argument,
+    contract_transfer_fee_cap, fetch_fee_stats, parse_classic_fee_choice,
+    resolve_classic_fee_selection, validate_profile_rpc_url, validate_rpc_url,
 };
 pub use friendbot::{
     ALLOWED_FRIENDBOT_HOSTS, FriendbotResult, FriendbotUrlError, default_friendbot_url,
@@ -115,18 +135,30 @@ pub use sequence_floor::{
 };
 pub use signing::source::{signer_from_env, signer_from_ledger};
 pub use signing::wallet::signer_from_wallet;
-pub use signing::{HardwareSigningKey, Signer, SigningKey, SoftwareSigningKey, WebAuthnAssertion};
+pub use signing::{
+    AuthorizedPayloadError, HardwareSigningKey, MainnetSorobanAuthPayload, MessagePayload, Signer,
+    SigningKey, SmartAccountAuthDigest, SoftwareSigningKey, SorobanAuthPayload, TxSigningPayload,
+    WebAuthnAssertion,
+};
 pub use simulation_audit::{
     AuthEntryFingerprint, fingerprint_soroban_auth_entries, verify_auth_entries_unchanged,
 };
 pub use stellar_rpc_client::{GetLedgerEntriesResponse, LedgerEntryResult};
+pub mod signed_intent;
+pub use signed_intent::{
+    AuthSubject, BindFacts, ExposedIntent, IntentBinding, IntentProof, IntentPurpose,
+    IntentSubject, NoValueAdmission, PermittedSigning, PlannedPayload, SignedIntentPlan,
+    SignerDescriptor, SigningAdmission, SigningPayload, SubjectKind, intent_xdr_hash,
+};
 pub use submission_record::{
-    ApprovalTombstone, AuditWriterHandle, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
-    WalletSubmissionRecorder,
+    ApprovalTombstone, AttemptEnd, AuditWriterHandle, OperationAttempt, SubmissionIntent,
+    SubmissionOutcome, SubmissionRecorder, WalletSubmissionRecorder, end_operation_attempt,
 };
 pub use submit::{
-    SubmissionResult, SubmissionSignerKind, envelope_hash_hex, redact_tx_hash,
-    refuse_mainnet_write, submit_transaction_and_wait,
+    MainnetSubmitGrant, PRE_SEND_BUDGET, PreSendStage, SentByError, SubmissionResult,
+    SubmissionSignerKind, envelope_hash_hex, redact_tx_hash, refuse_mainnet_write,
+    submit_authorized_transaction_and_wait, submit_transaction_and_wait,
+    submit_transaction_and_wait_sent_by,
 };
 pub use transaction_record::TransactionRecord;
 pub use wasm_hash::{

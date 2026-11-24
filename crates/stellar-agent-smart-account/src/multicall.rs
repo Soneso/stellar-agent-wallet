@@ -35,7 +35,9 @@ use stellar_agent_core::audit_log::AuditWriter;
 use stellar_agent_core::audit_log::schema::EventKind;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::policy::v1::PolicyEngineV1;
-use stellar_agent_core::policy::v1::bundle::{BundleStateOverlay, BundleView, decompose_bundle};
+use stellar_agent_core::policy::v1::bundle::{
+    BundleStateOverlay, BundleView, decompose_bundle_calls,
+};
 use stellar_agent_core::policy::{Decision, DenyReason};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::scval::scval_variant_name;
@@ -44,7 +46,11 @@ use stellar_agent_network::signing::Signer;
 use crate::SaError;
 use crate::error::PostSubmitVerificationKind;
 use crate::managers::rules::parse_c_strkey_to_smart_account;
-use crate::submit::{MulticallCheck, ResolvedFeePerOp, SubmitInvokeArgs, submit_signed_invoke};
+use crate::signing::ledger_witness::checked_secondary_rpc_url;
+use crate::submit::{
+    DeclaredSubInvocations, MulticallCheck, ResolvedFeePerOp, SubmitInvokeArgs, refuse_mainnet_sa,
+    submit_signed_invoke,
+};
 
 // ── WASM provenance constants ─────────────────────────────────────────────────
 
@@ -171,9 +177,9 @@ pub struct MulticallInvocation {
     pub fn_name: String,
     /// JSON-encoded arguments for the function call.
     ///
-    /// Step 1 validates that this is a JSON array; individual element shapes
-    /// are not validated host-side (the router contract passes them directly
-    /// as `Vec<Val>` to the target).
+    /// Elements are integers, strings, null, or exact single-member objects
+    /// `{"scval": "<base64 XDR ScVal>"}`. The build stage decodes each element
+    /// once for valuation, the declaration and the router arguments.
     pub args_json: serde_json::Value,
 }
 
@@ -183,8 +189,8 @@ pub struct MulticallInvocation {
 ///
 /// All fields are required; there are no optional defaults. The non-`Option`
 /// `secondary_rpc_url` field enforces at the type level that the caller has
-/// configured a secondary RPC endpoint — the cross-RPC 4-way trust-anchor
-/// equality check requires it.
+/// configured a secondary RPC endpoint: the ledger witness of the signature
+/// and the cross-RPC 4-way trust-anchor equality check both require it.
 pub struct MulticallSubmitArgs<'a> {
     /// C-strkey of the smart-account contract executing the multicall.
     pub smart_account: &'a str,
@@ -198,10 +204,13 @@ pub struct MulticallSubmitArgs<'a> {
     pub signer: &'a (dyn Signer + Send + Sync),
     /// Primary Soroban RPC URL (simulate + submit).
     pub primary_rpc_url: &'a str,
-    /// Secondary Soroban RPC URL (mandatory for 4-way trust-anchor equality).
+    /// Secondary Soroban RPC URL (mandatory for the ledger witness and 4-way
+    /// trust-anchor equality).
     ///
     /// Non-`Option` by design — a secondary RPC URL is unconditionally required
-    /// for multicall submission (cross-RPC trust-anchor model).
+    /// for multicall submission (cross-RPC trust-anchor model). It must be on
+    /// a host other than the primary's and serve the same network: signing
+    /// refuses otherwise.
     pub secondary_rpc_url: &'a str,
     /// Stellar network passphrase (auth-digest + envelope signing).
     pub network_passphrase: &'a str,
@@ -259,10 +268,23 @@ fn build_bundle_recorder<'a>(
         .map_err(|e| unavailable(format!("submission receipt store unavailable: {e}")))?;
     let now_ms = stellar_agent_core::timefmt::now_unix_ms()
         .map_err(|e| unavailable(format!("submission clock unavailable: {e}")))?;
-    let entries = args
+    let sizing = args
         .policy_engine
-        .record_confirmed_bundle(tool, args.profile, bundle)
+        .record_confirmed_bundle_checked(tool, args.profile, bundle)
         .map_err(|e| unavailable(format!("bundle accounting unavailable: {e}")))?;
+    let sizing = match sizing {
+        stellar_agent_core::policy::v1::SizingOutcome::Sized(sizing) => sizing,
+        stellar_agent_core::policy::v1::SizingOutcome::Refused(reason) => {
+            return Err(SaError::PolicyDenied {
+                reason: Box::new(reason),
+            });
+        }
+        _ => {
+            return Err(SaError::IntentRecordUnavailable {
+                class: "policy_unavailable",
+            });
+        }
+    };
     let legs = bundle
         .inners
         .iter()
@@ -278,14 +300,15 @@ fn build_bundle_recorder<'a>(
         Some(args.chain_id.to_owned()),
         stellar_agent_core::audit_log::PolicyDecision::Allow,
         legs,
-        entries,
+        sizing.entries().to_vec(),
         receipts,
         PersistedWindowStore::for_profile(profile_name),
         args.audit_writer.clone(),
         None,
         args.request_id,
         now_ms,
-    ))
+    )
+    .with_signing_sizing(sizing))
 }
 
 // ── MulticallResult ───────────────────────────────────────────────────────────
@@ -486,13 +509,11 @@ impl MulticallRegistry {
         // Honour the env-var override (test isolation + operator flexibility).
         // The const `STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV` is the canonical
         // env-var name; rustdoc on the const describes this behaviour.
-        let actual_path: std::borrow::Cow<'_, Path> =
-            match std::env::var(STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV) {
-                Ok(override_str) if !override_str.is_empty() => {
-                    std::borrow::Cow::Owned(PathBuf::from(override_str))
-                }
-                _ => std::borrow::Cow::Borrowed(config_path),
-            };
+        let actual_path: std::borrow::Cow<'_, Path> = crate::verifiers::networks_toml_override()
+            .map_or(
+                std::borrow::Cow::Borrowed(config_path),
+                std::borrow::Cow::Owned,
+            );
         let actual_path: &Path = actual_path.as_ref();
 
         let mut registry = Self {
@@ -505,20 +526,19 @@ impl MulticallRegistry {
             return Ok(registry);
         }
 
-        let contents =
-            std::fs::read_to_string(actual_path).map_err(|e| SaError::NetworksTomlIo {
-                source: e,
-                path: actual_path.to_path_buf(),
-            })?;
+        let contents = std::fs::read_to_string(actual_path)
+            .map_err(|e| SaError::NetworksTomlIo { source: e })?;
 
         let file: MulticallRegistryFile =
             toml::from_str(&contents).map_err(|e| SaError::NetworksTomlParse {
-                source: e,
+                position: stellar_agent_core::profile::toml_diagnostic::toml_error_position(
+                    &contents,
+                    e.span().map(|span| span.start),
+                ),
                 path: actual_path.to_path_buf(),
             })?;
 
         const WARNING_CAP: usize = 32;
-        const WARNING_TEXT_CAP: usize = 256;
 
         for (safename, raw) in file.multicall {
             // Validate C-strkey address.
@@ -526,10 +546,7 @@ impl MulticallRegistry {
                 if registry.partial_load_warnings.len() < WARNING_CAP {
                     registry.partial_load_warnings.push(RegistryLoadWarning {
                         network_safename: safename.clone(),
-                        reason: crate::error::truncate_to_byte_cap(
-                            &format!("invalid C-strkey address: {}", raw.address),
-                            WARNING_TEXT_CAP,
-                        ),
+                        reason: "address must be a C-strkey".to_owned(),
                     });
                 }
                 warn!(
@@ -544,10 +561,7 @@ impl MulticallRegistry {
                 if registry.partial_load_warnings.len() < WARNING_CAP {
                     registry.partial_load_warnings.push(RegistryLoadWarning {
                         network_safename: safename.clone(),
-                        reason: crate::error::truncate_to_byte_cap(
-                            &format!("invalid SHA-256 hex: {}", raw.wasm_sha256),
-                            WARNING_TEXT_CAP,
-                        ),
+                        reason: "wasm_sha256 must be 64 hex characters".to_owned(),
                     });
                 }
                 warn!(
@@ -562,15 +576,7 @@ impl MulticallRegistry {
                 if registry.partial_load_warnings.len() < WARNING_CAP {
                     registry.partial_load_warnings.push(RegistryLoadWarning {
                         network_safename: safename.clone(),
-                        reason: crate::error::truncate_to_byte_cap(
-                            &format!(
-                                "wasm_sha256 {} != MULTICALL_WASM_SHA256 {}; \
-                                 lookup will refuse (update wasm_sha256 after re-vendoring)",
-                                &raw.wasm_sha256[..8.min(raw.wasm_sha256.len())],
-                                &MULTICALL_WASM_SHA256[..8],
-                            ),
-                            WARNING_TEXT_CAP,
-                        ),
+                        reason: "wasm_sha256 does not match MULTICALL_WASM_SHA256; lookup will refuse (update wasm_sha256 after re-vendoring)".to_owned(),
                     });
                 }
                 warn!(
@@ -615,9 +621,7 @@ impl MulticallRegistry {
 
         if entry.wasm_sha256 != MULTICALL_WASM_SHA256 {
             return Err(SaError::MulticallSha256Drift {
-                attempted: entry.wasm_sha256.clone(),
                 expected: MULTICALL_WASM_SHA256.to_owned(),
-                existing: Some(entry.wasm_sha256.clone()),
             });
         }
 
@@ -640,9 +644,7 @@ impl MulticallRegistry {
         // Binary-const trust-anchor enforcement at register-time.
         if entry.wasm_sha256 != MULTICALL_WASM_SHA256 {
             return Err(SaError::MulticallSha256Drift {
-                attempted: entry.wasm_sha256.clone(),
                 expected: MULTICALL_WASM_SHA256.to_owned(),
-                existing: None,
             });
         }
 
@@ -654,9 +656,7 @@ impl MulticallRegistry {
         {
             if existing.wasm_sha256 != entry.wasm_sha256 {
                 return Err(SaError::MulticallSha256Drift {
-                    attempted: entry.wasm_sha256.clone(),
                     expected: MULTICALL_WASM_SHA256.to_owned(),
-                    existing: Some(existing.wasm_sha256.clone()),
                 });
             }
             // Same SHA → idempotent; no mutation.
@@ -752,13 +752,9 @@ impl MulticallRegistry {
                 std::io::ErrorKind::InvalidInput,
                 "registry path has no parent directory",
             ),
-            path: path.clone(),
         })?;
 
-        create_dir_0700(parent).map_err(|e| SaError::NetworksTomlIo {
-            source: e,
-            path: parent.to_path_buf(),
-        })?;
+        create_dir_0700(parent).map_err(|e| SaError::NetworksTomlIo { source: e })?;
 
         // Build the multicall section of the TOML file.
         let mut multicall_map = std::collections::HashMap::new();
@@ -772,13 +768,10 @@ impl MulticallRegistry {
 
         let toml_str = toml::to_string_pretty(&file).map_err(|e| SaError::NetworksTomlIo {
             source: std::io::Error::other(e.to_string()),
-            path: path.clone(),
         })?;
 
-        atomic_write_0600(path, toml_str.as_bytes()).map_err(|e| SaError::NetworksTomlIo {
-            source: e,
-            path: path.clone(),
-        })?;
+        atomic_write_0600(path, toml_str.as_bytes())
+            .map_err(|e| SaError::NetworksTomlIo { source: e })?;
 
         Ok(())
     }
@@ -823,8 +816,9 @@ impl stellar_agent_core::profile::loader::MulticallRegistryHook for MulticallReg
 /// All four must agree byte-exact.
 ///
 /// Returns `Err(SaError::MulticallFailed { phase: "rpc_divergence", .. })` if
-/// any pair disagrees. The error message identifies which leg diverged with
-/// first-8-hex prefix of the observed hash (no full URL, no full hash).
+/// any pair disagrees. The error message names the leg that diverged and the
+/// first eight hex characters of [`MULTICALL_WASM_SHA256`]; the refused hash
+/// is named in no part.
 pub(crate) fn cross_rpc_compare_wasm_hashes(
     registry_sha256: &str,
     primary_on_chain_hex: &str,
@@ -836,8 +830,7 @@ pub(crate) fn cross_rpc_compare_wasm_hashes(
         return Err(SaError::MulticallFailed {
             phase: "rpc_divergence",
             redacted_reason: format!(
-                "registry leg reported {}; expected {}",
-                &registry_sha256[..8.min(registry_sha256.len())],
+                "registry leg must report the multicall router hash {}",
                 &expected[..8],
             ),
             post_submit_kind: None,
@@ -848,8 +841,7 @@ pub(crate) fn cross_rpc_compare_wasm_hashes(
         return Err(SaError::MulticallFailed {
             phase: "rpc_divergence",
             redacted_reason: format!(
-                "primary-RPC leg reported {}; expected {}",
-                &primary_on_chain_hex[..8.min(primary_on_chain_hex.len())],
+                "primary-RPC leg must report the multicall router hash {}",
                 &expected[..8],
             ),
             post_submit_kind: None,
@@ -860,8 +852,7 @@ pub(crate) fn cross_rpc_compare_wasm_hashes(
         return Err(SaError::MulticallFailed {
             phase: "rpc_divergence",
             redacted_reason: format!(
-                "secondary-RPC leg reported {}; expected {}",
-                &secondary_on_chain_hex[..8.min(secondary_on_chain_hex.len())],
+                "secondary-RPC leg must report the multicall router hash {}",
                 &expected[..8],
             ),
             post_submit_kind: None,
@@ -1019,17 +1010,27 @@ pub(crate) async fn fetch_wasm_hash_via_rpc(
 ///    and expiration ledgers and setting signatures to void on cloned entries.
 ///    Credential addresses, source-account credentials, and entire invocation
 ///    trees stay byte-exact.
-/// 2. Transaction data as XDR after zeroing temporary read-write nonce keys that
-///    match the simulation's address credentials. The host records consumed
-///    nonces in the footprint. A persistent read-write nonce key, or a
+/// 2. Transaction data field by field after zeroing temporary read-write nonce
+///    keys that match the simulation's address credentials. The host records
+///    consumed nonces in the footprint. A persistent read-write nonce key, or a
 ///    read-write nonce key that matches no address credential of its own
 ///    simulation, refuses. A nonce key in another access mode stays unchanged,
-///    so the byte-exact comparison refuses it when its nonce differs between
-///    the simulations. All other fields stay byte-exact.
+///    so the comparison refuses it when its nonce differs between the
+///    simulations. Two nonnegative `resource_fee` values hold within the same
+///    5 percent tolerance as `min_resource_fee`, because the rent component
+///    depends on the ledger at which the endpoint simulated. A pair that
+///    includes a negative value is compared exactly. Every other field is
+///    compared exactly.
 /// 3. `min_resource_fee` within 5 percent numeric tolerance.
 ///
 /// Ledger heights can differ between RPCs and are excluded from this comparison.
-/// Every refusal is a `MulticallFailed` error with phase `rpc_divergence`.
+/// Every refusal is a `MulticallFailed` error with phase `rpc_divergence`. A
+/// transaction-data refusal names each differing part in fixed words
+/// (`footprint`, `instructions`, `read bytes`, `write bytes`, `resource fee`).
+/// It names `resource fee` when nonnegative fees exceed the tolerance or when
+/// unequal fees include a negative value. A fee refusal names
+/// `min resource fee`. Neither of these two refusals carries a value of either
+/// simulation.
 pub(crate) fn cross_rpc_compare_simulate_responses(
     primary: &stellar_rpc_client::SimulateTransactionResponse,
     secondary: &stellar_rpc_client::SimulateTransactionResponse,
@@ -1110,16 +1111,16 @@ pub(crate) fn cross_rpc_compare_simulate_responses(
         (Some(p_td), Some(s_td)) => {
             let p_td = normalize_simulated_nonce_keys(p_td, &primary_entries)?;
             let s_td = normalize_simulated_nonce_keys(s_td, &secondary_entries)?;
-            // Compare as XDR base64 strings.
-            // `SorobanTransactionData::to_xdr_base64` is from `stellar_xdr::WriteXdr`.
-            let p_xdr = p_td.to_xdr_base64(Limits::none()).unwrap_or_default();
-            let s_xdr = s_td.to_xdr_base64(Limits::none()).unwrap_or_default();
-            if p_xdr != s_xdr {
+            // `diverging_transaction_data_parts` destructures every field, so no
+            // field of the transaction data escapes the comparison.
+            let parts = diverging_transaction_data_parts(&p_td, &s_td);
+            if !parts.is_empty() {
                 return Err(SaError::MulticallFailed {
                     phase: "rpc_divergence",
-                    redacted_reason:
-                        "footprint (transaction_data) diverges between primary and secondary RPC"
-                            .to_owned(),
+                    redacted_reason: format!(
+                        "transaction_data diverges between primary and secondary RPC: {}",
+                        parts.join(", ")
+                    ),
                     post_submit_kind: None,
                 });
             }
@@ -1130,9 +1131,71 @@ pub(crate) fn cross_rpc_compare_simulate_responses(
     let primary_fee = primary.min_resource_fee;
     let secondary_fee = secondary.min_resource_fee;
 
-    check_numeric_tolerance("min_resource_fee", primary_fee, secondary_fee)?;
+    check_numeric_tolerance("min resource fee", primary_fee, secondary_fee)?;
 
     Ok(())
+}
+
+/// Names the parts of two simulations' transaction data that differ, in a
+/// fixed order and fixed words.
+///
+/// The resource fee differs only beyond the 5 percent tolerance of
+/// `beyond_five_percent`. A negative fee on either side is compared exactly.
+/// Every other field is compared exactly. The destructuring names every field,
+/// so a field the XDR gains fails to compile here rather than diverging
+/// unnamed. The extension lists archived entries by their index in the
+/// read-write footprint, so a differing extension is reported as `footprint`.
+/// The words carry no value of either simulation.
+fn diverging_transaction_data_parts(
+    primary: &stellar_xdr::SorobanTransactionData,
+    secondary: &stellar_xdr::SorobanTransactionData,
+) -> Vec<&'static str> {
+    let stellar_xdr::SorobanTransactionData {
+        ext: primary_ext,
+        resources:
+            stellar_xdr::SorobanResources {
+                footprint: primary_footprint,
+                instructions: primary_instructions,
+                disk_read_bytes: primary_read_bytes,
+                write_bytes: primary_write_bytes,
+            },
+        resource_fee: primary_resource_fee,
+    } = primary;
+    let stellar_xdr::SorobanTransactionData {
+        ext: secondary_ext,
+        resources:
+            stellar_xdr::SorobanResources {
+                footprint: secondary_footprint,
+                instructions: secondary_instructions,
+                disk_read_bytes: secondary_read_bytes,
+                write_bytes: secondary_write_bytes,
+            },
+        resource_fee: secondary_resource_fee,
+    } = secondary;
+    // The rent component of the fee depends on the ledger at which each endpoint simulates.
+    let fee_differs = match (
+        u64::try_from(*primary_resource_fee),
+        u64::try_from(*secondary_resource_fee),
+    ) {
+        (Ok(primary_fee), Ok(secondary_fee)) => beyond_five_percent(primary_fee, secondary_fee),
+        _ => primary_resource_fee != secondary_resource_fee,
+    };
+    [
+        (
+            primary_footprint != secondary_footprint || primary_ext != secondary_ext,
+            "footprint",
+        ),
+        (
+            primary_instructions != secondary_instructions,
+            "instructions",
+        ),
+        (primary_read_bytes != secondary_read_bytes, "read bytes"),
+        (primary_write_bytes != secondary_write_bytes, "write bytes"),
+        (fee_differs, "resource fee"),
+    ]
+    .into_iter()
+    .filter_map(|(differs, part)| differs.then_some(part))
+    .collect()
 }
 
 /// Normalizes the host's consumed nonce keys in a simulation's transaction data.
@@ -1144,7 +1207,7 @@ pub(crate) fn cross_rpc_compare_simulate_responses(
 /// and nonce, and its nonce is then zeroed. A persistent read-write nonce key,
 /// or one that matches no address credential of its own simulation, refuses
 /// with phase `rpc_divergence`. A nonce key in another access mode stays
-/// unchanged, so the byte-exact comparison refuses it with the same phase when
+/// unchanged, so the comparison refuses it with the same phase when
 /// its nonce differs between the simulations. Addresses, access modes, key
 /// counts, and resources stay exact.
 fn normalize_simulated_nonce_keys(
@@ -1199,7 +1262,59 @@ fn normalize_simulated_nonce_keys(
 /// - `SaError::MulticallFailed { phase: "build", .. }` on any XDR encoding
 ///   failure (invalid C-strkey, invalid symbol, argument encoding error).
 pub fn build_exec_invocations(bundle: &[MulticallInvocation]) -> Result<Vec<ScVal>, SaError> {
-    use stellar_xdr::{ContractId, Hash, ScAddress};
+    exec_invocations_from_calls(&bundle_calls(bundle)?)
+}
+
+/// Encodes the declared calls for the router without reinterpreting arguments.
+fn exec_invocations_from_calls(calls: &[InvokeContractArgs]) -> Result<Vec<ScVal>, SaError> {
+    calls
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(idx, call)| {
+            // The (Address, Symbol, Vec<Val>) tuple as a ScVal::Vec.
+            let tuple_elements: VecM<ScVal> = vec![
+                ScVal::Address(call.contract_address),
+                ScVal::Symbol(call.function_name),
+                ScVal::Vec(Some(call.args.into())),
+            ]
+            .try_into()
+            .map_err(|_| SaError::MulticallFailed {
+                phase: "build",
+                redacted_reason: format!("inner[{idx}]: tuple VecM encoding failed"),
+                post_submit_kind: None,
+            })?;
+            Ok(ScVal::Vec(Some(tuple_elements.into())))
+        })
+        .collect()
+}
+
+/// Encodes each bundle entry as the call the router's `exec` dispatches:
+/// target contract, function name and arguments.
+///
+/// [`build_exec_invocations`] encodes the same calls for the router's
+/// `invocations` argument, and [`submit_multicall_bundle`] declares them as
+/// the sub-invocations the wallet authorizes under `exec`, so the signed
+/// tree holds only calls the bundle names.
+///
+/// # Errors
+///
+/// - `SaError::MulticallFailed { phase: "build", .. }` on any XDR encoding
+///   failure (invalid C-strkey, invalid symbol, argument encoding error).
+fn bundle_calls(bundle: &[MulticallInvocation]) -> Result<Vec<InvokeContractArgs>, SaError> {
+    bundle
+        .iter()
+        .enumerate()
+        .map(|(idx, invocation)| bundle_call(idx, invocation))
+        .collect()
+}
+
+/// Encodes one invocation for valuation, authorization and router dispatch.
+fn bundle_call(
+    idx: usize,
+    invocation: &MulticallInvocation,
+) -> Result<InvokeContractArgs, SaError> {
+    use stellar_xdr::{ContractId, Hash};
 
     let build_err = |reason: String| SaError::MulticallFailed {
         phase: "build",
@@ -1207,39 +1322,33 @@ pub fn build_exec_invocations(bundle: &[MulticallInvocation]) -> Result<Vec<ScVa
         post_submit_kind: None,
     };
 
-    let mut result = Vec::with_capacity(bundle.len());
+    // 1. The target contract address.
+    let contract_strkey = stellar_strkey::Contract::from_string(&invocation.target_contract)
+        .map_err(|e| {
+            build_err(format!(
+                "inner[{idx}]: invalid target_contract C-strkey: {e}"
+            ))
+        })?;
 
-    for (idx, invocation) in bundle.iter().enumerate() {
-        // 1. Encode the contract address as ScVal::Address.
-        let contract_strkey = stellar_strkey::Contract::from_string(&invocation.target_contract)
-            .map_err(|e| {
-                build_err(format!(
-                    "inner[{idx}]: invalid target_contract C-strkey: {e}"
-                ))
-            })?;
-        let contract_id = ContractId(Hash(contract_strkey.0));
-        let address_val = ScVal::Address(ScAddress::Contract(contract_id));
-
-        // 2. Encode the function name as ScVal::Symbol.
-        let symbol_str = validate_soroban_symbol(&invocation.fn_name)
-            .map_err(|e| build_err(format!("inner[{idx}]: invalid fn_name symbol: {e}")))?;
-        let symbol_val =
-            ScVal::Symbol(ScSymbol(symbol_str.as_bytes().try_into().map_err(
-                |_| build_err(format!("inner[{idx}]: fn_name symbol encoding failed")),
-            )?));
-
-        // 3. Encode the JSON args as ScVal::Vec of ScVal elements.
-        let args = json_args_to_scval_vec(&invocation.args_json, idx)
-            .map_err(|e| build_err(format!("inner[{idx}]: args encoding failed: {e}")))?;
-
-        // 4. Build the (Address, Symbol, Vec<Val>) tuple as a ScVal::Vec.
-        let tuple_elements: VecM<ScVal> = vec![address_val, symbol_val, args]
+    // 2. The function name as a Soroban symbol.
+    let symbol_str = validate_soroban_symbol(&invocation.fn_name)
+        .map_err(|e| build_err(format!("inner[{idx}]: invalid fn_name symbol: {e}")))?;
+    let function_name = ScSymbol(
+        symbol_str
+            .as_bytes()
             .try_into()
-            .map_err(|_| build_err(format!("inner[{idx}]: tuple VecM encoding failed")))?;
-        result.push(ScVal::Vec(Some(tuple_elements.into())));
-    }
+            .map_err(|_| build_err(format!("inner[{idx}]: fn_name symbol encoding failed")))?,
+    );
 
-    Ok(result)
+    // 3. The JSON args as the call's argument vector.
+    let args = json_args_to_scval_vec(&invocation.args_json, idx)
+        .map_err(|e| build_err(format!("inner[{idx}]: args encoding failed: {e}")))?;
+
+    Ok(InvokeContractArgs {
+        contract_address: ScAddress::Contract(ContractId(Hash(contract_strkey.0))),
+        function_name,
+        args,
+    })
 }
 
 // ── submit_multicall_bundle ───────────────────────────────────────────────────
@@ -1251,7 +1360,8 @@ pub fn build_exec_invocations(bundle: &[MulticallInvocation]) -> Result<Vec<ScVa
 /// 1. **build** — validate bundle size ∈ [1, `MULTICALL_BUNDLE_CAP`]; validate
 ///    each invocation shape (C-strkey target, symbol fn_name, JSON args). Fail-CLOSED
 ///    `MulticallFailed { phase: "build" }` + emit `SaMulticallBundleDenied`.
-/// 2. **policy_gate** — decompose bundle via `decompose_bundle` → build `BundleView`
+/// 2. **policy_gate**: decompose the encoded calls via `decompose_bundle_calls`,
+///    then build `BundleView`
 ///    → call `policy_engine.evaluate_bundle`. Only `Allow` proceeds to submission.
 ///    Every other decision refuses with `MulticallFailed { phase: "policy_gate" }`
 ///    and emits `SaMulticallBundleDenied`: a `Deny` carries its reason code and
@@ -1308,16 +1418,6 @@ pub async fn submit_multicall_bundle(
     }
 
     let smart_account_redacted = redact_strkey_first5_last5(args.smart_account);
-
-    // Warn when primary and secondary RPC URLs are identical. The trust-anchor
-    // check degrades to single-RPC when both point to the same endpoint.
-    if args.primary_rpc_url == args.secondary_rpc_url {
-        warn!(
-            smart_account = %smart_account_redacted,
-            "submit_multicall_bundle: primary_rpc_url == secondary_rpc_url; \
-             cross-RPC trust-anchor degrades to single-RPC verification"
-        );
-    }
 
     // Helper: emit a denied audit row.
     let chain_id = args.chain_id;
@@ -1390,7 +1490,8 @@ pub async fn submit_multicall_bundle(
         });
     }
 
-    // Per-invocation shape validation.
+    // Validate and encode every call before policy evaluation.
+    let mut declared_calls = Vec::with_capacity(args.bundle.len());
     for (idx, inv) in args.bundle.iter().enumerate() {
         if stellar_strkey::Contract::from_string(&inv.target_contract).is_err() {
             let _ = emit_denied(
@@ -1420,10 +1521,9 @@ pub async fn submit_multicall_bundle(
             );
             return Err(SaError::MulticallFailed {
                 phase: "build",
-                redacted_reason: format!(
-                    "inner[{idx}]: fn_name '{}' is not a valid Soroban symbol",
-                    inv.fn_name
-                ),
+                redacted_reason: "fn_name must be a non-empty Soroban symbol of at most 32 bytes \
+                                  using only [A-Za-z0-9_]; correct the bundle function name."
+                    .to_owned(),
                 post_submit_kind: None,
             });
         }
@@ -1443,25 +1543,51 @@ pub async fn submit_multicall_bundle(
                 post_submit_kind: None,
             });
         }
+        match bundle_call(idx, inv) {
+            Ok(call) => declared_calls.push(call),
+            Err(error) => {
+                let _ = emit_denied(
+                    &args.audit_writer,
+                    Some(u32::try_from(idx).unwrap_or(u32::MAX)),
+                    None,
+                    None,
+                    "multicall.invalid_args_json".to_owned(),
+                    "build",
+                    inner_count,
+                );
+                return Err(error);
+            }
+        }
     }
 
     // ── Step 2: policy gate ───────────────────────────────────────────────────
 
-    // Decompose bundle into typed descriptors for policy evaluation.
-    let raw_bundle: Vec<(String, String, Vec<serde_json::Value>)> = args
-        .bundle
-        .iter()
-        .map(|inv| {
-            let args_vec = if let Some(arr) = inv.args_json.as_array() {
-                arr.clone()
-            } else {
-                Vec::new()
-            };
-            (inv.target_contract.clone(), inv.fn_name.clone(), args_vec)
-        })
-        .collect();
+    // The ledger witness and the trust anchor need a second endpoint. A
+    // configuration that cannot supply one refuses here, before the policy
+    // gate spends anything on a bundle that cannot be signed. A mainnet write
+    // keeps its own refusal, which the submit path raises first.
+    if refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url).is_ok()
+        && let Err(refusal) = checked_secondary_rpc_url(
+            args.primary_rpc_url,
+            Some(args.secondary_rpc_url),
+            args.network_passphrase,
+        )
+    {
+        let _ = emit_denied(
+            &args.audit_writer,
+            None,
+            None,
+            None,
+            format!("multicall.{}", refusal.wire_code()),
+            "policy_gate",
+            inner_count,
+        );
+        return Err(refusal);
+    }
 
-    let descriptors = decompose_bundle(&raw_bundle);
+    // The gate values the encoded calls the wallet declares and dispatches.
+    let caller_scaddr = parse_c_strkey_to_smart_account(args.smart_account)?;
+    let descriptors = decompose_bundle_calls(&declared_calls, &caller_scaddr);
 
     let overlay = BundleStateOverlay::default();
     let bundle_view = BundleView {
@@ -1491,6 +1617,29 @@ pub async fn submit_multicall_bundle(
         "rule_id": args.rule_id,
     });
 
+    let window = stellar_agent_network::policy_state::PersistedWindowStore::for_profile(
+        args.policy_engine.profile_name(),
+    );
+    window.observe_before_policy(args.profile).await;
+    args.policy_engine
+        .state_store()
+        .clear()
+        .map_err(|error| SaError::MulticallFailed {
+            phase: "policy_gate",
+            redacted_reason: error.to_string(),
+            post_submit_kind: None,
+        })?;
+    window
+        .load_into(
+            args.policy_engine.profile_name(),
+            args.profile,
+            args.policy_engine.state_store(),
+        )
+        .map_err(|error| SaError::MulticallFailed {
+            phase: "policy_gate",
+            redacted_reason: error.to_string(),
+            post_submit_kind: None,
+        })?;
     let policy_decision = args
         .policy_engine
         .evaluate_bundle(&tool, &eval_args, args.profile, &bundle_view)
@@ -1528,7 +1677,7 @@ pub async fn submit_multicall_bundle(
     })?;
 
     // Build the exec invocations XDR arg.
-    let exec_invocations_xdr = build_exec_invocations(&args.bundle)?;
+    let exec_invocations_xdr = exec_invocations_from_calls(&declared_calls)?;
 
     // Build the InvokeContractArgs for the router's `exec` function.
     let exec_invocations_scval: VecM<ScVal> =
@@ -1540,8 +1689,6 @@ pub async fn submit_multicall_bundle(
                 post_submit_kind: None,
             })?;
 
-    // Caller address (smart_account).
-    let caller_scaddr = parse_c_strkey_to_smart_account(args.smart_account)?;
     let caller_scval = ScVal::Address(caller_scaddr);
 
     // Build the args for `exec(caller, invocations)`.
@@ -1597,13 +1744,19 @@ pub async fn submit_multicall_bundle(
     let recorder = build_bundle_recorder(&args, &tool, &bundle_view)?;
 
     // The transaction invokes the router's `exec`; the wallet is the
-    // authorizing address whose credentials sign the simulated tree.
+    // authorizing address whose credentials sign `exec` as the root, with the
+    // bundle's wallet-authorized calls under it.
     let submit_result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
             .target_contract(&registry_entry.address)
             .auth_address(args.smart_account)
             .auth_rule_ids(&auth_rule_ids)
             .host_function(host_function)
+            // The calls the gate valued and the router argument carries,
+            // declared as the sub-invocations the wallet authorizes under
+            // `exec`: a simulated subtree holding any other call is refused
+            // before signing.
+            .sub_invocations(DeclaredSubInvocations::Calls(&declared_calls))
             .signer(args.signer)
             .primary_rpc_url(args.primary_rpc_url)
             .secondary_rpc_url(args.secondary_rpc_url)
@@ -1615,7 +1768,7 @@ pub async fn submit_multicall_bundle(
             .emit_observability_logs(true)
             .required_checks(&["multicall"])
             .multicall_check(multicall_check)
-            .submission_recorder(&recorder)
+            .admission(stellar_agent_network::SigningAdmission::Recorded(&recorder))
             .pin_check(crate::submit::PinCheck {
                 signers_manager: args.signers_manager,
                 request_id: args.request_id,
@@ -1773,13 +1926,15 @@ fn validate_soroban_symbol(s: &str) -> Result<&str, String> {
     }
     if s.len() > 32 {
         return Err(format!(
-            "symbol '{}' exceeds 32-byte Soroban limit",
-            &s[..32.min(s.len())]
+            "symbol must contain at most 32 bytes; got {}",
+            s.len()
         ));
     }
-    for c in s.chars() {
+    for (offset, c) in s.char_indices() {
         if !c.is_ascii_alphanumeric() && c != '_' {
-            return Err(format!("symbol contains invalid character '{c}'"));
+            return Err(format!(
+                "symbol contains an invalid character at byte offset {offset}; expected [A-Za-z0-9_]"
+            ));
         }
     }
     Ok(s)
@@ -1793,10 +1948,11 @@ fn validate_soroban_symbol(s: &str) -> Result<&str, String> {
 /// |------------|-----------|----------------|
 /// | `Number` (non-negative, fits u64) | `as_u64()` succeeds | `I128(Int128Parts { hi: 0, lo: v })` |
 /// | `Number` (negative, fits i64) | `as_i64()` succeeds and value is negative | `I128(Int128Parts { hi: -1, lo: v as u64 })` (sign-extended) |
-/// | `String` | — | `ScVal::String` |
-/// | `Null` | (empty args list sentinel) | produces empty `Vec<Val>` |
+/// | `String` | any UTF-8 | `ScVal::String` |
+/// | `Null` | top level or element | empty argument list or `ScVal::Void` |
 /// | `Array` | (only at top level; NOT nested) | the elements of the array |
-/// | Any other shape (bool, object, nested array) | — | **explicit error** |
+/// | `{"scval": "<base64 XDR ScVal>"}` | exactly one member, bounded XDR | decoded argument value |
+/// | Any other shape (bool, other object, nested array) | unsupported | explicit error |
 ///
 /// Non-primitive JSON shapes are rejected with an explicit error rather than
 /// silently converting to `ScVal::Void`. The router passes arguments directly
@@ -1817,7 +1973,10 @@ fn validate_soroban_symbol(s: &str) -> Result<&str, String> {
 /// # Errors
 ///
 /// Returns a description string on encoding failure or unsupported JSON shape.
-fn json_args_to_scval_vec(args_json: &serde_json::Value, idx: usize) -> Result<ScVal, String> {
+fn json_args_to_scval_vec(
+    args_json: &serde_json::Value,
+    idx: usize,
+) -> Result<VecM<ScVal>, String> {
     use stellar_xdr::{Int128Parts, ScString};
 
     let arr = match args_json {
@@ -1855,21 +2014,48 @@ fn json_args_to_scval_vec(args_json: &serde_json::Value, idx: usize) -> Result<S
                     format!("inner[{idx}] arg[{elem_idx}]: string arg too long")
                 })?))
             }
+            serde_json::Value::Object(object)
+                if object.len() == 1 && object.contains_key("scval") =>
+            {
+                use stellar_xdr::ReadXdr as _;
+                let encoded = object["scval"].as_str().ok_or_else(|| {
+                    format!("inner[{idx}] arg[{elem_idx}]: scval must be a base64 XDR string")
+                })?;
+                let value = ScVal::from_xdr_base64(
+                    encoded,
+                    stellar_agent_xdr_limits::untrusted_decode_limits(encoded.len()),
+                )
+                .map_err(|_| {
+                    format!("inner[{idx}] arg[{elem_idx}]: scval must be a base64 XDR string")
+                })?;
+                if stellar_agent_core::sc_address::scval_has_muxed_contract(&value) {
+                    return Err(format!(
+                        "inner[{idx}] arg[{elem_idx}]: {}",
+                        stellar_agent_core::sc_address::MUXED_CONTRACT_REFUSAL
+                    ));
+                }
+                if matches!(
+                    value,
+                    ScVal::ContractInstance(_)
+                        | ScVal::LedgerKeyContractInstance
+                        | ScVal::LedgerKeyNonce(_)
+                ) {
+                    return Err(format!(
+                        "inner[{idx}] arg[{elem_idx}]: ledger-only ScVal is not a contract argument"
+                    ));
+                }
+                value
+            }
             serde_json::Value::Bool(_)
             | serde_json::Value::Object(_)
             | serde_json::Value::Array(_) => {
-                // Non-primitive JSON shapes are explicitly refused.  The caller
-                // must encode complex args as pre-serialised XDR base64 strings
-                // or decompose them into scalar fields before passing to this API.
                 let kind = match elem {
                     serde_json::Value::Bool(_) => "Bool",
                     serde_json::Value::Object(_) => "Object",
-                    serde_json::Value::Array(_) => "Array (nested)",
-                    _ => "unknown",
+                    _ => "Array (nested)",
                 };
                 return Err(format!(
-                    "inner[{idx}] arg[{elem_idx}]: unsupported JSON argument shape '{kind}'; \
-                     encode complex args as pre-serialised XDR base64 strings"
+                    "inner[{idx}] arg[{elem_idx}]: unsupported {kind}; use integers, strings or null; use {{\"scval\": \"<base64 XDR ScVal>\"}} for any other type"
                 ));
             }
             serde_json::Value::Null => {
@@ -1881,11 +2067,9 @@ fn json_args_to_scval_vec(args_json: &serde_json::Value, idx: usize) -> Result<S
         elements.push(scval);
     }
 
-    let vecm: VecM<ScVal> = elements
+    elements
         .try_into()
-        .map_err(|_| format!("inner[{idx}] args VecM encoding failed"))?;
-
-    Ok(ScVal::Vec(Some(vecm.into())))
+        .map_err(|_| format!("inner[{idx}] args VecM encoding failed"))
 }
 
 /// Builds `MulticallInnerResult` values from the confirmed on-chain return value.
@@ -2056,10 +2240,11 @@ struct SubmitDeniedRow {
 ///
 /// - [`SaError::SubmissionUnresolved`] and [`SaError::PolicyDenied`] pass
 ///   through unwrapped with no row. The recorder's closing row records them.
-/// - [`SaError::MainnetWriteForbidden`] passes through unwrapped and keeps the
-///   canonical code. Its row has phase `policy_gate` and deny code
-///   `multicall.network.mainnet_write_forbidden`: the wallet refused it, and
-///   no transaction was sent.
+/// - [`SaError::MainnetWriteForbidden`], [`SaError::LedgerWitnessUnavailable`]
+///   and [`SaError::LedgerWitnessMismatch`] pass through unwrapped and keep
+///   their codes. Each row has phase `policy_gate` and deny code
+///   `multicall.<wire code>`: the wallet refused, nothing was signed after the
+///   refusal, and no transaction was sent.
 /// - A nested [`SaError::MulticallFailed`] keeps its phase, reason, and
 ///   post-submit kind, and writes a denied row at that phase.
 /// - Every other error writes a row at the phase of
@@ -2068,11 +2253,12 @@ struct SubmitDeniedRow {
 fn classify_submit_failure(sa_err: SaError) -> (Option<SubmitDeniedRow>, SaError) {
     match sa_err {
         SaError::SubmissionUnresolved { .. } => (None, sa_err),
-        // A reservation the window refuses is a policy denial. It carries the
-        // gate's own code, the recorder's closing row records it, and nothing
-        // was sent, so it passes through unwrapped and writes no second row.
-        SaError::PolicyDenied { .. } => (None, sa_err),
-        SaError::MainnetWriteForbidden => (
+        SaError::PolicyDenied { .. }
+        | SaError::IntentRecordUnavailable { .. }
+        | SaError::IntentBindingMismatch { .. }
+        | SaError::MainnetWriteForbidden
+        | SaError::LedgerWitnessUnavailable { .. }
+        | SaError::LedgerWitnessMismatch { .. } => (
             Some(SubmitDeniedRow {
                 deny_wire_code: format!("multicall.{}", sa_err.wire_code()),
                 refusal_phase: "policy_gate",
@@ -2106,13 +2292,16 @@ fn classify_submit_failure(sa_err: SaError) -> (Option<SubmitDeniedRow>, SaError
 ///   `rule_lock_missing`, `rule_locks_without_pin_check`, `baseline_read`,
 ///   `signer_set_compare`) → `"policy_gate"`; at any other stage → `"sign"`
 ///   (auth-entry assembly failure).
-/// - `"sa.rule_id_mismatch"` / `"sa.simulation_divergence"` → `"sign"` (context-rule
-///   divergence checks after simulation, before submission).
+/// - `"sa.rule_id_mismatch"` and [`SaError::SimulationDivergence`] under every
+///   `simulation.divergence.*` sub-code → `"sign"` (the signed-tree and
+///   context-rule divergence checks after simulation, before signing).
 /// - `"sa.submit_check_missing"` → `"build"` (programming-gate; fires before any I/O).
 /// - `"sa.horizon_exceeded"` / `"sa.rule_expired"` → `"policy_gate"`.
 /// - `"sa.verifier_hash_drift"` / `"sa.policy_hash_drift"` / `"sa.pinned_policy_absent"` /
-///   `"sa.pinned_verifier_absent"` / `"sa.pin_check_unavailable"` → `"policy_gate"` (the
-///   pinned-hash drift check).
+///   `"sa.pinned_verifier_absent"` / `"sa.wasm_pin_incomplete"` /
+///   `"sa.verifier_wasm_revoked"` / `"sa.verifier_wasm_retired"` /
+///   `"sa.pin_check_unavailable"` → `"policy_gate"` (the pinned-hash drift
+///   check and its verifier status gate).
 /// - `"sa.signer_set_missing_baseline"` / `"sa.signer_set_baseline_legacy"` /
 ///   `"sa.signer_set_diverged"` / `"sa.audit_log"` / `"network.rpc_divergence"` /
 ///   `"sa.threshold_policy_not_installed"` /
@@ -2123,6 +2312,11 @@ fn classify_submit_failure(sa_err: SaError) -> (Option<SubmitDeniedRow>, SaError
 fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
     if let SaError::MulticallFailed { phase, .. } = err {
         return phase;
+    }
+    // A divergence's wire code names its sub-code
+    // (`simulation.divergence.auth_contexts`, ...), so the variant decides.
+    if let SaError::SimulationDivergence { .. } = err {
+        return "sign";
     }
     match err.wire_code() {
         "sa.deployment_failed" => {
@@ -2150,9 +2344,7 @@ fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
             // rule refuse before simulation, as the pin check does.
             "policy_gate"
         }
-        "sa.auth_entry_construction_failed"
-        | "sa.rule_id_mismatch"
-        | "sa.simulation_divergence" => {
+        "sa.auth_entry_construction_failed" | "sa.rule_id_mismatch" => {
             // Auth-entry construction and context-rule divergence checks fire at the
             // sign stage (after simulate, before submit).
             "sign"
@@ -2165,6 +2357,9 @@ fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
         | "sa.policy_hash_drift"
         | "sa.pinned_policy_absent"
         | "sa.pinned_verifier_absent"
+        | "sa.wasm_pin_incomplete"
+        | "sa.verifier_wasm_revoked"
+        | "sa.verifier_wasm_retired"
         | "sa.pin_check_unavailable" => {
             // The pinned-hash drift check refuses before simulation: a wallet
             // security gate on the authorizing rule, not a network failure.
@@ -2204,6 +2399,8 @@ fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
 fn deny_reason_wire_code(reason: &DenyReason) -> String {
     use stellar_agent_core::policy::DenyReason;
     match reason {
+        DenyReason::UnsizableValueEffect { .. } => "unsizable_value_effect".to_owned(),
+        DenyReason::AssetNotAllowlisted => "asset_not_allowlisted".to_owned(),
         DenyReason::PerTxCapExceeded { .. } => "per_tx_cap_exceeded".to_owned(),
         DenyReason::PerPeriodCapExceeded { .. } => "per_period_cap_exceeded".to_owned(),
         DenyReason::RateLimitExceeded { .. } => "rate_limit_exceeded".to_owned(),
@@ -2335,29 +2532,33 @@ fn emit_audit_event(
 }
 
 /// Checks that two numeric estimates are within ±5% tolerance.
+///
+/// The refusal names `label` and carries neither estimate.
 fn check_numeric_tolerance(
     label: &'static str,
     primary: u64,
     secondary: u64,
 ) -> Result<(), SaError> {
-    // Allow exact zero on both sides (common for write_bytes in read-only ops).
-    if primary == 0 && secondary == 0 {
-        return Ok(());
-    }
-    let max = primary.max(secondary);
-    let min = primary.min(secondary);
-    // Compute as 5% of max; use saturating arithmetic.
-    let tolerance = max.saturating_div(20); // 5% = 1/20
-    if max.saturating_sub(min) > tolerance {
+    if beyond_five_percent(primary, secondary) {
         return Err(SaError::MulticallFailed {
             phase: "rpc_divergence",
             redacted_reason: format!(
-                "estimate '{label}' differs beyond 5%: primary={primary}, secondary={secondary}"
+                "{label} diverges between primary and secondary RPC beyond the tolerance"
             ),
             post_submit_kind: None,
         });
     }
     Ok(())
+}
+
+/// Reports whether two estimates differ by more than 5 percent of the larger one.
+///
+/// The tolerance is the larger estimate divided by 20 and rounded down, so a
+/// difference equal to it passes. Both zero is within the tolerance.
+fn beyond_five_percent(primary: u64, secondary: u64) -> bool {
+    let max = primary.max(secondary);
+    let min = primary.min(secondary);
+    max.saturating_sub(min) > max / 20
 }
 
 /// Validates whether `s` is a valid 64-char lowercase hex SHA-256.
@@ -2443,7 +2644,170 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn networks_override_outside_a_sandbox_is_ignored() {
+        const EXPECTED: &str = "STELLAR_AGENT_TEST_OVERRIDE_EXPECTED";
+        const SUPPLIED: &str = "STELLAR_AGENT_TEST_OVERRIDE_SUPPLIED";
+        if let Some(expected) = std::env::var_os(EXPECTED) {
+            let supplied = PathBuf::from(std::env::var_os(SUPPLIED).unwrap());
+            assert_eq!(
+                MulticallRegistry::load(&supplied).unwrap().config_path,
+                PathBuf::from(expected),
+                "override must remain inside a marked sandbox"
+            );
+            return;
+        }
+        let temporary = TempDir::new().unwrap();
+        let supplied = temporary.path().join("supplied.toml");
+        let override_path = temporary.path().join("override.toml");
+        std::fs::write(&supplied, "").unwrap();
+        std::fs::write(&override_path, "").unwrap();
+        let probe = |selected: &Path, expected: &Path| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "multicall::tests::networks_override_outside_a_sandbox_is_ignored",
+                    "--nocapture",
+                ])
+                .env(STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV, selected)
+                .env(EXPECTED, expected)
+                .env(SUPPLIED, &supplied)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        probe(&override_path, &supplied);
+        stellar_agent_test_support::sandbox::mark_sandbox(temporary.path()).unwrap();
+        probe(&override_path, &override_path);
+        probe(&temporary.path().join("child/../override.toml"), &supplied);
+        #[cfg(unix)]
+        {
+            let link = temporary.path().join("linked.toml");
+            std::os::unix::fs::symlink(&override_path, &link).unwrap();
+            probe(&link, &supplied);
+        }
+    }
+
+    // ── Verifier status phase, unsizable calls and argument forms ────────────
+
+    #[test]
+    fn muxed_contract_argument_refuses_before_policy() {
+        use stellar_xdr::{ContractId, Hash, Limits, MuxedContract, WriteXdr};
+        let value = ScVal::Address(ScAddress::MuxedContract(MuxedContract {
+            contract_id: ContractId(Hash([3; 32])),
+            id: 7,
+        }));
+        let json = serde_json::json!([{ "scval": value.to_xdr_base64(Limits::none()).unwrap() }]);
+        let error = json_args_to_scval_vec(&json, 0).unwrap_err();
+        assert_eq!(
+            error,
+            "inner[0] arg[0]: a muxed contract address (W) is not accepted on this path"
+        );
+    }
+
+    /// A revoked or retired verifier refuses at the policy gate, like the
+    /// pinned-hash drift check whose match path raises it.
+    #[test]
+    fn map_sa_error_to_phase_verifier_status_refusals_map_to_policy_gate() {
+        use stellar_agent_core::observability::RedactedStrkey;
+        let errors = [
+            SaError::VerifierWasmRevoked {
+                rule_id: None,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
+                revoked_reason: "problem".to_owned(),
+                request_id: "status".to_owned(),
+            },
+            SaError::VerifierWasmRetired {
+                rule_id: Some(1),
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
+                request_id: "status".to_owned(),
+            },
+        ];
+        for error in errors {
+            assert_eq!(map_sa_error_to_multicall_phase(&error), "policy_gate");
+        }
+    }
+
+    /// An unsizable call's denial records `unsizable_value_effect`.
+    #[test]
+    fn deny_reason_wire_code_unsizable_value_effect() {
+        assert_eq!(
+            deny_reason_wire_code(&DenyReason::UnsizableValueEffect {
+                detail: "unsized".to_owned()
+            }),
+            "unsizable_value_effect"
+        );
+    }
+
+    /// The `scval` form decodes to the value its XDR encodes.
+    #[test]
+    fn json_args_scval_form_encodes_any_value() {
+        use stellar_xdr::{ContractId, Hash, Int128Parts, Limits, ScMap, WriteXdr};
+        for value in [
+            ScVal::Address(ScAddress::Contract(ContractId(Hash([0x44; 32])))),
+            ScVal::I128(Int128Parts { hi: 1, lo: 30 }),
+            ScVal::Map(Some(ScMap::default())),
+        ] {
+            let json =
+                serde_json::json!([{ "scval": value.to_xdr_base64(Limits::none()).unwrap() }]);
+            assert_eq!(
+                json_args_to_scval_vec(&json, 0).unwrap().as_slice(),
+                &[value]
+            );
+        }
+    }
+
+    /// Every object other than one string `scval` member holding a contract
+    /// argument refuses, naming the argument index.
+    #[test]
+    fn json_args_scval_form_is_exact() {
+        use stellar_xdr::{Limits, ScNonceKey, WriteXdr};
+        let encoded = ScVal::Void.to_xdr_base64(Limits::none()).unwrap();
+        let nonce = ScVal::LedgerKeyNonce(ScNonceKey { nonce: 1 })
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        let key = ScVal::LedgerKeyContractInstance
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        for object in [
+            serde_json::json!({"scval": encoded, "extra": 1}),
+            serde_json::json!({"scval": 1}),
+            serde_json::json!({"other": encoded}),
+            serde_json::json!({"scval": "!"}),
+            serde_json::json!({"scval": "AQIDBA=="}),
+            serde_json::json!({"scval": nonce}),
+            serde_json::json!({"scval": key}),
+        ] {
+            let error = json_args_to_scval_vec(&serde_json::json!([null, object]), 2).unwrap_err();
+            assert!(error.contains("inner[2] arg[1]"), "{error}");
+        }
+    }
+
+    /// A refused argument names the `scval` form the encoder accepts.
+    #[test]
+    fn json_args_refusal_names_the_accepted_forms() {
+        let error = json_args_to_scval_vec(&serde_json::json!([true]), 0).unwrap_err();
+        assert!(error.contains("{\"scval\""), "{error}");
+        assert!(!error.contains("pre-serialised"));
+    }
+
     // ── A denied-path row that is not written is logged ──────────────────────
+
+    /// An `scval` value that is neither base64 nor XDR is refused with one
+    /// text at the computed position, holding no decoder diagnostic.
+    #[test]
+    fn invalid_scval_stays_out_of_the_refusal() {
+        for encoded in ["~", "AAAA"] {
+            let error = json_args_to_scval_vec(&serde_json::json!([null, { "scval": encoded }]), 3)
+                .unwrap_err();
+            assert_eq!(error, "inner[3] arg[1]: scval must be a base64 XDR string");
+        }
+    }
 
     /// The denied-path callers discard the emitter's result, so a row that is
     /// not written is logged at `error` with its event kind, and the emitter
@@ -2877,7 +3241,7 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
 
 [multicall.bad-entry]
 network_passphrase = "Bad Network"
-address = "NOT_A_STRKEY"
+address = "CREDMARKER7"
 wasm_sha256 = "{MULTICALL_WASM_SHA256}"
 "#
             ),
@@ -2894,7 +3258,8 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
         );
         let warning = &reg.partial_load_warnings[0];
         assert_eq!(warning.network_safename, "bad-entry");
-        assert_eq!(warning.reason, "invalid C-strkey address: NOT_A_STRKEY");
+        assert_eq!(warning.reason, "address must be a C-strkey");
+        assert!(!format!("{warning:?}").contains("CREDMARKER7"));
     }
 
     // ── cross_rpc_compare_simulate_responses ──────────────────────────────────
@@ -2937,6 +3302,14 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
         auth: &[stellar_xdr::SorobanAuthorizationEntry],
         data: &stellar_xdr::SorobanTransactionData,
     ) -> stellar_rpc_client::SimulateTransactionResponse {
+        simulated_response_with_fee(auth, data, 1000)
+    }
+
+    fn simulated_response_with_fee(
+        auth: &[stellar_xdr::SorobanAuthorizationEntry],
+        data: &stellar_xdr::SorobanTransactionData,
+        min_resource_fee: u64,
+    ) -> stellar_rpc_client::SimulateTransactionResponse {
         use stellar_xdr::{Limits, WriteXdr};
         let auth: Vec<_> = auth
             .iter()
@@ -2944,7 +3317,7 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
             .collect();
         serde_json::from_value(serde_json::json!({
             "latestLedger": 100,
-            "minResourceFee": "1000",
+            "minResourceFee": min_resource_fee.to_string(),
             "transactionData": data.to_xdr_base64(Limits::none()).unwrap(),
             "results": [{"auth": auth, "xdr": ScVal::Void.to_xdr_base64(Limits::none()).unwrap()}],
         }))
@@ -3133,6 +3506,178 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
             let secondary = simulated_response(std::slice::from_ref(&entry), &changed);
             assert_rpc_divergence(&primary, &secondary, "transaction_data");
         }
+    }
+
+    /// The divergence refusal for one changed part of the transaction data.
+    ///
+    /// The primary and secondary simulations share the authorization entry and
+    /// differ only in what `change` alters.
+    fn transaction_data_divergence(
+        change: impl FnOnce(&mut stellar_xdr::SorobanTransactionData),
+    ) -> String {
+        let entry = simulated_auth_entry(123, 200);
+        let data = simulated_nonce_data(&entry);
+        let primary = simulated_response(std::slice::from_ref(&entry), &data);
+        let mut changed = data;
+        change(&mut changed);
+        let secondary = simulated_response(std::slice::from_ref(&entry), &changed);
+        divergence_reason(&primary, &secondary)
+    }
+
+    fn divergence_reason(
+        primary: &stellar_rpc_client::SimulateTransactionResponse,
+        secondary: &stellar_rpc_client::SimulateTransactionResponse,
+    ) -> String {
+        match cross_rpc_compare_simulate_responses(primary, secondary) {
+            Err(SaError::MulticallFailed {
+                phase: "rpc_divergence",
+                redacted_reason,
+                ..
+            }) => {
+                assert!(
+                    !redacted_reason.chars().any(|c| c.is_ascii_digit()),
+                    "the refusal carries no value: {redacted_reason}"
+                );
+                redacted_reason
+            }
+            other => panic!("expected an rpc_divergence refusal, got {other:?}"),
+        }
+    }
+
+    const TRANSACTION_DATA_DIVERGES: &str =
+        "transaction_data diverges between primary and secondary RPC: ";
+
+    /// A differing footprint key is named `footprint`.
+    #[test]
+    fn cross_rpc_divergence_names_the_footprint() {
+        use stellar_xdr::{Hash, LedgerKey, LedgerKeyContractCode};
+        let reason = transaction_data_divergence(|data| {
+            data.resources.footprint.read_only =
+                vec![LedgerKey::ContractCode(LedgerKeyContractCode {
+                    hash: Hash([9; 32]),
+                })]
+                .try_into()
+                .unwrap();
+        });
+        assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}footprint"));
+    }
+
+    /// A differing archived-entry extension indexes the footprint and is named
+    /// `footprint`.
+    #[test]
+    fn cross_rpc_divergence_names_the_archived_entries_as_the_footprint() {
+        use stellar_xdr::{SorobanResourcesExtV0, SorobanTransactionDataExt};
+        let reason = transaction_data_divergence(|data| {
+            data.ext = SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: vec![0].try_into().unwrap(),
+            });
+        });
+        assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}footprint"));
+    }
+
+    /// A differing instruction budget is named `instructions`.
+    #[test]
+    fn cross_rpc_divergence_names_the_instructions() {
+        let reason = transaction_data_divergence(|data| data.resources.instructions += 1);
+        assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}instructions"));
+    }
+
+    /// A differing disk read budget is named `read bytes`.
+    #[test]
+    fn cross_rpc_divergence_names_the_read_bytes() {
+        let reason = transaction_data_divergence(|data| data.resources.disk_read_bytes += 1);
+        assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}read bytes"));
+    }
+
+    /// A differing write budget is named `write bytes`.
+    #[test]
+    fn cross_rpc_divergence_names_the_write_bytes() {
+        let reason = transaction_data_divergence(|data| data.resources.write_bytes += 1);
+        assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}write bytes"));
+    }
+
+    /// A resource fee beyond the tolerance is named `resource fee`.
+    #[test]
+    fn cross_rpc_divergence_names_the_resource_fee() {
+        let reason = transaction_data_divergence(|data| {
+            data.resource_fee = data.resource_fee.saturating_mul(2).saturating_add(1_000);
+        });
+        assert_eq!(reason, format!("{TRANSACTION_DATA_DIVERGES}resource fee"));
+    }
+
+    /// The transaction-data comparison for two resource fees under one
+    /// authorization entry and one footprint.
+    fn resource_fee_comparison(
+        primary_fee: i64,
+        secondary_fee: i64,
+    ) -> (
+        stellar_rpc_client::SimulateTransactionResponse,
+        stellar_rpc_client::SimulateTransactionResponse,
+    ) {
+        let entry = simulated_auth_entry(123, 200);
+        let mut primary_data = simulated_nonce_data(&entry);
+        primary_data.resource_fee = primary_fee;
+        let mut secondary_data = simulated_nonce_data(&entry);
+        secondary_data.resource_fee = secondary_fee;
+        (
+            simulated_response(std::slice::from_ref(&entry), &primary_data),
+            simulated_response(std::slice::from_ref(&entry), &secondary_data),
+        )
+    }
+
+    /// A resource fee 4 percent apart passes, since its rent component depends
+    /// on the ledger at which each endpoint simulates.
+    #[test]
+    fn cross_rpc_resource_fee_within_the_tolerance_passes() {
+        let (primary, secondary) = resource_fee_comparison(10_000, 10_400);
+        assert!(cross_rpc_compare_simulate_responses(&primary, &secondary).is_ok());
+    }
+
+    /// A resource fee 6 percent apart is named `resource fee`.
+    #[test]
+    fn cross_rpc_resource_fee_beyond_the_tolerance_is_named() {
+        let (primary, secondary) = resource_fee_comparison(10_000, 10_600);
+        assert_eq!(
+            divergence_reason(&primary, &secondary),
+            format!("{TRANSACTION_DATA_DIVERGES}resource fee")
+        );
+    }
+
+    /// Every differing part is named, in the fixed order.
+    #[test]
+    fn cross_rpc_divergence_names_every_differing_part() {
+        use stellar_xdr::{Hash, LedgerKey, LedgerKeyContractCode};
+        let reason = transaction_data_divergence(|data| {
+            data.resources.footprint.read_only =
+                vec![LedgerKey::ContractCode(LedgerKeyContractCode {
+                    hash: Hash([9; 32]),
+                })]
+                .try_into()
+                .unwrap();
+            data.resources.instructions += 1;
+            data.resources.disk_read_bytes += 1;
+            data.resources.write_bytes += 1;
+            data.resource_fee = data.resource_fee.saturating_mul(2).saturating_add(1_000);
+        });
+        assert_eq!(
+            reason,
+            format!(
+                "{TRANSACTION_DATA_DIVERGES}footprint, instructions, read bytes, write bytes, resource fee"
+            )
+        );
+    }
+
+    /// A minimum resource fee beyond the tolerance is named `min resource fee`.
+    #[test]
+    fn cross_rpc_divergence_names_the_min_resource_fee() {
+        let entry = simulated_auth_entry(123, 200);
+        let data = simulated_nonce_data(&entry);
+        let primary = simulated_response_with_fee(std::slice::from_ref(&entry), &data, 1000);
+        let secondary = simulated_response_with_fee(std::slice::from_ref(&entry), &data, 2000);
+        assert_eq!(
+            divergence_reason(&primary, &secondary),
+            "min resource fee diverges between primary and secondary RPC beyond the tolerance"
+        );
     }
 
     /// A nonce key must match its simulation's credential address, nonce, and durability.
@@ -3329,6 +3874,64 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
         assert_eq!(raw.wasm_sha256, entry.wasm_sha256);
     }
 
+    /// An unreadable registry path is refused with the check; the refusal
+    /// keeps the I/O source and holds the path in no rendered form.
+    #[test]
+    fn registry_io_refusal_holds_no_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("credmarker7");
+        std::fs::create_dir(&path).expect("directory");
+
+        let Err(error) = MulticallRegistry::load(&path) else {
+            panic!("a directory must be refused");
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "networks.toml must be a readable file with a writable parent directory; correct \
+             the registry path and retry."
+        );
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the I/O source stays attached"
+        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&error, "credmarker7");
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(!json.contains("credmarker7"), "{json}");
+    }
+
+    /// A registry hash other than the binary pin is refused at lookup and at
+    /// registration with the check, holding the hash in no rendered form.
+    #[test]
+    fn multicall_pin_refusals_hold_no_registry_hash() {
+        const REFUSED: &str = "6372656463726564637265646372656463726564637265646372656463726564";
+        const NETWORK: &str = "Test SDF Network ; September 2015";
+        const ADDRESS: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("networks.toml");
+        let entry = || MulticallRegistryEntry {
+            network_passphrase: NETWORK.to_owned(),
+            address: ADDRESS.to_owned(),
+            wasm_sha256: REFUSED.to_owned(),
+        };
+
+        let mut lookup_registry = MulticallRegistry::load(&path).expect("load");
+        lookup_registry.entries.push(entry());
+        let lookup_error = lookup_registry.lookup(NETWORK).unwrap_err();
+        let mut register_registry = MulticallRegistry::load(&path).expect("load");
+        let register_error = register_registry.register(entry()).unwrap_err();
+
+        for error in [lookup_error, register_error] {
+            assert_eq!(
+                error.to_string(),
+                "wasm_sha256 must match MULTICALL_WASM_SHA256; verify the router deployment and \
+                 correct the registry hash."
+            );
+            let forms = format!("{error:?}\n{}", serde_json::to_string(&error).unwrap());
+            assert!(!forms.contains(REFUSED), "{forms}");
+        }
+    }
+
     // ── load — TOML parse error ───────────────────────────────────────────────
 
     /// A file that is not valid TOML returns `SaError::NetworksTomlParse`.
@@ -3354,7 +3957,7 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
 [multicall.badsha]
 network_passphrase = "Bad SHA Network"
 address = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-wasm_sha256 = "not-a-sha256-at-all"
+wasm_sha256 = "CREDMARKER7"
 "#,
         )
         .expect("write");
@@ -3368,9 +3971,10 @@ wasm_sha256 = "not-a-sha256-at-all"
         assert!(
             reg.partial_load_warnings[0]
                 .reason
-                .contains("invalid SHA-256 hex"),
-            "warning reason must mention invalid SHA-256 hex"
+                .contains("wasm_sha256 must be 64 hex characters"),
+            "warning reason must state the expected SHA-256 form"
         );
+        assert!(!format!("{:?}", reg.partial_load_warnings).contains("CREDMARKER7"));
     }
 
     // ── load — sha drift (valid 64-char hex but != MULTICALL_WASM_SHA256) ────
@@ -3619,6 +4223,68 @@ wasm_sha256 = "{drifted_sha}"
         }
     }
 
+    /// Each leg's refusal names the leg and the pinned hash's first eight hex
+    /// characters, and no channel holds the refused hash, whole, as its first
+    /// eight bytes or as its first eight hex characters: not the Display,
+    /// Debug and source chain, the serialized form, or the MCP error envelope.
+    /// The comparison emits no event.
+    #[test]
+    fn cross_rpc_compare_wasm_hashes_refusals_hold_no_refused_hash() {
+        let refused: [u8; 32] = std::array::from_fn(|i| 0x3c ^ u8::try_from(i).unwrap());
+        let refused = hex::encode(refused);
+        let expected8 = &MULTICALL_WASM_SHA256[..8];
+        for (leg, registry, primary, secondary) in [
+            (
+                "registry",
+                refused.as_str(),
+                MULTICALL_WASM_SHA256,
+                MULTICALL_WASM_SHA256,
+            ),
+            (
+                "primary-RPC",
+                MULTICALL_WASM_SHA256,
+                refused.as_str(),
+                MULTICALL_WASM_SHA256,
+            ),
+            (
+                "secondary-RPC",
+                MULTICALL_WASM_SHA256,
+                MULTICALL_WASM_SHA256,
+                refused.as_str(),
+            ),
+        ] {
+            let error = cross_rpc_compare_wasm_hashes(registry, primary, secondary).unwrap_err();
+            let SaError::MulticallFailed {
+                phase,
+                redacted_reason,
+                post_submit_kind: None,
+            } = &error
+            else {
+                panic!("{leg}: expected MulticallFailed, got {error:?}");
+            };
+            assert_eq!(*phase, "rpc_divergence", "{leg}");
+            assert_eq!(
+                redacted_reason,
+                &format!("{leg} leg must report the multicall router hash {expected8}")
+            );
+            let serialized = serde_json::to_string(&error).expect("the refusal serializes");
+            let envelope =
+                stellar_agent_core::Envelope::<()>::err_raw(error.wire_code(), error.to_string())
+                    .to_json_pretty()
+                    .expect("the MCP error envelope serializes");
+            for marker in [&refused[..], &refused[..16], &refused[..8]] {
+                stellar_agent_test_support::rejected_value::assert_no_marker(&error, marker);
+                stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+                    &serialized,
+                    marker,
+                );
+                stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+                    &envelope, marker,
+                );
+            }
+        }
+    }
+
     // ── check_numeric_tolerance ───────────────────────────────────────────────
 
     /// Both zero is always within tolerance (common for write_bytes in read-only ops).
@@ -3777,6 +4443,27 @@ wasm_sha256 = "{drifted_sha}"
         assert_eq!(map_sa_error_to_multicall_phase(&err), "sign");
     }
 
+    /// `SimulationDivergence` maps to `"sign"` under every sub-code: the
+    /// signed-tree and context-rule checks refuse after simulation, before
+    /// anything is signed or sent.
+    #[test]
+    fn map_sa_error_to_phase_simulation_divergence_maps_to_sign() {
+        use crate::error::SimulationDivergenceSubCode;
+        for sub_code in [
+            SimulationDivergenceSubCode::ContextRuleIds,
+            SimulationDivergenceSubCode::AuthContexts,
+            SimulationDivergenceSubCode::Network,
+            SimulationDivergenceSubCode::Sequence,
+            SimulationDivergenceSubCode::FeeEnvelope,
+        ] {
+            let err = SaError::SimulationDivergence {
+                sub_code,
+                redacted_reason: "test".to_owned(),
+            };
+            assert_eq!(map_sa_error_to_multicall_phase(&err), "sign", "{err:?}");
+        }
+    }
+
     /// `SubmitCheckMissing` maps to `"build"`.
     #[test]
     fn map_sa_error_to_phase_submit_check_missing_maps_to_build() {
@@ -3803,6 +4490,32 @@ wasm_sha256 = "{drifted_sha}"
             matches!(returned, SaError::MainnetWriteForbidden),
             "the mainnet refusal must return unwrapped, got {returned:?}"
         );
+    }
+
+    /// A witness refusal returns unwrapped with its own code and writes a
+    /// denied row under it.
+    #[test]
+    fn classify_submit_failure_keeps_a_witness_refusal_with_a_denied_row() {
+        for (error, code) in [
+            (
+                SaError::LedgerWitnessUnavailable { reason: "fixed" },
+                "smart_account.ledger_witness_unavailable",
+            ),
+            (
+                SaError::LedgerWitnessMismatch { reason: "fixed" },
+                "simulation.divergence.ledger_skew",
+            ),
+        ] {
+            let (row, returned) = classify_submit_failure(error);
+            assert_eq!(
+                row,
+                Some(SubmitDeniedRow {
+                    deny_wire_code: format!("multicall.{code}"),
+                    refusal_phase: "policy_gate",
+                })
+            );
+            assert_eq!(returned.wire_code(), code, "{returned:?}");
+        }
     }
 
     /// Another submit failure still writes a row at its mapped phase and
@@ -3868,14 +4581,29 @@ wasm_sha256 = "{drifted_sha}"
         }
     }
 
-    /// A policy denial passes through with no second row.
+    /// Admission refusals carry their codes and one policy gate row.
     #[test]
-    fn classify_submit_failure_passes_a_policy_denial_through_without_a_row() {
-        let (row, returned) = classify_submit_failure(SaError::PolicyDenied {
-            reason: Box::new(stellar_agent_core::policy::DenyReason::NoMatchingRule),
-        });
-        assert_eq!(row, None);
-        assert!(matches!(returned, SaError::PolicyDenied { .. }));
+    fn classify_submit_failure_writes_a_policy_gate_row_for_a_policy_denial() {
+        for error in [
+            SaError::PolicyDenied {
+                reason: Box::new(stellar_agent_core::policy::DenyReason::NoMatchingRule),
+            },
+            SaError::IntentRecordUnavailable {
+                class: "window_unavailable",
+            },
+            SaError::IntentBindingMismatch { field: "signers" },
+        ] {
+            let code = error.wire_code();
+            let (row, returned) = classify_submit_failure(error);
+            assert_eq!(
+                row,
+                Some(SubmitDeniedRow {
+                    deny_wire_code: format!("multicall.{code}"),
+                    refusal_phase: "policy_gate"
+                })
+            );
+            assert_eq!(returned.wire_code(), code);
+        }
     }
 
     /// `HorizonExceeded` maps to `"policy_gate"`.
@@ -3912,18 +4640,14 @@ wasm_sha256 = "{drifted_sha}"
                 rule_id: 2,
                 smart_account_redacted: redacted(),
                 deploy_address_redacted: redacted(),
-                pinned_hash_first8: "aabbccdd".to_owned(),
-                observed_hash_first8: "11223344".to_owned(),
-                observed_executable: None,
+                pinned_hash: stellar_agent_core::audit_log::schema::WasmHashPin::new([0xaa; 32]),
                 request_id: "req".to_owned(),
             },
             SaError::PolicyHashDrift {
                 rule_id: 2,
                 smart_account_redacted: redacted(),
                 deploy_address_redacted: redacted(),
-                pinned_hash_first8: "aabbccdd".to_owned(),
-                observed_hash_first8: "11223344".to_owned(),
-                observed_executable: None,
+                pinned_hash: stellar_agent_core::audit_log::schema::WasmHashPin::new([0xaa; 32]),
                 request_id: "req".to_owned(),
             },
             SaError::PinnedPolicyAbsent {
@@ -3935,6 +4659,11 @@ wasm_sha256 = "{drifted_sha}"
             SaError::PinnedVerifierAbsent {
                 rule_id: 2,
                 verifier_redacted: redacted(),
+                smart_account_redacted: redacted(),
+                request_id: "req".to_owned(),
+            },
+            SaError::WasmPinIncomplete {
+                rule_id: 2,
                 smart_account_redacted: redacted(),
                 request_id: "req".to_owned(),
             },
@@ -3963,8 +4692,6 @@ wasm_sha256 = "{drifted_sha}"
         use stellar_agent_core::audit_log::signer_set::{SignerSetSnapshotV2, SignerSetView};
         use stellar_agent_core::observability::RedactedStrkey;
 
-        use crate::signers::types::WasmHashSummary;
-
         let redacted = || RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ");
         let view = || {
             SignerSetView::V2(SignerSetSnapshotV2 {
@@ -3974,7 +4701,6 @@ wasm_sha256 = "{drifted_sha}"
         };
         let refusals = [
             SaError::SignerSetMissingBaseline {
-                rule_id: 2,
                 smart_account_redacted: redacted(),
                 request_id: "req".to_owned(),
             },
@@ -4010,7 +4736,7 @@ wasm_sha256 = "{drifted_sha}"
             SaError::ThresholdPolicyIdentificationFailed {
                 rule_id: 2,
                 smart_account_redacted: redacted(),
-                observed_wasm_hashes_summary: WasmHashSummary::new(0, None).unwrap(),
+                observed_policy_count: 0,
                 request_id: "req".to_owned(),
             },
             SaError::ThresholdReadFailed {
@@ -4752,5 +5478,12 @@ wasm_sha256 = "{drifted_sha}"
             .expect("unregister_force via direct match");
         assert_eq!(raw.network_passphrase, raw_safename);
         assert!(reg.entries.is_empty(), "entry must be removed");
+    }
+    #[test]
+    fn deny_reason_wire_code_asset_not_allowlisted() {
+        assert_eq!(
+            deny_reason_wire_code(&DenyReason::AssetNotAllowlisted),
+            "asset_not_allowlisted"
+        );
     }
 }

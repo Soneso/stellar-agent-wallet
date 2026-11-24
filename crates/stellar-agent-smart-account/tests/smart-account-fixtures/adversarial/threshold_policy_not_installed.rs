@@ -35,7 +35,11 @@ use super::rpc_mock_helpers::{
 /// threshold and return `ThresholdPolicyNotInstalled`; with no policy there is
 /// no executable or threshold read.
 #[tokio::test]
+#[serial_test::serial]
 async fn empty_policies_returns_threshold_policy_not_installed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     // Write a valid 1-of-1 baseline so Step 1 passes.
@@ -103,7 +107,6 @@ async fn not_installed_requires_baseline_step_to_pass_first() {
         request_id: Uuid::new_v4().to_string(),
     };
     let missing_baseline = SaError::SignerSetMissingBaseline {
-        rule_id: 1,
         smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AD2KM"),
         request_id: Uuid::new_v4().to_string(),
     };

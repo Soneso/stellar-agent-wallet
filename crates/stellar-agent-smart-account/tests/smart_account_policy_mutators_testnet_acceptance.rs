@@ -140,14 +140,9 @@ fn fresh_deployer() -> (String, DeployerKeypair) {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 200 for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// The verified audit rows written under `request_id`, in chain order.
@@ -172,7 +167,7 @@ fn contract_id(address: &ScAddress) -> [u8; 32] {
 fn fresh_managers() -> (ContextRuleManager, Arc<SignersManager>, PathBuf, TempDir) {
     managers_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Duration::from_secs(TIMEOUT_SECS),
     )
 }
@@ -486,6 +481,7 @@ async fn deploy_threshold_policy_with_salt(
 ///   `policies: &Map<Address, Val>` — Soroban Map, unique Address keys.
 #[tokio::test]
 async fn h3_add_policy_increments_count_and_emits_audit_row() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Step 1: Generate and fund the operator signer ────────────────────────
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
@@ -786,6 +782,7 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
 /// - The OpenZeppelin `remove_policy` implementation.
 #[tokio::test]
 async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Step 1: Generate and fund the operator signer ────────────────────────
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
@@ -1070,6 +1067,7 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
 ///   `SaInvocationResult::PreSubmissionRefused`.
 #[tokio::test]
 async fn h5_add_policy_type_mismatched_install_param_no_success_audit() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Step 1: Generate and fund the operator signer ────────────────────────
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;

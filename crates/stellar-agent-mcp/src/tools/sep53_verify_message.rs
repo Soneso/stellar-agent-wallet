@@ -33,8 +33,8 @@ use crate::server::WalletServer;
 ///   match what was used during signing.
 /// - `signature` — base64-standard-encoded 64-byte ed25519 signature.
 /// - `public_key` — G-strkey of the signer to verify against.
-/// - `chain_id` — optional CAIP-2 chain identifier (not required; verification
-///   is chain-agnostic, but passed for dispatch-gate compatibility).
+/// - `chain_id`: CAIP-2 chain identifier. `chain_id` is required and must match
+///   the profile. Verification itself does not depend on the chain.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(crate = "rmcp::serde")]
 pub struct Sep53VerifyMessageArgs {
@@ -148,18 +148,21 @@ impl WalletServer {
         let message_bytes: Vec<u8> = match encoding {
             "base64" => match base64::engine::general_purpose::STANDARD.decode(&args.message) {
                 Ok(bytes) => bytes,
-                Err(e) => {
+                // The decoder's error quotes an offending byte of the
+                // message, so the refusal names the field and the form only.
+                Err(_) => {
                     return Ok(crate::tools::common::business_error_result(
                         "sep53.invalid_message_base64",
-                        format!("message base64 decode failed: {e}"),
+                        "message must be standard padded base64 when message_encoding is \
+                         'base64'",
                     ));
                 }
             },
             "utf8" => args.message.as_bytes().to_vec(),
-            other => {
+            _ => {
                 return Ok(crate::tools::common::business_error_result(
                     "sep53.invalid_encoding",
-                    format!("unsupported message_encoding: {other:?}; use 'utf8' or 'base64'"),
+                    "message_encoding must be 'utf8' or 'base64'",
                 ));
             }
         };
@@ -178,10 +181,10 @@ impl WalletServer {
         // Decode the base64 signature.
         let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(&args.signature) {
             Ok(bytes) => bytes,
-            Err(e) => {
+            Err(_) => {
                 return Ok(crate::tools::common::business_error_result(
                     "sep53.invalid_signature_base64",
-                    format!("signature base64 decode failed: {e}"),
+                    "signature must be standard padded base64",
                 ));
             }
         };
@@ -262,7 +265,12 @@ mod tests {
     use super::*;
     use stellar_agent_core::profile::schema::Profile;
 
+    /// A Noop-engine testnet server over a fresh mock keyring store.
+    ///
+    /// Construction reads the keyring and registers the platform store when
+    /// none is registered, so every caller holds the `keyring` serial key.
     fn make_server() -> crate::server::WalletServer {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         crate::server::WalletServer::new(
             Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
                 .with_noop_engine()
@@ -275,7 +283,12 @@ mod tests {
     /// successfully, and the result carries the documented `{ ok: true,
     /// data: { valid: true }, request_id }` envelope.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn valid_signature_verifies_under_normalised_envelope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let verifying_key = signing_key.verifying_key();
         let message = b"hello stellar";
@@ -319,7 +332,12 @@ mod tests {
     /// A malformed G-strkey public key is a business refusal
     /// (`sep53.invalid_public_key`), not a JSON-RPC protocol error.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn invalid_public_key_is_business_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_server();
         let args = Sep53VerifyMessageArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -339,7 +357,12 @@ mod tests {
     /// A signature that fails ed25519 verification against the supplied
     /// public key is `sep53.verify_failed`, not a JSON-RPC protocol error.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn wrong_signature_is_verify_failed_business_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let verifying_key = signing_key.verifying_key();
         let public_key = stellar_strkey::ed25519::PublicKey(verifying_key.to_bytes()).to_string();
@@ -359,5 +382,60 @@ mod tests {
             .expect("a failed verification must surface as a business-error envelope, not Err");
         let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
         assert_eq!(code, "sep53.verify_failed");
+    }
+
+    /// A malformed base64 message, an unsupported encoding and a malformed
+    /// base64 signature are refused by the field and the expected form, and
+    /// no refusal repeats the argument or the byte the decoder stopped at.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn sep53_verify_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let server = make_server();
+        let marked = format!("{CREDENTIAL_MARKER}~");
+        let signature = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+        let args =
+            |message: &str, encoding: Option<&str>, signature: &str| Sep53VerifyMessageArgs {
+                chain_id: "stellar:testnet".to_owned(),
+                message: message.to_owned(),
+                message_encoding: encoding.map(str::to_owned),
+                signature: signature.to_owned(),
+                public_key: "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned(),
+            };
+        let cases = [
+            (
+                args(&marked, Some("base64"), &signature),
+                "sep53.invalid_message_base64",
+                "message must be standard padded base64 when message_encoding is 'base64'",
+            ),
+            (
+                args("hello", Some(&marked), &signature),
+                "sep53.invalid_encoding",
+                "message_encoding must be 'utf8' or 'base64'",
+            ),
+            (
+                args("hello", None, &marked),
+                "sep53.invalid_signature_base64",
+                "signature must be standard padded base64",
+            ),
+        ];
+        for (args, expected_code, expected_message) in cases {
+            let result = server
+                .call_stellar_sep53_verify_message(args)
+                .await
+                .unwrap();
+            let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(code, expected_code);
+            assert_eq!(message, expected_message);
+            assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
+            assert_no_marker_in_text(&text, "symbol");
+        }
     }
 }

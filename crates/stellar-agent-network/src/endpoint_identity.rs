@@ -3,9 +3,9 @@
 //!
 //! [`StellarRpcClient::endpoint_identity`](crate::StellarRpcClient::endpoint_identity)
 //! asks the endpoint `getNetwork` and returns an [`EndpointIdentity`] only
-//! after the network checks and [`check_protocol_version`] pass. Outside the
-//! `test-helpers` feature, no other code in this crate builds one. Holding a
-//! value then means those checks pass against the endpoint it names.
+//! after the network checks and [`check_protocol_version`] pass. No other code
+//! builds one. Holding a value then means those checks passed against the
+//! endpoint it names, through the client whose identity it carries.
 
 use std::ops::RangeInclusive;
 
@@ -20,21 +20,86 @@ use stellar_agent_core::profile::caip2::Caip2;
 /// network.
 pub const SUPPORTED_PROTOCOL_VERSIONS: RangeInclusive<u32> = 29..=30;
 
+/// The first protocol version that admits CAP-84 muxed contract addresses.
+pub const MUXED_CONTRACT_MIN_PROTOCOL: u32 = 30;
+
+/// Evidence that a checked endpoint admits muxed contract addresses.
+/// Only [`EndpointIdentity::muxed_contract_admission`] constructs this value.
+#[derive(Debug)]
+pub struct MuxedContractAdmission {
+    _private: (),
+}
+
 /// What an RPC endpoint reports about itself, after the wallet checks it.
 ///
 /// The endpoint's passphrase matches the one the caller expects, and its
-/// protocol version passes [`check_protocol_version`]. Outside the `test-helpers`
-/// feature, the type has no public constructor. Its private fields prevent
-/// struct-literal construction outside this crate:
+/// protocol version passes [`check_protocol_version`]. The type has no public
+/// constructor, and two independent barriers keep it from being forged
+/// outside this crate: it is `#[non_exhaustive]`, and its fields are private.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0639
 /// use stellar_agent_network::EndpointIdentity;
+/// fn forge(p: EndpointIdentity) -> EndpointIdentity { EndpointIdentity { ..p } }
+/// ```
 ///
-/// let forged = EndpointIdentity {
-///     chain_id: None,
-///     protocol_version: 29,
-///     authority: String::from("https://rpc.example.com:443"),
-/// };
+/// Each field is private on its own:
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::EndpointIdentity;
+/// fn inspect(p: &EndpointIdentity) { let _ = &p.authority; }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::EndpointIdentity;
+/// fn inspect(p: &EndpointIdentity) { let _ = &p.chain_id; }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::EndpointIdentity;
+/// fn inspect(p: &EndpointIdentity) { let _ = &p.protocol_version; }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::EndpointIdentity;
+/// fn inspect(p: &EndpointIdentity) { let _ = &p.client_id; }
+/// ```
+///
+/// No test constructor exists:
+///
+/// ```compile_fail,E0599
+/// use stellar_agent_network::EndpointIdentity;
+/// fn main() { let _ = EndpointIdentity::for_tests(None, 29, "https://rpc.example.invalid"); }
+/// ```
+///
+/// The import and the getters resolve, so the snippets above fail on the
+/// barrier they name and not on the path:
+///
+/// ```
+/// use stellar_agent_network::EndpointIdentity;
+/// fn inspect(p: &EndpointIdentity) -> (u64, &str, u32) {
+///     (p.client_id(), p.authority(), p.protocol_version())
+/// }
+/// let _ = inspect;
+/// ```
+///
+/// The identity implements none of `Serialize`, `Deserialize`, or `Default`:
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::EndpointIdentity;
+/// fn need<T: serde::Serialize>() {}
+/// need::<EndpointIdentity>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::EndpointIdentity;
+/// fn need<T: serde::de::DeserializeOwned>() {}
+/// need::<EndpointIdentity>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::EndpointIdentity;
+/// fn need<T: Default>() {}
+/// need::<EndpointIdentity>();
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,36 +107,51 @@ pub struct EndpointIdentity {
     chain_id: Option<Caip2>,
     protocol_version: u32,
     authority: String,
+    client_id: u64,
 }
 
 impl EndpointIdentity {
-    /// Builds the identity of an endpoint whose answer passed every check.
+    /// Builds the identity of an endpoint whose answer passed every check,
+    /// through the client whose identity is `client_id`.
     pub(crate) fn checked(
         chain_id: Option<Caip2>,
         protocol_version: u32,
         authority: String,
+        client_id: u64,
     ) -> Self {
         Self {
             chain_id,
             protocol_version,
             authority,
+            client_id,
         }
     }
 
-    /// Builds an identity for a test in another crate.
-    ///
-    /// Only available under the `test-helpers` feature. Production code
-    /// receives an identity from
-    /// [`StellarRpcClient::endpoint_identity`](crate::StellarRpcClient::endpoint_identity)
-    /// alone.
-    #[cfg(feature = "test-helpers")]
+    /// The identity of the client the checks ran through, as
+    /// [`StellarRpcClient::id`](crate::StellarRpcClient::id) reports it.
     #[must_use]
-    pub fn for_tests(
-        chain_id: Option<Caip2>,
-        protocol_version: u32,
-        authority: impl Into<String>,
-    ) -> Self {
-        Self::checked(chain_id, protocol_version, authority.into())
+    pub fn client_id(&self) -> u64 {
+        self.client_id
+    }
+
+    /// The fact digest under `stellar-agent-authz-fact:endpoint:v1`.
+    ///
+    /// Fields, in order: the optional chain as its CAIP-2 text
+    /// (`lp(chain)`), `u32be(protocol_version)`, `lp(authority)`, and
+    /// `u64be(client_id)`.
+    #[must_use]
+    pub fn fact_digest(&self) -> [u8; 32] {
+        use stellar_agent_core::mainnet::fact::{FACT_LABEL_ENDPOINT, FactDigest};
+        let mut digest = FactDigest::new(FACT_LABEL_ENDPOINT);
+        digest.present(self.chain_id.is_some());
+        if let Some(chain) = self.chain_id {
+            digest.bytes(chain.caip2_str().as_bytes());
+        }
+        digest
+            .u32(self.protocol_version)
+            .bytes(self.authority.as_bytes())
+            .u64(self.client_id);
+        digest.finish()
     }
 
     /// The chain the endpoint's passphrase names: `Some` for testnet and
@@ -87,11 +167,198 @@ impl EndpointIdentity {
         self.protocol_version
     }
 
+    /// Whether the endpoint's protocol admits CAP-84 muxed contract addresses.
+    #[must_use]
+    pub fn admits_muxed_contract(&self) -> bool {
+        self.protocol_version() >= MUXED_CONTRACT_MIN_PROTOCOL
+    }
+
+    /// Admits muxed contract signing when the checked protocol supports it.
+    #[must_use]
+    pub fn muxed_contract_admission(&self) -> Option<MuxedContractAdmission> {
+        self.admits_muxed_contract()
+            .then_some(MuxedContractAdmission { _private: () })
+    }
+
     /// The endpoint's scheme, host, and port, the form every RPC error
     /// carries. It never holds userinfo, a path, or a query.
     #[must_use]
     pub fn authority(&self) -> &str {
         &self.authority
+    }
+}
+
+/// One endpoint's latest ledger, read through the client whose checked
+/// identity the observation carries.
+///
+/// [`PreparedSigningLedgerRead::read`](crate::PreparedSigningLedgerRead::read)
+/// is the only constructor outside this crate's tests.
+/// [`StellarRpcClient::prepare_signing_ledger_observation`](crate::StellarRpcClient::prepare_signing_ledger_observation)
+/// runs
+/// [`StellarRpcClient::endpoint_identity`](crate::StellarRpcClient::endpoint_identity)
+/// once, and each read asks `getLatestLedger` through the same client under
+/// the same deadline. Holding a value means the height came from an endpoint
+/// that passed the identity checks. The height itself is the endpoint's
+/// claim; a signing path compares it with another endpoint's observation
+/// before it relies on it.
+///
+/// ```compile_fail,E0639
+/// use stellar_agent_network::SigningLedgerObservation;
+/// fn forge(p: SigningLedgerObservation) -> SigningLedgerObservation {
+///     SigningLedgerObservation { ..p }
+/// }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::SigningLedgerObservation;
+/// fn inspect(p: &SigningLedgerObservation) { let _ = &p.ledger; }
+/// ```
+///
+/// The import and the getters resolve, so the snippets above fail on the
+/// barrier they name and not on the path:
+///
+/// ```
+/// use stellar_agent_network::SigningLedgerObservation;
+/// fn inspect(p: &SigningLedgerObservation) -> (u32, &str) {
+///     (p.ledger(), p.identity().authority())
+/// }
+/// let _ = inspect;
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningLedgerObservation {
+    identity: EndpointIdentity,
+    ledger: u32,
+    observed_at: tokio::time::Instant,
+    arrived_at_ms: u64,
+}
+
+impl SigningLedgerObservation {
+    /// Builds the observation of a height read through the client `identity`
+    /// names, at `observed_at`.
+    pub(crate) fn checked(
+        identity: EndpointIdentity,
+        ledger: u32,
+        observed_at: tokio::time::Instant,
+        arrived_at_ms: u64,
+    ) -> Self {
+        Self {
+            identity,
+            ledger,
+            observed_at,
+            arrived_at_ms,
+        }
+    }
+
+    /// The local arrival time in store clock milliseconds.
+    #[must_use]
+    pub fn arrived_at_ms(&self) -> u64 {
+        self.arrived_at_ms
+    }
+
+    /// The checked identity of the endpoint that reported the height.
+    #[must_use]
+    pub fn identity(&self) -> &EndpointIdentity {
+        &self.identity
+    }
+
+    /// The latest ledger the endpoint reported, as received.
+    #[must_use]
+    pub fn ledger(&self) -> u32 {
+        self.ledger
+    }
+
+    /// The local instant the answer arrived.
+    #[must_use]
+    pub fn observed_at(&self) -> tokio::time::Instant {
+        self.observed_at
+    }
+}
+
+/// An oracle client whose endpoint reported the mainnet passphrase and a
+/// protocol version the protocol rule accepts for mainnet.
+///
+/// [`MainnetOracle::verify`] is the only public constructor, and the
+/// crate's single-request form of it is the only other one. Both ask the
+/// endpoint `getNetwork` through the client and return a value only when the
+/// answer names mainnet and passes [`check_protocol_version`]. The settlement steps
+/// that release or confirm a mainnet submission on the oracle's word take
+/// this type rather than a bare client, so an oracle endpoint that serves
+/// another network, or whose identity could not be read, is never asked for
+/// that evidence.
+///
+/// ```compile_fail,E0451
+/// use stellar_agent_network::{MainnetOracle, StellarRpcClient};
+/// fn forge(client: &StellarRpcClient) -> MainnetOracle<'_> { MainnetOracle { client } }
+/// ```
+#[derive(Clone, Copy)]
+pub struct MainnetOracle<'a> {
+    client: &'a crate::StellarRpcClient,
+}
+
+impl<'a> MainnetOracle<'a> {
+    /// Checks that `client`'s endpoint serves mainnet, with the identity
+    /// probe's retries bounded by `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// `network.witness_unavailable` naming the oracle when the endpoint
+    /// reports another network, an unsupported protocol version, or no
+    /// identity before `deadline`; `network.rpc_credential_refused` when it
+    /// answers HTTP 401 or 403.
+    pub async fn verify(
+        client: &'a crate::StellarRpcClient,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, stellar_agent_core::error::WalletError> {
+        client
+            .mainnet_endpoint_identity(deadline)
+            .await
+            .map_err(|error| {
+                crate::cross_check::identity_error(error, &client.url.authority(), Caip2::Mainnet)
+            })?;
+        Ok(Self { client })
+    }
+
+    /// [`Self::verify`] with exactly one `getNetwork` request and no retry,
+    /// for a caller that charges every request it sends against an
+    /// allowance.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify`].
+    pub(crate) async fn verify_once(
+        client: &'a crate::StellarRpcClient,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, crate::client::RecoveryReadError> {
+        use crate::client::RecoveryReadError;
+        let result = tokio::time::timeout_at(deadline, client.recovery_identity())
+            .await
+            .map_err(|_| {
+                RecoveryReadError::from(stellar_rpc_client::Error::JsonRpc(
+                    jsonrpsee_core::ClientError::RequestTimeout,
+                ))
+            })?;
+        result.map_err(|error| match error {
+            RecoveryReadError::Validation(error) => RecoveryReadError::Validation(
+                crate::cross_check::identity_error(error, &client.url.authority(), Caip2::Mainnet),
+            ),
+            other => other,
+        })?;
+        Ok(Self { client })
+    }
+
+    /// The verified client.
+    #[must_use]
+    pub fn client(self) -> &'a crate::StellarRpcClient {
+        self.client
+    }
+}
+
+impl std::fmt::Debug for MainnetOracle<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MainnetOracle")
+            .field("authority", &self.client.url.authority())
+            .finish()
     }
 }
 
@@ -158,6 +425,45 @@ mod tests {
     use stellar_agent_test_support::WarningCapture;
 
     use super::*;
+
+    #[test]
+    fn muxed_contract_protocol_boundary() {
+        for (version, admitted) in [(29, false), (30, true), (31, true)] {
+            let identity = EndpointIdentity::checked(None, version, String::new(), 0);
+            assert_eq!(identity.admits_muxed_contract(), admitted, "{version}");
+            assert_eq!(
+                identity.muxed_contract_admission().is_some(),
+                admitted,
+                "{version}"
+            );
+        }
+    }
+
+    /// The fact digest follows the documented layout, against a vector
+    /// computed independently, and names the client.
+    #[test]
+    fn the_fact_digest_follows_the_layout() {
+        let identity = EndpointIdentity::checked(
+            Some(Caip2::Mainnet),
+            29,
+            "https://rpc.example.org".to_owned(),
+            7,
+        );
+        assert_eq!(identity.client_id(), 7);
+        assert_eq!(
+            stellar_agent_core::hex::encode(&identity.fact_digest()),
+            "9c9639a9968b49f4bf0d97c1c067370cdb4a445f2d654d6e2fb879f6a468c196"
+        );
+        let other_client = EndpointIdentity::checked(
+            Some(Caip2::Mainnet),
+            29,
+            "https://rpc.example.org".to_owned(),
+            8,
+        );
+        assert_ne!(other_client.fact_digest(), identity.fact_digest());
+        let no_chain = EndpointIdentity::checked(None, 29, "https://rpc.example.org".to_owned(), 7);
+        assert_ne!(no_chain.fact_digest(), identity.fact_digest());
+    }
 
     fn with_warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<BTreeMap<String, String>>) {
         let (warnings, _guard) = WarningCapture::capture(None);

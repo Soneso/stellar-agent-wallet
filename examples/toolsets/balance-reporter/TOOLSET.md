@@ -16,15 +16,15 @@ else: no signing, key, or policy tool is reachable through this toolset, and the
 
 ## Action
 
-`stellar_balances` — fetch the account's native XLM balance and, optionally, the
+`stellar_balances`: fetch the account's native XLM balance and, optionally, the
 balances of named trustlines.
 
 Arguments:
 
-- `chain_id` (required) — the CAIP-2 chain id, e.g. `stellar:testnet`. Must match
+- `chain_id` (required): the CAIP-2 chain id, e.g. `stellar:testnet`. Must match
   the active profile.
-- `account_id` (required) — the G-strkey account to read.
-- `assets` (optional) — a list of `{ "code", "issuer" }` objects to also report
+- `account_id` (required): the G-strkey or M-strkey account to read.
+- `assets` (optional): a list of `{ "code", "issuer" }` objects to also report
   trustline balances for.
 
 ## Instructions

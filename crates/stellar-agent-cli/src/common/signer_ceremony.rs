@@ -8,11 +8,19 @@
 //! 2. Parse it into a 32-byte seed; wrap the seed in `Zeroizing<[u8; 32]>`.
 //! 3. Explicitly zeroize the `Copy` residue left in `PrivateKey.0` (until
 //!    `stellar-strkey` gains its own `Drop`/`Zeroize` impl for the type).
-//! 4. Move the seed into `Wallet::unlock`, mlock-pinning the page for the
-//!    resolved profile's `[wallet]` posture and TTL.
-//! 5. Derive the `SoftwareSigningKey` via `signer_from_wallet`.
-//! 6. Dispose the wallet (munlock + zeroize the `LockedSeed`) before
-//!    returning the signer.
+//! 4. Borrow the seed into `Wallet::unlock`, which copies into a stable home
+//!    after the resolved profile's configured lock attempt.
+//! 5. Transfer that home into `SoftwareSigningKey` via `signer_from_wallet`.
+//!    The signer zeroizes before unlocking and freeing its home on drop. The
+//!    command keeps it for its run, which can outlast the wallet's
+//!    clock-checked unlock TTL.
+//!
+//! The ceremony erases the wallet's own copies only. The inherited process
+//! environment keeps the exported seed for the life of the process. Mainnet
+//! transaction signing refuses `--secret-env` through
+//! [`MainnetSignerChoice::from_flags`]. Testnet software signing and
+//! enrollment use this ceremony. Policy signing, signer binding and
+//! window-state resets read owner seeds through `commands::profile::owner_seed`.
 //!
 //! [`resolve_software_signer_from_env`] is the single call site for this
 //! ceremony. Every CLI verb that resolves a signer from an env var routes
@@ -37,6 +45,7 @@
 //! profile the signer must be the profile's enrolled identity. The enrollment
 //! ceremonies are exempt because they establish that identity.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
@@ -46,9 +55,14 @@ use stellar_agent_core::profile::Profile;
 #[cfg(test)]
 use stellar_agent_core::wallet::{DEFAULT_TTL_SECONDS, MlockRequired};
 use stellar_agent_core::wallet::{MlockDegradation, Wallet};
+use stellar_agent_network::keyring::{EnrolledSigner, lazy_signer_from_keyring};
 use stellar_agent_network::signing::hardware::HardwareSigningKey;
+use stellar_agent_network::signing::source::require_signer_key;
 use stellar_agent_network::signing::wallet::signer_from_wallet;
-use stellar_agent_network::{Signer, SoftwareSigningKey};
+use stellar_agent_network::{
+    KeyringSignHandle, MessagePayload, Signer, SmartAccountAuthDigest, SoftwareSigningKey,
+    SorobanAuthPayload, TxSigningPayload, WebAuthnAssertion,
+};
 use stellar_agent_smart_account::deployment::DeployerKeypair;
 use zeroize::Zeroizing;
 
@@ -70,17 +84,65 @@ pub(crate) struct SignerCeremonyOutcome {
 thread_local! {
     /// Calls to [`resolve_software_signer_from_env`] on this thread.
     static SIGNER_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Calls to [`mainnet_signer`] on this thread.
+    static MAINNET_SIGNERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// How many times [`resolve_software_signer_from_env`] ran on the calling
-/// thread.
+/// How many signer resolutions the calling thread attempted: the
+/// environment ceremonies of [`resolve_software_signer_from_env`] plus the
+/// mainnet signers [`mainnet_signer`] constructs.
+///
+/// An attempt counts when it starts, before it succeeds or fails. The lazy
+/// keyring signer of [`mainnet_signer`] opens its seed only at the
+/// signature, so a counted keyring resolution has read no seed yet.
 ///
 /// A command test on a current-thread runtime reads it before and after one
-/// command: an unchanged count proves the command refused before it loaded a
-/// signing key.
+/// command: an unchanged count proves the command refused before it resolved
+/// any signer, from the environment, the keyring or a Ledger.
 #[cfg(test)]
 pub(crate) fn signer_resolutions_on_this_thread() -> usize {
-    SIGNER_RESOLUTIONS.with(std::cell::Cell::get)
+    SIGNER_RESOLUTIONS.with(std::cell::Cell::get) + MAINNET_SIGNERS.with(std::cell::Cell::get)
+}
+
+/// Supplies the device public key and Ledger signer for a test on this thread.
+#[cfg(test)]
+pub(crate) type LedgerSignerFactory = std::rc::Rc<
+    dyn Fn(
+        u32,
+        &str,
+    ) -> Result<
+        (
+            stellar_strkey::ed25519::PublicKey,
+            Box<dyn Signer + Send + Sync>,
+        ),
+        WalletError,
+    >,
+>;
+
+#[cfg(test)]
+thread_local! {
+    /// The Ledger signer factory a test set on this thread.
+    static LEDGER_SIGNER_FACTORY: std::cell::RefCell<Option<LedgerSignerFactory>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous Ledger signer factory when dropped.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) struct LedgerSignerFactoryGuard(Option<LedgerSignerFactory>);
+
+#[cfg(all(test, feature = "mainnet-write"))]
+impl Drop for LedgerSignerFactoryGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        LEDGER_SIGNER_FACTORY.with(|factory| *factory.borrow_mut() = previous);
+    }
+}
+
+/// Makes the mainnet Ledger signer on this thread come from `factory` until
+/// the guard drops.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) fn set_ledger_signer_factory(factory: LedgerSignerFactory) -> LedgerSignerFactoryGuard {
+    LedgerSignerFactoryGuard(LEDGER_SIGNER_FACTORY.with(|slot| slot.replace(Some(factory))))
 }
 
 /// Derives a software signer using the loaded profile's wallet controls.
@@ -97,24 +159,18 @@ pub(crate) async fn resolve_software_signer_from_env(
     let mlock_required = profile.wallet.mlock_required;
     let ttl_seconds = profile.wallet.unlock_ttl_seconds;
 
-    let s_strkey: Zeroizing<String> = Zeroizing::new(std::env::var(var_name).map_err(|_| {
-        WalletError::Validation(ValidationError::SecretEnvNotSet {
-            var: var_name.to_owned(),
-        })
-    })?);
+    let s_strkey: Zeroizing<String> = Zeroizing::new(
+        std::env::var(var_name)
+            .map_err(|_| WalletError::Validation(ValidationError::SecretEnvNotSet))?,
+    );
 
-    let mut private_key =
-        stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).map_err(|_| {
-            WalletError::Validation(ValidationError::SecretEnvInvalid {
-                var: var_name.to_owned(),
-            })
-        })?;
+    let mut private_key = stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey)
+        .map_err(|_| WalletError::Validation(ValidationError::SecretEnvInvalid))?;
     let seed: Zeroizing<[u8; 32]> = Zeroizing::new(private_key.0);
     zeroize::Zeroize::zeroize(&mut private_key.0);
     drop(s_strkey);
 
-    let mut wallet = Wallet::unlock(wallet_label.to_owned(), seed, ttl_seconds, mlock_required)
-        .await
+    let wallet = Wallet::unlock(wallet_label.to_owned(), &seed, ttl_seconds, mlock_required)
         .map_err(|e| {
             WalletError::WalletState(WalletStateError::UnlockFailed {
                 detail: e.to_string(),
@@ -122,14 +178,7 @@ pub(crate) async fn resolve_software_signer_from_env(
         })?;
     let mlock_degradation = wallet.mlock_degradation().cloned();
 
-    let signer = match signer_from_wallet(&wallet) {
-        Ok(s) => s,
-        Err(e) => {
-            wallet.dispose();
-            return Err(e);
-        }
-    };
-    wallet.dispose();
+    let signer = signer_from_wallet(wallet)?;
     Ok(SignerCeremonyOutcome {
         signer,
         mlock_degradation,
@@ -247,6 +296,205 @@ pub(crate) fn record_mlock_degradation(
     );
 }
 
+/// The signer a mainnet write signs with, resolved from the verb's flags
+/// without any I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MainnetSignerChoice {
+    /// The connected Ledger at `account_index`.
+    Ledger {
+        /// The BIP-44 account index.
+        account_index: u32,
+    },
+    /// The profile's enrolled agent seed in the keyring, read at signing.
+    Keyring,
+}
+
+impl MainnetSignerChoice {
+    /// The mainnet signer of a verb that takes `--sign-with-ledger` and
+    /// `--secret-env`, chosen from the flags alone:
+    ///
+    /// - `--sign-with-ledger` selects the Ledger at `account_index`, also
+    ///   when `--secret-env` is given beside it.
+    /// - `--secret-env` without `--sign-with-ledger` is refused: mainnet
+    ///   signing never reads a seed from the process environment, which
+    ///   keeps an exported seed for the life of the process.
+    /// - No signer flag selects the profile's enrolled seed in the keyring.
+    ///
+    /// The variable named by `secret_env` is never read.
+    ///
+    /// # Errors
+    ///
+    /// `validation.mainnet_secret_env_refused` when `secret_env` is given
+    /// without `sign_with_ledger`.
+    pub(crate) fn from_flags(
+        sign_with_ledger: bool,
+        account_index: u32,
+        secret_env: Option<&str>,
+    ) -> Result<Self, WalletError> {
+        match (sign_with_ledger, secret_env) {
+            (true, _) => Ok(Self::Ledger { account_index }),
+            (false, Some(_)) => Err(ValidationError::MainnetSecretEnvRefused.into()),
+            (false, None) => Ok(Self::Keyring),
+        }
+    }
+
+    /// The signer kind the submission records.
+    #[must_use]
+    pub(crate) fn submission_kind(&self) -> stellar_agent_network::SubmissionSignerKind {
+        match self {
+            Self::Ledger { .. } => stellar_agent_network::SubmissionSignerKind::Hardware,
+            Self::Keyring => stellar_agent_network::SubmissionSignerKind::Keyring,
+        }
+    }
+}
+
+/// A mainnet signer, constructed after the authorization is minted.
+///
+/// `handle_failure` is set for the keyring choice only: it records whether
+/// the lazy keyring handle returned an error from a signing call, the one
+/// refusal of the authorized attach that means the signer was unavailable.
+pub(crate) struct MainnetSigner {
+    signer: Box<dyn Signer + Send + Sync>,
+    handle_failure: Option<Arc<AtomicBool>>,
+}
+
+impl MainnetSigner {
+    /// The signer the authorized attach signs with.
+    #[must_use]
+    pub(crate) fn signer(&self) -> &(dyn Signer + Send + Sync) {
+        self.signer.as_ref()
+    }
+
+    /// Whether the keyring handle returned an error; `false` for the Ledger.
+    #[must_use]
+    pub(crate) fn handle_failed(&self) -> bool {
+        self.handle_failure
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+}
+
+/// Constructs the signer `choice` names for the enrolled agent `enrolled`.
+///
+/// Runs after the authorization is minted. The Ledger is opened here and its
+/// key compared with `source`. The keyring seed is not read here: it is read
+/// inside the signing call, after the authorized attach checked the
+/// authorization.
+///
+/// # Errors
+///
+/// The device errors and `auth.signer_key_mismatch` for the Ledger, and the
+/// refusal of [`lazy_signer_from_keyring`] for the keyring.
+pub(crate) async fn mainnet_signer(
+    choice: &MainnetSignerChoice,
+    enrolled: &EnrolledSigner,
+    source: &str,
+    source_flag: &'static str,
+) -> Result<MainnetSigner, WalletError> {
+    #[cfg(test)]
+    MAINNET_SIGNERS.with(|count| count.set(count.get() + 1));
+    match choice {
+        MainnetSignerChoice::Ledger { account_index } => Ok(MainnetSigner {
+            signer: ledger_signer(*account_index, source, source_flag).await?,
+            handle_failure: None,
+        }),
+        MainnetSignerChoice::Keyring => {
+            let handle = lazy_signer_from_keyring(enrolled.seed_entry(), source)?;
+            let failed = Arc::new(AtomicBool::new(false));
+            Ok(MainnetSigner {
+                signer: Box::new(KeyringHandleSigner {
+                    handle,
+                    failed: Arc::clone(&failed),
+                }),
+                handle_failure: Some(failed),
+            })
+        }
+    }
+}
+
+/// Opens the Ledger at `account_index` and requires its key to be `source`.
+async fn ledger_signer(
+    account_index: u32,
+    source: &str,
+    source_flag: &'static str,
+) -> Result<Box<dyn Signer + Send + Sync>, WalletError> {
+    let device = async {
+        let signer = HardwareSigningKey::native()?.with_account_index(account_index);
+        let public_key = signer.public_key().await?;
+        Ok::<_, WalletError>((
+            public_key,
+            Box::new(signer) as Box<dyn Signer + Send + Sync>,
+        ))
+    };
+    #[cfg(test)]
+    let (public_key, signer) = match LEDGER_SIGNER_FACTORY.with(|slot| slot.borrow().clone()) {
+        Some(factory) => factory(account_index, source)?,
+        None => device.await?,
+    };
+    #[cfg(not(test))]
+    let (public_key, signer) = device.await?;
+    require_signer_key(public_key, source, source_flag)?;
+    Ok(signer)
+}
+
+/// The lazy keyring handle of the enrolled agent seed, recording whether a
+/// delegated call returned an error.
+///
+/// The handle loads the seed inside its first signing call, so an error it
+/// returns there means the seed was unavailable.
+pub(crate) struct KeyringHandleSigner {
+    handle: KeyringSignHandle,
+    failed: Arc<AtomicBool>,
+}
+
+impl KeyringHandleSigner {
+    fn observe<T>(&self, result: Result<T, WalletError>) -> Result<T, WalletError> {
+        if result.is_err() {
+            self.failed.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+}
+
+#[async_trait::async_trait]
+impl Signer for KeyringHandleSigner {
+    async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
+        self.observe(Signer::sign_tx_payload(&self.handle, payload).await)
+    }
+
+    async fn sign_auth_digest(
+        &self,
+        digest: &SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
+        self.observe(Signer::sign_auth_digest(&self.handle, digest).await)
+    }
+
+    async fn sign_soroban_address_auth_payload(
+        &self,
+        payload: &SorobanAuthPayload,
+    ) -> Result<[u8; 64], WalletError> {
+        self.observe(Signer::sign_soroban_address_auth_payload(&self.handle, payload).await)
+    }
+
+    async fn sign_message(&self, payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
+        self.observe(Signer::sign_message(&self.handle, payload).await)
+    }
+
+    async fn sign_webauthn_assertion(
+        &self,
+        auth_digest: &SmartAccountAuthDigest,
+        credential_id: &[u8],
+    ) -> Result<WebAuthnAssertion, WalletError> {
+        self.observe(
+            Signer::sign_webauthn_assertion(&self.handle, auth_digest, credential_id).await,
+        )
+    }
+
+    async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
+        self.observe(Signer::public_key(&self.handle).await)
+    }
+}
+
 /// Enrolled-identity fixtures shared by the signing tests of the CLI verbs.
 #[cfg(test)]
 pub(crate) mod test_fixtures {
@@ -343,6 +591,23 @@ pub(crate) mod test_fixtures {
             ),
         }
     }
+
+    /// Asserts the outcome `pin` predicts for a mainnet signing attempt with a
+    /// signer derived from the test seed: the enrolled pin is checked first,
+    /// and a signer that passes it meets the signing primitive's mainnet
+    /// refusal.
+    pub(crate) fn assert_enrolled_mainnet_signing_outcome<T: std::fmt::Debug>(
+        pin: EnrolledPin,
+        result: Result<T, WalletError>,
+    ) {
+        let expected = pin
+            .expected_refusal()
+            .unwrap_or("network.mainnet_write_forbidden");
+        assert_eq!(
+            result.expect_err("mainnet signing is refused").code(),
+            expected
+        );
+    }
 }
 
 #[cfg(test)]
@@ -361,6 +626,130 @@ mod tests {
 
     use super::*;
 
+    /// The CLI wrapper preserves the binding when a callback forwards a mainnet payload.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn keyring_handle_signer_refuses_another_mainnet_key() {
+        use crate::common::mainnet_write_fixture::{AGENT_SEED, DESTINATION, Spec};
+        use clap::Parser;
+
+        struct ForwardingSigner {
+            target: KeyringHandleSigner,
+        }
+
+        #[async_trait::async_trait]
+        impl Signer for ForwardingSigner {
+            async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
+                SoftwareSigningKey::new_from_bytes(AGENT_SEED)
+                    .public_key()
+                    .await
+            }
+
+            async fn sign_tx_payload(
+                &self,
+                payload: &TxSigningPayload,
+            ) -> Result<[u8; 64], WalletError> {
+                let error = self.target.sign_tx_payload(payload).await.unwrap_err();
+                assert_eq!(error.code(), "network.mainnet_authorization_refused");
+                Err(error)
+            }
+
+            async fn sign_auth_digest(
+                &self,
+                _: &SmartAccountAuthDigest,
+            ) -> Result<[u8; 64], WalletError> {
+                panic!("unexpected smart-account signing")
+            }
+
+            async fn sign_soroban_address_auth_payload(
+                &self,
+                _: &SorobanAuthPayload,
+            ) -> Result<[u8; 64], WalletError> {
+                panic!("unexpected Soroban signing")
+            }
+
+            async fn sign_message(&self, _: &MessagePayload) -> Result<[u8; 64], WalletError> {
+                panic!("unexpected message signing")
+            }
+
+            async fn sign_webauthn_assertion(
+                &self,
+                _: &SmartAccountAuthDigest,
+                _: &[u8],
+            ) -> Result<WebAuthnAssertion, WalletError> {
+                panic!("unexpected WebAuthn signing")
+            }
+        }
+
+        #[derive(Parser)]
+        struct PayCommand {
+            #[command(flatten)]
+            args: crate::commands::pay::PayArgs,
+        }
+
+        let fixture = Spec::new("keyring-payload-binding").build().await;
+        let seed = [0x3b; 32];
+        let public = SoftwareSigningKey::new_from_bytes(seed)
+            .public_key()
+            .await
+            .unwrap();
+        let entry = stellar_agent_core::profile::schema::KeyringEntryRef::new(
+            "stellar-agent-cli-payload-binding",
+            "default",
+        );
+        keyring_core::Entry::new(&entry.service, &entry.account)
+            .unwrap()
+            .set_password(
+                &stellar_strkey::ed25519::PrivateKey(seed)
+                    .as_unredacted()
+                    .to_string(),
+            )
+            .unwrap();
+        let failed = Arc::new(AtomicBool::new(false));
+        let target = KeyringHandleSigner {
+            handle: lazy_signer_from_keyring(&entry, &public.to_string()).unwrap(),
+            failed: Arc::clone(&failed),
+        };
+        assert!(target.sign_tx_payload(&tx_payload(7)).await.is_ok());
+        assert!(!failed.load(Ordering::SeqCst));
+        let record = Arc::clone(&failed);
+        let agent_public = SoftwareSigningKey::new_from_bytes(AGENT_SEED)
+            .public_key()
+            .await
+            .unwrap();
+        let _factory = set_ledger_signer_factory(std::rc::Rc::new(move |_, _| {
+            Ok((
+                agent_public,
+                Box::new(ForwardingSigner {
+                    target: KeyringHandleSigner {
+                        handle: lazy_signer_from_keyring(&entry, &public.to_string())?,
+                        failed: Arc::clone(&record),
+                    },
+                }),
+            ))
+        }));
+        let business_id = crate::common::business_entry::fresh_business_id();
+        let command = PayCommand::parse_from([
+            "pay",
+            DESTINATION,
+            "1 XLM",
+            "--profile",
+            fixture.name,
+            "--source",
+            &fixture.agent.g,
+            "--sign-with-ledger",
+            "--business-id",
+            &business_id,
+        ]);
+        assert_eq!(crate::commands::pay::run(&command.args).await, 1);
+        assert!(
+            failed.load(Ordering::SeqCst),
+            "the wrapper refuses the bound payload"
+        );
+        assert!(fixture.sent_envelopes().await.is_empty());
+    }
+
     fn test_profile() -> Profile {
         let mut profile = Profile::builder_testnet_named("ceremony", "s", "a", "n", "a").build();
         profile.wallet.mlock_required = MlockRequired::Warn;
@@ -371,6 +760,32 @@ mod tests {
         format!("SIGNER_CEREMONY_TEST_{tag}_{}", std::process::id())
     }
 
+    /// The SEP-23 payload of an empty testnet transaction at `sequence`.
+    #[cfg(feature = "mainnet-write")]
+    fn tx_payload(sequence: i64) -> TxSigningPayload {
+        use stellar_xdr::{
+            Memo, MuxedAccount, Preconditions, SequenceNumber, Transaction, TransactionEnvelope,
+            TransactionExt, TransactionV1Envelope, Uint256, VecM,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([0x11; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(sequence),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: VecM::default(),
+                ext: TransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        });
+        TxSigningPayload::for_envelope(
+            &envelope,
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+        )
+        .unwrap()
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
     #[allow(
@@ -378,6 +793,9 @@ mod tests {
         reason = "test-only process environment mutation; the variable name is unique to this test"
     )]
     async fn derives_the_expected_public_key_with_testnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let seed = [0x11u8; 32];
         let s_strkey = stellar_strkey::ed25519::PrivateKey(seed)
             .as_unredacted()
@@ -412,40 +830,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn unset_env_var_is_refused() {
-        let var = unique_var("UNSET");
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let var = unique_var("UNSET_CREDMARKER7");
         let err = match resolve_software_signer_from_env(&var, "unit-test", &test_profile()).await {
             Ok(_) => panic!("unset env var must refuse"),
             Err(e) => e,
         };
         assert_eq!(err.code(), "validation.secret_env_not_set");
-        assert!(
-            err.message().contains(&var),
-            "error must name the variable: {err}"
+        assert_eq!(
+            err.message(),
+            "the secret environment variable named by the argument is not set"
         );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, "CREDMARKER7");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
     #[allow(unsafe_code, reason = "test-only process environment mutation")]
     async fn invalid_s_strkey_is_refused() {
-        let var = unique_var("INVALID");
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let var = unique_var("INVALID_CREDMARKER7");
         unsafe {
-            std::env::set_var(&var, "not-an-s-strkey");
+            std::env::set_var(&var, "invalid-CREDMARKER7");
         }
         let err = match resolve_software_signer_from_env(&var, "unit-test", &test_profile()).await {
             Ok(_) => panic!("invalid S-strkey must refuse"),
             Err(e) => e,
         };
         assert_eq!(err.code(), "validation.secret_env_invalid");
-        assert!(
-            err.message().contains(&var),
-            "error must name the variable: {err}"
+        assert_eq!(
+            err.message(),
+            "the secret environment variable named by the argument must contain a valid S-strkey"
         );
-        assert!(
-            !err.message().contains("not-an-s-strkey"),
-            "error must not echo the malformed value: {err}"
-        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, "CREDMARKER7");
         unsafe {
             std::env::remove_var(&var);
         }
@@ -463,6 +886,9 @@ mod tests {
         reason = "test-only process environment mutation; the S-strkey variable name is unique to this test"
     )]
     async fn over_max_ttl_profile_surfaces_unlock_failed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::wallet::MAX_TTL_SECONDS;
 
         let mut profile = test_profile();
@@ -562,12 +988,35 @@ mod tests {
         let seed_bytes = Zeroizing::new(seed);
         let result = Wallet::unlock(
             "unit-test".to_owned(),
-            seed_bytes,
+            &seed_bytes,
             over_max,
             MlockRequired::Warn,
-        )
-        .await;
+        );
         assert!(result.is_err(), "TTL above MAX_TTL_SECONDS must be refused");
+    }
+
+    // ── MainnetSignerChoice::from_flags ─────────────────────────────────────
+
+    /// `--secret-env` alone is refused without reading the variable, no
+    /// signer flag selects the enrolled keyring seed, and `--sign-with-ledger`
+    /// selects the Ledger even beside `--secret-env`.
+    #[test]
+    fn mainnet_choice_maps_the_three_flag_cases() {
+        let refused = MainnetSignerChoice::from_flags(false, 0, Some("PROBE_SEED_VAR"))
+            .expect_err("an environment seed is refused on mainnet");
+        assert_eq!(refused.code(), "validation.mainnet_secret_env_refused");
+        assert!(
+            !refused.message().contains("PROBE_SEED_VAR"),
+            "the refusal names no variable: {refused}"
+        );
+        assert_eq!(
+            MainnetSignerChoice::from_flags(false, 0, None).expect("no flag is the keyring"),
+            MainnetSignerChoice::Keyring
+        );
+        assert_eq!(
+            MainnetSignerChoice::from_flags(true, 3, Some("X")).expect("the Ledger is chosen"),
+            MainnetSignerChoice::Ledger { account_index: 3 }
+        );
     }
 
     // ── mlock-degradation detection ─────────────────────────────────────────
@@ -587,11 +1036,10 @@ mod tests {
         let seed_bytes = Zeroizing::new([0x44u8; 32]);
         let mut wallet = Wallet::unlock(
             "unit-test-mlock-false".to_owned(),
-            seed_bytes,
+            &seed_bytes,
             DEFAULT_TTL_SECONDS,
             MlockRequired::False,
         )
-        .await
         .expect("unlock under MlockRequired::False must always succeed");
         assert!(
             wallet.mlock_degradation().is_none(),
@@ -668,7 +1116,11 @@ mod tests {
     /// resolver refuses with `validation.signer_source_required` before any
     /// key access.
     #[tokio::test]
+    #[serial_test::serial]
     async fn resolve_deployer_keypair_without_a_source_flag_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let error = match resolve_deployer_keypair(
             None,
             false,
@@ -696,30 +1148,40 @@ mod tests {
 
     fn counting_signer_error() -> WalletError {
         WalletError::Auth(AuthError::KeyringNotFound {
-            name: "counting-key-fetch-sentinel".to_owned(),
+            cause: stellar_agent_core::error::KeyringMissingCause::InvalidSecret,
         })
     }
 
     #[async_trait::async_trait]
     impl Signer for CountingKeyFetchSigner {
-        async fn sign_tx_payload(&self, _payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        async fn sign_tx_payload(
+            &self,
+            _payload: &TxSigningPayload,
+        ) -> Result<[u8; 64], WalletError> {
             Err(counting_signer_error())
         }
 
-        async fn sign_auth_digest(&self, _digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        async fn sign_auth_digest(
+            &self,
+            _digest: &SmartAccountAuthDigest,
+        ) -> Result<[u8; 64], WalletError> {
             Err(counting_signer_error())
         }
 
         async fn sign_soroban_address_auth_payload(
             &self,
-            _payload: &[u8; 32],
+            _payload: &SorobanAuthPayload,
         ) -> Result<[u8; 64], WalletError> {
+            Err(counting_signer_error())
+        }
+
+        async fn sign_message(&self, _payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
             Err(counting_signer_error())
         }
 
         async fn sign_webauthn_assertion(
             &self,
-            _auth_digest: &[u8; 32],
+            _auth_digest: &SmartAccountAuthDigest,
             _credential_id: &[u8],
         ) -> Result<WebAuthnAssertion, WalletError> {
             Err(counting_signer_error())
@@ -748,7 +1210,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn require_enrolled_signer_leaves_the_signer_untouched_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let signer = CountingKeyFetchSigner::default();
         let result = require_enrolled_signer("ceremony", &test_profile(), &signer).await;
         assert_eq!(
@@ -760,14 +1226,19 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn require_enrolled_signer_fetches_the_key_once_on_mainnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let signer = CountingKeyFetchSigner::default();
         let error = require_enrolled_signer("enrolled", &pinned_mainnet_profile(), &signer)
             .await
             .expect_err("the failing key fetch must surface on mainnet");
         assert_eq!(error.code(), counting_signer_error().code());
-        assert!(
-            error.message().contains("counting-key-fetch-sentinel"),
+        assert_eq!(
+            error.message(),
+            counting_signer_error().message(),
             "the signer's own error must surface: {error}"
         );
         assert_eq!(signer.key_fetches.load(Ordering::SeqCst), 1);

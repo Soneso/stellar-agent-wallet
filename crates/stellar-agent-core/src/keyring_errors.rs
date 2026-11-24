@@ -3,7 +3,7 @@
 //! Diagnostics use fixed labels and numeric OS codes. Upstream error and
 //! credential formatting can contain secrets and must never reach the detail.
 
-use crate::error::{AuthError, WalletError};
+use crate::error::{AuthError, KeyringMissingCause, WalletError};
 
 /// The credential operation that failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,25 +87,23 @@ pub fn classify_keyring_error(e: &keyring_core::Error, service: &str) -> AuthErr
 ///
 /// Only missing reads use [`AuthError::KeyringNotFound`]. Windows no-logon
 /// failures keep their interactive-session guidance for every operation.
-/// The service appears only in missing-read diagnostics.
+/// The service stays out of the classified error.
 #[must_use]
 pub fn classify_keyring_operation_error(
     e: &keyring_core::Error,
     operation: KeyringOperation,
-    service: &str,
+    _service: &str,
 ) -> AuthError {
     use keyring_core::Error;
     let cause = match e {
         Error::NoEntry if operation == KeyringOperation::Read => {
             return AuthError::KeyringNotFound {
-                name: service.to_owned(),
+                cause: KeyringMissingCause::MissingEntry,
             };
         }
         Error::NoDefaultStore if operation == KeyringOperation::Read => {
             return AuthError::KeyringNotFound {
-                name: format!(
-                    "{service} (no OS credential store is available for this session; ensure the platform keychain — macOS Keychain, GNOME Keyring / KWallet, or Windows Credential Manager — is running and unlocked)"
-                ),
+                cause: KeyringMissingCause::NoDefaultStore,
             };
         }
         Error::NoStorageAccess(inner) if is_windows_no_logon_session(inner) => {
@@ -132,6 +130,10 @@ pub fn classify_keyring_operation_error(
 }
 
 fn os_cause(cause: &str, inner: &keyring_core::error::PlatformError) -> String {
+    #[cfg(target_os = "macos")]
+    if let Some(error) = inner.downcast_ref::<security_framework::base::Error>() {
+        return format!("{cause} (OS status {})", error.code());
+    }
     match inner
         .downcast_ref::<std::io::Error>()
         .and_then(std::io::Error::raw_os_error)
@@ -406,6 +408,23 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial]
+    fn macos_platform_failure_keeps_status() {
+        let status = security_framework::base::Error::from_code(-25293);
+        let display = status.to_string();
+        let error = Error::PlatformFailure(Box::new(status));
+        assert_platform(
+            &error,
+            "credential store operation failed (OS status -25293)",
+        );
+        let classified = classify_keyring_operation_error(&error, KeyringOperation::Read, ACCOUNT);
+        let text = classified.to_string();
+        assert!(text.contains("(OS status -25293)"), "{text}");
+        assert!(!text.contains(&display), "{text}");
+    }
+
     #[test]
     #[serial]
     fn access_failure_preserves_only_os_code() {
@@ -566,14 +585,38 @@ mod tests {
         );
     }
 
+    /// A keyring coordinate stays out of a missing-read error in every
+    /// rendering, and the cause still tells the conditions apart.
+    #[test]
+    fn missing_reads_hold_no_coordinate() {
+        for (error, cause) in [
+            (Error::NoEntry, KeyringMissingCause::MissingEntry),
+            (Error::NoDefaultStore, KeyringMissingCause::NoDefaultStore),
+        ] {
+            let classified =
+                classify_keyring_operation_error(&error, KeyringOperation::Read, "credmarker7");
+            assert!(
+                matches!(classified, AuthError::KeyringNotFound { cause: found } if found == cause),
+                "{classified:?}"
+            );
+            stellar_agent_test_support::rejected_value::assert_no_marker(
+                &classified,
+                "credmarker7",
+            );
+        }
+    }
+
     #[test]
     #[allow(deprecated)]
     fn missing_read_and_legacy_wrappers_keep_guidance() {
         for (error, expected) in [
-            (Error::NoEntry, "keyring entry 'service' was not found"),
+            (
+                Error::NoEntry,
+                "the configured keyring entry must exist; provision or select the required entry.",
+            ),
             (
                 Error::NoDefaultStore,
-                "keyring entry 'service (no OS credential store is available for this session; ensure the platform keychain — macOS Keychain, GNOME Keyring / KWallet, or Windows Credential Manager — is running and unlocked)' was not found",
+                "a platform keychain must be available for this session; start and unlock macOS Keychain, GNOME Keyring, KWallet, or Windows Credential Manager.",
             ),
         ] {
             for classified in [

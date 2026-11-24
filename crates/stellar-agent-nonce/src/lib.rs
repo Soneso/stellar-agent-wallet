@@ -5,7 +5,7 @@
 //! Provides:
 //!
 //! - [`Nonce`] — a 48-byte (16-byte random salt + 32-byte HMAC-SHA256 tag)
-//!   opaque value transmitted as base64.
+//!   opaque value transmitted as base64.  The tag covers the salt.
 //! - [`NonceMint`] — a per-profile minter.  Holds no key bytes; the HMAC key
 //!   is lazy-loaded from the platform keyring on every [`NonceMint::mint`] or
 //!   [`NonceMint::verify`] call and zeroised immediately after.
@@ -34,6 +34,8 @@
 //!
 //! ```text
 //! HMAC-SHA256(profile_nonce_key,
+//!     NONCE_TAG_DOMAIN       ||   // 27 bytes: "stellar-agent-nonce-tag:v2\0"
+//!     salt                   ||   // 16 bytes: bytes[0..16] of the nonce
 //!     boot_nonce             ||   // 16 bytes — process-scoped (see below)
 //!     SHA-256(envelope_xdr)  ||   // 32 bytes
 //!     expiry_unix_ms         ||   // 8 bytes big-endian u64
@@ -43,6 +45,9 @@
 //!     chain_id                    // variable-length UTF-8
 //! )
 //! ```
+//!
+//! The domain constant versions the preimage layout: a tag computed over any
+//! other layout never verifies.
 //!
 //! Length-prefix separators prevent boundary-collision attacks where different
 //! `(tool_name, chain_id)` pairs produce the same concatenated byte stream.
@@ -80,13 +85,15 @@
 //! Transmitted as base64 (same URL-safe alphabet).  48 bytes on the wire:
 //!
 //! ```text
-//! bytes[0..16]  = random salt (OsRng; uniqueness + replay-window key)
+//! bytes[0..16]  = random salt (OsRng; HMAC input, uniqueness, replay-window key)
 //! bytes[16..48] = HMAC-SHA256 tag (32 bytes)
 //! ```
 //!
-//! The salt does NOT feed into either side of the HMAC computation.  Its role
-//! is nonce-uniqueness (two calls with the same envelope at the same millisecond
-//! produce different nonces) and the HashMap key for the replay window.
+//! The salt is an HMAC input.  It gives nonce uniqueness (two calls with the
+//! same envelope at the same millisecond produce different nonces) and, with
+//! the tag, forms the 48-byte replay-window key.  Because the tag covers the
+//! salt, that key is authenticated in full: a nonce with any changed byte fails
+//! verification with `HmacMismatch` before it is recorded in the replay window.
 //!
 //! # Self-custodial key residency
 //!

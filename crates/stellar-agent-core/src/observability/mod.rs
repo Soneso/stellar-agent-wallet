@@ -81,7 +81,8 @@
 
 pub mod redact;
 pub use redact::{
-    UNTRUSTED_DISPLAY_MAX_BYTES, redact_strkey_first5_last5, untrusted_display_bounded,
+    UNTRUSTED_DISPLAY_MAX_BYTES, escape_untrusted_text, is_untrusted_format_character,
+    redact_strkey_first5_last5, untrusted_display_bounded,
 };
 
 use std::fmt as std_fmt;
@@ -91,6 +92,7 @@ use std::time::SystemTime;
 use crate::audit_log::redact::redact_account_strkeys_first5_last5;
 use crate::timefmt::epoch_to_datetime;
 use serde::{Deserialize, Serialize};
+use tracing::Level;
 
 use tracing_subscriber::{
     EnvFilter,
@@ -397,8 +399,8 @@ impl FormatChoice {
 pub enum InitError {
     /// The `STELLAR_AGENT_LOG` (or `RUST_LOG`) value could not be parsed as a
     /// valid `EnvFilter` expression.
-    #[error("failed to parse log-filter expression: {0}")]
-    Filter(#[source] tracing_subscriber::filter::FromEnvError),
+    #[error("STELLAR_AGENT_LOG must be a valid log-filter expression")]
+    Filter,
 
     /// The `log`-crate bridge (`tracing_log::LogTracer`) could not be installed.
     ///
@@ -1668,6 +1670,7 @@ impl std::fmt::Debug for SubscriberConfig {
 /// }
 /// ```
 pub fn init_subscriber(log_format_override: Option<&str>) -> Result<(), InitError> {
+    crate::test_trace::record("subscriber");
     let format_override = log_format_override.map(FormatChoice::parse_format_str);
     init_subscriber_with(SubscriberConfig::default().with_format_override(format_override))
 }
@@ -1784,10 +1787,44 @@ const RAW_TRANSPORT_LOG_TARGET: &str = "jsonrpsee";
 fn raw_transport_logging_off(filter: EnvFilter) -> Result<EnvFilter, InitError> {
     let directive = format!("{RAW_TRANSPORT_LOG_TARGET}=off")
         .parse()
-        .map_err(|error| {
-            InitError::Filter(tracing_subscriber::filter::FromEnvError::from(error))
-        })?;
+        .map_err(|_| InitError::Filter)?;
     Ok(filter.add_directive(directive))
+}
+
+/// Dependency targets whose verbose events quote a value a check refused,
+/// each with the most verbose level the subscriber admits from it.
+///
+/// `rmcp::service::server` warns with the protocol version a client requested
+/// and the server refused. `rmcp::transport::async_rw` logs a frame that
+/// failed to parse at debug level. Their remaining events carry neither value.
+const HELD_DEPENDENCY_TARGETS: [(&str, Level); 2] = [
+    ("rmcp::service::server", Level::ERROR),
+    ("rmcp::transport::async_rw", Level::INFO),
+];
+
+/// Target of rmcp's session loop.
+const HELD_SERVICE_TARGET: &str = "rmcp::service";
+
+/// Fields of [`HELD_SERVICE_TARGET`] events that format a whole inbound client
+/// message: the initialize parameters with the requested protocol version, a
+/// request with its tool arguments, or a notification. The target's other
+/// events carry no client text and stay.
+const HELD_SERVICE_FIELDS: [&str; 4] = ["evt", "notification", "peer_info", "request"];
+
+/// Whether the subscriber admits an event or span with `metadata`.
+///
+/// The filter of [`build_subscriber`] applies it beside the `EnvFilter`, so
+/// no operator directive widens it.
+fn is_admitted(metadata: &tracing::Metadata<'_>) -> bool {
+    let target = metadata.target();
+    !is_raw_transport_target(target)
+        && HELD_DEPENDENCY_TARGETS
+            .iter()
+            .all(|(held, level)| target != *held || metadata.level() <= level)
+        && (target != HELD_SERVICE_TARGET
+            || !HELD_SERVICE_FIELDS
+                .iter()
+                .any(|field| metadata.fields().field(field).is_some()))
 }
 
 /// Whether `target` belongs to the raw transport logging.
@@ -1830,8 +1867,7 @@ fn build_subscriber(
     use tracing_subscriber::layer::Layered;
     type RawTransportFilter = FilterFn<fn(&tracing::Metadata<'_>) -> bool>;
     type S = Layered<RawTransportFilter, Layered<EnvFilter, Registry>>;
-    let raw_transport_filter: RawTransportFilter =
-        FilterFn::new(|metadata| !is_raw_transport_target(metadata.target()));
+    let raw_transport_filter: RawTransportFilter = FilterFn::new(is_admitted);
     let fmt_layer: Box<dyn tracing_subscriber::Layer<S> + Send + Sync> =
         match (format, writer_factory) {
             (FormatChoice::Pretty, None) => Box::new(
@@ -1915,16 +1951,14 @@ fn resolve_operator_filter(
     if let Some(value) = stellar_agent_log {
         match EnvFilter::builder().parse(value) {
             Ok(f) => return Ok(f),
-            Err(primary_err) => {
+            Err(_) => {
                 // (2) STELLAR_AGENT_LOG set but unparseable: try RUST_LOG.
                 if let Some(rust_value) = rust_log
                     && let Ok(f) = EnvFilter::builder().parse(rust_value)
                 {
                     return Ok(f);
                 }
-                return Err(InitError::Filter(
-                    tracing_subscriber::filter::FromEnvError::from(primary_err),
-                ));
+                return Err(InitError::Filter);
             }
         }
     }
@@ -1954,6 +1988,12 @@ fn resolve_ansi(is_tty: bool, no_color: bool) -> bool {
 /// the `...[TRUNCATED]` marker appended to a longer message.
 pub(crate) const PANIC_MESSAGE_MAX_BYTES: usize = 256;
 
+/// The path component that places a panic in the `soroban-spec-tools` crate.
+const SPEC_TOOLS_SOURCE_DIR: &str = "soroban-spec-tools";
+
+/// The message logged for a panic in `soroban-spec-tools`.
+const SPEC_TOOLS_PANIC_MESSAGE: &str = "a contract argument does not match its spec type";
+
 /// Install the panic hook.
 ///
 /// Routes panic payloads through `tracing::error!` so that Layer 2 redaction
@@ -1975,6 +2015,9 @@ pub(crate) const PANIC_MESSAGE_MAX_BYTES: usize = 256;
 /// a panic message.  The `tracing::error!` path carries the redacted panic to
 /// the subscriber, which writes to stderr.
 ///
+/// A panic located in `soroban-spec-tools` quotes the contract argument that
+/// failed the conversion, so the event carries a fixed message in its place.
+///
 /// # Backtraces
 ///
 /// Because the default panic hook is replaced without being chained, the
@@ -1987,6 +2030,7 @@ pub(crate) const PANIC_MESSAGE_MAX_BYTES: usize = 256;
 /// disabled backtrace that formats as a short placeholder string.  No
 /// stack frames reach stderr unredacted.
 fn install_panic_hook() {
+    crate::test_trace::record("panic-hook");
     std::panic::set_hook(Box::new(|info| {
         let payload: &str = if let Some(s) = info.payload().downcast_ref::<&str>() {
             s
@@ -1995,7 +2039,14 @@ fn install_panic_hook() {
         } else {
             "(non-string panic payload)"
         };
-        let (msg, truncated) = format_display_capped(&payload, PANIC_MESSAGE_MAX_BYTES);
+        let in_spec_tools = info
+            .location()
+            .is_some_and(|location| location.file().contains(SPEC_TOOLS_SOURCE_DIR));
+        let (msg, truncated) = if in_spec_tools {
+            (SPEC_TOOLS_PANIC_MESSAGE.to_owned(), false)
+        } else {
+            format_display_capped(&payload, PANIC_MESSAGE_MAX_BYTES)
+        };
 
         let backtrace = std::backtrace::Backtrace::capture().to_string();
 

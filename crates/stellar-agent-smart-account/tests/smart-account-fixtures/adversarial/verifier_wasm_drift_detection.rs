@@ -8,12 +8,11 @@
 //!
 //! # Design
 //!
-//! 1. Write a `SaContextRuleCreated` audit entry whose
-//!    `pinned_verifier_wasm_hashes_first8` is `["0101010101010101"]` (a
-//!    sentinel that will not match the mock RPC's response).
+//! 1. Write a `SaContextRuleCreatedV2` audit entry whose
+//!    `pinned_verifier_wasm_hashes` is `[[0x01; 32]]` (a sentinel that will
+//!    not match the mock RPC's response).
 //! 2. Mount a mock RPC that returns a contract instance with wasm hash
-//!    `VERIFIER_ALLOWLIST[0].wasm_hash` (first-8: `"67800690..."`) — different from
-//!    the audit-pinned `"0101010101010101"`.
+//!    `VERIFIER_ALLOWLIST[0].wasm_hash`, different from the pinned sentinel.
 //! 3. Call `verify_pinned_verifier_against_chain` (exposed via
 //!    `managers::verifiers::test_helpers` under `--features test-helpers`).
 //! 4. Assert `SaError::VerifierHashDrift` is returned AND a `SaVerifierHashDrift`
@@ -21,7 +20,8 @@
 //!
 //! # Implements
 //!
-//! Verifier-pinning drift detection: on-chain WASM hash change at sign time must be caught.
+//! Verifier-pinning drift detection: on-chain WASM hash change at sign time must be caught,
+//! including a hash that shares the pinned hash's first eight bytes.
 
 #![cfg(feature = "test-helpers")]
 
@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::schema::{EventKind, WasmHashPin};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::error::SaError;
@@ -44,8 +44,8 @@ use wiremock::{
 
 use super::combined_rpc_responder::JsonRpcResultResponder;
 use super::rpc_mock_helpers::{
-    ZERO_CONTRACT_REDACTED, build_ledger_entries_contract_instance, manager_one_url,
-    tmp_audit_writer,
+    ZERO_CONTRACT_REDACTED, assert_refusal_holds_no_marker, build_ledger_entries_contract_instance,
+    manager_one_url, mcp_error_envelope, tmp_audit_writer, wallet_traced,
 };
 
 // ── Address helpers ───────────────────────────────────────────────────────────
@@ -65,7 +65,6 @@ async fn verifier_wasm_hash_drift_detected_and_audit_row_emitted() {
     let verifier = verifier_addr();
 
     // ── Step 1: Set up a mock RPC that serves VERIFIER_ALLOWLIST[0].wasm_hash ──
-    // first-8 hex: "67800690..."
     let live_wasm_hash = VERIFIER_ALLOWLIST[0].wasm_hash;
     let ledger_entries = build_ledger_entries_contract_instance(&verifier, live_wasm_hash);
 
@@ -79,13 +78,12 @@ async fn verifier_wasm_hash_drift_detected_and_audit_row_emitted() {
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
 
-    // ── Step 2: Write a fake SaContextRuleCreated row with a DIFFERENT pinned hash
-    // Pinned sentinel: "0101010101010101" — will not match live_wasm_hash's first-8.
-    let fake_pinned_first8 = "0101010101010101".to_owned();
+    // ── Step 2: Write a fake SaContextRuleCreatedV2 row with a DIFFERENT pinned hash
+    let fake_pinned = WasmHashPin::new([0x01; 32]);
     let rule_id: u32 = 1;
     let request_id = Uuid::new_v4().to_string();
 
-    let fake_entry = AuditEntry::new_sa_context_rule_created(
+    let fake_entry = AuditEntry::new_sa_context_rule_created_v2(
         ZERO_CONTRACT_REDACTED,
         rule_id,
         "default",
@@ -94,7 +92,7 @@ async fn verifier_wasm_hash_drift_detected_and_audit_row_emitted() {
         None,
         "stellar:testnet",
         &request_id,
-        vec![fake_pinned_first8.clone()],
+        vec![fake_pinned],
         vec![],
         false,
         false,
@@ -150,5 +148,312 @@ async fn verifier_wasm_hash_drift_detected_and_audit_row_emitted() {
     assert_eq!(
         drift_entry.request_id, request_id,
         "SaVerifierHashDrift row must carry the same request_id as the verify call"
+    );
+}
+
+/// A pin naming a revoked verifier refuses once the live verifier matches it.
+///
+/// The status gate refuses the executable before the match event fires, so
+/// no channel of the refusal names the revoked hash, whole or as its first
+/// eight bytes, nor its executable summary: not the Display, Debug and
+/// source chain, the serialized form, the MCP error envelope, or the
+/// wallet's logs, which hold the manager's events.
+#[test]
+fn a_pinned_revoked_verifier_refuses_after_the_pin_matches() {
+    let revoked = [0xee; 32];
+    let revoked_full = hex::encode(revoked);
+    let revoked_first8 = hex::encode(&revoked[..8]);
+    let (audit, path, _dir) = tmp_audit_writer();
+    audit
+        .lock()
+        .unwrap()
+        .write_entry(AuditEntry::new_sa_context_rule_created_v2(
+            ZERO_CONTRACT_REDACTED,
+            1,
+            "default",
+            1,
+            0,
+            None,
+            "stellar:testnet",
+            "revoked-pin",
+            vec![WasmHashPin::new(revoked)],
+            vec![],
+            false,
+            false,
+            vec![],
+            vec![],
+        ))
+        .unwrap();
+    let (result, logs) = wallet_traced({
+        let audit = Arc::clone(&audit);
+        async move {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(JsonRpcResultResponder(
+                    build_ledger_entries_contract_instance(&verifier_addr(), revoked),
+                ))
+                .mount(&server)
+                .await;
+            let manager = manager_one_url(&server.uri(), audit, path);
+            test_helpers::verify_pinned_verifier_against_chain(
+                &manager,
+                verifier_addr(),
+                1,
+                ZERO_CONTRACT_REDACTED,
+                "revoked-pin",
+                &mut HashMap::new(),
+            )
+            .await
+        }
+    });
+    let error = result.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SaError::VerifierWasmRevoked {
+                rule_id: Some(1),
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "verifier wasm hash flagged as revoked for rule 1: \
+         reason='test-only revoked verifier fixture'"
+    );
+    assert!(
+        mcp_error_envelope(&error).contains("\"sa.verifier_wasm_revoked\""),
+        "the MCP envelope carries the wire code"
+    );
+    assert!(
+        logs.contains("two-RPC consultation degrades to single-RPC"),
+        "the manager's events are captured: {logs}"
+    );
+    assert!(
+        !logs.contains("executable matches pin (no drift)"),
+        "the match event names no revoked executable: {logs}"
+    );
+    assert_refusal_holds_no_marker(&error, &logs, &[&revoked_full, &revoked_first8], &["wasm"]);
+    assert!(
+        !verified_audit_entries(&audit)
+            .iter()
+            .any(|entry| matches!(entry.event_kind, EventKind::SaVerifierHashDrift { .. }))
+    );
+}
+
+/// The drift refusal holds no form of the observed executable hash, whole
+/// or as its first eight bytes, nor its executable summary, in its Display,
+/// Debug and source chain, its serialized form, the MCP error envelope or the
+/// wallet's logs, and names the full pinned hash. The drift row, written
+/// before the refusal returns, carries the observed hash's first eight bytes
+/// and the executable summary.
+#[test]
+fn the_drift_refusal_holds_no_observed_hash_and_the_drift_row_keeps_it() {
+    let pinned = WasmHashPin::new([0x01; 32]);
+    let observed: [u8; 32] = std::array::from_fn(|i| 0x9d ^ u8::try_from(i).unwrap());
+    let observed_full = hex::encode(observed);
+    let observed_first8 = WasmHashPin::new(observed).first8_display();
+    assert!(observed_full.starts_with(&observed_first8));
+
+    let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
+    audit_writer
+        .lock()
+        .unwrap()
+        .write_entry(AuditEntry::new_sa_context_rule_created_v2(
+            ZERO_CONTRACT_REDACTED,
+            1,
+            "default",
+            1,
+            0,
+            None,
+            "stellar:testnet",
+            "req-drift-forms",
+            vec![pinned],
+            vec![],
+            false,
+            false,
+            vec![],
+            vec![],
+        ))
+        .unwrap();
+    let (result, logs) = wallet_traced({
+        let audit_writer = Arc::clone(&audit_writer);
+        async move {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/"))
+                .respond_with(JsonRpcResultResponder(
+                    build_ledger_entries_contract_instance(&verifier_addr(), observed),
+                ))
+                .mount(&server)
+                .await;
+            let manager = manager_one_url(&server.uri(), audit_writer, audit_log_path);
+            test_helpers::verify_pinned_verifier_against_chain(
+                &manager,
+                verifier_addr(),
+                1,
+                ZERO_CONTRACT_REDACTED,
+                "req-drift-forms",
+                &mut HashMap::new(),
+            )
+            .await
+        }
+    });
+
+    let err = result.expect_err("the live verifier differs from the pin");
+    let SaError::VerifierHashDrift { pinned_hash, .. } = &err else {
+        panic!("expected VerifierHashDrift, got {err:?}");
+    };
+    assert_eq!(*pinned_hash, pinned);
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "verifier executable must match the pinned executable for rule 1: pinned={}",
+            pinned.to_hex()
+        )
+    );
+    assert!(
+        logs.contains("verifier executable must match the pinned executable"),
+        "{logs}"
+    );
+    assert!(
+        mcp_error_envelope(&err).contains("\"sa.verifier_hash_drift\""),
+        "the MCP envelope carries the wire code"
+    );
+    assert_refusal_holds_no_marker(&err, &logs, &[&observed_full, &observed_first8], &["wasm"]);
+
+    let entries = verified_audit_entries(&audit_writer);
+    let rows: Vec<&EventKind> = entries
+        .iter()
+        .filter(|entry| entry.request_id == "req-drift-forms")
+        .map(|entry| &entry.event_kind)
+        .filter(|kind| matches!(kind, EventKind::SaVerifierHashDrift { .. }))
+        .collect();
+    let [
+        EventKind::SaVerifierHashDrift {
+            pinned_hash_first8,
+            observed_hash_first8,
+            observed_executable,
+            ..
+        },
+    ] = rows.as_slice()
+    else {
+        panic!("one drift row: {rows:?}");
+    };
+    assert_eq!(pinned_hash_first8, &pinned.first8_display());
+    assert_eq!(observed_hash_first8, &observed_first8);
+    assert_eq!(observed_executable.as_deref(), Some("wasm"));
+}
+
+/// The pinned hash of the pin-width tests and a hash sharing its first eight
+/// bytes that differs in every later byte.
+fn pinned_and_twin() -> ([u8; 32], [u8; 32]) {
+    let pinned = [0x42u8; 32];
+    let mut twin = pinned;
+    twin[8..].fill(0x43);
+    (pinned, twin)
+}
+
+/// Serves `live` as the verifier's Wasm hash and pins `pinned` for rule 1
+/// with the given override flags; returns the check's outcome and the audit
+/// log's rows.
+async fn check_against(
+    pinned: [u8; 32],
+    live: [u8; 32],
+    overrides: bool,
+) -> (
+    Result<(), SaError>,
+    Vec<stellar_agent_core::audit_log::entry::AuditEntry>,
+) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(JsonRpcResultResponder(
+            build_ledger_entries_contract_instance(&verifier_addr(), live),
+        ))
+        .mount(&server)
+        .await;
+    let (audit, path, _dir) = tmp_audit_writer();
+    let manager = manager_one_url(&server.uri(), Arc::clone(&audit), path);
+    audit
+        .lock()
+        .unwrap()
+        .write_entry(AuditEntry::new_sa_context_rule_created_v2(
+            ZERO_CONTRACT_REDACTED,
+            1,
+            "default",
+            1,
+            0,
+            None,
+            "stellar:testnet",
+            "twin-pin",
+            vec![WasmHashPin::new(pinned)],
+            vec![],
+            overrides,
+            overrides,
+            vec![],
+            vec![],
+        ))
+        .unwrap();
+    let outcome = test_helpers::verify_pinned_verifier_against_chain(
+        &manager,
+        verifier_addr(),
+        1,
+        ZERO_CONTRACT_REDACTED,
+        "twin-pin",
+        &mut HashMap::new(),
+    )
+    .await;
+    (outcome, verified_audit_entries(&audit))
+}
+
+/// A live verifier whose hash shares the pinned hash's first eight bytes
+/// and is in no allowlist refuses as drift, with and without both admission
+/// overrides on the pin record, naming the full pinned hash, holding no form
+/// of the observed one, and writing the drift row. The exact pinned hash
+/// passes.
+#[tokio::test]
+async fn an_unlisted_equal_prefix_twin_refuses_as_drift_under_both_overrides() {
+    let (pinned, twin) = pinned_and_twin();
+    for overrides in [false, true] {
+        let (outcome, rows) = check_against(pinned, twin, overrides).await;
+        match &outcome {
+            Err(err @ SaError::VerifierHashDrift { pinned_hash, .. }) => {
+                assert_eq!(
+                    *pinned_hash,
+                    WasmHashPin::new(pinned),
+                    "overrides={overrides}"
+                );
+                let rendered = format!("{err}\n{err:?}\n{}", serde_json::to_string(err).unwrap());
+                assert!(
+                    !rendered.contains(&hex::encode(twin)),
+                    "overrides={overrides}: {rendered}"
+                );
+            }
+            other => panic!("overrides={overrides}: expected VerifierHashDrift, got {other:?}"),
+        }
+        assert!(
+            rows.iter()
+                .any(|entry| matches!(entry.event_kind, EventKind::SaVerifierHashDrift { .. })),
+            "overrides={overrides}: the drift row is written"
+        );
+
+        let (outcome, _) = check_against(pinned, pinned, overrides).await;
+        assert!(outcome.is_ok(), "overrides={overrides}: {outcome:?}");
+    }
+}
+
+/// A live twin of a pinned revoked verifier refuses as drift: the status of
+/// the revoked hash is never assigned to a hash that only shares its prefix,
+/// and the pin comparison refuses first.
+#[tokio::test]
+async fn a_twin_of_a_pinned_revoked_verifier_refuses_as_drift() {
+    let revoked = [0xeeu8; 32];
+    let mut twin = revoked;
+    twin[8..].fill(0x43);
+    let (outcome, _) = check_against(revoked, twin, false).await;
+    assert!(
+        matches!(outcome, Err(SaError::VerifierHashDrift { .. })),
+        "{outcome:?}"
     );
 }

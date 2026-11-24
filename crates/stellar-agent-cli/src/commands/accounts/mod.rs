@@ -36,7 +36,8 @@ pub enum AccountsSubcommand {
     /// Supports two mutually-exclusive modes:
     ///
     /// **Sponsored mode** (`--sponsor` + signer + `--starting-balance`): submits
-    /// a `CreateAccount` op signed by the sponsor account. Testnet only.
+    /// a `CreateAccount` op signed by the sponsor account. On mainnet it runs
+    /// under the mainnet authorization and refuses `--generate`.
     ///
     /// **Friendbot mode** (`--fund-with-friendbot`): funds the account via the
     /// Stellar Friendbot HTTP endpoint. Testnet only; structurally refused on

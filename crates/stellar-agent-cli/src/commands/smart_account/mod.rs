@@ -63,6 +63,8 @@ pub mod deploy_policy;
 pub mod deploy_spending_limit_policy;
 pub mod deploy_webauthn_verifier;
 pub mod execute;
+/// Read-only intent accounting view.
+pub mod list_intents;
 pub mod list_rules;
 pub mod list_verifiers;
 pub mod migrate_verifier;
@@ -94,7 +96,7 @@ pub enum SmartAccountSubcommand {
     ///
     /// - `<target>` is the C-strkey of the contract to invoke.
     /// - `<fn>` is the function name on that contract.
-    /// - `<json-args>` is a JSON array of Soroban XDR-encoded arguments.
+    /// - `<json-args>` contains integers, strings, null, or `{"scval": "<base64 XDR ScVal>"}` elements.
     ///
     /// The bundle is submitted via `submit_multicall_bundle` using the registered
     /// multicall router for the target network. The router address is resolved from
@@ -127,8 +129,8 @@ pub enum SmartAccountSubcommand {
     ///   via OZ `remove_policy`.
     /// - **`smart-account rules list`** — enumerate all active context rules (canonical
     ///   name). Delegates to `smart-account list-rules`; both produce identical
-    ///   JSON envelopes. `smart-account list-rules` is retained for
-    ///   backwards-compat (no deprecation warning).
+    ///   JSON envelopes. `smart-account list-rules` is a second entry point for
+    ///   the same command and prints no warning.
     ///
     /// All write subcommands invoke `Signer::sign_auth_digest` exclusively
     /// (inverse-bypass discipline) and emit
@@ -235,9 +237,8 @@ pub enum SmartAccountSubcommand {
     /// Mainnet is structurally refused. Use `--dry-run` to derive the
     /// deterministic policy address without any network access.
     ///
-    /// `--kind spending-limit` routes to the same substrate as the standalone
-    /// `smart-account deploy-spending-limit-policy` verb, which remains
-    /// available unchanged.
+    /// `--kind spending-limit` and `smart-account deploy-spending-limit-policy`
+    /// deploy the same contract.
     ///
     /// Each kind's WASM SHA-256 is re-verified at runtime before any
     /// submission. Idempotent per network + kind: re-running with the same
@@ -284,6 +285,10 @@ pub enum SmartAccountSubcommand {
     /// Alias for `smart-account rules list`; both produce identical JSON envelopes.
     #[command(name = "list-rules")]
     ListRules(list_rules::ListRulesArgs),
+
+    /// List retained smart-account intent charges without changing wallet state.
+    #[command(name = "list-intents")]
+    ListIntents(list_intents::ListIntentsArgs),
 
     /// Register a deployed multicall router contract in the local registry.
     ///
@@ -337,6 +342,12 @@ pub enum SmartAccountSubcommand {
     /// Mainnet is structurally refused. Empty function name, malformed
     /// `--arg` XDR, and an unresolvable Ed25519 verifier all refuse
     /// client-side before any RPC call or key-material access.
+    ///
+    /// The smart account authorizes the named call alone. A target whose
+    /// call needs further authorization from the smart account (for example
+    /// a contract that moves the account's tokens on its behalf) simulates
+    /// sub-invocations under the call and is refused before signing with
+    /// `simulation.divergence.auth_contexts`.
     Execute(Box<execute::ExecuteArgs>),
 }
 
@@ -373,6 +384,7 @@ pub async fn run(args: &SmartAccountArgs) -> i32 {
         }
         SmartAccountSubcommand::ListVerifiers(list_args) => list_verifiers::run(list_args).await,
         SmartAccountSubcommand::ListRules(list_args) => list_rules::run(list_args).await,
+        SmartAccountSubcommand::ListIntents(list_args) => list_intents::run(list_args).await,
         SmartAccountSubcommand::RegisterMulticall(args) => register_multicall::run(args).await,
         SmartAccountSubcommand::UnregisterMulticall(args) => unregister_multicall::run(args).await,
         SmartAccountSubcommand::Timelock(args) => timelock::run(args).await,
@@ -400,6 +412,7 @@ impl SmartAccountArgs {
             SmartAccountSubcommand::Timelock(a) => a.profile_flag(),
             SmartAccountSubcommand::MigrateVerifier(a) => a.profile.as_deref(),
             SmartAccountSubcommand::ListRules(a) => a.profile.as_deref(),
+            SmartAccountSubcommand::ListIntents(a) => a.profile.as_deref(),
             SmartAccountSubcommand::RegisterMulticall(a) => a.profile.as_deref(),
             SmartAccountSubcommand::UnregisterMulticall(a) => a.profile.as_deref(),
             SmartAccountSubcommand::Execute(a) => a.profile.as_deref(),

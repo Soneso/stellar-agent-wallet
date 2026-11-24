@@ -51,7 +51,7 @@ use thiserror::Error;
 // Error type
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Errors returned by [`decode_authoritative_args`].
+/// Errors returned by [`decode_authoritative_args`] and [`classic_summary`].
 ///
 /// Each variant carries the minimum description needed to diagnose the failure
 /// without leaking raw XDR byte content.
@@ -65,6 +65,7 @@ use thiserror::Error;
 /// | `OperationKindMismatch` | Operation kind disagrees with the dispatched tool | Caller passed the wrong tool name, or the envelope changed between simulate and commit. |
 /// | `UnsupportedTool` | Tool name is not in the recognised decoder set | Caller bug or future tool not yet wired into this decoder. |
 /// | `IssuerEncodeFailed` | XDR-decoded issuer key fails strkey encoding | Should be unreachable for valid XDR; defensive guard for malformed-but-XDR-valid keys. |
+/// | `AssetCodeInvalid` | An asset code holds a byte outside ASCII letters and digits, or is empty | [`classic_summary`] refuses a code an approval surface cannot show faithfully. |
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum EnvelopeDecodeError {
@@ -124,12 +125,10 @@ pub enum EnvelopeDecodeError {
     /// The `tool` argument is not a tool name supported by this decoder.
     ///
     /// Recognised tool names: `"stellar_pay_commit"`,
-    /// `"stellar_create_account_commit"`, and `"stellar_trustline_commit"`.
-    #[error("unsupported tool name: {tool}")]
-    UnsupportedTool {
-        /// The unrecognised tool name.
-        tool: String,
-    },
+    /// `"stellar_create_account_commit"`, `"stellar_trustline_commit"`, and
+    /// `"stellar_claim_commit"`.
+    #[error("unsupported tool name; expected a registered classic commit tool")]
+    UnsupportedTool,
 
     /// The asset issuer G-strkey could not be encoded.
     ///
@@ -142,6 +141,13 @@ pub enum EnvelopeDecodeError {
         /// Short description; no raw byte content.
         detail: String,
     },
+
+    /// An asset code is not 1 to 12 ASCII letters and digits followed only
+    /// by NUL padding.
+    ///
+    /// Returned by [`classic_summary`]; the code bytes are not echoed.
+    #[error("asset code is not 1 to 12 ASCII letters and digits")]
+    AssetCodeInvalid,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -180,9 +186,10 @@ pub fn stroops_to_human(stroops: i64) -> String {
 /// component; this function extracts that 32-byte array and encodes it as a
 /// G-strkey via [`stellar_strkey::ed25519::PublicKey`].
 ///
-/// `MuxedEd25519` carries an additional `id` mux-component; that component is
-/// discarded here because the policy engine works at the G-strkey granularity
-/// (all muxed sub-accounts share the same on-chain account entry).
+/// `MuxedEd25519` carries an additional `id`, which this function discards.
+/// It resolves source accounts: every M address of an account signs with
+/// the same key and spends from the same account entry. Payment destinations
+/// keep the complete M address through `muxed_account_to_display_strkey`.
 ///
 /// This function is **infallible** for inputs from XDR decode: the XDR decoder
 /// enforces exact 32-byte layout for ed25519 keys, and `format!("{}", PublicKey(bytes))`
@@ -258,66 +265,6 @@ fn xdr_asset_to_string(asset: &stellar_xdr::Asset) -> Result<String, EnvelopeDec
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Memo re-derivation
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Extracts the memo from a `stellar_xdr::Memo` to an
-/// `Option<String>` suitable for the policy-engine args JSON.
-///
-/// - `Memo::None` → `Ok(None)`.
-/// - `Memo::Text(bytes)` → `Ok(Some(utf8_string))` when bytes are valid UTF-8;
-///   `Err(XdrDecode)` when bytes are not valid UTF-8.
-/// - `Memo::Id(u64)` → `Ok(None)` (numeric memos are not forwarded through the
-///   policy path; the envelope divergence check is the integrity backstop).
-/// - `Memo::Hash(_)` → `Ok(None)` for the legacy `memo` text field.
-/// - `Memo::Return(_)` → `Ok(None)` for the legacy `memo` text field.
-///
-/// # Rationale for strict UTF-8 enforcement on `Memo::Text`
-///
-/// Stellar `Memo::Text` is XDR `string<28>` — opaque bytes, not UTF-8
-/// constrained.  Using `String::from_utf8_lossy` would silently substitute
-/// U+FFFD for malformed bytes, allowing a forger to craft an envelope whose
-/// on-chain memo bytes differ from the string the policy engine evaluates.
-/// `String::from_utf8` with an explicit error path closes this attack surface.
-///
-/// # Rationale for `Memo::Id` / `Memo::Hash` / `Memo::Return` in `memo`
-///
-/// Returning `Ok(None)` preserves the invariant that `memo` in the args JSON is
-/// either a UTF-8 string or `null`. Hash and return memos are surfaced by
-/// `decode_pay_args` as separate `memo_hash` / `memo_return` fields so existing
-/// text-memo consumers do not change shape.
-fn memo_to_optional_string(
-    memo: &stellar_xdr::Memo,
-) -> Result<Option<String>, EnvelopeDecodeError> {
-    match memo {
-        stellar_xdr::Memo::None => Ok(None),
-        stellar_xdr::Memo::Text(bytes) => {
-            // Strict UTF-8: reject malformed bytes rather than substituting
-            // U+FFFD — see module-level rationale above.
-            String::from_utf8(bytes.as_slice().to_vec())
-                .map(Some)
-                .map_err(|_| EnvelopeDecodeError::XdrDecode {
-                    detail: "memo text is not valid UTF-8".to_owned(),
-                })
-        }
-        // Numeric memos: not forwarded through the policy path.
-        // The envelope divergence check is the integrity backstop.
-        stellar_xdr::Memo::Id(_) => Ok(None),
-        // Hash and Return memos remain absent from the legacy text `memo`
-        // field. `decode_pay_args` surfaces their bytes separately.
-        stellar_xdr::Memo::Hash(_) | stellar_xdr::Memo::Return(_) => Ok(None),
-    }
-}
-
-fn structured_memo_field(memo: &stellar_xdr::Memo) -> Option<(&'static str, String)> {
-    match memo {
-        stellar_xdr::Memo::Hash(hash) => Some(("memo_hash", crate::hex::encode(&hash.0))),
-        stellar_xdr::Memo::Return(hash) => Some(("memo_return", crate::hex::encode(&hash.0))),
-        _ => None,
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -347,20 +294,37 @@ pub enum MemoKind {
     Return,
 }
 
+impl MemoKind {
+    /// The kind's name, as the `memo_kind` policy fact carries it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Text => "text",
+            Self::Id => "id",
+            Self::Hash => "hash",
+            Self::Return => "return",
+        }
+    }
+}
+
+/// The keys of the memo policy facts.
+const MEMO_FACT_KEYS: [&str; 5] = ["memo_kind", "memo", "memo_id", "memo_hash", "memo_return"];
+
 /// The memo kind of a single-payment envelope and the form of its
 /// destination.
 ///
-/// [`decode_authoritative_args`] reports an id memo as `memo: null` and
-/// resolves a muxed destination to its G account, so neither the absence of a
-/// memo nor a muxed destination can be read from its output; this shape keeps
-/// both.
+/// [`decode_authoritative_args`] reports an id memo as `memo: null`, so the
+/// absence of a memo cannot be read from its output. This shape keeps the
+/// memo kind and whether the destination is an M address. The output's
+/// `destination` holds the complete M address with its ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PaymentMemoShape {
     /// The transaction's memo kind.
     pub memo: MemoKind,
-    /// Whether the payment's destination is a muxed (`M...`) account, which
-    /// carries its memo in the muxed id.
+    /// Whether the payment's destination is an M address, whose ID names a
+    /// recipient within its base G account.
     pub destination_muxed: bool,
 }
 
@@ -404,27 +368,76 @@ pub fn payment_memo_shape(
     })
 }
 
-fn decode_single_operation(
+/// The accepted form of a caller-supplied transaction envelope.
+///
+/// A decoder error quotes a byte of the input, so a refusal states this form
+/// in its place.
+pub const TRANSACTION_ENVELOPE_XDR_FORM: &str = "must be base64-encoded TransactionEnvelope XDR";
+
+/// The longest base64 envelope text a decoder of untrusted input reads.
+///
+/// This local input budget includes base64 whitespace. The protocol's Soroban
+/// byte limit is configurable through `ConfigSettingContractBandwidthV0.tx_max_size_bytes`.
+pub const MAX_ENVELOPE_BASE64_LEN: usize = 2 * 1024 * 1024;
+pub(crate) const ENVELOPE_INPUT_TOO_LONG: &str = "the envelope exceeds the input length limit";
+
+#[derive(Debug)]
+pub(crate) enum EnvelopeReadError {
+    InputTooLong,
+    Xdr(stellar_xdr::Error),
+}
+
+/// Reads an envelope within fixed input and protocol collection bounds.
+///
+/// `stellar-xdr` limits `Transaction.operations` to 100 and `CreateClaimableBalanceOp.claimants` to 10.
+/// Its `VecM::read_xdr` checks each bound before reading the collection's elements.
+pub(crate) fn read_envelope(
     envelope_xdr_b64: &str,
-) -> Result<(stellar_xdr::Transaction, stellar_xdr::Operation, String), EnvelopeDecodeError> {
-    use stellar_xdr::{ReadXdr, TransactionEnvelope};
-    // 2. Decode base64 → raw XDR bytes (via from_xdr_base64).
-    //    Bounded limits are required because the envelope is caller-supplied and
-    //    untrusted. A deeply nested `SorobanAuthorizedInvocation.sub_invocations`
-    //    chain would otherwise exhaust the stack (the XDR reader calls
-    //    `with_limited_depth` per recursive node). Both depth and len are capped:
-    //    depth prevents stack exhaustion, len prevents an oversized-allocation
-    //    attack from a forged length field.
-    let envelope = TransactionEnvelope::from_xdr_base64(
+) -> Result<stellar_xdr::TransactionEnvelope, EnvelopeReadError> {
+    use stellar_xdr::ReadXdr;
+
+    if envelope_xdr_b64.len() > MAX_ENVELOPE_BASE64_LEN {
+        return Err(EnvelopeReadError::InputTooLong);
+    }
+    stellar_xdr::TransactionEnvelope::from_xdr_base64(
         envelope_xdr_b64,
         stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr_b64.len()),
     )
-    .map_err(|e| {
-        // Decode error details exclude raw envelope bytes.
-        // Decode failures must not echo XDR byte content.
-        EnvelopeDecodeError::XdrDecode {
-            detail: e.to_string(),
+    .map_err(EnvelopeReadError::Xdr)
+}
+
+/// The accepted form of a caller-supplied `ScVal`, in the place of a decoder
+/// error that quotes a byte of the input.
+pub const SCVAL_XDR_FORM: &str = "must be base64-encoded ScVal XDR";
+
+/// Describes a decode failure of a caller-supplied envelope by its class.
+///
+/// `stellar_xdr` reads the base64 text through an I/O reader, and the base64
+/// decoder's error inside that I/O error quotes the offending symbol of the
+/// envelope, so every I/O failure maps to a fixed text. The other variants
+/// render a fixed text or a byte position, never envelope content.
+fn describe_xdr_decode_error(error: &stellar_xdr::Error) -> String {
+    match error {
+        stellar_xdr::Error::Io(io) if io.kind() == std::io::ErrorKind::InvalidData => {
+            "the envelope is not valid standard base64".to_owned()
         }
+        stellar_xdr::Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof => {
+            "the envelope ends before the value is complete".to_owned()
+        }
+        stellar_xdr::Error::Io(_) => "the envelope could not be read".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+fn decode_single_operation(
+    envelope_xdr_b64: &str,
+) -> Result<(stellar_xdr::Transaction, stellar_xdr::Operation, String), EnvelopeDecodeError> {
+    use stellar_xdr::TransactionEnvelope;
+    let envelope = read_envelope(envelope_xdr_b64).map_err(|e| EnvelopeDecodeError::XdrDecode {
+        detail: match e {
+            EnvelopeReadError::InputTooLong => ENVELOPE_INPUT_TOO_LONG.to_owned(),
+            EnvelopeReadError::Xdr(error) => describe_xdr_decode_error(&error),
+        },
     })?;
 
     // 3. Extract the TransactionV1 body.
@@ -471,14 +484,21 @@ fn decode_single_operation(
 ///   "chain_id": "<from caller — not encoded in XDR>",
 ///   "source": "G...",
 ///   "total_fee_stroops": <u32>,
-///   "destination": "G...",
+///   "sequence_number": <i64>,
+///   "destination": "G..." | "M...",
 ///   "amount_stroops": "<decimal i64 stroops>",
 ///   "asset": "XLM" | "CODE:Gissuer",
 ///   "memo": "text" | null,
+///   "memo_kind": "none" | "text" | "id" | "hash" | "return",
+///   "memo_id": "<canonical u64 decimal, only for Memo::Id>",
 ///   "memo_hash": "<64 lowercase hex chars, only for Memo::Hash>",
 ///   "memo_return": "<64 lowercase hex chars, only for Memo::Return>"
 /// }
 /// ```
+///
+/// Every supported operation also carries these memo facts. A known no-memo
+/// envelope has `memo_kind = "none"` and `memo = null`. Payload fields for other
+/// kinds are absent. Text must be valid UTF-8 and retains its exact bytes.
 ///
 /// `chain_id` is **not** encoded in the XDR and must be supplied separately
 /// by the caller (it is present in the outer `*CommitArgs` struct and is
@@ -530,9 +550,9 @@ fn decode_single_operation(
 /// - [`EnvelopeDecodeError::NotTransactionV1`] — envelope is not a `Tx` v1 envelope.
 /// - [`EnvelopeDecodeError::UnexpectedOperationCount`] — transaction has ≠ 1 operations.
 /// - [`EnvelopeDecodeError::OperationKindMismatch`] — op body does not match the tool.
-/// - `EnvelopeDecodeError::SourceAccountEncodeFailed` — source G-strkey encode error.
-/// - `EnvelopeDecodeError::DestinationAccountEncodeFailed` — destination G-strkey encode error.
 /// - [`EnvelopeDecodeError::IssuerEncodeFailed`] — asset issuer G-strkey encode error.
+///   Source and destination accounts always encode: the source as its G
+///   account, a payment destination as its complete G or M address.
 /// - Note: `Memo::Hash` and `Memo::Return` keep `memo = null` and additionally
 ///   surface `memo_hash` / `memo_return`; a tampered memo XDR is still caught by
 ///   the caller's envelope-rebuild divergence check.
@@ -559,9 +579,7 @@ pub fn decode_authoritative_args(
         | "stellar_trustline_commit"
         | "stellar_claim_commit" => {}
         _ => {
-            return Err(EnvelopeDecodeError::UnsupportedTool {
-                tool: tool.to_owned(),
-            });
+            return Err(EnvelopeDecodeError::UnsupportedTool);
         }
     }
 
@@ -569,8 +587,8 @@ pub fn decode_authoritative_args(
     let op = &op;
 
     // 6. Dispatch by tool.
-    match tool {
-        "stellar_pay_commit" => decode_pay_args(&tx.memo, tx.fee, op, &source_strkey, tool),
+    let mut args = match tool {
+        "stellar_pay_commit" => decode_pay_args(tx.fee, tx.seq_num.0, op, &source_strkey, tool),
         "stellar_create_account_commit" => {
             decode_create_account_args(tx.fee, op, &source_strkey, tool)
         }
@@ -578,7 +596,41 @@ pub fn decode_authoritative_args(
         "stellar_claim_commit" => decode_claim_args(tx.fee, op, &source_strkey, tool),
         // The validation above is exhaustive; this arm is unreachable.
         _ => unreachable!("tool name validated in step 1"),
+    }?;
+    ClassicMemo::try_from(&tx.memo)?.insert_policy_fields(&mut args);
+    Ok(args)
+}
+
+/// Decodes the authoritative `stellar_pay_commit` facts of a classic or
+/// contract payment envelope.
+///
+/// With a context, the envelope must be the contract transfer that
+/// [`crate::sac_payment::verify_sac_payment`] proves for it, and the facts
+/// are [`VerifiedSacPayment::policy_args`](crate::sac_payment::VerifiedSacPayment::policy_args).
+/// Without one, a single `transfer(Account, Contract, I128)` invocation is
+/// still a payment and refuses; any other envelope decodes as
+/// [`decode_authoritative_args`] decodes it.
+///
+/// # Errors
+///
+/// The closed contract payment reasons of the verifier,
+/// `validation.contract_payment_invalid` for a transfer without a context,
+/// and `protocol.xdr_codec_failed` for a classic envelope that does not decode.
+pub fn decode_pay_args_with_context(
+    envelope_xdr: &str,
+    context: Option<&crate::sac_payment::SacPaymentContext>,
+) -> Result<serde_json::Value, crate::error::WalletError> {
+    if let Some(context) = context {
+        return Ok(crate::sac_payment::verify_sac_payment(envelope_xdr, context)?.policy_args());
     }
+    if crate::sac_payment::is_transfer_shaped(envelope_xdr) {
+        return Err(crate::sac_payment::SacPaymentError::Invalid.into());
+    }
+    decode_authoritative_args(envelope_xdr, "stellar_pay_commit").map_err(|error| {
+        crate::error::WalletError::Protocol(crate::error::ProtocolError::XdrCodecFailed {
+            detail: error.to_string(),
+        })
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -604,8 +656,8 @@ pub fn decode_authoritative_args(
 /// recipient account regardless of which asset is debited, so counterparty
 /// checks are unaffected by this distinction.
 fn decode_pay_args(
-    memo: &stellar_xdr::Memo,
     total_fee_stroops: u32,
+    sequence_number: i64,
     op: &stellar_xdr::Operation,
     source_strkey: &str,
     tool: &'static str,
@@ -668,15 +720,13 @@ fn decode_pay_args(
         }
     };
 
-    let memo_opt = memo_to_optional_string(memo)?;
-
     let mut args = match shape {
         PayShape::Simple {
             dest,
             asset,
             amount,
         } => {
-            let dest_strkey = muxed_account_to_strkey(dest);
+            let dest_strkey = muxed_account_to_display_strkey(dest);
             let asset_str = xdr_asset_to_string(asset)?;
             serde_json::json!({
                 "source": source_strkey,
@@ -684,7 +734,6 @@ fn decode_pay_args(
                 "destination": dest_strkey,
                 "amount_stroops": amount.to_string(),
                 "asset": asset_str,
-                "memo": memo_opt,
             })
         }
         PayShape::PathPayment {
@@ -694,7 +743,7 @@ fn decode_pay_args(
             dest_asset,
             dest_amount,
         } => {
-            let dest_strkey = muxed_account_to_strkey(dest);
+            let dest_strkey = muxed_account_to_display_strkey(dest);
             let send_asset_str = xdr_asset_to_string(send_asset)?;
             let dest_asset_str = xdr_asset_to_string(dest_asset)?;
             serde_json::json!({
@@ -705,16 +754,10 @@ fn decode_pay_args(
                 "asset": send_asset_str,
                 "dest_amount_stroops": dest_amount.to_string(),
                 "dest_asset": dest_asset_str,
-                "memo": memo_opt,
             })
         }
     };
-    if let Some((field, value)) = structured_memo_field(memo)
-        && let Some(obj) = args.as_object_mut()
-    {
-        obj.insert(field.to_owned(), serde_json::Value::String(value));
-    }
-
+    args["sequence_number"] = sequence_number.into();
     Ok(args)
 }
 
@@ -901,6 +944,406 @@ fn decode_claim_args(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Classic transaction summary for approval surfaces
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The classic transaction kind a pending approval holds.
+///
+/// Each kind names the operations its envelope may carry, the same set the
+/// matching `*_commit` tool accepts in [`decode_authoritative_args`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClassicTransactionKind {
+    /// A payment approval: a `Payment`, a path payment, or a `CreateAccount`.
+    Payment,
+    /// A `ChangeTrust` approval.
+    Trustline,
+    /// A `ClaimClaimableBalance` approval.
+    Claim,
+}
+
+/// The memo of a classic transaction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ClassicMemo {
+    /// The transaction carries no memo.
+    None,
+    /// A text memo, exactly as the envelope carries it.
+    Text(String),
+    /// An id memo.
+    Id(#[serde(with = "crate::wire_stroops::u64")] u64),
+    /// A hash memo.
+    Hash([u8; 32]),
+    /// A return memo.
+    Return([u8; 32]),
+}
+
+impl ClassicMemo {
+    /// The memo's kind.
+    #[must_use]
+    pub const fn kind(&self) -> MemoKind {
+        match self {
+            Self::None => MemoKind::None,
+            Self::Text(_) => MemoKind::Text,
+            Self::Id(_) => MemoKind::Id,
+            Self::Hash(_) => MemoKind::Hash,
+            Self::Return(_) => MemoKind::Return,
+        }
+    }
+
+    /// The authoritative policy facts, retaining the legacy text-or-null
+    /// `memo` field. IDs are canonical decimal strings and hashes are lowercase
+    /// hex, so neither integer precision nor the memo kind is lost.
+    #[must_use]
+    pub fn policy_fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        use serde_json::Value;
+        let payload = match self {
+            Self::None => None,
+            Self::Text(text) => Some(("memo", text.clone())),
+            Self::Id(id) => Some(("memo_id", id.to_string())),
+            Self::Hash(hash) => Some(("memo_hash", crate::hex::encode(hash))),
+            Self::Return(hash) => Some(("memo_return", crate::hex::encode(hash))),
+        };
+        let mut fields = serde_json::Map::from_iter([
+            (
+                "memo_kind".to_owned(),
+                Value::String(self.kind().as_str().to_owned()),
+            ),
+            ("memo".to_owned(), Value::Null),
+        ]);
+        if let Some((key, value)) = payload {
+            fields.insert(key.to_owned(), Value::String(value));
+        }
+        fields
+    }
+
+    /// Writes the policy facts into `args`, replacing every memo fact it
+    /// held, so no other source supplies one.
+    pub fn insert_policy_fields(&self, args: &mut serde_json::Value) {
+        if let Some(object) = args.as_object_mut() {
+            for key in MEMO_FACT_KEYS {
+                object.remove(key);
+            }
+        }
+        for (key, value) in self.policy_fields() {
+            args[key] = value;
+        }
+    }
+
+    /// Missing, malformed or contradictory facts carry no known memo.
+    pub(crate) fn from_policy_args(args: &serde_json::Value) -> Option<Self> {
+        let memo = match args.get("memo_kind")?.as_str()? {
+            "none" => Self::None,
+            "text" => {
+                let text = args.get("memo")?.as_str()?;
+                if text.len() > 28 {
+                    return None;
+                }
+                Self::Text(text.to_owned())
+            }
+            "id" => Self::Id(args.get("memo_id")?.as_str()?.parse().ok()?),
+            "hash" => Self::Hash(crate::hex::decode_hex32(args.get("memo_hash")?.as_str()?).ok()?),
+            "return" => {
+                Self::Return(crate::hex::decode_hex32(args.get("memo_return")?.as_str()?).ok()?)
+            }
+            _ => return None,
+        };
+        let expected = memo.policy_fields();
+        MEMO_FACT_KEYS
+            .iter()
+            .all(|key| args.get(*key) == expected.get(*key))
+            .then_some(memo)
+    }
+
+    /// Formats the memo with its signed type. The caller escapes this text
+    /// for its output surface.
+    #[must_use]
+    pub fn display(&self) -> String {
+        match self {
+            Self::None => "none".to_owned(),
+            Self::Text(text) => format!("text \"{text}\""),
+            Self::Id(id) => format!("id {id}"),
+            Self::Hash(hash) => format!("hash {}", crate::hex::encode(hash)),
+            Self::Return(hash) => format!("return {}", crate::hex::encode(hash)),
+        }
+    }
+}
+
+impl TryFrom<&stellar_xdr::Memo> for ClassicMemo {
+    type Error = EnvelopeDecodeError;
+
+    /// Preserves the signed kind and bytes, refusing text that is not UTF-8.
+    fn try_from(memo: &stellar_xdr::Memo) -> Result<Self, Self::Error> {
+        use stellar_xdr::Memo;
+        Ok(match memo {
+            Memo::None => Self::None,
+            Memo::Text(bytes) => {
+                Self::Text(String::from_utf8(bytes.as_slice().to_vec()).map_err(|_| {
+                    EnvelopeDecodeError::XdrDecode {
+                        detail: "memo text is not valid UTF-8".to_owned(),
+                    }
+                })?)
+            }
+            Memo::Id(id) => Self::Id(*id),
+            Memo::Hash(hash) => Self::Hash(hash.0),
+            Memo::Return(hash) => Self::Return(hash.0),
+        })
+    }
+}
+
+/// The operation facts of a classic transaction or verified contract payment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClassicOperation {
+    /// A `Payment`.
+    Payment {
+        /// The destination as the envelope names it: a G-strkey, or an
+        /// M-strkey for a muxed destination.
+        destination: String,
+        /// `"XLM"` or `"CODE:Gissuer"`.
+        asset: String,
+        /// The amount in stroops.
+        amount_stroops: i64,
+    },
+    /// A `PathPaymentStrictSend` or `PathPaymentStrictReceive`.
+    PathPayment {
+        /// The destination as the envelope names it.
+        destination: String,
+        /// The asset the source pays.
+        send_asset: String,
+        /// The most the source pays: `send_amount` for strict send,
+        /// `send_max` for strict receive.
+        send_amount_stroops: i64,
+        /// The asset the destination receives.
+        dest_asset: String,
+        /// What the destination receives: `dest_amount` for strict receive,
+        /// the floor `dest_min` for strict send.
+        dest_amount_stroops: i64,
+    },
+    /// A `CreateAccount`.
+    CreateAccount {
+        /// The account created.
+        destination: String,
+        /// The starting balance in stroops of XLM.
+        starting_balance_stroops: i64,
+    },
+    /// A `ChangeTrust` on a credit asset.
+    ChangeTrust {
+        /// The asset code.
+        asset_code: String,
+        /// The issuer G-strkey.
+        asset_issuer: String,
+        /// The limit in stroops; `None` is the unlimited limit `i64::MAX`.
+        limit_stroops: Option<i64>,
+    },
+    /// A `ClaimClaimableBalance`.
+    ClaimClaimableBalance {
+        /// The canonical 72-hex balance id.
+        balance_id_hex72: String,
+        /// The `B...` strkey of the balance id.
+        balance_id_strkey: String,
+    },
+    /// A classic-asset transfer to a C contract through the asset's contract,
+    /// verified by [`crate::sac_payment::verify_sac_payment`].
+    SacTransfer {
+        /// The full C recipient.
+        destination: String,
+        /// `"XLM"` or `"CODE:Gissuer"`.
+        asset: String,
+        /// The amount in stroops.
+        amount_stroops: i64,
+        /// The transaction fee minus the resource fee.
+        inclusion_fee_stroops: Option<u32>,
+        /// The Soroban resource fee, including any restoration charge.
+        resource_fee_stroops: Option<u32>,
+    },
+}
+
+/// The details of a single-operation transaction an approval surface shows,
+/// decoded from a classic envelope or a verified contract payment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClassicSummary {
+    /// The effective source G-strkey: the operation source, else the
+    /// transaction source.
+    pub source: String,
+    /// The transaction fee in stroops.
+    pub fee_stroops: u32,
+    /// The transaction sequence number.
+    pub seq_num: i64,
+    /// The transaction memo.
+    pub memo: ClassicMemo,
+    /// The single operation.
+    pub operation: ClassicOperation,
+}
+
+/// Decodes the details an approval surface shows for a classic pending
+/// approval from its envelope.
+///
+/// The decode is the one [`decode_authoritative_args`] runs: the same
+/// bounded XDR read, the single-operation rule, the operation-source
+/// override, and the operation kinds the matching `*_commit` tool accepts.
+/// It refuses what an approval surface cannot show faithfully: a text memo
+/// that is not UTF-8, an asset code that is not 1 to 12 ASCII letters and
+/// digits padded with NUL bytes, and a trustline on a pool share or on XLM.
+///
+/// # Errors
+///
+/// Returns the [`EnvelopeDecodeError`] of a malformed envelope, a fee-bump
+/// or legacy envelope, an operation count other than one, an operation the
+/// kind does not accept, or one of the refusals above
+/// ([`EnvelopeDecodeError::XdrDecode`] for the memo,
+/// [`EnvelopeDecodeError::AssetCodeInvalid`] for an asset code,
+/// [`EnvelopeDecodeError::OperationKindMismatch`] for the trustline asset).
+pub fn classic_summary(
+    envelope_xdr_b64: &str,
+    kind: ClassicTransactionKind,
+) -> Result<ClassicSummary, EnvelopeDecodeError> {
+    use stellar_xdr::{ChangeTrustAsset, ClaimableBalanceId, OperationBody};
+
+    let (tx, op, source) = decode_single_operation(envelope_xdr_b64)?;
+    let memo = ClassicMemo::try_from(&tx.memo)?;
+    let mismatch = |tool: &'static str, expected: &'static str, body: &OperationBody| {
+        EnvelopeDecodeError::OperationKindMismatch {
+            tool,
+            expected,
+            found: op_body_kind_name(body).to_owned(),
+        }
+    };
+
+    let operation = match (kind, &op.body) {
+        (ClassicTransactionKind::Payment, OperationBody::Payment(p)) => ClassicOperation::Payment {
+            destination: muxed_account_to_display_strkey(&p.destination),
+            asset: strict_asset_string(&p.asset)?,
+            amount_stroops: p.amount,
+        },
+        (ClassicTransactionKind::Payment, OperationBody::PathPaymentStrictReceive(pp)) => {
+            ClassicOperation::PathPayment {
+                destination: muxed_account_to_display_strkey(&pp.destination),
+                send_asset: strict_asset_string(&pp.send_asset)?,
+                send_amount_stroops: pp.send_max,
+                dest_asset: strict_asset_string(&pp.dest_asset)?,
+                dest_amount_stroops: pp.dest_amount,
+            }
+        }
+        (ClassicTransactionKind::Payment, OperationBody::PathPaymentStrictSend(pp)) => {
+            ClassicOperation::PathPayment {
+                destination: muxed_account_to_display_strkey(&pp.destination),
+                send_asset: strict_asset_string(&pp.send_asset)?,
+                send_amount_stroops: pp.send_amount,
+                dest_asset: strict_asset_string(&pp.dest_asset)?,
+                dest_amount_stroops: pp.dest_min,
+            }
+        }
+        (ClassicTransactionKind::Payment, OperationBody::CreateAccount(ca)) => {
+            ClassicOperation::CreateAccount {
+                destination: account_id_to_strkey(&ca.destination),
+                starting_balance_stroops: ca.starting_balance,
+            }
+        }
+        (ClassicTransactionKind::Payment, other) => {
+            return Err(mismatch(
+                "stellar_pay_commit",
+                "Payment, PathPaymentStrictReceive, PathPaymentStrictSend, or CreateAccount",
+                other,
+            ));
+        }
+        (ClassicTransactionKind::Trustline, OperationBody::ChangeTrust(ct)) => {
+            let (code_bytes, issuer): (&[u8], _) = match &ct.line {
+                ChangeTrustAsset::CreditAlphanum4(a) => (&a.asset_code.0, &a.issuer),
+                ChangeTrustAsset::CreditAlphanum12(a) => (&a.asset_code.0, &a.issuer),
+                ChangeTrustAsset::Native | ChangeTrustAsset::PoolShare(_) => {
+                    return Err(EnvelopeDecodeError::OperationKindMismatch {
+                        tool: "stellar_trustline_commit",
+                        expected: "ChangeTrust with credit asset",
+                        found: "ChangeTrust on a non-credit asset".to_owned(),
+                    });
+                }
+            };
+            ClassicOperation::ChangeTrust {
+                asset_code: strict_asset_code(code_bytes)?,
+                asset_issuer: account_id_to_strkey(issuer),
+                limit_stroops: (ct.limit != i64::MAX).then_some(ct.limit),
+            }
+        }
+        (ClassicTransactionKind::Trustline, other) => {
+            return Err(mismatch("stellar_trustline_commit", "ChangeTrust", other));
+        }
+        (ClassicTransactionKind::Claim, OperationBody::ClaimClaimableBalance(claim)) => {
+            let ClaimableBalanceId::ClaimableBalanceIdTypeV0(hash) = &claim.balance_id;
+            ClassicOperation::ClaimClaimableBalance {
+                balance_id_hex72: format!("00000000{}", crate::hex::encode(&hash.0)),
+                balance_id_strkey: format!("{}", stellar_strkey::ClaimableBalance::V0(hash.0)),
+            }
+        }
+        (ClassicTransactionKind::Claim, other) => {
+            return Err(mismatch(
+                "stellar_claim_commit",
+                "ClaimClaimableBalance",
+                other,
+            ));
+        }
+    };
+
+    Ok(ClassicSummary {
+        source,
+        fee_stroops: tx.fee,
+        seq_num: tx.seq_num.0,
+        memo,
+        operation,
+    })
+}
+
+/// Renders a `MuxedAccount` as the strkey it is: a G-strkey for a plain
+/// account, an M-strkey (account and mux id) for a muxed one.
+fn muxed_account_to_display_strkey(muxed: &stellar_xdr::MuxedAccount) -> String {
+    match muxed {
+        stellar_xdr::MuxedAccount::Ed25519(_) => muxed_account_to_strkey(muxed),
+        stellar_xdr::MuxedAccount::MuxedEd25519(med) => format!(
+            "{}",
+            stellar_strkey::ed25519::MuxedAccount {
+                ed25519: med.ed25519.0,
+                id: med.id,
+            }
+        ),
+    }
+}
+
+/// Renders an asset as `"XLM"` or `"CODE:Gissuer"`, refusing an asset code
+/// outside the protocol's alphabet.
+fn strict_asset_string(asset: &stellar_xdr::Asset) -> Result<String, EnvelopeDecodeError> {
+    match asset {
+        stellar_xdr::Asset::Native => Ok("XLM".to_owned()),
+        stellar_xdr::Asset::CreditAlphanum4(a) => Ok(format!(
+            "{}:{}",
+            strict_asset_code(&a.asset_code.0)?,
+            account_id_to_strkey(&a.issuer)
+        )),
+        stellar_xdr::Asset::CreditAlphanum12(a) => Ok(format!(
+            "{}:{}",
+            strict_asset_code(&a.asset_code.0)?,
+            account_id_to_strkey(&a.issuer)
+        )),
+    }
+}
+
+/// Returns the asset code of a fixed-width XDR code field: one or more ASCII
+/// letters and digits, followed only by NUL padding.
+fn strict_asset_code(bytes: &[u8]) -> Result<String, EnvelopeDecodeError> {
+    let len = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    let (code, padding) = bytes.split_at(len);
+    if code.is_empty()
+        || !code.iter().all(u8::is_ascii_alphanumeric)
+        || padding.iter().any(|b| *b != 0)
+    {
+        return Err(EnvelopeDecodeError::AssetCodeInvalid);
+    }
+    // ASCII alphanumeric bytes are UTF-8.
+    Ok(code.iter().map(|b| char::from(*b)).collect())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Helper: OperationBody name without echoing field values
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -953,6 +1396,48 @@ mod tests {
         clippy::panic,
         reason = "test-only; panics and unwraps acceptable in unit tests"
     )]
+
+    #[test]
+    fn envelope_reader_distinguishes_the_byte_budget_from_truncation() {
+        use base64::Engine as _;
+        use stellar_xdr::{HostFunction, InvokeHostFunctionOp, Limits, ReadXdr, WriteXdr};
+
+        let env = build_envelope(
+            SOURCE_G,
+            Operation {
+                source_account: None,
+                body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                    host_function: HostFunction::UploadContractWasm(Default::default()),
+                    auth: Default::default(),
+                }),
+            },
+            Memo::None,
+        );
+        let mut raw = env.to_xdr(Limits::none()).unwrap();
+        // The empty WASM length precedes the auth, extension, and signature counts.
+        let offset = raw.len() - 16;
+        raw[offset..offset + 4].copy_from_slice(&4096u32.to_be_bytes());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+        assert!(matches!(
+            read_envelope(&encoded),
+            Err(EnvelopeReadError::Xdr(
+                stellar_xdr::Error::LengthLimitExceeded
+            ))
+        ));
+        assert!(matches!(
+            TransactionEnvelope::from_xdr_base64(&encoded, Limits::none()),
+            Err(stellar_xdr::Error::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        let too_long = "!".repeat(MAX_ENVELOPE_BASE64_LEN + 1);
+        assert!(matches!(
+            read_envelope(&too_long),
+            Err(EnvelopeReadError::InputTooLong)
+        ));
+        assert!(matches!(
+            decode_authoritative_args(&too_long, "stellar_pay_commit"),
+            Err(EnvelopeDecodeError::XdrDecode { detail }) if detail == ENVELOPE_INPUT_TOO_LONG
+        ));
+    }
 
     use stellar_xdr::{
         AccountId, Asset, CreateAccountOp, Limits, Memo, MuxedAccount, MuxedAccountMed25519,
@@ -1347,7 +1832,7 @@ mod tests {
     }
 
     #[test]
-    fn memo_id_returns_null_without_structured_memo_fields() {
+    fn memo_id_retains_decimal_fact_with_null_legacy_memo() {
         let op = Operation {
             source_account: None,
             body: OperationBody::Payment(PaymentOp {
@@ -1356,19 +1841,255 @@ mod tests {
                 amount: 10_000_000,
             }),
         };
-        let env = build_envelope(SOURCE_G, op, Memo::Id(42));
-        let xdr_b64 = to_b64(&env);
-
-        let result = decode_authoritative_args(&xdr_b64, "stellar_pay_commit")
-            .expect("Memo::Id must not cause a decode error");
-        assert_eq!(result["memo"], serde_json::Value::Null);
-        assert!(result.get("memo_hash").is_none());
-        assert!(result.get("memo_return").is_none());
+        for (id, decimal) in [(0, "0"), (42, "42"), (u64::MAX, "18446744073709551615")] {
+            let env = build_envelope(SOURCE_G, op.clone(), Memo::Id(id));
+            let xdr_b64 = to_b64(&env);
+            let result = decode_authoritative_args(&xdr_b64, "stellar_pay_commit")
+                .expect("Memo::Id must not cause a decode error");
+            assert_eq!(result["memo"], serde_json::Value::Null);
+            assert_eq!(result["memo_kind"], "id");
+            assert_eq!(result["memo_id"], decimal);
+            assert!(result.get("memo_hash").is_none());
+            assert!(result.get("memo_return").is_none());
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Memo::Text with invalid UTF-8 → XdrDecode error
     // ─────────────────────────────────────────────────────────────────────────
+
+    fn memo_evaluation(
+        args: &serde_json::Value,
+        tool_name: &'static str,
+        requirement: Option<crate::policy::v1::criteria::memo_binding::MemoRequirement>,
+    ) -> crate::policy::Evaluation {
+        use crate::policy::v1::criteria::memo_binding::{MemoBinding, MemoBindingCriterion};
+        use crate::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
+        use crate::policy::{
+            Decision, McpToolRegistration, PolicyEngine, ToolDescriptor, ToolValueKind,
+        };
+        let engine = crate::policy::v1::PolicyEngineV1::new(
+            PolicyDocument {
+                version: 1,
+                scope: ScopeId::AllProfiles,
+                rules: vec![PolicyRule {
+                    r#match: RuleMatch {
+                        tool: "*".into(),
+                        chain: "*".into(),
+                    },
+                    criteria: requirement.map_or_else(Vec::new, |requirement| {
+                        vec![Box::new(MemoBindingCriterion::new(vec![
+                            MemoBinding::new(DEST_G, requirement).unwrap(),
+                        ]))
+                            as Box<dyn crate::policy::v1::criteria::Criterion>]
+                    }),
+                    decision: Decision::Allow,
+                    allow_opaque_signing: false,
+                }],
+                signature: None,
+            },
+            "memo".into(),
+        );
+        let mut tool = ToolDescriptor::from_registration(&McpToolRegistration {
+            name: tool_name,
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind: ToolValueKind::MovesValue,
+        });
+        tool.chain_id = "stellar:testnet".into();
+        let profile =
+            crate::profile::Profile::builder_testnet("memo", "acct", "svc", "nonce").build();
+        engine
+            .evaluate_full(&tool, args, &profile, None, None, None, None, None, 1000)
+            .unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn classic_policy_memo_facts_match_signed_xdr() {
+        use crate::policy::Decision;
+        use crate::policy::v1::criteria::memo_binding::MemoRequirement;
+        use stellar_xdr::{
+            CreateAccountOp, Hash, MuxedAccountMed25519, PathPaymentStrictReceiveOp,
+            PathPaymentStrictSendOp,
+        };
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let cases = [
+            (Memo::None, ClassicMemo::None, MemoRequirement::Any),
+            (
+                Memo::Text(Vec::new().try_into().unwrap()),
+                ClassicMemo::Text(String::new()),
+                MemoRequirement::Text(String::new()),
+            ),
+            (
+                Memo::Text("支払\n".as_bytes().to_vec().try_into().unwrap()),
+                ClassicMemo::Text("支払\n".into()),
+                MemoRequirement::Text("支払\n".into()),
+            ),
+            (Memo::Id(0), ClassicMemo::Id(0), MemoRequirement::Id(0)),
+            (
+                Memo::Id(u64::MAX),
+                ClassicMemo::Id(u64::MAX),
+                MemoRequirement::Id(u64::MAX),
+            ),
+            (
+                Memo::Hash(Hash([0xab; 32])),
+                ClassicMemo::Hash([0xab; 32]),
+                MemoRequirement::Hash([0xab; 32]),
+            ),
+            (
+                Memo::Return(Hash([0xab; 32])),
+                ClassicMemo::Return([0xab; 32]),
+                MemoRequirement::Return([0xab; 32]),
+            ),
+        ];
+        for id in [None, Some(0), Some(u64::MAX)] {
+            let destination = id.map_or_else(
+                || g_to_muxed(DEST_G),
+                |id| {
+                    MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+                        id,
+                        ed25519: Uint256(g_to_bytes(DEST_G)),
+                    })
+                },
+            );
+            let full_destination = id.map_or_else(
+                || DEST_G.to_owned(),
+                |id| {
+                    stellar_strkey::ed25519::MuxedAccount {
+                        ed25519: g_to_bytes(DEST_G),
+                        id,
+                    }
+                    .to_string()
+                    .to_string()
+                },
+            );
+            for (memo, expected, requirement) in &cases {
+                for body in [
+                    OperationBody::Payment(PaymentOp {
+                        destination: destination.clone(),
+                        asset: Asset::Native,
+                        amount: 17,
+                    }),
+                    OperationBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
+                        send_asset: Asset::Native,
+                        send_amount: 17,
+                        destination: destination.clone(),
+                        dest_asset: Asset::Native,
+                        dest_min: 3,
+                        path: Default::default(),
+                    }),
+                    OperationBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
+                        send_asset: Asset::Native,
+                        send_max: 17,
+                        destination: destination.clone(),
+                        dest_asset: Asset::Native,
+                        dest_amount: 3,
+                        path: Default::default(),
+                    }),
+                    OperationBody::CreateAccount(CreateAccountOp {
+                        destination: g_to_account_id(DEST_G),
+                        starting_balance: 17,
+                    }),
+                ] {
+                    let create = matches!(body, OperationBody::CreateAccount(_));
+                    let tool = if create {
+                        "stellar_create_account_commit"
+                    } else {
+                        "stellar_pay_commit"
+                    };
+                    let xdr = to_b64(&build_envelope(
+                        SOURCE_G,
+                        Operation {
+                            source_account: None,
+                            body,
+                        },
+                        memo.clone(),
+                    ));
+                    let args = decode_authoritative_args(&xdr, tool).unwrap();
+                    let evaluation = memo_evaluation(&args, tool, None);
+                    let effects = evaluation.value_effects.unwrap();
+                    assert_eq!(effects.memo(), Some(expected), "signed memo {memo:?}");
+                    assert_eq!(effects.legs()[0].amount, Some(17));
+                    assert_eq!(effects.legs()[0].asset.as_deref(), Some("native"));
+                    assert_eq!(
+                        effects.legs()[0].destination.as_deref(),
+                        Some(if create { DEST_G } else { &full_destination })
+                    );
+                    if effects.legs().len() == 2 {
+                        assert_eq!(effects.legs()[1].amount, Some(3));
+                        assert!(!effects.legs()[1].kind.carries_debit());
+                    }
+                    let decision = memo_evaluation(&args, tool, Some(requirement.clone())).decision;
+                    if *expected == ClassicMemo::None {
+                        assert!(matches!(
+                            decision,
+                            Decision::Deny(crate::policy::DenyReason::MemoBindingMismatch { .. })
+                        ));
+                    } else {
+                        assert_eq!(decision, Decision::Allow, "signed memo binding {memo:?}");
+                    }
+                    let wrong_kind = match expected {
+                        ClassicMemo::Id(id) => MemoRequirement::Text(id.to_string()),
+                        ClassicMemo::Hash(bytes) => MemoRequirement::Return(*bytes),
+                        ClassicMemo::Return(bytes) => MemoRequirement::Hash(*bytes),
+                        _ => MemoRequirement::Id(1),
+                    };
+                    assert!(matches!(
+                        memo_evaluation(&args, tool, Some(wrong_kind)).decision,
+                        Decision::Deny(crate::policy::DenyReason::MemoBindingMismatch { .. })
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn classic_policy_malformed_memo_facts_are_absent() {
+        use crate::policy::v1::criteria::memo_binding::MemoRequirement;
+        use serde_json::json;
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        for facts in [
+            json!({}),
+            json!({"memo": null}),
+            json!({"memo_kind": "none"}),
+            json!({"memo_kind": "none", "memo": "forged"}),
+            json!({"memo_kind": "none", "memo": null, "memo_id": "0"}),
+            json!({"memo_kind": "unknown", "memo": null}),
+            json!({"memo_kind": "id", "memo": null, "memo_id": "18446744073709551616"}),
+            json!({"memo_kind": "id", "memo": null, "memo_id": "-1"}),
+            json!({"memo_kind": "id", "memo": null, "memo_id": "+1"}),
+            json!({"memo_kind": "id", "memo": null, "memo_id": "01"}),
+            json!({"memo_kind": "id", "memo": null, "memo_id": 1}),
+            json!({"memo_kind": "text", "memo": "x".repeat(29)}),
+            json!({"memo_kind": "hash", "memo": null, "memo_hash": "AB".repeat(32)}),
+            json!({"memo_kind": "return", "memo": null, "memo_return": "ab".repeat(31)}),
+            json!({"memo_kind": "hash", "memo": null, "memo_hash": "ab".repeat(32), "memo_return": "ab".repeat(32)}),
+        ] {
+            let mut args = json!({"destination": DEST_G, "asset": "native", "amount_stroops": "1"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(facts.as_object().unwrap().clone());
+            assert_eq!(
+                memo_evaluation(&args, "stellar_pay", None)
+                    .value_effects
+                    .unwrap()
+                    .memo(),
+                None,
+                "{facts}"
+            );
+            assert!(matches!(
+                memo_evaluation(&args, "stellar_pay", Some(MemoRequirement::Any)).decision,
+                crate::policy::Decision::Deny(
+                    crate::policy::DenyReason::MemoBindingMismatch { .. }
+                )
+            ));
+        }
+    }
 
     #[test]
     fn invalid_utf8_memo_text_returns_xdr_decode_error() {
@@ -1410,7 +2131,7 @@ mod tests {
         let err = decode_authoritative_args("aGVsbG8=", "stellar_balances")
             .expect_err("must return UnsupportedTool");
         assert!(
-            matches!(err, EnvelopeDecodeError::UnsupportedTool { .. }),
+            matches!(err, EnvelopeDecodeError::UnsupportedTool),
             "expected UnsupportedTool, got: {err}"
         );
     }
@@ -1429,6 +2150,42 @@ mod tests {
             matches!(err, EnvelopeDecodeError::XdrDecode { .. }),
             "expected XdrDecode error, got: {err}"
         );
+    }
+
+    /// An envelope that is not base64 is refused by class; the detail names
+    /// neither the envelope text nor the symbol the base64 decoder stopped at.
+    #[test]
+    fn envelope_base64_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+
+        // The invalid symbol leads, so the base64 decoder fails on the first
+        // read, before any XDR value is parsed.
+        let envelope = format!("~{CREDENTIAL_MARKER}");
+        let err = decode_authoritative_args(&envelope, "stellar_pay_commit")
+            .expect_err("a non-base64 envelope is refused");
+        assert!(
+            matches!(
+                &err,
+                EnvelopeDecodeError::XdrDecode { detail }
+                    if detail == "the envelope is not valid standard base64"
+            ),
+            "{err:?}"
+        );
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        // The base64 decoder reports the offending symbol as its byte value.
+        assert_no_marker(&err, "126");
+        assert_no_marker(&err, "symbol");
+        let err = envelope_source_account(&envelope).expect_err("refused through the source path");
+        assert!(
+            matches!(
+                &err,
+                EnvelopeDecodeError::XdrDecode { detail }
+                    if detail == "the envelope is not valid standard base64"
+            ),
+            "{err:?}"
+        );
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        assert_no_marker(&err, "symbol");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1871,5 +2628,295 @@ mod tests {
             matches!(err, EnvelopeDecodeError::OperationKindMismatch { .. }),
             "expected OperationKindMismatch, got: {err}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // classic_summary
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn usdc() -> Asset {
+        use stellar_xdr::{AlphaNum4, AssetCode4};
+        Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USDC"),
+            issuer: g_to_account_id(USDC_ISSUER_G),
+        })
+    }
+
+    /// The summary of a payment carries the values the policy decoder
+    /// evaluates for the same envelope, plus the memo, fee and sequence.
+    #[test]
+    fn classic_summary_payment_agrees_with_the_policy_decoder() {
+        use stellar_xdr::ReadXdr as _;
+        const G: &str = "GCTKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNG7S";
+        const M0: &str = "MCTKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKMAAAAAAAAAAAABA5O";
+        const MMAX: &str = "MCTKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKN7777777777776QHC";
+        for destination in [G, M0, MMAX] {
+            for (asset, asset_text) in [
+                (Asset::Native, "XLM".to_owned()),
+                (usdc(), format!("USDC:{USDC_ISSUER_G}")),
+            ] {
+                for sequence in [101, i64::MAX] {
+                    for (memo, expected_memo) in [
+                        (Memo::None, ClassicMemo::None),
+                        (
+                            Memo::Text(Vec::new().try_into().unwrap()),
+                            ClassicMemo::Text(String::new()),
+                        ),
+                        (
+                            Memo::Text("é".as_bytes().try_into().unwrap()),
+                            ClassicMemo::Text("é".to_owned()),
+                        ),
+                        (Memo::Id(0), ClassicMemo::Id(0)),
+                        (Memo::Id(u64::MAX), ClassicMemo::Id(u64::MAX)),
+                        (
+                            Memo::Hash(stellar_xdr::Hash([0xab; 32])),
+                            ClassicMemo::Hash([0xab; 32]),
+                        ),
+                        (
+                            Memo::Return(stellar_xdr::Hash([0xab; 32])),
+                            ClassicMemo::Return([0xab; 32]),
+                        ),
+                    ] {
+                        let op = Operation {
+                            source_account: Some(g_to_muxed(DEST_G)),
+                            body: OperationBody::Payment(PaymentOp {
+                                destination: crate::payment_accounts::PaymentAccount::parse(
+                                    destination,
+                                )
+                                .unwrap()
+                                .to_muxed_account(),
+                                asset: asset.clone(),
+                                amount: 123_456_789,
+                            }),
+                        };
+                        let mut env = build_envelope(SOURCE_G, op, memo);
+                        let TransactionEnvelope::Tx(ref mut v1) = env else {
+                            unreachable!()
+                        };
+                        v1.tx.seq_num = SequenceNumber(sequence);
+                        let retained = to_b64(&env);
+                        assert_eq!(
+                            to_b64(
+                                &TransactionEnvelope::from_xdr_base64(&retained, Limits::none())
+                                    .unwrap()
+                            ),
+                            retained
+                        );
+                        let summary =
+                            classic_summary(&retained, ClassicTransactionKind::Payment).unwrap();
+                        let policy =
+                            decode_authoritative_args(&retained, "stellar_pay_commit").unwrap();
+                        assert_eq!(policy["sequence_number"], sequence);
+                        assert_eq!(summary.seq_num, sequence);
+                        assert_eq!(policy["source"], DEST_G);
+                        assert_eq!(policy["destination"], destination);
+                        assert_eq!(policy["amount_stroops"], "123456789");
+                        assert_eq!(policy["asset"], asset_text);
+                        assert_eq!(summary.memo, expected_memo);
+                        match expected_memo {
+                            ClassicMemo::None => assert!(policy["memo"].is_null()),
+                            ClassicMemo::Text(text) => assert_eq!(policy["memo"], text),
+                            ClassicMemo::Id(id) => assert_eq!(policy["memo_id"], id.to_string()),
+                            ClassicMemo::Hash(_) => assert_eq!(
+                                policy["memo_hash"],
+                                "abababababababababababababababababababababababababababababababab"
+                            ),
+                            ClassicMemo::Return(_) => assert_eq!(
+                                policy["memo_return"],
+                                "abababababababababababababababababababababababababababababababab"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        let op = Operation {
+            source_account: Some(g_to_muxed(DEST_G)),
+            body: OperationBody::Payment(PaymentOp {
+                destination: g_to_muxed(USDC_ISSUER_G),
+                asset: usdc(),
+                amount: 123_456_789,
+            }),
+        };
+        let memo = Memo::Text(b"inv \x1b[2K".as_slice().try_into().unwrap());
+        let xdr_b64 = to_b64(&build_envelope(SOURCE_G, op, memo));
+
+        let summary = classic_summary(&xdr_b64, ClassicTransactionKind::Payment).unwrap();
+        let policy = decode_authoritative_args(&xdr_b64, "stellar_pay_commit").unwrap();
+        assert_eq!(summary.source, policy["source"]);
+        assert_eq!(summary.source, DEST_G);
+        assert_eq!(summary.fee_stroops, 100);
+        assert_eq!(summary.seq_num, 101);
+        assert_eq!(summary.memo, ClassicMemo::Text("inv \u{1b}[2K".to_owned()));
+        assert_eq!(summary.memo.display(), "text \"inv \u{1b}[2K\"");
+        let ClassicOperation::Payment {
+            destination,
+            asset,
+            amount_stroops,
+        } = &summary.operation
+        else {
+            panic!("{:?}", summary.operation)
+        };
+        assert_eq!(destination, &policy["destination"]);
+        assert_eq!(asset, &policy["asset"]);
+        assert_eq!(amount_stroops.to_string(), policy["amount_stroops"]);
+    }
+
+    #[test]
+    fn classic_summary_memo_kinds_name_themselves() {
+        let pay = |memo| {
+            let op = Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: g_to_muxed(DEST_G),
+                    asset: Asset::Native,
+                    amount: 1,
+                }),
+            };
+            classic_summary(
+                &to_b64(&build_envelope(SOURCE_G, op, memo)),
+                ClassicTransactionKind::Payment,
+            )
+            .unwrap()
+            .memo
+            .display()
+        };
+        assert_eq!(pay(Memo::None), "none");
+        assert_ne!(
+            pay(Memo::Text(b"id 7".to_vec().try_into().unwrap())),
+            pay(Memo::Id(7))
+        );
+        assert_ne!(
+            pay(Memo::Text(b"(none)".to_vec().try_into().unwrap())),
+            pay(Memo::None)
+        );
+        assert_eq!(pay(Memo::Id(7)), "id 7");
+        assert_eq!(
+            pay(Memo::Hash(stellar_xdr::Hash([0xab; 32]))),
+            format!("hash {}", "ab".repeat(32))
+        );
+        assert_eq!(
+            pay(Memo::Return(stellar_xdr::Hash([0x01; 32]))),
+            format!("return {}", "01".repeat(32))
+        );
+    }
+
+    /// A summary refuses what it cannot show faithfully: an asset code with a
+    /// byte outside ASCII letters and digits, a text memo that is not UTF-8,
+    /// and an operation of another kind.
+    #[test]
+    fn classic_summary_refuses_unshowable_envelopes() {
+        use stellar_xdr::{AlphaNum4, AssetCode4};
+        for code in [*b"US\x1bD", *b"\0USD", *b"U\0SD", [0; 4]] {
+            let op = Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: g_to_muxed(DEST_G),
+                    asset: Asset::CreditAlphanum4(AlphaNum4 {
+                        asset_code: AssetCode4(code),
+                        issuer: g_to_account_id(USDC_ISSUER_G),
+                    }),
+                    amount: 1,
+                }),
+            };
+            let xdr_b64 = to_b64(&build_envelope(SOURCE_G, op, Memo::None));
+            assert!(
+                matches!(
+                    classic_summary(&xdr_b64, ClassicTransactionKind::Payment),
+                    Err(EnvelopeDecodeError::AssetCodeInvalid)
+                ),
+                "{code:?}"
+            );
+        }
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: g_to_muxed(DEST_G),
+                asset: Asset::Native,
+                amount: 1,
+            }),
+        };
+        let memo = Memo::Text(vec![0xff, 0xfe].try_into().unwrap());
+        let xdr_b64 = to_b64(&build_envelope(SOURCE_G, op.clone(), memo));
+        assert!(matches!(
+            classic_summary(&xdr_b64, ClassicTransactionKind::Payment),
+            Err(EnvelopeDecodeError::XdrDecode { .. })
+        ));
+
+        let xdr_b64 = to_b64(&build_envelope(SOURCE_G, op, Memo::None));
+        for kind in [
+            ClassicTransactionKind::Trustline,
+            ClassicTransactionKind::Claim,
+        ] {
+            assert!(matches!(
+                classic_summary(&xdr_b64, kind),
+                Err(EnvelopeDecodeError::OperationKindMismatch { .. })
+            ));
+        }
+        assert!(classic_summary("AAAA", ClassicTransactionKind::Payment).is_err());
+    }
+
+    #[test]
+    fn classic_summary_change_trust_and_claim() {
+        use stellar_xdr::{
+            AlphaNum12, AssetCode12, ChangeTrustAsset, ChangeTrustOp, ClaimClaimableBalanceOp,
+            ClaimableBalanceId, Hash,
+        };
+        let mut code = [0u8; 12];
+        code[..6].copy_from_slice(b"LONGER");
+        let trust = |limit| Operation {
+            source_account: None,
+            body: OperationBody::ChangeTrust(ChangeTrustOp {
+                line: ChangeTrustAsset::CreditAlphanum12(AlphaNum12 {
+                    asset_code: AssetCode12(code),
+                    issuer: g_to_account_id(USDC_ISSUER_G),
+                }),
+                limit,
+            }),
+        };
+        let summary = classic_summary(
+            &to_b64(&build_envelope(SOURCE_G, trust(i64::MAX), Memo::None)),
+            ClassicTransactionKind::Trustline,
+        )
+        .unwrap();
+        assert_eq!(
+            summary.operation,
+            ClassicOperation::ChangeTrust {
+                asset_code: "LONGER".to_owned(),
+                asset_issuer: USDC_ISSUER_G.to_owned(),
+                limit_stroops: None,
+            }
+        );
+        let summary = classic_summary(
+            &to_b64(&build_envelope(SOURCE_G, trust(0), Memo::None)),
+            ClassicTransactionKind::Trustline,
+        )
+        .unwrap();
+        assert!(matches!(
+            summary.operation,
+            ClassicOperation::ChangeTrust {
+                limit_stroops: Some(0),
+                ..
+            }
+        ));
+
+        let claim = Operation {
+            source_account: None,
+            body: OperationBody::ClaimClaimableBalance(ClaimClaimableBalanceOp {
+                balance_id: ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0x5a; 32])),
+            }),
+        };
+        let xdr_b64 = to_b64(&build_envelope(SOURCE_G, claim, Memo::None));
+        let summary = classic_summary(&xdr_b64, ClassicTransactionKind::Claim).unwrap();
+        let policy = decode_authoritative_args(&xdr_b64, "stellar_claim_commit").unwrap();
+        assert_eq!(
+            summary.operation,
+            ClassicOperation::ClaimClaimableBalance {
+                balance_id_hex72: policy["balance_id_hex72"].as_str().unwrap().to_owned(),
+                balance_id_strkey: policy["balance_id_strkey"].as_str().unwrap().to_owned(),
+            }
+        );
+        assert_eq!(summary.source, SOURCE_G);
     }
 }

@@ -59,6 +59,17 @@ use stellar_agent_network::{StellarRpcClient, enrolled_keyring_signer};
 use crate::server::WalletServer;
 use crate::tools::common::DispatchOutcome;
 
+/// The refusal of a `chain_id` with no pinned Soroswap router. It names the
+/// accepted values and never the refused argument.
+const UNRECOGNISED_NETWORK_TEXT: &str = "dex.unrecognised_network: chain_id must name a network \
+                                         with a pinned Soroswap router (stellar:testnet or \
+                                         stellar:pubnet)";
+
+/// The quote tool's form of [`UNRECOGNISED_NETWORK_TEXT`].
+const QUOTE_UNRECOGNISED_NETWORK_TEXT: &str = "dex.quote.unrecognised_network: chain_id must name \
+                                               a network with a pinned Soroswap router \
+                                               (stellar:testnet or stellar:pubnet)";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -177,7 +188,8 @@ impl WalletServer {
         description = "Swap tokens via Soroswap ROUTER-DIRECT path. Enforces ordered trust gate: \
                        venue allowlist, router WASM-hash pin, on-chain slippage re-verify. \
                        Requires absolute qty_out_min floor (not a percent). Signs and submits \
-                       via smart-account. destructive_hint=true, read_only_hint=false.",
+                       via smart-account. Testnet only. A mainnet profile refuses with \
+                       network.mainnet_write_forbidden at entry. destructive_hint=true, read_only_hint=false.",
         annotations(destructive_hint = true, read_only_hint = false)
     )]
     async fn stellar_dex_trade(
@@ -197,6 +209,16 @@ impl WalletServer {
         let qty_out_min =
             crate::tools::amount_wire::parse_i128_field("qty_out_min", &args.qty_out_min)?;
 
+        // ── Validate the smart-account address ───────────────────────────────
+        // Every later event names `from_address` by its first and last five
+        // characters, which is a safe rendering of a contract strkey only.
+        if stellar_strkey::Contract::from_string(&args.from_address).is_err() {
+            return Ok(crate::tools::common::business_error_result(
+                "dex.submit_failed",
+                "from_address must be a C-strkey (contract)",
+            ));
+        }
+
         // ── Resolve network settings ──────────────────────────────────────────
         let network_passphrase = self.context.network_passphrase();
         let rpc_url = self.context.rpc_url.as_str();
@@ -204,9 +226,7 @@ impl WalletServer {
         // ── Resolve pinned router address and WASM hash for network ──────────
         // Table lookup only (no RPC); safe to resolve ahead of the policy gate.
         let (router_address, router_wasm_hash) = pinned_router_for_network(&args.chain_id)
-            .map_err(|e| {
-                rmcp::ErrorData::invalid_params(format!("dex.unrecognised_network: {e}"), None)
-            })?;
+            .map_err(|_| rmcp::ErrorData::invalid_params(UNRECOGNISED_NETWORK_TEXT, None))?;
 
         // ── Canonicalise path for display and TradeArgs ───────────────────────
         // Surface canonicalisation errors (not swallowed): an unresolvable token
@@ -349,6 +369,7 @@ impl WalletServer {
             &self.profile_name_for_approval(),
             &self.profile,
             expected_g_strkey,
+            self.established_owner().as_ref(),
         )
         .await
         {
@@ -401,18 +422,19 @@ impl WalletServer {
         // classic commit verbs use, and its confirmed submit advances the
         // same floor.
         ctx.sequence_floor = Some(&sequence_floor_hook);
-        // Thread the pre-flight-acquired audit writer + gate-derived leg so the
-        // adapter emits the ValueActionSubmitted row after a confirmed submit
-        // (non-fatal past this point — the pre-flight above is what fails
-        // closed).
+        // Thread the pre-flight-acquired audit writer + gate-derived leg into
+        // the adapter context. The attached submission recorder owns the
+        // submission's audit rows, so a confirmed submit writes no
+        // ValueActionSubmitted row; the pre-flight above is what fails closed.
         ctx.audit_writer = Some(std::sync::Arc::clone(&audit_writer));
         ctx.audit_legs = Some(&audit_legs);
         ctx.audit_tool = Some("stellar_dex_trade");
 
         // Record the submission before the bytes leave: the receipt, the
         // pending audit row and the spending-window reservation. The recorder
-        // settles all three against what the network answers, and owns the
-        // confirmed row the adapter would otherwise emit.
+        // records a reported success on the receipt and in the reservation
+        // when the policy made one, leaves them standing on every other
+        // answer, and writes no row for a reported success.
         let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
             Ok(v) => v,
             Err(e) => {
@@ -438,6 +460,7 @@ impl WalletServer {
                 approval_nonce: None,
                 approval_dir: None,
                 now_ms,
+                provenance: None,
             },
             Some(&sequence_floor_hook),
         ) {
@@ -530,9 +553,8 @@ impl WalletServer {
         let rpc_url = self.context.rpc_url.as_str();
 
         // ── Resolve pinned router address ─────────────────────────────────────
-        let (router_address, _) = pinned_router_for_network(&args.chain_id).map_err(|e| {
-            rmcp::ErrorData::invalid_params(format!("dex.quote.unrecognised_network: {e}"), None)
-        })?;
+        let (router_address, _) = pinned_router_for_network(&args.chain_id)
+            .map_err(|_| rmcp::ErrorData::invalid_params(QUOTE_UNRECOGNISED_NETWORK_TEXT, None))?;
 
         // ── Canonicalise path ─────────────────────────────────────────────────
         let canonical_path = canonicalise_path(&args.path, network_passphrase).map_err(|e| {
@@ -789,7 +811,12 @@ mod secondary_rule_tests {
 
     /// A server on a mainnet or testnet profile whose context is forced to
     /// mainnet, with the file secondary `https://file-secondary.example`.
+    ///
+    /// Construction reads the keyring and registers the platform store when
+    /// none is registered, so the helper installs a fresh mock store and
+    /// every caller holds the `keyring` serial key.
     fn server(mainnet: bool, rpc: &str) -> WalletServer {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let profile = if mainnet {
             Profile::builder_mainnet_named("secondary", rpc, "s", "default", "n", "a")
         } else {
@@ -804,7 +831,12 @@ mod secondary_rule_tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn secondary_override_reads_context_and_preserves_defaults() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut server = server(false, "https://primary.example");
         let err = server
             .secondary_override(Some("https://input.example"))
@@ -844,8 +876,10 @@ mod secondary_rule_tests {
         server
     }
 
-    /// A testnet server whose context comes from its profile.
+    /// A testnet server whose context comes from its profile, over a fresh
+    /// mock keyring store, as [`server`] installs it.
     fn testnet_server(rpc: &str) -> WalletServer {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let profile = Profile::builder_testnet_named("secondary", "s", "default", "n", "a")
             .rpc_url(rpc)
             .with_noop_engine()
@@ -864,7 +898,12 @@ mod secondary_rule_tests {
     /// code: the refusal keys on the context, not on the profile or the
     /// argument.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dex_trade_refuses_mainnet_at_entry_divergent_context() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let server = mock_server(false, &rpc.uri());
         let args = trade_args("stellar:testnet", Some(rpc.uri().as_str()));
@@ -877,7 +916,12 @@ mod secondary_rule_tests {
     /// A mainnet profile on the Noop engine refuses with the canonical code
     /// ahead of the secondary-endpoint refusal and the router lookup.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dex_trade_refuses_mainnet_at_entry_mainnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let server = mock_server(true, &rpc.uri());
         let args = trade_args("stellar:mainnet", Some(rpc.uri().as_str()));
@@ -890,7 +934,12 @@ mod secondary_rule_tests {
     /// The refusal precedes the policy gate: an engine that allows every call
     /// changes nothing.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dex_trade_refuses_mainnet_under_allow_all_engine() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let mut server = mock_server(true, &rpc.uri());
         server.policy_engine = std::sync::Arc::new(crate::tools::common::AllowAllPolicyEngine);
@@ -904,7 +953,12 @@ mod secondary_rule_tests {
     /// On testnet the handler still resolves the caller's secondary endpoint:
     /// a credentialed URL is refused before any lookup or RPC.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn dex_trade_refuses_credentialed_secondary_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rpc = wiremock::MockServer::start().await;
         let server = testnet_server(&rpc.uri());
         let credentialed = format!("http://agent:secret@{}", rpc.address());
@@ -916,6 +970,95 @@ mod secondary_rule_tests {
                 .contains(stellar_agent_core::redact::CREDENTIALED_URL_INPUT_REFUSAL),
             "{err:?}"
         );
+        assert!(rpc.received_requests().await.unwrap().is_empty());
+    }
+
+    /// The trade tool refuses a malformed amount, a non-contract
+    /// `from_address` and a `chain_id` without a pinned router by the field
+    /// and the expected form, and none of the three refusals repeats the
+    /// argument.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn dex_trade_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let rpc = wiremock::MockServer::start().await;
+        let server = testnet_server(&rpc.uri());
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let cases: [(&str, &str); 3] = [
+            ("qty_in", "qty_in: not a valid decimal i128"),
+            ("from_address", "from_address must be a C-strkey (contract)"),
+            ("chain_id", UNRECOGNISED_NETWORK_TEXT),
+        ];
+        for (field, expected) in cases {
+            let mut args = serde_json::json!({
+                "chain_id": "stellar:testnet",
+                "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+                "qty_in": "1",
+                "qty_out_min": "0",
+                "path": ["native", "native"],
+                "deadline": 9_999_999_999_i64,
+            });
+            args[field] = serde_json::Value::String(CREDENTIAL_MARKER.to_owned());
+            let args: DexTradeArgs = serde_json::from_value(args).unwrap();
+            let result = server.call_stellar_dex_trade(args).await;
+            assert_no_marker_in_text(&format!("{result:?}"), CREDENTIAL_MARKER);
+            if field == "from_address" {
+                let result = result.expect("the address refusal is a business envelope");
+                let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+                assert_eq!(code, "dex.submit_failed");
+                assert_eq!(message, expected);
+                assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
+            } else {
+                let err = result.expect_err("the argument is refused");
+                assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+                assert_eq!(err.message, expected, "{field}");
+            }
+        }
+        assert_no_marker_in_text(&capture.captured_str(), CREDENTIAL_MARKER);
+        assert!(rpc.received_requests().await.unwrap().is_empty());
+    }
+
+    /// The quote tool refuses a `chain_id` without a pinned router by the
+    /// accepted values, without the argument.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn dex_quote_chain_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let rpc = wiremock::MockServer::start().await;
+        let server = testnet_server(&rpc.uri());
+        let args: DexQuoteArgs = serde_json::from_value(serde_json::json!({
+            "chain_id": CREDENTIAL_MARKER, "qty_in": "1", "path": ["native", "native"]
+        }))
+        .unwrap();
+        let err = server
+            .call_stellar_dex_quote(args)
+            .await
+            .expect_err("the chain is refused");
+        assert_eq!(err.message, QUOTE_UNRECOGNISED_NETWORK_TEXT);
+        assert_no_marker_in_text(&format!("{err:?}"), CREDENTIAL_MARKER);
         assert!(rpc.received_requests().await.unwrap().is_empty());
     }
 }

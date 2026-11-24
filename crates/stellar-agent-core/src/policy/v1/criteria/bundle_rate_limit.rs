@@ -29,8 +29,6 @@
 //! `RateLimitCriterion` (bucket `"rate_limit"`) so that single-tx calls
 //! already recorded in the window count toward the bundle cap.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::criteria::Criterion;
 use crate::policy::v1::criteria::per_period_cap::Window;
@@ -107,6 +105,10 @@ impl BundleRateLimitCriterion {
 }
 
 impl Criterion for BundleRateLimitCriterion {
+    fn windowed(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "bundle_rate_limit"
     }
@@ -134,20 +136,14 @@ impl Criterion for BundleRateLimitCriterion {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] when:
-    /// - `SystemTime::now()` is before UNIX epoch.
-    /// - The state store detects clock skew exceeding 30 seconds.
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] when the state store
+    /// detects clock skew exceeding 30 seconds against `ctx.now_ms`.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         let Some(view) = ctx.bundle else {
             return Ok(None);
         };
 
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .map_err(|e| PolicyError::CriterionEvaluationFailed {
-                detail: format!("bundle_rate_limit: system clock is before UNIX epoch: {e}"),
-            })?;
+        let now_ms = ctx.now_ms;
 
         // Use the same StateKey derivation as RateLimitCriterion (bucket "rate_limit")
         // so that single-tx calls already recorded in the window count toward the cap.
@@ -198,14 +194,7 @@ impl Criterion for BundleRateLimitCriterion {
             return Ok(Vec::new());
         };
 
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .map_err(|e| PolicyError::CriterionEvaluationFailed {
-                detail: format!(
-                    "bundle_rate_limit: record_confirmed system clock is before UNIX epoch: {e}"
-                ),
-            })?;
+        let now_ms = ctx.now_ms;
         let state_key = StateKey::new(ctx.profile_name, 1, "rate_limit", self.window.as_secs());
 
         let mut recorded = Vec::with_capacity(view.inners.len());
@@ -237,8 +226,6 @@ mod tests {
         clippy::expect_used,
         reason = "test-only; panics acceptable in unit tests"
     )]
-
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use serial_test::serial;
 
@@ -281,11 +268,9 @@ mod tests {
         }
     }
 
+    /// The fixture evaluation instant every context of this module carries.
     fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after UNIX epoch")
-            .as_millis() as u64
+        1_700_000_000_000
     }
 
     fn make_ctx_with_bundle<'a>(
@@ -308,6 +293,9 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: view,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: now_ms(),
         }
     }
 
@@ -315,6 +303,9 @@ mod tests {
     #[test]
     #[serial]
     fn single_tx_bundle_none_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -328,6 +319,9 @@ mod tests {
     #[test]
     #[serial]
     fn empty_bundle_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -347,6 +341,9 @@ mod tests {
     #[test]
     #[serial]
     fn bundle_under_cap_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -372,6 +369,9 @@ mod tests {
     #[test]
     #[serial]
     fn bundle_at_cap_denies_at_last_inner() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -398,6 +398,9 @@ mod tests {
     #[test]
     #[serial]
     fn recorded_calls_plus_bundle_tips_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -442,6 +445,9 @@ mod tests {
     #[test]
     #[serial]
     fn token_transfer_and_generic_both_count() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();

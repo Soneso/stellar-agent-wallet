@@ -59,21 +59,33 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn a_profile_without_the_block_serves_a_neutral_identity() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = profile();
         assert!(p.served_pages.is_none());
         assert_eq!(page_identity_for(&p), PageIdentity::neutral());
     }
 
     #[test]
+    #[serial_test::serial]
     fn an_empty_display_name_serves_a_neutral_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut p = profile();
         p.served_pages = Some(ServedPagesConfig::new(Some("   ".to_owned()), false));
         assert_eq!(page_identity_for(&p).display_name(), None);
     }
 
     #[test]
+    #[serial_test::serial]
     fn a_configured_block_carries_the_name_and_the_mark_flag() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut p = profile();
         p.served_pages = Some(ServedPagesConfig::new(Some("Acme Ops".to_owned()), true));
         let identity = page_identity_for(&p);
@@ -83,7 +95,11 @@ mod tests {
 
     /// The mark can be enabled without a name, and a name without the mark.
     #[test]
+    #[serial_test::serial]
     fn the_two_inputs_are_independent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut p = profile();
         p.served_pages = Some(ServedPagesConfig::new(None, true));
         let identity = page_identity_for(&p);

@@ -158,12 +158,19 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: view,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: 1_700_000_000_000,
         }
     }
 
     /// count=5 vs cap=50 — should pass.
     #[test]
+    #[serial_test::serial]
     fn count_under_cap_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -183,7 +190,11 @@ mod tests {
 
     /// count=51 vs cap=50 — should deny.
     #[test]
+    #[serial_test::serial]
     fn count_over_cap_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -212,7 +223,11 @@ mod tests {
 
     /// single-tx path (bundle=None) passes regardless of max_count.
     #[test]
+    #[serial_test::serial]
     fn single_tx_path_bundle_none_always_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -230,7 +245,11 @@ mod tests {
 
     /// Exact cap boundary (count == max_count) must pass.
     #[test]
+    #[serial_test::serial]
     fn count_exactly_at_cap_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();

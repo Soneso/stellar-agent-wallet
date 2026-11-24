@@ -39,12 +39,16 @@ mod multicall_auth_rule_count_mock;
 mod oz_caps_parity_test;
 #[path = "smart_account/oz_panic_discriminant_mapping_mock.rs"]
 mod oz_panic_discriminant_mapping_mock;
+#[path = "smart_account/rejected_input.rs"]
+mod rejected_input;
 #[path = "smart_account/simulate_install_rule_mock.rs"]
 mod simulate_install_rule_mock;
 #[path = "smart_account/submission_records_mock.rs"]
 mod submission_records_mock;
 #[path = "smart_account/submit_signed_invoke_sequence_floor_mock.rs"]
 mod submit_signed_invoke_sequence_floor_mock;
+#[path = "smart_account/submit_signed_invoke_signed_tree_mock.rs"]
+mod submit_signed_invoke_signed_tree_mock;
 #[path = "smart_account/upper_bound_max_scan_id_parity_test.rs"]
 mod upper_bound_max_scan_id_parity_test;
 #[path = "smart_account/verify_rule_wasm_pins_paths.rs"]

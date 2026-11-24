@@ -117,6 +117,19 @@ pub struct KeyringEntryRef {
 /// Account value used before signer enrollment.
 pub const SIGNER_PLACEHOLDER_ACCOUNT: &str = "default";
 
+/// Keyring service of the installation's toolset pin key.
+///
+/// Every profile coordinate is `stellar-agent-<kind>-<profile>` with a
+/// non-empty profile name, so this service lies outside every profile's
+/// default coordinate space.
+pub const TOOLSET_PIN_KEY_SERVICE: &str = "stellar-agent-toolsets";
+
+/// Keyring account of the installation's toolset pin key.
+pub const TOOLSET_PIN_KEY_ACCOUNT: &str = "pin-key";
+
+/// File name of the installation pin-key lock in [`canonical_data_root`].
+pub const TOOLSET_PIN_KEY_LOCK_FILE_NAME: &str = ".toolset-pin-key.lock";
+
 impl KeyringEntryRef {
     /// Returns whether this reference still names the enrollment placeholder.
     #[must_use]
@@ -373,6 +386,30 @@ impl KeyringEntryRef {
         )
     }
 
+    /// Constructs the keyring entry reference of the installation's toolset
+    /// pin key.
+    ///
+    /// Entry name: [`TOOLSET_PIN_KEY_SERVICE`] / [`TOOLSET_PIN_KEY_ACCOUNT`].
+    /// The toolsets directory and its commands carry no profile, so the key
+    /// is one per installation. It holds the 32-byte HMAC key that
+    /// authenticates every toolset install record; the first toolset install
+    /// mints it. A profile document naming this coordinate as one of its own
+    /// keys is a key-scope finding.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::profile::schema::KeyringEntryRef;
+    ///
+    /// let r = KeyringEntryRef::toolset_pin_key();
+    /// assert_eq!(r.service, "stellar-agent-toolsets");
+    /// assert_eq!(r.account, "pin-key");
+    /// ```
+    #[must_use]
+    pub fn toolset_pin_key() -> Self {
+        Self::new(TOOLSET_PIN_KEY_SERVICE, TOOLSET_PIN_KEY_ACCOUNT)
+    }
+
     /// Constructs the default keyring entry reference of an RPC provider
     /// credential for one role of a profile.
     ///
@@ -406,7 +443,7 @@ impl KeyringEntryRef {
 const RPC_CREDENTIAL_SERVICE_PREFIX: &str = "stellar-agent-rpc-";
 
 /// The namespace of the wallet's own keyring services.
-const WALLET_SERVICE_NAMESPACE: &str = "stellar-agent-";
+pub(crate) const WALLET_SERVICE_NAMESPACE: &str = "stellar-agent-";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PolicyEngineKind
@@ -477,19 +514,21 @@ impl FromStr for PolicyEngineKind {
         match s.to_ascii_lowercase().as_str() {
             "noop" => Ok(Self::Noop),
             "v1" => Ok(Self::V1),
-            other => Err(PolicyEngineKindParseError::Unknown(other.to_owned())),
+            _ => Err(PolicyEngineKindParseError::Unknown),
         }
     }
 }
 
 /// Error returned by [`PolicyEngineKind::from_str`] for an unrecognised
 /// engine name.
+///
+/// The error names the accepted values and never the refused text.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PolicyEngineKindParseError {
     /// The supplied string is not `"noop"` or `"v1"`.
-    #[error("unknown policy engine '{0}'; supported values: noop, v1")]
-    Unknown(String),
+    #[error("unknown policy engine; supported values: noop, v1")]
+    Unknown,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -505,6 +544,8 @@ pub enum PolicyEngineKindParseError {
 #[non_exhaustive]
 pub struct PolicyConfig {
     /// Active policy engine for this profile.
+    /// With an enrolled owner, this matches the verified signed policy selector.
+    /// An omitted signed selector means `v1`; explicit selectors require policy version 2.
     ///
     /// Default for newly-minted profiles is `V1`.  Profiles migrated from
     /// schema v1 have `Noop` set explicitly by `migrate_v1_to_v2`; they
@@ -545,9 +586,10 @@ pub struct WalletConfig {
 
     /// Unlock-window TTL in seconds.  Default: 30.
     ///
-    /// The wallet handle is held for at most this many seconds across
-    /// approval + sign + submit; on TTL fire the seed is zeroized and
-    /// the next sign attempt re-loads from the keyring.
+    /// The clock refuses wallet seed access and transfer after this window.
+    /// The seed remains in its stable home until its wallet or signer drops.
+    /// Mainnet environment signers drop it after each signature; testnet
+    /// environment signers keep it for their command, which can outlast the TTL.
     ///
     /// Passed directly to [`crate::wallet::Wallet::unlock`], which enforces
     /// `(0, MAX_TTL_SECONDS]` (`MAX_TTL_SECONDS` = 600 seconds): a value of
@@ -641,10 +683,14 @@ const fn default_unlock_ttl_seconds() -> u32 {
 /// engine = "v1"
 /// ```
 /// `Debug` redacts every URL-typed field: `rpc_url`, `secondary_rpc_url`,
-/// and `oracle_provider_url`. All other fields use their derived `Debug` output.
+/// and `oracle_provider_url`. Other persisted fields use their derived `Debug` output.
 #[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Profile {
+    /// Top-level fields supplied by the loader overlay; never persisted.
+    #[serde(skip)]
+    pub(crate) overlaid_fields: Vec<&'static str>,
+
     /// Schema version.  Must be `2`.
     ///
     /// Forward-compatibility: a wallet reading a profile with `version > 2`
@@ -805,7 +851,10 @@ pub struct Profile {
     /// Mainnet requires a matching `providers.oracle` record asserting independent
     /// administration and a host distinct from the primary, and a
     /// `[providers.primary]` record.
-    /// An absent URL skips these second-endpoint checks.
+    /// An absent URL skips these second-endpoint checks at load. Mainnet
+    /// enablement and every mainnet write refuse a profile without the URL
+    /// and its record; see
+    /// [`require_mainnet_oracle`](crate::mainnet::oracle::require_mainnet_oracle).
     /// A high-value rebuild mismatch reports `simulation.divergence`.
     ///
     /// The loader checks a configured value with [`check_endpoint_url`].
@@ -1234,14 +1283,25 @@ pub struct RemoteApprovalConfig {
     /// WebAuthn Relying Party ID: a DNS hostname, never an IP literal.
     ///
     /// The operator must give the wallet host a resolvable name from the
-    /// approving device and reach it as `https://<rp_id>:<port>`.
+    /// approving device. Testnet uses `https://<rp_id>:<port>`.
+    /// Mainnet requires the signed origin's host and uses its public port.
     pub rp_id: String,
 
-    /// Base64url WebAuthn credential IDs authorized to consent to pending
-    /// approvals over the remote surface.
-    ///
-    /// Defaults to an empty list when omitted — fail-closed: no credential
-    /// is authorized until the operator explicitly lists one.
+    /// PEM certificate chain, with the served leaf first. Mainnet requires this path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_path: Option<PathBuf>,
+
+    /// PEM private key. Mainnet requires this path and private file permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<PathBuf>,
+
+    /// Base64url WebAuthn credential IDs admitted by testnet remote approval.
+    /// An omitted list is empty and admits no testnet credentials.
+    /// Testnet reads this list and enrollment at each login, decision and commit.
+    /// Removing an ID revokes its uncommitted approvals.
+    /// Revoke here before removing enrollment with `approve operator remove`.
+    /// Signed-origin mainnet consent trusts only current policy credentials.
+    /// This list and enrollment rows neither grant nor withhold that trust.
     #[serde(default)]
     pub allowed_credentials: Vec<String>,
 }
@@ -1432,6 +1492,13 @@ pub(crate) const WALLET_KEY_REFERENCE_FIELDS: [&str; 8] = [
 ];
 
 impl Profile {
+    /// Whether a loader overlay (environment or programmatic) set this top-level
+    /// key; an alias is reported as written.
+    #[must_use]
+    pub fn is_overlaid(&self, field: &str) -> bool {
+        self.overlaid_fields.contains(&field)
+    }
+
     /// The endpoint URL of `role`: `rpc_url`, `secondary_rpc_url`, or
     /// `oracle_provider_url`, as the profile holds it. `None` when the role
     /// has no URL.
@@ -1465,8 +1532,9 @@ impl Profile {
     /// Returns the operator-facing view with URL credentials and paths removed.
     #[must_use]
     pub fn redacted(&self) -> RedactedProfile {
-        // Every field is listed; a URL-typed field is redacted, every other field is cloned.
+        // Persisted fields are cloned with URL redaction. Overlay provenance stays internal.
         let Self {
+            overlaid_fields: _,
             version,
             chain_id,
             rpc_url,
@@ -1548,6 +1616,10 @@ impl Profile {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use stellar_agent_core::profile::schema::{Profile, MINIMUM_FLOOR};
     ///
     /// let mut p = Profile::builder_testnet("svc", "acct", "nonce-svc", "nonce-acct").build();
@@ -1556,6 +1628,7 @@ impl Profile {
     ///
     /// p.cross_check_threshold_stroops = u64::MAX;
     /// assert_eq!(p.effective_cross_check_threshold_stroops(), u64::MAX);
+    /// # }
     /// ```
     #[must_use]
     pub fn effective_cross_check_threshold_stroops(&self) -> u64 {
@@ -1569,6 +1642,10 @@ impl Profile {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use std::time::Duration;
     /// use stellar_agent_core::profile::schema::Profile;
     ///
@@ -1578,6 +1655,7 @@ impl Profile {
     ///
     /// p.submit_timeout_seconds = Some(15);
     /// assert_eq!(p.submit_timeout(), Duration::from_secs(15));
+    /// # }
     /// ```
     #[must_use]
     pub fn submit_timeout(&self) -> std::time::Duration {
@@ -1604,6 +1682,10 @@ impl Profile {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use stellar_agent_core::profile::schema::Profile;
     ///
     /// let mut p = Profile::builder_mainnet("https://rpc.example", "s", "a", "n", "a").build();
@@ -1612,6 +1694,7 @@ impl Profile {
     /// p.secondary_rpc_url = Some("http://secondary.example".to_owned());
     /// let err = p.validate_endpoint_urls().unwrap_err();
     /// assert_eq!(err.field, "secondary_rpc_url");
+    /// # }
     /// ```
     pub fn validate_endpoint_urls(&self) -> Result<(), EndpointUrlError> {
         check_endpoint_url("rpc_url", &self.rpc_url, self.chain_id)?;
@@ -1636,6 +1719,10 @@ impl Profile {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use stellar_agent_core::profile::schema::Profile;
     ///
     /// let p = Profile::builder_testnet(
@@ -1647,6 +1734,7 @@ impl Profile {
     /// .build();
     /// assert_eq!(p.chain_id.caip2_str(), "stellar:testnet");
     /// assert_eq!(p.version, 2);
+    /// # }
     /// ```
     pub fn builder_testnet(
         signer_service: impl Into<String>,
@@ -1720,6 +1808,10 @@ impl Profile {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use stellar_agent_core::profile::schema::Profile;
     ///
     /// let p = Profile::builder_mainnet(
@@ -1732,6 +1824,7 @@ impl Profile {
     /// .build();
     /// assert_eq!(p.chain_id.caip2_str(), "stellar:mainnet");
     /// assert_eq!(p.rpc_url, "https://rpc.example");
+    /// # }
     /// ```
     pub fn builder_mainnet(
         rpc_url: impl Into<String>,
@@ -1864,7 +1957,8 @@ pub fn check_endpoint_url(
 
 /// Returns the URL crate's host with exactly one trailing dot removed.
 /// Invalid URLs, hostless URLs, and empty hosts have no provider host.
-pub(crate) fn provider_host(raw: &str) -> Option<String> {
+#[must_use]
+pub fn provider_host(raw: &str) -> Option<String> {
     let url = Url::parse(raw).ok()?;
     let host = url.host_str()?;
     let host = host.strip_suffix('.').unwrap_or(host);
@@ -2217,8 +2311,14 @@ impl<'a> From<&'a ProviderRecord> for ProviderRecordView<'a> {
 /// prove no independence, which the operator attests.
 #[must_use]
 pub fn same_provider_operator(left: &str, right: &str) -> bool {
-    let fold = |name: &str| name.trim().to_uppercase().to_lowercase();
-    fold(left) == fold(right)
+    provider_operator_fold(left) == provider_operator_fold(right)
+}
+
+/// Trims Unicode white space and folds a provider operator name through
+/// upper case then lower case, preserving internal spacing and punctuation.
+#[must_use]
+pub fn provider_operator_fold(name: &str) -> String {
+    name.trim().to_uppercase().to_lowercase()
 }
 
 /// The most bytes an RPC credential value may hold.
@@ -2385,6 +2485,119 @@ pub(crate) fn keyring_entry_alias(entry: &KeyringEntryRef) -> String {
 #[must_use]
 pub fn generation_account(account: &str) -> String {
     format!("{account}-generation")
+}
+
+/// Returns the account of the MPP generation intent counter beside the HMAC
+/// entry `account`.
+#[must_use]
+pub fn generation_intent_account(account: &str) -> String {
+    intent_account(&generation_account(account))
+}
+
+/// Derives the intent counter account beside the committed counter account
+/// `generation_account`.
+#[must_use]
+pub fn intent_account(generation_account: &str) -> String {
+    format!("{generation_account}-intent")
+}
+
+/// The keyring account suffix of the policy pin beside the window-state key.
+pub(crate) const POLICY_PIN_SUFFIX: &str = "-policy-pin";
+
+/// The keyring account suffix of the mainnet enablement nonce beside the
+/// window-state key.
+const MAINNET_ENABLEMENT_SUFFIX: &str = "-mainnet-enablement";
+
+/// The keyring account that holds the enrolled signer's identity record,
+/// under the signer's own service.
+pub const SIGNER_IDENTITY_ACCOUNT: &str = "enrolled-identity";
+
+/// The keyring coordinate of the policy pin: the window-state key's service
+/// and its account suffixed `-policy-pin`.
+///
+/// Derived from the coordinate itself, so an operator-overridden window-state
+/// coordinate keeps its pin beside it.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::profile::schema::{KeyringEntryRef, policy_pin_entry_ref};
+///
+/// let window = KeyringEntryRef::default_policy_window_state_key("alice");
+/// let pin = policy_pin_entry_ref(&window);
+/// assert_eq!(pin.service, "stellar-agent-policy-window-alice");
+/// assert_eq!(pin.account, "default-policy-pin");
+/// ```
+#[must_use]
+pub fn policy_pin_entry_ref(window_key: &KeyringEntryRef) -> KeyringEntryRef {
+    KeyringEntryRef::new(
+        window_key.service.clone(),
+        format!("{}{POLICY_PIN_SUFFIX}", window_key.account),
+    )
+}
+
+/// The spent rule approval coordinate beside the attestation key.
+///
+/// The service matches the attestation key and the account has the suffix
+/// `-rule-approvals-spent`, including for operator-overridden coordinates.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::profile::schema::{KeyringEntryRef, rule_approval_spent_entry_ref};
+/// let key = KeyringEntryRef::default_attestation_key("unit");
+/// let spent = rule_approval_spent_entry_ref(&key);
+/// assert_eq!(spent.service, "stellar-agent-attestation-unit");
+/// assert_eq!(spent.account, "default-rule-approvals-spent");
+/// ```
+#[must_use]
+pub fn rule_approval_spent_entry_ref(attestation_key: &KeyringEntryRef) -> KeyringEntryRef {
+    KeyringEntryRef::new(
+        attestation_key.service.clone(),
+        format!("{}-rule-approvals-spent", attestation_key.account),
+    )
+}
+
+/// The keyring coordinate of the mainnet enablement nonce: the window-state
+/// key's service and its account suffixed `-mainnet-enablement`.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::profile::schema::{KeyringEntryRef, mainnet_enablement_entry_ref};
+///
+/// let window = KeyringEntryRef::default_policy_window_state_key("alice");
+/// let nonce = mainnet_enablement_entry_ref(&window);
+/// assert_eq!(nonce.service, "stellar-agent-policy-window-alice");
+/// assert_eq!(nonce.account, "default-mainnet-enablement");
+/// ```
+#[must_use]
+pub fn mainnet_enablement_entry_ref(window_key: &KeyringEntryRef) -> KeyringEntryRef {
+    KeyringEntryRef::new(
+        window_key.service.clone(),
+        format!("{}{MAINNET_ENABLEMENT_SUFFIX}", window_key.account),
+    )
+}
+
+/// The keyring coordinate of the enrolled signer's identity record: the
+/// signer's service and the account [`SIGNER_IDENTITY_ACCOUNT`].
+///
+/// The record holds the enrolled public key, role, profile, chain and owner
+/// binding, never the seed. The seed stays at the signer coordinate itself.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::profile::schema::{KeyringEntryRef, signer_identity_entry_ref};
+///
+/// let signer = KeyringEntryRef::default_signer("alice");
+/// let identity = signer_identity_entry_ref(&signer);
+/// assert_eq!(identity.service, "stellar-agent-signer-alice");
+/// assert_eq!(identity.account, "enrolled-identity");
+/// ```
+#[must_use]
+pub fn signer_identity_entry_ref(signer: &KeyringEntryRef) -> KeyringEntryRef {
+    KeyringEntryRef::new(signer.service.clone(), SIGNER_IDENTITY_ACCOUNT)
 }
 
 /// Whether a credential reference names a keyring entry another wallet key
@@ -2759,6 +2972,10 @@ impl ProfileBuilder {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use stellar_agent_core::profile::schema::Profile;
     ///
     /// let p = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
@@ -2768,6 +2985,7 @@ impl ProfileBuilder {
     ///     p.audit_log_hash_chain_key_id.service,
     ///     "stellar-agent-audit-my-named-profile"
     /// );
+    /// # }
     /// ```
     #[must_use = "builder setters return the updated builder by value"]
     pub fn with_profile_name(mut self, profile_name: impl AsRef<str>) -> Self {
@@ -2869,12 +3087,17 @@ impl ProfileBuilder {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use stellar_agent_core::profile::schema::{Profile, PolicyEngineKind};
     ///
     /// let p = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
     ///     .with_noop_engine()
     ///     .build();
     /// assert_eq!(p.policy.engine, PolicyEngineKind::Noop);
+    /// # }
     /// ```
     #[must_use = "builder setters return the updated builder by value"]
     pub fn with_noop_engine(mut self) -> Self {
@@ -2892,12 +3115,17 @@ impl ProfileBuilder {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use stellar_agent_core::profile::schema::{Profile, PolicyEngineKind};
     ///
     /// let p = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
     ///     .policy_engine(PolicyEngineKind::V1)
     ///     .build();
     /// assert_eq!(p.policy.engine, PolicyEngineKind::V1);
+    /// # }
     /// ```
     #[must_use = "builder setters return the updated builder by value"]
     pub fn policy_engine(mut self, kind: PolicyEngineKind) -> Self {
@@ -2980,9 +3208,11 @@ impl ProfileBuilder {
     ///
     /// If `audit_log_path` was not supplied via [`ProfileBuilder::audit_log_path`],
     /// the method resolves the per-profile location via
-    /// [`default_audit_log_path_for`] (which carries its own relative-path
-    /// fallback when the OS-conventional directory cannot be determined).
-    /// It never panics.
+    /// [`default_audit_log_path_for`]. Production retains the relative fallback
+    /// when the OS-conventional directory cannot be determined.
+    ///
+    /// # Panics
+    /// Isolated builds require a marked home when the audit path is not supplied.
     pub fn build(self) -> Profile {
         // Unset audit_log_path resolves to the PER-PROFILE location the
         // field's contract documents (`<root>/audit/<name>.jsonl`), never a
@@ -2992,6 +3222,7 @@ impl ProfileBuilder {
             .audit_log_path
             .unwrap_or_else(|| default_audit_log_path_for(&self.profile_name));
         Profile {
+            overlaid_fields: Vec::new(),
             version: self.version,
             chain_id: self.chain_id,
             rpc_url: self.rpc_url,
@@ -3048,9 +3279,10 @@ pub struct StateDirError;
 /// (`profiles`, `policies`, `audit`, `policy`, `networks.toml`, ...) onto this
 /// root; none derives `directories::ProjectDirs`/`BaseDirs` independently. A
 /// crate that cannot depend on `stellar-agent-core` without introducing a
-/// dependency cycle (`stellar-agent-headless-keyring`) replicates this exact
-/// derivation locally instead, cross-referencing this function and pinning
-/// byte-equality of the two roots with a unit test.
+/// dependency cycle (`stellar-agent-headless-keyring`) replicates this derivation.
+/// A source test pins the identical provider calls without resolving real directories.
+///
+/// Isolated builds require an absolute, marked `STELLAR_AGENT_HOME` directory and never consult the platform resolver.
 ///
 /// Platform roots (`directories` v6.0.0; verified against
 /// `directories-6.0.0/src/{lin,mac,win}.rs` — `ProjectDirs::from("", "Soneso",
@@ -3068,22 +3300,76 @@ pub struct StateDirError;
 /// Returns [`StateDirError`] when the platform directories library cannot
 /// determine the user's data-local directory (rare; CI containers without
 /// `$HOME`).
+/// Isolated builds also return this error when the sandbox is missing or invalid.
 pub fn canonical_data_root() -> Result<PathBuf, StateDirError> {
-    // Gated env-var override: only honoured in test builds OR when the crate
-    // is compiled with `--features test-helpers`. Production release builds
-    // never read this variable, eliminating the env-injection root-swap
-    // surface. The per-directory helpers (`default_profile_dir`,
-    // `default_policy_dir`, ...) pre-check the same variable with the same
-    // join conventions, so every canonical-root-derived path — including the
-    // audit directory — resolves under one redirected root in tests.
     #[cfg(any(test, feature = "test-helpers"))]
-    if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
-        return Ok(PathBuf::from(home));
+    {
+        let root = std::env::var_os("STELLAR_AGENT_HOME")
+            .map(PathBuf::from)
+            .ok_or(StateDirError)?;
+        marked_sandbox(&root).then_some(root).ok_or(StateDirError)
     }
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    production_data_root()
+}
 
+#[cfg(not(any(test, feature = "test-helpers")))]
+fn production_data_root() -> Result<PathBuf, StateDirError> {
     let dirs =
         directories::ProjectDirs::from("", "Soneso", "stellar-agent").ok_or(StateDirError)?;
     Ok(dirs.data_local_dir().to_path_buf())
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn ordinary_metadata(path: &std::path::Path) -> Option<std::fs::Metadata> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return None;
+        }
+    }
+    Some(meta)
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn marked_sandbox(path: &std::path::Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+        && ordinary_metadata(path).is_some_and(|meta| meta.is_dir())
+        && ordinary_metadata(&path.join(".stellar-agent-test-sandbox"))
+            .is_some_and(|meta| meta.is_file())
+}
+
+/// Returns an environment override confined to a marked fixture directory.
+#[cfg(any(test, feature = "test-helpers"))]
+#[must_use]
+pub fn sandboxed_override(variable: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(variable)?);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        return None;
+    }
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) if ordinary_metadata(ancestor).is_none() => return None,
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return None,
+            _ => {}
+        }
+        if marked_sandbox(ancestor) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Returns the OS-conventional audit-log file path for `profile_name`.
@@ -3091,8 +3377,9 @@ pub fn canonical_data_root() -> Result<PathBuf, StateDirError> {
 /// `<canonical_data_root>/audit/<profile_name>.jsonl` — see
 /// [`canonical_data_root`] for the per-platform root.
 ///
-/// Falls back to `./stellar-agent/audit/<profile_name>.jsonl` if the
+/// Production falls back to `./stellar-agent/audit/<profile_name>.jsonl` if the
 /// canonical root cannot be determined (rare; CI containers without `$HOME`).
+/// Isolated builds panic when the marked sandbox is missing.
 ///
 /// `profile_name` is normalised to a filename-safe stem before `.jsonl` is
 /// appended. ASCII letters, digits, `-`, and `_` are preserved; all other
@@ -3102,12 +3389,24 @@ pub fn canonical_data_root() -> Result<PathBuf, StateDirError> {
 ///
 /// Used by audit-writer registry construction that needs the per-profile
 /// path convention from one public schema-level helper.
+///
+/// # Panics
+/// Isolated builds panic when the marked sandbox is missing.
 #[must_use]
+#[allow(
+    clippy::panic,
+    reason = "isolated wallet paths require a marked sandbox"
+)]
 pub fn default_audit_log_path_for(profile_name: &str) -> PathBuf {
     let file_name = format!("{}.jsonl", audit_log_file_stem(profile_name));
     default_audit_log_dir()
         .map(|dir| dir.join(&file_name))
-        .unwrap_or_else(|| PathBuf::from("stellar-agent/audit").join(file_name))
+        .unwrap_or_else(|| {
+            #[cfg(any(test, feature = "test-helpers"))]
+            panic!("STELLAR_AGENT_TEST_STORAGE_ISOLATED: wallet state requires a marked STELLAR_AGENT_HOME");
+            #[cfg(not(any(test, feature = "test-helpers")))]
+            PathBuf::from("stellar-agent/audit").join(file_name)
+        })
 }
 
 fn default_audit_log_dir() -> Option<PathBuf> {
@@ -3125,22 +3424,26 @@ fn default_audit_log_dir() -> Option<PathBuf> {
 /// rule-set TOML files — this path holds accumulated runtime window state,
 /// not policy configuration.
 ///
-/// Tests may set `STELLAR_AGENT_HOME` to redirect the directory to
-/// `$STELLAR_AGENT_HOME/policy`, mirroring [`default_policy_dir`]'s override.
-/// The env-var read is **gated behind `#[cfg(any(test, feature =
-/// "test-helpers"))]`** so production release builds never honour it —
-/// closing the same env-injection store-swap surface `default_profile_dir`
-/// documents.
+/// In isolated builds this joins the marked `STELLAR_AGENT_HOME` root;
+/// see [`canonical_data_root`].
+///
+/// # Panics
+/// Isolated builds panic when the marked sandbox is missing.
 #[must_use]
+#[allow(
+    clippy::panic,
+    reason = "isolated wallet paths require a marked sandbox"
+)]
 pub fn default_policy_window_state_path_for(profile_name: &str) -> PathBuf {
     let file_name = format!("{}.window", audit_log_file_stem(profile_name));
-    #[cfg(any(test, feature = "test-helpers"))]
-    if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
-        return PathBuf::from(home).join("policy").join(&file_name);
-    }
     default_policy_window_state_dir()
         .map(|dir| dir.join(&file_name))
-        .unwrap_or_else(|| PathBuf::from("stellar-agent/policy").join(file_name))
+        .unwrap_or_else(|| {
+            #[cfg(any(test, feature = "test-helpers"))]
+            panic!("STELLAR_AGENT_TEST_STORAGE_ISOLATED: wallet state requires a marked STELLAR_AGENT_HOME");
+            #[cfg(not(any(test, feature = "test-helpers")))]
+            PathBuf::from("stellar-agent/policy").join(file_name)
+        })
 }
 
 fn default_policy_window_state_dir() -> Option<PathBuf> {
@@ -3190,29 +3493,14 @@ fn audit_log_file_stem(profile_name: &str) -> String {
 /// `<canonical_data_root>/profiles` — see [`canonical_data_root`] for the
 /// per-platform root.
 ///
-/// Tests may set `STELLAR_AGENT_HOME` to redirect this directory to
-/// `$STELLAR_AGENT_HOME/profiles`. The env-var read is **gated behind
-/// `#[cfg(any(test, feature = "test-helpers"))]`** so production release builds
-/// never honour it — this closes the env-injection profile-store-swap attack
-/// surface. A profile file governs which policy engine and owner-key
-/// coordinate a value-moving command trusts, so an unauthenticated override of
-/// this path in a production binary would let an attacker substitute a
-/// permissive profile.
+/// In isolated builds this joins the marked `STELLAR_AGENT_HOME` root;
+/// see [`canonical_data_root`].
 ///
 /// # Errors
 ///
 /// Returns [`StateDirError`] when the platform directories library cannot
 /// determine the user's state directory.
 pub fn default_profile_dir() -> Result<PathBuf, StateDirError> {
-    // Gated env-var override: only honoured in test builds OR when the crate is
-    // compiled with `--features test-helpers`. Production release builds never
-    // read this variable, eliminating the env-injection profile-store-swap
-    // surface.
-    #[cfg(any(test, feature = "test-helpers"))]
-    if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
-        return Ok(PathBuf::from(home).join("profiles"));
-    }
-
     Ok(canonical_data_root()?.join("profiles"))
 }
 
@@ -3223,29 +3511,14 @@ pub fn default_profile_dir() -> Result<PathBuf, StateDirError> {
 /// `<canonical_data_root>/policies` — see [`canonical_data_root`] for the
 /// per-platform root.
 ///
-/// Tests may set `STELLAR_AGENT_HOME` to redirect this directory to
-/// `$STELLAR_AGENT_HOME/policies`. The env-var read is **gated behind
-/// `#[cfg(any(test, feature = "test-helpers"))]`** so production release builds
-/// never honour it — this closes the env-injection policy-store-swap attack
-/// surface. The policy directory holds the operator-signed root-of-trust
-/// document `PolicyEngineV1` enforces; an unauthenticated override of this
-/// path in a production binary would let an attacker substitute a forged or
-/// permissive policy file.
+/// In isolated builds this joins the marked `STELLAR_AGENT_HOME` root;
+/// see [`canonical_data_root`].
 ///
 /// # Errors
 ///
 /// Returns [`StateDirError`] when the platform directories library cannot
 /// determine the user's state directory.
 pub fn default_policy_dir() -> Result<PathBuf, StateDirError> {
-    // Gated env-var override: only honoured in test builds OR when the crate is
-    // compiled with `--features test-helpers`. Production release builds never
-    // read this variable, eliminating the env-injection policy-store-swap
-    // surface.
-    #[cfg(any(test, feature = "test-helpers"))]
-    if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
-        return Ok(PathBuf::from(home).join("policies"));
-    }
-
     Ok(canonical_data_root()?.join("policies"))
 }
 
@@ -3288,12 +3561,8 @@ pub fn default_approval_dir() -> Result<PathBuf, StateDirError> {
 /// `<canonical_data_root>/passkeys` — see [`canonical_data_root`] for the
 /// per-platform root.
 ///
-/// Tests may set `STELLAR_AGENT_HOME` to redirect this directory to
-/// `$STELLAR_AGENT_HOME/passkeys`. The env-var read is **gated behind
-/// `#[cfg(any(test, feature = "test-helpers"))]`** so production release builds
-/// never honour it — this closes the env-injection credential-store-swap attack
-/// surface.  The passkeys registry stores `CredentialMetadata` records keyed
-/// by `credential_name`.
+/// In isolated builds this joins the marked `STELLAR_AGENT_HOME` root;
+/// see [`canonical_data_root`].
 ///
 /// # Errors
 ///
@@ -3311,15 +3580,6 @@ pub fn default_approval_dir() -> Result<PathBuf, StateDirError> {
 /// }
 /// ```
 pub fn default_passkeys_dir() -> Result<PathBuf, StateDirError> {
-    // Gated env-var override: only honoured in test builds OR when the crate is
-    // compiled with `--features test-helpers`. Production release builds never
-    // read this variable, eliminating the env-injection credential-store-swap
-    // surface.
-    #[cfg(any(test, feature = "test-helpers"))]
-    if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
-        return Ok(PathBuf::from(home).join("passkeys"));
-    }
-
     Ok(canonical_data_root()?.join("passkeys"))
 }
 
@@ -3349,14 +3609,6 @@ pub fn default_passkeys_dir() -> Result<PathBuf, StateDirError> {
 /// }
 /// ```
 pub fn default_toolsets_dir() -> Result<PathBuf, StateDirError> {
-    // Gated env-var override: only honoured in test builds OR when the crate is
-    // compiled with `--features test-helpers`. Production release builds never
-    // read this variable, eliminating the env-injection store-swap surface.
-    #[cfg(any(test, feature = "test-helpers"))]
-    if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
-        return Ok(PathBuf::from(home).join("toolsets"));
-    }
-
     Ok(canonical_data_root()?.join("toolsets"))
 }
 
@@ -3373,11 +3625,8 @@ pub fn default_toolsets_dir() -> Result<PathBuf, StateDirError> {
 /// `<canonical_data_root>/operator-approval-credentials` — see
 /// [`canonical_data_root`] for the per-platform root.
 ///
-/// Tests may set `STELLAR_AGENT_HOME` to redirect this directory to
-/// `$STELLAR_AGENT_HOME/operator-approval-credentials`. The env-var read is
-/// gated behind `#[cfg(any(test, feature = "test-helpers"))]` so production
-/// release builds never honour it, closing the env-injection
-/// credential-store-swap attack surface.
+/// In isolated builds this joins the marked `STELLAR_AGENT_HOME` root;
+/// see [`canonical_data_root`].
 ///
 /// # Errors
 ///
@@ -3395,11 +3644,6 @@ pub fn default_toolsets_dir() -> Result<PathBuf, StateDirError> {
 /// }
 /// ```
 pub fn default_operator_approval_credentials_dir() -> Result<PathBuf, StateDirError> {
-    #[cfg(any(test, feature = "test-helpers"))]
-    if let Some(home) = std::env::var_os("STELLAR_AGENT_HOME") {
-        return Ok(PathBuf::from(home).join("operator-approval-credentials"));
-    }
-
     Ok(canonical_data_root()?.join("operator-approval-credentials"))
 }
 
@@ -3458,6 +3702,82 @@ mod tests {
     use super::*;
     use crate::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
 
+    #[test]
+    #[serial_test::serial]
+    fn isolated_root_requires_a_marked_sandbox() {
+        use stellar_agent_test_support::{env_guard::ScopedEnvVar, sandbox::mark_sandbox};
+        let temporary = tempfile::tempdir().unwrap();
+        for value in [
+            None,
+            Some(std::ffi::OsStr::new("relative")),
+            Some(temporary.path().as_os_str()),
+        ] {
+            let _env = ScopedEnvVar::new("STELLAR_AGENT_HOME", value);
+            assert!(canonical_data_root().is_err(), "unmarked root must refuse");
+        }
+        mark_sandbox(temporary.path()).unwrap();
+        let _env = ScopedEnvVar::new("STELLAR_AGENT_HOME", Some(temporary.path().as_os_str()));
+        assert_eq!(canonical_data_root().unwrap(), temporary.path());
+        std::fs::create_dir(temporary.path().join("child")).unwrap();
+        let traversal = temporary.path().join("child/..");
+        let _env = ScopedEnvVar::new("STELLAR_AGENT_HOME", Some(traversal.as_os_str()));
+        assert!(canonical_data_root().is_err());
+        #[cfg(unix)]
+        {
+            let links = tempfile::tempdir().unwrap();
+            let link = links.path().join("root");
+            std::os::unix::fs::symlink(temporary.path(), &link).unwrap();
+            let _env = ScopedEnvVar::new("STELLAR_AGENT_HOME", Some(link.as_os_str()));
+            assert!(canonical_data_root().is_err());
+            std::os::unix::fs::symlink(
+                temporary.path().join(".stellar-agent-test-sandbox"),
+                links.path().join(".stellar-agent-test-sandbox"),
+            )
+            .unwrap();
+            let _env = ScopedEnvVar::new("STELLAR_AGENT_HOME", Some(links.path().as_os_str()));
+            assert!(canonical_data_root().is_err());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn infallible_wallet_paths_require_a_marked_sandbox() {
+        use stellar_agent_test_support::{StellarAgentHomeGuard, env_guard::ScopedEnvVar};
+        let temporary = tempfile::tempdir().unwrap();
+        for helper in [
+            default_audit_log_path_for,
+            default_policy_window_state_path_for,
+        ] {
+            for value in [None, Some(temporary.path().as_os_str())] {
+                let _env = ScopedEnvVar::new("STELLAR_AGENT_HOME", value);
+                let panic = std::panic::catch_unwind(|| helper("isolated"))
+                    .expect_err("an unmarked root must not yield a wallet path");
+                let reason = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap();
+                assert_eq!(
+                    reason,
+                    "STELLAR_AGENT_TEST_STORAGE_ISOLATED: wallet state requires a marked STELLAR_AGENT_HOME"
+                );
+            }
+        }
+        let _home = StellarAgentHomeGuard::new(temporary.path());
+        // The guard and the helpers resolve the canonical home, and a
+        // verbatim path takes only separate components, so the expected
+        // paths join each component onto the canonical temporary path.
+        let home = temporary.path().canonicalize().unwrap();
+        assert_eq!(
+            default_audit_log_path_for("isolated"),
+            home.join("audit").join("isolated.jsonl")
+        );
+        assert_eq!(
+            default_policy_window_state_path_for("isolated"),
+            home.join("policy").join("isolated.window")
+        );
+    }
+
     /// An in-memory mainnet endpoint for fixtures that never reach a network.
     const MAINNET_FIXTURE_RPC: &str = "https://rpc.example.invalid";
 
@@ -3475,7 +3795,11 @@ mod tests {
     /// exactly the wallet key reference fields, and `wallet_key_references`
     /// yields each field's value at that field's position.
     #[test]
+    #[serial_test::serial]
     fn wallet_key_reference_fields_match_the_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let distinct = |name: &str| KeyringEntryRef::new(name, format!("{name}-account"));
         let mut profile = make_testnet_profile();
         profile.mcp_signer_default = distinct("signer");
@@ -3497,6 +3821,7 @@ mod tests {
         // No `..`: a field added to `Profile` fails to compile here until its
         // author binds it as a wallet key reference or ignores it with `_`.
         let Profile {
+            overlaid_fields: _,
             version: _,
             chain_id: _,
             rpc_url: _,
@@ -3573,7 +3898,11 @@ mod tests {
 
     /// `role_url` returns each role's URL as the profile holds it.
     #[test]
+    #[serial_test::serial]
     fn role_url_follows_the_role() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = make_testnet_profile();
         profile.rpc_url = "https://primary.example/rpc".to_owned();
         assert_eq!(profile.role_url(ProviderRole::Secondary), None);
@@ -3595,27 +3924,43 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_builder_chain_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert_eq!(p.chain_id, crate::profile::caip2::Caip2::Testnet);
         assert!(!p.chain_id.is_mainnet());
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_builder_passphrase_derived_from_chain_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert_eq!(p.network_passphrase, TESTNET_PASSPHRASE);
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_builder_passphrase_derived_from_chain_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_mainnet(MAINNET_FIXTURE_RPC, "s", "a", "n", "a").build();
         assert_eq!(p.network_passphrase, MAINNET_PASSPHRASE);
         assert_eq!(p.rpc_url, MAINNET_FIXTURE_RPC);
     }
 
     #[test]
+    #[serial_test::serial]
     fn builder_testnet_named_derives_v2_keys_from_explicit_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_testnet_named(
             "alice",
             "stellar-agent-signer",
@@ -3642,7 +3987,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn builder_mainnet_named_derives_v2_keys_from_explicit_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_mainnet_named(
             "bob",
             MAINNET_FIXTURE_RPC,
@@ -3671,7 +4020,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn builder_testnet_named_matches_manual_with_profile_name_chain() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let named = Profile::builder_testnet_named(
             "alice",
             "stellar-agent-signer",
@@ -3707,21 +4060,33 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn effective_cross_check_threshold_stroops_floor_on_zero() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut p = make_testnet_profile();
         p.cross_check_threshold_stroops = 0;
         assert_eq!(p.effective_cross_check_threshold_stroops(), MINIMUM_FLOOR);
     }
 
     #[test]
+    #[serial_test::serial]
     fn effective_cross_check_threshold_stroops_floor_on_below_minimum() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut p = make_testnet_profile();
         p.cross_check_threshold_stroops = MINIMUM_FLOOR - 1;
         assert_eq!(p.effective_cross_check_threshold_stroops(), MINIMUM_FLOOR);
     }
 
     #[test]
+    #[serial_test::serial]
     fn effective_cross_check_threshold_stroops_above_floor_passes_through() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut p = make_testnet_profile();
         p.cross_check_threshold_stroops = MINIMUM_FLOOR + 500;
         assert_eq!(
@@ -3731,20 +4096,32 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn effective_cross_check_threshold_stroops_max_passthrough() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut p = make_testnet_profile();
         p.cross_check_threshold_stroops = u64::MAX;
         assert_eq!(p.effective_cross_check_threshold_stroops(), u64::MAX);
     }
 
     #[test]
+    #[serial_test::serial]
     fn validate_endpoint_urls_valid() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert_eq!(p.validate_endpoint_urls(), Ok(()));
     }
 
     #[test]
+    #[serial_test::serial]
     fn validate_endpoint_urls_invalid() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut p = make_testnet_profile();
         p.rpc_url = "not-a-url".to_owned();
         assert_eq!(
@@ -3759,7 +4136,11 @@ mod tests {
     /// `validate_endpoint_urls` reaches the two optional fields as well as
     /// `rpc_url`: `profile init` and `profile migrate` rely on it for all three.
     #[test]
+    #[serial_test::serial]
     fn validate_endpoint_urls_checks_the_optional_fields() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let base = Profile::builder_mainnet(MAINNET_FIXTURE_RPC, "s", "a", "n", "a").build();
         assert_eq!(base.validate_endpoint_urls(), Ok(()));
 
@@ -3831,13 +4212,21 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mcp_disabled_default_false() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert!(!p.mcp_disabled);
     }
 
     #[test]
+    #[serial_test::serial]
     fn mcp_disabled_builder() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .mcp_disabled()
             .build();
@@ -3845,13 +4234,21 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn classic_fee_per_op_default_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert_eq!(p.classic_fee_per_op_stroops, None);
     }
 
     #[test]
+    #[serial_test::serial]
     fn classic_fee_per_op_serde_round_trip() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .classic_fee_per_op_stroops(Some(250))
             .build();
@@ -3866,7 +4263,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn classic_fee_per_op_absent_deserializes_to_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         let toml_str = toml::to_string(&p).unwrap();
         assert!(
@@ -3879,7 +4280,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn submit_timeout_seconds_defaults_to_none_when_absent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         let toml_str = toml::to_string(&p).unwrap();
         assert!(
@@ -3892,7 +4297,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn submit_timeout_seconds_round_trips() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut p = make_testnet_profile();
         p.submit_timeout_seconds = Some(120);
         let toml_str = toml::to_string(&p).unwrap();
@@ -3908,7 +4317,11 @@ mod tests {
     /// An unset submit timeout resolves to the 60-second default and a
     /// configured one to its own value.
     #[test]
+    #[serial_test::serial]
     fn submit_timeout_resolves_the_default_and_the_configured_value() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut p = make_testnet_profile();
         p.submit_timeout_seconds = None;
         assert_eq!(DEFAULT_SUBMIT_TIMEOUT_SECS, 60);
@@ -3919,13 +4332,21 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn version_is_2() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert_eq!(p.version, 2);
     }
 
     #[test]
+    #[serial_test::serial]
     fn audit_key_default_derived_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert_eq!(
             p.audit_log_hash_chain_key_id.service,
@@ -3935,7 +4356,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn default_audit_log_path_for_appends_profile_log_under_audit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let path = default_audit_log_path_for("alice");
 
         assert_eq!(path.file_name().unwrap(), "alice.jsonl");
@@ -3943,7 +4368,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn default_audit_log_path_for_sanitises_profile_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let path = default_audit_log_path_for("../alice\\bob");
 
         assert_eq!(path.file_name().unwrap(), "___alice_bob.jsonl");
@@ -3951,53 +4380,49 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn default_audit_log_path_for_empty_profile_uses_default_stem() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let path = default_audit_log_path_for("");
 
         assert_eq!(path.file_name().unwrap(), "default.jsonl");
     }
 
     #[test]
+    #[serial_test::serial]
     fn default_audit_log_path_for_prefixes_windows_reserved_stems() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let path = default_audit_log_path_for("CON");
 
         assert_eq!(path.file_name().unwrap(), "_CON.jsonl");
     }
 
     #[test]
-    fn default_audit_log_path_for_uses_platform_project_dir_shape() {
-        let path = default_audit_log_path_for("alice");
-        let rendered = path.to_string_lossy();
-
-        #[cfg(target_os = "linux")]
-        {
-            assert!(
-                rendered.contains("/stellar-agent/audit/alice.jsonl"),
-                "linux path should end under stellar-agent/audit: {rendered}"
-            );
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            assert!(
-                rendered.contains(
-                    "/Library/Application Support/Soneso.stellar-agent/audit/alice.jsonl"
-                ),
-                "macOS path should use Application Support/Soneso.stellar-agent: {rendered}"
-            );
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            assert!(
-                rendered.ends_with(r"Soneso\stellar-agent\data\audit\alice.jsonl"),
-                "windows path should end under Soneso\\stellar-agent\\data\\audit: {rendered}"
-            );
-        }
+    #[serial_test::serial]
+    fn default_audit_log_path_for_joins_marked_root() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let path = default_audit_log_path_for("profile/fixture");
+        assert_eq!(path, sandbox.path().join("audit/profile_fixture.jsonl"));
     }
 
     #[test]
+    #[serial_test::serial]
     fn owner_key_default_derived_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert_eq!(
             p.policy_owner_key_id.service,
@@ -4007,7 +4432,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn attestation_key_default_derived_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert_eq!(
             p.attestation_key_id.service,
@@ -4017,7 +4446,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn counterparty_key_default_derived_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert_eq!(
             p.counterparty_cache_key_id.service,
@@ -4027,7 +4460,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn oracle_provider_url_default_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert_eq!(p.oracle_provider_url, None);
     }
@@ -4036,7 +4473,11 @@ mod tests {
     /// retain `Noop` — see `migrate_v1_to_v2_produces_noop_engine` in
     /// `migrate.rs`.
     #[test]
+    #[serial_test::serial]
     fn policy_engine_default_v1_for_new_profiles() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert_eq!(
             p.policy.engine,
@@ -4047,7 +4488,11 @@ mod tests {
 
     /// Both testnet and mainnet builder-produced profiles default to `V1`.
     #[test]
+    #[serial_test::serial]
     fn policy_engine_default_v1_for_new_mainnet_profiles() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_mainnet(MAINNET_FIXTURE_RPC, "s", "a", "n", "a").build();
         assert_eq!(
             p.policy.engine,
@@ -4057,7 +4502,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn policy_engine_builder_sets_noop_for_testnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .policy_engine(PolicyEngineKind::Noop)
             .build();
@@ -4066,7 +4515,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn policy_engine_builder_sets_v1_for_mainnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_mainnet(MAINNET_FIXTURE_RPC, "s", "a", "n", "b")
             .policy_engine(PolicyEngineKind::V1)
             .build();
@@ -4075,7 +4528,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn policy_engine_builder_overrides_prior_noop_choice() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .with_noop_engine()
             .policy_engine(PolicyEngineKind::V1)
@@ -4085,7 +4542,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn with_noop_engine_overrides_prior_policy_engine_choice() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .policy_engine(PolicyEngineKind::V1)
             .with_noop_engine()
@@ -4135,6 +4596,23 @@ mod tests {
         assert!(PolicyEngineKind::from_str("").is_err());
     }
 
+    /// An unknown engine name is refused by the accepted values, and the
+    /// error carries none of the supplied text.
+    #[test]
+    fn policy_engine_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+
+        let error = PolicyEngineKind::from_str(CREDENTIAL_MARKER).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unknown policy engine; supported values: noop, v1"
+        );
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+        // The refused text is lowercased before matching; the lowercase form
+        // stays out of the error as well.
+        assert_no_marker(&error, &CREDENTIAL_MARKER.to_ascii_lowercase());
+    }
+
     #[test]
     fn policy_engine_kind_display_matches_wire_strings() {
         assert_eq!(PolicyEngineKind::V1.to_string(), "v1");
@@ -4174,7 +4652,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn stellar_agent_home_override_redirects_profile_and_policy_dirs() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
 
         let profile_dir = default_profile_dir().expect("default_profile_dir must succeed");
@@ -4194,31 +4678,17 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn default_passkeys_dir_ends_with_passkeys_component() {
-        let dir = default_passkeys_dir().expect("default_passkeys_dir must succeed on CI");
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         assert!(
-            dir.ends_with("passkeys"),
-            "default_passkeys_dir must end with 'passkeys' component: {dir:?}"
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
-
-        let rendered = dir.to_string_lossy();
-
-        #[cfg(target_os = "linux")]
-        assert!(
-            rendered.contains("/stellar-agent/passkeys"),
-            "linux path must contain stellar-agent/passkeys: {rendered}"
-        );
-
-        #[cfg(target_os = "macos")]
-        assert!(
-            rendered.contains("stellar-agent/passkeys"),
-            "macOS path must contain stellar-agent/passkeys: {rendered}"
-        );
-
-        #[cfg(target_os = "windows")]
-        assert!(
-            rendered.contains(r"stellar-agent\passkeys"),
-            "windows path must contain stellar-agent\\passkeys: {rendered}"
-        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let path = default_passkeys_dir().unwrap();
+        assert_eq!(path, sandbox.path().join("passkeys"));
     }
 
     /// `default_operator_approval_credentials_dir` returns a path ending with
@@ -4230,19 +4700,18 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn default_operator_approval_credentials_dir_ends_with_expected_component() {
-        let dir = default_operator_approval_credentials_dir()
-            .expect("default_operator_approval_credentials_dir must succeed on CI");
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         assert!(
-            dir.ends_with("operator-approval-credentials"),
-            "must end with 'operator-approval-credentials' component: {dir:?}"
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
-
-        let passkeys_dir = default_passkeys_dir().expect("default_passkeys_dir must succeed on CI");
-        assert_ne!(
-            dir, passkeys_dir,
-            "operator-approval credential dir must be distinct from the smart-account \
-             passkeys dir"
-        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let path = default_operator_approval_credentials_dir().unwrap();
+        assert_eq!(path, sandbox.path().join("operator-approval-credentials"));
+        assert_ne!(path, default_passkeys_dir().unwrap());
     }
 
     // ── KeyringEntryRef helpers ───────────────────────────────────────────────
@@ -4307,7 +4776,11 @@ mod tests {
     // ── Profile::Debug redaction ──────────────────────────────────────────────
 
     #[test]
+    #[serial_test::serial]
     fn redacted_profile_hides_every_url_field() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = Profile::builder_testnet("svc", "acct", "nonce", "acct")
             .rpc_url("https://user:SENTINEL-PRIMARY@primary.example:8443/v1/SENTINEL-PRIMARY-PATH?key=SENTINEL-PRIMARY-QUERY")
             .oracle_provider_url(Url::parse("https://user:SENTINEL-ORACLE@oracle.example/SENTINEL-ORACLE-PATH?key=SENTINEL-ORACLE-QUERY").unwrap())
@@ -4332,6 +4805,8 @@ mod tests {
         });
         profile.remote_approval = Some(RemoteApprovalConfig {
             enabled: false,
+            cert_path: None,
+            key_path: None,
             bind: "127.0.0.1:8443".to_owned(),
             rp_id: "wallet.example".to_owned(),
             allowed_credentials: vec![],
@@ -4361,7 +4836,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn profile_debug_redacts_rpc_url() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut p = Profile::builder_testnet(
             "stellar-agent-signer",
             "dbg-profile",
@@ -4397,7 +4876,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn profile_debug_secondary_rpc_url_none_shows_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         // secondary_rpc_url is None on a freshly built profile.
         let dbg = format!("{p:?}");
@@ -4413,7 +4896,11 @@ mod tests {
     /// Neither `Display` nor `Debug` of an endpoint refusal echoes any part of
     /// the URL, for an unparseable value and for each mainnet refusal.
     #[test]
+    #[serial_test::serial]
     fn endpoint_url_error_display_and_debug_omit_the_url() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let cases = [
             (sentinel::UNPARSEABLE, Caip2::Testnet),
             (sentinel::FTP, Caip2::Testnet),
@@ -4435,7 +4922,11 @@ mod tests {
     // ── ProfileBuilder setters not yet tested ─────────────────────────────────
 
     #[test]
+    #[serial_test::serial]
     fn builder_rpc_url_override() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let custom_url = "https://custom-rpc.example.com";
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .rpc_url(custom_url)
@@ -4444,7 +4935,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn builder_cross_check_threshold_stroops_override() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .cross_check_threshold_stroops(999_999_999_999)
             .build();
@@ -4452,7 +4947,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn builder_classic_max_fee_per_op_stroops_some_and_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p_some = Profile::builder_testnet("s", "a", "n", "b")
             .classic_max_fee_per_op_stroops(Some(500))
             .build();
@@ -4465,7 +4964,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn classic_max_fee_per_op_stroops_serde_round_trip() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .classic_max_fee_per_op_stroops(Some(750))
             .build();
@@ -4479,7 +4982,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn classic_max_fee_per_op_none_absent_from_toml() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         let toml_str = toml::to_string(&p).unwrap();
         assert!(
@@ -4498,7 +5005,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn builder_oracle_provider_url_some_and_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use url::Url;
 
         let url = Url::parse("https://oracle.example.com/rpc").unwrap();
@@ -4514,7 +5025,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn oracle_provider_url_serde_round_trip() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use url::Url;
 
         let url = Url::parse("https://oracle.example.com/rpc").unwrap();
@@ -4531,7 +5046,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn builder_wallet_override() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let cfg = WalletConfig {
             mlock_required: crate::wallet::MlockRequired::False,
             unlock_ttl_seconds: 15,
@@ -4544,7 +5063,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn wallet_config_serde_round_trip() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .wallet(WalletConfig {
                 mlock_required: crate::wallet::MlockRequired::Warn,
@@ -4561,13 +5084,21 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn wallet_config_default_unlock_ttl_is_30() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert_eq!(p.wallet.unlock_ttl_seconds, 30);
     }
 
     #[test]
+    #[serial_test::serial]
     fn builder_session_rule_max_horizon_ledgers_some_and_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p_some = Profile::builder_testnet("s", "a", "n", "b")
             .session_rule_max_horizon_ledgers(Some(500))
             .build();
@@ -4580,7 +5111,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn session_rule_max_horizon_ledgers_serde_round_trip() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .session_rule_max_horizon_ledgers(Some(2000))
             .build();
@@ -4594,7 +5129,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn builder_secondary_rpc_url_some_and_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p_some = Profile::builder_testnet("s", "a", "n", "b")
             .secondary_rpc_url(Some("https://secondary.example.com".to_owned()))
             .build();
@@ -4610,7 +5149,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn secondary_rpc_url_omitted_from_toml_when_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         let toml_str = toml::to_string(&p).unwrap();
         assert!(
@@ -4620,7 +5163,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn secondary_rpc_url_serde_round_trip_when_set() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = Profile::builder_testnet("s", "a", "n", "b")
             .secondary_rpc_url("https://secondary.example.com".to_owned())
             .build();
@@ -4635,7 +5182,11 @@ mod tests {
     // ── Pool fields are None in freshly built profiles ────────────────────────
 
     #[test]
+    #[serial_test::serial]
     fn pool_fields_none_in_new_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert!(
             p.pool_master_key_id.is_none(),
@@ -4650,7 +5201,11 @@ mod tests {
     // ── remote_approval is None by default, and round-trips when set ─────────
 
     #[test]
+    #[serial_test::serial]
     fn remote_approval_none_in_new_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert!(
             p.remote_approval.is_none(),
@@ -4664,10 +5219,35 @@ mod tests {
     }
 
     #[test]
+    fn remote_approval_without_tls_paths_loads_unchanged() {
+        let text = "enabled = true\nbind = \"0.0.0.0:8443\"\nrp_id = \"wallet.internal\"\nallowed_credentials = [\"credential\"]\n";
+        let config: RemoteApprovalConfig = toml::from_str(text).unwrap();
+        assert!(config.cert_path.is_none());
+        assert!(config.key_path.is_none());
+        assert_eq!(toml::to_string(&config).unwrap(), text);
+    }
+
+    #[test]
+    fn remote_tls_paths_round_trip_when_set() {
+        let text = "enabled = true\nbind = \"0.0.0.0:8443\"\nrp_id = \"wallet.internal\"\ncert_path = \"remote/cert.pem\"\nkey_path = \"remote/key.pem\"\n";
+        let config: RemoteApprovalConfig = toml::from_str(text).unwrap();
+        let restored: RemoteApprovalConfig =
+            toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.cert_path, Some(PathBuf::from("remote/cert.pem")));
+        assert_eq!(restored.key_path, Some(PathBuf::from("remote/key.pem")));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn remote_approval_serde_round_trip_when_set() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut p = make_testnet_profile();
         p.remote_approval = Some(RemoteApprovalConfig {
             enabled: true,
+            cert_path: None,
+            key_path: None,
             bind: "0.0.0.0:8443".to_owned(),
             rp_id: "wallet.internal".to_owned(),
             allowed_credentials: vec!["AABBCCDDEEFFGGHHIIJJKK".to_owned()],
@@ -4700,7 +5280,11 @@ mod tests {
     /// `[served_pages]` block: a deployment that asked for nothing gets no
     /// identity rather than the project's own.
     #[test]
+    #[serial_test::serial]
     fn served_pages_none_in_new_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert!(
             p.served_pages.is_none(),
@@ -4714,7 +5298,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn served_pages_serde_round_trip_when_set() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut p = make_testnet_profile();
         p.served_pages = Some(ServedPagesConfig::new(Some("Acme Ops".to_owned()), true));
         let toml_str = toml::to_string(&p).unwrap();
@@ -4741,6 +5329,8 @@ mod tests {
     fn remote_approval_config_debug_redacts_credential_ids() {
         let cfg = RemoteApprovalConfig {
             enabled: true,
+            cert_path: None,
+            key_path: None,
             bind: "0.0.0.0:8443".to_owned(),
             rp_id: "wallet.internal".to_owned(),
             allowed_credentials: vec!["AABBCCDDEEFFGGHHIIJJKK".to_owned()],
@@ -4773,7 +5363,11 @@ mod tests {
     /// field's contract documents — never a host-global shared file whose
     /// hash-chained rows would interleave across profiles.
     #[test]
+    #[serial_test::serial]
     fn builder_unset_audit_log_path_resolves_per_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
             .with_profile_name("alice")
             .build();
@@ -4788,7 +5382,11 @@ mod tests {
     /// Without `with_profile_name`, the audit path derives from the same
     /// signer-account name base the v2 keyring references derive from.
     #[test]
+    #[serial_test::serial]
     fn builder_unnamed_audit_path_derives_from_signer_account() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
         assert_eq!(profile.audit_log_path, default_audit_log_path_for("acct"));
     }
@@ -4809,68 +5407,77 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn default_profile_dir_ends_with_profiles() {
-        let dir = default_profile_dir().expect("default_profile_dir must succeed on CI");
-        assert_eq!(
-            dir.file_name().unwrap(),
-            "profiles",
-            "default_profile_dir must end with 'profiles'; got: {dir:?}"
-        );
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         assert!(
-            dir.to_string_lossy().contains("stellar-agent"),
-            "default_profile_dir must be under stellar-agent directory; got: {dir:?}"
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let path = default_profile_dir().unwrap();
+        assert_eq!(path, sandbox.path().join("profiles"));
     }
 
     /// `#[serial]`: see `default_passkeys_dir_ends_with_passkeys_component`.
     #[test]
     #[serial_test::serial]
     fn default_policy_dir_ends_with_policies() {
-        let dir = default_policy_dir().expect("default_policy_dir must succeed on CI");
-        assert_eq!(
-            dir.file_name().unwrap(),
-            "policies",
-            "default_policy_dir must end with 'policies'; got: {dir:?}"
-        );
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         assert!(
-            dir.to_string_lossy().contains("stellar-agent"),
-            "default_policy_dir must be under stellar-agent directory; got: {dir:?}"
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let path = default_policy_dir().unwrap();
+        assert_eq!(path, sandbox.path().join("policies"));
     }
 
     #[test]
+    #[serial_test::serial]
     fn default_approval_dir_ends_with_approvals() {
-        let dir = default_approval_dir().expect("default_approval_dir must succeed on CI");
-        assert_eq!(
-            dir.file_name().unwrap(),
-            "approvals",
-            "default_approval_dir must end with 'approvals'; got: {dir:?}"
-        );
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         assert!(
-            dir.to_string_lossy().contains("stellar-agent"),
-            "default_approval_dir must be under stellar-agent directory; got: {dir:?}"
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let path = default_approval_dir().unwrap();
+        assert_eq!(path, sandbox.path().join("approvals"));
     }
 
     /// `#[serial]`: see `default_passkeys_dir_ends_with_passkeys_component`.
     #[test]
     #[serial_test::serial]
     fn default_toolsets_dir_ends_with_toolsets() {
-        let dir = default_toolsets_dir().expect("default_toolsets_dir must succeed on CI");
-        assert_eq!(
-            dir.file_name().unwrap(),
-            "toolsets",
-            "default_toolsets_dir must end with 'toolsets'; got: {dir:?}"
-        );
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         assert!(
-            dir.to_string_lossy().contains("stellar-agent"),
-            "default_toolsets_dir must be under stellar-agent directory; got: {dir:?}"
+            sandbox
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let path = default_toolsets_dir().unwrap();
+        assert_eq!(path, sandbox.path().join("toolsets"));
     }
 
     // ── audit_log_file_stem: Windows-reserved names (COM / LPT variants) ─────
 
     #[test]
+    #[serial_test::serial]
     fn audit_log_file_stem_prefixes_all_com_variants() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for name in &[
             "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
         ] {
@@ -4884,7 +5491,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn audit_log_file_stem_prefixes_all_lpt_variants() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for name in &[
             "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
         ] {
@@ -4898,7 +5509,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn audit_log_file_stem_prefixes_prn_aux_nul() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for name in &["PRN", "AUX", "NUL"] {
             let path = default_audit_log_path_for(name);
             let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
@@ -4910,7 +5525,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn audit_log_file_stem_prefixes_reserved_names_case_insensitive() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // Lowercase forms must also be treated as reserved.
         for name in &["con", "prn", "aux", "nul", "com1", "lpt9"] {
             let path = default_audit_log_path_for(name);
@@ -4923,7 +5542,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn audit_log_file_stem_reduces_the_console_device_names_to_ordinary_stems() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // `$` is outside `[A-Za-z0-9_-]`, so `CONIN$` sanitises to `CONIN_`,
         // which names no device on any platform. The validator's exact-match
         // console refusal therefore has nothing to answer on this path, and
@@ -4940,7 +5563,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn audit_log_file_stem_allows_normal_names() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // Names that look similar but are not reserved must not be prefixed.
         for name in &[
             "connect",
@@ -4962,7 +5589,11 @@ mod tests {
     // ── ProfileBuilder::policy setter ─────────────────────────────────────────
 
     #[test]
+    #[serial_test::serial]
     fn builder_policy_setter_overrides_default() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let cfg = PolicyConfig {
             engine: PolicyEngineKind::Noop,
         };
@@ -4975,13 +5606,21 @@ mod tests {
     // ── smart_account_max_context_rule_scan_id ────────────────────────────────
 
     #[test]
+    #[serial_test::serial]
     fn smart_account_max_scan_id_defaults_to_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = make_testnet_profile();
         assert_eq!(p.smart_account_max_context_rule_scan_id, None);
     }
 
     #[test]
+    #[serial_test::serial]
     fn smart_account_max_scan_id_serde_round_trip() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut p = make_testnet_profile();
         p.smart_account_max_context_rule_scan_id = Some(200);
         let toml_str = toml::to_string(&p).unwrap();
@@ -5103,7 +5742,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn provider_records_round_trip_and_omit_unset_roles() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let secondary = ProviderRecord::new("Secondary operator", "secondary.example", true);
         let oracle = ProviderRecord::new("Oracle operator", "oracle.example", false);
         let profile = Profile::builder_testnet("s", "a", "n", "a")
@@ -5200,7 +5843,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn provider_builder_sets_and_clears_three_roles() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let primary = PrimaryProviderRecord::new("Primary operator", "primary.example")
             .with_credential(
                 KeyringEntryRef::new("stellar-agent-rpc-p", "primary"),
@@ -5296,7 +5943,11 @@ mod tests {
     /// The reference and the placement are public metadata and print in
     /// `Debug`, in the redacted view, and in its serialization.
     #[test]
+    #[serial_test::serial]
     fn profile_debug_prints_credential_reference_and_placement() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = Profile::builder_testnet("s", "a", "n", "a")
             .primary_provider(
                 PrimaryProviderRecord::new("Primary operator", "primary.example").with_credential(
@@ -5403,7 +6054,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn provider_metadata_is_visible_in_show_and_debug() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = Profile::builder_testnet("s", "a", "n", "a")
             .rpc_url(concat!(
                 "https://USER_SECRET:PASS_SECRET@primary.example/",
@@ -5452,7 +6107,11 @@ mod tests {
         }
     }
     #[test]
+    #[serial_test::serial]
     fn cross_check_thresholds_are_visible_in_show_and_debug() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::asset_id::CanonicalAsset;
         use crate::cross_check::CrossCheckThresholds;
         let issuer = stellar_strkey::ed25519::PublicKey([7; 32])

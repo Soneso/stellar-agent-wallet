@@ -16,14 +16,13 @@ use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{SubmissionError, WalletError};
 use stellar_agent_core::policy::v1::ValueClass;
 use stellar_agent_core::policy::{PolicyEngine, ToolDescriptor};
-use stellar_agent_core::profile::receipt::{
-    ReceiptStatus, ReceiptStore, ReleaseEvidence, SettledRow,
-};
+use stellar_agent_core::profile::receipt::ReceiptStore;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::policy_state::PersistedWindowStore;
-use stellar_agent_network::{
-    ApprovalTombstone, SequenceFloorHook, WalletSubmissionRecorder, envelope_hash_hex,
+use stellar_agent_network::submission_flow::{
+    self, RecorderInputs, StageMarkedRecorder, assemble_recorder, checked_sizing, open_receipts,
 };
+use stellar_agent_network::{ApprovalTombstone, SequenceFloorHook, WalletSubmissionRecorder};
 
 use super::common::profile_bound_descriptor;
 
@@ -67,6 +66,9 @@ pub(crate) struct CommitRecord<'a> {
     pub approval_dir: Option<std::path::PathBuf>,
     /// The caller's clock in unix milliseconds.
     pub now_ms: u64,
+    /// The provenance of the governing mainnet decision, which the pending
+    /// audit row records; `None` off mainnet.
+    pub provenance: Option<stellar_agent_core::mainnet::decision::MainnetProvenance>,
 }
 
 /// Builds the recorder for one submission.
@@ -86,11 +88,85 @@ pub(crate) fn build_recorder<'a>(
     record: CommitRecord<'a>,
     sequence_floor: Option<&'a dyn SequenceFloorHook>,
 ) -> Result<WalletSubmissionRecorder<'a>, WalletError> {
+    let approval = approval_binding(&record)?;
+
+    let descriptor = profile_bound_descriptor(record.registry, record.profile, record.tool)
+        .ok_or_else(|| {
+            WalletError::Submission(SubmissionError::RecordUnavailable {
+                detail: format!("the submission tool {} has no registry entry", record.tool),
+            })
+        })?;
+
+    let receipts = open_receipts(&record.profile_name)?;
+
+    let sizing = record
+        .engine
+        .record_confirmed_checked(&descriptor, record.profile, &record.value_class)
+        .map_err(|e| {
+            WalletError::Submission(SubmissionError::RecordUnavailable {
+                detail: format!("the policy engine could not account for this action: {e}"),
+            })
+        })?;
+
+    let sizing = checked_sizing(sizing, || {
+        WalletError::Submission(SubmissionError::IntentRecordUnavailable {
+            class: "policy_unavailable",
+        })
+    })?;
+    Ok(assemble_recorder(
+        RecorderInputs {
+            profile: record.profile,
+            profile_name: record.profile_name,
+            tool: record.tool,
+            chain_id: record.chain_id,
+            policy_decision: record.policy_decision,
+            legs: record.legs,
+            audit: Some(record.audit),
+            nonce_id: record.nonce_id,
+            now_ms: record.now_ms,
+            provenance: None,
+            operation: None,
+            pre_exposure_ledger: None,
+            observation: None,
+        },
+        receipts,
+        Some(sizing),
+    )
+    .with_sequence_floor(sequence_floor)
+    .with_approval(approval))
+}
+
+/// Builds checked count admission with the server's governing policy.
+pub(crate) fn no_value_admission(
+    server: &crate::server::WalletServer,
+    tool: &'static str,
+    now_ms: u64,
+) -> Result<Arc<stellar_agent_network::NoValueAdmission>, WalletError> {
+    let unavailable = || {
+        WalletError::Submission(SubmissionError::IntentRecordUnavailable {
+            class: "policy_unavailable",
+        })
+    };
+    let descriptor = profile_bound_descriptor(&server.tool_registry, &server.profile, tool)
+        .ok_or_else(unavailable)?;
+    let sizing = server
+        .policy_engine
+        .size_no_value(&descriptor, &server.profile, now_ms)
+        .map_err(|_| unavailable())?;
+    stellar_agent_network::NoValueAdmission::with_store(
+        server.profile.as_ref().clone(),
+        server.window_store.clone(),
+        sizing,
+    )
+    .map(Arc::new)
+}
+
+fn approval_binding(record: &CommitRecord<'_>) -> Result<Option<ApprovalTombstone>, WalletError> {
     // Only a gate that required approval verified the presented nonce, so only
     // that decision binds, spends and records it.
     let approval = match record.policy_decision {
         stellar_agent_core::audit_log::PolicyDecision::RequireApproval => {
-            match (record.approval_nonce, record.approval_dir) {
+            match (record.approval_nonce.clone(), record.approval_dir.clone()) {
                 (Some(approval_nonce), Some(store_dir)) => Some(ApprovalTombstone {
                     store_dir,
                     profile_name: record.profile_name.clone(),
@@ -116,167 +192,437 @@ pub(crate) fn build_recorder<'a>(
         _ => None,
     };
 
-    let descriptor = profile_bound_descriptor(record.registry, record.profile, record.tool)
-        .ok_or_else(|| {
-            WalletError::Submission(SubmissionError::RecordUnavailable {
-                detail: format!("the submission tool {} has no registry entry", record.tool),
-            })
-        })?;
-
-    let receipts = ReceiptStore::open(&record.profile_name).map_err(|e| {
-        WalletError::Submission(SubmissionError::RecordUnavailable {
-            detail: format!("the submission receipt store could not be opened: {e}"),
-        })
-    })?;
-
-    let window_entries = record
-        .engine
-        .record_confirmed(&descriptor, record.profile, &record.value_class)
-        .map_err(|e| {
-            WalletError::Submission(SubmissionError::RecordUnavailable {
-                detail: format!("the policy engine could not account for this action: {e}"),
-            })
-        })?;
-
-    Ok(WalletSubmissionRecorder::new(
-        record.profile,
-        record.profile_name.clone(),
-        record.tool,
-        Some(record.chain_id),
-        record.policy_decision,
-        record.legs,
-        window_entries,
-        receipts,
-        PersistedWindowStore::for_profile(&record.profile_name),
-        Some(record.audit),
-        record.nonce_id,
-        uuid::Uuid::new_v4().to_string(),
-        record.now_ms,
-    )
-    .with_sequence_floor(sequence_floor)
-    .with_approval(approval))
+    Ok(approval)
 }
 
-/// Writes the value-action row that settles a reconciled submission.
+/// Fallible local inputs prepared before an authorization is minted.
+pub(crate) struct PreparedRecorder<'a> {
+    record: CommitRecord<'a>,
+    approval: Option<ApprovalTombstone>,
+    receipts: ReceiptStore,
+    pub window: PersistedWindowStore,
+    /// Whether a toolset restriction leases the grant, so the recorder
+    /// defers the approval consumption until the lease drops.
+    restricted: bool,
+}
+
+/// The tombstone a mainnet submission under `authority` owes: the verified
+/// approval nonce under `Approval`, and none under `Policy`.
 ///
-/// The row carries the SAME value legs the gate sized, read back from the
-/// pending row this submission wrote before it was sent: they were derived
-/// once, at the gate, and are never re-derived here. `ledger` is the ledger
-/// the chain reports the transaction in.
+/// # Errors
 ///
-/// A `Success` receipt owes a `value_action_submitted` row and a `Failed` one
-/// a `value_action_failed` row under its failure code. An `Ambiguous` receipt
-/// released on chain evidence (`release_code`) owes a `value_action_failed`
-/// row under the evidence's wire code. Every other status leaves the outcome
-/// open, which is what the pending row already records: a pending receipt,
-/// and an ambiguous one whose retention window closed. A receipt an operator
-/// cleared owes no row by design.
+/// `submission.record_unavailable` for an approval without a store.
+fn authority_tombstone(
+    record: &CommitRecord<'_>,
+    authority: &stellar_agent_network::mainnet::authority::MainnetAuthority<'_>,
+) -> Result<Option<ApprovalTombstone>, WalletError> {
+    use stellar_agent_network::mainnet::authority::MainnetAuthority;
+    let MainnetAuthority::Approval(witness) = authority else {
+        return Ok(None);
+    };
+    let Some(store_dir) = record.approval_dir.clone() else {
+        return Err(WalletError::Submission(
+            SubmissionError::RecordUnavailable {
+                detail: "the approved submission has no approval store".to_owned(),
+            },
+        ));
+    };
+    Ok(Some(ApprovalTombstone {
+        store_dir,
+        profile_name: record.profile_name.clone(),
+        approval_nonce: witness.witness().nonce().to_owned(),
+    }))
+}
+
+pub(crate) fn prepare_authorized_recorder<'a>(
+    record: CommitRecord<'a>,
+    window: PersistedWindowStore,
+    authority: &stellar_agent_network::mainnet::authority::MainnetAuthority<'_>,
+) -> Result<PreparedRecorder<'a>, WalletError> {
+    let approval = authority_tombstone(&record, authority)?;
+    profile_bound_descriptor(record.registry, record.profile, record.tool).ok_or_else(|| {
+        WalletError::Submission(SubmissionError::RecordUnavailable {
+            detail: format!("the submission tool {} has no registry entry", record.tool),
+        })
+    })?;
+    let receipts = open_receipts(&record.profile_name)?;
+    window
+        .load_into(
+            &record.profile_name,
+            record.profile,
+            &stellar_agent_core::policy::v1::PolicyStateStore::new(),
+        )
+        .map_err(|error| window_open_error(&error))?;
+    Ok(PreparedRecorder {
+        record,
+        approval,
+        receipts,
+        window,
+        restricted: false,
+    })
+}
+
+/// The refusal of a window store that cannot be hydrated: a chain or
+/// total-budget epoch refusal keeps its own code, and every other failure is
+/// `submission.record_unavailable`.
+fn window_open_error(error: &stellar_agent_network::policy_state::WindowStoreError) -> WalletError {
+    if let Some(refusal) = error
+        .chain_validation_error()
+        .or_else(|| error.total_epoch_error())
+    {
+        return WalletError::Validation(refusal);
+    }
+    WalletError::Submission(SubmissionError::RecordUnavailable {
+        detail: format!("the submission window store could not be opened: {error}"),
+    })
+}
+
+impl<'a> PreparedRecorder<'a> {
+    fn build(
+        self,
+        authorization: &stellar_agent_network::mainnet::authorization::MainnetTxSignAuthorization,
+        floor: Option<&'a dyn SequenceFloorHook>,
+        witness: Option<&'a stellar_agent_network::cross_check::CrossCheckWitness>,
+        operation: Option<stellar_agent_network::OperationAttempt>,
+        request_id: String,
+        observation: stellar_agent_network::policy_state::SubmissionObservation,
+    ) -> StageMarkedRecorder<'a> {
+        let record = self.record;
+        let recorder = WalletSubmissionRecorder::new_authorized(
+            record.profile,
+            record.profile_name,
+            record.tool,
+            Some(record.chain_id),
+            record.policy_decision,
+            record.legs,
+            authorization,
+            self.receipts,
+            self.window,
+            Some(record.audit),
+            record.nonce_id,
+            request_id,
+            record.now_ms,
+        )
+        .with_sequence_floor(floor)
+        .with_approval(self.approval)
+        .with_deferred_approval(self.restricted)
+        .with_witness(witness)
+        .with_operation(operation)
+        .with_pre_exposure_ledger(observation.pre_exposure_ledger)
+        .with_observation(observation.observation);
+        // Both authority variants record the governing decision's provenance.
+        StageMarkedRecorder::new(match record.provenance {
+            Some(provenance) => recorder.with_provenance(provenance),
+            None => recorder,
+        })
+    }
+}
+
+pub(crate) fn submit_failure_stage(
+    entered: bool,
+) -> stellar_agent_network::mainnet::resolve::InvalidationStage {
+    use stellar_agent_network::mainnet::resolve::InvalidationStage;
+    if entered {
+        InvalidationStage::PreSendRefused
+    } else {
+        InvalidationStage::SubmitGateRefused
+    }
+}
+
+pub(crate) fn sign_failure_stage(
+    error: &WalletError,
+) -> stellar_agent_network::mainnet::resolve::InvalidationStage {
+    use stellar_agent_network::mainnet::resolve::InvalidationStage;
+    if matches!(error, WalletError::Auth(_)) {
+        InvalidationStage::SignerUnavailable
+    } else {
+        InvalidationStage::SignRefused
+    }
+}
+
+pub(crate) fn cleanup_authorization(
+    store: &PersistedWindowStore,
+    context: &stellar_agent_network::MainnetWriteContext,
+    id: stellar_agent_network::mainnet::AuthorizationId,
+    stage: stellar_agent_network::mainnet::resolve::InvalidationStage,
+) {
+    if let Err(error) =
+        stellar_agent_network::mainnet::resolve::invalidate_unconsumed(store, context, id, stage)
+    {
+        let settled = matches!(
+            &error,
+            stellar_agent_network::mainnet::MainnetAuthorizationError::Refused(
+                stellar_agent_network::mainnet::MainnetPrecondition::NotOpen
+            )
+        );
+        tracing::warn!(
+            ?stage,
+            settled,
+            code = stellar_agent_core::WalletError::from(error).code(),
+            "authorization cleanup refused; primary failure retained"
+        );
+    }
+}
+
+/// Signs and submits the approved bytes under the same client and consumer.
 ///
-/// The settlement lookup reads the retained history, newest file first. A
-/// settled row found there means the submission is accounted for, so a
-/// repeated reconciliation writes nothing.
-///
-/// Non-fatal: the chain has already answered, and the settled record is the
-/// receipt and the spending window. A row that cannot be appended is logged,
-/// and the receipt keeps what a later run needs to write it. A settlement
-/// lookup that cannot read the retained history is logged at WARN with the
-/// profile, the envelope hash, and the error, and writes nothing: whether the
-/// row is owed is unknown, and a row written on a guess could count one spend
-/// twice.
+/// Under a mainnet guard with an operation record, the record's next attempt is
+/// committed as `Sending` after the mint and before the signature; a canonical
+/// record's attempt commits in the same write as its mint. Every refusal
+/// before any send ends it as `NotSent`.
 #[allow(
     clippy::too_many_arguments,
-    reason = "settlement carries submission identity, its evidence and the reconciliation decision"
+    reason = "one call owns the signing and submission lifecycle"
 )]
-pub(crate) fn write_settled_row(
-    profile: &Profile,
-    profile_name: &str,
-    audit: &Arc<Mutex<AuditWriter>>,
-    envelope_hash: &str,
-    tx_hash: &str,
-    status: &ReceiptStatus,
-    release_code: Option<ReleaseEvidence>,
-    ledger: Option<u32>,
-    reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
-) {
-    use stellar_agent_core::audit_log::{AuditEntry, reader::ValueActionSettlement};
-
-    let Some(row) = status.settled_row(release_code) else {
-        return;
+pub(crate) async fn sign_and_submit_classic(
+    server: &crate::server::WalletServer,
+    guard: Option<&crate::server::MainnetWriteGuard<'_>>,
+    authority: Option<&stellar_agent_network::mainnet::authority::MainnetAuthority<'_>>,
+    audit: Option<stellar_agent_network::mainnet::audit_readiness::AuditReadiness>,
+    consumer: stellar_agent_network::mainnet::MainnetConsumer,
+    client: &stellar_agent_network::StellarRpcClient,
+    envelope: &str,
+    source: &str,
+    record: CommitRecord<'_>,
+    witness: Option<&stellar_agent_network::cross_check::CrossCheckWitness>,
+    floor: Option<&dyn SequenceFloorHook>,
+    operation: Option<&stellar_agent_network::policy_state::OperationHandle>,
+    restriction: Option<stellar_agent_network::mainnet::restriction::ToolsetRestriction>,
+) -> Result<stellar_agent_network::submit::SubmissionResult, CallToolResult> {
+    use stellar_agent_network::{
+        signing::envelope_signing::{attach_signature, attach_signature_authorized},
+        submit::{
+            MainnetSubmitGrant, SubmissionSignerKind, submit_authorized_transaction_and_wait,
+            submit_transaction_and_wait,
+        },
     };
-
-    let settlement = match stellar_agent_core::audit_log::reader::try_value_action_settlement(
-        &profile.audit_log_path,
-        envelope_hash,
-    ) {
-        Ok(settlement) => settlement,
-        Err(error) => {
-            tracing::warn!(
-                profile = %profile_name,
-                envelope_hash = %envelope_hash,
-                error = %error,
-                "settlement lookup could not read the audit history; settled row NOT emitted"
-            );
-            return;
-        }
-    };
-    let (tool, chain_id, legs, nonce_id, policy_decision, approval_nonce, witness) =
-        match settlement {
-            // Already accounted for. Reconciliation is repeatable, and a second
-            // row would count one spend twice.
-            ValueActionSettlement::Settled => return,
-            ValueActionSettlement::Owed(pending) => (
-                pending.tool,
-                pending.chain_id,
-                pending.legs,
-                pending.nonce_id,
-                pending.policy_decision,
-                pending.approval_nonce,
-                pending.witness,
-            ),
-            // No pending row survives in retained history, so its sizing is
-            // unavailable. The outcome still belongs in the log, under the name
-            // of the surface that settled it.
-            ValueActionSettlement::OwedWithoutLegs => (
-                RECONCILE_TOOL.to_owned(),
-                profile.chain_id.caip2_str().to_owned().into(),
-                Vec::new(),
-                None,
-                reconciliation_decision,
-                None,
-                None,
-            ),
-        };
-    let chain_id: Option<String> = chain_id;
-    let tx_redacted = stellar_agent_network::redact_tx_hash(tx_hash);
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let entry = match row {
-        SettledRow::Submitted => AuditEntry::new_value_action_submitted(
-            tool,
-            chain_id,
-            legs,
-            tx_redacted.as_str(),
-            ledger.unwrap_or(0),
-            policy_decision,
-            Some(envelope_hash.to_owned()),
-            nonce_id,
-            approval_nonce,
-            &request_id,
+    let render = |error: WalletError| submission_error_result(&error, envelope);
+    stellar_agent_network::signing::envelope_signing::check_envelope_address_forms(envelope)
+        .map_err(render)?;
+    let timeout = super::common::submit_timeout(record.profile);
+    // A restricted submission's outcome leaves the approval consumption owed;
+    // it completes here after the grant lease drops.
+    let restricted = restriction.is_some();
+    if let Some(guard) = guard {
+        let authority = authority.ok_or_else(|| {
+            super::common::approval_required_indistinguishable(&record.profile_name)
+        })?;
+        let audit = audit.ok_or_else(|| {
+            super::common::business_error_result(
+                "audit.chain_key_unavailable",
+                "audit readiness missing",
+            )
+        })?;
+        // The oracle confirms a negative answer of the primary endpoint after
+        // the send; a stored oracle URL off the signed oracle host, or a
+        // client that cannot be built, refuses before the signer loads.
+        let oracle = guard
+            .context
+            .oracle_client(guard.enablement)
+            .map_err(render)?;
+        let observation = stellar_agent_network::policy_state::submission_observation(
+            client,
+            oracle.as_ref(),
+            None,
+            stellar_agent_network::operational::readiness_deadline(),
+        )
+        .await;
+        let signer = server.mainnet_enrolled_signer(guard).map_err(render)?;
+        let handle = stellar_agent_network::keyring::lazy_signer_from_keyring(
+            signer.seed_entry(),
+            &stellar_strkey::ed25519::PublicKey(signer.public_key()).to_string(),
+        )
+        .map_err(render)?;
+        let store = server.window_store.clone();
+        let profile = record.profile;
+        let writer = Arc::clone(&record.audit);
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let mut prepared =
+            prepare_authorized_recorder(record, server.window_store.clone(), authority)
+                .map_err(render)?;
+        prepared.restricted = restricted;
+        let request = stellar_agent_network::mainnet::resolve::TxSignRequest {
+            context: guard.context,
+            consumer,
+            unsigned_envelope_xdr: envelope,
+            client,
+            probe_deadline: stellar_agent_network::PRE_SEND_BUDGET,
             witness,
-        ),
-        SettledRow::Failed { code } => AuditEntry::new_value_action_failed(
-            tool,
-            chain_id,
-            legs,
-            tx_redacted.as_str(),
-            code,
-            policy_decision,
-            Some(envelope_hash.to_owned()),
-            nonce_id,
-            approval_nonce,
-            &request_id,
-        ),
-    };
-    crate::tools::value_audit::emit_value_audit_row_with_writer(audit, profile_name, entry);
+            signer: &signer,
+            policy: guard.policy,
+            enablement: guard.enablement,
+            authority,
+            audit,
+            store: &prepared.window,
+            operation: operation.map(stellar_agent_network::operation_entry::next_attempt_link),
+            restriction,
+            sac_payment_context: None,
+        };
+        // A canonical operation's authorization is minted inside its attempt's
+        // begin, so no mint, approval consumption or attempt commits alone; a
+        // refusal there leaves nothing to clean up.
+        let canonical = operation.filter(|handle| {
+            handle.intent().kind() == stellar_agent_network::policy_state::SlotKind::Canonical
+        });
+        let (authorization, attempt) = if let Some(handle) = canonical {
+            let pending =
+                stellar_agent_network::mainnet::resolve::resolve_canonical_tx_sign(request)
+                    .await
+                    .map_err(|error| render(error.into()))?;
+            let (attempt, authorization) =
+                stellar_agent_network::operation_entry::begin_canonical_attempt(
+                    &writer,
+                    &request_id,
+                    handle,
+                    envelope,
+                    pending,
+                )
+                .map_err(render)?;
+            (authorization, Some(attempt))
+        } else {
+            let authorization = stellar_agent_network::mainnet::resolve::resolve_tx_sign(request)
+                .await
+                .map_err(|error| render(error.into()))?;
+            let id = authorization.id();
+            // The attempt is committed before the signature exists: a crash from
+            // here on leaves a `Sending` record that recovery reads.
+            let attempt = match operation {
+                Some(handle) => {
+                    match stellar_agent_network::operation_entry::begin_classic_attempt(
+                        &store,
+                        profile,
+                        &writer,
+                        &request_id,
+                        handle,
+                        envelope,
+                    ) {
+                        Ok(attempt) => Some(attempt),
+                        Err(error) => {
+                            cleanup_authorization(
+                            &store,
+                            guard.context,
+                            id,
+                            stellar_agent_network::mainnet::resolve::InvalidationStage::SignRefused,
+                        );
+                            return Err(render(error));
+                        }
+                    }
+                }
+                None => None,
+            };
+            (authorization, attempt)
+        };
+        let id = authorization.id();
+        let end_unsent = |code: &str| {
+            if let Some(attempt) = attempt {
+                end_unsent_attempt(&store, profile, &writer, &request_id, attempt, code);
+            }
+        };
+        let signed = match attach_signature_authorized(
+            envelope,
+            &handle,
+            guard.context.network_passphrase(),
+            consumer,
+            &authorization,
+        )
+        .await
+        {
+            Ok(signed) => signed,
+            Err(error) => {
+                cleanup_authorization(&store, guard.context, id, sign_failure_stage(&error));
+                end_unsent(error.code());
+                return Err(render(error));
+            }
+        };
+        let recorder = prepared.build(
+            &authorization,
+            floor,
+            witness,
+            attempt,
+            request_id.clone(),
+            observation,
+        );
+        let result = submit_authorized_transaction_and_wait(
+            client,
+            oracle.as_ref(),
+            &signed,
+            timeout,
+            guard.context.network_passphrase(),
+            Some(SubmissionSignerKind::Keyring),
+            &recorder,
+            consumer,
+            MainnetSubmitGrant::Tx(authorization),
+        )
+        .await;
+        if let Err(error) = &result {
+            cleanup_authorization(
+                &store,
+                guard.context,
+                id,
+                submit_failure_stage(recorder.pre_send_entered()),
+            );
+            recorder.end_refused_attempt(error.code());
+        }
+        // The submission's scope dropped the restriction, and its lease.
+        recorder.complete_owed_approval();
+        result.map_err(|error| submission_error_result(&error, &signed))
+    } else {
+        let handle = stellar_agent_network::keyring::enrolled_keyring_signer(
+            &record.profile_name,
+            record.profile,
+            source,
+            server.established_owner().as_ref(),
+        )
+        .await
+        .map_err(render)?;
+        let signed = attach_signature(envelope, &handle, server.context.network_passphrase())
+            .await
+            .map_err(render)?;
+        let recorder = build_recorder(record, floor)
+            .map_err(render)?
+            .with_witness(witness)
+            .with_deferred_approval(restricted);
+        let result = submit_transaction_and_wait(
+            client,
+            &signed,
+            timeout,
+            server.context.network_passphrase(),
+            Some(SubmissionSignerKind::Keyring),
+            Some(&recorder),
+        )
+        .await;
+        drop(restriction);
+        recorder.complete_owed_approval();
+        result.map_err(|error| submission_error_result(&error, &signed))
+    }
+}
+
+/// Ends `attempt` as `NotSent` after a refusal with wire code `code` before
+/// any send. The caller's refusal stands either way, so a failure is logged.
+fn end_unsent_attempt(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    writer: &stellar_agent_network::AuditWriterHandle,
+    request_id: &str,
+    attempt: stellar_agent_network::OperationAttempt,
+    code: &str,
+) {
+    if let Err(error) = stellar_agent_network::end_operation_attempt(
+        store,
+        profile,
+        writer,
+        request_id,
+        attempt,
+        &stellar_agent_network::AttemptEnd::NotSent {
+            code: code.to_owned(),
+        },
+    ) {
+        tracing::warn!(
+            code = error.code(),
+            "operation record: the unsent attempt's end was not recorded; it stays sending \
+             until recovery reads it"
+        );
+    }
 }
 
 /// Renders a submit-path error as a tool result, attaching the structured
@@ -293,10 +639,7 @@ pub(crate) fn submission_error_result(err: &WalletError, signed_xdr: &str) -> Ca
     if let Some(result) = policy_denial_result(err) {
         return result;
     }
-    let envelope = match submission_details(err, signed_xdr) {
-        Some(details) => Envelope::<()>::err_with_details(err, details),
-        None => Envelope::<()>::err(err),
-    };
+    let envelope = submission_flow::submission_error_envelope(err, signed_xdr, RECONCILE_TOOL);
     let json = envelope
         .to_json_pretty()
         .unwrap_or_else(|_| String::from("{}"));
@@ -397,8 +740,9 @@ pub(crate) fn unresolved_from_defi(
 /// Renders a DeFi submit failure as a tool result.
 ///
 /// A policy denial renders as the dispatch gate renders one. A mainnet refusal
-/// reports `network.mainnet_write_forbidden`. An unresolved submission keeps
-/// its `submission.*` code and its `details`; everything else is reported under
+/// reports `network.mainnet_write_forbidden`. A signing refusal keeps its own
+/// code, with no transaction to reconcile. An unresolved submission keeps its
+/// `submission.*` code and its `details`; everything else is reported under
 /// `fallback_code`.
 pub(crate) fn defi_submit_error_result(
     error: &stellar_agent_defi::adapter::DefiAdapterError,
@@ -412,6 +756,11 @@ pub(crate) fn defi_submit_error_result(
         stellar_agent_defi::adapter::DefiAdapterError::MainnetWriteForbidden
     ) {
         return crate::tools::common::mainnet_write_forbidden_result();
+    }
+    if let stellar_agent_defi::adapter::DefiAdapterError::SigningRefusal { wire_code, message } =
+        error
+    {
+        return crate::tools::common::business_error_result(*wire_code, message.clone());
     }
     match unresolved_from_defi(error) {
         Some(unresolved) => unresolved_result(&unresolved),
@@ -437,40 +786,6 @@ pub(crate) fn unresolved_result(unresolved: &UnresolvedSubmission<'_>) -> CallTo
     result
 }
 
-/// The structured detail for the three codes that carry one, or `None`.
-fn submission_details(err: &WalletError, signed_xdr: &str) -> Option<serde_json::Value> {
-    let WalletError::Submission(submission) = err else {
-        return None;
-    };
-    let mut details = serde_json::Map::new();
-    match submission {
-        SubmissionError::TxTimeout { tx_hash, seconds } => {
-            details.insert("tx_hash".to_owned(), tx_hash.clone().into());
-            details.insert("timeout_seconds".to_owned(), (*seconds).into());
-        }
-        SubmissionError::TxAlreadySubmitted { hash } => {
-            details.insert("tx_hash".to_owned(), hash.clone().into());
-        }
-        SubmissionError::HashMismatch { local, server } => {
-            details.insert("tx_hash".to_owned(), local.clone().into());
-            details.insert("server_tx_hash".to_owned(), server.clone().into());
-        }
-        _ => return None,
-    }
-    // The envelope hash names the submission record the operator verbs
-    // address. A caller that does not hold the signed bytes reports the
-    // transaction hash alone rather than a hash of nothing.
-    if !signed_xdr.is_empty() {
-        details.insert(
-            "envelope_hash".to_owned(),
-            envelope_hash_hex(signed_xdr).into(),
-        );
-    }
-    details.insert("outcome".to_owned(), "unknown".into());
-    details.insert("reconcile_with".to_owned(), RECONCILE_TOOL.into());
-    Some(serde_json::Value::Object(details))
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -481,8 +796,333 @@ mod tests {
     )]
 
     use super::*;
+    use stellar_agent_core::profile::receipt::ReceiptStatus;
+    use stellar_agent_network::policy_state::{DeliveryReport, ReconcileReport};
+    use stellar_agent_network::submission_flow::{ReconcilePass, finish_reconciliation};
+    use stellar_agent_network::{envelope_hash_hex, submission_flow::submission_details};
+
+    #[test]
+    fn a_window_epoch_refusal_keeps_its_code() {
+        use stellar_agent_network::policy_state::WindowStoreError;
+        for (error, code) in [
+            (
+                WindowStoreError::TotalEpochUnavailable {
+                    detail: "pin unreadable".to_owned(),
+                },
+                "policy.total_epoch_unavailable",
+            ),
+            (
+                WindowStoreError::TotalEpochStale,
+                "policy.total_epoch_stale",
+            ),
+            (
+                WindowStoreError::TotalEpochRetired,
+                "policy.total_epoch_retired",
+            ),
+            (
+                WindowStoreError::GenerationMismatch,
+                "submission.record_unavailable",
+            ),
+        ] {
+            assert_eq!(window_open_error(&error).code(), code);
+        }
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn recovery_mcp_build_stores_the_minimum_bound_or_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use crate::tools::common::tests::mainnet::{ClassicRun, Tool, ledger, mount_rpc};
+        use wiremock::MockServer;
+        for oracle_ledger in [Some(90_u32), Some(110), None] {
+            let mut run = ClassicRun::allowed(Tool::Pay).await;
+            let primary = MockServer::start().await;
+            let oracle = MockServer::start().await;
+            mount_rpc(&run.f, &primary).await;
+            mount_rpc(&run.f, &oracle).await;
+            mount_oracle_ledger(&oracle, oracle_ledger).await;
+            run.f.server = crate::server::WalletServer::new_with_selection_and_routes_for_test(
+                (*run.f.server.profile).clone(),
+                stellar_agent_core::profile::name::ProfileNameSource::Flag,
+                &stellar_agent_core::profile::schema::default_profile_dir().unwrap(),
+                &[
+                    ("rpc.example.invalid", &primary.uri()),
+                    ("oracle.example.invalid", &oracle.uri()),
+                ],
+            )
+            .unwrap();
+            let result = run.commit().await;
+            assert_eq!(result["ok"], true, "{result}");
+            let state = ledger(&run.f).unwrap();
+            let exposure = &state["operations"]["records"][0]["attempts"][0];
+            assert_eq!(
+                exposure["pre_exposure_ledger"],
+                serde_json::json!(oracle_ledger.map(|value| value.min(100)))
+            );
+            assert_eq!(state["last_observation"]["ledger"], 100);
+        }
+    }
+
+    /// Mounts an oracle at `latest`, or a failing one for `None`. Its
+    /// `getLedgers` refuses a start beyond `latest`, as an RPC endpoint does.
+    #[cfg(feature = "mainnet-write")]
+    async fn mount_oracle_ledger(oracle: &wiremock::MockServer, latest: Option<u32>) {
+        use wiremock::{Mock, ResponseTemplate, matchers::body_partial_json};
+        let answer = move |request: &wiremock::Request, result: serde_json::Value| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"jsonrpc":"2.0", "id":body["id"], "result":result}),
+            )
+        };
+        Mock::given(body_partial_json(
+            serde_json::json!({"method":"getLatestLedger"}),
+        ))
+        .respond_with(move |request: &wiremock::Request| {
+            let Some(latest) = latest else {
+                return ResponseTemplate::new(500);
+            };
+            answer(
+                request,
+                serde_json::json!({"id":"00".repeat(32), "protocolVersion":23, "sequence":latest}),
+            )
+        })
+        .with_priority(1)
+        .mount(oracle)
+        .await;
+        Mock::given(body_partial_json(serde_json::json!({"method":"getLedgers"})))
+            .respond_with(move |request: &wiremock::Request| {
+                let Some(latest) = latest else {
+                    return ResponseTemplate::new(500);
+                };
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["params"]["startLedger"].as_u64() > Some(u64::from(latest)) {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc":"2.0", "id":body["id"],
+                        "error":{"code":-32600, "message":"startLedger must be at most the latest ledger"}
+                    }));
+                }
+                answer(
+                    request,
+                    serde_json::json!({
+                        "latestLedger":latest, "oldestLedger":1,
+                        "latestLedgerCloseTime":(stellar_agent_core::timefmt::now_unix_ms().unwrap()/1000).to_string(),
+                        "oldestLedgerCloseTime":1, "cursor":latest.to_string(), "ledgers":[]
+                    }),
+                )
+            })
+            .with_priority(1)
+            .mount(oracle)
+            .await;
+    }
+
+    #[test]
+    fn submission_error_wire_guard_timeout() {
+        let err = WalletError::Submission(SubmissionError::TxTimeout {
+            tx_hash: "ab".repeat(32),
+            seconds: 30,
+        });
+        let text = submission_error_result(&err, SIGNED_XDR).content[0]
+            .as_text()
+            .unwrap()
+            .text
+            .clone();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let text = text.replace(value["request_id"].as_str().unwrap(), "REQUEST_ID");
+        assert_eq!(
+            text,
+            r#"{
+  "ok": false,
+  "error": {
+    "code": "submission.tx_timeout",
+    "message": "transaction 'abababab...abababab' was not confirmed within 30s; its outcome is unknown: settle it by its transaction hash and do not resubmit",
+    "details": {
+      "envelope_hash": "fdca46b81c5c77753f52cce8845503c8eef69ef48266f0e4ded1ea19060db975",
+      "outcome": "unknown",
+      "reconcile_with": "stellar_transaction_status",
+      "recovery": {
+        "next_action": "TargetedStatus",
+        "reason": "RecoveryRequired",
+        "result": "NeedsEvidence",
+        "retry_time_unavailable": "MissingBound"
+      },
+      "timeout_seconds": 30,
+      "tx_hash": "abababababababababababababababababababababababababababababababab"
+    }
+  },
+  "request_id": "REQUEST_ID"
+}"#
+        );
+    }
+
+    #[test]
+    fn submission_error_wire_guard_policy_denied() {
+        let err = WalletError::PolicyDenied {
+            reason: Box::new(stellar_agent_core::policy::DenyReason::EvaluationError {
+                detail: "guard refusal".to_owned(),
+            }),
+        };
+        let text = submission_error_result(&err, SIGNED_XDR).content[0]
+            .as_text()
+            .unwrap()
+            .text
+            .clone();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let text = text.replace(value["request_id"].as_str().unwrap(), "REQUEST_ID");
+        assert_eq!(
+            text,
+            r#"{
+  "ok": false,
+  "error": {
+    "code": "policy.deny.evaluation_error",
+    "message": "policy denied this operation: {\"EvaluationError\":{\"detail\":\"guard refusal\"}}"
+  },
+  "request_id": "REQUEST_ID"
+}"#
+        );
+    }
 
     const SIGNED_XDR: &str = "AAAAAgAAAAA=";
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn an_opaque_class_under_a_value_cap_builds_no_recorder() {
+        use stellar_agent_core::policy::v1::criteria::{
+            per_period_cap::{PerPeriodCapCriterion, Window},
+            rate_limit::RateLimitCriterion,
+            state_store::{StateKey, WindowEntry, WindowLimit},
+        };
+        use stellar_agent_core::policy::v1::loader::{
+            PolicyDocument, PolicyRule, RuleMatch, ScopeId,
+        };
+        use stellar_agent_core::policy::v1::{OpaqueReason, PolicyEngineV1};
+        use stellar_agent_network::SubmissionRecorder;
+        for exemption in [false, true] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                dir.path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+            let profile = Profile::builder_testnet_named(
+                "intent",
+                "opaque",
+                "account",
+                "opaque-nonce",
+                "account",
+            )
+            .build();
+            let audit = Arc::new(Mutex::new(
+                AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap(),
+            ));
+            let tool = "stellar_smart_account_execute";
+            let engine = PolicyEngineV1::new(
+                PolicyDocument {
+                    version: 1,
+                    scope: ScopeId::AllProfiles,
+                    signature: None,
+                    rules: vec![PolicyRule {
+                        r#match: RuleMatch {
+                            tool: tool.into(),
+                            chain: "*".into(),
+                        },
+                        criteria: vec![
+                            Box::new(PerPeriodCapCriterion::new(
+                                "native".into(),
+                                Window::parse("1m").unwrap(),
+                                10,
+                            )),
+                            Box::new(RateLimitCriterion::new(Window::parse("1m").unwrap(), 1)),
+                        ],
+                        decision: stellar_agent_core::policy::Decision::Allow,
+                        allow_opaque_signing: exemption,
+                    }],
+                },
+                "intent".into(),
+            );
+            let registry = HashMap::from([(
+                tool,
+                ToolDescriptor::from_registration(
+                    &stellar_agent_core::policy::McpToolRegistration {
+                        name: tool,
+                        destructive_hint: true,
+                        read_only_hint: false,
+                        chain_id_required: true,
+                        value_kind: stellar_agent_core::policy::ToolValueKind::MovesValue,
+                    },
+                ),
+            )]);
+            let window = PersistedWindowStore::for_profile("intent");
+            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+            let before = if exemption {
+                window
+                    .record_and_persist(
+                        &profile,
+                        &[WindowEntry::new(
+                            StateKey::new("intent", 1, "rate_limit", 60),
+                            now,
+                            1,
+                            WindowLimit::Count {
+                                window: "1m".into(),
+                                max_calls: 1,
+                            },
+                        )],
+                    )
+                    .unwrap();
+                Some(std::fs::read(window.path()).unwrap())
+            } else {
+                None
+            };
+            let result = build_recorder(
+                CommitRecord {
+                    profile: &profile,
+                    profile_name: "intent".into(),
+                    tool,
+                    chain_id: "stellar:testnet".into(),
+                    policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
+                    legs: vec![],
+                    engine: &engine,
+                    registry: &registry,
+                    value_class: ValueClass::Opaque(OpaqueReason::UnvaluedContractCall),
+                    audit,
+                    nonce_id: None,
+                    approval_nonce: None,
+                    approval_dir: None,
+                    now_ms: now,
+                    provenance: None,
+                },
+                None,
+            );
+            if exemption {
+                let recorder = result.unwrap();
+                let plan =
+                    stellar_agent_network::signed_intent::test_helpers::intent_fixture_plan(1, 60)
+                        .0;
+                let error = recorder.admit_signed_intent(&plan).await.err().unwrap();
+                assert_eq!(error.code(), "policy.deny.rate_limit_exceeded");
+                assert_eq!(std::fs::read(window.path()).unwrap(), before.unwrap());
+            } else {
+                assert_eq!(
+                    result.unwrap_err().code(),
+                    "policy.deny.unsizable_value_effect"
+                );
+                assert!(!window.path().exists());
+            }
+            assert!(
+                window
+                    .signed_intents("intent", &profile)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
 
     #[test]
     fn timeout_carries_the_full_hash_and_the_recovery_protocol() {
@@ -491,7 +1131,7 @@ mod tests {
             tx_hash: hash.clone(),
             seconds: 30,
         });
-        let details = submission_details(&err, SIGNED_XDR).unwrap();
+        let details = submission_details(&err, SIGNED_XDR, RECONCILE_TOOL).unwrap();
         assert_eq!(details["tx_hash"], hash);
         assert_eq!(details["timeout_seconds"], 30);
         assert_eq!(details["outcome"], "unknown");
@@ -504,7 +1144,7 @@ mod tests {
         let hash = "cd".repeat(32);
         let err =
             WalletError::Submission(SubmissionError::TxAlreadySubmitted { hash: hash.clone() });
-        let details = submission_details(&err, SIGNED_XDR).unwrap();
+        let details = submission_details(&err, SIGNED_XDR, RECONCILE_TOOL).unwrap();
         assert_eq!(details["tx_hash"], hash);
         assert_eq!(details["outcome"], "unknown");
     }
@@ -517,7 +1157,7 @@ mod tests {
             local: local.clone(),
             server: server.clone(),
         });
-        let details = submission_details(&err, SIGNED_XDR).unwrap();
+        let details = submission_details(&err, SIGNED_XDR, RECONCILE_TOOL).unwrap();
         assert_eq!(details["tx_hash"], local);
         assert_eq!(details["server_tx_hash"], server);
     }
@@ -527,14 +1167,14 @@ mod tests {
         let err = WalletError::Submission(SubmissionError::TxMalformed {
             detail: "txINSUFFICIENT_FEE".to_owned(),
         });
-        assert!(submission_details(&err, SIGNED_XDR).is_none());
+        assert!(submission_details(&err, SIGNED_XDR, RECONCILE_TOOL).is_none());
     }
 
     #[test]
     fn non_submission_errors_carry_no_details() {
         let err =
             WalletError::Network(stellar_agent_core::error::NetworkError::MainnetWriteForbidden);
-        assert!(submission_details(&err, SIGNED_XDR).is_none());
+        assert!(submission_details(&err, SIGNED_XDR, RECONCILE_TOOL).is_none());
     }
 
     /// A DeFi submit failure whose outcome is unknown keeps the submission
@@ -576,6 +1216,37 @@ mod tests {
                 code, "network.mainnet_write_forbidden",
                 "fallback {fallback}"
             );
+        }
+    }
+
+    /// A DeFi signing refusal reports its own code under every surface
+    /// fallback, with no transaction to reconcile.
+    #[test]
+    fn a_defi_signing_refusal_reports_its_own_code_without_a_transaction() {
+        for expected in [
+            "smart_account.ledger_witness_unavailable",
+            "simulation.divergence.ledger_skew",
+            "submission.intent_record_unavailable",
+            "submission.intent_binding_mismatch",
+        ] {
+            let error = stellar_agent_defi::adapter::DefiAdapterError::SigningRefusal {
+                wire_code: expected,
+                message: "fixed".to_owned(),
+            };
+            for fallback in ["vault.submit_failed", "dex.submit_failed"] {
+                let result = defi_submit_error_result(&error, fallback);
+                let text = match &result.content[0].raw {
+                    rmcp::model::RawContent::Text(t) => t.text.clone(),
+                    other => panic!("expected text content; got {other:?}"),
+                };
+                let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(json["error"]["code"], expected, "fallback {fallback}");
+                assert_eq!(json["error"]["message"], "fixed", "fallback {fallback}");
+                assert!(
+                    json["error"]["details"].is_null(),
+                    "a refusal before signing names no transaction"
+                );
+            }
         }
     }
 
@@ -709,6 +1380,24 @@ mod tests {
         assert_eq!(code, "submission.record_unavailable");
     }
 
+    /// A total-budget overflow the recorder reports keeps its code, and a
+    /// multibyte diagnostic renders intact.
+    #[test]
+    fn a_total_overflow_keeps_its_code_and_text() {
+        let detail = "the spending-window reservation could not be written: Invalid { \
+                      detail: \"a total-budget sum overflows\" } profil \u{e9}t\u{e9} \u{20ac}";
+        let err = WalletError::Submission(SubmissionError::RecordUnavailable {
+            detail: detail.to_owned(),
+        });
+        let (code, message) = rendered(&submission_error_result(&err, SIGNED_XDR));
+        assert_eq!(code, "submission.record_unavailable");
+        assert!(
+            message.contains("a total-budget sum overflows"),
+            "{message}"
+        );
+        assert!(message.contains("\u{e9}t\u{e9} \u{20ac}"), "{message}");
+    }
+
     /// A timeout carries the window it ran out of.
     #[test]
     fn a_defi_timeout_carries_its_timeout_seconds() {
@@ -730,8 +1419,16 @@ mod tests {
     }
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn allowed_recorder_requires_a_registered_tool() {
-        let dir = tempfile::tempdir().expect("isolated audit directory");
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new()
+            .expect("isolated audit directory");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let profile = Profile::builder_testnet("signer", "default", "nonce", "default").build();
         let audit = Arc::new(Mutex::new(
@@ -753,6 +1450,7 @@ mod tests {
                 approval_nonce: None,
                 approval_dir: None,
                 now_ms: 0,
+                provenance: None,
             },
             None,
         )
@@ -762,7 +1460,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn approved_recorder_requires_its_approval_store() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let profile = Profile::builder_testnet("signer", "default", "nonce", "default").build();
         let audit = Arc::new(Mutex::new(
@@ -784,6 +1486,7 @@ mod tests {
                 approval_nonce: Some("approval-binding".to_owned()),
                 approval_dir: None,
                 now_ms: 0,
+                provenance: None,
             },
             None,
         )
@@ -792,7 +1495,11 @@ mod tests {
         assert!(error.message().contains("approval store"));
     }
     #[test]
+    #[serial_test::serial]
     fn approved_recorder_requires_its_approval_nonce() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let profile = Profile::builder_testnet("signer", "default", "nonce", "default").build();
         let audit = Arc::new(Mutex::new(
@@ -814,6 +1521,7 @@ mod tests {
                 approval_nonce: None,
                 approval_dir: Some(dir.path().to_path_buf()),
                 now_ms: 0,
+                provenance: None,
             },
             None,
         )
@@ -822,128 +1530,662 @@ mod tests {
         assert!(error.message().contains("approval nonce"));
     }
 
-    /// Each receipt outcome selects the audit row and code it owes.
-    #[test]
-    fn settlement_rows_follow_receipt_status_and_evidence() {
-        use stellar_agent_core::audit_log::PolicyDecision;
-
-        for (status, evidence, expected) in [
-            (
-                ReceiptStatus::Success,
-                None,
-                Some(("value_action_submitted", None)),
-            ),
-            (
-                ReceiptStatus::Failed {
-                    code: "ledger.failed".to_owned(),
-                },
-                None,
-                Some(("value_action_failed", Some("ledger.failed"))),
-            ),
-            (
-                ReceiptStatus::Ambiguous,
-                Some(ReleaseEvidence::TimeBoundPassed),
-                Some(("value_action_failed", Some("submission.time_bound_passed"))),
-            ),
-            (
-                ReceiptStatus::Ambiguous,
-                Some(ReleaseEvidence::SequenceConsumed),
-                Some(("value_action_failed", Some("submission.sequence_consumed"))),
-            ),
-            (ReceiptStatus::Ambiguous, None, None),
-            (ReceiptStatus::Pending, None, None),
-            (ReceiptStatus::Reorged, None, None),
-            (
-                ReceiptStatus::ClearedByOperator,
-                Some(ReleaseEvidence::TimeBoundPassed),
-                None,
-            ),
+    /// A mainnet recorder refuses each defect before any authorization: an
+    /// approval without a store, an unregistered tool, unreadable receipts,
+    /// an unreadable window and a window of another chain. Policy authority
+    /// owes no tombstone, so it needs no approval store.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn mainnet_recorder_preparation_refuses_before_authorization() {
+        use crate::tools::common::tests::mainnet::{Fixture, payment_witness};
+        use stellar_agent_network::mainnet::authority::MainnetAuthority;
+        for defect in [
+            "none",
+            "policy",
+            "approval_dir",
+            "registry",
+            "receipts",
+            "window",
+            "window_chain",
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            let mut profile =
-                Profile::builder_testnet("row-kind", "default", "nonce", "default").build();
-            profile.audit_log_path = dir.path().join("audit.jsonl");
-            let audit = Arc::new(Mutex::new(
-                AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
-            ));
-            write_settled_row(
-                &profile,
-                "row-kind",
-                &audit,
-                "envelope",
-                "transaction",
-                &status,
-                evidence,
-                Some(9),
-                PolicyDecision::Allow,
-            );
-            let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
-            if let Some((kind, code)) = expected {
-                assert_eq!(rows.len(), 1, "{status:?}/{evidence:?}");
-                assert_eq!(rows[0]["kind"], kind);
-                assert_eq!(rows[0]["code"], serde_json::to_value(code).unwrap());
+            let f = Fixture::new(|raw| raw);
+            // The legacy-attested witness runs unenforced for every kind.
+            let _unenforced =
+                stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+                    &f.server.profile_name_for_approval(),
+                );
+            let witness = payment_witness(&f).await;
+            let outcome = f
+                .server
+                .dispatch_gate("stellar_pay", &f.args(), "stellar:mainnet")
+                .await
+                .unwrap();
+            let decision = outcome.mainnet_decision().unwrap();
+            let authority = if defect == "policy" {
+                MainnetAuthority::from_decision(decision, None).unwrap()
             } else {
-                assert!(rows.is_empty(), "{status:?}/{evidence:?}: {rows:?}");
+                MainnetAuthority::from_decision(decision, Some(&witness)).unwrap()
+            };
+            let profile = f.server.security_profile();
+            let readiness = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
+                profile, "operator",
+            )
+            .unwrap();
+            if defect == "receipts" {
+                let directory =
+                    stellar_agent_core::profile::receipt::default_receipts_dir().unwrap();
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(directory.join("operator.json"), "invalid receipt state").unwrap();
+            }
+            if defect == "window" {
+                std::fs::create_dir_all(f.server.window_store.path().parent().unwrap()).unwrap();
+                std::fs::write(f.server.window_store.path(), "invalid window state").unwrap();
+            }
+            if defect == "window_chain" {
+                let mut foreign = profile.clone();
+                foreign.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
+                f.server
+                    .window_store
+                    .record_and_persist(&foreign, &[])
+                    .unwrap();
+            }
+            let window_before = std::fs::read(f.server.window_store.path()).ok();
+            let result = prepare_authorized_recorder(
+                CommitRecord {
+                    profile,
+                    profile_name: "operator".to_owned(),
+                    tool: if defect == "registry" {
+                        "stellar_unregistered_commit"
+                    } else {
+                        "stellar_pay_commit"
+                    },
+                    policy_decision: stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+                    chain_id: "stellar:mainnet".to_owned(),
+                    legs: Vec::new(),
+                    engine: f.server.policy_engine.as_ref(),
+                    registry: &f.server.tool_registry,
+                    value_class: ValueClass::ReadOnly,
+                    audit: Arc::clone(readiness.writer()),
+                    nonce_id: None,
+                    approval_nonce: Some("approval-binding".to_owned()),
+                    approval_dir: (!matches!(defect, "approval_dir" | "policy"))
+                        .then(|| f.server.resolve_approval_dir().unwrap()),
+                    now_ms: stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                    provenance: Some(decision.provenance()),
+                },
+                f.server.window_store.clone(),
+                &authority,
+            );
+            if matches!(defect, "none" | "policy") {
+                assert!(result.is_ok());
+            } else {
+                let error = match result {
+                    Ok(_) => panic!("accepted {defect}"),
+                    Err(error) => error,
+                };
+                let code = if defect == "window_chain" {
+                    "policy.window_chain_mismatch"
+                } else {
+                    "submission.record_unavailable"
+                };
+                assert_eq!(error.code(), code, "{defect}");
+                assert_eq!(
+                    std::fs::read(f.server.window_store.path()).ok(),
+                    window_before
+                );
+            }
+            assert_eq!(f.seed_reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+            if defect != "window" && f.server.window_store.exists() {
+                let bytes = std::fs::read(f.server.window_store.path()).unwrap();
+                let state: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+                assert!(state["authorizations"].as_array().is_none_or(Vec::is_empty));
             }
         }
     }
 
-    #[test]
-    fn pending_witness_survives_mcp_reconciliation() {
-        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
-        let dir = tempfile::tempdir().unwrap();
-        let mut profile = Profile::builder_testnet("signer", "witness", "nonce", "witness").build();
-        profile.audit_log_path = dir.path().join("audit.jsonl");
-        let audit = Arc::new(Mutex::new(
-            AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
+    /// The post-send oracle client is built only for the signed oracle host:
+    /// a write context whose stored profile names another oracle than the
+    /// verified enablement refuses with `network.mainnet_authorization_refused`
+    /// before the signer loads.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_stored_oracle_off_the_signed_host_refuses_before_the_signer() {
+        use crate::tools::common::tests::mainnet::Fixture;
+        use stellar_agent_network::mainnet::{MainnetConsumer, authority::MainnetAuthority};
+        let mut f = Fixture::new(|raw| raw);
+        let outcome = f
+            .server
+            .dispatch_gate("stellar_pay", &f.args(), "stellar:mainnet")
+            .await
+            .unwrap();
+        let decision = outcome.mainnet_decision().unwrap().clone();
+        let mut moved = f.server.security_profile().clone();
+        moved.oracle_provider_url =
+            Some(url::Url::parse("https://moved-oracle.example.invalid").unwrap());
+        moved.providers.as_mut().unwrap().oracle =
+            Some(stellar_agent_core::profile::schema::ProviderRecord::new(
+                "Moved oracle operator",
+                "moved-oracle.example.invalid",
+                true,
+            ));
+        let profiles = stellar_agent_core::profile::schema::default_profile_dir().unwrap();
+        stellar_agent_core::profile::loader::save_to_dir("operator", &moved, &profiles).unwrap();
+        f.server.mainnet_context = Some(Arc::new(
+            stellar_agent_network::NetworkContext::mainnet_write(
+                &moved,
+                &stellar_agent_core::profile::name::ResolvedProfileName::from_flag("operator"),
+                &profiles,
+                stellar_agent_network::MainnetEndpointFlags::default(),
+            )
+            .unwrap(),
         ));
-        let witness = stellar_agent_core::audit_log::CrossCheckRecord {
-            provider: "https://oracle.example".to_owned(),
-            ledger: 123,
-            inputs_digest: "09".repeat(32),
-            kinds: vec![stellar_agent_core::cross_check::WitnessEntry::SourceAccount],
+        let guard = f
+            .server
+            .mainnet_write_admission(MainnetConsumer::McpPay)
+            .unwrap();
+        let authority = MainnetAuthority::from_decision(&decision, None).unwrap();
+        let profile = f.server.security_profile();
+        let readiness =
+            stellar_agent_network::mainnet::audit_readiness::audit_readiness(profile, "operator")
+                .unwrap();
+        let client = guard.context.primary_client().unwrap();
+        let writer = Arc::clone(readiness.writer());
+        let record = CommitRecord {
+            profile,
+            profile_name: "operator".to_owned(),
+            tool: "stellar_pay_commit",
+            policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
+            chain_id: "stellar:mainnet".to_owned(),
+            legs: Vec::new(),
+            engine: f.server.policy_engine.as_ref(),
+            registry: &f.server.tool_registry,
+            value_class: ValueClass::ReadOnly,
+            audit: writer,
+            nonce_id: None,
+            approval_nonce: None,
+            approval_dir: None,
+            now_ms: stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+            provenance: Some(decision.provenance()),
         };
-        audit
+        let (capture, _capture_guard) =
+            stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
+        let result = sign_and_submit_classic(
+            &f.server,
+            Some(&guard),
+            Some(&authority),
+            Some(readiness),
+            MainnetConsumer::McpPay,
+            &client,
+            f.envelope.envelope_xdr(),
+            f.envelope.source(),
+            record,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let refusal = match result {
+            Ok(_) => panic!("a stored oracle off the signed host must refuse"),
+            Err(refusal) => refusal,
+        };
+        let (code, _, _) = crate::tools::common::assert_business_envelope(&refusal);
+        assert_eq!(code, "network.mainnet_authorization_refused");
+        let refusals: Vec<_> = capture
+            .seen()
+            .into_iter()
+            .filter(|fields| {
+                fields.get("message").map(String::as_str) == Some("mainnet authorization refused")
+            })
+            .map(|fields| {
+                (
+                    fields.get("path").cloned().unwrap_or_default(),
+                    fields.get("precondition").cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            refusals,
+            vec![(
+                "\"mainnet_oracle_client\"".to_owned(),
+                "\"witness_oracle_unbound\"".to_owned()
+            )]
+        );
+        assert_eq!(f.seed_reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A profile under `dir` whose window key and audit chain key live in the
+    /// keyring mock, with its window and receipt stores.
+    struct DrainFixture {
+        _dir: tempfile::TempDir,
+        profile: Profile,
+        name: String,
+        window: PersistedWindowStore,
+        receipts: ReceiptStore,
+    }
+
+    fn drain_fixture(name: &str) -> DrainFixture {
+        use base64::Engine as _;
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = Profile::builder_testnet(name, "acct", "nonce", name).build();
+        profile.audit_log_path = dir.path().join("audit").join("log.jsonl");
+        profile.policy_window_state_key_id =
+            stellar_agent_core::profile::schema::KeyringEntryRef::default_policy_window_state_key(
+                name,
+            );
+        let coordinate = &profile.audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+            .unwrap()
+            .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x52; 32]))
+            .unwrap();
+        let window = PersistedWindowStore::at_path(dir.path().join(format!("{name}.window")));
+        let receipts = ReceiptStore::open_at(dir.path(), name).unwrap();
+        DrainFixture {
+            _dir: dir,
+            profile,
+            name: name.to_owned(),
+            window,
+            receipts,
+        }
+    }
+
+    impl DrainFixture {
+        /// Acquires the profile's bound keyed writer, as every value verb
+        /// acquires it.
+        fn acquire(&self) -> Result<Arc<Mutex<AuditWriter>>, WalletError> {
+            crate::tools::value_audit::require_value_audit_writer(
+                &self.profile,
+                &self.name,
+                stellar_agent_core::audit_log::BindingCheck::Enforce,
+            )
+        }
+
+        fn writer(&self) -> Arc<Mutex<AuditWriter>> {
+            self.acquire().unwrap()
+        }
+
+        /// A sent submission `id` whose receipt reads `status`.
+        fn receipt(&self, id: &str, status: Option<ReceiptStatus>) {
+            self.receipts
+                .try_begin(id, id, "GSOURCE", 7, 0, 1_000)
+                .unwrap();
+            self.receipts.mark_submitted(id).unwrap();
+            match status {
+                None | Some(ReceiptStatus::Pending) => {}
+                Some(ReceiptStatus::Ambiguous) => self
+                    .receipts
+                    .finalize_released(
+                        id,
+                        stellar_agent_core::profile::receipt::ReleaseEvidence::TimeBoundPassed,
+                    )
+                    .unwrap(),
+                Some(ReceiptStatus::ClearedByOperator) => {
+                    self.receipts
+                        .finalize_released(
+                            id,
+                            stellar_agent_core::profile::receipt::ReleaseEvidence::SequenceConsumed,
+                        )
+                        .unwrap();
+                    self.receipts.clear_by_operator(id).unwrap();
+                }
+                Some(ReceiptStatus::Reorged) => {
+                    self.receipts
+                        .finalize(id, ReceiptStatus::Success, Some(5))
+                        .unwrap();
+                    self.receipts.finalize_reorged(id).unwrap();
+                }
+                Some(other) => self.receipts.finalize(id, other, Some(5)).unwrap(),
+            }
+        }
+
+        /// Commits the accounting expiry of a bounded hold whose horizon has
+        /// passed, through an ordinary reconciliation pass, and returns its
+        /// decision identifier.
+        async fn committed_expiry(&self, id: &str) -> String {
+            use stellar_agent_core::policy::v1::criteria::state_store::{
+                StateKey, WindowEntry, WindowLimit,
+            };
+            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+            let since = now - stellar_agent_network::policy_state::RECONCILE_MIN_AGE_MS;
+            let hold = stellar_agent_network::policy_state::SubmissionHold {
+                destinations: Default::default(),
+                chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                    self.profile.chain_id,
+                ),
+                id: id.to_owned(),
+                tx_hash: id.to_owned(),
+                source: "GSOURCE".to_owned(),
+                sequence: 7,
+                max_time: now / 1_000 - 61,
+                pending_since_ms: since,
+                submission_ledger: 1_000,
+                submission_anchor: None,
+                operator_required: false,
+            };
+            let entry = WindowEntry::new(
+                StateKey::new(&self.name, 1, "native", 60),
+                since,
+                300,
+                WindowLimit::Amount {
+                    asset: "native".to_owned(),
+                    window: "1m".to_owned(),
+                    max_stroops: 1_000_000,
+                },
+            );
+            self.window
+                .record_pending(&self.profile, &[entry], &hold)
+                .unwrap();
+            let client =
+                stellar_agent_network::StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+            let report = self
+                .window
+                .reconcile_due(&self.profile, &client, None, None, now, 4)
+                .await
+                .unwrap();
+            assert_eq!(report.rpc_calls, 0, "local expiry asks no endpoint");
+            let [settled] = report.settled.as_slice() else {
+                panic!("one committed expiry: {report:?}");
+            };
+            settled.decision_id.clone()
+        }
+
+        /// Every row of the active audit file.
+        fn rows(&self) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&self.profile.audit_log_path)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+
+        fn rows_of(&self, kind: &str) -> usize {
+            self.rows().iter().filter(|row| row["kind"] == kind).count()
+        }
+    }
+
+    /// No receipt status selects an audit row: every receipt-only case,
+    /// `Failed` included, leaves the log untouched and never acquires the
+    /// writer. Delivery of an identifier the verified window state does not
+    /// hold refuses before any append.
+    #[test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    fn no_receipt_status_selects_an_audit_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for (label, status) in [
+            ("success", Some(ReceiptStatus::Success)),
+            (
+                "failed",
+                Some(ReceiptStatus::Failed {
+                    code: "ledger.failed".to_owned(),
+                }),
+            ),
+            ("ambiguous", Some(ReceiptStatus::Ambiguous)),
+            ("pending", None),
+            ("reorged", Some(ReceiptStatus::Reorged)),
+            ("cleared", Some(ReceiptStatus::ClearedByOperator)),
+        ] {
+            let f = drain_fixture(&format!("row-kind-{label}"));
+            f.receipt(&"ab".repeat(32), status);
+            let report = stellar_agent_network::policy_state::drain_accounting_obligations(
+                &f.window,
+                &f.profile,
+                &f.name,
+                Some(&f.receipts),
+                || panic!("{label}: no obligation acquires the writer"),
+            )
+            .unwrap();
+            assert_eq!(report, DeliveryReport::default(), "{label}");
+            assert!(f.rows().is_empty(), "{label}: {:?}", f.rows());
+        }
+
+        let f = drain_fixture("row-kind-unverifiable");
+        let writer = f.writer();
+        let before = std::fs::read(&f.profile.audit_log_path).ok();
+        let error = stellar_agent_network::policy_state::deliver_accounting_expiry(
+            &mut writer.lock().unwrap(),
+            &f.window,
+            &f.profile,
+            &f.name,
+            Some(&f.receipts),
+            &"cd".repeat(32),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "submission.settlement_unverifiable");
+        assert_eq!(std::fs::read(&f.profile.audit_log_path).ok(), before);
+    }
+
+    /// Receipt-only reconciliation leaves the pending row, with its witness,
+    /// as the one row of the submission.
+    #[test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    fn pending_witness_survives_mcp_reconciliation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
+        for (label, status) in [
+            ("success", ReceiptStatus::Success),
+            (
+                "failed",
+                ReceiptStatus::Failed {
+                    code: "ledger.failed".to_owned(),
+                },
+            ),
+        ] {
+            let f = drain_fixture(&format!("witness-{label}"));
+            let envelope = "ef".repeat(32);
+            let witness = stellar_agent_core::audit_log::CrossCheckRecord {
+                provider: "https://oracle.example".to_owned(),
+                ledger: 123,
+                inputs_digest: "09".repeat(32),
+                kinds: vec![stellar_agent_core::cross_check::WitnessEntry::SourceAccount],
+            };
+            f.writer()
+                .lock()
+                .unwrap()
+                .write_entry(AuditEntry::new_value_action_pending(
+                    "stellar_pay_commit",
+                    "stellar:testnet",
+                    vec![],
+                    &envelope,
+                    "source",
+                    7,
+                    PolicyDecision::Allow,
+                    Some(envelope.clone()),
+                    None,
+                    None,
+                    "pending-request",
+                    Some(witness.clone()),
+                ))
+                .unwrap();
+            f.receipt(&envelope, Some(status));
+            stellar_agent_network::policy_state::drain_accounting_obligations(
+                &f.window,
+                &f.profile,
+                &f.name,
+                Some(&f.receipts),
+                || f.acquire(),
+            )
+            .unwrap();
+            let rows: Vec<_> = f
+                .rows()
+                .into_iter()
+                .filter(|row| row["envelope_hash"] == envelope.as_str())
+                .collect();
+            assert_eq!(rows.len(), 1, "{label}: {rows:?}");
+            assert_eq!(rows[0]["kind"], "value_action_pending");
+            assert_eq!(rows[0]["tool"], "stellar_pay_commit");
+            assert_eq!(rows[0]["witness"], serde_json::to_value(&witness).unwrap());
+        }
+    }
+
+    /// A forged tail past the writer's verified tip cannot acknowledge an
+    /// authentic expiry: the integrity refusal appends nothing and leaves the
+    /// expiry owed. A forged `Failed` receipt emits no outcome row.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_forged_tail_cannot_acknowledge_an_owed_expiry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
+        let f = drain_fixture("forged-tail");
+        let envelope = "a1".repeat(32);
+        let decision_id = f.committed_expiry(&envelope).await;
+        f.writer()
             .lock()
             .unwrap()
             .write_entry(AuditEntry::new_value_action_pending(
                 "stellar_pay_commit",
                 "stellar:testnet",
                 vec![],
-                "transaction",
+                &envelope,
                 "source",
                 7,
                 PolicyDecision::Allow,
-                Some("envelope".to_owned()),
+                Some(envelope.clone()),
                 None,
                 None,
                 "pending-request",
-                Some(witness.clone()),
+                None,
             ))
             .unwrap();
-        write_settled_row(
-            &profile,
-            "witness",
-            &audit,
-            "envelope",
-            "transaction",
-            &ReceiptStatus::Success,
-            None,
-            Some(124),
-            PolicyDecision::Allow,
-        );
-        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+        f.receipts
+            .finalize(
+                &envelope,
+                ReceiptStatus::Failed {
+                    code: "ledger.failed".to_owned(),
+                },
+                Some(5),
+            )
+            .unwrap();
+        let forged = f
+            .window
+            .accounting_expiry_event(&f.profile, &decision_id)
             .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1]["kind"], "value_action_submitted");
-        assert_eq!(rows[1]["witness"], serde_json::to_value(&witness).unwrap());
-        assert_eq!(rows[0]["witness"], rows[1]["witness"]);
+            .unwrap();
+        stellar_agent_core::audit_log::test_helpers::append_forged_entry(
+            &f.profile.audit_log_path,
+            forged,
+            |_| None,
+        );
+        let before = std::fs::read(&f.profile.audit_log_path).unwrap();
+
+        let refused = stellar_agent_network::policy_state::drain_accounting_obligations(
+            &f.window,
+            &f.profile,
+            &f.name,
+            Some(&f.receipts),
+            || f.acquire(),
+        );
+        assert_eq!(
+            refused.map(|_| ()).unwrap_err().code(),
+            "audit.tip_anchor_mismatch"
+        );
+        assert_eq!(std::fs::read(&f.profile.audit_log_path).unwrap(), before);
+        assert_eq!(f.rows_of("value_action_failed"), 0);
+        assert_eq!(
+            f.window
+                .owed_accounting_expiries(&f.profile)
+                .unwrap()
+                .unacknowledged,
+            vec![decision_id],
+            "the expiry stays owed"
+        );
+    }
+
+    /// The dispatch-time drain delivers an obligation an earlier pass left,
+    /// whatever the current pass did: completed, refused, or skipped for an
+    /// unavailable clock or primary client.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn the_dispatch_drain_delivers_old_obligations_after_any_pass() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for (label, pass) in [
+            (
+                "completed",
+                ReconcilePass::Completed(ReconcileReport::default()),
+            ),
+            (
+                "failed",
+                ReconcilePass::Failed(
+                    stellar_agent_network::policy_state::WindowStoreError::WriterLocked,
+                ),
+            ),
+            ("clock", ReconcilePass::ClockUnavailable),
+            ("client", ReconcilePass::ClientUnavailable),
+        ] {
+            let f = drain_fixture(&format!("dispatch-drain-{label}"));
+            let envelope = "b2".repeat(32);
+            let decision_id = f.committed_expiry(&envelope).await;
+            let report = finish_reconciliation(
+                &f.profile,
+                &f.name,
+                &f.window,
+                Some(&f.receipts),
+                &pass,
+                || f.acquire(),
+            )
+            .unwrap();
+            assert_eq!(
+                (report.appended, report.acknowledged, report.projected),
+                (1, 1, 1),
+                "{label}: {report:?}"
+            );
+            let rows = f.rows();
+            let expiries: Vec<_> = rows
+                .iter()
+                .filter(|row| row["kind"] == "submission_accounting_expired")
+                .collect();
+            assert_eq!(expiries.len(), 1, "{label}");
+            assert_eq!(expiries[0]["decision_id"], decision_id.as_str());
+            assert!(
+                f.window
+                    .owed_accounting_expiries(&f.profile)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                f.receipts
+                    .get(&envelope)
+                    .unwrap()
+                    .unwrap()
+                    .settlement_decision_id,
+                Some(decision_id)
+            );
+        }
+    }
+
+    #[test]
+    fn mainnet_classic_cleanup_tracks_signing_and_pre_send_entry() {
+        use stellar_agent_network::mainnet::resolve::InvalidationStage as S;
+        assert!(matches!(submit_failure_stage(false), S::SubmitGateRefused));
+        assert!(matches!(submit_failure_stage(true), S::PreSendRefused));
+        let unavailable =
+            WalletError::Auth(stellar_agent_core::error::AuthError::SignerKeyMismatch {
+                what: "the expected signing account",
+                expected: "expected".to_owned(),
+                got: "missing".to_owned(),
+            });
+        assert!(matches!(
+            sign_failure_stage(&unavailable),
+            S::SignerUnavailable
+        ));
+        let refused =
+            WalletError::from(stellar_agent_core::error::NetworkError::MainnetAuthorizationRefused);
+        assert!(matches!(sign_failure_stage(&refused), S::SignRefused));
     }
 }

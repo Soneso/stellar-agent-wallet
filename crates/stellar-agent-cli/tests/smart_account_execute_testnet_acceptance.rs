@@ -61,8 +61,10 @@
 #[path = "live/smart_account_fixtures.rs"]
 mod smart_account_fixtures;
 
+#[path = "cli/acceptance_storage.rs"]
+mod acceptance_storage;
+
 use std::path::Path;
-use std::process::Command;
 
 use smart_account_fixtures::{
     DEPLOY_TIMEOUT, TESTNET_FRIENDBOT_URL, TESTNET_PASSPHRASE, TESTNET_RPC_URL, XLM_SAC_TESTNET,
@@ -71,7 +73,7 @@ use smart_account_fixtures::{
     wait_until_account_queryable,
 };
 use stellar_agent_core::StellarAmount;
-use stellar_agent_network::{StellarRpcClient, fetch_account};
+use stellar_agent_network::{AssetType, StellarRpcClient, fetch_account};
 use stellar_agent_smart_account::deployment::{
     Ed25519VerifierDeployArgs, ResolvedFeePerOp, SpendingLimitPolicyDeployArgs,
     deploy_ed25519_verifier, deploy_spending_limit_policy,
@@ -133,7 +135,7 @@ async fn xlm_stroops_balance(g_strkey: &str) -> i64 {
     let native = account
         .balances
         .iter()
-        .find(|b| b.asset.asset_type == "native")
+        .find(|b| b.asset.asset_type == AssetType::Native)
         .expect("account must have a native balance entry");
     StellarAmount::parse_with_unit(&format!("{} XLM", native.balance))
         .expect("native balance decimal string must parse as a StellarAmount")
@@ -240,7 +242,7 @@ fn scval_b64(val: &ScVal) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Runs the `stellar-agent` release binary with `args`, `STELLAR_AGENT_HOME`
-/// and `HOME` under `home`, the headless keyring backend, and the given
+/// and `HOME` under `home`, the selected acceptance store, and the given
 /// environment variables set only on the child process. Returns
 /// `(exit_success, last_stdout_line_as_json, stdout, stderr)`.
 fn run_cli(
@@ -249,13 +251,13 @@ fn run_cli(
     envs: &[(&str, &str)],
 ) -> (bool, serde_json::Value, String, String) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
-    let mut cmd = Command::new(bin_path);
+    stellar_agent_test_support::sandbox::mark_sandbox(&home.join("agent"))
+        .expect("mark fixture directory");
+    let mut cmd = acceptance_storage::command(bin_path, &home.join("agent"), Some(HEADLESS_KEY));
     cmd.args(args)
         .env("STELLAR_AGENT_HOME", home.join("agent"))
         .env("HOME", home.join("home"))
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY);
+        .env_remove("STELLAR_AGENT_PROFILE");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -325,6 +327,8 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ],
         &[(FEE_PAYER_ENV_VAR, &bootstrap_s_strkey)],
     );
@@ -364,6 +368,8 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ],
         &[(FEE_PAYER_ENV_VAR, &bootstrap_s_strkey)],
     );
@@ -408,6 +414,7 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
     // refuses before anything is signed or sent.
     let first_amount_scval = ScVal::I128(i128_parts(FIRST_TRANSFER_STROOPS));
     let empty_home = tempfile::tempdir().expect("tempdir must be created");
+    stellar_agent_test_support::sandbox::mark_sandbox(empty_home.path()).expect("marked sandbox");
     let empty_home_path = empty_home
         .path()
         .to_str()
@@ -443,6 +450,8 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ],
         &[
             (RULE_SIGNER_ENV_VAR, &rule_signer_s_strkey),
@@ -500,6 +509,8 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ],
         &[
             (RULE_SIGNER_ENV_VAR, &rule_signer_s_strkey),
@@ -563,6 +574,8 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ],
         &[
             (RULE_SIGNER_ENV_VAR, &rule_signer_s_strkey),
@@ -625,6 +638,8 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ],
         &[
             (RULE_SIGNER_ENV_VAR, &rule_signer_s_strkey),

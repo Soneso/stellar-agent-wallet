@@ -37,7 +37,11 @@ use super::rpc_mock_helpers::{
 /// addresses (duplicate attachment, or two upgrades) must be rejected — the
 /// wallet cannot safely choose between them without operator intervention.
 #[tokio::test]
+#[serial_test::serial]
 async fn two_allowlisted_policies_returns_identification_failed_multi_match() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     let policy_a = policy_sc_address();
@@ -97,20 +101,14 @@ async fn two_allowlisted_policies_returns_identification_failed_multi_match() {
 
 /// Type-level: verify the `SpendingLimitPolicyIdentificationFailed` multi-match shape.
 ///
-/// The `observed_wasm_hashes_summary.count` carries the number of observed policies
+/// The `observed_policy_count` carries the number of attached policies
 /// (not the number of matches), allowing operators to diagnose the configuration.
 #[test]
 fn identification_failed_multi_match_wire_code() {
-    use stellar_agent_smart_account::signers::types::WasmHashSummary;
-
     let err = SaError::SpendingLimitPolicyIdentificationFailed {
         rule_id: 1,
         smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AD2KM"),
-        observed_wasm_hashes_summary: WasmHashSummary::new(
-            2,
-            Some([0x0e, 0x8d, 0xa0, 0xcc, 0xff, 0x5c, 0x44, 0x45]),
-        )
-        .expect("count=2 + Some is valid"),
+        observed_policy_count: 2,
         request_id: Uuid::new_v4().to_string(),
     };
     assert_eq!(

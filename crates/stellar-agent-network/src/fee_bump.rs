@@ -36,16 +36,19 @@
 //! Source: stellar-core `FeeBumpTransactionFrame::commonValid` +
 //! CAP-0015 §"Validity of FeeBumpTransactions".
 
-use sha2::{Digest, Sha256};
-use stellar_agent_core::error::{ProtocolError, SubmissionError, ValidationError, WalletError};
+use stellar_agent_core::envelope_decode::TRANSACTION_ENVELOPE_XDR_FORM;
+use stellar_agent_core::error::{
+    NetworkError, ProtocolError, SubmissionError, ValidationError, WalletError,
+};
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 use stellar_xdr::{
     DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
-    FeeBumpTransactionInnerTx, Hash, Limits, MuxedAccount, ReadXdr, Signature, SignatureHint,
-    TransactionEnvelope, TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
-    TransactionV1Envelope, Uint256, WriteXdr,
+    FeeBumpTransactionInnerTx, Limits, MuxedAccount, ReadXdr, Signature, SignatureHint,
+    TransactionEnvelope, TransactionSignaturePayloadTaggedTransaction, TransactionV1Envelope,
+    Uint256, WriteXdr,
 };
 
-use crate::signing::Signer;
+use crate::signing::{Signer, TxSigningPayload};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CAP-15 constants
@@ -96,12 +99,10 @@ pub enum FeeBumpError {
     /// The minimum outer fee is `(inner_op_count + 1) * max(MIN_BASE_FEE_STROOPS,
     /// ceil(inner_fee / inner_op_count))`.
     #[error(
-        "outer_fee_stroops ({supplied}) is below the CAP-15 minimum ({minimum}); \
+        "outer_fee_stroops must meet the CAP-15 minimum ({minimum}); \
          inner_op_count={inner_op_count}, inner_fee={inner_fee}"
     )]
     FeeBelowCap15Minimum {
-        /// The fee supplied by the caller.
-        supplied: i64,
         /// The computed CAP-15 minimum.
         minimum: i64,
         /// The number of operations in the inner transaction.
@@ -111,10 +112,8 @@ pub enum FeeBumpError {
     },
 
     /// `outer_fee_stroops` exceeds the caller-supplied policy cap.
-    #[error("outer_fee_stroops ({supplied}) exceeds the policy cap ({cap})")]
+    #[error("outer_fee_stroops must not exceed the policy cap ({cap})")]
     FeeExceedsPolicyCap {
-        /// The fee supplied by the caller.
-        supplied: i64,
         /// The policy cap supplied by the caller.
         cap: i64,
     },
@@ -152,6 +151,14 @@ pub enum FeeBumpError {
     /// The underlying [`WalletError`] is propagated transparently.
     #[error("fee-payer signing failed: {0}")]
     SigningFailed(WalletError),
+
+    /// The network passphrase is the mainnet one.
+    ///
+    /// [`build_and_sign_fee_bump`] refuses mainnet before it decodes the
+    /// envelope or touches the fee-payer key; the fee-bump domain has no
+    /// authorized signing path.
+    #[error("fee-bump signing on mainnet is not permitted")]
+    MainnetSigningForbidden,
 }
 
 impl FeeBumpError {
@@ -167,6 +174,7 @@ impl FeeBumpError {
             Self::FeeSourceSignerMismatch => "feebump.fee_source_signer_mismatch",
             Self::EnvelopeEncodeFailed { .. } => "feebump.envelope_encode_failed",
             Self::SigningFailed(_) => "feebump.signing_failed",
+            Self::MainnetSigningForbidden => "feebump.mainnet_signing_forbidden",
         }
     }
 }
@@ -184,26 +192,24 @@ impl From<FeeBumpError> for WalletError {
             }
             // Validation errors (caller-supplied bad input).
             FeeBumpError::InnerNotV1 { found } => {
-                WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("inner envelope type {found} (expected Tx/v1)"),
-                })
+                WalletError::Validation(ValidationError::address_check(format!(
+                    "inner envelope type {found} (expected Tx/v1)"
+                )))
             }
-            FeeBumpError::InvalidFeeSource { detail } => {
-                WalletError::Validation(ValidationError::AddressInvalid { input: detail })
+            FeeBumpError::InvalidFeeSource { .. } => {
+                WalletError::Validation(ValidationError::address_argument("fee_source"))
             }
             // Submission errors.
-            FeeBumpError::FeeBelowCap15Minimum {
-                supplied, minimum, ..
-            } => WalletError::Submission(SubmissionError::TxMalformed {
-                detail: format!(
-                    "fee_bump: outer_fee_stroops {supplied} below CAP-15 minimum {minimum}"
-                ),
-            }),
-            FeeBumpError::FeeExceedsPolicyCap { supplied, cap } => {
+            FeeBumpError::FeeBelowCap15Minimum { .. } => {
                 WalletError::Submission(SubmissionError::TxMalformed {
-                    detail: format!(
-                        "fee_bump: outer_fee_stroops {supplied} exceeds policy cap {cap}"
-                    ),
+                    detail: "fee_bump: outer_fee_stroops must meet the CAP-15 minimum of the \
+                             inner transaction"
+                        .to_owned(),
+                })
+            }
+            FeeBumpError::FeeExceedsPolicyCap { .. } => {
+                WalletError::Submission(SubmissionError::TxMalformed {
+                    detail: "fee_bump: outer_fee_stroops must not exceed the policy cap".to_owned(),
                 })
             }
             FeeBumpError::FeeSourceSignerMismatch => {
@@ -213,6 +219,10 @@ impl From<FeeBumpError> for WalletError {
             }
             // Signing failures contain a WalletError; unwrap and propagate directly.
             FeeBumpError::SigningFailed(source) => source,
+            // The mainnet refusal is the network's write refusal.
+            FeeBumpError::MainnetSigningForbidden => {
+                WalletError::Network(NetworkError::MainnetWriteForbidden)
+            }
         }
     }
 }
@@ -348,7 +358,16 @@ pub(crate) fn build_fee_bump(
 /// - `network_passphrase` — used to construct the SEP-23 signature payload.
 /// - `fee_payer_signer` — signer whose public key MUST match `fee_source`.
 ///
+/// # Mainnet
+///
+/// A mainnet `network_passphrase` is refused with
+/// [`FeeBumpError::MainnetSigningForbidden`] before the envelope is decoded
+/// and before `fee_payer_signer` is asked for its key or a signature.
+///
 /// # Errors
+///
+/// - [`FeeBumpError::MainnetSigningForbidden`]: `network_passphrase` is the
+///   mainnet passphrase.
 ///
 /// All errors from `build_fee_bump`, plus:
 ///
@@ -390,6 +409,9 @@ pub async fn build_and_sign_fee_bump(
     network_passphrase: &str,
     fee_payer_signer: &dyn Signer,
 ) -> Result<String, FeeBumpError> {
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(FeeBumpError::MainnetSigningForbidden);
+    }
     let v1_inner = decode_inner_v1(inner_envelope_xdr)?;
     validate_fee(outer_fee_stroops, policy_fee_cap_stroops, &v1_inner)?;
     let fee_source_muxed = parse_fee_source(fee_source)?;
@@ -420,36 +442,26 @@ pub async fn build_and_sign_fee_bump(
 
     let fee_bump_tx = build_fee_bump_tx(fee_source_muxed, outer_fee_stroops, v1_inner);
 
-    // Build the SEP-23 TxFeeBump signature payload.
-    //
-    // Preimage: SHA-256(network_id || TransactionSignaturePayload {
-    //     tagged_transaction: TxFeeBump(fee_bump_tx)
-    // })
-    //
-    // This is the EnvelopeType::TxFeeBump variant of TransactionSignaturePayload,
-    // using a dedicated signing site for the outer fee-bump payload
-    // (distinct from the EnvelopeType::Tx variant used for inner transactions).
-    let network_id_hash = Hash(Sha256::digest(network_passphrase.as_bytes()).into());
-    let sig_payload = TransactionSignaturePayload {
-        network_id: network_id_hash,
-        tagged_transaction: TransactionSignaturePayloadTaggedTransaction::TxFeeBump(
-            // Clone is required: fee_bump_tx is also moved into the outer
-            // FeeBumpTransactionEnvelope below; the payload construction
-            // must happen before the move.
-            fee_bump_tx.clone(),
-        ),
-    };
-    let payload_bytes =
-        sig_payload
-            .to_xdr(Limits::none())
-            .map_err(|e| FeeBumpError::EnvelopeEncodeFailed {
-                detail: format!("TransactionSignaturePayload TxFeeBump XDR encode failed: {e}"),
-            })?;
+    // The SEP-23 TxFeeBump payload, `SHA-256(network_id ||
+    // TransactionSignaturePayload { tagged_transaction: TxFeeBump(..) })`:
+    // the outer fee-bump domain, distinct from the inner transaction's `Tx`
+    // payload. Built before `fee_bump_tx` moves into the outer envelope.
+    let payload = TxSigningPayload::for_tagged(
+        &TransactionSignaturePayloadTaggedTransaction::TxFeeBump(fee_bump_tx.clone()),
+        network_passphrase,
+    )
+    .map_err(|e| match e {
+        WalletError::Network(NetworkError::MainnetWriteForbidden) => {
+            FeeBumpError::MainnetSigningForbidden
+        }
+        other => FeeBumpError::EnvelopeEncodeFailed {
+            detail: format!("TxFeeBump signature payload: {other}"),
+        },
+    })?;
 
-    // SHA-256 the payload and sign exactly once.
-    let tx_hash: [u8; 32] = Sha256::digest(&payload_bytes).into();
+    // Sign exactly once.
     let sig_bytes = fee_payer_signer
-        .sign_tx_payload(&tx_hash)
+        .sign_tx_payload(&payload)
         .await
         .map_err(FeeBumpError::SigningFailed)?;
 
@@ -513,10 +525,17 @@ pub(crate) fn decode_inner_v1(
         inner_envelope_xdr,
         stellar_agent_xdr_limits::untrusted_decode_limits(inner_envelope_xdr.len()),
     )
-    .map_err(|e| FeeBumpError::InnerDecodeFailed {
-        detail: format!("failed to decode TransactionEnvelope from base64 XDR: {e}"),
+    .map_err(|_| FeeBumpError::InnerDecodeFailed {
+        detail: format!(
+            "failed to decode TransactionEnvelope from base64 XDR: {TRANSACTION_ENVELOPE_XDR_FORM}"
+        ),
     })?;
 
+    if stellar_agent_core::sc_address::envelope_has_muxed_contract(&envelope) {
+        return Err(FeeBumpError::InnerDecodeFailed {
+            detail: stellar_agent_core::sc_address::MUXED_CONTRACT_REFUSAL.to_owned(),
+        });
+    }
     match envelope {
         TransactionEnvelope::Tx(v1) => Ok(v1),
         TransactionEnvelope::TxV0(_) => Err(FeeBumpError::InnerNotV1 {
@@ -580,7 +599,6 @@ fn validate_fee(
 
     if outer_fee_stroops < cap15_minimum_i64 {
         return Err(FeeBumpError::FeeBelowCap15Minimum {
-            supplied: outer_fee_stroops,
             minimum: cap15_minimum_i64,
             inner_op_count,
             inner_fee,
@@ -589,7 +607,6 @@ fn validate_fee(
 
     if outer_fee_stroops > policy_fee_cap_stroops {
         return Err(FeeBumpError::FeeExceedsPolicyCap {
-            supplied: outer_fee_stroops,
             cap: policy_fee_cap_stroops,
         });
     }
@@ -606,7 +623,7 @@ fn validate_fee(
 fn parse_fee_source(fee_source: &str) -> Result<MuxedAccount, FeeBumpError> {
     let pk = stellar_strkey::ed25519::PublicKey::from_string(fee_source).map_err(|e| {
         FeeBumpError::InvalidFeeSource {
-            detail: format!("invalid fee_source G-strkey '{fee_source}': {e}"),
+            detail: format!("invalid fee_source G-strkey: {e}"),
         }
     })?;
     Ok(MuxedAccount::Ed25519(Uint256(pk.0)))
@@ -659,9 +676,54 @@ mod tests {
     use super::*;
     use crate::signing::software::SoftwareSigningKey;
 
+    /// A refused outer fee stays out of the refusal and its wallet form.
+    #[test]
+    fn refused_fee_stays_out_of_both_errors() {
+        use stellar_agent_test_support::rejected_value::assert_no_marker;
+        let inner_xdr = make_inner_v1_xdr(1, 100);
+        let below = build_fee_bump(&inner_xdr, FEE_PAYER_GSTRKEY, 199, 100_000).unwrap_err();
+        assert_no_marker(&below, "199");
+        let wallet = WalletError::from(below);
+        assert_eq!(
+            wallet.to_string(),
+            "the transaction is malformed: fee_bump: outer_fee_stroops must meet the CAP-15 \
+             minimum of the inner transaction"
+        );
+        assert_no_marker(&wallet, "199");
+        let above = build_fee_bump(&inner_xdr, FEE_PAYER_GSTRKEY, 424_242, 1_000).unwrap_err();
+        assert_no_marker(&above, "424242");
+        let wallet = WalletError::from(above);
+        assert_eq!(
+            wallet.to_string(),
+            "the transaction is malformed: fee_bump: outer_fee_stroops must not exceed the \
+             policy cap"
+        );
+        assert_no_marker(&wallet, "424242");
+    }
+
     // ── Test constants ────────────────────────────────────────────────────────
 
     const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+
+    #[tokio::test]
+    async fn muxed_contract_fee_bump_refuses_before_signature() {
+        let signer = crate::signing::test_doubles::CountingSigner::new([5; 32]);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let fee_source =
+            stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()).to_string();
+        let encoded = stellar_agent_test_support::xdr_fixtures::muxed_contract_envelope();
+        let result = build_and_sign_fee_bump(
+            &encoded,
+            fee_source.as_str(),
+            200,
+            1000,
+            TESTNET_PASSPHRASE,
+            &signer,
+        )
+        .await;
+        assert_eq!(signer.sign_calls(), 0);
+        assert_eq!(result.unwrap_err().code(), "feebump.inner_decode_failed");
+    }
 
     // Seed [1u8;32] → G-strkey GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR
     // (verified via SoftwareSigningKey::new_from_bytes([1u8;32]).public_key())
@@ -912,13 +974,9 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(FeeBumpError::FeeBelowCap15Minimum {
-                    supplied: 199,
-                    minimum: 200,
-                    ..
-                })
+                Err(FeeBumpError::FeeBelowCap15Minimum { minimum: 200, .. })
             ),
-            "expected FeeBelowCap15Minimum(supplied=199, minimum=200), got {result:?}"
+            "expected FeeBelowCap15Minimum(minimum=200), got {result:?}"
         );
     }
 
@@ -933,13 +991,7 @@ mod tests {
             /* policy_fee_cap_stroops */ 1000,
         );
         assert!(
-            matches!(
-                result,
-                Err(FeeBumpError::FeeExceedsPolicyCap {
-                    supplied: 5000,
-                    cap: 1000,
-                })
-            ),
+            matches!(result, Err(FeeBumpError::FeeExceedsPolicyCap { cap: 1000 })),
             "expected FeeExceedsPolicyCap, got {result:?}"
         );
     }
@@ -980,13 +1032,9 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(FeeBumpError::FeeBelowCap15Minimum {
-                    supplied: 1499,
-                    minimum: 1500,
-                    ..
-                })
+                Err(FeeBumpError::FeeBelowCap15Minimum { minimum: 1500, .. })
             ),
-            "expected FeeBelowCap15Minimum(1499, 1500), got {result:?}"
+            "expected FeeBelowCap15Minimum(1500), got {result:?}"
         );
 
         // Supply 1500: should succeed.
@@ -1214,6 +1262,51 @@ mod tests {
             fb_env.signatures.len(),
             1,
             "outer envelope must have exactly 1 fee-payer signature"
+        );
+    }
+
+    // ── Tests: mainnet ────────────────────────────────────────────────────────
+
+    /// A mainnet passphrase is refused before the fee payer is asked for its
+    /// key or a signature, and the refusal converts to the network's write
+    /// refusal.
+    #[tokio::test]
+    async fn a_mainnet_passphrase_is_refused_before_any_key_access() {
+        let inner_xdr = make_inner_v1_xdr(1, 100);
+        let fee_payer = crate::signing::test_doubles::CountingSigner::new(FEE_PAYER_SEED);
+
+        let result = build_and_sign_fee_bump(
+            &inner_xdr,
+            FEE_PAYER_GSTRKEY,
+            /* outer_fee_stroops */ 300,
+            /* policy_fee_cap_stroops */ 100_000,
+            MAINNET_PASSPHRASE,
+            &fee_payer,
+        )
+        .await;
+
+        let Err(error) = result else {
+            panic!("mainnet must be refused, got {result:?}");
+        };
+        assert!(matches!(error, FeeBumpError::MainnetSigningForbidden));
+        assert_eq!(error.code(), "feebump.mainnet_signing_forbidden");
+        assert_eq!(
+            fee_payer.key_accesses(),
+            0,
+            "no key access before the refusal"
+        );
+        assert_eq!(
+            WalletError::from(error).code(),
+            "network.mainnet_write_forbidden"
+        );
+    }
+
+    /// The refusal's message names no precondition and no key material.
+    #[test]
+    fn the_mainnet_refusal_display_is_fixed() {
+        assert_eq!(
+            FeeBumpError::MainnetSigningForbidden.to_string(),
+            "fee-bump signing on mainnet is not permitted"
         );
     }
 }

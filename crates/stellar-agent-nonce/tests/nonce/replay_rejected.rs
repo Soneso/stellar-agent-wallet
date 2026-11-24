@@ -13,6 +13,9 @@ use crate::helpers::{
 #[test]
 #[serial]
 fn replay_rejected() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xCCu8; 32];
     let profile = make_profile("replay-rejected");

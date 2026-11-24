@@ -7,11 +7,12 @@
 
 #![allow(
     clippy::expect_used,
+    clippy::unwrap_used,
     clippy::panic,
     reason = "test-only; assertions panic on violation"
 )]
 
-use std::process::{Command, Output};
+use std::process::Output;
 
 use serde_json::Value;
 
@@ -20,15 +21,19 @@ const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
 /// Runs the binary with `args` against an isolated home.
 fn run(args: &[&str]) -> Output {
-    let home = tempfile::tempdir().expect("temp home");
-    Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(args)
-        .env("STELLAR_AGENT_HOME", home.path())
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-        .output()
-        .expect("binary runs")
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+    stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child")
+    .args(args)
+    .env("STELLAR_AGENT_HOME", home.path())
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .output()
+    .expect("binary runs")
 }
 
 /// Asserts `output` is a usage refusal: exit `1`, empty stderr, and stdout
@@ -69,10 +74,11 @@ fn assert_usage_error(output: &Output) -> String {
 #[test]
 fn an_unknown_flag_is_one_usage_error_envelope() {
     let message = assert_usage_error(&run(&["balances", "--bogus-flag"]));
-    assert!(
-        message.starts_with("unexpected argument '--bogus-flag'"),
-        "{message}"
+    assert_eq!(
+        message,
+        "command-line arguments are not valid; run the command with --help for the accepted arguments"
     );
+    assert!(!message.contains("--bogus-flag"));
 }
 
 #[test]
@@ -97,4 +103,193 @@ fn help_and_version_print_their_text_and_exit_zero() {
         );
         assert!(output.stderr.is_empty(), "{flag}");
     }
+}
+
+#[test]
+fn usage_diagnostic_marker_is_not_echoed() {
+    let marker = "CREDMARKER7";
+    for args in [
+        vec!["smart-account", "list-rules", "--max-scan-id", marker],
+        vec!["balances", "--CREDMARKER7"],
+        vec!["CREDMARKER7"],
+        vec!["balances", "--account", marker, "--output", marker],
+        vec![
+            "profile",
+            "init",
+            "--profile",
+            "fixture",
+            "--rpc-url",
+            "https://CREDMARKER7@example.invalid",
+        ],
+    ] {
+        let output = run(&args);
+        let message = assert_usage_error(&output);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(marker));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(marker));
+        let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+        assert!(!envelope.to_string().contains(marker));
+        assert!(!message.contains(marker));
+        for flag in ["--max-scan-id", "--rpc-url"] {
+            if args.contains(&flag) {
+                assert!(message.contains(flag));
+            }
+        }
+    }
+}
+
+#[test]
+fn friendbot_refused_url_marker_is_not_echoed() {
+    let output = run(&[
+        "friendbot",
+        "--account",
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        "--friendbot-url",
+        "CREDMARKER7",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+    assert_eq!(envelope["error"]["code"], "network.rpc_unreachable");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("the friendbot endpoint")
+    );
+    for text in [
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ] {
+        assert!(!text.contains("CREDMARKER7"));
+    }
+    assert!(!envelope.to_string().contains("CREDMARKER7"));
+}
+
+#[test]
+fn credentials_missing_name_marker_is_not_echoed() {
+    let output = run(&["credentials", "show", "CREDMARKER7"]);
+    assert_eq!(output.status.code(), Some(1));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+    assert_eq!(envelope["error"]["code"], "credentials.not_found");
+    assert_eq!(
+        envelope["error"]["message"],
+        "the requested credential was not found"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("CREDMARKER7"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("CREDMARKER7"));
+    assert!(!envelope.to_string().contains("CREDMARKER7"));
+}
+
+#[test]
+fn credentials_registry_marker_is_not_echoed() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("test home");
+    std::fs::create_dir_all(home.path().join("passkeys")).expect("passkeys directory");
+    std::fs::write(
+        home.path().join("passkeys/default.toml"),
+        "credentials = CREDMARKER7 here\n",
+    )
+    .expect("registry fixture");
+    for args in [
+        vec!["credentials", "list"],
+        vec!["credentials", "show", "fixture"],
+    ] {
+        let output = stellar_agent_test_support::cli_child::cli_command(
+            env!("CARGO_BIN_EXE_stellar-agent"),
+            home.path(),
+        )
+        .expect("isolated CLI child")
+        .args(args)
+        .env("STELLAR_AGENT_HOME", home.path())
+        .env_remove("STELLAR_AGENT_PROFILE")
+        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+        .output()
+        .expect("binary runs");
+        assert_eq!(output.status.code(), Some(1));
+        let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+        assert_eq!(
+            envelope["error"]["code"],
+            "credentials.registry_parse_failed"
+        );
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not valid TOML: line 1, column")
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("CREDMARKER7"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("CREDMARKER7"));
+        assert!(!envelope.to_string().contains("CREDMARKER7"));
+    }
+}
+
+#[test]
+fn profile_migration_refusal_omits_the_requested_name() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("test home");
+    std::fs::create_dir_all(home.path().join("profiles")).expect("profiles directory");
+    std::fs::write(
+        home.path().join("profiles/CREDMARKER7.toml"),
+        "version = 987654321\n",
+    )
+    .expect("profile fixture");
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child")
+    .args(["profile", "migrate", "--profile", "CREDMARKER7"])
+    .env("STELLAR_AGENT_HOME", home.path())
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .output()
+    .expect("binary runs");
+    assert_eq!(output.status.code(), Some(1));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+    assert_eq!(envelope["error"]["code"], "internal.unexpected_state");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("migration failed:")
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("CREDMARKER7"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("CREDMARKER7"));
+}
+
+#[test]
+fn a_seed_as_expect_rule_signer_is_not_echoed() {
+    use stellar_agent_test_support::rejected_value::seed_marker;
+
+    let seed = seed_marker();
+    assert_eq!(seed.len(), 56, "the marker is a 56-character S-strkey");
+    assert!(seed.starts_with('S'), "the marker is an S-strkey seed");
+    let output = run(&[
+        "smart-account",
+        "execute",
+        "--account",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "--contract",
+        "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB4RJU",
+        "--function",
+        "transfer",
+        "--auth-rule-id",
+        "1",
+        "--rule-signer-ed25519-secret-env",
+        "__EXEC_TEST_RULE_SIGNER",
+        "--signer-secret-env",
+        "__EXEC_TEST_FEE_PAYER",
+        "--expect-rule-signer",
+        &seed,
+    ]);
+    let message = assert_usage_error(&output);
+    assert_eq!(
+        message,
+        "the argument value is not valid: --expect-rule-signer; run the command with --help for the accepted arguments"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+    assert!(!stdout.contains(&seed), "{stdout}");
+    assert!(!stderr.contains(&seed), "{stderr}");
+    assert!(!envelope.to_string().contains(&seed), "{envelope}");
 }

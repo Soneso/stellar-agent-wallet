@@ -8,35 +8,52 @@
 //! 1. `resolve_denomination` — USDT hard-refusal + known-lookalike denylist +
 //!    pinned-issuer-mismatch + unpinned-bare-code.
 //! 2. Endpoint identity check on the one client that every later read and the
-//!    send use, under the profile's [`Profile::submit_timeout`]. An endpoint
+//!    send use, under the pre-send budget
+//!    [`PRE_SEND_BUDGET`](stellar_agent_network::PRE_SEND_BUDGET). An endpoint
 //!    serving another network is refused before it answers any read.
 //! 3. Live issuer account fetch via `fetch_account` → `AccountFlagsView`
 //!    (for the clawback gate).
 //! 4. Source account fetch via `fetch_account` (for the policy gate's
 //!    `account_view`; sequence number consumed at envelope-build time).
-//! 5. Operator policy evaluation: the shared
+//! 5. Fee resolution, with the profile's per-operation fee as the default
+//!    source, and the unsigned `ChangeTrust` envelope via
+//!    `ClassicOpBuilder::change_trust`, so the policy counts the fee.
+//! 6. Operator policy evaluation: the shared
 //!    [`crate::commands::policy_engine::build_v1_policy_engine`]
-//!    (V1 `NoopPolicyEngine` / `PolicyEngineV1`; fail-closed on build failures),
-//!    once both views from steps 3-4 are populated. A denial is a clean
-//!    refusal that signs nothing and requires no audit setup.
-//! 6. Audit pre-flight (fail-closed): the profile's audit
+//!    (V1 `NoopPolicyEngine` / `PolicyEngineV1`; fail-closed on build
+//!    failures), once both views from steps 3-4 are populated, with the
+//!    envelope's total fee in the arguments. A denial is a clean refusal that
+//!    signs nothing and requires no audit setup.
+//! 7. Audit pre-flight (fail-closed): the profile's audit
 //!    chain-root key must be acquirable via
 //!    [`crate::commands::value_audit::require_value_audit_writer`] before any
 //!    later step touches the signer or submits; refuses
-//!    `audit.chain_key_unavailable` otherwise. The acquired writer is reused
-//!    for the post-confirm row.
-//! 7. `clawback_gate(flags, opt_in_present)` where `opt_in_present` is derived
+//!    `audit.chain_key_unavailable` otherwise. The submission recorder reuses
+//!    the acquired writer for the pending row it writes before the send.
+//! 8. `clawback_gate(flags, opt_in_present)` where `opt_in_present` is derived
 //!    from the wallet-controlled `PendingApprovalStore` (NOT a CLI flag).
-//! 8. `TrustlinePreview::build`: the typed preview of the trustline.
-//! 9. `RefuseWithWarning` / `Refuse` gate decisions → early return (exit 1).
-//! 10. Fee resolution and the classic fee cap, with the profile's
-//!     per-operation fee as the default source.
-//! 11. Cross-check witness of the source account and the issuer, before the
+//! 9. `TrustlinePreview::build`: the typed preview of the trustline.
+//! 10. `RefuseWithWarning` / `Refuse` gate decisions → early return (exit 1).
+//! 11. The classic fee cap on the built fee.
+//! 12. Cross-check witness of the source account and the issuer, before the
 //!     signer loads. A disagreement refuses `simulation.divergence`; an
 //!     oracle that cannot serve refuses `network.witness_unavailable`.
-//! 12. Build `ChangeTrust` envelope via `ClassicOpBuilder::change_trust`.
 //! 13. Sign via keyring → submit → wait for confirmation. The submit layer
 //!     checks the endpoint of the sending client again before the send.
+//!
+//! # Mainnet
+//!
+//! A build without the `mainnet-write` feature refuses a mainnet profile with
+//! `network.mainnet_write_forbidden` before the keyring and any request. With
+//! the feature, the run takes the stored profile of an explicit `--profile`
+//! selection, a verified signed policy with a `[mainnet]` table and its
+//! enablement, the enrolled keyring signer, and the independent witness.
+//! Under `allow` the run signs with policy authority and no passkey ceremony.
+//! An `approval_above` escalation or a `require_approval` rule runs the
+//! passkey ceremony, which records consent from an approval credential in the
+//! signed policy. The signed fee cap applies
+//! before the audit pre-flight and the clawback gate, and the keyring seed is
+//! read only after the authorization is minted.
 //!
 //! # Policy engine
 //!
@@ -44,8 +61,8 @@
 //! `vault` and `trade` CLI commands. Policy evaluation uses
 //! `evaluate_value_moving_policy`; `derive_value_class` derives the `Trustline`
 //! leg from `policy_args`. `commands::policy_engine::trustline_policy_args`
-//! builds those arguments with the MCP `stellar_trustline` tool's `{from, asset}`
-//! dispatch fields.
+//! builds those arguments with the MCP `stellar_trustline` tool's
+//! `{from, asset}` dispatch fields.
 //! `account_view` is the fetched source account; `identity_view` is `None`
 //! (the issuer's on-chain `home_domain` is self-asserted and must not feed
 //! allowlist matching, so identity-class criteria configured on this verb
@@ -55,13 +72,13 @@
 //!
 //! One JSON envelope on stdout. Returns `0` on success, `1` on error.
 //!
-//! The typed preview from step 8 is rendered once, as a nested `preview`
-//! object, after the step 9 gate decision passes. It sits in `data.preview`
+//! The typed preview from step 9 is rendered once, as a nested `preview`
+//! object, after the step 10 gate decision passes. It sits in `data.preview`
 //! beside the submission result on success. It sits in
-//! `error.details.preview` when a later stage fails: fee resolution, the fee
-//! cap, the witness, envelope build, signing, or submission. The fee cap and
-//! witness refusals keep their own codes. A refusal up to and including the
-//! step 9 gate decision carries no preview.
+//! `error.details.preview` when a later stage fails: the fee cap, the
+//! witness, signing, or submission. The fee cap and witness refusals keep
+//! their own codes. A refusal up to and including the step 10 gate decision
+//! carries no preview.
 //!
 //! # Behavior
 //!
@@ -92,12 +109,18 @@ use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::profile::schema::{Profile, default_approval_dir};
 use stellar_agent_network::cross_check::{
     AccountObservation, CrossCheckView, IssuerObservation, TrustlineWitnessInputs,
-    obtain_classic_witness,
+    obtain_classic_witness, obtain_classic_witness_bound,
 };
-use stellar_agent_network::fees::{check_classic_fee_cap, classic_fee_source};
+use stellar_agent_network::fees::{
+    check_classic_fee_cap, check_classic_fee_cap_signed, classic_fee_source,
+};
+use stellar_agent_network::mainnet::MainnetConsumer;
+use stellar_agent_network::{ClassicFeeChoice, MainnetEndpointFlags};
 
 use crate::commands::policy_engine::{
-    build_v1_policy_engine, evaluate_value_moving_policy, trustline_policy_args,
+    build_v1_policy_engine, effective_classic_fee_cap, envelope_total_fee, evaluate_mainnet_policy,
+    evaluate_value_moving_policy, load_mainnet_policy_engine, mainnet_floor_source_requesting,
+    reload_mainnet_policy_engine, trustline_policy_args, with_total_fee,
 };
 
 use stellar_agent_network::{
@@ -117,28 +140,23 @@ use stellar_agent_stablecoin::{
     resolve::{DenominationInput, ResolvedAsset, resolve_denomination},
 };
 
-use crate::common::network::{check_endpoint_identity, mainnet_write_refusal};
+use crate::common::business_entry::{
+    Bound, ClassicStart, Staging, bind_signing, classic_start, entry_business_id,
+    mainnet_business_id, write_replay,
+};
+use crate::common::mainnet_write::{
+    MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
+    require_v1_engine,
+};
+use crate::common::network::{check_endpoint_identity, check_endpoint_ready, submit_timeout};
 use crate::common::profile_access::{
     ProfileAccessError, injected_profile_load, reconcile_loaded_profile,
 };
 use crate::common::render::{WithPreview, with_preview_detail, write_envelope};
 use crate::common::resolve_profile_name;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Private helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Redacts the issuer half of an asset string for logging.
-///
-/// For `CODE:ISSUER` form, the issuer is replaced by `redact_strkey_first5_last5`;
-/// bare codes (no colon) and C-strkey SAC addresses are returned as-is.
-fn redact_asset_for_log(asset: &str) -> String {
-    if let Some((code, issuer)) = asset.split_once(':') {
-        format!("{}:{}", code, redact_strkey_first5_last5(issuer))
-    } else {
-        asset.to_owned()
-    }
-}
+use crate::common::signer_ceremony::MainnetSignerChoice;
+use stellar_agent_network::operational::read_within_readiness_deadline;
+use stellar_agent_network::policy_state::{FloorSource, OperationKind, OperationTool};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument types
@@ -202,6 +220,19 @@ pub struct TrustlineArgs {
     /// Absent → profile's `classic_fee_per_op_stroops` value.
     #[arg(long = "fee")]
     pub classic_base: Option<String>,
+
+    /// Timeout in seconds for the send and the confirmation poll.
+    /// Default: the profile's `submit_timeout_seconds`, then 60.
+    /// The endpoint checks and the reads before the send run under a fixed
+    /// 30-second budget instead.
+    #[arg(long, value_name = "SECONDS")]
+    pub timeout_seconds: Option<u64>,
+    /// Business id naming this value operation: 1 to 64 printable ASCII
+    /// characters, no space. Required on mainnet, where a retry with the
+    /// same id prints the stored operation instead of doing new work; on
+    /// another network it is validated and echoed.
+    #[arg(long = "business-id", value_name = "ID")]
+    pub business_id: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -265,16 +296,12 @@ where
         Err(e @ ProfileAccessError::Load(_)) if !e.requires_refusal() => {
             return write_envelope(
                 out,
-                &Envelope::<()>::err_raw("trustline.profile_load_failed", e.message(&profile_name)),
+                &Envelope::<()>::err_raw("trustline.profile_load_failed", e.message()),
                 1,
             );
         }
         Err(e) => {
-            return write_envelope(
-                out,
-                &Envelope::<()>::err_raw(e.code(), e.message(&profile_name)),
-                1,
-            );
+            return write_envelope(out, &Envelope::<()>::err_raw(e.code(), e.message()), 1);
         }
     };
 
@@ -286,10 +313,10 @@ where
 
     let context = NetworkContext::from_profile(&profile);
 
-    // ── Structural mainnet refusal ────────────────────────────────────────────
+    // ── Mainnet: its own pipeline from the write context ─────────────────────
     // Before the keyring store, the signer, and any RPC request.
-    if let Some(err) = mainnet_write_refusal(context.chain_id) {
-        return write_envelope(out, &Envelope::<()>::err(&err), 1);
+    if context.chain_id.is_mainnet() {
+        return run_mainnet_pipeline(args, &resolved, &profile, init_keyring, out).await;
     }
 
     // ── Initialise platform keyring store ─────────────────────────────────────
@@ -314,6 +341,11 @@ where
             1,
         );
     }
+    // Off mainnet a supplied business id is validated and echoed, and no
+    // record exists.
+    if let Err(e) = entry_business_id(&profile, args.business_id.as_deref()) {
+        return write_envelope(out, &Envelope::<()>::err(&e), 1);
+    }
 
     // ── GATE 1: resolve_denomination (D3 ordered refusal) ────────────────────
     let input = parse_denomination_input(&args.asset);
@@ -323,7 +355,6 @@ where
             tracing::info!(
                 subcommand = "trustline",
                 chain = %chain_id,
-                asset = %redact_asset_for_log(&args.asset),
                 error = %e,
                 "denomination resolver refused trustline"
             );
@@ -352,10 +383,20 @@ where
         }
     };
 
-    // The endpoint check precedes the issuer read: the issuer flags feed the
-    // clawback gate, and every later read and the send use this client. It
-    // gets its own budget of the profile's submit timeout.
-    if let Err(e) = check_endpoint_identity(&rpc_client, &context, profile.submit_timeout()).await {
+    // The endpoint checks precede the issuer read: the issuer flags feed the
+    // clawback gate, and every later read and the send use this client. The
+    // identity check and the readiness check each get their own pre-send
+    // budget.
+    let budget = stellar_agent_network::PRE_SEND_BUDGET;
+    if let Err(e) = check_endpoint_identity(&rpc_client, &context, budget).await {
+        return write_envelope(out, &Envelope::<()>::err(&e), 1);
+    }
+    if let Err(e) = check_endpoint_ready(
+        &rpc_client,
+        stellar_agent_network::operational::readiness_deadline(),
+    )
+    .await
+    {
         return write_envelope(out, &Envelope::<()>::err(&e), 1);
     }
 
@@ -389,7 +430,8 @@ where
 
     // ── GATE 3: Fetch source account (feeds the policy gate's account_view;
     // sequence number also consumed by the envelope build below) ────────────
-    let source_account_view = match fetch_account(&rpc_client, &args.from, &[]).await {
+    let requested = Asset::trustline_request(&resolved.code, &resolved.issuer);
+    let source_account_view = match fetch_account(&rpc_client, &args.from, &requested).await {
         Ok(v) => v,
         Err(e) => {
             return write_envelope(
@@ -419,13 +461,36 @@ where
         &profile_name,
         crate::common::profile_access::ProfileOrigin::Persisted,
         &rpc_client,
+        crate::commands::submission_record::settlement_oracle(&profile).as_ref(),
         now_ms,
+        None,
     )
     .await;
+
+    // ── Fee and unsigned ChangeTrust envelope ─────────────────────────────────
+    // Built before the gate, so the policy counts the fee the envelope pays.
+    let built = match build_change_trust(
+        args,
+        &profile,
+        &rpc_client,
+        context.chain_id,
+        &resolved,
+        &source_account_view,
+    )
+    .await
+    {
+        Ok(built) => built,
+        Err(envelope) => return write_envelope(out, &envelope, 1),
+    };
+    let total_fee = match envelope_total_fee(&built.envelope_xdr) {
+        Ok(fee) => fee,
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
 
     // ── GATE 4: Operator policy evaluation (args-path; mirrors the MCP
     // `stellar_trustline` twin, which derives its `Trustline` leg from the
     // dispatch args via `derive_value_class` rather than a typed builder) ────
+    crate::commands::submission_record::observe_intents(&profile, &profile_name).await;
     let policy_engine = match build_v1_policy_engine(
         "trustline",
         &profile.policy.engine,
@@ -436,12 +501,17 @@ where
         Err(msg) => {
             return write_envelope(
                 out,
-                &Envelope::<()>::err_raw("trustline.policy_engine_unavailable", msg),
+                &Envelope::<()>::err_raw(
+                    msg.code_or("trustline.policy_engine_unavailable"),
+                    msg.to_string(),
+                ),
                 1,
             );
         }
     };
-    let policy_args = trustline_policy_args(&args.from, &args.asset);
+    // The leg names the asset the envelope carries: the resolved code and issuer.
+    let leg_asset = format!("{}:{}", resolved.code, resolved.issuer);
+    let policy_args = with_total_fee(trustline_policy_args(&args.from, &leg_asset), total_fee);
     // `account_view` is the fetched source account (feeds `minimum_reserve`).
     // `identity_view` stays `None`, matching the MCP twin: the issuer's
     // self-asserted `home_domain` must not feed allowlist matching, so
@@ -466,10 +536,11 @@ where
 
     // ── Audit pre-flight (fail-closed) ────────────────────────────────────────
     // Proves the profile's audit chain-root key is acquirable AFTER the
-    // policy gate (a denial is a clean refusal that signs nothing and needs
-    // no audit setup) but BEFORE the signer is loaded (below) or the
-    // transaction is submitted. Reused (not re-acquired) for the
-    // post-confirm `value_action_submitted` row.
+    // policy gate but BEFORE the signer is loaded (below) or the transaction
+    // is submitted. A policy denial is a clean refusal that signs nothing and
+    // needs no audit setup. The submission recorder reuses it (not
+    // re-acquired) for the `value_action_pending` row it writes before the
+    // send.
     let audit_writer =
         match crate::commands::value_audit::require_value_audit_writer(&profile, &profile_name) {
             Ok(w) => w,
@@ -478,6 +549,340 @@ where
             }
         };
 
+    let preview = match clawback_gate(
+        out,
+        &profile,
+        &profile_name,
+        context.chain_id,
+        &resolved,
+        issuer_flags.as_ref(),
+        args.limit_stroops,
+        None,
+    ) {
+        Ok(preview) => preview,
+        Err(code) => return code,
+    };
+
+    // ── Report every later stage in one envelope carrying the preview ────────
+    let preview_view = trustline_preview_view(&preview);
+    let outcome = sign_and_submit(
+        GatedTrustline {
+            args,
+            profile: &profile,
+            profile_name: &profile_name,
+            context: &context,
+            rpc_client: &rpc_client,
+            network_passphrase,
+            chain_id,
+            resolved: &resolved,
+            source: &source_account_view,
+            issuer: IssuerObservation::from_view(&resolved.issuer, issuer_account_view.as_ref()),
+            built,
+            effects: trustline_effects.as_ref(),
+            audit_writer: &audit_writer,
+            now_ms,
+        },
+        submit_transaction_and_wait,
+    )
+    .await;
+    render_trustline_outcome(out, preview_view, outcome)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stages after the preview
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The inputs the stages after the preview take from the gates before it.
+struct GatedTrustline<'a> {
+    args: &'a TrustlineArgs,
+    profile: &'a Profile,
+    profile_name: &'a str,
+    context: &'a NetworkContext,
+    rpc_client: &'a StellarRpcClient,
+    network_passphrase: &'a str,
+    chain_id: &'a str,
+    resolved: &'a ResolvedAsset,
+    source: &'a AccountView,
+    issuer: IssuerObservation,
+    built: BuiltTrustline,
+    effects: Option<&'a stellar_agent_core::policy::v1::ValueEffects>,
+    audit_writer: &'a Arc<Mutex<AuditWriter>>,
+    now_ms: u64,
+}
+
+/// The success payload of a submitted `ChangeTrust` transaction.
+#[derive(Debug, serde::Serialize)]
+struct TrustlineSubmitted {
+    status: &'static str,
+    action: &'static str,
+    code: String,
+    issuer_redacted: String,
+    limit_stroops: Option<String>,
+    is_pinned: bool,
+    tx_hash: String,
+    ledger: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cross_check: Option<CrossCheckView>,
+    /// The business id the run named. Absent when the run named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    business_id: Option<String>,
+}
+
+/// Caps the built fee, obtains the cross-check witness of the source and the
+/// issuer, then signs, records, and submits the built `ChangeTrust` envelope.
+///
+/// `submit_and_wait` is the submission step, with the signature of
+/// [`submit_transaction_and_wait`], which production passes. It receives
+/// `--timeout-seconds`, else the profile's [`Profile::submit_timeout`].
+///
+/// Renders nothing: the caller reports the returned payload or failure
+/// envelope in the one envelope that carries the preview.
+async fn sign_and_submit<S>(
+    gated: GatedTrustline<'_>,
+    submit_and_wait: S,
+) -> Result<TrustlineSubmitted, Envelope<()>>
+where
+    S: AsyncFnOnce(
+        &StellarRpcClient,
+        &str,
+        std::time::Duration,
+        &str,
+        Option<SubmissionSignerKind>,
+        Option<&dyn SubmissionRecorder>,
+    ) -> Result<SubmissionResult, WalletError>,
+{
+    let GatedTrustline {
+        args,
+        profile,
+        profile_name,
+        context,
+        rpc_client,
+        network_passphrase,
+        chain_id,
+        resolved,
+        source,
+        issuer,
+        built,
+        effects,
+        audit_writer,
+        now_ms,
+    } = gated;
+
+    check_classic_fee_cap(
+        built.fee_per_op,
+        classic_fee_source(built.fee_choice, FeeSource::ProfileDefault),
+        profile,
+    )
+    .map_err(|error| Envelope::<()>::err(&error))?;
+    let cross_check = obtain_classic_witness(
+        profile,
+        context,
+        CrossCheckValue::Unvalued,
+        TrustlineWitnessInputs {
+            source: AccountObservation::from_view(source)
+                .map_err(|error| Envelope::<()>::err(&error))?,
+            issuer,
+        },
+        "stellar_trustline",
+    )
+    .await
+    .map_err(|error| Envelope::<()>::err(&error))?;
+    let envelope_xdr = built.envelope_xdr;
+
+    // ── Drain the audit outbox before the signing key loads ──────────────────
+    // The clawback opt-in was read from the approval store after the audit
+    // pre-flight. Re-acquiring the keyed writer is a cache hit, which drains
+    // the outbox, so a consent row `stellar-agent approve` queued meanwhile is
+    // in the log before the key is touched. Fail closed.
+    crate::commands::value_audit::drain_consent_rows_before_signing(profile, profile_name)
+        .map_err(|e| Envelope::<()>::err(&e))?;
+
+    // ── Load signer from keyring ──────────────────────────────────────────────
+    let expected_g = profile.mcp_signer_default.account.as_str();
+    let signer_handle = enrolled_keyring_signer(profile_name, profile, expected_g, None)
+        .await
+        .map_err(|e| {
+            let (code, message) = signer_load_failure_parts(&e);
+            Envelope::<()>::err_raw(code, message)
+        })?;
+
+    // ── Sign envelope ─────────────────────────────────────────────────────────
+    let signed_xdr = attach_signature(&envelope_xdr, &signer_handle, network_passphrase)
+        .await
+        .map_err(|e| Envelope::<()>::err_raw("trustline.sign_failed", e.to_string()))?;
+
+    // ── Record, then submit ───────────────────────────────────────────────────
+    // The recorder writes the receipt, the pending audit row and the
+    // spending-window reservation before the bytes leave. It records a
+    // reported success on the receipt and in the reservation, and every other
+    // answer leaves all three standing.
+    let submission_failure = |e: WalletError| {
+        crate::commands::submission_record::error_envelope_with_fallback(
+            &e,
+            &signed_xdr,
+            "trustline",
+            "trustline.submit_failed",
+        )
+    };
+    let recorder = crate::commands::submission_record::build_recorder(
+        crate::commands::submission_record::SubmitRecord {
+            unvalued: None,
+            policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
+            profile,
+            profile_name: profile_name.to_owned(),
+            verb: "trustline",
+            tool: "stellar_trustline",
+            chain_id,
+            effects,
+            audit: Some(Arc::clone(audit_writer)),
+            now_ms,
+        },
+    )
+    .map_err(submission_failure)?
+    .with_witness(cross_check.witness());
+
+    let SubmissionResult {
+        tx_hash, ledger, ..
+    } = submit_and_wait(
+        rpc_client,
+        &signed_xdr,
+        submit_timeout(args.timeout_seconds, profile),
+        network_passphrase,
+        Some(SubmissionSignerKind::Keyring),
+        Some(&recorder),
+    )
+    .await
+    .map_err(submission_failure)?;
+
+    let tx_hash_redacted = stellar_agent_network::submit::redact_tx_hash(&tx_hash);
+    tracing::info!(
+        subcommand = "trustline",
+        chain = %chain_id,
+        code = %resolved.code,
+        issuer = %redact_strkey_first5_last5(&resolved.issuer),
+        tx_hash = %tx_hash_redacted,
+        ledger = ?ledger,
+        "ChangeTrust tx submitted"
+    );
+
+    Ok(TrustlineSubmitted {
+        status: "submitted",
+        action: "change_trust",
+        code: resolved.code.clone(),
+        issuer_redacted: redact_strkey_first5_last5(&resolved.issuer),
+        limit_stroops: args.limit_stroops.map(|v| v.to_string()),
+        is_pinned: resolved.is_pinned,
+        tx_hash,
+        ledger,
+        cross_check: Some(cross_check.view()),
+        business_id: args.business_id.clone(),
+    })
+}
+
+/// A built, unsigned `ChangeTrust` envelope and the fee it pays.
+struct BuiltTrustline {
+    /// The unsigned envelope, base64.
+    envelope_xdr: String,
+    /// The parsed `--fee` choice, which names the fee's source in a cap
+    /// refusal.
+    fee_choice: ClassicFeeChoice,
+    /// The selected per-operation fee.
+    fee_per_op: u32,
+}
+
+/// The fee per operation a profile-default fee choice gives: the profile's
+/// configured fee, else 100 stroops, as the MCP helper
+/// `resolve_classic_fee_per_op_stroops` gives.
+fn default_fee_per_op(profile: &Profile) -> u32 {
+    const DEFAULT_CLASSIC_FEE_STROOPS: u32 = 100;
+    profile
+        .classic_fee_per_op_stroops
+        .unwrap_or(DEFAULT_CLASSIC_FEE_STROOPS)
+}
+
+/// Resolves the fee and builds the unsigned `ChangeTrust` envelope of `from`
+/// for `resolved`, at the source's current sequence.
+///
+/// # Errors
+///
+/// `trustline.invalid_fee`, `trustline.fee_resolution_failed`,
+/// `trustline.asset_build_failed` or `trustline.envelope_build_failed`.
+async fn build_change_trust(
+    args: &TrustlineArgs,
+    profile: &Profile,
+    rpc_client: &StellarRpcClient,
+    chain: stellar_agent_core::profile::caip2::Caip2,
+    resolved: &ResolvedAsset,
+    source: &AccountView,
+) -> Result<BuiltTrustline, Envelope<()>> {
+    let fee_choice = parse_classic_fee_choice(args.classic_base.as_deref())
+        .map_err(|e| Envelope::<()>::err_raw("trustline.invalid_fee", e.code().to_string()))?;
+    let fee_selection =
+        resolve_classic_fee_selection(rpc_client, default_fee_per_op(profile), fee_choice)
+            .await
+            .map_err(|e| {
+                Envelope::<()>::err_raw("trustline.fee_resolution_failed", e.to_string())
+            })?;
+    let fee_per_op = fee_selection.per_op_stroops;
+
+    let asset = Asset::from_code_and_issuer(&resolved.code, &resolved.issuer)
+        .map_err(|e| Envelope::<()>::err_raw("trustline.asset_build_failed", e.to_string()))?;
+    let envelope_build_failed =
+        |e: WalletError| Envelope::<()>::err_raw("trustline.envelope_build_failed", e.to_string());
+    let mut builder = ClassicOpBuilder::new(
+        &args.from,
+        source.sequence_number,
+        chain.network_passphrase(),
+        fee_per_op,
+    );
+    builder
+        .change_trust(&asset, args.limit_stroops)
+        .map_err(envelope_build_failed)?;
+    builder
+        .with_mainnet_deadline()
+        .map_err(envelope_build_failed)?;
+    let envelope_xdr = builder.build().map_err(envelope_build_failed)?;
+
+    // NEVER log the envelope XDR at info.
+    tracing::debug!(
+        subcommand = "trustline",
+        chain = %chain.caip2_str(),
+        "ChangeTrust envelope built (XDR at debug only)"
+    );
+    Ok(BuiltTrustline {
+        envelope_xdr,
+        fee_choice,
+        fee_per_op,
+    })
+}
+
+/// Runs the wallet-controlled clawback gate of a trustline to `resolved`.
+///
+/// Reads the verified opt-in from the approval store, builds the preview,
+/// and applies its gate decision. On testnet the opt-in is HMAC-verified; on
+/// mainnet, where `mainnet_policy` is the verified policy the write runs
+/// under, it must also carry a verified passkey receipt under that policy,
+/// still current. A clawback-enabled issuer without a verified opt-in gets an
+/// opt-in pending entry and the `clawback_opt_in_required` outcome.
+///
+/// # Errors
+///
+/// Returns the exit code after writing the gate's outcome or refusal to
+/// `out`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct input of the clawback gate"
+)]
+fn clawback_gate(
+    out: &mut dyn Write,
+    profile: &Profile,
+    profile_name: &str,
+    chain: stellar_agent_core::profile::caip2::Caip2,
+    resolved: &ResolvedAsset,
+    issuer_flags: Option<&AccountFlagsView>,
+    limit_stroops: Option<i64>,
+    mainnet_policy: Option<&stellar_agent_core::mainnet::verified_policy::VerifiedPolicy>,
+) -> Result<TrustlinePreview, i32> {
     // ── GATE 5: Wallet-controlled clawback opt-in lookup (HMAC-verified) ────
     //
     // `opt_in_present` is NOT a CLI flag; it is derived from the wallet-controlled
@@ -487,23 +892,23 @@ where
     // loads the attestation key from the keyring and calls `verify_attestation`
     // (constant-time HMAC-SHA256).  A presence-only check allows forged blobs.
     //
-    // Network key: `context.chain_id.caip2_str()` is canonical and consistent
-    // across mint, digest, record, and lookup.
+    // Network key: `chain.caip2_str()` is canonical and consistent across
+    // mint, digest, record, and lookup.
     //
-    // Keyring unavailable → fail-closed: opt-in treated as absent.
+    // Keyring unavailable: fail closed, the opt-in is treated as absent.
     let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
         Ok(ms) => ms,
         Err(e) => {
-            return write_envelope(
+            return Err(write_envelope(
                 out,
                 &Envelope::<()>::err_raw("trustline.clock_error", e.to_string()),
                 1,
-            );
+            ));
         }
     };
-    let network_key = context.chain_id.caip2_str();
+    let network_key = chain.caip2_str();
     let opt_in_present: bool = {
-        match load_attestation_key_for_verify(&profile, &profile_name) {
+        match load_attestation_key_for_verify(profile, profile_name) {
             Ok(key_bytes) => {
                 let attestation_key = zeroize::Zeroizing::new(key_bytes);
                 default_approval_dir()
@@ -512,24 +917,37 @@ where
                         let store_path = dir.join(format!("{profile_name}.toml"));
                         open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
                             .map(|store| {
-                                store.verify_attested_trustline_clawback_opt_in(
-                                    &attestation_key,
-                                    &stellar_agent_core::approval::AttestationBinding::new(
-                                        &profile_name,
-                                        context.chain_id.caip2_str(),
+                                let binding = stellar_agent_core::approval::AttestationBinding::new(
+                                    profile_name,
+                                    chain.caip2_str(),
+                                );
+                                match mainnet_policy {
+                                    Some(policy) => store
+                                        .verify_mainnet_trustline_clawback_opt_in(
+                                            &attestation_key,
+                                            &binding,
+                                            &resolved.code,
+                                            &resolved.issuer,
+                                            policy,
+                                            now_ms,
+                                        )
+                                        .unwrap_or(false),
+                                    None => store.verify_attested_trustline_clawback_opt_in(
+                                        &attestation_key,
+                                        &binding,
+                                        network_key,
+                                        &resolved.code,
+                                        &resolved.issuer,
+                                        now_ms,
                                     ),
-                                    network_key,
-                                    &resolved.code,
-                                    &resolved.issuer,
-                                    now_ms,
-                                )
+                                }
                             })
                             .unwrap_or(false)
                     })
                     .unwrap_or(false)
             }
             Err(_) => {
-                // Keyring unavailable — fail-closed: treat opt-in as absent.
+                // Keyring unavailable: fail closed, treat the opt-in as absent.
                 tracing::debug!(
                     subcommand = "trustline",
                     "attestation key load failed; treating clawback opt-in as absent (fail-closed)"
@@ -542,8 +960,8 @@ where
     // ── GATE 6: Build trustline preview (includes clawback gate decision) ─────
     let preview = TrustlinePreview::build(
         resolved.clone(),
-        args.limit_stroops,
-        issuer_flags.as_ref(),
+        limit_stroops,
+        issuer_flags,
         opt_in_present,
     );
 
@@ -555,26 +973,26 @@ where
     // HMAC-verified opt-in clears the gate.
     match &preview.gate_decision {
         GateDecisionView::Proceed => {
-            // Gate passed — proceed to envelope build.
+            // The gate passed; the preview is returned below.
         }
         GateDecisionView::RefuseWithWarning { warning } => {
             tracing::info!(
                 subcommand = "trustline",
-                chain = %chain_id,
+                chain = %chain.caip2_str(),
                 code = %resolved.code,
                 issuer = %redact_strkey_first5_last5(&resolved.issuer),
                 warning = %warning,
-                "clawback gate RefuseWithWarning — minting opt-in pending entry"
+                "clawback gate RefuseWithWarning: minting opt-in pending entry"
             );
             // Mint the opt-in pending entry so the operator can approve it.
             let uid = match process_uid_for_attestation() {
                 Ok(u) => u,
                 Err(e) => {
-                    return write_envelope(
+                    return Err(write_envelope(
                         out,
                         &Envelope::<()>::err_raw("trustline.uid_unavailable", e.to_string()),
                         1,
-                    );
+                    ));
                 }
             };
             match default_approval_dir() {
@@ -610,7 +1028,7 @@ where
                                                 "opt-in entry insert failed"
                                             );
                                         } else {
-                                            return write_envelope(
+                                            return Err(write_envelope(
                                                 out,
                                                 &Envelope::ok(serde_json::json!({
                                                     "outcome": "clawback_opt_in_required",
@@ -624,7 +1042,7 @@ where
                                                     },
                                                 })),
                                                 1,
-                                            );
+                                            ));
                                         }
                                     }
                                     Err(e) => {
@@ -655,272 +1073,29 @@ where
                 }
             }
             // Fall-through: render a plain refusal if the store mint failed.
-            return write_envelope(
+            return Err(write_envelope(
                 out,
                 &Envelope::<()>::err_raw("trustline.clawback_gate_refused", warning),
                 1,
-            );
+            ));
         }
         GateDecisionView::Refuse { reason } => {
             tracing::info!(
                 subcommand = "trustline",
-                chain = %chain_id,
+                chain = %chain.caip2_str(),
                 code = %resolved.code,
                 issuer = %redact_strkey_first5_last5(&resolved.issuer),
                 reason = %reason,
-                "clawback gate Refuse — trustline refused (fail-closed or hard-refusal)"
+                "clawback gate Refuse: trustline refused (fail-closed or hard-refusal)"
             );
-            return write_envelope(
+            return Err(write_envelope(
                 out,
                 &Envelope::<()>::err_raw("trustline.gate_refused", reason),
                 1,
-            );
+            ));
         }
     }
-
-    // ── Report every later stage in one envelope carrying the preview ────────
-    let preview_view = trustline_preview_view(&preview);
-    let outcome = sign_and_submit(
-        GatedTrustline {
-            args,
-            profile: &profile,
-            profile_name: &profile_name,
-            context: &context,
-            rpc_client: &rpc_client,
-            network_passphrase,
-            chain_id,
-            resolved: &resolved,
-            source: &source_account_view,
-            issuer: IssuerObservation::from_view(&resolved.issuer, issuer_account_view.as_ref()),
-            effects: trustline_effects.as_ref(),
-            audit_writer: &audit_writer,
-            now_ms,
-        },
-        submit_transaction_and_wait,
-    )
-    .await;
-    render_trustline_outcome(out, preview_view, outcome)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Stages after the preview
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The inputs the stages after the preview take from the gates before it.
-struct GatedTrustline<'a> {
-    args: &'a TrustlineArgs,
-    profile: &'a Profile,
-    profile_name: &'a str,
-    context: &'a NetworkContext,
-    rpc_client: &'a StellarRpcClient,
-    network_passphrase: &'a str,
-    chain_id: &'a str,
-    resolved: &'a ResolvedAsset,
-    source: &'a AccountView,
-    issuer: IssuerObservation,
-    effects: Option<&'a stellar_agent_core::policy::v1::ValueEffects>,
-    audit_writer: &'a Arc<Mutex<AuditWriter>>,
-    now_ms: u64,
-}
-
-/// The success payload of a submitted `ChangeTrust` transaction.
-#[derive(Debug, serde::Serialize)]
-struct TrustlineSubmitted {
-    status: &'static str,
-    action: &'static str,
-    code: String,
-    issuer_redacted: String,
-    limit_stroops: Option<String>,
-    is_pinned: bool,
-    tx_hash: String,
-    ledger: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cross_check: Option<CrossCheckView>,
-}
-
-/// Resolves and caps the fee, obtains the cross-check witness of the source
-/// and the issuer, then builds, signs, records, and submits the `ChangeTrust`
-/// envelope.
-///
-/// `submit_and_wait` is the submission step, with the signature of
-/// [`submit_transaction_and_wait`], which production passes. It receives the
-/// profile's [`Profile::submit_timeout`].
-///
-/// Renders nothing: the caller reports the returned payload or failure
-/// envelope in the one envelope that carries the preview.
-async fn sign_and_submit<S>(
-    gated: GatedTrustline<'_>,
-    submit_and_wait: S,
-) -> Result<TrustlineSubmitted, Envelope<()>>
-where
-    S: AsyncFnOnce(
-        &StellarRpcClient,
-        &str,
-        std::time::Duration,
-        &str,
-        Option<SubmissionSignerKind>,
-        Option<&dyn SubmissionRecorder>,
-    ) -> Result<SubmissionResult, WalletError>,
-{
-    let GatedTrustline {
-        args,
-        profile,
-        profile_name,
-        context,
-        rpc_client,
-        network_passphrase,
-        chain_id,
-        resolved,
-        source,
-        issuer,
-        effects,
-        audit_writer,
-        now_ms,
-    } = gated;
-
-    // ── Fee resolution ────────────────────────────────────────────────────────
-    let fee_choice = parse_classic_fee_choice(args.classic_base.as_deref())
-        .map_err(|e| Envelope::<()>::err_raw("trustline.invalid_fee", e.code().to_string()))?;
-    // Unwrap Option<u32> with a safe default (100 stroops = testnet safe floor).
-    // The MCP path uses the common helper `resolve_classic_fee_per_op_stroops`;
-    // the CLI path is equivalent: fallback to 100 when the profile has no explicit
-    // fee configured.
-    const DEFAULT_CLASSIC_FEE_STROOPS: u32 = 100;
-    let default_fee_per_op = profile
-        .classic_fee_per_op_stroops
-        .unwrap_or(DEFAULT_CLASSIC_FEE_STROOPS);
-    let fee_selection = resolve_classic_fee_selection(rpc_client, default_fee_per_op, fee_choice)
-        .await
-        .map_err(|e| Envelope::<()>::err_raw("trustline.fee_resolution_failed", e.to_string()))?;
-    let fee_per_op = fee_selection.per_op_stroops;
-    check_classic_fee_cap(
-        fee_per_op,
-        classic_fee_source(fee_choice, FeeSource::ProfileDefault),
-        profile,
-    )
-    .map_err(|error| Envelope::<()>::err(&error))?;
-    let cross_check = obtain_classic_witness(
-        profile,
-        context,
-        CrossCheckValue::Unvalued,
-        TrustlineWitnessInputs {
-            source: AccountObservation::from_view(source)
-                .map_err(|error| Envelope::<()>::err(&error))?,
-            issuer,
-        },
-        "stellar_trustline",
-    )
-    .await
-    .map_err(|error| Envelope::<()>::err(&error))?;
-
-    // ── Build unsigned ChangeTrust envelope ───────────────────────────────────
-    let asset = Asset::from_code_and_issuer(&resolved.code, &resolved.issuer)
-        .map_err(|e| Envelope::<()>::err_raw("trustline.asset_build_failed", e.to_string()))?;
-    let envelope_build_failed =
-        |e: WalletError| Envelope::<()>::err_raw("trustline.envelope_build_failed", e.to_string());
-    let mut builder = ClassicOpBuilder::new(
-        &args.from,
-        source.sequence_number,
-        network_passphrase,
-        fee_per_op,
-    );
-    builder
-        .change_trust(&asset, args.limit_stroops)
-        .map_err(envelope_build_failed)?;
-    let envelope_xdr = builder.build().map_err(envelope_build_failed)?;
-
-    // NEVER log the envelope XDR at info.
-    tracing::debug!(
-        subcommand = "trustline",
-        chain = %chain_id,
-        "ChangeTrust envelope built (XDR at debug only)"
-    );
-
-    // ── Drain the audit outbox before the signing key loads ──────────────────
-    // The clawback opt-in was read from the approval store after the audit
-    // pre-flight. Re-acquiring the keyed writer is a cache hit, which drains
-    // the outbox, so a consent row `stellar-agent approve` queued meanwhile is
-    // in the log before the key is touched. Fail closed.
-    crate::commands::value_audit::drain_consent_rows_before_signing(profile, profile_name)
-        .map_err(|e| Envelope::<()>::err(&e))?;
-
-    // ── Load signer from keyring ──────────────────────────────────────────────
-    let expected_g = profile.mcp_signer_default.account.as_str();
-    let signer_handle = enrolled_keyring_signer(profile_name, profile, expected_g)
-        .await
-        .map_err(|e| {
-            let (code, message) = signer_load_failure_parts(&e);
-            Envelope::<()>::err_raw(code, message)
-        })?;
-
-    // ── Sign envelope ─────────────────────────────────────────────────────────
-    let signed_xdr = attach_signature(&envelope_xdr, &signer_handle, network_passphrase)
-        .await
-        .map_err(|e| Envelope::<()>::err_raw("trustline.sign_failed", e.to_string()))?;
-
-    // ── Record, then submit ───────────────────────────────────────────────────
-    // The recorder writes the receipt, the pending audit row and the
-    // spending-window reservation before the bytes leave, and settles all
-    // three against what the network answers.
-    let submission_failure = |e: WalletError| {
-        crate::commands::submission_record::error_envelope_with_fallback(
-            &e,
-            &signed_xdr,
-            "trustline",
-            "trustline.submit_failed",
-        )
-    };
-    let recorder = crate::commands::submission_record::build_recorder(
-        crate::commands::submission_record::SubmitRecord {
-            policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
-            profile,
-            profile_name: profile_name.to_owned(),
-            verb: "trustline",
-            tool: "stellar_trustline",
-            chain_id,
-            effects,
-            audit: Some(Arc::clone(audit_writer)),
-            now_ms,
-        },
-    )
-    .map_err(submission_failure)?
-    .with_witness(cross_check.witness());
-
-    let SubmissionResult {
-        tx_hash, ledger, ..
-    } = submit_and_wait(
-        rpc_client,
-        &signed_xdr,
-        profile.submit_timeout(),
-        network_passphrase,
-        Some(SubmissionSignerKind::Keyring),
-        Some(&recorder),
-    )
-    .await
-    .map_err(submission_failure)?;
-
-    let tx_hash_redacted = stellar_agent_network::submit::redact_tx_hash(&tx_hash);
-    tracing::info!(
-        subcommand = "trustline",
-        chain = %chain_id,
-        code = %resolved.code,
-        issuer = %redact_strkey_first5_last5(&resolved.issuer),
-        tx_hash = %tx_hash_redacted,
-        ledger = ?ledger,
-        "ChangeTrust tx submitted"
-    );
-
-    Ok(TrustlineSubmitted {
-        status: "submitted",
-        action: "change_trust",
-        code: resolved.code.clone(),
-        issuer_redacted: redact_strkey_first5_last5(&resolved.issuer),
-        limit_stroops: args.limit_stroops.map(|v| v.to_string()),
-        is_pinned: resolved.is_pinned,
-        tx_hash,
-        ledger,
-        cross_check: Some(cross_check.view()),
-    })
+    Ok(preview)
 }
 
 /// The typed preview as the nested `preview` object of the output envelope.
@@ -1058,8 +1233,379 @@ fn signer_load_failure_parts(e: &WalletError) -> (&'static str, String) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Mainnet pipeline
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Runs the trustline on a mainnet profile.
+///
+/// The stored profile of the explicit selection replaces the merged one at
+/// the write context, and every later step reads it from the context. The
+/// verb's own steps run up to the clawback gate and the bound witness, and
+/// [`authorize_and_submit`] runs the rest with the enrolled keyring signer,
+/// calling the authorized submit directly.
+async fn run_mainnet_pipeline<InitKeyring>(
+    args: &TrustlineArgs,
+    resolved: &crate::common::ResolvedProfileName,
+    profile: &Profile,
+    init_keyring: InitKeyring,
+    out: &mut dyn Write,
+) -> i32
+where
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
+    let context = match mainnet_context(profile, resolved, MainnetEndpointFlags::default()) {
+        Ok(context) => context,
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
+    let net_context = context.network_context();
+    let profile = context.profile();
+    let name = context.profile_name();
+    if let Err(envelope) = require_v1_engine("trustline", &context) {
+        return write_envelope(out, &envelope, 1);
+    }
+    if let Err(e) = init_keyring() {
+        return write_envelope(out, &Envelope::<()>::err(&e), 1);
+    }
+    let profiles_dir = match mainnet_profiles_dir() {
+        Ok(dir) => dir,
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
+    if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.from) {
+        return write_envelope(
+            out,
+            &Envelope::<()>::err_raw(
+                "trustline.invalid_from",
+                format!("invalid from address (expected G-strkey): {err}"),
+            ),
+            1,
+        );
+    }
+    let asset = match resolve_denomination(
+        parse_denomination_input(&args.asset),
+        context.network_passphrase(),
+    ) {
+        Ok(asset) => asset,
+        Err(e) => {
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("trustline.denomination_refused", e.to_string()),
+                1,
+            );
+        }
+    };
+    // The reconcile pass below can settle, so the enablement verifies the
+    // snapshot's primary and oracle hosts before any client is built; the
+    // engine reloads after the pass, so the evaluation reads the window
+    // state the pass left.
+    let enabled = match load_mainnet_policy_engine(
+        "trustline",
+        "trustline.policy_engine_unavailable",
+        &context,
+        resolved.source,
+        &profiles_dir,
+    ) {
+        Ok(policy) => policy,
+        Err(envelope) => return write_envelope(out, &envelope, 1),
+    };
+
+    // One client serves every read, the resolver and the send.
+    let client = match context.primary_client() {
+        Ok(client) => client,
+        Err(e) if is_credential_error(&e) => {
+            return write_envelope(out, &Envelope::<()>::err(&e), 1);
+        }
+        Err(e) => {
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("trustline.rpc_init_failed", e.to_string()),
+                1,
+            );
+        }
+    };
+    let budget = stellar_agent_network::PRE_SEND_BUDGET;
+    if let Err(e) = check_endpoint_identity(&client, &net_context, budget).await {
+        return write_envelope(out, &Envelope::<()>::err(&e), 1);
+    }
+    // The check precedes the issuer and source reads, and the source read
+    // runs under the check's deadline; the summary names the ledger the
+    // check observed.
+    let readiness_deadline = stellar_agent_network::operational::readiness_deadline();
+    let operational = match check_endpoint_ready(&client, readiness_deadline).await {
+        Ok(report) => report,
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
+    let issuer_account_view = match fetch_account(&client, &asset.issuer, &[]).await {
+        Ok(view) => Some(view),
+        Err(WalletError::Network(NetworkError::AccountNotFound { .. })) => None,
+        Err(error) => return write_envelope(out, &Envelope::<()>::err(&error), 1),
+    };
+    let issuer_flags: Option<AccountFlagsView> = issuer_account_view
+        .as_ref()
+        .and_then(|v| v.account_flags.clone());
+    let requested = Asset::trustline_request(&asset.code, &asset.issuer);
+    let source_account_view = match read_within_readiness_deadline(
+        readiness_deadline,
+        fetch_account(&client, &args.from, &requested),
+    )
+    .await
+    {
+        Ok(view) => view,
+        Err(e @ WalletError::Network(NetworkError::EndpointNotReady { .. })) => {
+            return write_envelope(out, &Envelope::<()>::err(&e), 1);
+        }
+        Err(e) => {
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("trustline.source_account_fetch_failed", e.to_string()),
+                1,
+            );
+        }
+    };
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("wallet.clock_error", e.to_string()),
+                1,
+            );
+        }
+    };
+    crate::commands::submission_record::reconcile_open_reservations(
+        profile,
+        name,
+        crate::common::profile_access::ProfileOrigin::Persisted,
+        &client,
+        crate::commands::submission_record::settlement_oracle_in(profile, &net_context).as_ref(),
+        now_ms,
+        args.business_id.as_deref(),
+    )
+    .await;
+
+    // The intent the business id binds needs the verified policy and the
+    // request facts only, so a retained operation answers before the
+    // envelope is built.
+    let policy = match reload_mainnet_policy_engine(
+        "trustline",
+        "trustline.policy_engine_unavailable",
+        &context,
+        enabled,
+    ) {
+        Ok(policy) => policy,
+        Err(envelope) => return write_envelope(out, &envelope, 1),
+    };
+    let fee_choice = match parse_classic_fee_choice(args.classic_base.as_deref()) {
+        Ok(choice) => choice,
+        Err(e) => {
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("trustline.invalid_fee", e.code().to_string()),
+                1,
+            );
+        }
+    };
+    // The id is checked where the run first needs it, after every refusal
+    // a run without one gives, so their codes stay.
+    let business_id = match mainnet_business_id(args.business_id.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
+    let payload = stellar_agent_core::approval::IntentPayload::Trustline {
+        issuer: asset.issuer.clone(),
+        code: asset.code.clone(),
+        limit_stroops: args.limit_stroops.unwrap_or(i64::MAX),
+    };
+    let operation = match classic_start(
+        &context,
+        &policy.verified,
+        business_id,
+        &args.from,
+        fee_choice,
+        &stellar_xdr::Memo::None,
+        stellar_agent_network::operation_entry::IdentityFacts::Intent(payload.clone()),
+    ) {
+        Ok(ClassicStart::Proceed(operation)) => operation,
+        Ok(ClassicStart::Replay(view)) => {
+            return write_replay(out, stellar_agent_core::envelope::OutputFormat::Json, &view);
+        }
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
+
+    let built = match build_change_trust(
+        args,
+        profile,
+        &client,
+        context.chain(),
+        &asset,
+        &source_account_view,
+    )
+    .await
+    {
+        Ok(built) => built,
+        Err(envelope) => return write_envelope(out, &envelope, 1),
+    };
+    let candidate = operation.candidate(&built.envelope_xdr);
+    let total_fee = match envelope_total_fee(&candidate) {
+        Ok(fee) => fee,
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
+    // The leg names the asset the envelope carries: the resolved code and issuer.
+    let leg_asset = format!("{}:{}", asset.code, asset.issuer);
+    let policy_args = with_total_fee(trustline_policy_args(&args.from, &leg_asset), total_fee);
+    let floor = match mainnet_floor_source_requesting(
+        &context,
+        &client,
+        &policy.verified,
+        "stellar_trustline",
+        &source_account_view.account_id,
+        &requested,
+    )
+    .await
+    {
+        Ok(floor) => floor,
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
+    let source_adapter = AccountViewAdapter::new(&source_account_view);
+    let evaluation = match evaluate_mainnet_policy(
+        &policy.verified,
+        profile,
+        "stellar_trustline",
+        stellar_agent_core::policy::ToolValueKind::MovesValue,
+        context.chain().caip2_str(),
+        &policy_args,
+        Some(FloorSource::view_or(floor.as_ref(), &source_adapter)),
+        None,
+    ) {
+        Ok(evaluation) => evaluation,
+        Err(refusal) => {
+            return write_envelope(
+                out,
+                &crate::common::mainnet_confirm::render_authority_refusal("trustline", refusal),
+                1,
+            );
+        }
+    };
+    let signing = match bind_signing(
+        &context,
+        operation,
+        Staging {
+            policy: &policy.verified,
+            tool: OperationTool::CliTrustline,
+            kind: OperationKind::Trustline,
+            built: &built.envelope_xdr,
+            payload,
+            verdict: evaluation.verdict,
+        },
+    ) {
+        Ok(Bound::Sign(signing)) => signing,
+        Ok(Bound::Replay(view)) => {
+            return write_replay(out, stellar_agent_core::envelope::OutputFormat::Json, &view);
+        }
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
+
+    let body = &policy.body;
+    if let Err(e) = check_classic_fee_cap_signed(
+        signing.fee_per_op_stroops(),
+        classic_fee_source(built.fee_choice, FeeSource::ProfileDefault),
+        profile,
+        Some(body.classic_max_fee_per_op_stroops),
+    ) {
+        return write_envelope(out, &Envelope::<()>::err(&e), 1);
+    }
+    let effective_cap = effective_classic_fee_cap(profile, body.classic_max_fee_per_op_stroops);
+    if let Err(e) = crate::commands::value_audit::require_value_audit_writer(profile, name) {
+        return write_envelope(out, &Envelope::<()>::err(&e), 1);
+    }
+    // The clawback opt-in is read after the audit pre-flight, as on testnet.
+    let preview = match clawback_gate(
+        out,
+        profile,
+        name,
+        context.chain(),
+        &asset,
+        issuer_flags.as_ref(),
+        args.limit_stroops,
+        Some(&policy.verified),
+    ) {
+        Ok(preview) => preview,
+        Err(code) => return code,
+    };
+    let preview_view = trustline_preview_view(&preview);
+
+    let thresholds = stellar_agent_core::cross_check::ThresholdSet::from_profile_and_signed(
+        profile,
+        body.cross_check_thresholds.as_ref(),
+    );
+    let outcome = async {
+        let source = AccountObservation::from_view(&source_account_view)
+            .map_err(|error| Envelope::<()>::err(&error))?;
+        let inputs = TrustlineWitnessInputs {
+            source,
+            issuer: IssuerObservation::from_view(&asset.issuer, issuer_account_view.as_ref()),
+        };
+        let cross_check = obtain_classic_witness_bound(
+            profile,
+            &net_context,
+            CrossCheckValue::Unvalued,
+            inputs.clone(),
+            signing.checked(),
+            &thresholds,
+            "stellar_trustline",
+        )
+        .await
+        .map_err(|error| Envelope::<()>::err(&error))?;
+        let submitted = authorize_and_submit(MainnetWriteRequest {
+            context: &context,
+            profiles_dir: &profiles_dir,
+            verb: "trustline",
+            tool: "stellar_trustline",
+            consumer: MainnetConsumer::CliTrustline,
+            unsigned_xdr: signing.stored(),
+            client: &client,
+            probe_deadline: stellar_agent_network::PRE_SEND_BUDGET,
+            submit_timeout: submit_timeout(args.timeout_seconds, profile),
+            source: &args.from,
+            source_flag: "--from",
+            signer: MainnetSignerChoice::Keyring,
+            policy: &policy,
+            evaluation: &evaluation,
+            effective_cap,
+            witness: cross_check.witness(),
+            ledger: operational,
+            operation: Some(signing.handle()),
+            rebuild: signing.rebuild(
+                built.fee_choice,
+                (default_fee_per_op(profile), FeeSource::ProfileDefault),
+                inputs,
+                &thresholds,
+            ),
+        })
+        .await?;
+        let cross_check = submitted.cross_check(&cross_check).view();
+        let SubmissionResult {
+            tx_hash, ledger, ..
+        } = submitted.result;
+        Ok(TrustlineSubmitted {
+            status: "submitted",
+            action: "change_trust",
+            code: asset.code.clone(),
+            issuer_redacted: redact_strkey_first5_last5(&asset.issuer),
+            limit_stroops: args.limit_stroops.map(|v| v.to_string()),
+            is_pinned: asset.is_pinned,
+            tx_hash,
+            ledger,
+            cross_check: Some(cross_check),
+            business_id: args.business_id.clone(),
+        })
+    }
+    .await;
+    render_trustline_outcome(out, preview_view, outcome)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -1078,6 +1624,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn load_attestation_key_for_verify_is_fail_closed_on_environmental_failure() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let profile = Profile::builder_testnet_named(
             "trustline-attest-no-logon-test",
@@ -1106,6 +1655,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn load_attestation_key_for_verify_refuses_owner_key_forms() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::KeyringEntryRef;
         stellar_agent_test_support::keyring_mock::install().ok();
         let name = "trustline-attest-owner";
@@ -1215,7 +1767,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                stellar_agent_stablecoin::resolve::ResolveError::UsdtRefused { .. }
+                stellar_agent_stablecoin::resolve::ResolveError::UsdtRefused
             ),
             "expected UsdtRefused, got: {err:?}"
         );
@@ -1262,14 +1814,21 @@ mod tests {
 
     // ── mainnet refusal ahead of the keyring and the endpoint ────────────────
 
-    /// A mainnet profile is refused with exit 1 before the keyring
-    /// initialiser, which panics if called, and before any request reaches
-    /// the profile's endpoint.
-    #[tokio::test(flavor = "current_thread")]
-    #[serial_test::serial]
-    async fn run_refuses_mainnet_before_keyring_and_any_request() {
-        let home = tempfile::tempdir().unwrap();
+    /// Runs a trustline on the mainnet profile `trustline-mainnet`, which the
+    /// injected loader answers and nothing persists, and returns the exit
+    /// code, the rendered envelope, the requests the endpoint received and
+    /// the initializer's calls.
+    async fn run_unpersisted_mainnet() -> (i32, serde_json::Value, usize, usize) {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
         let mut output = Vec::new();
         let rpc = wiremock::MockServer::start().await;
         let args = TrustlineArgs {
@@ -1278,32 +1837,105 @@ mod tests {
             asset: "USDC".to_owned(),
             limit_stroops: None,
             classic_base: None,
+            timeout_seconds: None,
+            business_id: None,
         };
         let code = run_with_dependencies(
             &args,
-            |name| {
-                Ok(
-                    Profile::builder_mainnet_named(name, rpc.uri(), "s", "default", "n", "a")
-                        .build(),
-                )
-            },
-            || panic!("a mainnet profile must not initialise the keyring"),
+            crate::test_rpc::ImplicitSelection::loader(&rpc.uri()),
+            crate::test_rpc::counting_initializer(&calls),
             &mut output,
         )
         .await;
-        assert_eq!(code, 1, "a mainnet trustline must exit with code 1");
-        assert!(
-            rpc.received_requests().await.unwrap().is_empty(),
-            "a mainnet trustline must send no request"
-        );
         let rendered: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let requests = rpc.received_requests().await.unwrap().len();
+        (code, rendered, requests, calls.get())
+    }
+
+    /// Without `mainnet-write` a mainnet profile is refused at the write
+    /// context, before the keyring initializer and before any request.
+    #[cfg(not(feature = "mainnet-write"))]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn run_refuses_mainnet_before_keyring_and_any_request() {
+        let (code, rendered, requests, calls) = run_unpersisted_mainnet().await;
+        assert_eq!(code, 1, "a mainnet trustline must exit with code 1");
         assert_eq!(rendered["error"]["code"], "network.mainnet_write_forbidden");
+        assert_eq!(requests, 0, "a mainnet trustline must send no request");
+        assert_eq!(calls, 0, "the keyring is never initialized");
+    }
+
+    /// With `mainnet-write` the write context loads the stored profile, and
+    /// an absent profile file refuses before the keyring initializer and
+    /// before any request.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn run_refuses_mainnet_before_keyring_and_any_request() {
+        let (code, rendered, requests, calls) = run_unpersisted_mainnet().await;
+        assert_eq!(code, 1, "a mainnet trustline must exit with code 1");
+        assert_eq!(rendered["error"]["code"], "validation.profile_not_found");
+        assert_eq!(requests, 0, "a mainnet trustline must send no request");
+        assert_eq!(calls, 0, "the keyring is never initialized");
+    }
+
+    /// A mainnet profile selected without `--profile` refuses before the
+    /// keyring, in both builds.
+    async fn assert_implicit_selection_refused(source: crate::test_rpc::ImplicitSource) {
+        let selection = crate::test_rpc::ImplicitSelection::new(source);
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut output = Vec::new();
+        let args = TrustlineArgs {
+            profile: None,
+            from: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN".to_owned(),
+            asset: "USDC".to_owned(),
+            limit_stroops: None,
+            classic_base: None,
+            timeout_seconds: None,
+            business_id: None,
+        };
+        let code = run_with_dependencies(
+            &args,
+            crate::test_rpc::ImplicitSelection::loader("https://rpc.example.invalid"),
+            crate::test_rpc::counting_initializer(&calls),
+            &mut output,
+        )
+        .await;
+        assert_eq!(code, 1);
+        let rendered: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            rendered["error"]["code"], "profile.mainnet_requires_explicit_profile",
+            "{}: {rendered}",
+            selection.name
+        );
+        assert_eq!(calls.get(), 0, "the keyring is never initialized");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn a_mainnet_profile_named_by_the_variable_refuses() {
+        assert_implicit_selection_refused(crate::test_rpc::ImplicitSource::Env).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn a_mainnet_profile_saved_as_default_refuses() {
+        assert_implicit_selection_refused(crate::test_rpc::ImplicitSource::Default).await;
     }
 
     // ── keyring store initialisation ordering ─────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_initialises_keyring_store_before_signer_resolution() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1329,6 +1961,8 @@ mod tests {
             asset: String::new(),
             limit_stroops: None,
             classic_base: None,
+            timeout_seconds: None,
+            business_id: None,
         };
 
         let code = run_with_dependencies(
@@ -1351,7 +1985,7 @@ mod tests {
                 );
                 init_writer.store(true, Ordering::SeqCst);
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
-                    name: "keyring-order-test-sentinel".to_owned(),
+                    cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                 }))
             },
             &mut std::io::sink(),
@@ -1399,6 +2033,7 @@ mod tests {
             tx_hash: "ab".repeat(32),
             ledger: 7,
             cross_check: None,
+            business_id: None,
         }
     }
 
@@ -1444,18 +2079,17 @@ mod tests {
         }
     }
 
-    /// A failure after the preview stage prints exactly one JSON document:
-    /// the error envelope, with the preview nested at `error.details.preview`.
-    ///
-    /// `--fee bogus` passes every gate up to the preview against a mocked
-    /// endpoint and fails at the fee parse, before the fee-statistics request
-    /// or any submission.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_failure_after_the_preview_prints_one_envelope_with_the_preview_in_details() {
-        const NAME: &str = "trustline-one-envelope";
-
-        let home = tempfile::tempdir().unwrap();
+    /// Runs a `USDC` trustline of profile `name` with `--fee fee` against a
+    /// mocked endpoint, under a profile fee cap of 1000 stroops, and returns
+    /// the one envelope it printed and the methods the endpoint received.
+    async fn run_with_fee(name: &str, fee: &str) -> (serde_json::Value, Vec<String>) {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let rpc = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -1473,7 +2107,8 @@ mod tests {
                             stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
                         )
                     }
-                    _ => serde_json::json!({}),
+                    other => crate::test_rpc::operational_result(other)
+                        .unwrap_or_else(|| serde_json::json!({})),
                 };
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "jsonrpc": "2.0",
@@ -1484,11 +2119,12 @@ mod tests {
             .mount(&rpc)
             .await;
         let mut profile =
-            Profile::builder_testnet_named(NAME, "svc-one-envelope", ONE_ENVELOPE_FROM, "n", "a")
+            Profile::builder_testnet_named(name, "svc-one-envelope", ONE_ENVELOPE_FROM, "n", "a")
                 .with_noop_engine()
                 .build();
         profile.rpc_url = rpc.uri();
-        profile.audit_log_path = home.path().join("audit").join(format!("{NAME}.jsonl"));
+        profile.classic_max_fee_per_op_stroops = Some(1000);
+        profile.audit_log_path = home.path().join("audit").join(format!("{name}.jsonl"));
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let audit_key = &profile.audit_log_hash_chain_key_id;
         KeyringEntry::new(&audit_key.service, &audit_key.account)
@@ -1497,28 +2133,20 @@ mod tests {
             .unwrap();
 
         let args = TrustlineArgs {
-            profile: Some(NAME.to_owned()),
+            profile: Some(name.to_owned()),
             from: ONE_ENVELOPE_FROM.to_owned(),
             asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
             limit_stroops: None,
-            classic_base: Some("bogus".to_owned()),
+            classic_base: Some(fee.to_owned()),
+            timeout_seconds: None,
+            business_id: None,
         };
         let mut out = Vec::new();
         let loaded = profile.clone();
         let code =
             run_with_dependencies(&args, move |_| Ok(loaded.clone()), || Ok(()), &mut out).await;
-
         assert_eq!(code, 1);
         let envelope = crate::common::render::single_json_document(&out);
-        assert_eq!(envelope["ok"], false, "{envelope}");
-        assert_eq!(
-            envelope["error"]["code"], "trustline.invalid_fee",
-            "{envelope}"
-        );
-        let preview = &envelope["error"]["details"]["preview"];
-        assert_eq!(preview["code"], "USDC", "{envelope}");
-        assert_eq!(preview["issuer"], ONE_ENVELOPE_ISSUER, "{envelope}");
-        assert_eq!(preview["gate_decision"]["kind"], "proceed", "{envelope}");
         let methods: Vec<String> = rpc
             .received_requests()
             .await
@@ -1530,6 +2158,51 @@ mod tests {
                     .and_then(|body| body["method"].as_str().map(str::to_owned))
             })
             .collect();
+        (envelope, methods)
+    }
+
+    /// A failure after the preview stage prints exactly one JSON document:
+    /// the error envelope, with the preview nested at `error.details.preview`.
+    ///
+    /// `--fee 5000` above the profile's 1000-stroop cap passes every gate up
+    /// to the preview and fails at the fee cap check after it, before any
+    /// submission.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failure_after_the_preview_prints_one_envelope_with_the_preview_in_details() {
+        let (envelope, methods) = run_with_fee("trustline-one-envelope", "5000").await;
+
+        assert_eq!(envelope["ok"], false, "{envelope}");
+        assert_eq!(
+            envelope["error"]["code"], "fees.percentile_exceeds_cap",
+            "{envelope}"
+        );
+        let preview = &envelope["error"]["details"]["preview"];
+        assert_eq!(preview["code"], "USDC", "{envelope}");
+        assert_eq!(preview["issuer"], ONE_ENVELOPE_ISSUER, "{envelope}");
+        assert_eq!(preview["gate_decision"]["kind"], "proceed", "{envelope}");
+        assert!(
+            !methods
+                .iter()
+                .any(|m| m == "getFeeStats" || m == "sendTransaction"),
+            "the fee cap check fails before any later request: {methods:?}"
+        );
+    }
+
+    /// The fee is parsed with the envelope build, before the policy and the
+    /// preview, so a malformed fee refuses with one envelope that carries no
+    /// preview, before the fee-statistics request or any submission.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_malformed_fee_refuses_before_the_preview() {
+        let (envelope, methods) = run_with_fee("trustline-malformed-fee", "bogus").await;
+
+        assert_eq!(envelope["ok"], false, "{envelope}");
+        assert_eq!(
+            envelope["error"]["code"], "trustline.invalid_fee",
+            "{envelope}"
+        );
+        assert!(envelope["error"].get("details").is_none(), "{envelope}");
         assert!(
             !methods
                 .iter()
@@ -1541,17 +2214,29 @@ mod tests {
     // ── Submit timeout ────────────────────────────────────────────────────────
 
     /// Runs the stages after the preview for a `USDC` trustline of profile
-    /// `name` from a seeded keyring signer, with a submission step that
-    /// records the timeout it is handed and refuses, and returns that timeout.
+    /// `name`, whose `submit_timeout_seconds` is `configured`, from a seeded
+    /// keyring signer with `--timeout-seconds` set to `flag`. The submission
+    /// step records the timeout it is handed and refuses, and the helper
+    /// returns that timeout.
     ///
     /// The fee comes from the profile default, so no request reaches the
     /// unroutable endpoint the client names. Each call takes its own profile
     /// name: the process-wide audit registry and the keyring tip anchor bind a
     /// profile name to one audit log.
-    async fn forwarded_submit_timeout(name: &str, configured: Option<u64>) -> std::time::Duration {
+    async fn forwarded_submit_timeout(
+        name: &str,
+        configured: Option<u64>,
+        flag: Option<u64>,
+    ) -> std::time::Duration {
         const SEED: [u8; 32] = [0x5c; 32];
 
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let from = stellar_agent_test_support::signed_envelope::account_id_for_seed(SEED);
         let mut profile =
@@ -1577,6 +2262,7 @@ mod tests {
                 ),
             )
             .unwrap();
+        crate::common::identity_fixture::store_signer_identity_of_seed(name, &profile, SEED);
         let audit_writer =
             crate::commands::value_audit::require_value_audit_writer(&profile, name).unwrap();
 
@@ -1586,6 +2272,8 @@ mod tests {
             asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
             limit_stroops: None,
             classic_base: None,
+            timeout_seconds: flag,
+            business_id: None,
         };
         let resolved = resolve_denomination(
             DenominationInput::CodeAndIssuer {
@@ -1597,6 +2285,32 @@ mod tests {
         .unwrap();
         let rpc_client = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
         let context = NetworkContext::from_profile(&profile);
+        let source = AccountView::new(
+            from.clone(),
+            1,
+            0,
+            vec![stellar_agent_network::BalanceView::new(
+                stellar_agent_network::AssetView::native(),
+                "100.0000000".to_owned(),
+                None,
+                "0.0000000".to_owned(),
+                "0.0000000".to_owned(),
+            )],
+            stellar_agent_network::ThresholdsView::new(1, 0, 0, 0),
+            vec![],
+            None,
+            None,
+        );
+        let built = build_change_trust(
+            &args,
+            &profile,
+            &rpc_client,
+            stellar_agent_core::profile::caip2::Caip2::Testnet,
+            &resolved,
+            &source,
+        )
+        .await
+        .unwrap();
 
         let forwarded = Arc::new(Mutex::new(None));
         let seen = Arc::clone(&forwarded);
@@ -1610,23 +2324,9 @@ mod tests {
                 network_passphrase: stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
                 chain_id: "stellar:testnet",
                 resolved: &resolved,
-                source: &AccountView::new(
-                    from.clone(),
-                    1,
-                    0,
-                    vec![stellar_agent_network::BalanceView::new(
-                        stellar_agent_network::AssetView::native(),
-                        "100.0000000".to_owned(),
-                        None,
-                        "0.0000000".to_owned(),
-                        "0.0000000".to_owned(),
-                    )],
-                    stellar_agent_network::ThresholdsView::new(1, 0, 0, 0),
-                    vec![],
-                    None,
-                    None,
-                ),
+                source: &source,
                 issuer: IssuerObservation::from_view(ONE_ENVELOPE_ISSUER, None),
+                built,
                 effects: None,
                 audit_writer: &audit_writer,
                 now_ms: stellar_agent_core::timefmt::now_unix_ms().unwrap(),
@@ -1667,11 +2367,17 @@ mod tests {
     ) -> (
         Profile,
         String,
-        tempfile::TempDir,
+        stellar_agent_test_support::sandbox::StateSandbox,
         stellar_agent_test_support::StellarAgentHomeGuard,
     ) {
         const SEED: [u8; 32] = [0x5d; 32];
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let from = stellar_agent_test_support::signed_envelope::account_id_for_seed(SEED);
         let mut profile = Profile::builder_testnet_named(name, "svc-endpoint", &from, "n", "a")
@@ -1695,6 +2401,7 @@ mod tests {
                 ),
             )
             .unwrap();
+        crate::common::identity_fixture::store_signer_identity_of_seed(name, &profile, SEED);
         (profile, from, home, home_guard)
     }
 
@@ -1716,6 +2423,8 @@ mod tests {
             asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
             limit_stroops: None,
             classic_base: Some("auto".to_owned()),
+            timeout_seconds: None,
+            business_id: None,
         };
         let mut out = Vec::new();
         let loaded = profile.clone();
@@ -1756,6 +2465,8 @@ mod tests {
             asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
             limit_stroops: None,
             classic_base: None,
+            timeout_seconds: None,
+            business_id: None,
         };
         let mut out = Vec::new();
         let loaded = profile.clone();
@@ -1779,18 +2490,119 @@ mod tests {
         );
     }
 
-    /// An unset `submit_timeout_seconds` hands the submission the 60-second
-    /// default, and a configured one hands it its own value.
+    /// Runs a `USDC` trustline of the seeded profile `name` against `server`
+    /// and returns the exit code and the printed envelope.
+    async fn readiness_run(name: &str, server: &wiremock::MockServer) -> (i32, serde_json::Value) {
+        let (profile, from, _home, _home_guard) = seeded_trustline_profile(name, &server.uri());
+        let args = TrustlineArgs {
+            profile: Some(name.to_owned()),
+            from,
+            asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
+            limit_stroops: None,
+            classic_base: None,
+            timeout_seconds: None,
+            business_id: None,
+        };
+        let mut out = Vec::new();
+        let loaded = profile.clone();
+        let code =
+            run_with_dependencies(&args, move |_| Ok(loaded.clone()), || Ok(()), &mut out).await;
+        (code, crate::common::render::single_json_document(&out))
+    }
+
+    /// A trustline checks the endpoint's identity, then its health and the
+    /// close time of its latest ledger, and reads the issuer only after both
+    /// checks.
     #[tokio::test]
     #[serial_test::serial]
-    async fn sign_and_submit_forwards_the_profile_submit_timeout() {
+    async fn a_trustline_checks_readiness_before_the_issuer_read() {
+        let from = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x5d; 32]);
+        let server = crate::test_rpc::ClassicRpc::testnet(&[&from, ONE_ENVELOPE_ISSUER])
+            .serve()
+            .await;
+
+        let (code, envelope) = readiness_run("trustline-readiness-order", &server).await;
+        let methods = crate::test_rpc::methods(&server).await;
+
+        assert_eq!(code, 0, "{envelope}");
         assert_eq!(
-            forwarded_submit_timeout("trustline-timeout-unset", None).await,
-            std::time::Duration::from_secs(60)
+            methods[..4],
+            ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"],
+            "identity, then readiness, then the issuer read: {methods:?}"
+        );
+    }
+
+    /// An endpoint whose latest ledger closed beyond the readiness bound is
+    /// refused with `network.endpoint_not_ready` before the issuer read.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stale_endpoint_is_refused_before_the_issuer_read() {
+        let from = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x5d; 32]);
+        let endpoint = crate::test_rpc::ClassicRpc::testnet(&[&from, ONE_ENVELOPE_ISSUER]);
+        endpoint.close_ledgers_ago(120);
+        let server = endpoint.serve().await;
+
+        let (code, envelope) = readiness_run("trustline-readiness-stale", &server).await;
+
+        assert_eq!(code, 1, "{envelope}");
+        assert_eq!(
+            envelope["error"]["code"], "network.endpoint_not_ready",
+            "{envelope}"
         );
         assert_eq!(
-            forwarded_submit_timeout("trustline-timeout-set", Some(17)).await,
+            crate::test_rpc::methods(&server).await,
+            ["getNetwork", "getHealth", "getLedgers"],
+            "a stale endpoint answers no issuer read"
+        );
+    }
+
+    /// An endpoint that reports a status other than healthy is refused with
+    /// `network.endpoint_not_ready` before its latest ledger and the issuer
+    /// are read.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unhealthy_endpoint_is_refused_before_the_issuer_read() {
+        let from = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x5d; 32]);
+        let endpoint = crate::test_rpc::ClassicRpc::testnet(&[&from, ONE_ENVELOPE_ISSUER]);
+        endpoint.report_health("unhealthy");
+        let server = endpoint.serve().await;
+
+        let (code, envelope) = readiness_run("trustline-readiness-unhealthy", &server).await;
+
+        assert_eq!(code, 1, "{envelope}");
+        assert_eq!(
+            envelope["error"]["code"], "network.endpoint_not_ready",
+            "{envelope}"
+        );
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("status \"unhealthy\"")),
+            "the refusal names the status: {envelope}"
+        );
+        assert_eq!(
+            crate::test_rpc::methods(&server).await,
+            ["getNetwork", "getHealth"],
+            "an unhealthy endpoint answers no ledger or issuer read"
+        );
+    }
+
+    /// `--timeout-seconds` sets the submission timeout; without it the
+    /// profile's `submit_timeout_seconds` applies, then 60 seconds.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn timeout_flag_falls_back_to_the_profile_then_sixty() {
+        assert_eq!(
+            forwarded_submit_timeout("trustline-timeout-flag", Some(17), Some(5)).await,
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            forwarded_submit_timeout("trustline-timeout-set", Some(17), None).await,
             std::time::Duration::from_secs(17)
+        );
+        assert_eq!(
+            forwarded_submit_timeout("trustline-timeout-unset", None, None).await,
+            std::time::Duration::from_secs(60)
         );
     }
 
@@ -1818,7 +2630,7 @@ mod tests {
                 ),
                 (
                     WalletError::Auth(AuthError::KeyringNotFound {
-                        name: "missing".into(),
+                        cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                     }),
                     "auth.keyring_not_found",
                 ),
@@ -1865,7 +2677,13 @@ mod tests {
             const FROM: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
             const ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
-            let home = tempfile::tempdir().unwrap();
+            let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                home.path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
             let rpc = wiremock::MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -1883,7 +2701,8 @@ mod tests {
                             )
                         }
                         "getFeeStats" => serde_json::json!({}),
-                        _ => serde_json::json!({}),
+                        other => crate::test_rpc::operational_result(other)
+                            .unwrap_or_else(|| serde_json::json!({})),
                     };
                     wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                         "jsonrpc": "2.0",
@@ -1911,11 +2730,15 @@ mod tests {
             let queue_hook = {
                 let queued = Arc::clone(&queued);
                 let log_path = log_path.clone();
+                let outbox_store = stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                    &profile.audit_log_hash_chain_key_id,
+                    &log_path,
+                );
                 Arc::new(move || {
                     if queued.swap(true, Ordering::SeqCst) {
                         return;
                     }
-                    AuditOutbox::for_log(&log_path)
+                    AuditOutbox::for_log(&log_path, outbox_store.clone())
                         .append(&AuditEntry::new_approval_attested(
                             "TrustlineClawbackOptIn",
                             "stellar_trustline_commit",
@@ -1962,6 +2785,7 @@ mod tests {
                     )
                     .unwrap();
             }
+            crate::common::identity_fixture::store_signer_identity_of_account(NAME, &profile);
 
             // An earlier keyed call caches the writer in this process.
             let _cached = AuditWriterRegistry::get_or_open_keyed(
@@ -1982,6 +2806,8 @@ mod tests {
                 asset: format!("USDC:{ISSUER}"),
                 limit_stroops: None,
                 classic_base: None,
+                timeout_seconds: None,
+                business_id: None,
             };
             let loaded = profile.clone();
             let code = run_with_dependencies(
@@ -2009,7 +2835,7 @@ mod tests {
         use super::*;
         use crate::test_rpc::{
             ACCOUNT_SEQUENCE, ClassicRpc, PRIMARY_CREDENTIAL, PRIMARY_CREDENTIAL_TOKEN,
-            account_key, account_xdr, assert_rows_carry_witness, credential_primary,
+            account_key, account_xdr, assert_pending_row_carries_witness, credential_primary,
             fail_read_of_with_text, methods, sent,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2124,12 +2950,17 @@ mod tests {
                     .as_str(),
             )
             .unwrap();
+            crate::common::identity_fixture::store_signer_identity_of_seed(
+                &name, &profile, [0x5d; 32],
+            );
             let args = TrustlineArgs {
                 profile: Some(name),
                 from,
                 asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
                 limit_stroops: None,
                 classic_base: None,
+                timeout_seconds: None,
+                business_id: None,
             };
             let mut out = Vec::new();
             let rc =
@@ -2167,7 +2998,7 @@ mod tests {
                         value["error"]["message"]
                             .as_str()
                             .unwrap()
-                            .contains("profile's per-operation fee")
+                            .contains("classic_fee_per_op_stroops must not exceed")
                     );
                 }
                 if matches!(case, Case::Transport) {
@@ -2192,7 +3023,7 @@ mod tests {
                     }
                 );
                 if matches!(case, Case::Pass) {
-                    assert_rows_carry_witness(&profile, &oracle.uri());
+                    assert_pending_row_carries_witness(&profile, &oracle.uri());
                 } else {
                     assert!(methods(&oracle).await.is_empty());
                 }
@@ -2243,6 +3074,987 @@ mod tests {
         #[serial_test::serial]
         async fn absent_issuer_refuses_gate() {
             exercise(Case::Absent).await;
+        }
+    }
+
+    /// The mainnet pipeline over the fixture's stored profile, ceremony and
+    /// routed endpoints.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) mod mainnet_full {
+        use super::*;
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        use serde_json::Value;
+        use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+        use stellar_agent_test_support::WarningCapture;
+        use stellar_agent_test_support::signed_envelope::get_network_result;
+
+        use crate::common::mainnet_write::invalidations_on_this_thread;
+        use crate::common::mainnet_write_fixture::{
+            AGENT_SEED, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, Spec, TRUSTLINE_ASSET,
+            balance_floor, minimum_reserve, refusal_warnings, trustline_rule,
+        };
+        use crate::common::signer_ceremony::signer_resolutions_on_this_thread;
+        use crate::test_rpc::{ACCOUNT_SEQUENCE, ClassicRpc, account_key, account_xdr};
+
+        /// The native balance the mocked endpoints report for every account.
+        const BALANCE: i64 = 100_000_000_000;
+        /// The protocol reserve of an account without subentries.
+        const RESERVE: i64 = 10_000_000;
+        /// The issuer flag that enables clawback on the assets it issues.
+        const AUTH_CLAWBACK_ENABLED: u32 = 0x8;
+        /// The testnet issuer the wallet pins for USDC.
+        pub(crate) const TESTNET_ISSUER: &str =
+            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+        fn agent() -> String {
+            stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED)
+        }
+
+        /// An endpoint funding the agent and the destination, and reporting
+        /// the network's USDC issuer with `issuer_flags`.
+        pub(crate) fn ledger(mainnet: bool, issuer_flags: u32) -> ClassicRpc {
+            let agent = agent();
+            let (rpc, issuer) = if mainnet {
+                (ClassicRpc::mainnet(&[&agent, DESTINATION]), ISSUER)
+            } else {
+                (ClassicRpc::testnet(&[&agent, DESTINATION]), TESTNET_ISSUER)
+            };
+            rpc.with_entry(
+                account_key(issuer),
+                account_xdr(issuer, ACCOUNT_SEQUENCE, issuer_flags, ""),
+            )
+        }
+
+        pub(crate) fn spec(name: &'static str) -> Spec {
+            Spec::new(name)
+                .primary(ledger(true, 0))
+                .oracle(ledger(true, 0))
+        }
+
+        /// A trustline from the agent to [`TRUSTLINE_ASSET`] on the
+        /// fixture's profile.
+        pub(crate) fn mainnet_args(fixture: &MainnetFixture) -> TrustlineArgs {
+            TrustlineArgs {
+                profile: Some(fixture.name.to_owned()),
+                from: fixture.agent.g.clone(),
+                asset: TRUSTLINE_ASSET.to_owned(),
+                limit_stroops: None,
+                classic_base: None,
+                timeout_seconds: None,
+                business_id: Some(crate::common::business_entry::fresh_business_id()),
+            }
+        }
+
+        pub(crate) struct Run {
+            pub(crate) code: i32,
+            pub(crate) envelope: Value,
+        }
+
+        impl Run {
+            fn code(&self) -> &str {
+                self.envelope["error"]["code"].as_str().unwrap_or("")
+            }
+            fn message(&self) -> &str {
+                self.envelope["error"]["message"].as_str().unwrap_or("")
+            }
+        }
+
+        pub(crate) async fn run(fixture: &MainnetFixture, args: &TrustlineArgs) -> Run {
+            let mut out = Vec::new();
+            let code =
+                run_with_dependencies(args, fixture.loader(), fixture.initializer(), &mut out)
+                    .await;
+            Run {
+                code,
+                envelope: crate::common::render::single_json_document(&out),
+            }
+        }
+
+        /// A real browser listener gates the signer, authorization, and submission.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn direct_mainnet_confirmation_requires_uv_before_signing() {
+            for (name, flags, verdict) in [
+                ("trustline-browser-no-uv", 1, "allow"),
+                ("trustline-browser-uv", 5, "allow"),
+                ("trustline-browser-required-no-uv", 1, "require_approval"),
+                ("trustline-browser-required-uv", 5, "require_approval"),
+            ] {
+                let mut fixture = spec(name)
+                    .rules(vec![trustline_rule(verdict, "")])
+                    .build()
+                    .await;
+                fixture.present_in_browser(flags);
+                let before = signer_resolutions_on_this_thread();
+                let result = run(&fixture, &mainnet_args(&fixture)).await;
+                if verdict == "require_approval" && flags == 1 {
+                    assert_eq!(
+                        result.code(),
+                        "approval.presence_invalid",
+                        "{}",
+                        result.envelope
+                    );
+                    assert!(records(&fixture).is_empty());
+                    assert!(fixture.sent_envelopes().await.is_empty());
+                    assert!(fixture.audit_rows("approval_attested").is_empty());
+                    assert_eq!(signer_resolutions_on_this_thread(), before);
+                } else {
+                    assert_eq!(result.code, 0, "{}", result.envelope);
+                    assert_eq!(fixture.sent_envelopes().await.len(), 1);
+                    assert_eq!(signer_resolutions_on_this_thread(), before + 1);
+                    crate::common::mainnet_authority_tests::assert_authorized(
+                        &fixture,
+                        verdict == "require_approval",
+                        0,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        fn now() -> u64 {
+            stellar_agent_core::timefmt::now_unix_ms().unwrap()
+        }
+
+        fn records(fixture: &MainnetFixture) -> Vec<Value> {
+            if !fixture.window_path().exists() {
+                return Vec::new();
+            }
+            fixture.window_body()["authorizations"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        async fn assert_refused_before_confirmation(
+            fixture: &MainnetFixture,
+            run: &Run,
+            code: &str,
+        ) {
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.code(), code, "{}", run.envelope);
+            assert!(records(fixture).is_empty(), "no authorization record");
+            assert!(
+                fixture.pending_entries().is_empty(),
+                "no confirmation entry"
+            );
+            assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+        }
+
+        /// The audit writer is acquired before the signing key loads, at the
+        /// business id lookup of `classic_start`. With the profile's keyed
+        /// audit writer held from the start by another handle, as a writer of
+        /// another process holds it, the mainnet trustline refuses with the
+        /// writer's refusal before the confirmation: no authorization record,
+        /// no confirmation entry, no signer resolution, no consent ceremony,
+        /// and nothing sent.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_writer_held_from_the_start_refuses_at_the_lookup_before_the_signer() {
+            let fixture = spec("mainnet-trustline-held-writer").build().await;
+            let profile = fixture.profile();
+            // The enrollment ceremony left this process's registry holding the
+            // writer; dropping that entry leaves the log to the handle below.
+            stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(fixture.name);
+            let _held = crate::commands::value_audit::open_best_effort_audit_writer(
+                &profile,
+                fixture.name,
+                crate::common::profile_access::ProfileOrigin::Persisted,
+            )
+            .unwrap_or_else(|e| panic!("the test holds the keyed writer: {e}"));
+            let resolutions = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "audit.chain_key_unavailable").await;
+            assert!(
+                run.message().contains("audit.writer_locked"),
+                "{}",
+                run.envelope
+            );
+            assert_eq!(
+                signer_resolutions_on_this_thread(),
+                resolutions,
+                "no signer resolution"
+            );
+            fixture.assert_no_consent_ceremony();
+        }
+
+        /// The audit writer is acquired before the signing key loads, at the
+        /// trustline's own audit preflight. A first run under a business id
+        /// cancels its ceremony and leaves the operation waiting. The rerun
+        /// under the same id resumes it, so the lookup in `classic_start`
+        /// finds the record, and another handle then takes the writer at the
+        /// rerun's fee statistics read, which an automatic fee makes in the
+        /// build between the lookup and the preflight. The rerun
+        /// refuses with the writer's code at the preflight: it shows no
+        /// summary, runs no ceremony, leaves the waiting entry as it was,
+        /// resolves no signer and sends nothing.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_trustline_preflight_refuses_a_writer_taken_after_the_lookup() {
+            use stellar_agent_core::error::{ApprovalFailure, WalletError};
+            let late = crate::common::mainnet_write_fixture::LateWriter::default();
+            let mut fixture = Spec::new("mainnet-trustline-late-writer")
+                .primary(late.on(ledger(true, 0), "getFeeStats"))
+                .oracle(ledger(true, 0))
+                .build()
+                .await;
+            let mut args = mainnet_args(&fixture);
+            args.business_id = Some("late-writer".to_owned());
+            // An automatic fee reads the fee statistics in the build, which
+            // follows the lookup and precedes the preflight.
+            args.classic_base = Some("auto".to_owned());
+            fixture.present_with(|_: &crate::common::mainnet_presence::driver::Ceremony| {
+                Err(WalletError::Approval(ApprovalFailure::PresenceCanceled))
+            });
+            let first = run(&fixture, &args).await;
+            assert_eq!(first.code, 1, "canceled: {}", first.envelope);
+            let entries = fixture.pending_entries();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            let (summaries, ceremonies) = (fixture.summaries().len(), fixture.ceremonies().len());
+            stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(fixture.name);
+            late.arm(&fixture);
+            let resolutions = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(late.held(), Ok(true), "the late handle holds the writer");
+            assert_eq!(run.code, 1, "late writer: {}", run.envelope);
+            assert_eq!(
+                run.code(),
+                "audit.chain_key_unavailable",
+                "late writer: {}",
+                run.envelope
+            );
+            assert!(
+                run.message().contains("audit.writer_locked"),
+                "late writer: {}",
+                run.envelope
+            );
+            assert_eq!(
+                fixture.summaries().len(),
+                summaries,
+                "late writer: no summary is shown"
+            );
+            assert_eq!(
+                fixture.ceremonies().len(),
+                ceremonies,
+                "late writer: no ceremony runs"
+            );
+            assert_eq!(
+                fixture.pending_entries(),
+                entries,
+                "late writer: the waiting entry stays as it was"
+            );
+            assert_eq!(
+                signer_resolutions_on_this_thread(),
+                resolutions,
+                "late writer: no signer resolution"
+            );
+            assert!(
+                fixture.sent_envelopes().await.is_empty(),
+                "late writer: nothing is sent"
+            );
+        }
+
+        /// Operational check: the build checks the primary's identity, then
+        /// its health and latest ledger, and reads the issuer only after
+        /// both checks.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_endpoint_checks_precede_the_issuer_read() {
+            let fixture = Spec::new("mainnet-trustline-readiness-order")
+                .primary(ledger(true, 0))
+                .oracle(ledger(true, 0))
+                .build()
+                .await;
+
+            let _run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            let methods = fixture.primary_methods().await;
+            assert_eq!(
+                methods.get(..4),
+                Some(
+                    ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"]
+                        .map(str::to_owned)
+                        .as_slice()
+                ),
+                "identity, then readiness, then the issuer read: {methods:?}"
+            );
+        }
+
+        /// Operational check: a primary whose latest ledger closed beyond the
+        /// readiness bound refuses with `network.endpoint_not_ready` before
+        /// any account read, before the summary is shown and before an entry
+        /// is parked.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_stale_endpoint_refuses_before_the_issuer_read() {
+            let primary = ledger(true, 0);
+            let fixture = Spec::new("mainnet-trustline-readiness-stale")
+                .primary(primary.clone())
+                .oracle(ledger(true, 0))
+                .build()
+                .await;
+            primary.close_ledgers_ago(120);
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "network.endpoint_not_ready").await;
+            assert_eq!(
+                fixture.primary_methods().await,
+                ["getNetwork", "getHealth", "getLedgers"],
+                "a stale endpoint answers no account read"
+            );
+            fixture.assert_no_consent_ceremony();
+        }
+
+        /// Accept: the trustline is witnessed through the routed oracle,
+        /// signed through the keyring handle and sent once.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
+        #[serial_test::serial]
+        async fn mainnet_time_bounds_trustline() {
+            let fixture = spec("mainnet-trustline-accept").build().await;
+
+            let built_at_ms =
+                stellar_agent_network::mainnet::clock::now_ms().unwrap() + CLOCK_LEAD_MS;
+            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(built_at_ms);
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1);
+            fixture.assert_signed_by_agent(&sent[0]);
+            crate::common::mainnet_write_fixture::assert_deadline_bound(&sent[0], built_at_ms);
+            let data = &run.envelope["data"];
+            assert_eq!(data["status"], "submitted", "{}", run.envelope);
+            assert_eq!(data["action"], "change_trust");
+            assert_eq!(data["code"], "USDC");
+            assert_eq!(data["ledger"], 1005);
+            assert!(!fixture.oracle_methods().await.is_empty());
+            assert!(fixture.open_authorizations(now()).is_empty());
+            assert!(invalidations_on_this_thread().is_empty());
+            crate::common::mainnet_authority_tests::assert_consumption_owed(&fixture);
+        }
+
+        /// Elapsed bound: a confirmation one second past the prepared
+        /// envelope's on-chain deadline covers the stored intent, so the
+        /// verb rebuilds the envelope with a deadline from the confirmation
+        /// time and signs it once; no refusal is logged and nothing is
+        /// invalidated.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
+        #[serial_test::serial]
+        async fn mainnet_time_bounds_trustline_elapsed_rebuilds_after_consent() {
+            let mut fixture = spec("mainnet-trustline-elapsed").build().await;
+            let clock = Rc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
+                now() + CLOCK_LEAD_MS,
+            ));
+            fixture.present_past_the_deadline(Rc::clone(&clock));
+            let args = mainnet_args(&fixture);
+            let resolutions = signer_resolutions_on_this_thread();
+            let (capture, _guard) = WarningCapture::capture(None);
+
+            let run = run(&fixture, &args).await;
+
+            let confirmed_at_ms = stellar_agent_network::mainnet::clock::now_ms().unwrap();
+            drop(clock);
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert!(refusal_warnings(&capture, "resolve_canonical_tx_sign").is_empty());
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1, "signed once");
+            crate::common::mainnet_write_fixture::assert_deadline_bound(&sent[0], confirmed_at_ms);
+            assert!(invalidations_on_this_thread().is_empty());
+            assert_eq!(signer_resolutions_on_this_thread(), resolutions + 1);
+        }
+
+        /// Engine kind: a Noop profile refuses at the engine check.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_noop_engine_refuses_before_the_keyring() {
+            let fixture = spec("mainnet-trustline-noop").noop_engine().build().await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(
+                run.code(),
+                "network.mainnet_write_forbidden",
+                "{}",
+                run.envelope
+            );
+            assert!(run.message().contains("Noop"), "{}", run.message());
+            assert_eq!(fixture.initializer_calls(), 0);
+            assert!(fixture.primary_methods().await.is_empty());
+        }
+
+        /// Engine proofs: a signed policy without a `[mainnet]` table refuses
+        /// before the confirmation.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_policy_without_the_mainnet_table_refuses() {
+            let fixture = spec("mainnet-trustline-pre-enable")
+                .pre_enable()
+                .build()
+                .await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "network.mainnet_write_forbidden")
+                .await;
+            assert!(run.message().contains("[mainnet]"), "{}", run.message());
+            assert!(
+                run.message().contains("profile enable-mainnet"),
+                "{}",
+                run.message()
+            );
+        }
+
+        /// Engine proofs: a tampered policy signature fails the engine build
+        /// with the trustline's code.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_tampered_policy_signature_refuses() {
+            let fixture = spec("mainnet-trustline-tampered").build().await;
+            fixture.tamper_policy_signature();
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(
+                &fixture,
+                &run,
+                "trustline.policy_engine_unavailable",
+            )
+            .await;
+        }
+
+        /// Enrollment: a placeholder pin refuses before the confirmation.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_placeholder_pin_refuses_before_the_confirmation() {
+            let fixture = spec("mainnet-trustline-unpinned").build().await;
+            fixture.unpin_signer();
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "auth.enrolled_signer_unpinned")
+                .await;
+            fixture.assert_no_consent_ceremony();
+        }
+
+        /// Enrollment: a `--from` other than the enrolled key refuses with the
+        /// identity rule.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_holder_other_than_the_enrolled_key_refuses() {
+            let fixture = spec("mainnet-trustline-other-holder").build().await;
+            let mut args = mainnet_args(&fixture);
+            args.from = DESTINATION.to_owned();
+
+            let run = run(&fixture, &args).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "auth.enrolled_identity_unusable")
+                .await;
+            assert!(
+                run.message().contains("public_key_mismatch"),
+                "{}",
+                run.message()
+            );
+            assert!(
+                run.message().contains(&fixture.agent.g),
+                "must name the enrolled signer address: {}",
+                run.message()
+            );
+            assert!(
+                run.message()
+                    .contains("pass it as the source with `--from`"),
+                "must tell the operator to pass the enrolled signer with `--from`: {}",
+                run.message()
+            );
+            assert!(
+                !run.message().contains("--repair-identity"),
+                "must not suggest --repair-identity: {}",
+                run.message()
+            );
+            assert!(
+                !run.message().contains("bind-signer"),
+                "must not suggest bind-signer: {}",
+                run.message()
+            );
+            fixture.assert_no_consent_ceremony();
+        }
+
+        /// Clawback: a clawback-enabled issuer without an opt-in mints the
+        /// opt-in entry and reports the outcome, before any mainnet
+        /// confirmation or authorization.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_clawback_issuer_requires_the_opt_in_first() {
+            let fixture = Spec::new("mainnet-trustline-clawback")
+                .primary(ledger(true, AUTH_CLAWBACK_ENABLED))
+                .oracle(ledger(true, AUTH_CLAWBACK_ENABLED))
+                .build()
+                .await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.envelope["ok"], true, "{}", run.envelope);
+            assert_eq!(run.envelope["data"]["outcome"], "clawback_opt_in_required");
+            let entries = fixture.pending_entries();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert_eq!(entries[0].kind_name, "TrustlineClawbackOptIn");
+            assert!(fixture.open_authorizations(now()).is_empty());
+            assert!(records(&fixture).is_empty());
+            assert!(fixture.summaries().is_empty(), "no mainnet confirmation");
+        }
+
+        /// Clawback: an opt-in entry that cannot be written refuses the
+        /// trustline.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_unwritable_approval_directory_refuses_the_clawback_gate() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let fixture = Spec::new("mainnet-trustline-clawback-store")
+                .primary(ledger(true, AUTH_CLAWBACK_ENABLED))
+                .oracle(ledger(true, AUTH_CLAWBACK_ENABLED))
+                .build()
+                .await;
+            let dir = fixture
+                .approval_store_path()
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                run.code(),
+                "trustline.clawback_gate_refused",
+                "{}",
+                run.envelope
+            );
+            assert!(records(&fixture).is_empty());
+            assert!(fixture.summaries().is_empty(), "no mainnet confirmation");
+        }
+
+        /// Trustline keyring seed: the enrolled proof reads only the identity
+        /// record, so a deleted seed entry surfaces at the signing call as
+        /// the keyring's refusal, after the claim. The claimed record keeps
+        /// its holds, and its invalidation refuses `NotOpen`.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_deleted_seed_entry_is_signer_unavailable() {
+            use stellar_agent_network::mainnet::{MainnetAuthorizationError, MainnetPrecondition};
+            // The rate limit makes the authorization hold one call.
+            let fixture = spec("mainnet-trustline-seed-deleted")
+                .rules(vec![trustline_rule(
+                    "require_approval",
+                    "{ kind = \"rate_limit\", window = \"1d\", max_calls = 10 },\n",
+                )])
+                .build()
+                .await;
+            fixture.delete_keyring_entry(&fixture.profile().mcp_signer_default);
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert!(run.code().starts_with("auth."), "{}", run.envelope);
+            assert!(
+                run.message()
+                    .ends_with(" The signature was withheld and nothing was sent."),
+                "{}",
+                run.message()
+            );
+            assert_eq!(
+                invalidations_on_this_thread(),
+                vec![(
+                    "signer_unavailable",
+                    Err(MainnetAuthorizationError::Refused(
+                        MainnetPrecondition::NotOpen
+                    ))
+                )]
+            );
+            let auths = records(&fixture);
+            assert_eq!(auths.len(), 1, "{auths:?}");
+            assert_eq!(auths[0]["state"], "claimed");
+            assert!(auths[0]["claimed_ms"].is_u64());
+            assert!(auths[0]["invalidation"].is_null());
+            let body = fixture.window_body();
+            assert!(
+                body["holds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|hold| hold["authorization_id"] == auths[0]["id"]
+                        && hold["amount"] == "1"),
+                "{body}"
+            );
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// Rendering: a resolver refusal renders the withheld text under the
+        /// generic code, never as a submit failure.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_resolver_refusal_renders_the_withheld_text() {
+            let fixture = Spec::new("mainnet-trustline-resolver")
+                .primary(ledger(true, 0).with_script(|method, index, _| {
+                    (method == "getNetwork" && index == 1)
+                        .then(|| get_network_result(TESTNET_PASSPHRASE))
+                }))
+                .oracle(ledger(true, 0))
+                .build()
+                .await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(
+                run.code(),
+                "network.mainnet_authorization_refused",
+                "{}",
+                run.envelope
+            );
+            assert_eq!(
+                run.message(),
+                "the mainnet write was refused; the signature was withheld and nothing was sent"
+            );
+        }
+
+        /// Rendering: a refusal inside the submit renders the after-signing
+        /// text under the generic code.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
+        #[serial_test::serial]
+        async fn a_submit_refusal_renders_the_after_signing_text() {
+            let started_at = now();
+            let clock = Arc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
+                started_at,
+            ));
+            let _wall_clock = stellar_agent_core::timefmt::test_clock::install(Arc::new(
+                stellar_agent_core::timefmt::MockClock::new(|| {
+                    Ok(stellar_agent_network::mainnet::clock::now_ms().unwrap())
+                }),
+            ));
+            // The script lives on in the pooled mock server after the test,
+            // so it holds the clock weakly: the override ends with `clock`.
+            let advance = Arc::downgrade(&clock);
+            let endpoint = || {
+                ledger(true, 0).with_close_clock(|| {
+                    stellar_agent_network::mainnet::clock::now_ms().unwrap() / 1000
+                })
+            };
+            let fixture = Spec::new("mainnet-trustline-submit")
+                .primary(endpoint().with_script(move |method, index, _| {
+                    if method == "getNetwork"
+                        && index == 2
+                        && let Some(clock) = advance.upgrade()
+                    {
+                        clock.set(started_at + 3_600_000);
+                    }
+                    None
+                }))
+                .oracle(endpoint())
+                .build()
+                .await;
+
+            // Issuance and authorization share the clock after a delayed setup.
+            clock.set(started_at + 6_000);
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(
+                run.code(),
+                "network.mainnet_authorization_refused",
+                "{}",
+                run.envelope
+            );
+            assert_eq!(
+                run.message(),
+                "the mainnet write was refused; the submission was refused after signing and \
+                 nothing was sent"
+            );
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// The base reserve the new trustline adds to the source's reserve.
+        const ADDED_RESERVE: i64 = stellar_agent_core::BASE_RESERVE_STROOPS;
+
+        /// The margin at which the trustline, which debits nothing, passes
+        /// the reserve it opens alone and crosses it with any fee.
+        const FEE_CROSSING_MARGIN: i64 = BALANCE - RESERVE - ADDED_RESERVE;
+
+        /// The envelope fee of the one-operation trustline.
+        const TRUSTLINE_FEE: i64 = 100;
+
+        /// The trustline opens a subentry on mainnet: at the raised reserve
+        /// plus the fee it signs and sends, and one stroop under it refuses
+        /// before any signer is resolved and sends nothing.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_opened_trustline_counts_toward_the_reserve_on_mainnet() {
+            let boundary = FEE_CROSSING_MARGIN - TRUSTLINE_FEE;
+            for (name, margin) in [
+                ("mainnet-trustline-opened-reserve", boundary),
+                ("mainnet-trustline-opened-reserve-under", boundary + 1),
+            ] {
+                let fixture = spec(name)
+                    .rules(vec![trustline_rule("allow", &minimum_reserve(margin))])
+                    .build()
+                    .await;
+                let args = mainnet_args(&fixture);
+                let before = signer_resolutions_on_this_thread();
+
+                let run = run(&fixture, &args).await;
+
+                if margin == boundary {
+                    assert_eq!(run.code, 0, "{}", run.envelope);
+                    assert_eq!(fixture.sent_envelopes().await.len(), 1);
+                    assert_eq!(signer_resolutions_on_this_thread(), before + 1);
+                } else {
+                    assert_eq!(
+                        run.code(),
+                        "policy.deny.minimum_reserve_breached",
+                        "{}",
+                        run.envelope
+                    );
+                    assert_eq!(signer_resolutions_on_this_thread(), before);
+                    assert!(fixture.sent_envelopes().await.is_empty());
+                }
+            }
+        }
+
+        /// The agent holds one USDC trustline: 1.6 XLM against a reserve of
+        /// 1.5 XLM. Removing it with limit 0 at margin 0 opens no subentry,
+        /// so it signs and sends on mainnet and on testnet, however the
+        /// caller spells the asset the resolver accepts.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn removing_a_held_trustline_adds_no_reserve() {
+            let agent = agent();
+            // The code as the caller spells it, and whether it names the issuer.
+            for (name, mainnet, code, with_issuer) in [
+                ("mainnet-trustline-held-removal", true, "USDC", true),
+                ("mainnet-trustline-held-lower", true, "usdc", true),
+                ("mainnet-trustline-held-bare", true, "usdc", false),
+                ("testnet-trustline-held-removal", false, "USDC", true),
+                ("testnet-trustline-held-lower", false, "usdc", true),
+            ] {
+                let issuer = if mainnet { ISSUER } else { TESTNET_ISSUER };
+                let spelling = if with_issuer {
+                    format!("{code}:{issuer}")
+                } else {
+                    code.to_owned()
+                };
+                let (key, entry) = crate::test_rpc::trustline_xdr(&agent, "USDC", issuer, 0, 1, 0);
+                let endpoint = || {
+                    ledger(mainnet, 0)
+                        .with_account(&agent, 16_000_000, 1)
+                        .with_entry(key.clone(), entry.clone())
+                };
+                let asset = format!("USDC:{issuer}");
+                let spec = Spec::new(name).primary(endpoint()).rules(vec![
+                    trustline_rule("allow", &minimum_reserve(0)).replace(TRUSTLINE_ASSET, &asset),
+                ]);
+                let fixture = if mainnet {
+                    spec.oracle(endpoint())
+                } else {
+                    spec.testnet()
+                }
+                .build()
+                .await;
+                let mut args = mainnet_args(&fixture);
+                args.asset = spelling;
+                args.limit_stroops = Some(0);
+
+                let run = run(&fixture, &args).await;
+
+                assert_eq!(run.code, 0, "{name}: {}", run.envelope);
+                assert_eq!(fixture.sent_envelopes().await.len(), 1, "{name}");
+            }
+        }
+
+        /// Under a met balance floor the gate and the resolver read the
+        /// floor source, which requests the trustline too: removing the
+        /// held trustline at 1.6 XLM against 1.5 XLM signs and sends.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn removing_a_held_trustline_under_a_floor_adds_no_reserve() {
+            let agent = agent();
+            let (key, entry) = crate::test_rpc::trustline_xdr(&agent, "USDC", ISSUER, 0, 1, 0);
+            let endpoint = || {
+                ledger(true, 0)
+                    .with_account(&agent, 16_000_000, 1)
+                    .with_entry(key.clone(), entry.clone())
+            };
+            let criteria = format!("{}{}", minimum_reserve(0), balance_floor(1));
+            let fixture = Spec::new("mainnet-trustline-floored-removal")
+                .primary(endpoint().entries_at_readiness_ledger())
+                .oracle(endpoint())
+                .rules(vec![trustline_rule("allow", &criteria)])
+                .build()
+                .await;
+            fixture.cover_native_history();
+            let mut args = mainnet_args(&fixture);
+            args.limit_stroops = Some(0);
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(fixture.sent_envelopes().await.len(), 1);
+        }
+
+        /// Fee in the policy arguments, mainnet.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_fee_counts_toward_the_reserve_on_mainnet() {
+            let fixture = spec("mainnet-trustline-fee-reserve")
+                .rules(vec![trustline_rule(
+                    "require_approval",
+                    &minimum_reserve(FEE_CROSSING_MARGIN),
+                )])
+                .build()
+                .await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(
+                &fixture,
+                &run,
+                "policy.deny.minimum_reserve_breached",
+            )
+            .await;
+        }
+
+        /// A matched balance floor reads the operating account: the
+        /// trustline's fee takes the observed balance below a floor at that
+        /// balance.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_floor_reads_the_observed_account_on_mainnet() {
+            let fixture = Spec::new("mainnet-trustline-floor")
+                .primary(ledger(true, 0).entries_at_readiness_ledger())
+                .oracle(ledger(true, 0))
+                .rules(vec![trustline_rule(
+                    "require_approval",
+                    &balance_floor(BALANCE),
+                )])
+                .build()
+                .await;
+            fixture.cover_native_history();
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "account.floor_refused").await;
+        }
+
+        /// Fee in the policy arguments, testnet.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_fee_counts_toward_the_reserve_on_testnet() {
+            let testnet_asset = format!("USDC:{TESTNET_ISSUER}");
+            let fixture = Spec::new("testnet-trustline-fee-reserve")
+                .testnet()
+                .primary(ledger(false, 0))
+                .rules(vec![
+                    trustline_rule("allow", &minimum_reserve(FEE_CROSSING_MARGIN))
+                        .replace(TRUSTLINE_ASSET, &testnet_asset),
+                ])
+                .build()
+                .await;
+            let mut args = mainnet_args(&fixture);
+            args.asset = testnet_asset;
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(
+                run.code(),
+                "policy.deny.minimum_reserve_breached",
+                "{}",
+                run.envelope
+            );
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// Mainnet `trustline` echoes the run's `business_id` on success.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn mainnet_trustline_success_echoes_business_id() {
+            let fixture = spec("mainnet-trustline-business-id").build().await;
+            let mut args = mainnet_args(&fixture);
+            args.business_id = Some("trustline-mainnet-bid-1".to_owned());
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(
+                run.envelope["data"]["business_id"], "trustline-mainnet-bid-1",
+                "{}",
+                run.envelope
+            );
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    async fn early_observation_precedes_window_gate() {
+        use crate::commands::submission_record::intent_gate_fixture::{IntentGateState, home};
+        use wiremock::{Mock, MockServer, matchers::method};
+        let (_home, _guard) = home();
+        let primary = MockServer::start().await;
+        let source = stellar_strkey::ed25519::PublicKey([1; 32])
+            .to_string()
+            .to_string();
+        let issuer = stellar_strkey::ed25519::PublicKey([2; 32])
+            .to_string()
+            .to_string();
+        Mock::given(method("POST"))
+            .respond_with(crate::test_rpc::ClassicRpc::testnet(&[&source, &issuer]))
+            .mount(&primary)
+            .await;
+        let name = "intent-trustline";
+        let mut profile = Profile::builder_testnet_named(name, "signer", &source, "nonce", name)
+            .rpc_url(primary.uri())
+            .build();
+        let state = IntentGateState::seed(name, &mut profile).await;
+        let args = TrustlineArgs {
+            profile: Some(name.into()),
+            from: source,
+            asset: format!("USD:{issuer}"),
+            limit_stroops: None,
+            classic_base: Some("100".into()),
+            timeout_seconds: None,
+            business_id: None,
+        };
+        for after in [false, false, true] {
+            if after {
+                state.after_retention();
+            }
+            let before = state.bytes();
+            let mut out = Vec::new();
+            assert_eq!(
+                run_with_dependencies(&args, |_| Ok(profile.clone()), || Ok(()), &mut out).await,
+                1
+            );
+            let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                value["error"]["code"],
+                if after {
+                    "audit.chain_key_unavailable"
+                } else {
+                    "policy.deny.rate_limit_exceeded"
+                }
+            );
+            state.assert_closed(&profile, u32::from(!after)).await;
+            if after {
+                assert_eq!(state.bytes(), before);
+            }
         }
     }
 }

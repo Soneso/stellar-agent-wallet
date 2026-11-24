@@ -5,11 +5,11 @@
 //!
 //! # Supported kinds
 //!
-//! - `G_ACCOUNT` — G-strkey destination address.
-//! - `C_ACCOUNT` — C-strkey (contract) destination address.
+//! - `G_ACCOUNT`: G or M destination address.
+//! - `C_ACCOUNT`: C or W destination address.
 //! - `KNOWN_ISSUER` — asset issuer G-strkey for non-native payments.
 //! - `HOME_DOMAIN` — the `home_domain` field of the destination's on-chain
-//!   `AccountEntry`, resolved via `AccountReservesView::home_domain`.
+//!   `AccountEntry`, resolved via `AccountIdentityView::home_domain`.
 //!
 //! Unsupported kinds (`SEP10_IDENTITY`, `ONE_TIME_ADDRESS`) return
 //! [`DenyReason::CounterpartyKindUnsupported`] rather than silently allowing;
@@ -24,21 +24,31 @@
 //! { kind = "counterparty_allowlist", kinds = ["HOME_DOMAIN"], allowlist = ["circle.com", "stellar.org"] }
 //! ```
 //!
-//! `kinds` selects which counterparty dimension(s) to check; `allowlist` is
-//! the approved set for all listed kinds. `gate_inflows` (bool, default
+//! `kinds` selects address alternatives and other required checks.
+//! `allowlist` is the approved set for all listed kinds. `gate_inflows` (bool, default
 //! `false`) is a `KNOWN_ISSUER`-only opt-in — see the KNOWN_ISSUER section
 //! below.
 //!
-//! # G_ACCOUNT logic
+//! # Address kinds
 //!
-//! Extracts `args["destination"]` and validates it as a G-strkey via
-//! [`stellar_strkey::ed25519::PublicKey::from_string`].  If the destination is
-//! not on the allowlist, returns [`DenyReason::CounterpartyDenied`].
+//! G and C kinds are alternatives in one address check. A destination is
+//! listed only when its kind is selected and its exact string or base address
+//! occurs in the list. M uses G_ACCOUNT and its G base; W uses C_ACCOUNT
+//! and its C base. Entries compare byte for byte. An exact M or W entry
+//! covers only that mux id. Payment-envelope decoding supplies the full M.
+//! The check runs at the first address kind; duplicates add no check.
+//! Issuer and domain checks remain required before the unlisted mode applies.
+//! With no address kind, no address check runs.
 //!
-//! # C_ACCOUNT logic
-//!
-//! Extracts `args["destination"]` and validates it as a C-strkey (contract
-//! address) via [`stellar_strkey::Contract::from_string`].
+//! Missing destinations are unverifiable. Other strkey forms and malformed
+//! strings return an evaluation error without the input or decoder detail.
+//! Raw arguments receive a denial for an unlisted address in every mode.
+//! The opaque own-rule check of SEP-43 signing, undecodable staged pay or claim
+//! envelopes, and generic bundle inners refuse even under `allow_opaque_signing`.
+//! That check has no evaluated effects: no recipient class or amount exists for
+//! a budget or approval threshold to bind. Each decoded SEP-43 payment then
+//! reaches its payment tool's rule with evaluated effects.
+//! A budget refuses generic bundle inners before evaluating any inner.
 //!
 //! # KNOWN_ISSUER logic
 //!
@@ -122,13 +132,56 @@
 //! mode for operator triage: no on-chain domain, non-ASCII homoglyph, cache
 //! not populated, no live domain binding in the cache, account not listed by the
 //! domain's `stellar.toml`, or (only once verified) not on the allowlist.
+//!
+//! # Unlisted recipients
+//!
+//! A version 2 policy can give one criterion per rule an `unlisted` table,
+//! and every table of the policy equals the first. Equal budget tables share
+//! one counter per asset across the rules that carry them. A rule without a
+//! table, its allow list, and its caps are unaffected. A table decides a call
+//! whose only failure is a debit recipient that is well-formed, verified, and
+//! outside this criterion's own list ([`RecipientClass::Unlisted`]):
+//!
+//! ```toml
+//! { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GABC..."], unlisted = { mode = "approval" } }
+//! { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GABC..."], unlisted = { mode = "budget", per_tx_stroops = 2000000, per_period_stroops = 5000000, asset = "native", window = "1d" } }
+//! ```
+//!
+//! - `deny`, the default, returns the criterion's denial.
+//! - `approval` requires approval at any amount.
+//! - `budget` admits the call when its debit in `asset` stays within
+//!   `per_tx_stroops` and, with the window's earlier unlisted debits, within
+//!   `per_period_stroops`. Every rule's budget in one asset and window shares
+//!   the bucket `unlisted:<asset>`.
+//!
+//! A missing destination or asset, an unverified home domain, or an
+//! unsupported kind is [`RecipientClass::Unverifiable`] and keeps the denial in
+//! every mode, as do an inflow-leg denial and the raw-argument path. The
+//! strictest class over the debit legs governs the call.
 
-use stellar_strkey::{Contract, ed25519::PublicKey};
+use stellar_strkey::{Strkey, ed25519::PublicKey};
 
 use crate::policy::v1::EvalContext;
+use crate::policy::v1::asset_equivalence::{assets_equivalent, total_budget_identity};
+use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
-use crate::policy::v1::value::{ValueEffects, ValueGate, classify_value};
-use crate::policy::{DenyReason, PolicyError};
+use crate::policy::v1::criteria::descriptor::{BucketDescriptor, BucketKind};
+use crate::policy::v1::criteria::per_period_cap::Window;
+use crate::policy::v1::criteria::state_store::{
+    StateKey, StateStoreError, WindowEntry, WindowLimit,
+};
+use crate::policy::v1::loader::DEFAULT_APPROVAL_TTL_SECONDS;
+use crate::policy::v1::value::{
+    ValueClass, ValueEffects, ValueGate, ValueLeg, asset_normalise, classify_value,
+    value_class_for_inner,
+};
+use crate::policy::{ApprovalRequest, Decision, DenyReason, PolicyError, UnlistedBound};
+
+#[cfg(test)]
+thread_local! {
+    /// Counts entries into `address_check` on the current test thread.
+    static ADDRESS_CHECK_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CounterpartyKind
@@ -138,7 +191,7 @@ use crate::policy::{DenyReason, PolicyError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CounterpartyKind {
-    /// A classic Stellar account address (G-strkey).
+    /// A classic or muxed Stellar account address (G or M strkey).
     GAccount,
     /// A Soroban contract address (C-strkey).
     CAccount,
@@ -177,13 +230,11 @@ impl CounterpartyKind {
             "SEP10_IDENTITY" => Ok(Self::Sep10Identity),
             "HOME_DOMAIN" => Ok(Self::HomeDomain),
             "ONE_TIME_ADDRESS" => Ok(Self::OneTimeAddress),
-            other => Err(PolicyError::PolicyFileParseFailed {
-                detail: format!(
-                    "counterparty_allowlist: unknown kind '{}'; \
+            _ => Err(PolicyError::PolicyFileParseFailed {
+                detail: "counterparty_allowlist: unknown kind; \
                      accepted: G_ACCOUNT, C_ACCOUNT, KNOWN_ISSUER, \
-                     SEP10_IDENTITY, HOME_DOMAIN, ONE_TIME_ADDRESS",
-                    other
-                ),
+                     SEP10_IDENTITY, HOME_DOMAIN, ONE_TIME_ADDRESS"
+                    .into(),
             }),
         }
     }
@@ -203,14 +254,176 @@ impl CounterpartyKind {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RecipientClass / UnlistedMode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The class a counterparty criterion assigns to the recipients of a call.
+///
+/// Only debit legs are classified; an inflow leg has no recipient class. The
+/// strictest class over the legs and kinds governs the call:
+/// `Unverifiable`, then `Unlisted`, then `Listed`. Address alternatives
+/// contribute one class. Reserved kinds are unverifiable even without debits.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::v1::criteria::counterparty_allowlist::RecipientClass;
+///
+/// assert_ne!(RecipientClass::Listed, RecipientClass::Unlisted);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipientClass {
+    /// Each required check passes, including the selected address kind and entry.
+    Listed,
+    /// A well-formed, verified recipient that fails a kind or entry requirement.
+    Unlisted,
+    /// A recipient the criterion cannot establish: a missing destination or
+    /// asset, an unverified home domain, or an unsupported kind.
+    Unverifiable,
+}
+
+impl RecipientClass {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Listed => 0,
+            Self::Unlisted => 1,
+            Self::Unverifiable => 2,
+        }
+    }
+
+    /// Returns the stricter of two optional classes. A present class is
+    /// stricter than an absent one.
+    pub(crate) fn stricter(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(if b.rank() > a.rank() { b } else { a }),
+            (a, None) => a,
+            (None, b) => b,
+        }
+    }
+}
+
+/// How a `counterparty_allowlist` criterion treats a well-formed, verified
+/// recipient outside its list.
+///
+/// A missing or unverified recipient never reaches the mode: it is refused
+/// with the criterion's own denial in every mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnlistedMode {
+    /// Refuse with the criterion's denial, as a criterion without the mode does.
+    Deny,
+    /// Require approval at any amount; every other criterion still applies.
+    Approval,
+    /// Admit the payment within a per-transaction and a rolling-window bound.
+    Budget(UnlistedBudget),
+}
+
+/// The bounds of an unlisted-recipient budget.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::v1::criteria::counterparty_allowlist::UnlistedBudget;
+/// use stellar_agent_core::policy::v1::criteria::per_period_cap::Window;
+///
+/// let budget = UnlistedBudget::new("native".into(), 10, 40, Window::parse("1d").unwrap());
+/// assert_eq!(budget.per_tx_stroops(), 10);
+/// assert_eq!(budget.per_period_stroops(), 40);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlistedBudget {
+    asset: String,
+    per_tx_stroops: i128,
+    per_period_stroops: i128,
+    window: Window,
+}
+
+impl UnlistedBudget {
+    /// Constructs a budget of `per_tx_stroops` per call and
+    /// `per_period_stroops` per `window` in `asset`.
+    #[must_use]
+    pub fn new(
+        asset: String,
+        per_tx_stroops: i128,
+        per_period_stroops: i128,
+        window: Window,
+    ) -> Self {
+        Self {
+            asset,
+            per_tx_stroops,
+            per_period_stroops,
+            window,
+        }
+    }
+
+    /// Returns the budget asset identifier.
+    #[must_use]
+    pub fn asset(&self) -> &str {
+        &self.asset
+    }
+
+    /// Returns the per-transaction bound in stroops.
+    #[must_use]
+    pub fn per_tx_stroops(&self) -> i128 {
+        self.per_tx_stroops
+    }
+
+    /// Returns the rolling-window bound in stroops.
+    #[must_use]
+    pub fn per_period_stroops(&self) -> i128 {
+        self.per_period_stroops
+    }
+
+    /// Returns the rolling window.
+    #[must_use]
+    pub fn window(&self) -> Window {
+        self.window
+    }
+
+    /// The bucket every rule's unlisted budget in this asset and window
+    /// shares, at scope specificity 1 as `per_period_cap` uses. Every
+    /// spelling of the asset on the network of `network_passphrase`, its
+    /// asset contract included, names one bucket.
+    fn state_key(&self, profile_name: &str, network_passphrase: &str) -> StateKey {
+        StateKey::new(
+            profile_name,
+            1,
+            &format!(
+                "unlisted:{}",
+                total_budget_identity(&self.asset, network_passphrase)
+            ),
+            self.window.as_secs(),
+        )
+    }
+
+    /// The limit every recorded entry carries, so the durable reservation
+    /// write re-applies the rolling-window bound.
+    fn window_limit(&self) -> WindowLimit {
+        WindowLimit::Unlisted {
+            asset: self.asset.clone(),
+            window: self.window.label().to_owned(),
+            max_stroops: self.per_period_stroops,
+        }
+    }
+}
+
+/// The fixed reason of an unlisted-recipient approval. It names no address.
+const UNLISTED_APPROVAL_REASON: &str =
+    "counterparty_allowlist: an unlisted recipient requires approval";
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CounterpartyAllowlistCriterion
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Counterparty allowlist criterion.
 ///
 /// Checks that the destination account or asset issuer is present in the
-/// configured `allowlist` for each of the specified `kinds`.  All kinds are
-/// checked; the first denial wins.
+/// configured `allowlist`. Address kinds are alternatives; issuer and domain
+/// checks are conjoined with them. The first denial follows `kinds`.
+///
+/// An optional [`UnlistedMode`] decides a call whose only failure is a
+/// well-formed, verified recipient outside the list. Every other failure keeps
+/// the criterion's first denial in every mode.
 ///
 /// # Examples
 ///
@@ -237,6 +450,8 @@ pub struct CounterpartyAllowlistCriterion {
     /// descriptor (debit and inflow alike) instead of debit legs only.  See
     /// the module-level `# KNOWN_ISSUER logic` section.  Defaults to `false`.
     gate_inflows: bool,
+    /// The treatment of an unlisted recipient; `None` keeps the denial.
+    unlisted: Option<UnlistedMode>,
 }
 
 impl CounterpartyAllowlistCriterion {
@@ -262,6 +477,7 @@ impl CounterpartyAllowlistCriterion {
             kinds,
             allowlist,
             gate_inflows: false,
+            unlisted: None,
         }
     }
 
@@ -286,10 +502,145 @@ impl CounterpartyAllowlistCriterion {
         self
     }
 
+    /// Sets the treatment of an unlisted recipient.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::policy::v1::criteria::counterparty_allowlist::{
+    ///     CounterpartyAllowlistCriterion, CounterpartyKind, UnlistedMode,
+    /// };
+    ///
+    /// let criterion = CounterpartyAllowlistCriterion::new(
+    ///     vec![CounterpartyKind::GAccount],
+    ///     vec!["GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN".to_owned()],
+    /// )
+    /// .with_unlisted(UnlistedMode::Approval);
+    /// assert_eq!(criterion.unlisted(), Some(&UnlistedMode::Approval));
+    /// ```
+    #[must_use]
+    pub fn with_unlisted(mut self, mode: UnlistedMode) -> Self {
+        self.unlisted = Some(mode);
+        self
+    }
+
     /// Returns whether the `KNOWN_ISSUER`-only inflow-gating opt-in is set.
     #[must_use]
     pub fn gate_inflows(&self) -> bool {
         self.gate_inflows
+    }
+
+    /// Returns the treatment of an unlisted recipient, or `None` when the
+    /// criterion carries no `unlisted` table.
+    #[must_use]
+    pub fn unlisted(&self) -> Option<&UnlistedMode> {
+        self.unlisted.as_ref()
+    }
+
+    /// Returns the budget of a criterion in budget mode.
+    fn budget(&self) -> Option<&UnlistedBudget> {
+        match &self.unlisted {
+            Some(UnlistedMode::Budget(budget)) => Some(budget),
+            _ => None,
+        }
+    }
+
+    /// Classifies the recipients of the call against this criterion's own
+    /// list.
+    ///
+    /// Returns `None` unless the call carries resolved value effects. Debit
+    /// legs only are classified, with the same per-kind checks the criterion
+    /// applies. With no debit, address, issuer and domain kinds leave `Listed`;
+    /// a reserved kind makes it `Unverifiable`. An M entry matches exactly,
+    /// and a G entry covers its muxed destinations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] for a malformed
+    /// destination strkey or asset issuer, as the criterion's evaluation does.
+    pub fn recipient_class(
+        &self,
+        ctx: &EvalContext<'_>,
+    ) -> Result<Option<RecipientClass>, PolicyError> {
+        let ValueGate::Effects(effects) = classify_value(ctx) else {
+            return Ok(None);
+        };
+        Ok(Some(self.classify_effects(ctx, effects)?.class))
+    }
+}
+
+/// The result of an evaluation before it maps to the deny-only or the
+/// decision interface.
+enum Outcome {
+    Pass,
+    Deny(DenyReason),
+    /// An unlisted recipient under `approval`, with the denial the deny-only
+    /// interface returns.
+    Escalate(DenyReason),
+}
+
+/// The classification of every leg of a call against one criterion.
+struct Classification {
+    /// The strictest class over the debit legs.
+    class: RecipientClass,
+    /// Whether an inflow leg fails the `gate_inflows` issuer check.
+    inflow_denied: bool,
+    /// The first denial in the configured order.
+    denial: Option<DenyReason>,
+}
+
+impl Classification {
+    fn new() -> Self {
+        Self {
+            class: RecipientClass::Listed,
+            inflow_denied: false,
+            denial: None,
+        }
+    }
+
+    fn include(&mut self, check: Check, classify: bool, inflow: bool) {
+        if classify && check.class().rank() > self.class.rank() {
+            self.class = check.class();
+        }
+        let denial = check.denial();
+        self.inflow_denied |= inflow && denial.is_some();
+        if self.denial.is_none() {
+            self.denial = denial;
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        if other.class.rank() > self.class.rank() {
+            self.class = other.class;
+        }
+        self.inflow_denied |= other.inflow_denied;
+        if self.denial.is_none() {
+            self.denial = other.denial;
+        }
+    }
+}
+
+/// The outcome of one counterparty check, with the denial it produces.
+enum Check {
+    Listed,
+    Unlisted(DenyReason),
+    Unverifiable(DenyReason),
+}
+
+impl Check {
+    fn class(&self) -> RecipientClass {
+        match self {
+            Self::Listed => RecipientClass::Listed,
+            Self::Unlisted(_) => RecipientClass::Unlisted,
+            Self::Unverifiable(_) => RecipientClass::Unverifiable,
+        }
+    }
+
+    fn denial(self) -> Option<DenyReason> {
+        match self {
+            Self::Listed => None,
+            Self::Unlisted(denial) | Self::Unverifiable(denial) => Some(denial),
+        }
     }
 }
 
@@ -298,9 +649,40 @@ impl Criterion for CounterpartyAllowlistCriterion {
         "counterparty_allowlist"
     }
 
-    /// Evaluates each configured kind against the current tool call.
+    fn windowed(&self) -> bool {
+        self.budget().is_some()
+    }
+
+    fn descriptors(&self) -> Vec<BucketDescriptor> {
+        self.budget().map_or_else(Vec::new, |budget| {
+            vec![
+                BucketDescriptor::per_call(
+                    BucketKind::UnlistedTransaction,
+                    budget.asset(),
+                    budget.per_tx_stroops(),
+                ),
+                BucketDescriptor::accumulating(
+                    BucketKind::UnlistedPeriod,
+                    budget.asset(),
+                    budget.per_period_stroops(),
+                    &StateKey::new(
+                        "",
+                        1,
+                        &format!("unlisted:{}", asset_normalise(budget.asset())),
+                        budget.window().as_secs(),
+                    ),
+                ),
+            ]
+        })
+    }
+
+    fn records_bundle_inners(&self) -> bool {
+        self.budget().is_some()
+    }
+
+    /// Evaluates address alternatives once and conjoins the other checks.
     ///
-    /// Returns `Ok(None)` when every kind passes (destination on allowlist).
+    /// Returns `Ok(None)` when required checks pass or the budget admits the call.
     /// Returns `Ok(Some(DenyReason::CounterpartyDenied))` when a destination
     /// is not on the allowlist.
     /// `HOME_DOMAIN` is evaluated against the account's on-chain home domain via
@@ -308,293 +690,509 @@ impl Criterion for CounterpartyAllowlistCriterion {
     /// `Ok(Some(DenyReason::CounterpartyKindUnsupported))` when an unsupported
     /// kind (`SEP10_IDENTITY`, `ONE_TIME_ADDRESS`) is listed.
     ///
+    /// Under `unlisted.mode = "approval"` an unlisted recipient returns the
+    /// denial here; [`Criterion::evaluate_decision`] escalates it. Under
+    /// `budget` an unlisted recipient passes within both bounds and returns
+    /// [`DenyReason::UnlistedBudgetExceeded`] beyond either. On a mainnet
+    /// profile [`Criterion::evaluate_decision`] escalates that excess.
+    ///
     /// # Errors
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when the destination
     /// field is missing or is not a valid strkey.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        // The shared fail-closed gate: an opaque-sign call under a matched
-        // rule (without `allow_opaque_signing`) or a forgotten `MovesValue`
-        // population denies here. `NotApplicable` (a genuinely read-only call,
-        // or a tool the descriptor derivation has not classified) falls
-        // through to the legacy per-kind path below, unchanged.
-        match classify_value(ctx) {
-            ValueGate::Deny(reason) => return Ok(Some(reason)),
-            ValueGate::Effects(effects) => {
-                for kind in &self.kinds {
-                    if let Some(deny) = self.evaluate_kind_over_effects(kind, ctx, effects)? {
-                        return Ok(Some(deny));
-                    }
-                }
-                return Ok(None);
-            }
-            ValueGate::NotApplicable => {}
-        }
+        Ok(match self.outcome(ctx)? {
+            Outcome::Pass => None,
+            Outcome::Deny(denial) | Outcome::Escalate(denial) => Some(denial),
+        })
+    }
 
-        for kind in &self.kinds {
-            if let Some(deny) = self.evaluate_kind(kind, ctx)? {
-                return Ok(Some(deny));
-            }
+    /// Escalates an unlisted recipient under `approval`, and on a mainnet
+    /// profile an unlisted payment beyond a budget bound, with the default
+    /// approval lifetime and a fixed reason that names no address.
+    fn evaluate_decision(&self, ctx: &EvalContext<'_>) -> Result<Decision, PolicyError> {
+        Ok(match self.outcome(ctx)? {
+            Outcome::Pass => Decision::Allow,
+            Outcome::Deny(denial) => Decision::Deny(denial),
+            Outcome::Escalate(_) => Decision::RequireApproval(
+                ApprovalRequest::new(String::new(), DEFAULT_APPROVAL_TTL_SECONDS)
+                    .with_reason(UNLISTED_APPROVAL_REASON.to_owned()),
+            ),
+        })
+    }
+
+    /// Accumulates an unlisted inner's transfer into the budget's bundle
+    /// overlay, under the key the budget check reads.
+    ///
+    /// The inner is classified against the list without account views, as the
+    /// bundle evaluation checks it. A listed inner consumes no budget.
+    fn accumulate_overlay(
+        &self,
+        ctx: &EvalContext<'_>,
+        inner: &InnerOpDescriptor,
+        overlay: &mut BundleStateOverlay,
+    ) {
+        let Some(budget) = self.budget() else {
+            return;
+        };
+        let InnerOpDescriptor::TokenTransfer { asset, amount, .. } = inner else {
+            return;
+        };
+        let inner_ctx = EvalContext {
+            tool: ctx.tool,
+            args: ctx.args,
+            profile_name: ctx.profile_name,
+            profile: ctx.profile,
+            value: value_class_for_inner(inner),
+            account_view: None,
+            identity_view: None,
+            quorum: None,
+            counterparty_cache: None,
+            sep10_sessions: None,
+            sep45_sessions: None,
+            state_store: ctx.state_store,
+            bundle: None,
+            policy_digest: ctx.policy_digest,
+            provisional: ctx.provisional,
+            now_ms: ctx.now_ms,
+        };
+        if !matches!(
+            self.recipient_class(&inner_ctx),
+            Ok(Some(RecipientClass::Unlisted))
+        ) {
+            return;
         }
-        Ok(None)
+        if !assets_equivalent(
+            &asset_normalise(asset),
+            &asset_normalise(budget.asset()),
+            &ctx.profile.network_passphrase,
+        ) {
+            return;
+        }
+        overlay.accumulate(
+            budget.state_key(ctx.profile_name, &ctx.profile.network_passphrase),
+            *amount,
+        );
+    }
+
+    /// Records the confirmed debit to unlisted recipients into the budget's
+    /// window, under the key the budget check reads.
+    fn record_confirmed(&self, ctx: &EvalContext<'_>) -> Result<Vec<WindowEntry>, PolicyError> {
+        if self.budget().is_none() {
+            return Ok(Vec::new());
+        }
+        let now_ms = ctx.now_ms;
+        let entry = self.size(ctx, now_ms)?;
+        if let Some(entry) = &entry {
+            ctx.state_store
+                .append(entry.key(), entry.timestamp_ms(), entry.amount())
+                .map_err(|error| PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "counterparty_allowlist: record_confirmed state store error: {error}"
+                    ),
+                })?;
+        }
+        Ok(entry.into_iter().collect())
+    }
+
+    /// Sizes the budget entry of a call the evaluation classified `Unlisted`.
+    ///
+    /// Reads the class the evaluation carried on the effects and never
+    /// classifies again; a listed call sizes no entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] when the effects
+    /// carry no recipient class, and [`PolicyError::AccountingOverflow`]
+    /// when the debit legs overflow their sum.
+    fn size(&self, ctx: &EvalContext<'_>, now_ms: u64) -> Result<Option<WindowEntry>, PolicyError> {
+        let Some(budget) = self.budget() else {
+            return Ok(None);
+        };
+        let ValueClass::Value(effects) = &ctx.value else {
+            return Ok(None);
+        };
+        match effects.recipient_class() {
+            None => {
+                return Err(PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "counterparty_allowlist: sizing the unlisted budget for tool '{}' \
+                         requires the evaluated recipient class",
+                        ctx.tool.name
+                    ),
+                });
+            }
+            Some(RecipientClass::Unlisted) => {}
+            Some(RecipientClass::Listed | RecipientClass::Unverifiable) => return Ok(None),
+        }
+        let budget_asset = asset_normalise(budget.asset());
+        let mut matched = false;
+        let mut sum: i128 = 0;
+        for leg in effects.legs() {
+            if !leg.kind.carries_debit() {
+                continue;
+            }
+            let Some(leg_asset) = leg.asset.as_deref() else {
+                continue;
+            };
+            if !assets_equivalent(leg_asset, &budget_asset, &ctx.profile.network_passphrase) {
+                continue;
+            }
+            let Some(amount) = leg.amount else {
+                continue;
+            };
+            matched = true;
+            sum = sum
+                .checked_add(amount)
+                .ok_or(PolicyError::AccountingOverflow)?;
+        }
+        if !matched {
+            return Ok(None);
+        }
+        Ok(Some(WindowEntry::new(
+            budget.state_key(ctx.profile_name, &ctx.profile.network_passphrase),
+            now_ms,
+            sum,
+            budget.window_limit(),
+        )))
     }
 }
 
 impl CounterpartyAllowlistCriterion {
-    /// Legacy per-kind dispatch reading raw `ctx.args` — reached only when
-    /// [`classify_value`] resolves `NotApplicable` for the current call (a
-    /// genuinely read-only tool, or one the descriptor derivation has not yet
-    /// classified).
+    /// Evaluates the call: the per-kind checks in order, then the unlisted
+    /// mode for a call whose only failure is an unlisted debit recipient.
+    fn outcome(&self, ctx: &EvalContext<'_>) -> Result<Outcome, PolicyError> {
+        // Opaque effects and missing value effects refuse. Calls classified
+        // as not applicable use raw arguments and keep denials in every mode.
+        let effects = match classify_value(ctx) {
+            ValueGate::Deny(reason) => return Ok(Outcome::Deny(reason)),
+            ValueGate::Effects(effects) => effects,
+            ValueGate::NotApplicable => {
+                for kind in self.check_kinds() {
+                    if let Some(deny) = self.evaluate_kind(kind, ctx)? {
+                        return Ok(Outcome::Deny(deny));
+                    }
+                }
+                return Ok(Outcome::Pass);
+            }
+        };
+
+        let mut classification = Classification::new();
+        for kind in self.check_kinds() {
+            classification.merge(self.evaluate_kind_over_effects(kind, ctx, effects)?);
+            if matches!(self.unlisted, None | Some(UnlistedMode::Deny))
+                && let Some(denial) = classification.denial.take()
+            {
+                return Ok(Outcome::Deny(denial));
+            }
+        }
+        let Some(denial) = classification.denial else {
+            return Ok(Outcome::Pass);
+        };
+        if classification.class != RecipientClass::Unlisted || classification.inflow_denied {
+            return Ok(Outcome::Deny(denial));
+        }
+        let mode = self.unlisted.as_ref().unwrap_or(&UnlistedMode::Deny);
+        match mode {
+            UnlistedMode::Approval => Ok(Outcome::Escalate(denial)),
+            UnlistedMode::Budget(budget) => self.check_budget(ctx, effects, budget, denial),
+            UnlistedMode::Deny => Ok(Outcome::Deny(denial)),
+        }
+    }
+
+    /// Checks an unlisted call against both budget bounds.
+    ///
+    /// The attempt sums the debit legs in the budget asset. A debit leg in
+    /// another asset, or without an asset, keeps the criterion's denial. The
+    /// recorded window, the bundle overlay, and the attempt sum without
+    /// overflow before either bound applies. A call beyond a bound escalates
+    /// on a mainnet profile, whose locked mint admits a per-payment approval
+    /// over the allowance, and is denied on every other network.
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyError::AccountingOverflow`] when a sum overflows, or
+    /// [`PolicyError::AccountingInvalid`] for a negative accounting contributor.
+    fn check_budget(
+        &self,
+        ctx: &EvalContext<'_>,
+        effects: &ValueEffects,
+        budget: &UnlistedBudget,
+        denial: DenyReason,
+    ) -> Result<Outcome, PolicyError> {
+        let budget_asset = asset_normalise(budget.asset());
+        let mut attempted_stroops: i128 = 0;
+        for leg in effects.legs() {
+            if !leg.kind.carries_debit() {
+                continue;
+            }
+            let Some(leg_asset) = leg.asset.as_deref() else {
+                return Ok(Outcome::Deny(denial));
+            };
+            if !assets_equivalent(leg_asset, &budget_asset, &ctx.profile.network_passphrase) {
+                return Ok(Outcome::Deny(denial));
+            }
+            let amount = leg
+                .amount
+                .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "counterparty_allowlist: unresolvable amount for a debit leg of tool '{}'",
+                        ctx.tool.name
+                    ),
+                })?;
+            attempted_stroops = attempted_stroops
+                .checked_add(amount)
+                .ok_or(PolicyError::AccountingOverflow)?;
+        }
+
+        let state_key = budget.state_key(ctx.profile_name, &ctx.profile.network_passphrase);
+        let (window_used_stroops, _) = ctx
+            .state_store
+            .query_window(&state_key, ctx.now_ms)
+            .map_err(|e| match e {
+                StateStoreError::SumOverflow => PolicyError::AccountingOverflow,
+                StateStoreError::NegativeAmount => PolicyError::AccountingInvalid,
+                e => PolicyError::CriterionEvaluationFailed {
+                    detail: format!("counterparty_allowlist: state store error: {e}"),
+                },
+            })?;
+        let bundle_accumulated_stroops = ctx
+            .bundle
+            .map(|view| view.overlay.checked_get(&state_key))
+            .unwrap_or(Some(0))
+            .ok_or(PolicyError::AccountingOverflow)?;
+        let would_use = window_used_stroops
+            .checked_add(bundle_accumulated_stroops)
+            .and_then(|used| used.checked_add(attempted_stroops))
+            .ok_or(PolicyError::AccountingOverflow)?;
+        let exceeded = |bound, max_stroops| {
+            let denial = DenyReason::UnlistedBudgetExceeded {
+                asset: budget.asset().to_owned(),
+                bound,
+                max_stroops,
+                attempted_stroops,
+            };
+            if ctx.profile.chain_id.is_mainnet() {
+                Outcome::Escalate(denial)
+            } else {
+                Outcome::Deny(denial)
+            }
+        };
+        if attempted_stroops > budget.per_tx_stroops() {
+            return Ok(exceeded(UnlistedBound::PerTx, budget.per_tx_stroops()));
+        }
+        if would_use > budget.per_period_stroops() {
+            return Ok(exceeded(
+                UnlistedBound::PerPeriod,
+                budget.per_period_stroops(),
+            ));
+        }
+        Ok(Outcome::Pass)
+    }
+
+    /// Classifies every leg of `effects` against each configured kind.
+    fn classify_effects(
+        &self,
+        ctx: &EvalContext<'_>,
+        effects: &ValueEffects,
+    ) -> Result<Classification, PolicyError> {
+        let mut classification = Classification::new();
+        let has_debit = effects.legs().iter().any(|leg| leg.kind.carries_debit());
+        for kind in self.check_kinds() {
+            if *kind == CounterpartyKind::HomeDomain && !has_debit {
+                continue;
+            }
+            classification.merge(self.evaluate_kind_over_effects(kind, ctx, effects)?);
+        }
+        Ok(classification)
+    }
+
+    /// Keeps one address check at the first address kind's position.
+    fn check_kinds(&self) -> impl Iterator<Item = &CounterpartyKind> {
+        let mut address_seen = false;
+        self.kinds.iter().filter(move |kind| {
+            if matches!(
+                kind,
+                CounterpartyKind::GAccount | CounterpartyKind::CAccount
+            ) {
+                let first = !address_seen;
+                address_seen = true;
+                first
+            } else {
+                true
+            }
+        })
+    }
+
+    /// Dispatches raw arguments when value classification is not applicable.
     fn evaluate_kind(
         &self,
         kind: &CounterpartyKind,
         ctx: &EvalContext<'_>,
     ) -> Result<Option<DenyReason>, PolicyError> {
         match kind {
-            CounterpartyKind::GAccount => self.check_g_account(ctx),
-            CounterpartyKind::CAccount => self.check_c_account(ctx),
+            CounterpartyKind::GAccount | CounterpartyKind::CAccount => {
+                let destination = resolve_destination(ctx)?;
+                Ok(self
+                    .address_check(ctx, kind, Some(destination.as_str()))?
+                    .denial())
+            }
             CounterpartyKind::KnownIssuer => self.check_known_issuer(ctx),
-            CounterpartyKind::HomeDomain => self.check_home_domain(ctx),
+            CounterpartyKind::HomeDomain => Ok(self.home_domain_check(ctx).denial()),
             unsupported => Ok(Some(DenyReason::CounterpartyKindUnsupported {
                 kind: unsupported.tag().to_owned(),
             })),
         }
     }
 
-    /// Descriptor-driven per-kind dispatch over the resolved value legs.
-    ///
-    /// `HOME_DOMAIN` stays on `identity_view` (leg-independent — the
-    /// destination account's home domain, not any per-leg field), unchanged
-    /// from the raw-args path.
+    /// Checks one dimension over the effects, retaining its first denial.
+    /// Address and issuer checks classify debit legs. A domain check can deny
+    /// without a debit, and reserved kinds always classify as unverifiable.
     fn evaluate_kind_over_effects(
         &self,
         kind: &CounterpartyKind,
         ctx: &EvalContext<'_>,
         effects: &ValueEffects,
-    ) -> Result<Option<DenyReason>, PolicyError> {
+    ) -> Result<Classification, PolicyError> {
+        let mut result = Classification::new();
         match kind {
-            CounterpartyKind::GAccount => self.check_g_account_legs(ctx, effects),
-            CounterpartyKind::CAccount => self.check_c_account_legs(ctx, effects),
-            CounterpartyKind::KnownIssuer => self.check_known_issuer_legs(ctx, effects),
-            CounterpartyKind::HomeDomain => self.check_home_domain(ctx),
-            unsupported => Ok(Some(DenyReason::CounterpartyKindUnsupported {
-                kind: unsupported.tag().to_owned(),
-            })),
-        }
-    }
-
-    /// Checks each debit leg's `destination` as a G-strkey against the
-    /// allowlist.
-    ///
-    /// A debit leg with `destination == None` denies
-    /// ([`DenyReason::CounterpartyDenied`]) rather than erroring: a
-    /// counterparty-bearing action with no resolvable counterparty cannot
-    /// satisfy an allowlist. A single-leg pay/create call sees exactly the
-    /// same check as the raw-args path, since its sole leg carries the same
-    /// `args["destination"]` string the gate derived.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] when a present
-    /// destination is not a well-formed G-strkey.
-    fn check_g_account_legs(
-        &self,
-        ctx: &EvalContext<'_>,
-        effects: &ValueEffects,
-    ) -> Result<Option<DenyReason>, PolicyError> {
-        for leg in effects.legs() {
-            if !leg.kind.carries_debit() {
-                continue;
-            }
-            let Some(destination) = leg.destination.as_deref() else {
-                return Ok(Some(DenyReason::CounterpartyDenied {
-                    kind: "G_ACCOUNT".to_owned(),
-                    value: String::new(),
-                }));
-            };
-
-            PublicKey::from_string(destination).map_err(|e| {
-                PolicyError::CriterionEvaluationFailed {
-                    detail: format!(
-                        "counterparty_allowlist: invalid G-strkey in a debit leg's \
-                         destination for tool '{}': {e}",
-                        ctx.tool.name
-                    ),
+            CounterpartyKind::GAccount | CounterpartyKind::CAccount => {
+                for leg in effects.legs().iter().filter(|leg| leg.kind.carries_debit()) {
+                    result.include(
+                        self.address_check(ctx, kind, leg.destination.as_deref())?,
+                        true,
+                        false,
+                    );
                 }
-            })?;
-
-            if !self.allowlist.iter().any(|a| a == destination) {
-                return Ok(Some(DenyReason::CounterpartyDenied {
-                    kind: "G_ACCOUNT".to_owned(),
-                    value: destination.to_owned(),
-                }));
             }
-        }
-        Ok(None)
-    }
-
-    /// Checks each debit leg's `destination` as a C-strkey against the
-    /// allowlist. See [`Self::check_g_account_legs`] for the `None`-is-deny
-    /// posture.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] when a present
-    /// destination is not a well-formed C-strkey.
-    fn check_c_account_legs(
-        &self,
-        ctx: &EvalContext<'_>,
-        effects: &ValueEffects,
-    ) -> Result<Option<DenyReason>, PolicyError> {
-        for leg in effects.legs() {
-            if !leg.kind.carries_debit() {
-                continue;
-            }
-            let Some(destination) = leg.destination.as_deref() else {
-                return Ok(Some(DenyReason::CounterpartyDenied {
-                    kind: "C_ACCOUNT".to_owned(),
-                    value: String::new(),
-                }));
-            };
-
-            Contract::from_string(destination).map_err(|e| {
-                PolicyError::CriterionEvaluationFailed {
-                    detail: format!(
-                        "counterparty_allowlist: invalid C-strkey in a debit leg's \
-                         destination for tool '{}': {e}",
-                        ctx.tool.name
-                    ),
+            CounterpartyKind::KnownIssuer => {
+                for leg in effects.legs() {
+                    let debit = leg.kind.carries_debit();
+                    if debit || self.gate_inflows {
+                        result.include(self.known_issuer_leg(ctx, leg, debit)?, debit, !debit);
+                    }
                 }
-            })?;
-
-            if !self.allowlist.iter().any(|a| a == destination) {
-                return Ok(Some(DenyReason::CounterpartyDenied {
-                    kind: "C_ACCOUNT".to_owned(),
-                    value: destination.to_owned(),
-                }));
             }
+            CounterpartyKind::HomeDomain => {
+                let has_debit = effects.legs().iter().any(|leg| leg.kind.carries_debit());
+                result.include(self.home_domain_check(ctx), has_debit, false);
+            }
+            unsupported => result.include(
+                Check::Unverifiable(DenyReason::CounterpartyKindUnsupported {
+                    kind: unsupported.tag().to_owned(),
+                }),
+                true,
+                false,
+            ),
         }
-        Ok(None)
+        Ok(result)
     }
 
-    /// Checks each leg's `asset` issuer against the allowlist.
-    ///
-    /// Debit legs are always checked. Inflow legs (`carries_debit() ==
-    /// false`) are checked only when `self.gate_inflows` is `true` — the
-    /// default (`false`) preserves today's debit-only scoping exactly.
-    ///
-    /// A native-asset leg has no issuer and is skipped, debit or inflow
-    /// alike. A checked leg whose asset is `None` (unresolved) denies
-    /// fail-closed ([`DenyReason::CounterpartyDenied`], `kind =
-    /// "KNOWN_ISSUER"`): the operator asked to bound issuers and this leg's
-    /// issuer cannot be established, so it is never waved through. An inflow
-    /// denial carries a `value` detail distinct from a debit denial's, so an
-    /// operator can tell the direction apart during triage.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] when a present
-    /// non-native asset is not in `CODE:Gissuer` format, or the issuer is not
-    /// a well-formed G-strkey.
-    fn check_known_issuer_legs(
+    /// Matches a destination's kind and its exact string or base address.
+    /// `first_address_kind` is the address kind [`Self::check_kinds`] keeps;
+    /// a missing destination is unverifiable and carries its tag.
+    fn address_check(
         &self,
         ctx: &EvalContext<'_>,
-        effects: &ValueEffects,
-    ) -> Result<Option<DenyReason>, PolicyError> {
-        for leg in effects.legs() {
-            let is_debit = leg.kind.carries_debit();
-            if !is_debit && !self.gate_inflows {
-                continue;
-            }
-            // A checked leg whose asset the dispatch site could not resolve
-            // cannot be checked against the issuer allowlist, so it denies
-            // fail-closed — mirroring the None-destination
-            // posture in `check_g_account_legs`. A `None` here is never a
-            // silent pass, for either direction.
-            let Some(asset_str) = leg.asset.as_deref() else {
-                return Ok(Some(DenyReason::CounterpartyDenied {
-                    kind: "KNOWN_ISSUER".to_owned(),
-                    value: if is_debit {
-                        String::new()
-                    } else {
-                        "inflow leg carries no resolvable asset".to_owned()
-                    },
-                }));
+        first_address_kind: &CounterpartyKind,
+        destination: Option<&str>,
+    ) -> Result<Check, PolicyError> {
+        #[cfg(test)]
+        ADDRESS_CHECK_RUNS.with(|runs| runs.set(runs.get() + 1));
+        let Some(destination) = destination else {
+            return Ok(Check::Unverifiable(DenyReason::CounterpartyDenied {
+                kind: first_address_kind.tag().to_owned(),
+                value: String::new(),
+            }));
+        };
+        let (kind, base) = destination_form(destination).ok_or_else(|| {
+            let field = if matches!(classify_value(ctx), ValueGate::Effects(_)) {
+                "the destination of a debit leg"
+            } else {
+                "'destination'"
             };
-            if asset_str.eq_ignore_ascii_case("native") || asset_str.eq_ignore_ascii_case("xlm") {
-                continue;
+            PolicyError::CriterionEvaluationFailed {
+                detail: format!(
+                    "counterparty_allowlist: {field} for tool '{}' is not a G, M, C, or W strkey",
+                    ctx.tool.name
+                ),
             }
+        })?;
+        if self.kinds.contains(&kind)
+            && self
+                .allowlist
+                .iter()
+                .any(|entry| entry == destination || *entry == base)
+        {
+            Ok(Check::Listed)
+        } else {
+            Ok(Check::Unlisted(DenyReason::CounterpartyDenied {
+                kind: kind.tag().to_owned(),
+                value: destination.to_owned(),
+            }))
+        }
+    }
 
-            let issuer = parse_asset_issuer(asset_str, ctx)?;
+    /// Classifies one present destination; a present destination never reads
+    /// the missing-destination tag, so any address kind serves.
+    #[cfg(test)]
+    pub(crate) fn address_class_for_test(
+        &self,
+        ctx: &EvalContext<'_>,
+        destination: &str,
+    ) -> Result<RecipientClass, PolicyError> {
+        self.address_check(ctx, &CounterpartyKind::GAccount, Some(destination))
+            .map(|check| check.class())
+    }
 
-            let on_list = self.allowlist.iter().any(|entry| {
-                if let Some(list_issuer) = entry.split_once(':').map(|(_, i)| i) {
-                    list_issuer == issuer
+    /// Checks one leg's asset issuer against the allowlist.
+    fn known_issuer_leg(
+        &self,
+        ctx: &EvalContext<'_>,
+        leg: &ValueLeg,
+        is_debit: bool,
+    ) -> Result<Check, PolicyError> {
+        // A checked leg whose asset the dispatch site could not resolve
+        // cannot be checked against the issuer allowlist, so it denies
+        // fail-closed, mirroring the None-destination
+        // posture in `address_check`. A `None` here is never a
+        // silent pass, for either direction.
+        let Some(asset_str) = leg.asset.as_deref() else {
+            return Ok(Check::Unverifiable(DenyReason::CounterpartyDenied {
+                kind: "KNOWN_ISSUER".to_owned(),
+                value: if is_debit {
+                    String::new()
                 } else {
-                    entry == &issuer
-                }
-            });
-
-            if !on_list {
-                return Ok(Some(DenyReason::CounterpartyDenied {
-                    kind: "KNOWN_ISSUER".to_owned(),
-                    value: if is_debit {
-                        issuer
-                    } else {
-                        format!("inflow leg issuer {issuer} not allowlisted")
-                    },
-                }));
-            }
-        }
-        Ok(None)
-    }
-
-    fn check_g_account(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        let destination = resolve_destination(ctx)?;
-
-        // Validate that it is a well-formed G-strkey.
-        PublicKey::from_string(&destination).map_err(|e| {
-            PolicyError::CriterionEvaluationFailed {
-                detail: format!(
-                    "counterparty_allowlist: invalid G-strkey in 'destination' \
-                     for tool '{}': {e}",
-                    ctx.tool.name
-                ),
-            }
-        })?;
-
-        if !self.allowlist.contains(&destination) {
-            return Ok(Some(DenyReason::CounterpartyDenied {
-                kind: "G_ACCOUNT".to_owned(),
-                value: destination,
+                    "inflow leg carries no resolvable asset".to_owned()
+                },
             }));
+        };
+        if asset_str.eq_ignore_ascii_case("native") || asset_str.eq_ignore_ascii_case("xlm") {
+            return Ok(Check::Listed);
         }
 
-        Ok(None)
-    }
+        let issuer = parse_asset_issuer(asset_str, ctx)?;
 
-    fn check_c_account(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        let destination = resolve_destination(ctx)?;
-
-        // Validate that it is a well-formed C-strkey.
-        Contract::from_string(&destination).map_err(|e| {
-            PolicyError::CriterionEvaluationFailed {
-                detail: format!(
-                    "counterparty_allowlist: invalid C-strkey in 'destination' \
-                     for tool '{}': {e}",
-                    ctx.tool.name
-                ),
+        let on_list = self.allowlist.iter().any(|entry| {
+            if let Some(list_issuer) = entry.split_once(':').map(|(_, i)| i) {
+                list_issuer == issuer
+            } else {
+                entry == &issuer
             }
-        })?;
+        });
 
-        if !self.allowlist.contains(&destination) {
-            return Ok(Some(DenyReason::CounterpartyDenied {
-                kind: "C_ACCOUNT".to_owned(),
-                value: destination,
-            }));
+        if on_list {
+            Ok(Check::Listed)
+        } else {
+            Ok(Check::Unlisted(DenyReason::CounterpartyDenied {
+                kind: "KNOWN_ISSUER".to_owned(),
+                value: if is_debit {
+                    issuer
+                } else {
+                    format!("inflow leg issuer {issuer} not allowlisted")
+                },
+            }))
         }
-
-        Ok(None)
     }
 
     fn check_known_issuer(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
@@ -640,15 +1238,17 @@ impl CounterpartyAllowlistCriterion {
     /// the full 5-step rationale. Reads `home_domain` via
     /// [`crate::policy::v1::AccountIdentityView::home_domain`] (supplied in
     /// [`EvalContext::identity_view`]) and cross-checks it against
-    /// [`EvalContext::counterparty_cache`]. Every failure mode returns
-    /// [`DenyReason::CounterpartyDenied`] with `kind = "HOME_DOMAIN"`; the
+    /// [`EvalContext::counterparty_cache`]. Every failure mode denies with
+    /// [`DenyReason::CounterpartyDenied`] and `kind = "HOME_DOMAIN"`; the
     /// `value` field distinguishes which step failed for operator triage.
-    fn check_home_domain(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        fn deny(value: impl Into<String>) -> Result<Option<DenyReason>, PolicyError> {
-            Ok(Some(DenyReason::CounterpartyDenied {
+    /// Every unverified step is `Unverifiable`; only a verified domain outside
+    /// the allowlist is `Unlisted`.
+    fn home_domain_check(&self, ctx: &EvalContext<'_>) -> Check {
+        fn deny(value: impl Into<String>) -> DenyReason {
+            DenyReason::CounterpartyDenied {
                 kind: "HOME_DOMAIN".to_owned(),
                 value: value.into(),
-            }))
+            }
         }
 
         // Step 1: retrieve the (self-asserted) home_domain from the identity
@@ -656,10 +1256,10 @@ impl CounterpartyAllowlistCriterion {
         // implementation, so forgetting to implement it at the dispatch site
         // is a compile error.
         let Some(identity) = ctx.identity_view else {
-            return deny(String::new());
+            return Check::Unverifiable(deny(String::new()));
         };
         let Some(resolved) = identity.home_domain() else {
-            return deny(String::new());
+            return Check::Unverifiable(deny(String::new()));
         };
 
         // Step 2: strict-ASCII enforcement — the homoglyph defence. If the
@@ -669,7 +1269,7 @@ impl CounterpartyAllowlistCriterion {
         // denied. Non-ASCII bytes are REDACTED from the value to avoid leaking
         // potentially sensitive data in error/audit envelopes.
         if !resolved.bytes().all(|b| b.is_ascii()) {
-            return deny("<non-ascii-redacted>");
+            return Check::Unverifiable(deny("<non-ascii-redacted>"));
         }
 
         // Case-insensitive ASCII comparison per RFC 4343. Lowercase the
@@ -683,19 +1283,16 @@ impl CounterpartyAllowlistCriterion {
         // operator independently fetched a real stellar.toml at this domain —
         // it does NOT (by itself) prove this specific account belongs to it,
         // since the cache is keyed by domain alone.
-        let cache = match ctx.counterparty_cache {
-            Some(c) => c,
-            None => {
-                return deny(format!(
-                    "{resolved_lower}: not verified (counterparty cache not populated)"
-                ));
-            }
+        let Some(cache) = ctx.counterparty_cache else {
+            return Check::Unverifiable(deny(format!(
+                "{resolved_lower}: not verified (counterparty cache not populated)"
+            )));
         };
         if !cache.has_resolved(&resolved_lower) {
-            return deny(format!(
+            return Check::Unverifiable(deny(format!(
                 "{resolved_lower}: not verified (no live entry in the counterparty cache; \
                  run `stellar-agent counterparty refresh {resolved_lower}`)"
-            ));
+            )));
         }
 
         // Step 4: account-listing verification — the bidirectional half of
@@ -704,19 +1301,19 @@ impl CounterpartyAllowlistCriterion {
         // operator's home_domain and pass, since has_resolved does not
         // distinguish which account a resolved domain belongs to.
         if !cache.is_account_listed(&resolved_lower, identity.account_id()) {
-            return deny(format!(
+            return Check::Unverifiable(deny(format!(
                 "{resolved_lower}: not verified (account not listed by domain's stellar.toml)"
-            ));
+            )));
         }
 
         // Step 5: only a VERIFIED domain is checked against the operator's
         // allowlist. A verified-but-non-allowlisted domain still denies, with
         // a distinct value text from every unverified-domain deny above.
         if !self.allowlist.iter().any(|entry| entry == &resolved_lower) {
-            return deny(resolved_lower);
+            return Check::Unlisted(deny(resolved_lower));
         }
 
-        Ok(None)
+        Check::Listed
     }
 }
 
@@ -724,15 +1321,35 @@ impl CounterpartyAllowlistCriterion {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Identifies a destination's kind and base address.
+pub(crate) fn destination_form(d: &str) -> Option<(CounterpartyKind, String)> {
+    match Strkey::from_string(d).ok()? {
+        Strkey::PublicKeyEd25519(_) => Some((CounterpartyKind::GAccount, d.to_owned())),
+        Strkey::MuxedAccountEd25519(m) => Some((
+            CounterpartyKind::GAccount,
+            format!("{}", PublicKey(m.ed25519)),
+        )),
+        Strkey::Contract(_) => Some((CounterpartyKind::CAccount, d.to_owned())),
+        Strkey::MuxedContract(w) => Some((
+            CounterpartyKind::CAccount,
+            format!("{}", stellar_strkey::Contract(w.contract_id)),
+        )),
+        Strkey::PreAuthTx(_) => None,
+        Strkey::HashX(_) => None,
+        Strkey::SignedPayloadEd25519(_) => None,
+        Strkey::LiquidityPool(_) => None,
+        Strkey::ClaimableBalance(_) => None,
+    }
+}
+
 /// Resolves the counterparty destination for the current call from raw
 /// `ctx.args`.
 ///
-/// Reached only via [`CounterpartyAllowlistCriterion::evaluate_kind`], which
-/// runs when [`classify_value`] resolves `NotApplicable` for the current
-/// call — a tool the descriptor derivation has not classified as
-/// value-moving. A value-moving tool (including the pay/create family) is
-/// always routed through [`CounterpartyAllowlistCriterion::evaluate_kind_over_effects`]
-/// instead, which reads the resolved value leg(s) rather than raw args.
+/// The raw path serves read-only registry tools, Friendbot, rule creation,
+/// and toolset actions whose outer gate carries no payment effects.
+/// Exempted opaque SEP-43 calls, undecodable staged pay or claim envelopes,
+/// and exempted generic bundle inners also reach it. They have no destination
+/// and refuse because no evaluated recipient or amount binds their signing.
 ///
 /// # Errors
 ///
@@ -769,23 +1386,26 @@ fn extract_string_field(ctx: &EvalContext<'_>, field: &str) -> Result<String, Po
 }
 
 /// Parses `"CODE:G…ISSUER"` and returns the issuer G-strkey.
+///
+/// A refusal names the check, the expected form and the tool; the asset
+/// string and the strkey parser's error stay out of the detail, because the
+/// asset comes from the tool arguments and a refused value can hold a seed
+/// or a credential.
 fn parse_asset_issuer(asset_str: &str, ctx: &EvalContext<'_>) -> Result<String, PolicyError> {
     let issuer = asset_str.split_once(':').map(|(_, i)| i).ok_or_else(|| {
         PolicyError::CriterionEvaluationFailed {
             detail: format!(
-                "counterparty_allowlist: non-native asset '{}' must be in \
-                 CODE:Gissuer format for tool '{}'",
-                asset_str, ctx.tool.name
+                "counterparty_allowlist: non-native asset must be in CODE:Gissuer format for tool '{}'",
+                ctx.tool.name
             ),
         }
     })?;
 
     // Validate the issuer is a proper G-strkey.
-    PublicKey::from_string(issuer).map_err(|e| PolicyError::CriterionEvaluationFailed {
+    PublicKey::from_string(issuer).map_err(|_| PolicyError::CriterionEvaluationFailed {
         detail: format!(
-            "counterparty_allowlist: invalid issuer G-strkey in asset '{}' \
-             for tool '{}': {e}",
-            asset_str, ctx.tool.name
+            "counterparty_allowlist: asset issuer must be a valid G-strkey for tool '{}'",
+            ctx.tool.name
         ),
     })?;
 
@@ -808,6 +1428,871 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use stellar_strkey::{Contract, ed25519::MuxedAccount};
+
+    fn key_g() -> String {
+        format!("{}", PublicKey([1; 32]))
+    }
+    fn key_i() -> String {
+        format!("{}", PublicKey([2; 32]))
+    }
+    fn key_c() -> String {
+        format!("{}", Contract([3; 32]))
+    }
+    fn key_m(id: u64) -> String {
+        format!(
+            "{}",
+            MuxedAccount {
+                ed25519: [1; 32],
+                id
+            }
+        )
+    }
+
+    fn key_w(contract: u8, id: u64) -> String {
+        format!(
+            "{}",
+            stellar_strkey::MuxedContract {
+                contract_id: [contract; 32],
+                id
+            }
+        )
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn muxed_payment_decoder_keeps_exact_destination() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_xdr::*;
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::Payment(PaymentOp {
+                        destination: stellar_xdr::MuxedAccount::MuxedEd25519(
+                            MuxedAccountMed25519 {
+                                id: 7,
+                                ed25519: Uint256([1; 32]),
+                            },
+                        ),
+                        asset: Asset::Native,
+                        amount: 1,
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+        let args =
+            crate::envelope_decode::decode_authoritative_args(&envelope, "stellar_pay_commit")
+                .unwrap();
+        assert_eq!(args["destination"], key_m(7));
+        for (entry, class) in [
+            (key_g(), RecipientClass::Listed),
+            (key_m(7), RecipientClass::Listed),
+            (key_m(8), RecipientClass::Unlisted),
+        ] {
+            let criterion =
+                criterion_of(&[CounterpartyKind::GAccount], &[entry], UnlistedMode::Deny);
+            in_ctx(
+                pay_value(args["destination"].as_str(), "native"),
+                args.clone(),
+                |ctx| assert_eq!(criterion.recipient_class(ctx).unwrap(), Some(class)),
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn muxed_contract_base_and_exact_entries_match_on_both_paths() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use RecipientClass::{Listed, Unlisted};
+        for (list, classes) in [
+            (vec![key_c()], [Listed, Listed, Unlisted, Listed]),
+            (vec![key_w(3, 7)], [Listed, Unlisted, Unlisted, Unlisted]),
+            (vec![key_w(3, 7).to_ascii_lowercase()], [Unlisted; 4]),
+            (vec![], [Unlisted; 4]),
+        ] {
+            let criterion = criterion_of(&[CounterpartyKind::CAccount], &list, UnlistedMode::Deny);
+            for (destination, class) in [key_w(3, 7), key_w(3, 8), key_w(4, 7), key_c()]
+                .into_iter()
+                .zip(classes)
+            {
+                for value in [
+                    pay_value(Some(&destination), "native"),
+                    ValueClass::ReadOnly,
+                ] {
+                    in_ctx(value, json!({"destination": destination}), |ctx| {
+                        assert_eq!(
+                            criterion.address_class_for_test(ctx, &destination).unwrap(),
+                            class
+                        );
+                        let expected = if class == Listed {
+                            Decision::Allow
+                        } else {
+                            counterparty_denial("C_ACCOUNT", &destination)
+                        };
+                        assert_eq!(
+                            criterion.evaluate_decision(ctx).unwrap(),
+                            expected,
+                            "{list:?} {destination}"
+                        );
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn muxed_contract_own_kind_and_unlisted_modes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for mode in every_mode() {
+            let criterion =
+                criterion_of(&[CounterpartyKind::GAccount], &[key_w(3, 7)], mode.clone());
+            in_ctx(pay_value(Some(&key_w(3, 7)), "native"), json!({}), |ctx| {
+                assert_eq!(
+                    criterion.recipient_class(ctx).unwrap(),
+                    Some(RecipientClass::Unlisted)
+                );
+                match mode {
+                    UnlistedMode::Deny => assert_eq!(
+                        criterion.evaluate_decision(ctx).unwrap(),
+                        counterparty_denial("C_ACCOUNT", &key_w(3, 7))
+                    ),
+                    UnlistedMode::Approval => assert!(matches!(
+                        criterion.evaluate_decision(ctx).unwrap(),
+                        Decision::RequireApproval(_)
+                    )),
+                    UnlistedMode::Budget(_) => {
+                        assert_eq!(criterion.evaluate_decision(ctx).unwrap(), Decision::Allow);
+                        let mut value = pay_value(Some(&key_w(3, 7)), "native");
+                        if let ValueClass::Value(effects) = &mut value {
+                            *effects = effects
+                                .clone()
+                                .with_recipient_class(Some(RecipientClass::Unlisted));
+                        }
+                        in_ctx(value, json!({}), |sized| {
+                            assert!(criterion.size(sized, 0).unwrap().is_some())
+                        });
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn muxed_contract_preserves_non_address_conjunctions() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use crate::policy::v1::value::ActionKind;
+        for mode in every_mode() {
+            for kinds in [
+                vec![],
+                vec![CounterpartyKind::CAccount],
+                vec![CounterpartyKind::CAccount, CounterpartyKind::KnownIssuer],
+                vec![CounterpartyKind::CAccount, CounterpartyKind::HomeDomain],
+            ] {
+                let criterion = criterion_of(&kinds, &[key_c()], mode.clone());
+                for (action, asset) in [
+                    (ActionKind::Payment, "native".to_owned()),
+                    (ActionKind::Payment, format!("USD:{}", key_i())),
+                    (ActionKind::Claim, "native".to_owned()),
+                    (ActionKind::Trustline, "native".to_owned()),
+                ] {
+                    let evaluate = |destination: String| {
+                        in_ctx(
+                            ValueClass::single(ValueLeg {
+                                kind: action,
+                                destination: Some(destination),
+                                amount: Some(1),
+                                asset: Some(asset.clone()),
+                            }),
+                            json!({}),
+                            |ctx| {
+                                (
+                                    criterion.recipient_class(ctx).unwrap(),
+                                    criterion.evaluate_decision(ctx).unwrap(),
+                                )
+                            },
+                        )
+                    };
+                    assert_eq!(evaluate(key_w(3, 7)), evaluate(key_c()), "{kinds:?}");
+                }
+            }
+        }
+    }
+    fn pay_value(destination: Option<&str>, asset: &str) -> ValueClass {
+        ValueClass::single(ValueLeg {
+            kind: crate::policy::v1::value::ActionKind::Payment,
+            destination: destination.map(str::to_owned),
+            amount: Some(1),
+            asset: Some(asset.to_owned()),
+        })
+    }
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the fixture owns the context inputs"
+    )]
+    fn in_ctx<T>(
+        value: ValueClass,
+        args: serde_json::Value,
+        f: impl FnOnce(&EvalContext<'_>) -> T,
+    ) -> T {
+        let tool = make_tool("registry_read");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let ctx = EvalContext::new(
+            &tool,
+            &args,
+            "operator",
+            &profile,
+            &store,
+            1_700_000_000_000,
+        )
+        .with_value(value);
+        f(&ctx)
+    }
+    fn criterion_of(
+        kinds: &[CounterpartyKind],
+        list: &[String],
+        mode: UnlistedMode,
+    ) -> CounterpartyAllowlistCriterion {
+        CounterpartyAllowlistCriterion::new(kinds.to_vec(), list.to_vec()).with_unlisted(mode)
+    }
+    fn every_mode() -> [UnlistedMode; 3] {
+        [
+            UnlistedMode::Deny,
+            UnlistedMode::Approval,
+            UnlistedMode::Budget(UnlistedBudget::new(
+                "native".into(),
+                10,
+                20,
+                Window::parse("1d").unwrap(),
+            )),
+        ]
+    }
+    fn counterparty_denial(kind: &str, value: &str) -> Decision {
+        Decision::Deny(DenyReason::CounterpartyDenied {
+            kind: kind.into(),
+            value: value.into(),
+        })
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn g_and_c_alternatives_are_both_listed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let criterion = criterion_of(
+            &[CounterpartyKind::GAccount, CounterpartyKind::CAccount],
+            &[key_g(), key_c()],
+            UnlistedMode::Deny,
+        );
+        for d in [key_g(), key_c()] {
+            in_ctx(pay_value(Some(&d), "native"), json!({}), |ctx| {
+                assert_eq!(
+                    criterion.recipient_class(ctx).unwrap(),
+                    Some(RecipientClass::Listed)
+                );
+                assert_eq!(criterion.evaluate_decision(ctx).unwrap(), Decision::Allow);
+            });
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unselected_kind_destination_escalates_under_approval() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let criterion = criterion_of(
+            &[CounterpartyKind::GAccount],
+            &[key_g()],
+            UnlistedMode::Approval,
+        );
+        in_ctx(pay_value(Some(&key_c()), "native"), json!({}), |ctx| {
+            assert!(matches!(
+                criterion.evaluate_decision(ctx).unwrap(),
+                Decision::RequireApproval(_)
+            ));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn same_payload_does_not_match_across_forms() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for (kind, entry, destination) in [
+            (
+                CounterpartyKind::CAccount,
+                key_g(),
+                format!("{}", Contract([1; 32])),
+            ),
+            (
+                CounterpartyKind::GAccount,
+                format!("{}", Contract([1; 32])),
+                key_g(),
+            ),
+        ] {
+            let criterion = criterion_of(&[kind], &[entry], UnlistedMode::Deny);
+            in_ctx(pay_value(Some(&destination), "native"), json!({}), |ctx| {
+                assert_eq!(
+                    criterion.recipient_class(ctx).unwrap(),
+                    Some(RecipientClass::Unlisted)
+                );
+            });
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn muxed_destination_matches_base_g_on_both_paths() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let criterion = criterion_of(
+            &[CounterpartyKind::GAccount],
+            &[key_g()],
+            UnlistedMode::Deny,
+        );
+        for id in [0, 7, u64::MAX] {
+            for value in [pay_value(Some(&key_m(id)), "native"), ValueClass::ReadOnly] {
+                in_ctx(value, json!({"destination": key_m(id)}), |ctx| {
+                    assert_eq!(
+                        criterion.evaluate_decision(ctx).unwrap(),
+                        Decision::Allow,
+                        "{id}"
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn muxed_entry_matches_only_its_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for (entry, others) in [
+            (7, [0, 8, u64::MAX]),
+            (0, [1, 7, u64::MAX]),
+            (u64::MAX, [0, 7, u64::MAX - 1]),
+        ] {
+            let criterion = criterion_of(
+                &[CounterpartyKind::GAccount],
+                &[key_m(entry)],
+                UnlistedMode::Deny,
+            );
+            let mut cases = vec![
+                (key_m(entry), RecipientClass::Listed),
+                (key_g(), RecipientClass::Unlisted),
+            ];
+            cases.extend(others.map(|id| (key_m(id), RecipientClass::Unlisted)));
+            for (d, class) in cases {
+                in_ctx(pay_value(Some(&d), "native"), json!({}), |ctx| {
+                    assert_eq!(criterion.recipient_class(ctx).unwrap(), Some(class), "{d}");
+                });
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn issuer_check_is_conjoined_before_mode() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let asset = format!("USD:{}", key_i());
+        for mode in [
+            UnlistedMode::Deny,
+            UnlistedMode::Approval,
+            UnlistedMode::Budget(UnlistedBudget::new(
+                asset.clone(),
+                10,
+                20,
+                Window::parse("1d").unwrap(),
+            )),
+        ] {
+            let criterion = criterion_of(
+                &[CounterpartyKind::GAccount, CounterpartyKind::KnownIssuer],
+                &[key_g()],
+                mode.clone(),
+            );
+            for amount in [6, 15] {
+                let mut value = pay_value(Some(&key_g()), &asset);
+                if let ValueClass::Value(ref mut effects) = value {
+                    *effects = ValueEffects::single(ValueLeg {
+                        amount: Some(amount),
+                        ..effects.legs()[0].clone()
+                    });
+                }
+                in_ctx(value, json!({}), |ctx| {
+                    let decision = criterion.evaluate_decision(ctx).unwrap();
+                    match mode {
+                        UnlistedMode::Deny => {
+                            assert_eq!(decision, counterparty_denial("KNOWN_ISSUER", &key_i()))
+                        }
+                        UnlistedMode::Approval => {
+                            assert!(matches!(decision, Decision::RequireApproval(_)))
+                        }
+                        UnlistedMode::Budget(_) if amount == 6 => {
+                            assert_eq!(decision, Decision::Allow)
+                        }
+                        _ => assert!(matches!(
+                            decision,
+                            Decision::Deny(DenyReason::UnlistedBudgetExceeded { .. })
+                        )),
+                    }
+                });
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn denial_names_destination_kind() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for (kinds, d, tag) in [
+            (vec![CounterpartyKind::GAccount], key_c(), "C_ACCOUNT"),
+            (vec![CounterpartyKind::CAccount], key_g(), "G_ACCOUNT"),
+        ] {
+            let criterion = criterion_of(&kinds, &[], UnlistedMode::Deny);
+            in_ctx(pay_value(Some(&d), "native"), json!({}), |ctx| {
+                assert_eq!(
+                    criterion.evaluate_decision(ctx).unwrap(),
+                    counterparty_denial(tag, &d)
+                );
+            });
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn non_destination_forms_error_without_input() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let inputs = [
+            format!("{}", stellar_strkey::PreAuthTx([4; 32])),
+            format!("{}", stellar_strkey::HashX([4; 32])),
+            format!(
+                "{}",
+                stellar_strkey::ed25519::SignedPayload::new([4; 32], &[1, 2, 3]).unwrap()
+            ),
+            format!("{}", stellar_strkey::LiquidityPool([4; 32])),
+            format!("{}", stellar_strkey::ClaimableBalance::V0([4; 32])),
+            stellar_strkey::ed25519::PrivateKey([4; 32])
+                .as_unredacted()
+                .to_string()
+                .to_string(),
+            "WAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "not-a-strkey".to_owned(),
+        ];
+        let criterion = criterion_of(
+            &[CounterpartyKind::GAccount, CounterpartyKind::CAccount],
+            &[],
+            UnlistedMode::Approval,
+        );
+        for d in inputs {
+            for (value, field) in [
+                (
+                    pay_value(Some(&d), "native"),
+                    "the destination of a debit leg",
+                ),
+                (ValueClass::ReadOnly, "'destination'"),
+            ] {
+                in_ctx(value, json!({"destination": d}), |ctx| {
+                    let error = criterion.evaluate_decision(ctx).unwrap_err();
+                    assert_eq!(error.wire_code(), "policy.criterion_evaluation_failed");
+                    let PolicyError::CriterionEvaluationFailed { detail } = error else {
+                        panic!("wrong error")
+                    };
+                    assert_eq!(
+                        detail,
+                        format!(
+                            "counterparty_allowlist: {field} for tool 'registry_read' is not a G, M, C, or W strkey"
+                        )
+                    );
+                    assert!(!detail.contains(&d));
+                });
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn raw_path_keeps_denials_and_missing_field_errors() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for mode in every_mode() {
+            let criterion = criterion_of(&[CounterpartyKind::GAccount], &[], mode);
+            in_ctx(
+                ValueClass::ReadOnly,
+                json!({"destination": key_g()}),
+                |ctx| {
+                    assert_eq!(
+                        criterion.evaluate_decision(ctx).unwrap(),
+                        counterparty_denial("G_ACCOUNT", &key_g())
+                    );
+                    assert_eq!(criterion.recipient_class(ctx).unwrap(), None);
+                },
+            );
+            for args in [json!({}), json!({"destination": 7})] {
+                in_ctx(ValueClass::ReadOnly, args, |ctx| {
+                    let PolicyError::CriterionEvaluationFailed { detail } =
+                        criterion.evaluate_decision(ctx).unwrap_err()
+                    else {
+                        panic!("wrong error")
+                    };
+                    assert_eq!(
+                        detail,
+                        "counterparty_allowlist: missing or non-string field 'destination' in args for tool 'registry_read'"
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn address_order_and_duplicates_run_one_check() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use CounterpartyKind::{CAccount as C, GAccount as G, KnownIssuer as I};
+        for list in [vec![key_g(), key_c()], vec![]] {
+            for mode in every_mode() {
+                for kinds in [
+                    vec![G, C],
+                    vec![G, I, C],
+                    vec![C, I, G],
+                    vec![G, G, C, C],
+                    vec![C, G],
+                ] {
+                    let criterion = criterion_of(&kinds, &list, mode.clone());
+                    let legs = [key_g(), key_c(), key_m(7)]
+                        .iter()
+                        .map(|d| {
+                            let ValueClass::Value(effects) = pay_value(Some(d), "native") else {
+                                unreachable!()
+                            };
+                            effects.legs()[0].clone()
+                        })
+                        .collect();
+                    in_ctx(
+                        ValueClass::Value(ValueEffects::new(legs)),
+                        json!({}),
+                        |ctx| {
+                            ADDRESS_CHECK_RUNS.with(|runs| runs.set(0));
+                            let class = criterion.recipient_class(ctx).unwrap();
+                            assert_eq!(ADDRESS_CHECK_RUNS.with(|runs| runs.get()), 3);
+                            assert_eq!(
+                                class,
+                                Some(if list.is_empty() {
+                                    RecipientClass::Unlisted
+                                } else {
+                                    RecipientClass::Listed
+                                })
+                            );
+                            ADDRESS_CHECK_RUNS.with(|runs| runs.set(0));
+                            let decision = criterion.evaluate_decision(ctx).unwrap();
+                            assert_eq!(ADDRESS_CHECK_RUNS.with(|runs| runs.get()), 3);
+                            if !list.is_empty() || matches!(mode, UnlistedMode::Budget(_)) {
+                                assert_eq!(decision, Decision::Allow);
+                            } else if matches!(mode, UnlistedMode::Approval) {
+                                assert!(matches!(decision, Decision::RequireApproval(_)));
+                            } else {
+                                assert_eq!(decision, counterparty_denial("G_ACCOUNT", &key_g()));
+                            }
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn no_address_kind_runs_no_address_check() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for kinds in [vec![], vec![CounterpartyKind::KnownIssuer]] {
+            let criterion = criterion_of(&kinds, &[], UnlistedMode::Deny);
+            for d in [key_g(), key_c(), "not-a-strkey".to_owned()] {
+                in_ctx(pay_value(Some(&d), "native"), json!({}), |ctx| {
+                    ADDRESS_CHECK_RUNS.with(|runs| runs.set(0));
+                    assert_eq!(criterion.evaluate_decision(ctx).unwrap(), Decision::Allow);
+                    assert_eq!(
+                        criterion.recipient_class(ctx).unwrap(),
+                        Some(RecipientClass::Listed)
+                    );
+                    assert_eq!(ADDRESS_CHECK_RUNS.with(|runs| runs.get()), 0);
+                });
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn first_denial_follows_kind_order() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use CounterpartyKind::{GAccount as G, KnownIssuer as I};
+        for (kinds, tag, d) in [
+            (vec![I, G], "KNOWN_ISSUER", key_i()),
+            (vec![G, I], "G_ACCOUNT", key_g()),
+        ] {
+            let criterion = criterion_of(&kinds, &[], UnlistedMode::Deny);
+            in_ctx(
+                pay_value(Some(&key_g()), &format!("USD:{}", key_i())),
+                json!({}),
+                |ctx| {
+                    assert_eq!(
+                        criterion.evaluate_decision(ctx).unwrap(),
+                        counterparty_denial(tag, &d)
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn first_denial_follows_kind_order_under_approval() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use CounterpartyKind::{GAccount as G, KnownIssuer as I};
+        for (kinds, tag, d) in [
+            (vec![I, G], "KNOWN_ISSUER", key_i()),
+            (vec![G, I], "G_ACCOUNT", key_g()),
+        ] {
+            let criterion = criterion_of(&kinds, &[], UnlistedMode::Approval);
+            in_ctx(
+                pay_value(Some(&key_g()), &format!("USD:{}", key_i())),
+                json!({}),
+                |ctx| {
+                    assert!(matches!(
+                        criterion.evaluate_decision(ctx).unwrap(),
+                        Decision::RequireApproval(_)
+                    ));
+                    assert_eq!(
+                        criterion.evaluate(ctx).unwrap(),
+                        Some(DenyReason::CounterpartyDenied {
+                            kind: tag.into(),
+                            value: d.clone(),
+                        })
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn listed_entry_of_unselected_kind_is_unlisted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let criterion = criterion_of(
+            &[CounterpartyKind::GAccount],
+            &[key_c()],
+            UnlistedMode::Deny,
+        );
+        in_ctx(pay_value(Some(&key_c()), "native"), json!({}), |ctx| {
+            assert_eq!(
+                criterion.recipient_class(ctx).unwrap(),
+                Some(RecipientClass::Unlisted)
+            );
+            assert_eq!(
+                criterion.evaluate_decision(ctx).unwrap(),
+                counterparty_denial("C_ACCOUNT", &key_c())
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reserved_kinds_refuse_in_every_mode_without_debits() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for reserved in [
+            CounterpartyKind::Sep10Identity,
+            CounterpartyKind::OneTimeAddress,
+        ] {
+            for mode in every_mode() {
+                let criterion = criterion_of(
+                    &[CounterpartyKind::GAccount, reserved.clone()],
+                    &[key_g()],
+                    mode,
+                );
+                for kind in [
+                    crate::policy::v1::value::ActionKind::Payment,
+                    crate::policy::v1::value::ActionKind::Claim,
+                ] {
+                    let value = ValueClass::single(ValueLeg {
+                        kind,
+                        amount: Some(1),
+                        asset: Some("native".into()),
+                        destination: Some(key_g()),
+                    });
+                    in_ctx(value, json!({}), |ctx| {
+                        assert_eq!(
+                            criterion.evaluate_decision(ctx).unwrap(),
+                            Decision::Deny(DenyReason::CounterpartyKindUnsupported {
+                                kind: reserved.tag().into()
+                            })
+                        );
+                        assert_eq!(
+                            criterion.recipient_class(ctx).unwrap(),
+                            Some(RecipientClass::Unverifiable)
+                        );
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn entries_compare_byte_for_byte() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for entry in [
+            format!(" {}", key_g()),
+            format!("{} ", key_g()),
+            key_g().to_lowercase(),
+        ] {
+            let criterion =
+                criterion_of(&[CounterpartyKind::GAccount], &[entry], UnlistedMode::Deny);
+            in_ctx(pay_value(Some(&key_g()), "native"), json!({}), |ctx| {
+                assert_eq!(
+                    criterion.recipient_class(ctx).unwrap(),
+                    Some(RecipientClass::Unlisted)
+                );
+            });
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn missing_destination_uses_first_address_tag() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use CounterpartyKind::{CAccount as C, GAccount as G};
+        for (kinds, tag) in [(vec![C, G], "C_ACCOUNT"), (vec![G, C], "G_ACCOUNT")] {
+            for mode in every_mode() {
+                let criterion = criterion_of(&kinds, &[], mode);
+                in_ctx(pay_value(None, "native"), json!({}), |ctx| {
+                    assert_eq!(
+                        criterion.evaluate_decision(ctx).unwrap(),
+                        counterparty_denial(tag, "")
+                    );
+                    assert_eq!(
+                        criterion.recipient_class(ctx).unwrap(),
+                        Some(RecipientClass::Unverifiable)
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn overlay_accumulates_g_and_c_transfers() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let criterion = criterion_of(
+            &[CounterpartyKind::GAccount, CounterpartyKind::CAccount],
+            &[],
+            every_mode()[2].clone(),
+        );
+        in_ctx(ValueClass::ReadOnly, json!({}), |ctx| {
+            let mut overlay = BundleStateOverlay::default();
+            for to in [key_g(), key_c()] {
+                criterion.accumulate_overlay(
+                    ctx,
+                    &InnerOpDescriptor::TokenTransfer {
+                        asset: "native".into(),
+                        from: key_i(),
+                        to,
+                        amount: 6,
+                    },
+                    &mut overlay,
+                );
+            }
+            assert_eq!(
+                overlay.get(&StateKey::new("operator", 1, "unlisted:native", 86_400)),
+                12
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn gated_inflow_failure_refuses_in_every_mode() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for mode in every_mode() {
+            let criterion = criterion_of(
+                &[CounterpartyKind::GAccount, CounterpartyKind::KnownIssuer],
+                &[],
+                mode,
+            )
+            .with_gate_inflows(true);
+            let value = ValueClass::Value(ValueEffects::new(vec![
+                ValueLeg {
+                    kind: crate::policy::v1::value::ActionKind::Payment,
+                    amount: Some(1),
+                    asset: Some("native".into()),
+                    destination: Some(key_g()),
+                },
+                ValueLeg {
+                    kind: crate::policy::v1::value::ActionKind::Claim,
+                    amount: Some(1),
+                    asset: Some(format!("USD:{}", key_i())),
+                    destination: None,
+                },
+            ]));
+            in_ctx(value, json!({}), |ctx| {
+                assert_eq!(
+                    criterion.evaluate_decision(ctx).unwrap(),
+                    counterparty_denial("G_ACCOUNT", &key_g())
+                );
+                assert_eq!(
+                    criterion.recipient_class(ctx).unwrap(),
+                    Some(RecipientClass::Unlisted)
+                );
+            });
+        }
+    }
     use crate::policy::v1::criteria::state_store::PolicyStateStore;
     use crate::policy::{McpToolRegistration, ToolDescriptor};
     use crate::profile::schema::Profile;
@@ -871,11 +2356,18 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: 1_700_000_000_000,
         }
     }
 
     #[test]
+    #[serial_test::serial]
     fn g_account_in_allowlist_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -890,7 +2382,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn g_account_not_in_allowlist_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -908,7 +2404,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn c_account_in_allowlist_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -923,7 +2423,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn c_account_not_in_allowlist_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -943,7 +2447,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn known_issuer_in_allowlist_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -961,7 +2469,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn known_issuer_bare_g_strkey_allowlist_entry_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -983,7 +2495,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn known_issuer_not_in_allowlist_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1003,7 +2519,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn unsupported_kind_returns_counterparty_kind_unsupported() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1019,7 +2539,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn invalid_g_strkey_in_args_returns_evaluation_failed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1037,7 +2561,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn native_asset_skips_known_issuer_check() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1055,7 +2583,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn known_issuer_debit_leg_with_no_asset_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_dex_trade");
@@ -1074,7 +2606,7 @@ mod tests {
             asset: None,
             destination: Some("CAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -1084,7 +2616,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn approval_trustline_commit_known_issuer_gates_decoded_inflow() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_trustline_commit");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1097,7 +2633,8 @@ mod tests {
             let args =
                 json!({"asset_code": "USDC", "asset_issuer": issuer, "limit_stroops": "1000000"});
             let value = crate::policy::v1::value::derive_value_class(&tool.name, &args);
-            let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store).with_value(value);
+            let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
+                .with_value(value);
             let result = criterion.evaluate(&ctx).unwrap();
             if issuer == USDC_ISSUER {
                 assert!(
@@ -1129,7 +2666,11 @@ mod tests {
     /// `gate_inflows` defaults to `false`: an inflow leg from an issuer NOT on
     /// the allowlist is allowed — pins today's debit-only scoping unchanged.
     #[test]
+    #[serial_test::serial]
     fn gate_inflows_default_false_allows_unknown_issuer_inflow() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
         let tool = make_tool("stellar_dex_trade");
@@ -1143,7 +2684,7 @@ mod tests {
         );
         let args = json!({});
         let leg = inflow_leg(Some(&format!("MYTOKEN:{USDC_ISSUER}")));
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -1155,7 +2696,11 @@ mod tests {
     /// `gate_inflows = true`: an inflow leg from an issuer NOT on the
     /// allowlist denies, with a `value` detail distinct from a debit denial.
     #[test]
+    #[serial_test::serial]
     fn gate_inflows_true_denies_unknown_issuer_inflow() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
         let tool = make_tool("stellar_dex_trade");
@@ -1168,7 +2713,7 @@ mod tests {
         .with_gate_inflows(true);
         let args = json!({});
         let leg = inflow_leg(Some(&format!("MYTOKEN:{USDC_ISSUER}")));
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         match result {
@@ -1188,7 +2733,11 @@ mod tests {
 
     /// `gate_inflows = true`: an inflow leg from an ALLOWLISTED issuer passes.
     #[test]
+    #[serial_test::serial]
     fn gate_inflows_true_allows_allowlisted_issuer_inflow() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
         let tool = make_tool("stellar_dex_trade");
@@ -1201,7 +2750,7 @@ mod tests {
         .with_gate_inflows(true);
         let args = json!({});
         let leg = inflow_leg(Some(&format!("USDC:{USDC_ISSUER}")));
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -1214,7 +2763,11 @@ mod tests {
     /// fail-closed, the same posture as the existing asset-`None` debit
     /// handling.
     #[test]
+    #[serial_test::serial]
     fn gate_inflows_true_asset_none_inflow_denies_fail_closed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ValueClass, ValueEffects};
 
         let tool = make_tool("stellar_dex_trade");
@@ -1227,7 +2780,7 @@ mod tests {
         .with_gate_inflows(true);
         let args = json!({});
         let leg = inflow_leg(None);
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         match result {
@@ -1250,7 +2803,11 @@ mod tests {
     /// unlisted-issuer debit still denies with the plain (non-inflow) `value`
     /// shape, exactly as it does with `gate_inflows` unset.
     #[test]
+    #[serial_test::serial]
     fn gate_inflows_true_debit_leg_behavior_unchanged() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_dex_trade");
@@ -1268,7 +2825,7 @@ mod tests {
             asset: Some(format!("MYTOKEN:{USDC_ISSUER}")),
             destination: Some("CAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         match result {
@@ -1332,6 +2889,9 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: 1_700_000_000_000,
         }
     }
 
@@ -1380,6 +2940,9 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: 1_700_000_000_000,
         }
     }
 
@@ -1394,7 +2957,11 @@ mod tests {
     /// asserted domain is on the operator's allowlist — matching the domain
     /// on-chain proves nothing without cache verification.
     #[test]
+    #[serial_test::serial]
     fn home_domain_self_asserted_only_with_no_cache_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1428,7 +2995,11 @@ mod tests {
     /// in the counterparty cache, the counterparty account is listed in that
     /// domain's `ACCOUNTS`, and the domain is on the operator's allowlist.
     #[test]
+    #[serial_test::serial]
     fn home_domain_cache_verified_and_allowlisted_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1456,7 +3027,11 @@ mod tests {
     /// distinguishable from an unverified-domain deny (the operator can tell
     /// "verified but not on our allowlist" from "not verified at all").
     #[test]
+    #[serial_test::serial]
     fn home_domain_cache_verified_but_not_allowlisted_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1498,7 +3073,11 @@ mod tests {
     /// Cache absent entirely (`ctx.counterparty_cache = None`) denies as
     /// unverified, distinct from a populated-but-empty/miss cache.
     #[test]
+    #[serial_test::serial]
     fn home_domain_cache_absent_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1532,7 +3111,11 @@ mod tests {
     /// unverified, with a detail that names the missing live entry and the
     /// refresh command for that domain.
     #[test]
+    #[serial_test::serial]
     fn home_domain_without_live_cache_entry_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1572,7 +3155,11 @@ mod tests {
     /// anti-spoofing case #49 closes: an attacker account cannot borrow an
     /// already-cached, legitimate operator's `home_domain` string.
     #[test]
+    #[serial_test::serial]
     fn home_domain_resolved_but_account_not_listed_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1617,7 +3204,11 @@ mod tests {
     /// the allowlist entry `"circle.com"` because byte-equality comparison
     /// distinguishes `'1'` (0x31) from `'l'` (0x6C).
     #[test]
+    #[serial_test::serial]
     fn home_domain_digit_one_homoglyph_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1661,7 +3252,11 @@ mod tests {
     /// enforcement converts this to a `CounterpartyDenied` outcome with a
     /// REDACTED value.
     #[test]
+    #[serial_test::serial]
     fn home_domain_cyrillic_non_ascii_denies_with_redacted_value() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1696,7 +3291,11 @@ mod tests {
     /// On-chain home_domain with mixed case must match a lowercase-normalised
     /// allowlist entry (RFC 4343 DNS case-insensitivity).
     #[test]
+    #[serial_test::serial]
     fn home_domain_mixed_case_matches_lowercase_allowlist_entry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1729,7 +3328,11 @@ mod tests {
     /// An account with no home domain cannot be matched against an allowlist of
     /// trusted operators.
     #[test]
+    #[serial_test::serial]
     fn home_domain_none_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1755,7 +3358,11 @@ mod tests {
     /// resolved.  `account_view` alone is not sufficient to unlock HOME_DOMAIN
     /// matching; `identity_view` must be set.
     #[test]
+    #[serial_test::serial]
     fn home_domain_no_identity_view_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1779,7 +3386,11 @@ mod tests {
     /// Mixed-kinds criterion: both `G_ACCOUNT` and `HOME_DOMAIN` are enabled.
     /// Verifies that both checks fire in order and that the first denial wins.
     #[test]
+    #[serial_test::serial]
     fn mixed_kinds_g_account_and_home_domain_both_checked() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1808,7 +3419,11 @@ mod tests {
 
     /// Mixed-kinds: G_ACCOUNT denies first — HOME_DOMAIN check is never reached.
     #[test]
+    #[serial_test::serial]
     fn mixed_kinds_g_account_denies_before_home_domain() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1855,7 +3470,11 @@ mod tests {
     /// (`derive_value_class` falls through to `ReadOnly` for any name outside
     /// its match arms) must deny fail-closed rather than passing silently.
     #[test]
+    #[serial_test::serial]
     fn moves_value_tool_with_unpopulated_effects_denies_unsizable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool_with_kind(
             "stellar_dex_trade",
             crate::policy::ToolValueKind::MovesValue,
@@ -1877,7 +3496,11 @@ mod tests {
 
     /// An opaque-signing call on the single-tx path must deny fail-closed.
     #[test]
+    #[serial_test::serial]
     fn opaque_sign_call_denies_unsizable_on_single_tx() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_sep43_sign_transaction");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1898,7 +3521,11 @@ mod tests {
     /// single-leg pay/create call is checked identically to the raw-args
     /// path (byte-identical outcome for the existing pay tests above).
     #[test]
+    #[serial_test::serial]
     fn g_account_over_effects_single_leg_matches_raw_args_outcome() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1921,7 +3548,11 @@ mod tests {
     /// (`CounterpartyDenied`) rather than erroring: a counterparty-bearing
     /// action with no resolvable counterparty cannot satisfy an allowlist.
     #[test]
+    #[serial_test::serial]
     fn g_account_over_effects_missing_destination_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_multicall");
@@ -1938,7 +3569,7 @@ mod tests {
             destination: None,
         };
         let args = json!({});
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(

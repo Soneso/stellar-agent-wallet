@@ -1,0 +1,12 @@
+{
+  "ok": true,
+  "data": {
+    "cross_check": {
+      "reason": "below_threshold",
+      "status": "not_required"
+    },
+    "ledger": 1005,
+    "tx_hash": "a2205231bf42f867e8f8a6c9bd9be3ba124a83e44fd010f4e7d71ac4f273cb34"
+  },
+  "request_id": "REQUEST_ID"
+}

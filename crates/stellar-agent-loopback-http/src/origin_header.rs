@@ -285,6 +285,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_https_localhost_scheme_on_post() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/post")
+            .header(header::HOST, "localhost:8080")
+            .header(header::ORIGIN, "https://localhost:8080")
+            .body(Body::empty())
+            .unwrap();
+        let resp = test_router(8080).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({"error": "origin_header_rejected"})
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_wrong_port_on_post() {
         let status = do_post(test_router(8080), Some("http://127.0.0.1:9999")).await;
         assert_eq!(status, 403, "wrong port should be rejected");

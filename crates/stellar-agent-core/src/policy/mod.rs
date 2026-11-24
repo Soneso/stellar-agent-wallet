@@ -58,6 +58,9 @@ use crate::{approval::ApprovalError, profile::schema::Profile};
 // Sub-modules
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Startup advisories for verified policy tool coverage.
+pub mod advisory;
+
 /// `PolicyEngineV1` typed-criteria evaluator.
 ///
 /// Implements [`PolicyEngine`] over the typed schema (per-tx cap, per-period
@@ -65,6 +68,22 @@ use crate::{approval::ApprovalError, profile::schema::Profile};
 /// resource-fee cap).  Replaces [`NoopPolicyEngine`] at runtime when
 /// `profile.policy.engine = PolicyEngineKind::V1`.
 pub mod v1;
+
+/// The policy pin: the sequence, digest, and owner of the signed policy a
+/// mainnet profile last verified, read and written under the window-state
+/// store's lock.
+pub mod pin;
+
+/// The exclusive lock over one profile's policy window-state store, shared by
+/// the store, its authorization ledger, and the policy pin.
+pub mod state_lock;
+
+/// Value effects of caller-supplied transaction envelopes.
+pub mod transaction_effects;
+
+pub use v1::criteria::state_store::policy_now_ms;
+mod snapshot;
+pub use snapshot::{PolicyEvaluationInputs, PolicyEvaluationSnapshot};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BuildRegistryError
@@ -172,34 +191,22 @@ pub enum BuildRegistryError {
         detail: String,
     },
 
-    /// The value stored in the owner keyring entry could not be decoded as
-    /// URL-safe base64.
-    ///
-    /// `detail` is the base64 decode error message (no secret material —
-    /// the encoded bytes are not echoed back).
-    #[error("owner key for profile '{profile}' is not valid URL-safe base64: {detail}")]
-    OwnerKeyDecodeFailed {
-        /// Profile name whose owner key failed to decode.
+    /// The owner entry is in the ambiguous older base64 form.
+    #[error(
+        "owner key for profile '{profile}' is in the older base64 form; enroll the owner public key again"
+    )]
+    OwnerKeyOlderForm {
+        /// Profile whose owner entry needs enrollment.
         profile: String,
-        /// Non-secret decode error description.
-        detail: String,
     },
 
-    /// The decoded owner key has an unexpected byte length.
-    ///
-    /// Ed25519 public keys are exactly 32 bytes.  A stored key of the wrong
-    /// length indicates storage corruption or a wrong key type.
-    #[error(
-        "owner key for profile '{profile}' has unexpected length \
-         {actual_len} (expected {expected_len})"
-    )]
-    OwnerKeyLengthMismatch {
-        /// Profile name whose key has the wrong length.
+    /// The owner entry is neither a G-strkey nor the older form.
+    #[error("owner key for profile '{profile}' cannot be decoded: {detail}")]
+    OwnerKeyDecodeFailed {
+        /// Profile whose owner entry cannot be decoded.
         profile: String,
-        /// Actual decoded byte length.
-        actual_len: usize,
-        /// Expected byte length (always 32 for ed25519).
-        expected_len: usize,
+        /// Fixed diagnostic with no stored value.
+        detail: String,
     },
 
     /// The OS-conventional policy directory could not be resolved.
@@ -544,6 +551,8 @@ pub enum Decision {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum DenyReason {
+    /// A value leg names an asset outside the signed allowlist.
+    AssetNotAllowlisted,
     /// The per-transaction amount cap was exceeded.
     PerTxCapExceeded {
         /// Asset code or canonical identifier (e.g. `"XLM"` or
@@ -561,6 +570,15 @@ pub enum DenyReason {
         #[serde(with = "crate::wire_stroops::i128")]
         attempted_stroops: i128,
     },
+    /// A per-transaction debit sum exceeds i128 and every representable cap.
+    /// Uses the same refusal code as [`Self::PerTxCapExceeded`].
+    PerTxCapOverflow {
+        /// The configured asset identifier.
+        asset: String,
+        /// The exceeded cap.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
+    },
     /// The `approval_above` threshold requires approval through the decision interface.
     ApprovalAboveExceeded {
         /// The configured asset identifier.
@@ -571,6 +589,15 @@ pub enum DenyReason {
         /// The attempted debit total, serialized as a decimal string.
         #[serde(with = "crate::wire_stroops::i128")]
         attempted_stroops: i128,
+    },
+    /// A debit sum above i128 exceeds the `approval_above` threshold.
+    /// Uses the same refusal code as [`Self::ApprovalAboveExceeded`].
+    ApprovalAboveOverflow {
+        /// The configured asset identifier.
+        asset: String,
+        /// The exceeded threshold.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
     },
     /// The per-period aggregate cap was exceeded.
     PerPeriodCapExceeded {
@@ -590,6 +617,28 @@ pub enum DenyReason {
         /// Accumulated spend in the current window in stroops.
         #[serde(with = "crate::wire_stroops::i128")]
         period_used_stroops: i128,
+    },
+    /// A period sum exceeds i128, so no exact usage total can be reported.
+    /// Uses the same refusal code as [`Self::PerPeriodCapExceeded`].
+    PerPeriodCapOverflow {
+        /// The configured asset identifier.
+        asset: String,
+        /// The configured window label.
+        window: String,
+        /// The exceeded cap.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
+    },
+    /// An unlisted debit sum exceeds i128 and every representable bound.
+    /// Uses the same refusal code as [`Self::UnlistedBudgetExceeded`].
+    UnlistedBudgetOverflow {
+        /// The configured asset identifier.
+        asset: String,
+        /// The exceeded budget bound.
+        bound: UnlistedBound,
+        /// The exceeded cap.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
     },
     /// The rate-limit (calls per window) was exceeded.
     RateLimitExceeded {
@@ -807,6 +856,116 @@ pub enum DenyReason {
         /// found or has expired. Redacted at the MCP dispatch-gate boundary.
         contract_id: String,
     },
+
+    // ── Non-renewing total budget ──────────────────────────────────────
+    /// The call would exceed the total allocation of the signed policy.
+    ///
+    /// Wire code: `policy.deny.total_budget_exhausted`.
+    ///
+    /// Time never releases the allocation; only a re-signed policy starts
+    /// another. `remaining_stroops` is the allocation minus its use, floored
+    /// at zero.
+    TotalBudgetExhausted {
+        /// The configured asset identifier.
+        asset: String,
+        /// The total allocation, serialized as a decimal string.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
+        /// The allocation left before this call, serialized as a decimal string.
+        #[serde(with = "crate::wire_stroops::i128")]
+        remaining_stroops: i128,
+    },
+
+    // ── Unlisted-recipient budget ──────────────────────────────────────
+    /// A payment to an unlisted recipient exceeds one bound of the unlisted
+    /// budget.
+    ///
+    /// Wire code: `policy.deny.unlisted_budget_exceeded`. The payload names no
+    /// recipient.
+    UnlistedBudgetExceeded {
+        /// The configured budget asset identifier.
+        asset: String,
+        /// The bound the call exceeds.
+        bound: UnlistedBound,
+        /// The exceeded bound, serialized as a decimal string.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
+        /// The attempted debit total, serialized as a decimal string.
+        #[serde(with = "crate::wire_stroops::i128")]
+        attempted_stroops: i128,
+    },
+
+    // ── Memo binding ───────────────────────────────────────────────────
+    /// A payment to a bound destination lacks the memo its binding requires.
+    ///
+    /// Wire code: `policy.deny.memo_binding_mismatch`. The payload carries the
+    /// required memo kind only, never a destination or a memo value.
+    MemoBindingMismatch {
+        /// The required memo kind: `text`, `id`, `hash`, `return`, or `any`.
+        kind: String,
+    },
+
+    // ── Observed operating-account floor ───────────────────────────────
+    /// The call would leave the operating balance below the signed floor.
+    ///
+    /// Code and wire code: `account.floor_refused`, outside the
+    /// `policy.deny.` prefix because the refusal depends on an account read.
+    AccountFloorRefused {
+        /// The signed floor, serialized as a decimal string.
+        #[serde(with = "crate::wire_stroops::i128")]
+        min_stroops: i128,
+        /// The balance left after reservations, the debit, and the fee,
+        /// serialized as a decimal string.
+        #[serde(with = "crate::wire_stroops::i128")]
+        balance_after_stroops: i128,
+    },
+    /// The floor check has no account observation, reservation sum, or
+    /// balance.
+    ///
+    /// Code and wire code: `account.unread`.
+    AccountUnread,
+    /// The account observation is older than the floor admits.
+    ///
+    /// Code and wire code: `account.stale`.
+    AccountStale {
+        /// The observation age in milliseconds.
+        age_ms: u64,
+    },
+}
+
+/// The bound of an unlisted-recipient budget a call exceeds.
+///
+/// Serialized as `per_tx` or `per_period`.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::UnlistedBound;
+///
+/// assert_eq!(UnlistedBound::PerTx.as_str(), "per_tx");
+/// assert_eq!(
+///     serde_json::to_string(&UnlistedBound::PerPeriod).unwrap(),
+///     "\"per_period\""
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnlistedBound {
+    /// The per-transaction bound.
+    PerTx,
+    /// The rolling-window bound.
+    PerPeriod,
+}
+
+impl UnlistedBound {
+    /// Returns the wire label, `per_tx` or `per_period`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PerTx => "per_tx",
+            Self::PerPeriod => "per_period",
+        }
+    }
 }
 
 impl DenyReason {
@@ -821,6 +980,11 @@ impl DenyReason {
     /// prepend the prefix here — see [`PolicyError::wire_code`] for the parallel
     /// method that returns the full prefixed wire code (load-time errors are not
     /// routed through `dispatch_gate`).
+    ///
+    /// The account refusals ([`Self::AccountFloorRefused`],
+    /// [`Self::AccountUnread`], [`Self::AccountStale`]) are the exception:
+    /// their code is the full `account.*` code, and [`Self::wire_code`]
+    /// returns it unchanged.
     ///
     /// # Examples
     ///
@@ -841,9 +1005,14 @@ impl DenyReason {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
-            Self::PerTxCapExceeded { .. } => "per_tx_cap_exceeded",
-            Self::ApprovalAboveExceeded { .. } => "approval_above_exceeded",
-            Self::PerPeriodCapExceeded { .. } => "per_period_cap_exceeded",
+            Self::AssetNotAllowlisted => "asset_not_allowlisted",
+            Self::PerTxCapExceeded { .. } | Self::PerTxCapOverflow { .. } => "per_tx_cap_exceeded",
+            Self::ApprovalAboveExceeded { .. } | Self::ApprovalAboveOverflow { .. } => {
+                "approval_above_exceeded"
+            }
+            Self::PerPeriodCapExceeded { .. } | Self::PerPeriodCapOverflow { .. } => {
+                "per_period_cap_exceeded"
+            }
             Self::RateLimitExceeded { .. } => "rate_limit_exceeded",
             Self::CounterpartyDenied { .. } => "counterparty_denied",
             Self::MinimumReserveBreached { .. } => "minimum_reserve_breached",
@@ -861,6 +1030,14 @@ impl DenyReason {
             Self::HomeDomainNotResolved { .. } => "home_domain_not_resolved",
             Self::Sep10SessionMissing { .. } => "sep10.session_missing",
             Self::Sep45SessionMissing { .. } => "sep45.session_missing",
+            Self::TotalBudgetExhausted { .. } => "total_budget_exhausted",
+            Self::UnlistedBudgetExceeded { .. } | Self::UnlistedBudgetOverflow { .. } => {
+                "unlisted_budget_exceeded"
+            }
+            Self::MemoBindingMismatch { .. } => "memo_binding_mismatch",
+            Self::AccountFloorRefused { .. } => "account.floor_refused",
+            Self::AccountUnread => "account.unread",
+            Self::AccountStale { .. } => "account.stale",
         }
     }
 
@@ -869,7 +1046,8 @@ impl DenyReason {
     /// The same string `dispatch_gate` and the CLI's policy-evaluation
     /// helpers build from [`Self::code`], available as a `&'static str` to
     /// callers that carry a denial through a typed error whose own `code()`
-    /// returns `&'static str`.
+    /// returns `&'static str`. An account refusal returns its `account.*`
+    /// code without the prefix, equal to [`Self::code`].
     ///
     /// # Examples
     ///
@@ -893,9 +1071,16 @@ impl DenyReason {
     #[must_use]
     pub fn wire_code(&self) -> &'static str {
         match self {
-            Self::PerTxCapExceeded { .. } => "policy.deny.per_tx_cap_exceeded",
-            Self::ApprovalAboveExceeded { .. } => "policy.deny.approval_above_exceeded",
-            Self::PerPeriodCapExceeded { .. } => "policy.deny.per_period_cap_exceeded",
+            Self::AssetNotAllowlisted => "policy.deny.asset_not_allowlisted",
+            Self::PerTxCapExceeded { .. } | Self::PerTxCapOverflow { .. } => {
+                "policy.deny.per_tx_cap_exceeded"
+            }
+            Self::ApprovalAboveExceeded { .. } | Self::ApprovalAboveOverflow { .. } => {
+                "policy.deny.approval_above_exceeded"
+            }
+            Self::PerPeriodCapExceeded { .. } | Self::PerPeriodCapOverflow { .. } => {
+                "policy.deny.per_period_cap_exceeded"
+            }
             Self::RateLimitExceeded { .. } => "policy.deny.rate_limit_exceeded",
             Self::CounterpartyDenied { .. } => "policy.deny.counterparty_denied",
             Self::MinimumReserveBreached { .. } => "policy.deny.minimum_reserve_breached",
@@ -915,6 +1100,14 @@ impl DenyReason {
             Self::HomeDomainNotResolved { .. } => "policy.deny.home_domain_not_resolved",
             Self::Sep10SessionMissing { .. } => "policy.deny.sep10.session_missing",
             Self::Sep45SessionMissing { .. } => "policy.deny.sep45.session_missing",
+            Self::TotalBudgetExhausted { .. } => "policy.deny.total_budget_exhausted",
+            Self::UnlistedBudgetExceeded { .. } | Self::UnlistedBudgetOverflow { .. } => {
+                "policy.deny.unlisted_budget_exceeded"
+            }
+            Self::MemoBindingMismatch { .. } => "policy.deny.memo_binding_mismatch",
+            Self::AccountFloorRefused { .. } => "account.floor_refused",
+            Self::AccountUnread => "account.unread",
+            Self::AccountStale { .. } => "account.stale",
         }
     }
 }
@@ -1100,6 +1293,65 @@ pub const TRANSACTION_STATUS_UNMATCHED_ADVISORY_CODE: &str = "policy.transaction
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum PolicyError {
+    /// The latest reset already consumes this request id.
+    #[error(
+        "policy.reset_consent_replayed: the latest reset consent already consumes this request id"
+    )]
+    ResetConsentReplayed,
+    /// The profile engine differs from the verified signed selection.
+    #[error(
+        "policy.engine_selection_unsigned: the engine selection '{selection}' lacks matching owner authorization in the signed policy"
+    )]
+    EngineSelectionUnsigned {
+        /// The engine selected by the profile.
+        selection: &'static str,
+    },
+    /// A mainnet binding appeared on a testnet policy.
+    #[error("policy.mainnet_table_on_testnet")]
+    MainnetTableOnTestnet,
+    /// The policy predates the installation's pin.
+    #[error("policy.sequence_rollback")]
+    SequenceRollback,
+    /// Equal sequences name different bodies or owners.
+    #[error("policy.sequence_fork")]
+    SequenceFork,
+    /// An enabled installation has no policy pin.
+    #[error("policy.pin_absent")]
+    PinAbsent,
+    /// A new owner has no statement from the pinned owner.
+    #[error("policy.owner_rotation_required")]
+    OwnerRotationRequired,
+    /// The rotation statement does not authorize this owner and body.
+    #[error("policy.owner_rotation_invalid")]
+    OwnerRotationInvalid,
+    /// The window-state lock remained held through the retry window.
+    #[error("policy.state_lock_busy")]
+    StateLockBusy,
+    /// The lock file could not be opened.
+    #[error("policy.state_lock_io: {kind:?}")]
+    StateLockIo {
+        /// The classified I/O failure.
+        kind: std::io::ErrorKind,
+    },
+    /// A mainnet policy omits a required restriction.
+    #[error("policy.mainnet_minimum_unmet: requirement={requirement}, rule={rule:?}")]
+    MainnetMinimumUnmet {
+        /// The failed requirement.
+        requirement: &'static str,
+        /// Zero-based rule index for a rule requirement.
+        rule: Option<usize>,
+    },
+    /// The installation's policy pin could not be read, parsed, or written.
+    #[error("policy.pin_unusable: {detail}")]
+    PinUnusable {
+        /// The pin operation's error, which never carries the pin value.
+        detail: String,
+    },
+    /// The owner key came from the test-only owner public-key file, which an
+    /// enabled mainnet policy refuses: only the keyring's owner entry
+    /// verifies a policy that can authorize mainnet writes.
+    #[error("policy.engine_unavailable: test_owner_key")]
+    TestOwnerKeyRefused,
     /// The full policy engine is not yet implemented.
     ///
     /// Returned by [`NoopPolicyEngine`] for destructive tools on mainnet
@@ -1127,7 +1379,9 @@ pub enum PolicyError {
 
     /// The policy file could not be deserialized.
     ///
-    /// `detail` contains the parse error message (no secret material).
+    /// `detail` names the rule the body breaks or, for a body that is not
+    /// valid TOML, the position of the failure (see
+    /// [`PolicyError::toml_syntax`]).
     #[error("policy file parse failed: {detail}")]
     PolicyFileParseFailed {
         /// Non-secret parse error description.
@@ -1179,6 +1433,26 @@ pub enum PolicyError {
         /// Non-secret evaluator diagnostic.
         detail: String,
     },
+
+    /// An unlisted or native amount, fee, or aggregate exceeds its accounting
+    /// range, so the evaluation refuses.
+    #[error("the policy accounting sum overflows")]
+    AccountingOverflow,
+
+    /// An accounting contributor is negative, or a required native fee is
+    /// missing or malformed, so the evaluation refuses.
+    #[error("a policy accounting amount or fee is invalid")]
+    AccountingInvalid,
+
+    /// A policy evaluation reached a state its own invariants exclude, such
+    /// as a rule position that does not fit the provenance width.
+    ///
+    /// `detail` contains the non-secret diagnostic.
+    #[error("policy internal error: {detail}")]
+    Internal {
+        /// Non-secret diagnostic.
+        detail: String,
+    },
 }
 
 /// Renders the remedy that [`PolicyError::OwnerSignatureInvalid`] appends
@@ -1205,7 +1479,42 @@ fn signed_optional_keys_remedy(rules: &[usize]) -> String {
     )
 }
 
+impl From<pin::PinError> for PolicyError {
+    /// A refused pin operation is `policy.pin_unusable` with the refusal's
+    /// rendering, which never carries the pin value.
+    fn from(error: pin::PinError) -> Self {
+        Self::PinUnusable {
+            detail: error.to_string(),
+        }
+    }
+}
+
+/// The detail of a policy body that is not valid TOML: the line and column of
+/// the failure.
+///
+/// The `Display` of the parser's error prints the offending line, which can
+/// hold a credential, so it is not used.
+#[must_use]
+pub fn toml_syntax_detail(raw: &str, error: &toml_edit::TomlError) -> String {
+    format!(
+        "not valid TOML: {}",
+        crate::profile::toml_diagnostic::toml_error_position(
+            raw,
+            error.span().map(|span| span.start)
+        )
+    )
+}
+
 impl PolicyError {
+    /// The refusal of a policy body that is not valid TOML, carrying
+    /// [`toml_syntax_detail`].
+    #[must_use]
+    pub fn toml_syntax(raw: &str, error: &toml_edit::TomlError) -> Self {
+        Self::PolicyFileParseFailed {
+            detail: toml_syntax_detail(raw, error),
+        }
+    }
+
     /// Returns the semver-stable JSON-RPC wire code for this policy error.
     ///
     /// # Prefix convention
@@ -1237,6 +1546,19 @@ impl PolicyError {
     #[must_use]
     pub fn wire_code(&self) -> &'static str {
         match self {
+            Self::MainnetTableOnTestnet => "policy.mainnet_table_on_testnet",
+            Self::EngineSelectionUnsigned { .. } => "policy.engine_selection_unsigned",
+            Self::ResetConsentReplayed => "policy.reset_consent_replayed",
+            Self::SequenceRollback => "policy.sequence_rollback",
+            Self::PinAbsent => "policy.pin_absent",
+            Self::OwnerRotationRequired => "policy.owner_rotation_required",
+            Self::OwnerRotationInvalid => "policy.owner_rotation_invalid",
+            Self::SequenceFork => "policy.sequence_fork",
+            Self::StateLockBusy => "policy.state_lock_busy",
+            Self::StateLockIo { .. } => "policy.state_lock_io",
+            Self::MainnetMinimumUnmet { .. } => "policy.mainnet_minimum_unmet",
+            Self::PinUnusable { .. } => "policy.pin_unusable",
+            Self::TestOwnerKeyRefused => "policy.engine_unavailable",
             Self::NotImplemented => "policy.engine_required",
             Self::PolicyFileLoadFailed { .. } => "policy.policy_file_load_failed",
             Self::PolicyFileParseFailed { .. } => "policy.policy_file_parse_failed",
@@ -1244,6 +1566,9 @@ impl PolicyError {
             Self::MissingOwnerKey { .. } => "policy.missing_owner_key",
             Self::ScopeResolutionFailed { .. } => "policy.scope_resolution_failed",
             Self::CriterionEvaluationFailed { .. } => "policy.criterion_evaluation_failed",
+            Self::AccountingOverflow => "policy.accounting_overflow",
+            Self::AccountingInvalid => "policy.accounting_invalid",
+            Self::Internal { .. } => "policy.internal",
         }
     }
 }
@@ -1270,6 +1595,68 @@ impl PolicyError {
 /// caller maps `Err(PolicyError::NotImplemented)` to the `policy.engine_required`
 /// wire-format error code.
 pub trait PolicyEngine: Send + Sync {
+    /// Reports whether the first matching rule explicitly permits opaque signing.
+    /// This consent query does not replace the rule's policy decision.
+    fn opaque_signing_opted_in(&self, _tool: &ToolDescriptor) -> bool {
+        false
+    }
+
+    /// Evaluates against a privately owned window image and its fixed instant.
+    ///
+    /// # Errors
+    /// Stateful engines must implement this entry; the default refuses them.
+    /// Provisional evaluation requires an explicit value in the default entry.
+    /// Stateless engines otherwise retain their ordinary evaluation errors.
+    fn evaluate_in_snapshot(
+        &self,
+        inputs: PolicyEvaluationInputs<'_>,
+        snapshot: &PolicyEvaluationSnapshot,
+    ) -> Result<Evaluation, PolicyError> {
+        if self.window_state_store().is_some() {
+            return Err(PolicyError::Internal {
+                detail: "stateful engine does not support evaluation snapshots".to_owned(),
+            });
+        }
+        if inputs.provisional && inputs.value.is_none() {
+            return Err(PolicyError::Internal {
+                detail: "provisional snapshot evaluation requires an explicit value".to_owned(),
+            });
+        }
+        match inputs.value {
+            Some(value) => {
+                let evaluate = if inputs.provisional {
+                    Self::evaluate_provisional
+                } else {
+                    Self::evaluate_with_value_full
+                };
+                evaluate(
+                    self,
+                    inputs.tool,
+                    inputs.args,
+                    inputs.profile,
+                    value,
+                    inputs.account_view,
+                    inputs.identity_view,
+                    inputs.counterparty_cache,
+                    inputs.sep10_sessions,
+                    inputs.sep45_sessions,
+                    snapshot.now_ms(),
+                )
+            }
+            None => self.evaluate_full(
+                inputs.tool,
+                inputs.args,
+                inputs.profile,
+                inputs.account_view,
+                inputs.identity_view,
+                inputs.counterparty_cache,
+                inputs.sep10_sessions,
+                inputs.sep45_sessions,
+                snapshot.now_ms(),
+            ),
+        }
+    }
+
     /// Evaluates whether the given tool call is permitted under the active profile.
     ///
     /// Returns the [`Decision`] ONLY and discards any value descriptor the engine
@@ -1301,6 +1688,9 @@ pub trait PolicyEngine: Send + Sync {
     /// - `sep45_sessions` — optional SEP-45 session view for the
     ///   `sep45_session_active` criterion.  Pass `None` when the criterion is
     ///   not active or when no session store is available at the dispatch site.
+    /// - `now_ms`: the evaluation instant in Unix milliseconds. Every
+    ///   criterion reads this one sample and never the clock; a caller without
+    ///   an instant of its own takes it from [`policy_now_ms`].
     ///
     /// # Errors
     ///
@@ -1320,6 +1710,7 @@ pub trait PolicyEngine: Send + Sync {
         counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
         sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
         sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Decision, PolicyError>;
 
     /// Evaluates a tool call with the value descriptor supplied explicitly by
@@ -1356,6 +1747,7 @@ pub trait PolicyEngine: Send + Sync {
         counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
         sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
         sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         self.evaluate(
             tool,
@@ -1366,6 +1758,7 @@ pub trait PolicyEngine: Send + Sync {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            now_ms,
         )
     }
 
@@ -1393,6 +1786,7 @@ pub trait PolicyEngine: Send + Sync {
         counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
         sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
         sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Evaluation, PolicyError> {
         let decision = self.evaluate(
             tool,
@@ -1403,10 +1797,13 @@ pub trait PolicyEngine: Send + Sync {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            now_ms,
         )?;
         Ok(Evaluation {
             decision,
             value_effects: None,
+            provisional: false,
+            rule_ordinal: None,
         })
     }
 
@@ -1431,6 +1828,7 @@ pub trait PolicyEngine: Send + Sync {
         counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
         sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
         sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Evaluation, PolicyError> {
         let decision = self.evaluate_with_value(
             tool,
@@ -1442,11 +1840,58 @@ pub trait PolicyEngine: Send + Sync {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            now_ms,
         )?;
         Ok(Evaluation {
             decision,
             value_effects: None,
+            provisional: false,
+            rule_ordinal: None,
         })
+    }
+
+    /// Evaluates a call that reads no account before its approval, deferring
+    /// the account-dependent criteria.
+    ///
+    /// Takes the arguments of [`Self::evaluate_with_value_full`]. An engine
+    /// that overrides it skips `minimum_reserve` and `balance_floor`, applies
+    /// every other criterion, and marks the result
+    /// [`Evaluation::provisional`]. The caller runs the strict evaluation with
+    /// a live account read before it signs, so a deferred refusal stays final.
+    ///
+    /// The default delegates to [`Self::evaluate_with_value_full`], so an
+    /// engine without the override evaluates strictly and returns
+    /// `provisional = false`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::evaluate_with_value_full`].
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_provisional(
+        &self,
+        tool: &ToolDescriptor,
+        args: &serde_json::Value,
+        profile: &Profile,
+        value: crate::policy::v1::ValueClass,
+        account_view: Option<&dyn crate::policy::v1::AccountReservesView>,
+        identity_view: Option<&dyn crate::policy::v1::AccountIdentityView>,
+        counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
+        sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
+        sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+        now_ms: u64,
+    ) -> Result<Evaluation, PolicyError> {
+        self.evaluate_with_value_full(
+            tool,
+            args,
+            profile,
+            value,
+            account_view,
+            identity_view,
+            counterparty_cache,
+            sep10_sessions,
+            sep45_sessions,
+            now_ms,
+        )
     }
 
     /// Records a CONFIRMED call's contribution into the engine's persisted
@@ -1480,6 +1925,52 @@ pub trait PolicyEngine: Send + Sync {
         _value: &crate::policy::v1::ValueClass,
     ) -> Result<Vec<crate::policy::v1::criteria::state_store::WindowEntry>, PolicyError> {
         Ok(Vec::new())
+    }
+
+    /// Records certified accounting entries for the supplied value.
+    ///
+    /// # Errors
+    /// Refuses when this engine does not support checked sizing.
+    fn record_confirmed_checked(
+        &self,
+        _tool: &ToolDescriptor,
+        _profile: &Profile,
+        _value: &v1::ValueClass,
+    ) -> Result<v1::SizingOutcome, PolicyError> {
+        Err(PolicyError::CriterionEvaluationFailed {
+            detail: "checked sizing is unsupported by this engine".into(),
+        })
+    }
+
+    /// Checks value rules and sizes an unvalued call without recording it.
+    ///
+    /// # Errors
+    /// Refuses when this engine does not support checked sizing.
+    fn size_unvalued_call(
+        &self,
+        _tool: &ToolDescriptor,
+        _profile: &Profile,
+        _reason: v1::OpaqueReason,
+        _now_ms: u64,
+    ) -> Result<v1::SizingOutcome, PolicyError> {
+        Err(PolicyError::CriterionEvaluationFailed {
+            detail: "checked sizing is unsupported by this engine".into(),
+        })
+    }
+
+    /// Sizes count charges for a call without a value leg.
+    ///
+    /// # Errors
+    /// Refuses when this engine does not support checked sizing.
+    fn size_no_value(
+        &self,
+        _tool: &ToolDescriptor,
+        _profile: &Profile,
+        _now_ms: u64,
+    ) -> Result<v1::CheckedSizing, PolicyError> {
+        Err(PolicyError::CriterionEvaluationFailed {
+            detail: "checked sizing is unsupported by this engine".into(),
+        })
     }
 
     /// Returns the engine's in-memory sliding-window state store, for a
@@ -1526,6 +2017,21 @@ pub struct Evaluation {
     pub decision: Decision,
     /// The sized value effects for an allowed or approval-required call, or `None`.
     pub value_effects: Option<crate::policy::v1::ValueEffects>,
+    /// Whether the decision deferred the account-dependent criteria.
+    ///
+    /// `true` only from an engine's override of
+    /// [`PolicyEngine::evaluate_provisional`]. A provisional decision never
+    /// authorizes signing: the caller re-evaluates strictly with a live
+    /// account read first.
+    pub provisional: bool,
+    /// The zero-based position, in document order, of the rule that decided
+    /// the call.
+    ///
+    /// The position counts every rule in the resolved scope, including rules
+    /// whose tool pattern does not match this call, so it names the same rule
+    /// for every tool. `None` for the default-deny when no rule matches and
+    /// for engines without rules ([`NoopPolicyEngine`]).
+    pub rule_ordinal: Option<usize>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1549,6 +2055,10 @@ pub struct Evaluation {
 /// # Examples
 ///
 /// ```
+/// # #[serial_test::serial]
+/// # fn main() {
+/// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+/// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
 /// use stellar_agent_core::policy::{
 ///     Decision, McpToolRegistration, NoopPolicyEngine, PolicyEngine, ToolDescriptor,
 /// };
@@ -1565,7 +2075,7 @@ pub struct Evaluation {
 ///     name: "stellar_pay", destructive_hint: true, read_only_hint: false, chain_id_required: true,
 ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
 /// });
-/// assert_eq!(engine.evaluate(&tool, &args, &profile, None, None, None, None, None).unwrap(), Decision::Allow);
+/// assert_eq!(engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 0).unwrap(), Decision::Allow);
 ///
 /// // Mainnet: read-only tool is allowed.
 /// let profile_mainnet = Profile::builder_mainnet("https://rpc.example", "svc", "acct", "n-svc", "n-acct")
@@ -1575,18 +2085,69 @@ pub struct Evaluation {
 ///     name: "stellar_balances", destructive_hint: false, read_only_hint: true, chain_id_required: true,
 ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
 /// });
-/// assert_eq!(engine.evaluate(&read_tool, &args, &profile_mainnet, None, None, None, None, None).unwrap(), Decision::Allow);
+/// assert_eq!(engine.evaluate(&read_tool, &args, &profile_mainnet, None, None, None, None, None, 0).unwrap(), Decision::Allow);
 ///
 /// // Mainnet: destructive tool is NOT implemented yet.
 /// let write_tool = ToolDescriptor::from_registration(&McpToolRegistration {
 ///     name: "stellar_pay", destructive_hint: true, read_only_hint: false, chain_id_required: true,
 ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
 /// });
-/// assert!(engine.evaluate(&write_tool, &args, &profile_mainnet, None, None, None, None, None).is_err());
+/// assert!(engine.evaluate(&write_tool, &args, &profile_mainnet, None, None, None, None, None, 0).is_err());
+/// # }
 /// ```
 pub struct NoopPolicyEngine;
 
 impl PolicyEngine for NoopPolicyEngine {
+    fn opaque_signing_opted_in(&self, _tool: &ToolDescriptor) -> bool {
+        true
+    }
+
+    /// Returns `NoApplicableLimit` because this engine holds no window state.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    fn record_confirmed_checked(
+        &self,
+        _tool: &ToolDescriptor,
+        _profile: &Profile,
+        _value: &v1::ValueClass,
+    ) -> Result<v1::SizingOutcome, PolicyError> {
+        Ok(v1::SizingOutcome::Sized(v1::CheckedSizing::new(
+            v1::SizingBasis::NoApplicableLimit,
+            Vec::new(),
+        )?))
+    }
+
+    /// Returns `NoApplicableLimit` because this engine holds no window state.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    fn size_unvalued_call(
+        &self,
+        _tool: &ToolDescriptor,
+        _profile: &Profile,
+        _reason: v1::OpaqueReason,
+        _now_ms: u64,
+    ) -> Result<v1::SizingOutcome, PolicyError> {
+        Ok(v1::SizingOutcome::Sized(v1::CheckedSizing::new(
+            v1::SizingBasis::NoApplicableLimit,
+            Vec::new(),
+        )?))
+    }
+
+    /// Returns `NoApplicableLimit` because this engine holds no window state.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    fn size_no_value(
+        &self,
+        _tool: &ToolDescriptor,
+        _profile: &Profile,
+        _now_ms: u64,
+    ) -> Result<v1::CheckedSizing, PolicyError> {
+        v1::CheckedSizing::new(v1::SizingBasis::NoApplicableLimit, Vec::new())
+    }
+
     fn evaluate(
         &self,
         tool: &ToolDescriptor,
@@ -1597,6 +2158,7 @@ impl PolicyEngine for NoopPolicyEngine {
         _counterparty_cache: Option<&dyn crate::policy::v1::CounterpartyCacheView>,
         _sep10_sessions: Option<&dyn crate::policy::v1::Sep10SessionView>,
         _sep45_sessions: Option<&dyn crate::policy::v1::Sep45SessionView>,
+        _now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         // Testnet: all tools allowed.
         if !profile.chain_id.is_mainnet() {
@@ -1668,7 +2230,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_destructive_tool_allowed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = NoopPolicyEngine;
         let result = engine.evaluate(
             &destructive_tool(),
@@ -1679,12 +2245,17 @@ mod tests {
             None,
             None,
             None,
+            1_700_000_000_000,
         );
         assert_eq!(result.unwrap(), Decision::Allow);
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_read_tool_allowed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = NoopPolicyEngine;
         let result = engine.evaluate(
             &read_tool(),
@@ -1695,12 +2266,17 @@ mod tests {
             None,
             None,
             None,
+            1_700_000_000_000,
         );
         assert_eq!(result.unwrap(), Decision::Allow);
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_read_tool_allowed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = NoopPolicyEngine;
         let result = engine.evaluate(
             &read_tool(),
@@ -1711,12 +2287,17 @@ mod tests {
             None,
             None,
             None,
+            1_700_000_000_000,
         );
         assert_eq!(result.unwrap(), Decision::Allow);
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_destructive_tool_not_implemented() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = NoopPolicyEngine;
         let result = engine.evaluate(
             &destructive_tool(),
@@ -1727,6 +2308,7 @@ mod tests {
             None,
             None,
             None,
+            1_700_000_000_000,
         );
         assert!(
             matches!(result, Err(PolicyError::NotImplemented)),
@@ -1786,6 +2368,19 @@ mod tests {
         // guard makes the test driver's full-coverage dependency explicit.
         fn _exhaustiveness_guard(e: &PolicyError) {
             match e {
+                PolicyError::EngineSelectionUnsigned { .. } => {}
+                PolicyError::ResetConsentReplayed => {}
+                PolicyError::MainnetTableOnTestnet => {}
+                PolicyError::SequenceRollback => {}
+                PolicyError::PinAbsent => {}
+                PolicyError::OwnerRotationRequired => {}
+                PolicyError::OwnerRotationInvalid => {}
+                PolicyError::SequenceFork => {}
+                PolicyError::StateLockBusy => {}
+                PolicyError::StateLockIo { .. } => {}
+                PolicyError::MainnetMinimumUnmet { .. } => {}
+                PolicyError::PinUnusable { .. } => {}
+                PolicyError::TestOwnerKeyRefused => {}
                 PolicyError::NotImplemented => {}
                 PolicyError::PolicyFileLoadFailed { .. } => {}
                 PolicyError::PolicyFileParseFailed { .. } => {}
@@ -1793,10 +2388,33 @@ mod tests {
                 PolicyError::MissingOwnerKey { .. } => {}
                 PolicyError::ScopeResolutionFailed { .. } => {}
                 PolicyError::CriterionEvaluationFailed { .. } => {}
+                PolicyError::AccountingOverflow => {}
+                PolicyError::AccountingInvalid => {}
+                PolicyError::Internal { .. } => {}
             }
         }
 
         vec![
+            PolicyError::MainnetTableOnTestnet,
+            PolicyError::EngineSelectionUnsigned { selection: "noop" },
+            PolicyError::ResetConsentReplayed,
+            PolicyError::SequenceRollback,
+            PolicyError::PinAbsent,
+            PolicyError::OwnerRotationRequired,
+            PolicyError::OwnerRotationInvalid,
+            PolicyError::SequenceFork,
+            PolicyError::StateLockBusy,
+            PolicyError::StateLockIo {
+                kind: std::io::ErrorKind::PermissionDenied,
+            },
+            PolicyError::MainnetMinimumUnmet {
+                requirement: "scope",
+                rule: None,
+            },
+            PolicyError::PinUnusable {
+                detail: detail.to_owned(),
+            },
+            PolicyError::TestOwnerKeyRefused,
             PolicyError::NotImplemented,
             PolicyError::PolicyFileLoadFailed {
                 detail: detail.to_owned(),
@@ -1817,11 +2435,29 @@ mod tests {
             PolicyError::CriterionEvaluationFailed {
                 detail: detail.to_owned(),
             },
+            PolicyError::AccountingOverflow,
+            PolicyError::AccountingInvalid,
+            PolicyError::Internal {
+                detail: detail.to_owned(),
+            },
         ]
     }
 
     fn expected_policy_error_wire_code(err: &PolicyError) -> &'static str {
         match err {
+            PolicyError::EngineSelectionUnsigned { .. } => "policy.engine_selection_unsigned",
+            PolicyError::ResetConsentReplayed => "policy.reset_consent_replayed",
+            PolicyError::MainnetTableOnTestnet => "policy.mainnet_table_on_testnet",
+            PolicyError::SequenceRollback => "policy.sequence_rollback",
+            PolicyError::PinAbsent => "policy.pin_absent",
+            PolicyError::OwnerRotationRequired => "policy.owner_rotation_required",
+            PolicyError::OwnerRotationInvalid => "policy.owner_rotation_invalid",
+            PolicyError::SequenceFork => "policy.sequence_fork",
+            PolicyError::StateLockBusy => "policy.state_lock_busy",
+            PolicyError::StateLockIo { .. } => "policy.state_lock_io",
+            PolicyError::MainnetMinimumUnmet { .. } => "policy.mainnet_minimum_unmet",
+            PolicyError::PinUnusable { .. } => "policy.pin_unusable",
+            PolicyError::TestOwnerKeyRefused => "policy.engine_unavailable",
             PolicyError::NotImplemented => "policy.engine_required",
             PolicyError::PolicyFileLoadFailed { .. } => "policy.policy_file_load_failed",
             PolicyError::PolicyFileParseFailed { .. } => "policy.policy_file_parse_failed",
@@ -1829,6 +2465,9 @@ mod tests {
             PolicyError::MissingOwnerKey { .. } => "policy.missing_owner_key",
             PolicyError::ScopeResolutionFailed { .. } => "policy.scope_resolution_failed",
             PolicyError::CriterionEvaluationFailed { .. } => "policy.criterion_evaluation_failed",
+            PolicyError::AccountingOverflow => "policy.accounting_overflow",
+            PolicyError::AccountingInvalid => "policy.accounting_invalid",
+            PolicyError::Internal { .. } => "policy.internal",
         }
     }
 
@@ -2038,16 +2677,18 @@ mod tests {
         );
     }
 
-    /// Every `DenyReason` variant's full wire code is its `code()` under the
-    /// `policy.deny.` prefix, so a surface that reports a denial through a
+    /// Every policy `DenyReason` variant's full wire code is its `code()`
+    /// under the `policy.deny.` prefix, and every account variant's wire code
+    /// is its `code()` unprefixed, so a surface that reports a denial through a
     /// typed error names it exactly as the gate does.
     ///
     /// The list is the closed variant inventory: a new variant that is not
     /// added here leaves its `wire_code()` unchecked, so the list is what
     /// keeps the two tables from drifting apart.
     #[test]
-    fn deny_reason_wire_code_is_the_prefixed_code_for_every_variant() {
+    fn deny_reason_wire_codes_match_variant_namespaces() {
         let all = [
+            DenyReason::AssetNotAllowlisted,
             DenyReason::ApprovalAboveExceeded {
                 asset: "native".into(),
                 max_stroops: 1,
@@ -2119,11 +2760,31 @@ mod tests {
             DenyReason::Sep45SessionMissing {
                 contract_id: "CAAA".into(),
             },
+            DenyReason::TotalBudgetExhausted {
+                asset: "native".into(),
+                max_stroops: 1,
+                remaining_stroops: 0,
+            },
+            DenyReason::UnlistedBudgetExceeded {
+                asset: "native".into(),
+                bound: UnlistedBound::PerPeriod,
+                max_stroops: 1,
+                attempted_stroops: 2,
+            },
+            DenyReason::MemoBindingMismatch { kind: "id".into() },
+        ];
+        let account = [
+            DenyReason::AccountFloorRefused {
+                min_stroops: 1,
+                balance_after_stroops: 0,
+            },
+            DenyReason::AccountUnread,
+            DenyReason::AccountStale { age_ms: 120_001 },
         ];
 
         assert_eq!(
-            all.len(),
-            20,
+            all.len() + account.len(),
+            27,
             "the inventory must name every DenyReason variant"
         );
         for reason in &all {
@@ -2131,6 +2792,14 @@ mod tests {
                 reason.wire_code(),
                 format!("policy.deny.{}", reason.code()),
                 "wire_code must be the prefixed code for {reason:?}"
+            );
+        }
+        for reason in &account {
+            assert!(reason.code().starts_with("account."), "{reason:?}");
+            assert_eq!(
+                reason.wire_code(),
+                reason.code(),
+                "an account wire code is its code for {reason:?}"
             );
         }
     }

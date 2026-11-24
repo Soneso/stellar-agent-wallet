@@ -128,7 +128,7 @@ pub async fn run(args: &ShowArgs) -> i32 {
             0
         }
         Err(err) => {
-            let wallet_err = WalletError::Validation(err.to_validation_error(args.profile_name()));
+            let wallet_err = WalletError::Validation(err.to_validation_error());
             render::render_json(&Envelope::err(&wallet_err));
             1
         }
@@ -161,19 +161,20 @@ mod tests {
         args: ShowArgs,
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn show_not_found_returns_exit_1() {
-        // We test the run() function with a name that does not exist.
-        // Since run() calls loader::load() which uses the default OS dir,
-        // we can only test for a profile that definitively does not exist.
-        // This is more of a smoke-test; the loader unit tests cover the full
-        // load paths.
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let args = ShowArgs {
             name: Some("__nonexistent_profile_for_tests__".to_owned()),
             profile: None,
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
+        fixture.assert_refusal(
+            Some("validation.profile_not_found"),
+            &["the requested profile was not found"],
+        );
     }
 
     #[test]

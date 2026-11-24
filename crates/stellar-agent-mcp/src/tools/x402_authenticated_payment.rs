@@ -134,12 +134,11 @@ impl PaytoAnchored {
 ///
 /// # Returns
 ///
-/// [`PaytoAnchored::Anchored`] if `pay_to` (a G-strkey) is in `accounts`.
-/// [`PaytoAnchored::NotAnchored`] if `accounts` is non-empty and `pay_to` (a
-/// G-strkey) is absent from it.
-/// [`PaytoAnchored::Unknown`] if `accounts` is empty, OR `pay_to` is not a
-/// G-strkey (e.g. a C-strkey SAC destination) — SEP-1 `ACCOUNTS` only enumerates
-/// G-strkeys, so a non-G `pay_to` can never match and anchoring is indeterminate.
+/// [`PaytoAnchored::Anchored`] if the G payee or the M payee's base G is listed.
+/// [`PaytoAnchored::NotAnchored`] if that account is absent from a non-empty list.
+/// [`PaytoAnchored::Unknown`] if the list is empty or the payee is C or W.
+/// SEP-1 `ACCOUNTS` lists accounts only. The result is advisory; the payment
+/// keeps the full recipient.
 ///
 /// # Panics
 ///
@@ -148,15 +147,14 @@ fn compute_payto_anchored(pay_to: &str, accounts: &[String]) -> PaytoAnchored {
     if accounts.is_empty() {
         return PaytoAnchored::Unknown;
     }
-    // SEP-1 `ACCOUNTS` only enumerates G-strkey accounts. An x402 `payTo` is
-    // frequently a C-strkey (SAC contract destination), which can never appear in
-    // a G-only `ACCOUNTS` list — so anchoring is genuinely indeterminate (Unknown),
-    // not a substitution warning (a `NotAnchored` here would be a false alarm that
-    // trains operators to ignore the signal).
-    if !pay_to.starts_with('G') {
-        return PaytoAnchored::Unknown;
-    }
-    if accounts.iter().any(|a| a == pay_to) {
+    let account = match stellar_strkey::Strkey::from_string(pay_to) {
+        Ok(stellar_strkey::Strkey::PublicKeyEd25519(key)) => key.to_string(),
+        Ok(stellar_strkey::Strkey::MuxedAccountEd25519(m)) => {
+            stellar_strkey::ed25519::PublicKey(m.ed25519).to_string()
+        }
+        _ => return PaytoAnchored::Unknown,
+    };
+    if accounts.iter().any(|a| a == account.as_str()) {
         PaytoAnchored::Anchored
     } else {
         PaytoAnchored::NotAnchored
@@ -179,7 +177,10 @@ fn compute_payto_anchored(pay_to: &str, accounts: &[String]) -> PaytoAnchored {
 /// - `home_domain` — operator-supplied home domain for SEP-10 identity
 ///   verification (e.g. `"testanchor.stellar.org"`).
 /// - `address` — optional signer address (G-strkey).
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+/// - `approval_nonce`, `approval_attestation`: the approval of the queueing
+///   call, on either network. Both are absent for the queueing call and
+///   present for the payment.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(crate = "rmcp::serde")]
 pub struct X402AuthenticatedPaymentArgs {
     /// Base64-encoded `PAYMENT-REQUIRED` header value OR raw JSON
@@ -213,6 +214,56 @@ pub struct X402AuthenticatedPaymentArgs {
     /// When provided must match the active signer enrolled in the profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+
+    /// Wallet-issued approval nonce from the queueing call's `data.approval` block.
+    ///
+    /// Supply it with `approval_attestation` when the policy requires approval, on either network.
+    /// The call verifies the attestation and the approved payment intent and home domain before the SEP-10 authentication.
+    #[serde(default)]
+    pub approval_nonce: Option<String>,
+
+    /// HMAC-SHA256 attestation blob, URL-safe base64 no-pad encoded (32 bytes).
+    ///
+    /// Written to the pending-approvals store by `stellar-agent approve --id
+    /// <approval_nonce> --profile <name>` after the operator approves. On
+    /// testnet the operator confirms at a terminal or in the `approve serve`
+    /// page. On mainnet the operator approves with a verified passkey
+    /// assertion, in the local browser or at the signed approval origin. The payment call verifies the proof before the SEP-10
+    /// authentication. On testnet it compares the HMAC under the attestation
+    /// key. On mainnet it verifies the passkey approval witness.
+    ///
+    /// Required alongside `approval_nonce` when the policy requires approval.
+    /// An absent, invalid, or expired attestation returns
+    /// `policy.approval_required`. A rejected approval returns
+    /// `policy.approval_rejected`, and a spent one returns
+    /// `policy.approval_consumed`.
+    #[serde(default)]
+    pub approval_attestation: Option<String>,
+    /// Business id naming this value operation: 1 to 64 printable ASCII
+    /// characters, no space. Required on `stellar:mainnet`, where a retry
+    /// with the same id returns the stored operation instead of new work;
+    /// on another chain it is validated and echoed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_id: Option<String>,
+}
+
+/// Prints every field but the attestation, which shows only whether it is
+/// set: the attestation is the operator's approval credential.
+impl std::fmt::Debug for X402AuthenticatedPaymentArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("X402AuthenticatedPaymentArgs")
+            .field("payment_required", &self.payment_required)
+            .field("chain_id", &self.chain_id)
+            .field("home_domain", &self.home_domain)
+            .field("address", &self.address)
+            .field("approval_nonce", &self.approval_nonce)
+            .field("business_id", &self.business_id)
+            .field(
+                "approval_attestation",
+                &crate::tools::common::AttestationPresence(&self.approval_attestation),
+            )
+            .finish()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -228,9 +279,35 @@ pub struct X402AuthenticatedPaymentArgs {
 /// shape, such as the LDH endpoint host, is printed as validated. Endpoints
 /// are named by host and port, and the text carries no JWT and no response
 /// body.
+///
+/// The two mainnet identity errors answer the agent-facing network codes:
+/// the signing refusal is `network.mainnet_write_forbidden`, and a refused
+/// authorization of the SEP-10 challenge is
+/// `network.mainnet_authorization_refused` with a text that names no
+/// precondition.
 fn identity_error_to_tool_result(err: &IdentityError) -> CallToolResult {
-    crate::tools::common::business_error_result(err.wire_code(), err.to_string())
+    match err {
+        IdentityError::MainnetSigningForbidden { .. } => {
+            crate::tools::common::x402_mainnet_signing_forbidden_result()
+        }
+        IdentityError::MainnetAuthorizationRefused => crate::tools::common::business_error_result(
+            stellar_agent_core::error::NetworkError::MainnetAuthorizationRefused.code(),
+            SEP10_REFUSAL_TEXT,
+        ),
+        other => crate::tools::common::business_error_result(other.wire_code(), other.to_string()),
+    }
 }
+
+/// The text of a refused mainnet authorization before the SEP-10 challenge
+/// was submitted.
+const SEP10_REFUSAL_TEXT: &str = "the mainnet authorization for this SEP-10 authentication was \
+                                  refused; no signed challenge was submitted";
+
+/// The text of a refused mainnet authorization of the payment: an intent,
+/// submission or release refusal after the SEP-10 authentication.
+#[cfg(feature = "mainnet-write")]
+const PAYMENT_REFUSAL_TEXT: &str =
+    "the mainnet authorization for this payment was refused; the payment payload was withheld";
 
 /// Builds the standard business-error envelope for a payment-build failure that
 /// occurs AFTER the identity gate has passed, carrying the
@@ -334,6 +411,10 @@ impl WalletServer {
                        ephemeral challenge/response → JWT) then calls create_payment, which \
                        obtains the cross-check witness before signing. Any gate failure aborts \
                        BEFORE the payment is built. \
+                       When policy requires approval, the first call returns an approval block, \
+                       signs nothing, and runs no SEP-10. \
+                       Repeat the call with approval_nonce and approval_attestation. \
+                       Mainnet calls need business_id. \
                        Returns { paymentSignature, authorization (Bearer JWT for Authorization header), \
                        payer, asset, amount, payTo, home_domain, network, payto_anchored, \
                        cross_check }. \
@@ -351,17 +432,53 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use std::sync::Arc;
 
+        use crate::tools::common::{
+            DispatchOutcome, GatedApprovalKind, approval_required_indistinguishable,
+            verify_attestation_subject_gate,
+        };
+        use crate::tools::x402_create_payment::{
+            ApprovalView, X402ApprovalProof, X402ApprovalSpend, X402CheckedSigner,
+            approval_response, presented_x402_terms_refusal, x402_address_mismatch,
+            x402_approval_callback, x402_protocol_refusal,
+        };
         use stellar_agent_network::keyring::enrolled_keyring_signer;
-        use stellar_agent_x402::exact::{create_payment, validate_requirements};
+        use stellar_agent_x402::exact::{create_payment_with_pre_sign, validate_requirements};
         use stellar_agent_x402::wire::encode_payment_signature;
 
-        // Mainnet structural refusal — before any key access, SEP-10 identity
-        // gate, or signing. This tool returns a payment authorization the MCP
-        // host broadcasts externally; the submit-layer mainnet gate never fires
-        // because the wallet does not submit. Refuse on a mainnet profile so no
-        // valid mainnet payment signature is ever produced. Wire code:
-        // network.mainnet_write_forbidden.
+        // Mainnet: this tool returns a payment authorization the MCP host
+        // broadcasts externally, so the submit-layer mainnet gate never fires
+        // because the wallet does not submit. Without the server's mainnet
+        // write context, which a build without mainnet writes never holds,
+        // the tool refuses before any key access, SEP-10 identity gate, or
+        // signing, so no mainnet payment signature is produced. Wire code:
+        // network.mainnet_write_forbidden. With the context it runs the
+        // approved two-call flow. The Message authorization is consumed
+        // before the SEP-10 signature. The payment intent is consumed before
+        // the signed simulation, and the submit authorization before the
+        // payload release.
         if self.context.chain_id.is_mainnet() {
+            if self.mainnet_context.is_none() {
+                return Ok(crate::tools::common::x402_mainnet_signing_forbidden_result());
+            }
+            // A build without the mainnet-write feature refuses a mainnet
+            // payment here.
+            #[cfg(feature = "mainnet-write")]
+            {
+                // A fixed test session would stand in for the authorized
+                // identity gate, so a server with the context refuses it.
+                #[cfg(any(test, feature = "test-helpers"))]
+                if self.x402_identity_session_override.is_some() {
+                    return Ok(crate::tools::common::x402_mainnet_signing_forbidden_result());
+                }
+                let guard = match self.mainnet_write_admission(
+                    stellar_agent_network::mainnet::MainnetConsumer::X402Authenticated,
+                ) {
+                    Ok(guard) => guard,
+                    Err(result) => return Ok(result),
+                };
+                return self.mainnet_authenticated_payment(args, guard).await;
+            }
+            #[cfg(not(feature = "mainnet-write"))]
             return Ok(crate::tools::common::x402_mainnet_signing_forbidden_result());
         }
 
@@ -375,6 +492,10 @@ impl WalletServer {
             Ok(r) => r,
             Err(ref err) => return Ok(x402_error_to_tool_result(err)),
         };
+        let complete_proof = args.approval_nonce.is_some() && args.approval_attestation.is_some();
+        if complete_proof && let Some(result) = presented_x402_terms_refusal(self, &requirements) {
+            return Ok(result);
+        }
         let amount = match validate_requirements(
             &requirements,
             self.context.network_passphrase(),
@@ -382,6 +503,23 @@ impl WalletServer {
         ) {
             Ok(amount) => amount,
             Err(ref err) => return Ok(x402_error_to_tool_result(err)),
+        };
+        if let Err(result) = crate::tools::common::check_x402_payee_protocol(
+            &requirements.pay_to,
+            &self.profile,
+            || self.context.primary_client(),
+        )
+        .await
+        {
+            return Ok(x402_protocol_refusal(self, result, complete_proof));
+        }
+        // Off mainnet a supplied id is validated here and echoed. A mainnet
+        // call takes its own path and checks its id at its record lookup,
+        // after every refusal a call without one gives.
+        let business_id = match self.echoed_business_id(&args.chain_id, args.business_id.as_deref())
+        {
+            Ok(id) => id,
+            Err(result) => return Ok(result),
         };
 
         // ── Build the value-carrying leg from the SAME decode ────────────────
@@ -393,9 +531,6 @@ impl WalletServer {
         // Capture the gate-derived leg as an audit record before it moves into
         // the value descriptor, so the row carries exactly what the gate sized.
         let audit_leg = ValueLegRecord::from(&value_leg);
-        // Also retain an owned clone for the window-state record after
-        // authorization (single-derivation invariant on the recording side
-        // too) — `value_leg` itself moves into `ValueClass::single` below.
         let value_leg_for_record = value_leg.clone();
 
         // ── Telemetry preamble (redaction) ───────────────────────────────────
@@ -407,10 +542,8 @@ impl WalletServer {
 
         // The gate performs registry lookup, chain validation, and policy evaluation.
         // Value criteria use the supplied value_leg.
-        // Single-shot sign tool: RequireApproval is fail-closed. The two-phase
-        // approval flow is not supported on this surface. `account_view` /
-        // `identity_view` are `None`: the `minimum_reserve` / `home_domain`
-        // criteria fail closed on this tool pending account-view wiring.
+        // Approval requirements queue an intent or verify the presented proof.
+        // Account-reserve and account-identity criteria fail closed without views.
         let dispatch_outcome = match self
             .dispatch_gate_with_value(
                 "stellar_x402_authenticated_payment",
@@ -425,12 +558,122 @@ impl WalletServer {
             Ok(o) => o,
             Err(e) => return e.into_result(),
         };
-        match dispatch_outcome {
-            crate::tools::common::DispatchOutcome::Allow(_) => {}
-            crate::tools::common::DispatchOutcome::RequireApproval(_) => {
-                return Ok(crate::tools::common::single_shot_require_approval_error());
+        let audit_decision = dispatch_outcome.audit_decision();
+        let (value_for_record, approval) = match &dispatch_outcome {
+            DispatchOutcome::Allow(outcome) => (
+                outcome
+                    .value_effects
+                    .clone()
+                    .map_or(ValueClass::single(value_leg_for_record), ValueClass::Value),
+                None,
+            ),
+            DispatchOutcome::RequireApproval(outcome) => (
+                outcome
+                    .value_effects
+                    .clone()
+                    .map_or(ValueClass::single(value_leg_for_record), ValueClass::Value),
+                Some(outcome),
+            ),
+        };
+        let mut approval_proof = None;
+        if let Some(approval) = approval {
+            let profile_name = self.profile_name_for_approval();
+            let payer = self.profile.mcp_signer_default.account.as_str();
+            if let Err(error) =
+                stellar_agent_network::counterparty::fetch::validate_home_domain(&args.home_domain)
+            {
+                if complete_proof {
+                    return Ok(approval_required_indistinguishable(&profile_name));
+                }
+                let detail = match error {
+                    stellar_agent_network::counterparty::CounterpartyError::HomeDomainInvalid {
+                        detail,
+                    } => detail,
+                    other => other.to_string(),
+                };
+                return Ok(identity_error_to_tool_result(
+                    &IdentityError::HomeDomainInvalid { detail },
+                ));
+            }
+            if let Some(result) = x402_address_mismatch(args.address.as_deref(), payer) {
+                return Ok(if complete_proof {
+                    approval_required_indistinguishable(&profile_name)
+                } else if args.approval_nonce.is_none() && args.approval_attestation.is_none() {
+                    crate::tools::common::single_shot_require_approval_error()
+                } else {
+                    result
+                });
+            }
+            let root = match stellar_agent_x402::exact::payment_root(&requirements, payer) {
+                Ok(root) => root,
+                Err(error) => return Ok(x402_error_to_tool_result(&error)),
+            };
+            let digest = match stellar_agent_x402::exact::intent_digest(&requirements, payer) {
+                Ok(digest) => digest,
+                Err(error) => return Ok(x402_error_to_tool_result(&error)),
+            };
+            if args.approval_nonce.is_none() && args.approval_attestation.is_none() {
+                let entry = match self.write_x402_pending_approval(
+                    &root,
+                    Some(args.home_domain.clone()),
+                    approval,
+                    || {
+                        self.clock.now_unix_ms().map_err(|error| {
+                            stellar_agent_core::WalletError::WalletState(
+                                stellar_agent_core::error::WalletStateError::clock_error(&error),
+                            )
+                        })
+                    },
+                ) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        return Ok(crate::tools::common::business_error_result(
+                            error.code(),
+                            error.message(),
+                        ));
+                    }
+                };
+                return Ok(approval_response(&ApprovalView {
+                    entry: &entry,
+                    profile: &profile_name,
+                    chain_id: &args.chain_id,
+                    endpoint_host: None,
+                    signer: payer,
+                    requirements: &requirements,
+                    business_id: business_id.as_ref(),
+                }));
+            }
+            let subject =
+                stellar_agent_core::approval::subject::approval_subject_x402_authenticated(
+                    &digest,
+                    &args.home_domain,
+                );
+            if let Err(result) = verify_attestation_subject_gate(
+                self,
+                &dispatch_outcome,
+                GatedApprovalKind::X402.expectation(subject),
+                None,
+                args.approval_nonce.as_deref(),
+                args.approval_attestation.as_deref(),
+                None,
+                "stellar_x402_authenticated_payment",
+            )
+            .await
+            {
+                return Ok(result);
+            }
+            if let (Some(nonce), Some(attestation)) =
+                (&args.approval_nonce, &args.approval_attestation)
+            {
+                approval_proof = Some(X402ApprovalProof {
+                    nonce: nonce.clone(),
+                    attestation: attestation.clone(),
+                    expected_subject: subject,
+                    governing_ttl_ms: approval.governing_ttl_ms,
+                });
             }
         }
+        let approval_refusal = std::sync::Mutex::new(None);
 
         // ── Audit pre-flight (fail-closed) ────────────────────────────────────
         // Runs AFTER the dispatch gate: a policy denial or approval escalation
@@ -476,13 +719,12 @@ impl WalletServer {
         {
             Ok(s) => s,
             Err(ref err) => {
+                // The event carries the wire code only: the home domain is
+                // the refused argument when the identity gate rejects its
+                // form, and the error details may name URL paths.
                 tracing::warn!(
                     error_code = %err.wire_code(),
-                    home_domain = %args.home_domain,
                     "x402_authenticated_payment: identity gate aborted before payment",
-                    // NEVER log err details that might contain URL paths
-                    // (IdentityError::Display is redaction-safe, but explicit
-                    // redact at the span boundary is belt-and-braces).
                 );
                 return Ok(identity_error_to_tool_result(err));
             }
@@ -498,15 +740,8 @@ impl WalletServer {
         // `requirements` was decoded above (before the gate), alongside
         // `value_leg` — not re-decoded here.
         let account = self.profile.mcp_signer_default.account.as_str();
-        if let Some(ref requested_addr) = args.address
-            && requested_addr != account
-        {
-            let err = stellar_agent_x402::X402Error::InvalidPaymentRequired {
-                detail: format!(
-                    "requested address {requested_addr} does not match profile signer {account}"
-                ),
-            };
-            return Ok(x402_error_to_tool_result(&err));
+        if let Some(result) = x402_address_mismatch(args.address.as_deref(), account) {
+            return Ok(result);
         }
 
         // ── Cross-check requirement, before the signer is read ───────────────
@@ -532,13 +767,21 @@ impl WalletServer {
         };
 
         // ── Step 3: Load signer from keyring ─────────────────────────────────
-        let signer_handle = match enrolled_keyring_signer(
-            &self.profile_name_for_approval(),
-            &self.profile,
-            account,
-        )
-        .await
-        {
+        let signer_result = if approval_proof.is_some() {
+            crate::tools::x402_create_payment::x402_mainnet_signing_handle(
+                &self.profile.mcp_signer_default,
+                account,
+            )
+        } else {
+            enrolled_keyring_signer(
+                &self.profile_name_for_approval(),
+                &self.profile,
+                account,
+                self.established_owner().as_ref(),
+            )
+            .await
+        };
+        let signer_handle = match signer_result {
             Ok(h) => h,
             Err(err) => {
                 if matches!(&err, stellar_agent_core::error::WalletError::Auth(_)) {
@@ -572,7 +815,12 @@ impl WalletServer {
 
         // ── Step 5: Dispatch to stellar_agent_x402::create_payment ───────────
         let signer: Arc<dyn stellar_agent_network::signing::Signer + Send + Sync> =
-            Arc::new(signer_handle);
+            Arc::new(X402CheckedSigner {
+                inner: signer_handle,
+                server: self,
+                proof: &approval_proof,
+                refusal: &approval_refusal,
+            });
 
         // Shared-window admission precedes signing and the signed RPC
         // re-simulation. A failure after it, an endpoint identity refusal
@@ -580,7 +828,7 @@ impl WalletServer {
         if let Err(refusal) = crate::tools::x402_create_payment::record_x402_authorization(
             self,
             "stellar_x402_authenticated_payment",
-            &stellar_agent_core::policy::v1::ValueClass::single(value_leg_for_record),
+            &value_for_record,
         ) {
             return Ok(refusal);
         }
@@ -594,18 +842,28 @@ impl WalletServer {
             args.chain_id.as_str(),
             audit_leg,
         );
+        if let Some(proof) = &approval_proof {
+            audit = audit
+                .with_decision(audit_decision)
+                .with_approval_spend(X402ApprovalSpend {
+                    server: self,
+                    nonce: proof.nonce.clone(),
+                    governing_ttl_ms: proof.governing_ttl_ms,
+                });
+        }
         // The identity check runs under the profile's submit timeout, resolved
         // here; the requirement's `maxTimeoutSeconds` bounds the signed
         // authorization, never this deadline.
         let identity_deadline =
             tokio::time::Instant::now() + crate::tools::common::submit_timeout(&self.profile);
-        let created = create_payment(
+        let created = create_payment_with_pre_sign(
             &requirements,
             signer.as_ref(),
             &client,
             &cross_check,
             network_passphrase,
             identity_deadline,
+            x402_approval_callback(self, &approval_proof, &approval_refusal),
             |authorization| audit.before_transmit(authorization),
         )
         .await;
@@ -617,6 +875,13 @@ impl WalletServer {
                 );
                 // An audit refusal at the transmit gate answers its own
                 // `audit.*` code; it is not a payment-build failure.
+                if let Some(refusal) = approval_refusal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    return Ok(refusal);
+                }
                 if let Some(refusal) = audit.refusal_result() {
                     return Ok(refusal);
                 }
@@ -632,6 +897,12 @@ impl WalletServer {
                     return Ok(crate::tools::common::endpoint_refusal_result(refusal));
                 }
                 audit.record_withheld(X402Failure::CreatePayment(&source));
+                if matches!(
+                    source,
+                    stellar_agent_x402::X402Error::MuxedContractProtocolUnsupported { .. }
+                ) {
+                    return Ok(x402_error_to_tool_result(&source));
+                }
                 // Surface a uniform single-pipeline error envelope. The
                 // X402Error Display is redaction-safe (authority-only, no secrets).
                 return Ok(payment_build_error_result(&source.to_string()));
@@ -669,26 +940,48 @@ impl WalletServer {
         // "not_anchored" = ACCOUNTS non-empty, payTo absent — display warning.
         // "unknown"      = ACCOUNTS absent/empty — no determination possible.
         // This is a DISPLAY signal only; the tool never hard-denies on it.
-        let payto_anchored = compute_payto_anchored(&requirements.pay_to, &session.accounts);
-        let authorization = format!("Bearer {}", session.jwt);
-        let response = json!({
-            "paymentSignature": payment_signature,
-            "authorization": authorization,
-            "payer": payer_address,
-            "asset": requirements.asset,
-            "amount": requirements.amount,
-            "payTo": requirements.pay_to,
-            "home_domain": session.home_domain,
-            "network": requirements.network,
-            "payto_anchored": payto_anchored.as_str(),
-            "cross_check": created.cross_check.view(),
-        });
-        let envelope = stellar_agent_core::envelope::Envelope::ok(response);
-        let json_str = envelope
-            .to_json_pretty()
-            .unwrap_or_else(|_| String::from("{}"));
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(payment_response(
+            &payment_signature,
+            &payer_address,
+            &requirements,
+            &session,
+            &created.cross_check,
+            business_id.as_ref(),
+        ))
     }
+}
+
+/// The success result of a payment: the `PAYMENT-SIGNATURE` value, the
+/// `Bearer` token of the verified session, the payment's display fields, the
+/// home domain, the payTo-anchoring signal, and the witness outcome.
+fn payment_response(
+    payment_signature: &str,
+    payer: &str,
+    requirements: &stellar_agent_x402::wire::PaymentRequirements,
+    session: &stellar_agent_x402_identity::VerifiedCounterpartySession,
+    cross_check: &stellar_agent_network::cross_check::CrossCheckOutcome,
+    business_id: Option<&stellar_agent_network::policy_state::BusinessId>,
+) -> CallToolResult {
+    let payto_anchored = compute_payto_anchored(&requirements.pay_to, &session.accounts);
+    let authorization = format!("Bearer {}", session.jwt);
+    let mut response = json!({
+        "paymentSignature": payment_signature,
+        "authorization": authorization,
+        "payer": payer,
+        "asset": requirements.asset,
+        "amount": requirements.amount,
+        "payTo": requirements.pay_to,
+        "home_domain": session.home_domain,
+        "network": requirements.network,
+        "payto_anchored": payto_anchored.as_str(),
+        "cross_check": cross_check.view(),
+    });
+    crate::tools::business_entry::echo_business_id(&mut response, business_id);
+    let envelope = stellar_agent_core::envelope::Envelope::ok(response);
+    let json_str = envelope
+        .to_json_pretty()
+        .unwrap_or_else(|_| String::from("{}"));
+    CallToolResult::success(vec![Content::text(json_str)])
 }
 
 impl WalletServer {
@@ -702,6 +995,14 @@ impl WalletServer {
         home_domain: &str,
         network_passphrase: &str,
     ) -> Result<stellar_agent_x402_identity::VerifiedCounterpartySession, IdentityError> {
+        #[cfg(test)]
+        IDENTITY_CALLS.with(|count| count.set(count.get() + 1));
+        #[cfg(test)]
+        if IDENTITY_FAILURE.with(std::cell::Cell::get) {
+            return Err(IdentityError::HomeDomainUnresolvable {
+                authority: home_domain.to_owned(),
+            });
+        }
         #[cfg(any(test, feature = "test-helpers"))]
         if let Some((jwt, sub, accounts)) = &self.x402_identity_session_override {
             return Ok(stellar_agent_x402_identity::VerifiedCounterpartySession {
@@ -713,6 +1014,558 @@ impl WalletServer {
         }
         resolve_and_verify_counterparty(home_domain, network_passphrase).await
     }
+}
+
+#[cfg(feature = "mainnet-write")]
+impl WalletServer {
+    /// The authenticated payment on a server holding the mainnet write
+    /// context, in one call under an `Allow` rule and in two calls under a
+    /// `RequireApproval` rule.
+    ///
+    /// Every call decodes and validates the requirements and checks the
+    /// chain, the approval pair and the home domain. It obtains the enrolled
+    /// payer, checks the optional address, recomputes the payment root and
+    /// intent digest, and runs the dispatch gate. Under an approval requirement, a
+    /// call without approval arguments writes a pending x402 approval for the
+    /// intent and the home domain, after the W endpoint check. A call that pays
+    /// checks that the startup proofs are unchanged and, with approval
+    /// arguments, verifies the approval of the intent for the home domain.
+    /// It runs the authorized identity gate, which signs the SEP-10
+    /// challenge under a consumed message authorization, and builds the
+    /// payment as the intent that continues the message receipt. It releases
+    /// the payload only after the submission authorization is consumed and
+    /// any approval is tombstoned.
+    async fn mainnet_authenticated_payment(
+        &self,
+        args: X402AuthenticatedPaymentArgs,
+        guard: crate::server::MainnetWriteGuard<'_>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        use crate::tools::common::{
+            DispatchOutcome, GatedApprovalKind, SuppliedProof, approval_required_indistinguishable,
+            authority_refusal_result, business_error_result, endpoint_refusal_result,
+            mainnet_authority,
+        };
+        use crate::tools::x402_create_payment::{
+            ApprovalView, ReleaseFailure, approval_response, mainnet_x402_error, release_decision,
+            require_terminal_consumption,
+        };
+        use stellar_agent_core::approval::subject::approval_subject_x402_authenticated;
+        use stellar_agent_network::mainnet::MainnetConsumer;
+        use stellar_agent_network::mainnet::audit_readiness::audit_readiness;
+        use stellar_agent_network::mainnet::authority::{AuthorityRefusal, MainnetAuthority};
+        use stellar_agent_x402::exact::{
+            X402MainnetProofs, create_payment_authorized, intent_digest, payment_root,
+            validate_requirements_for_payment,
+        };
+        use stellar_agent_x402_identity::MainnetIdentityInputs;
+
+        const TOOL: &str = "stellar_x402_authenticated_payment";
+        let profile = guard.context.profile();
+        let name = guard.context.profile_name();
+        let requirements = match decode_payment_required_input(&args.payment_required) {
+            Ok(requirements) => requirements,
+            Err(error) => return Ok(x402_error_to_tool_result(&error)),
+        };
+        let amount = match validate_requirements_for_payment(
+            &requirements,
+            guard.context.network_passphrase(),
+        ) {
+            Ok(amount) => amount,
+            Err(error) => return Ok(x402_error_to_tool_result(&error)),
+        };
+        if let Err(result) =
+            crate::tools::common::check_x402_payee_protocol(&requirements.pay_to, profile, || {
+                guard.context.primary_client()
+            })
+            .await
+        {
+            return Ok(result);
+        }
+        stellar_agent_core::profile::caip2::validate_chain_id_matches_profile(
+            &args.chain_id,
+            profile,
+        )
+        .map_err(|error| rmcp::ErrorData::invalid_params(error.to_string(), None))?;
+        let call_two = match (&args.approval_nonce, &args.approval_attestation) {
+            (None, None) => false,
+            (Some(_), Some(_)) => true,
+            _ => return Ok(approval_required_indistinguishable(name)),
+        };
+        // The home domain is validated before the approval names it, so a
+        // malformed domain is never approved.
+        if let Err(error) =
+            stellar_agent_network::counterparty::fetch::validate_home_domain(&args.home_domain)
+        {
+            let detail = match error {
+                stellar_agent_network::counterparty::CounterpartyError::HomeDomainInvalid {
+                    detail,
+                } => detail,
+                other => other.to_string(),
+            };
+            return Ok(identity_error_to_tool_result(
+                &IdentityError::HomeDomainInvalid { detail },
+            ));
+        }
+        if call_two && let Err(result) = self.verify_mainnet_freshness(&guard) {
+            return Ok(result);
+        }
+        let signer = match self.mainnet_enrolled_signer(&guard) {
+            Ok(signer) => signer,
+            Err(error) => return Ok(endpoint_refusal_result(&error)),
+        };
+        let payer = stellar_strkey::ed25519::PublicKey(signer.public_key())
+            .to_string()
+            .as_str()
+            .to_owned();
+        // On mainnet the address check precedes the identity gate, so a
+        // mismatching address spends no approval.
+        if args
+            .address
+            .as_ref()
+            .is_some_and(|address| address != &payer)
+        {
+            let error = stellar_agent_x402::X402Error::InvalidPaymentRequired {
+                detail: "requested address does not match the enrolled signer".to_owned(),
+            };
+            return Ok(x402_error_to_tool_result(&error));
+        }
+        let root = match payment_root(&requirements, &payer) {
+            Ok(root) => root,
+            Err(error) => return Ok(x402_error_to_tool_result(&error)),
+        };
+        let digest = match intent_digest(&requirements, &payer) {
+            Ok(digest) => digest,
+            Err(error) => return Ok(x402_error_to_tool_result(&error)),
+        };
+        // The payment names its operation; a retained one answers here with
+        // its stored state, and an unknown id opens its record.
+        let entry = match self.x402_entry(
+            &args.chain_id,
+            args.business_id.as_deref(),
+            stellar_agent_network::policy_state::OperationTool::X402AuthenticatedPayment,
+            stellar_agent_network::policy_state::OperationKind::X402AuthenticatedPayment,
+            digest,
+            stellar_agent_network::policy_state::X402Intent {
+                network: requirements.network.clone(),
+                asset: requirements.asset.clone(),
+                payer: payer.clone(),
+                pay_to: requirements.pay_to.clone(),
+                amount: requirements.amount.clone(),
+            },
+        ) {
+            Ok(entry) => entry,
+            Err(result) => return Ok(result),
+        };
+        let business_id = entry.as_ref().map(|handle| handle.business_id().clone());
+        let value = ValueClass::single(x402_value_leg(&requirements, amount));
+        let audit_leg = ValueLegRecord::from(&x402_value_leg(&requirements, amount));
+        let payer_view = match self
+            .x402_payer_view(|| guard.context.primary_client(), &payer, TOOL)
+            .await
+        {
+            Ok(view) => view,
+            Err(error) => return error.into_result(),
+        };
+        let dispatch = match self
+            .dispatch_preparation(
+                TOOL,
+                &json!({"chain_id": args.chain_id, "home_domain": args.home_domain}),
+                &args.chain_id,
+                value,
+                payer_view
+                    .as_ref()
+                    .map(|view| view as &dyn stellar_agent_core::policy::v1::AccountReservesView),
+                stellar_agent_core::mainnet::decision::EvaluationScope::X402Authenticated {
+                    home_domain: args.home_domain.clone(),
+                    tool: TOOL.to_owned(),
+                },
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return error.into_result(),
+        };
+        // An `Allow` without a proof pays in this call under policy
+        // authority. An approval requirement without a proof writes the
+        // pending approval and returns it. A proof verifies through the gate.
+        let mut witness: Option<stellar_agent_core::approval::witness::ApprovalWitness> = None;
+        let authority = match mainnet_authority(
+            self,
+            &dispatch,
+            GatedApprovalKind::X402.expectation(approval_subject_x402_authenticated(
+                &digest,
+                &args.home_domain,
+            )),
+            None,
+            &SuppliedProof {
+                nonce: args.approval_nonce.clone(),
+                attestation: args.approval_attestation.clone(),
+            },
+            entry.as_ref().map(|handle| handle.id()),
+            TOOL,
+            &mut witness,
+        )
+        .await
+        {
+            Ok(authority) => authority,
+            Err(AuthorityRefusal::ApprovalRequired { .. }) => {
+                let DispatchOutcome::RequireApproval(approval) = &dispatch else {
+                    return Ok(approval_required_indistinguishable(name));
+                };
+                let entry = self.x402_pending_approval(
+                    entry.as_ref(),
+                    dispatch.audit_decision(),
+                    crate::tools::business_entry::Staged {
+                        build: |_: Option<&stellar_agent_core::approval::ClassicIntent>| {
+                            self.x402_pending_entry(&root, Some(args.home_domain.clone()), approval)
+                        },
+                        insert: |entry| {
+                            self.insert_x402_pending(
+                                entry,
+                                stellar_agent_network::mainnet::clock::now_ms,
+                            )
+                        },
+                    },
+                );
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        return Ok(business_error_result(error.code(), error.message()));
+                    }
+                };
+                return Ok(approval_response(&ApprovalView {
+                    entry: &entry,
+                    profile: name,
+                    chain_id: &args.chain_id,
+                    endpoint_host: Some(guard.enablement.endpoint_host()),
+                    signer: &payer,
+                    requirements: &requirements,
+                    business_id: business_id.as_ref(),
+                }));
+            }
+            Err(refusal) => return Ok(authority_refusal_result(self, refusal)),
+        };
+        // Policy authority pays in this call, so the startup proofs are
+        // checked here, before any preparation.
+        if matches!(authority, MainnetAuthority::Policy(_))
+            && let Err(result) = self.verify_mainnet_freshness(&guard)
+        {
+            return Ok(result);
+        }
+        // ── Audit pre-flight (fail-closed) ────────────────────────────────────
+        // A log that cannot take a row refuses before the SEP-10 exchange
+        // spends the approval.
+        if let Err(err) = crate::tools::value_audit::require_value_audit_writer(
+            self.security_profile(),
+            &self.profile_name_for_approval(),
+            self.audit_binding,
+        ) {
+            return Ok(business_error_result(err.code(), err.to_string()));
+        }
+        let store = self.window_store.clone();
+        let intent = stellar_agent_network::mainnet::resolve::SorobanIntent {
+            consumer: MainnetConsumer::X402Authenticated,
+            root_invocation: &root,
+            network_id: {
+                use sha2::{Digest, Sha256};
+                Sha256::digest(guard.context.network_passphrase().as_bytes()).into()
+            },
+        };
+        let identity_audit = match audit_readiness(profile, name) {
+            Ok(readiness) => readiness,
+            Err(error) => return Ok(endpoint_refusal_result(&error)),
+        };
+        let inputs = MainnetIdentityInputs {
+            approval_operation: entry.as_ref().map(|handle| handle.id()),
+            context: guard.context,
+            intent: &intent,
+            policy: guard.policy,
+            enablement: guard.enablement,
+            authority: &authority,
+            audit: identity_audit,
+            store: &store,
+        };
+        let verified = match self
+            .verify_x402_counterparty_authorized(&args.home_domain, inputs)
+            .await
+        {
+            Ok(verified) => verified,
+            Err(ref err) => {
+                // A refused authorization was logged with its precondition
+                // where it was refused; every other identity failure is
+                // logged here.
+                // The home domain stays out of the event: it is the refused
+                // argument when the identity gate rejects its form.
+                if !matches!(err, IdentityError::MainnetAuthorizationRefused) {
+                    tracing::warn!(
+                        error_code = %err.wire_code(),
+                        "x402_authenticated_payment: mainnet identity gate aborted before payment",
+                    );
+                }
+                return Ok(identity_error_to_tool_result(err));
+            }
+        };
+        let (session, receipt) = verified.into_parts();
+
+        let readiness = match audit_readiness(profile, name) {
+            Ok(readiness) => readiness,
+            Err(error) => return Ok(endpoint_refusal_result(&error)),
+        };
+        let handle = match crate::tools::x402_create_payment::x402_mainnet_signing_handle(
+            signer.seed_entry(),
+            &payer,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => return Ok(endpoint_refusal_result(&error)),
+        };
+        let asset = match x402_canonical_asset(&requirements) {
+            Ok(asset) => asset,
+            Err(result) => return Ok(result),
+        };
+        let mut audit = X402AuthorizationAudit::new(self, TOOL, &args.chain_id, audit_leg)
+            .with_decision(dispatch.audit_decision())
+            .with_provenance(
+                dispatch
+                    .mainnet_decision()
+                    .map(stellar_agent_core::mainnet::decision::MainnetDecision::provenance),
+            );
+        let steps = crate::tools::business_entry::X402Steps::new(self, entry);
+        let proofs = X402MainnetProofs::new(
+            guard.context,
+            guard.policy,
+            guard.enablement,
+            &authority,
+            &signer,
+            &handle,
+            readiness,
+            &store,
+        )
+        .with_authenticated(receipt);
+        let proofs = match steps.link() {
+            Some(link) => proofs.with_operation(link),
+            None => proofs,
+        };
+        let created = create_payment_authorized(
+            &requirements,
+            MainnetConsumer::X402Authenticated,
+            proofs,
+            CrossCheckValue::Amount {
+                asset: &asset,
+                base_units: amount,
+            },
+            tokio::time::Instant::now() + crate::tools::common::submit_timeout(profile),
+            |authorization| audit.before_transmit(authorization),
+            steps.hooks(),
+        )
+        .await;
+        let created = match created {
+            Ok(created) => created,
+            Err(error) => {
+                steps.failed(error.wire_code());
+                if let Some(result) = steps.refusal_result() {
+                    return Ok(result);
+                }
+                // An audit refusal at the transmit gate answers its own
+                // `audit.*` code.
+                if let Some(error) = audit.refusal.take() {
+                    return Ok(business_error_result(
+                        error.code(),
+                        format!("payment withheld at intent transmit gate: {error}"),
+                    ));
+                }
+                let withheld = if audit.gate_passed {
+                    "after intent authorization"
+                } else {
+                    "before signed transmission"
+                };
+                audit.record_withheld(X402Failure::CreatePayment(&error));
+                return Ok(mainnet_payment_error(
+                    &error,
+                    withheld,
+                    audit.transmitted_ledger(),
+                ));
+            }
+        };
+        let id = created.authorization.id();
+        let withhold = |failure: ReleaseFailure| {
+            let decision = release_decision(failure);
+            steps.withheld();
+            if let Some(stage) = decision.cleanup {
+                crate::tools::submission_record::cleanup_authorization(
+                    &store,
+                    guard.context,
+                    id,
+                    stage,
+                );
+            }
+            audit.record_withheld(decision.withheld);
+            decision.withheld_at
+        };
+        let payment_signature =
+            match stellar_agent_x402::wire::encode_payment_signature(&created.payment.payload) {
+                Ok(signature) => signature,
+                Err(error) => {
+                    let withheld = withhold(ReleaseFailure::Encoding);
+                    return Ok(mainnet_x402_error(
+                        &error,
+                        withheld,
+                        audit.transmitted_ledger(),
+                    ));
+                }
+            };
+        let envelope = &created.payment.payload.payload.transaction;
+        if let Err(error) = stellar_agent_network::mainnet::resolve::consume_soroban_submit(
+            guard.context,
+            created.authorization,
+            envelope,
+            &store,
+        ) {
+            let withheld = withhold(ReleaseFailure::ReleaseConsume);
+            let error = stellar_agent_x402::X402Error::MainnetAuthorization(error);
+            return Ok(mainnet_payment_error(
+                &error,
+                withheld,
+                audit.transmitted_ledger(),
+            ));
+        }
+        // Only an approval is spent; policy authority holds no approval.
+        if let MainnetAuthority::Approval(approval) = &authority {
+            let final_digest = stellar_agent_core::hex::encode(
+                &stellar_agent_core::approval::subject::approval_subject_classic(envelope),
+            );
+            let terminal = self.x402_approval_store().and_then(|mut pending| {
+                pending
+                    .consume(
+                        approval.witness().nonce(),
+                        &final_digest,
+                        stellar_agent_core::approval::ConsumedOutcome::Unknown,
+                    )
+                    .map_err(|error| stellar_agent_core::approval::attest::record_error(&error))
+            });
+            if let Err(error) = require_terminal_consumption(terminal) {
+                let withheld = withhold(ReleaseFailure::TerminalApproval);
+                return Ok(terminal_payment_error(
+                    &error,
+                    withheld,
+                    audit.transmitted_ledger(),
+                ));
+            }
+        }
+        steps.released();
+        Ok(payment_response(
+            &payment_signature,
+            &payer,
+            &requirements,
+            &session,
+            &created.payment.cross_check,
+            business_id.as_ref(),
+        ))
+    }
+
+    /// Runs the authorized SEP-10 counterparty gate for `home_domain` over
+    /// the mainnet `inputs`.
+    ///
+    /// A test build may point the gate at a test transport; see
+    /// `WalletServer::set_x402_identity_transport_for_test`. The transport
+    /// replaces the stellar.toml fetch and the SEP-10 requests only.
+    async fn verify_x402_counterparty_authorized(
+        &self,
+        home_domain: &str,
+        inputs: stellar_agent_x402_identity::MainnetIdentityInputs<'_>,
+    ) -> Result<stellar_agent_x402_identity::MainnetCounterpartySession, IdentityError> {
+        #[cfg(any(test, feature = "test-helpers"))]
+        if let Some(transport) = &self.x402_identity_transport_override {
+            return stellar_agent_x402_identity::resolve_and_verify_counterparty_authorized_at(
+                home_domain,
+                &transport.toml_base_url,
+                &transport.http,
+                transport.web_auth_override.as_deref(),
+                inputs,
+            )
+            .await;
+        }
+        stellar_agent_x402_identity::resolve_and_verify_counterparty_authorized(home_domain, inputs)
+            .await
+    }
+}
+
+/// Renders a mainnet payment failure after the SEP-10 authentication.
+///
+/// A refused authorization of the intent, the submission or the release is
+/// `network.mainnet_authorization_refused` with a text that says the payload
+/// was withheld and names no precondition. A policy denial keeps the reason's
+/// `policy.deny.*` code, a total-budget epoch refusal keeps its
+/// `policy.total_epoch_*` code, `FeatureDisabled` maps to the signing refusal
+/// `network.mainnet_write_forbidden`, an endpoint identity or cross-check
+/// refusal keeps its own code, and every other failure is
+/// `x402.payment_build_failed`.
+///
+/// `transmitted` is the signature expiration ledger of an authorization the
+/// transmit gate let through. The denial, refusal and build-failure texts
+/// then end with the sentence of
+/// [`crate::tools::x402_create_payment::transmitted_authorization`]. The
+/// `FeatureDisabled`, endpoint identity and cross-check refusals arise only
+/// before anything is signed and keep their texts.
+#[cfg(feature = "mainnet-write")]
+fn mainnet_payment_error(
+    error: &stellar_agent_x402::X402Error,
+    withheld: &str,
+    transmitted: Option<u32>,
+) -> CallToolResult {
+    use crate::tools::x402_create_payment::transmitted_authorization;
+    use stellar_agent_network::mainnet::MainnetAuthorizationError;
+    use stellar_agent_x402::X402Error;
+    match error {
+        X402Error::MuxedContractProtocolUnsupported { .. } => x402_error_to_tool_result(error),
+        X402Error::MainnetAuthorization(
+            MainnetAuthorizationError::PolicyDenied(_) | MainnetAuthorizationError::TotalEpoch(_),
+        ) => crate::tools::x402_create_payment::mainnet_x402_error(error, withheld, transmitted),
+        X402Error::MainnetAuthorization(MainnetAuthorizationError::FeatureDisabled) => {
+            crate::tools::common::x402_mainnet_signing_forbidden_result()
+        }
+        X402Error::MainnetAuthorization(_) | X402Error::MainnetAuthorizationRefused => {
+            crate::tools::common::business_error_result(
+                stellar_agent_core::error::NetworkError::MainnetAuthorizationRefused.code(),
+                format!(
+                    "{PAYMENT_REFUSAL_TEXT}{}",
+                    transmitted_authorization(transmitted)
+                ),
+            )
+        }
+        X402Error::EndpointIdentity(refusal) | X402Error::CrossCheck(refusal) => {
+            crate::tools::common::endpoint_refusal_result(refusal)
+        }
+        other => payment_build_error_result(&format!(
+            "{other}{}",
+            transmitted_authorization(transmitted)
+        )),
+    }
+}
+
+/// Renders the refusal tombstone of the pending approval after the release
+/// consumption. A refused authorization answers with the payment refusal
+/// text, every other error with its own message after "payment withheld" and
+/// `withheld`; both end with the sentence of
+/// [`crate::tools::x402_create_payment::transmitted_authorization`] for
+/// `transmitted`.
+#[cfg(feature = "mainnet-write")]
+fn terminal_payment_error(
+    error: &stellar_agent_core::WalletError,
+    withheld: &str,
+    transmitted: Option<u32>,
+) -> CallToolResult {
+    let code = error.code();
+    let transmitted = crate::tools::x402_create_payment::transmitted_authorization(transmitted);
+    let message =
+        if code == stellar_agent_core::error::NetworkError::MainnetAuthorizationRefused.code() {
+            format!("{PAYMENT_REFUSAL_TEXT}{transmitted}")
+        } else {
+            format!(
+                "payment withheld {withheld}: {}{transmitted}",
+                error.message()
+            )
+        };
+    crate::tools::common::business_error_result(code, message)
 }
 
 // The x402 decode and error-envelope helpers are single-sourced in
@@ -757,6 +1610,47 @@ impl WalletServer {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+thread_local! {
+    pub(super) static IDENTITY_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static IDENTITY_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod approval_boundary_tests {
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn x402_queue_reads_no_signer_and_runs_no_identity_gate() {
+        crate::tools::x402_create_payment::approval_tests::queue_key_case(true).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn authenticated_x402_queue_skips_sep10() {
+        crate::tools::x402_create_payment::approval_tests::queue_key_case(true).await;
+    }
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn approval_expiring_during_preparation_signs_nothing() {
+        crate::tools::x402_create_payment::approval_tests::expiry_case(true, false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn key_read_crossing_expiry_signs_nothing() {
+        crate::tools::x402_create_payment::approval_tests::expiry_case(true, true).await;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn identity_calls_on_this_thread() -> u64 {
+    IDENTITY_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(
         clippy::unwrap_used,
@@ -768,6 +1662,46 @@ mod tests {
     use super::*;
 
     // ── compute_payto_anchored ─────────────────────────────────────────────────
+
+    #[test]
+    fn muxed_payee_anchoring_uses_only_the_account_base() {
+        let m = stellar_strkey::ed25519::MuxedAccount {
+            ed25519: [1; 32],
+            id: 7,
+        }
+        .to_string();
+        let base = stellar_strkey::ed25519::PublicKey([1; 32])
+            .to_string()
+            .as_str()
+            .to_owned();
+        assert_eq!(
+            compute_payto_anchored(&m, std::slice::from_ref(&base)),
+            PaytoAnchored::Anchored
+        );
+        assert_eq!(
+            compute_payto_anchored(&m, &[PAY_TO_A.to_owned()]),
+            PaytoAnchored::NotAnchored
+        );
+        assert_eq!(compute_payto_anchored(&m, &[]), PaytoAnchored::Unknown);
+        let w = stellar_strkey::MuxedContract {
+            contract_id: [1; 32],
+            id: 7,
+        }
+        .to_string();
+        assert_eq!(compute_payto_anchored(&w, &[base]), PaytoAnchored::Unknown);
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    fn mainnet_muxed_protocol_error_keeps_its_code() {
+        let error = stellar_agent_x402::X402Error::MuxedContractProtocolUnsupported {
+            protocol_version: 29,
+        };
+        let result = mainnet_payment_error(&error, "before signing", None);
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "x402.muxed_contract_protocol_unsupported");
+        assert_eq!(message, error.to_string());
+    }
 
     const PAY_TO_A: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
     const PAY_TO_B: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
@@ -846,6 +1780,60 @@ mod tests {
     }
 
     // ── decode_payment_required_input ──────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn muxed_contract_payment_refuses_before_state() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let rpc = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                serde_json::json!({
+                    "passphrase": stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                    "protocolVersion": 29
+                }),
+            ))
+            .mount(&rpc)
+            .await;
+        let mut server = make_require_approval_server();
+        server.context =
+            stellar_agent_network::NetworkContext::new(server.profile.chain_id, rpc.uri());
+        let mut requirements: serde_json::Value =
+            serde_json::from_str(&sample_requirements_json()).unwrap();
+        requirements["payTo"] = serde_json::json!(
+            stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string()
+        );
+        let before = std::fs::read_dir(home.path()).unwrap().count();
+        let result = server
+            .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
+                payment_required: requirements.to_string(),
+                chain_id: "stellar:testnet".to_owned(),
+                home_domain: String::new(),
+                address: None,
+                business_id: None,
+                approval_nonce: None,
+                approval_attestation: None,
+            })
+            .await
+            .unwrap();
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "x402.muxed_contract_protocol_unsupported");
+        assert_eq!(
+            message,
+            "a W (muxed contract) payee requires Stellar protocol 30 or later; the network reports protocol 29"
+        );
+        assert!(!text.contains("paymentSignature"));
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), before);
+    }
 
     fn sample_requirements_json() -> String {
         serde_json::json!({
@@ -949,6 +1937,7 @@ mod tests {
             _counterparty_cache: Option<&dyn CounterpartyCacheView>,
             _sep10_sessions: Option<&dyn Sep10SessionView>,
             _sep45_sessions: Option<&dyn Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             Ok(Decision::RequireApproval(ApprovalRequest::new(
                 "test-nonce".into(),
@@ -970,6 +1959,7 @@ mod tests {
             _counterparty_cache: Option<&dyn CounterpartyCacheView>,
             _sep10_sessions: Option<&dyn Sep10SessionView>,
             _sep45_sessions: Option<&dyn Sep45SessionView>,
+            _now_ms: u64,
         ) -> Result<Decision, PolicyError> {
             Ok(Decision::Deny(DenyReason::NoMatchingRule))
         }
@@ -977,20 +1967,25 @@ mod tests {
 
     fn make_require_approval_server() -> crate::server::WalletServer {
         use std::sync::Arc;
-        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
-            .with_noop_engine()
-            .build();
-        // No audit chain key is seeded at this profile's coordinate: gate
-        // verdicts (RequireApproval here) precede the audit pre-flight, so
-        // this scenario must complete without one — the test's assertion on
-        // the fail-closed approval error doubles as the ordering pin.
+        let profile = Profile::builder_testnet(
+            "svc",
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "n-svc",
+            "n-acct",
+        )
+        .with_noop_engine()
+        .build();
+        // Queueing requires no signer, attestation, or audit key.
         let mut server = crate::server::WalletServer::new(profile)
             .expect("WalletServer::new must not fail in tests");
         server.policy_engine = Arc::new(RequireApprovalEngine);
         server
     }
 
+    /// A Noop-engine mainnet server over a fresh mock keyring store; callers
+    /// hold the `keyring` serial key.
     fn make_mainnet_server() -> crate::server::WalletServer {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         crate::server::WalletServer::new(
             Profile::builder_mainnet(
                 "https://rpc.example.invalid",
@@ -1015,15 +2010,23 @@ mod tests {
     /// placeholder that is never resolved: reaching either the identity gate or
     /// the keyring would surface a different message, so this test also proves
     /// the refusal fires before any of that work.
+    #[cfg(not(feature = "mainnet-write"))]
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn mainnet_profile_refuses_before_signing_no_signature_produced() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_mainnet_server();
         let args = X402AuthenticatedPaymentArgs {
             chain_id: "stellar:mainnet".to_owned(),
             home_domain: "example.com".to_owned(),
             payment_required: sample_requirements_json(),
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
+            business_id: None,
         };
         let result = server
             .call_stellar_x402_authenticated_payment(args)
@@ -1048,38 +2051,107 @@ mod tests {
         );
     }
 
-    /// Security regression: a `RequireApproval` policy verdict on
-    /// `stellar_x402_authenticated_payment` must return fail-closed `ErrorData`
-    /// with wire code `policy.approval_required_unsupported` and MUST NOT produce
-    /// a signed payment or request a SEP-10 session.
+    /// Queueing requires no keys and persists the complete payment intent.
     #[tokio::test]
     #[serial_test::serial(keyring)]
-    async fn require_approval_verdict_is_fail_closed_no_signature_produced() {
-        stellar_agent_test_support::keyring_mock::install().ok();
-        let server = make_require_approval_server();
-        let args = X402AuthenticatedPaymentArgs {
-            chain_id: "stellar:testnet".to_owned(),
-            home_domain: "example.com".to_owned(),
-            payment_required: sample_requirements_json(),
-            address: None,
+    #[serial_test::serial]
+    async fn require_approval_verdict_queues_the_payment_and_signs_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let mut server = make_require_approval_server();
+        server.set_approval_dir_for_test(home.path().join("approvals"));
+        let result = server
+            .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
+                approval_nonce: None,
+                approval_attestation: None,
+                chain_id: "stellar:testnet".to_owned(),
+                address: None,
+                business_id: None,
+                payment_required: sample_requirements_json(),
+                home_domain: "example.com".to_owned(),
+            })
+            .await
+            .unwrap();
+        let text = &result.content[0].as_text().unwrap().text;
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_ne!(result.is_error, Some(true), "{value}");
+        let approval = &value["data"]["approval"];
+        assert!(approval.get("endpoint_host").is_none());
+        assert!(!text.contains("paymentSignature"));
+        let requirements: serde_json::Value =
+            serde_json::from_str(&sample_requirements_json()).unwrap();
+        for field in ["payTo", "amount", "asset"] {
+            assert_eq!(approval["summary"][field], requirements[field]);
+        }
+        let store = server.x402_approval_store().unwrap();
+        let entry = store
+            .get(approval["approval_nonce"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(entry.expires_at_unix_ms, entry.created_at_unix_ms + 120_000);
+        let stellar_agent_core::approval::ApprovalKind::X402Payment { home_domain, .. } =
+            &entry.kind
+        else {
+            panic!("queue must persist an x402 approval");
         };
-        let result = server.call_stellar_x402_authenticated_payment(args).await;
-        let result = result.expect(
-            "RequireApproval must return Ok(is_error) envelope, not a protocol error or a signature",
-        );
-        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
-        assert_eq!(
-            code, "policy.approval_required_unsupported",
-            "wire code must be policy.approval_required_unsupported"
-        );
-        assert!(
-            message.contains("single-shot"),
-            "error message must mention single-shot; got: {message}"
-        );
-        assert!(
-            !text.contains("\"paymentSignature\"") && !text.contains("\"signature\""),
-            "fail-closed approval refusal must not produce a signature; got: {text}"
-        );
+        assert_eq!(home_domain.as_deref(), Some("example.com"));
+        assert!(!server.profile.audit_log_path.exists());
+    }
+
+    /// A home domain the identity gate refuses for its form aborts before any
+    /// fetch, and no event at the most verbose level carries the domain or its
+    /// authority.
+    #[test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    fn x402_home_domain_marker_is_not_logged() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.seed_audit();
+        let server = fixture.server();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for home_domain in ["credmarker7_invalid.example", "credmarker7.example:1"] {
+            let mut result = None;
+            let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+                result = Some(
+                    runtime.block_on(server.call_stellar_x402_authenticated_payment(
+                        X402AuthenticatedPaymentArgs {
+                            chain_id: "stellar:testnet".to_owned(),
+                            home_domain: home_domain.to_owned(),
+                            payment_required: sample_requirements_json(),
+                            address: None,
+                            approval_nonce: None,
+                            approval_attestation: None,
+                            business_id: None,
+                        },
+                    )),
+                );
+            });
+            let result = result
+                .expect("the call ran")
+                .expect("the identity abort is a business envelope");
+            let (code, _message, text) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(code, "identity.home_domain_invalid");
+            assert!(!text.contains("credmarker7"), "{text}");
+            assert!(
+                logs.contains("identity gate aborted before payment"),
+                "{logs}"
+            );
+            assert!(!logs.contains("fetching stellar.toml"), "{logs}");
+            assert!(!logs.contains("credmarker7"), "{logs}");
+        }
     }
 
     /// A policy denial precedes the audit pre-flight: with a denying engine
@@ -1089,7 +2161,11 @@ mod tests {
     /// `audit.chain_key_unavailable`.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn policy_denial_precedes_the_audit_preflight() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::Arc;
         stellar_agent_test_support::keyring_mock::install().ok();
         let profile = Profile::builder_testnet(
@@ -1108,6 +2184,9 @@ mod tests {
             home_domain: "example.com".to_owned(),
             payment_required: sample_requirements_json(),
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
+            business_id: None,
         };
         let result = server
             .call_stellar_x402_authenticated_payment(args)
@@ -1119,5 +2198,341 @@ mod tests {
             !text.contains("\"paymentSignature\""),
             "no payment signature may be produced on a policy denial; got: {text}"
         );
+    }
+
+    /// A build with mainnet writes still refuses on a mainnet server that
+    /// holds no mainnet context, before any key access or SEP-10 request.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_mainnet_server_without_a_context_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let server = make_mainnet_server();
+        assert!(server.mainnet_context.is_none());
+        let result = server
+            .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
+                chain_id: "stellar:mainnet".to_owned(),
+                home_domain: "example.com".to_owned(),
+                payment_required: sample_requirements_json(),
+                address: None,
+                approval_nonce: None,
+                approval_attestation: None,
+                business_id: Some(crate::tools::common::tests::fresh_business_id()),
+            })
+            .await
+            .unwrap();
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "network.mainnet_write_forbidden");
+        let canonical = crate::tools::common::x402_mainnet_signing_forbidden_result();
+        assert_eq!(
+            message,
+            crate::tools::common::assert_business_envelope(&canonical).1,
+            "the signing refusal, before the mainnet admission"
+        );
+        assert!(!text.contains("\"paymentSignature\""), "{text}");
+    }
+
+    /// Both approval arguments are optional properties and the required
+    /// fields are the three the testnet flow requires.
+    #[test]
+    fn the_approval_arguments_are_optional_in_the_schema() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(X402AuthenticatedPaymentArgs)).unwrap();
+        let properties = schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("approval_nonce"));
+        assert!(properties.contains_key("approval_attestation"));
+        let mut required = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        required.sort();
+        assert_eq!(required, ["chain_id", "home_domain", "payment_required"]);
+    }
+
+    /// The arguments print whether an attestation is set, never the
+    /// attestation.
+    #[test]
+    fn the_arguments_debug_hides_the_attestation() {
+        let args = X402AuthenticatedPaymentArgs {
+            chain_id: "stellar:mainnet".to_owned(),
+            home_domain: "anchor.example.com".to_owned(),
+            payment_required: sample_requirements_json(),
+            address: None,
+            approval_nonce: Some("nonce-1".to_owned()),
+            approval_attestation: Some("attestation-secret".to_owned()),
+            business_id: Some(crate::tools::common::tests::fresh_business_id()),
+        };
+        let text = format!("{args:?}");
+        assert!(text.contains("approval_attestation: Some(<set>)"), "{text}");
+        assert!(text.contains("nonce-1"), "{text}");
+        assert!(!text.contains("attestation-secret"), "{text}");
+    }
+
+    /// Preconditions whose labels must never reach an agent-facing text.
+    fn precondition_labels() -> Vec<&'static str> {
+        use stellar_agent_network::mainnet::MainnetPrecondition as P;
+        [
+            P::MessageUseMismatch,
+            P::MessageClientAccount,
+            P::ApprovalNonceReused,
+            P::NotYetValid,
+            P::Expired,
+            P::ChainNotMainnet,
+            P::SignatureInvalid,
+            P::ClockUnavailable,
+            P::NotOpen,
+        ]
+        .into_iter()
+        .map(P::label)
+        .collect()
+    }
+
+    /// The two mainnet identity errors answer the network codes; the
+    /// authorization refusal says that no signed challenge was submitted and
+    /// names no precondition.
+    #[test]
+    fn the_mainnet_identity_errors_map_to_the_network_codes() {
+        let forbidden = identity_error_to_tool_result(&IdentityError::MainnetSigningForbidden {
+            detail: stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL.to_owned(),
+        });
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&forbidden);
+        assert_eq!(code, "network.mainnet_write_forbidden");
+        let refused = identity_error_to_tool_result(&IdentityError::MainnetAuthorizationRefused);
+        let (refused_code, refused_message, _) =
+            crate::tools::common::assert_business_envelope(&refused);
+        assert_eq!(refused_code, "network.mainnet_authorization_refused");
+        assert_eq!(
+            refused_message,
+            "the mainnet authorization for this SEP-10 authentication was refused; no signed \
+             challenge was submitted"
+        );
+        for label in precondition_labels() {
+            assert!(!message.contains(label), "{label}: {message}");
+            assert!(
+                !refused_message.contains(label),
+                "{label}: {refused_message}"
+            );
+        }
+    }
+
+    /// A refused authorization of the payment says that the payload was
+    /// withheld; a denial keeps its policy code, `FeatureDisabled` the write
+    /// refusal, and every other error its own code.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    fn library_errors_map_to_the_payment_codes() {
+        use stellar_agent_network::mainnet::{
+            MainnetAuthorizationError as A, MainnetPrecondition as P,
+        };
+        use stellar_agent_x402::X402Error;
+        const PAYMENT: &str = "the mainnet authorization for this payment was refused; the payment payload was \
+             withheld";
+        for error in [
+            X402Error::MainnetAuthorization(A::Refused(P::ApprovalNonceReused)),
+            X402Error::MainnetAuthorizationRefused,
+        ] {
+            let result = mainnet_payment_error(&error, "after intent authorization", None);
+            let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(code, "network.mainnet_authorization_refused", "{error:?}");
+            assert_eq!(message, PAYMENT, "{error:?}");
+            for label in precondition_labels() {
+                assert!(!message.contains(label), "{label}: {message}");
+            }
+        }
+        let denied = mainnet_payment_error(
+            &X402Error::MainnetAuthorization(A::PolicyDenied(Box::new(DenyReason::NoMatchingRule))),
+            "before signed transmission",
+            None,
+        );
+        assert_eq!(
+            crate::tools::common::assert_business_envelope(&denied).0,
+            "policy.deny.no_matching_rule"
+        );
+        let disabled = mainnet_payment_error(
+            &X402Error::MainnetAuthorization(A::FeatureDisabled),
+            "before signed transmission",
+            None,
+        );
+        assert_eq!(
+            crate::tools::common::assert_business_envelope(&disabled).0,
+            "network.mainnet_write_forbidden"
+        );
+        let other = mainnet_payment_error(
+            &X402Error::TransactionBuildFailed {
+                detail: "build failed".to_owned(),
+            },
+            "before signed transmission",
+            None,
+        );
+        assert_eq!(
+            crate::tools::common::assert_business_envelope(&other).0,
+            "x402.payment_build_failed"
+        );
+    }
+
+    /// A total-budget epoch refusal of the ledger authorization keeps its
+    /// own code on the authenticated payment tool.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    fn a_ledger_epoch_refusal_keeps_its_payment_code() {
+        use stellar_agent_network::mainnet::{MainnetAuthorizationError, TotalEpochRefusal};
+        use stellar_agent_x402::X402Error;
+        for (refusal, code) in [
+            (
+                TotalEpochRefusal::Unavailable {
+                    detail: "pin unreadable".to_owned(),
+                },
+                "policy.total_epoch_unavailable",
+            ),
+            (TotalEpochRefusal::Stale, "policy.total_epoch_stale"),
+            (TotalEpochRefusal::Retired, "policy.total_epoch_retired"),
+        ] {
+            let result = mainnet_payment_error(
+                &X402Error::MainnetAuthorization(MainnetAuthorizationError::TotalEpoch(refusal)),
+                "after intent authorization",
+                None,
+            );
+            assert_eq!(
+                crate::tools::common::assert_business_envelope(&result).0,
+                code
+            );
+        }
+    }
+
+    /// After the transmit gate the refusal, denial, build-failure and
+    /// terminal-approval texts end with the sentence naming the signature
+    /// expiration ledger, under unchanged codes; before it they do not.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    fn post_gate_payment_errors_name_the_transmitted_authorization() {
+        use stellar_agent_network::mainnet::{
+            MainnetAuthorizationError as A, MainnetPrecondition as P,
+        };
+        use stellar_agent_x402::X402Error;
+        const SENTENCE: &str = "; the signed authorization may have reached the configured RPC \
+                                and is valid through ledger 1060";
+        let errors = [
+            (
+                X402Error::MainnetAuthorization(A::Refused(P::NotOpen)),
+                "network.mainnet_authorization_refused",
+            ),
+            (
+                X402Error::MainnetAuthorization(A::PolicyDenied(Box::new(
+                    DenyReason::NoMatchingRule,
+                ))),
+                "policy.deny.no_matching_rule",
+            ),
+            (
+                X402Error::RpcSimulateFailed {
+                    detail: "re-simulate returned error".to_owned(),
+                },
+                "x402.payment_build_failed",
+            ),
+        ];
+        for (error, expected) in &errors {
+            let before = mainnet_payment_error(error, "before signed transmission", None);
+            let (code, message, _) = crate::tools::common::assert_business_envelope(&before);
+            assert_eq!(code, *expected, "{error:?}");
+            assert!(!message.contains("valid through ledger"), "{message}");
+            let after = mainnet_payment_error(error, "after intent authorization", Some(1060));
+            let (code, message, _) = crate::tools::common::assert_business_envelope(&after);
+            assert_eq!(code, *expected, "{error:?}");
+            assert!(message.ends_with(SENTENCE), "{message}");
+        }
+        for (error, expected, prefix) in [
+            (
+                stellar_agent_core::WalletError::from(
+                    stellar_agent_core::error::NetworkError::MainnetAuthorizationRefused,
+                ),
+                "network.mainnet_authorization_refused",
+                PAYMENT_REFUSAL_TEXT.to_owned(),
+            ),
+            (
+                stellar_agent_core::WalletError::from(
+                    stellar_agent_core::error::ValidationError::ConfigInvalid {
+                        component: "approval",
+                        reason: "locked".to_owned(),
+                    },
+                ),
+                "validation.config_invalid",
+                "payment withheld at terminal approval: ".to_owned(),
+            ),
+        ] {
+            let result = terminal_payment_error(&error, "at terminal approval", Some(1060));
+            let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(code, expected);
+            assert!(message.starts_with(&prefix), "{message}");
+            assert!(message.ends_with(SENTENCE), "{message}");
+        }
+    }
+
+    /// Each failure point of the payment after the identity gate selects the
+    /// cleanup stage, the withheld row's stage and the message the tool
+    /// passes on.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    fn each_failure_point_selects_its_stage() {
+        use crate::tools::x402_create_payment::{
+            ReleaseFailure, X402Failure, release_decision, x402_withheld_stage,
+        };
+        use stellar_agent_network::mainnet::resolve::InvalidationStage;
+        let simulate = stellar_agent_x402::X402Error::RpcSimulateFailed {
+            detail: "re-simulate returned error".to_owned(),
+        };
+        let build = stellar_agent_x402::X402Error::TransactionBuildFailed {
+            detail: "build failed".to_owned(),
+        };
+        // A library failure records its row with the gate's verdict.
+        assert_eq!(
+            x402_withheld_stage(false, X402Failure::CreatePayment(&build)),
+            None
+        );
+        assert_eq!(
+            x402_withheld_stage(true, X402Failure::CreatePayment(&simulate)),
+            Some("resimulation")
+        );
+        assert_eq!(
+            x402_withheld_stage(true, X402Failure::CreatePayment(&build)),
+            Some("response_processing")
+        );
+        // The release failures select the cleanup and the row themselves.
+        for (failure, cleanup, stage, withheld_at) in [
+            (
+                ReleaseFailure::Encoding,
+                Some(InvalidationStage::PayloadReleaseRefused),
+                "encoding",
+                "at payload encoding",
+            ),
+            (
+                ReleaseFailure::ReleaseConsume,
+                Some(InvalidationStage::PayloadReleaseRefused),
+                "payload_release",
+                "at payload release",
+            ),
+            (
+                ReleaseFailure::TerminalApproval,
+                None,
+                "terminal_approval",
+                "at terminal approval",
+            ),
+        ] {
+            let decision = release_decision(failure);
+            assert_eq!(
+                format!("{:?}", decision.cleanup),
+                format!("{cleanup:?}"),
+                "{failure:?}"
+            );
+            assert_eq!(
+                x402_withheld_stage(true, decision.withheld),
+                Some(stage),
+                "{failure:?}"
+            );
+            assert_eq!(decision.withheld_at, withheld_at, "{failure:?}");
+        }
     }
 }

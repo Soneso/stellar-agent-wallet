@@ -9,7 +9,7 @@
 
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::criteria::Criterion;
-use crate::policy::v1::criteria::per_tx_cap::{AssetDebitSum, asset_debit_sum};
+use crate::policy::v1::criteria::per_tx_cap::{AssetDebitSum, checked_asset_debit_sum};
 use crate::policy::v1::loader::DEFAULT_APPROVAL_TTL_SECONDS;
 use crate::policy::{ApprovalRequest, Decision, DenyReason, PolicyError};
 
@@ -40,7 +40,11 @@ impl Criterion for ApprovalAboveCriterion {
     }
 
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        let sum = match asset_debit_sum(ctx, &self.asset, self.kind())? {
+        let overflow = DenyReason::ApprovalAboveOverflow {
+            asset: self.asset.clone(),
+            max_stroops: self.max_stroops,
+        };
+        let sum = match checked_asset_debit_sum(ctx, &self.asset, self.kind(), &overflow)? {
             AssetDebitSum::NotApplicable => return Ok(None),
             AssetDebitSum::Deny(reason) => return Ok(Some(reason)),
             AssetDebitSum::Amount(sum) => sum,
@@ -68,6 +72,15 @@ impl Criterion for ApprovalAboveCriterion {
                     ),
                 ),
             ),
+            Some(DenyReason::ApprovalAboveOverflow { asset, max_stroops }) => {
+                Decision::RequireApproval(
+                    ApprovalRequest::new(String::new(), DEFAULT_APPROVAL_TTL_SECONDS).with_reason(
+                        format!(
+                            "approval_above: the debit total of {asset} exceeds the representable amount and threshold {max_stroops} stroops"
+                        ),
+                    ),
+                )
+            }
             Some(reason) => Decision::Deny(reason),
         })
     }
@@ -84,7 +97,11 @@ mod tests {
     use crate::profile::schema::Profile;
 
     #[test]
+    #[serial_test::serial]
     fn deny_only_threshold_and_decision_escalation_agree() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = ApprovalAboveCriterion::new("native".into(), 100);
         let tool = ToolDescriptor::from_registration(&McpToolRegistration {
             name: "stellar_pay",
@@ -111,6 +128,9 @@ mod tests {
                 sep45_sessions: None,
                 state_store: &store,
                 bundle: None,
+                policy_digest: [0; 32],
+                provisional: false,
+                now_ms: 1_700_000_000_000,
             };
             if amount <= 100 {
                 assert_eq!(criterion.evaluate(&ctx).unwrap(), None);

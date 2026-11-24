@@ -229,6 +229,7 @@ fn simulate_args() -> StellarClaimArgs {
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(SOURCE_G.to_owned()),
+        business_id: None,
     }
 }
 
@@ -305,7 +306,9 @@ impl Respond for ClaimRpcResponder {
                     empty_ledger_entries_result()
                 }
             }
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
         json_rpc_response(&req_id, &result)
     }
@@ -344,7 +347,7 @@ impl Respond for EntryGoneResponder {
                 empty_ledger_entries_result()
             }
         } else {
-            serde_json::json!({})
+            crate::common::operational_result(&method).unwrap_or_else(|| serde_json::json!({}))
         };
         json_rpc_response(&req_id, &result)
     }
@@ -425,6 +428,7 @@ async fn simulate_happy_path_returns_envelope_nonce_and_preview() {
             .and_then(serde_json::Value::as_str),
         Some(CLAIM_AMOUNT_STROOPS.to_string().as_str())
     );
+    crate::common::assert_operational_reported(data);
 }
 
 /// Scenario 2: empty `entries` for the claimable-balance key →
@@ -669,11 +673,12 @@ fn commit_args(
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(SOURCE_G.to_owned()),
-        nonce,
-        expires_at_unix_ms,
-        envelope_xdr,
+        nonce: Some(nonce),
+        expires_at_unix_ms: Some(expires_at_unix_ms),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     }
 }
 
@@ -964,7 +969,9 @@ impl Respond for ClaimSubmitSuccessRpcResponder {
                 "ledger": 1005,
                 "txHash": crate::common::polled_tx_hash(request),
             }),
-            _ => serde_json::json!({}),
+            other => {
+                crate::common::operational_result(other).unwrap_or_else(|| serde_json::json!({}))
+            }
         };
         json_rpc_response(&req_id, &result)
     }
@@ -993,6 +1000,7 @@ async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let id = test_balance_id();
     let cb_key_xdr = claim_key_xdr(&id);
@@ -1026,6 +1034,7 @@ async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(claimant_g.clone()),
+        business_id: None,
     };
     let (sim_result, simulate_clients) =
         crate::common::clients_built_by(server.call_stellar_claim(simulate_args)).await;
@@ -1048,11 +1057,12 @@ async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(claimant_g),
-        nonce,
-        expires_at_unix_ms,
-        envelope_xdr,
+        nonce: Some(nonce),
+        expires_at_unix_ms: Some(expires_at_unix_ms),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let (commit_result, commit_clients) =
         crate::common::clients_built_by(server.call_stellar_claim_commit(commit_args)).await;
@@ -1136,6 +1146,7 @@ async fn claim_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rul
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let id = test_balance_id();
     let cb_key_xdr = claim_key_xdr(&id);
@@ -1175,6 +1186,7 @@ async fn claim_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rul
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(claimant_g.clone()),
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_claim(simulate_args)
@@ -1194,11 +1206,12 @@ async fn claim_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rul
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(claimant_g),
-        nonce,
-        expires_at_unix_ms,
-        envelope_xdr,
+        nonce: Some(nonce),
+        expires_at_unix_ms: Some(expires_at_unix_ms),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let commit_result = server
         .call_stellar_claim_commit(commit_args)
@@ -1285,11 +1298,12 @@ async fn claim_commit_denies_under_unsatisfied_minimum_reserve_rule() {
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(SOURCE_G.to_owned()),
-        nonce: "dGVzdA".to_owned(),
-        expires_at_unix_ms: u64::MAX,
-        envelope_xdr,
+        nonce: Some("dGVzdA".to_owned()),
+        expires_at_unix_ms: Some(u64::MAX),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let commit_result = server
         .call_stellar_claim_commit(commit_args)
@@ -1390,6 +1404,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let id = test_balance_id();
     let cb_key_xdr = claim_key_xdr(&id);
@@ -1426,6 +1441,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
             chain_id: "stellar:testnet".to_owned(),
             balance_id: "ab".repeat(32),
             source_account: Some(claimant_g.clone()),
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -1436,11 +1452,12 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(claimant_g),
-        nonce,
-        expires_at_unix_ms,
-        envelope_xdr,
+        nonce: Some(nonce),
+        expires_at_unix_ms: Some(expires_at_unix_ms),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     // ── Commit against the wrong network ───────────────────────────────────
@@ -1498,6 +1515,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
     let id = test_balance_id();
     let mock_server = MockServer::start().await;
     crate::common::require_rpc_credential(&mock_server).await;
@@ -1529,6 +1547,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(claimant_g.clone()),
+        business_id: None,
     };
     let sim_result = server
         .call_stellar_claim(simulate_args.clone())
@@ -1545,11 +1564,12 @@ async fn prepare_and_commit_send_the_primary_credential() {
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(claimant_g),
-        nonce,
-        expires_at_unix_ms,
-        envelope_xdr,
+        nonce: Some(nonce),
+        expires_at_unix_ms: Some(expires_at_unix_ms),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let committed = server
         .call_stellar_claim_commit(commit_args.clone())
@@ -1615,6 +1635,7 @@ async fn simulate_refuses_an_endpoint_serving_another_network_before_any_read() 
             chain_id: "stellar:testnet".to_owned(),
             balance_id: "ab".repeat(32),
             source_account: Some(claimant_g),
+            business_id: None,
         }))
         .await;
     let result = result.expect("the refusal is a tool result, not a protocol error");
@@ -1635,6 +1656,7 @@ async fn claim_endpoint(seed: [u8; 32]) -> (MockServer, String) {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
     let id = test_balance_id();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1679,6 +1701,7 @@ async fn claim_prepare_fee_above_cap_refuses() {
             chain_id: "stellar:testnet".to_owned(),
             balance_id: "ab".repeat(32),
             source_account: Some(claimant_g),
+            business_id: None,
         })
         .await
         .unwrap();
@@ -1687,9 +1710,8 @@ async fn claim_prepare_fee_above_cap_refuses() {
     assert_eq!(code, "fees.percentile_exceeds_cap");
     assert_eq!(
         message,
-        "the profile's per-operation fee 500 stroops (classic_fee_per_op_stroops) exceeds the \
-         profile cap of 400 stroops; lower classic_fee_per_op_stroops or raise \
-         classic_max_fee_per_op_stroops"
+        "classic_fee_per_op_stroops must not exceed classic_max_fee_per_op_stroops; lower \
+         classic_fee_per_op_stroops or raise classic_max_fee_per_op_stroops."
     );
 }
 
@@ -1722,6 +1744,7 @@ async fn claim_commit_fee_above_cap_refuses() {
             chain_id: "stellar:testnet".to_owned(),
             balance_id: "ab".repeat(32),
             source_account: Some(claimant_g.clone()),
+            business_id: None,
         })
         .await
         .unwrap();
@@ -1742,11 +1765,12 @@ async fn claim_commit_fee_above_cap_refuses() {
             chain_id: "stellar:testnet".to_owned(),
             balance_id: "ab".repeat(32),
             source_account: Some(claimant_g),
-            nonce,
-            expires_at_unix_ms,
-            envelope_xdr,
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .unwrap();
@@ -1832,6 +1856,7 @@ async fn witness_claim_case(case: ClaimCase, expected: &str) {
         .unwrap()
         .set_password(&sstrkey_for_seed([0x74; 32]))
         .unwrap();
+    crate::common::store_signer_identity("svc", &account, [0x74; 32]);
     let id = test_balance_id();
     let entries = vec![
         (
@@ -1894,6 +1919,7 @@ async fn witness_claim_case(case: ClaimCase, expected: &str) {
             chain_id: "stellar:testnet".to_owned(),
             balance_id: "ab".repeat(32),
             source_account: Some(source.clone()),
+            business_id: None,
         })
         .await
         .unwrap();
@@ -1928,11 +1954,12 @@ async fn witness_claim_case(case: ClaimCase, expected: &str) {
         chain_id: "stellar:testnet".to_owned(),
         balance_id: "ab".repeat(32),
         source_account: Some(source),
-        nonce,
-        expires_at_unix_ms,
-        envelope_xdr,
+        nonce: Some(nonce),
+        expires_at_unix_ms: Some(expires_at_unix_ms),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
     let server = if case == ClaimCase::Cap {
         profile.classic_max_fee_per_op_stroops = Some(50);
@@ -2009,11 +2036,17 @@ async fn witness_claim_case(case: ClaimCase, expected: &str) {
     let pending = rows_of_kind(&rows, "value_action_pending");
     let submitted = rows_of_kind(&rows, "value_action_submitted");
     assert_eq!(pending.len(), 1);
-    assert_eq!(submitted.len(), 1);
+    assert!(submitted.is_empty());
     if expected == "passed" {
         assert_eq!(pending[0]["witness"]["provider"], oracle.uri());
         assert_eq!(pending[0]["witness"]["ledger"], 1001);
-        assert_eq!(pending[0]["witness"], submitted[0]["witness"]);
+        assert_eq!(
+            pending[0]["witness"]["inputs_digest"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
     } else {
         assert!(received_methods(&oracle).await.is_empty());
     }

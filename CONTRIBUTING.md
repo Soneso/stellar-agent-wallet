@@ -12,8 +12,11 @@ source before relying on a behavior.
 ## Getting set up
 
 Stellar Agent Wallet is a Cargo workspace of `stellar-agent-*` crates that builds
-two binaries: `stellar-agent` (the CLI, from crate `stellar-agent-cli`) and
-`stellar-agent-mcp` (the MCP stdio server, from crate `stellar-agent-mcp`).
+one executable, `stellar-agent`, from crate `stellar-agent-cli`. It runs the CLI,
+and it runs the MCP stdio server of the `stellar-agent-mcp` library crate as
+`stellar-agent mcp serve` or under the file name `stellar-agent-mcp`. The MCP
+integration tests start that server child, so build both packages first:
+`cargo test -p stellar-agent-cli -p stellar-agent-mcp --no-run`.
 
 The toolchain channel is `stable` (pinned in `rust-toolchain.toml`, with the
 `rustfmt` and `clippy` components) and the workspace targets Rust edition 2024. See
@@ -25,8 +28,8 @@ the gate-tool installation, the build commands, and the test tiers.
 Every change must be production-ready. There is no separate "good enough for alpha"
 standard.
 
-The workspace lints are declared in the root `Cargo.toml` and denied across the
-workspace. In particular:
+The workspace lints are declared in the root `Cargo.toml`. Every crate except
+`stellar-agent-sep7` inherits them. In particular:
 
 - No `unsafe` code (`unsafe_code` is denied).
 - No `unwrap`, `expect`, or `panic` in library code unless a path is provably
@@ -41,8 +44,8 @@ Beyond the lints, a change is expected to:
 - Fail closed. A check that runs before signing or submission refuses on error
   rather than proceeds. The behaviors that deliberately differ are documented: the
   audit chain-key pre-flight on the synthesized zero-config profile in
-  [SECURITY.md](SECURITY.md#security-model-summary) and the post-confirmation audit
-  append in [concepts](docs/concepts.md#fail-closed-on-an-unminted-audit-key). A
+  [SECURITY.md](SECURITY.md#security-model-summary) and the audit rows written
+  after the chain action in [concepts](docs/concepts.md#the-hash-chained-audit-log). A
   change adds no new one without a security review.
 - Keep secrets out of logs, `Debug` output, and error messages. Account identifiers
   and transaction hashes are redacted at info level. Secret material zeroizes on
@@ -71,22 +74,19 @@ request description. Issue-specific acceptance commands still apply.
 including coverage. Local coverage, `cargo machete`, and `cargo deny check` are
 optional reproductions of CI checks.
 
-CI runs the offline workspace suite on every pull request. Pull-request
+CI runs the offline gates on every pull request; a docs-only pull request into
+`mainnet-write` runs the reduced set that
+[docs/maintainers/building.md](docs/maintainers/building.md) describes. Pull-request
 coverage requires the `coverage` label; live acceptance uses its separate
 workflow. The exact commands, gate-tool installation, and test tiers are in
 [docs/maintainers/building.md](docs/maintainers/building.md).
 
-A CLI preflight retains 3,756,896 KiB (about 3.6 GiB) with a 30-second sampled
-peak of 3,756,896 KiB, at 0.43 and 0.43 times the baseline sizes, respectively.
-A full preflight retains 21,188,348 KiB (about 20.2 GiB) with a 30-second
-sampled peak of 21,188,348 KiB, at 0.51 and 0.51 times the baseline sizes,
-respectively.
-See [Disk use](docs/maintainers/building.md#disk-use) for the measurements and
-cleanup guidance.
+See [Disk use](docs/maintainers/building.md#disk-use) for the disk space a preflight
+retains and for cleanup guidance.
 
 ## Review process
 
-Your first pull request or issue gets an automatic welcome comment that names the next step.
+Your first contribution, whether an issue or a pull request, gets an automatic welcome comment that names the next step.
 
 A maintainer acknowledges a new pull request within one working day (Monday to
 Friday, Central European Time). The review follows within three working days for
@@ -123,7 +123,7 @@ maintainer merges next. An issue or pull request loses both labels when a person
 closes it.
 
 A pull request that waits on its author for 14 days gets a reminder, and it
-closes after 21 days. You can reopen it at any time.
+closes after 21 days. Draft pull requests are exempt. You can reopen it at any time.
 
 ## Contributing with a coding agent
 
@@ -243,6 +243,51 @@ The file may live outside the checkout.
 
 Commit messages and pull request descriptions follow the same rules except for
 tense, which the next section sets.
+
+## Changelog entries
+
+A fragment is a pending changelog entry under `changelog.d/`.
+It supplies the entry that source compatibility policies require.
+Add one `<slug>.<category>.md` file for each category your change needs.
+Use a descriptive branch name as the slug.
+Lowercase it and replace every character outside `a-z`, `0-9`, and `-` with `-`.
+For example, `fix/Login_v2.1` becomes `fix-login-v2-1`.
+Use a topic slug for generic branch names such as `main` or `patch-1`.
+Use lowercase letters, digits, and hyphens; omit the pull request number.
+Categories are `added`, `changed`, `deprecated`, `removed`, `fixed`, and
+`security`.
+Each top-level entry starts with `- ` and contains text.
+Indented continuations and nested lists follow an entry; headings and metadata
+are invalid.
+
+For example, `changelog.d/account-timeouts.fixed.md` contains:
+
+```markdown
+- Retry an account lookup after a network timeout.
+```
+
+Keep `CHANGELOG.md` and the fragment README unchanged in contributing pull
+requests. Move any direct changelog entries into fragments.
+Remove the `CHANGELOG.md` edits from the branch history; a later revert commit
+still fails the integration guard.
+An eligible sync merge has exactly two parents and brings new ancestry from
+`main` through its second parent.
+Its `CHANGELOG.md` equals the clean three-way merge over the parents' merge
+base, preserving both sides' lines.
+The guard refuses conflicts; a maintainer resolves and merges them.
+The guard never accepts hand-resolved changelog bytes.
+Never edit an existing fragment. Add a new file for a further entry.
+Each fragment file belongs to one pull request and is never reused.
+A sync merge deletes fragments that `main` folds and deletes.
+It never deletes a fragment that holds an unreleased entry under this rule.
+The fragment README states the rules the guard applies to branch history and
+filename conflicts.
+
+Run `python3 .github/scripts/changelog.py check` to validate your fragments.
+Run `python3 .github/scripts/changelog.py preview` to read the folded
+Unreleased section without changing files.
+See [Fragment format](changelog.d/README.md) and
+[Release preparation](docs/maintainers/releasing.md#cut-a-release-tag).
 
 ## Commit and pull request conventions
 

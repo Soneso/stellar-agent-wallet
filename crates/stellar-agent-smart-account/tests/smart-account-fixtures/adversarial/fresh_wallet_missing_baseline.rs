@@ -63,6 +63,9 @@ fn manager_with_url(
         "test-profile".to_owned(),
         Duration::from_secs(5),
         "stellar:testnet".to_owned(),
+    )
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
     );
     SignersManager::new(config).expect("SignersManager::new must succeed with valid URL")
 }
@@ -83,7 +86,12 @@ fn zero_sc_address() -> ScAddress {
 /// no network I/O occurs — if RPC were called, the test would fail with
 /// a connection error, not `SignerSetMissingBaseline`.
 #[tokio::test]
+#[serial_test::serial]
 async fn verify_returns_missing_baseline_on_empty_audit_log() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     // Intentionally unreachable URL — any RPC attempt would return a
@@ -104,17 +112,19 @@ async fn verify_returns_missing_baseline_on_empty_audit_log() {
         .await;
 
     assert!(
-        matches!(
-            result,
-            Err(SaError::SignerSetMissingBaseline { rule_id: 1, .. })
-        ),
+        matches!(result, Err(SaError::SignerSetMissingBaseline { .. })),
         "fresh wallet must return SignerSetMissingBaseline (no RPC call); got: {result:?}"
     );
 }
 
 /// The wire code on `SignerSetMissingBaseline` is `"sa.signer_set_missing_baseline"`.
 #[tokio::test]
+#[serial_test::serial]
 async fn missing_baseline_wire_code_is_correct() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     let manager = manager_with_url("http://127.0.0.1:1", audit_writer, audit_log_path);
@@ -135,17 +145,22 @@ async fn missing_baseline_wire_code_is_correct() {
         "wire_code must be 'sa.signer_set_missing_baseline'; got: '{}'",
         err.wire_code()
     );
-    let message = err.to_string();
-    assert!(
-        message.contains("'smart-account signers list --rule-id 2'"),
-        "the message must name the command that records the baseline: {message}"
+    assert_eq!(
+        err.to_string(),
+        "rule_id must identify a rule with a recorded signer-set baseline; run \
+         'smart-account signers list --rule-id <RULE_ID>' to record one before retrying."
     );
 }
 
 /// Rule 0 (bootstrap rule) and rule 1 are independent in the audit log.
 /// Missing baseline for rule 1 returns the error even if rule 0 has a baseline.
 #[tokio::test]
+#[serial_test::serial]
 async fn missing_baseline_is_per_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     // Write a baseline for rule 0 (bootstrap rule is skipped in divergence checks
@@ -200,10 +215,7 @@ async fn missing_baseline_is_per_rule() {
         .await;
 
     assert!(
-        matches!(
-            result,
-            Err(SaError::SignerSetMissingBaseline { rule_id: 1, .. })
-        ),
+        matches!(result, Err(SaError::SignerSetMissingBaseline { .. })),
         "rule 1 must return SignerSetMissingBaseline even if rule 0 has a baseline; got: {result:?}"
     );
 

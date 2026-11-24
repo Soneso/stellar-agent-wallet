@@ -19,27 +19,33 @@
 //!    exactly (CTAP2, resident key, automatic presence simulation).
 //! 3. The browser navigates to `handle.enroll_url()` — the SAME method the
 //!    CLI uses, so this suite exercises the exact URL an operator would
-//!    open: a `localhost`-hostnamed `/bootstrap/{token}` link that
-//!    303-redirects to `/enroll` and sets the session cookie. chromiumoxide
-//!    follows the redirect and persists the cookie automatically, so the
-//!    ceremony proceeds unchanged from the browser's perspective.
-//! 4. Types a label into `#label-input`, clicks `#enroll-btn` — a REAL
-//!    `navigator.credentials.create()` runs through the shipped
+//!    open: a `localhost`-hostnamed `/bootstrap/{token}` link whose response
+//!    sets the session cookie and returns the bootstrap page. The shipped
+//!    `/static/session-bootstrap.js` stores the session proof in the tab's
+//!    `sessionStorage` and replaces the location with `/enroll`, so the
+//!    ceremony below runs with the cookie and the proof a real operator's
+//!    tab holds.
+//! 4. Types a label into `#label-input`, clicks `#enroll-btn`: the page
+//!    requests the server's registration challenge, and a REAL
+//!    `navigator.credentials.create()` runs over it through the shipped
 //!    `/static/operator-enroll.js`, so the virtual authenticator generates
 //!    its own credential id and P-256 keypair, exactly as a hardware key
-//!    would.
-//! 5. `handle.await_completion` resolves once the POST persists the
-//!    credential; the page's `#status` text is polled to confirm the
-//!    shipped frontend also reflects success, not just the backend.
-//! 6. Rigorous cross-check (the part a DOM-only assertion cannot provide):
+//!    would, and returns its own `clientDataJSON` and `attestationObject`.
+//! 5. `handle.await_completion` resolves once the server has verified the
+//!    registration and staged the credential. The page shows its
+//!    confirmation code, and the credential store is still empty: nothing
+//!    is enrolled before the terminal confirmation.
+//! 6. The code the page shows is typed at the confirmation step the CLI
+//!    runs (`PendingOperatorEnrollment::confirm`), which persists the
+//!    staged credential.
+//! 7. Rigorous cross-check (the part a DOM-only assertion cannot provide):
 //!    `WebAuthn.getCredentials` returns the virtual authenticator's own
 //!    record of what it just created — the STORED SEC1 public key must
 //!    equal the public key derived from the PKCS#8 private key CDP
 //!    returns, and the STORED sign count must EXACTLY equal CDP's own
-//!    `signCount` — not merely "both present", an equality that only holds
-//!    if the shipped JS's `getAuthenticatorData()`-based extraction (see
-//!    `operator-enroll.js`) reads the real authenticator data correctly.
-//! 7. A raw second `POST /enroll/credential` carrying no session cookie
+//!    `signCount`, which the server reads from the authenticator data
+//!    inside the attestation object.
+//! 8. A raw second `POST /enroll/credential` carrying no session cookie
 //!    confirms the session gate refuses it (`404`) before the completion
 //!    latch is even consulted; the bootstrap token was already consumed by
 //!    step 3's navigation, so a fresh out-of-browser client cannot establish
@@ -48,9 +54,30 @@
 //!
 //! Negative paths (`post_wrong_csrf_...`, `post_duplicate_credential_id_...`)
 //! drive the real HTTP surface directly (no browser needed for those, each
-//! performing its own bootstrap → session-cookie exchange) to confirm CSRF
-//! rejection and the duplicate-id refusal hold against a real TCP listener,
-//! not only the in-process router tests.
+//! performing its own bootstrap exchange for the session cookie and proof) to
+//! confirm CSRF rejection and the duplicate-id refusal hold against a real
+//! TCP listener, not only the in-process router tests. Their registrations
+//! come from a software authenticator with a real P-256 key.
+//!
+//! # Cross-port isolation
+//!
+//! Browsers scope cookies by host, not by port, so any other service on the
+//! same loopback host receives the wallet's session cookie when the browser
+//! visits it. The session proof lives in `sessionStorage`, which is scoped
+//! to the full origin, port included. `cross_port_cookie_does_not_authorize_*`
+//! show both halves against a real Chromium: a second loopback service
+//! receives the cookie, its page cannot read the proof, and the cookie plus a
+//! valid CSRF value without the proof can neither request a registration
+//! challenge, enroll a credential nor decide an approval, while the
+//! operator's own tab still can.
+//!
+//! # Trust controls
+//!
+//! `signed_origin_enrollment_browser_trusts_only_the_test_authority` runs
+//! through the acceptance runner, which installs its test certificate
+//! authority for Chromium alone. Chromium loads a page the authority issued
+//! and refuses the signed enrollment listener when another authority issued
+//! its leaf; no registration is staged.
 //!
 //! # Gate
 //!
@@ -63,7 +90,8 @@
 //!
 //! - `CHROMIUM` or `chromium`/`chromium-browser`/`google-chrome` on `PATH`,
 //!   or the `CHROME` environment variable pointing to the executable
-//!   (`operator_enroll_browser_creates_and_persists_credential` only).
+//!   (`operator_enroll_browser_confirms_then_persists_credential` and the
+//!   `cross_port_cookie_does_not_authorize_*` tests).
 
 #![cfg(feature = "operator-enroll-browser-acceptance")]
 #![allow(
@@ -74,6 +102,7 @@
 )]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -89,11 +118,29 @@ use p256::SecretKey;
 use p256::elliptic_curve::sec1::ToEncodedPoint as _;
 use p256::pkcs8::DecodePrivateKey as _;
 use serial_test::serial;
-use stellar_agent_approval_ui::operator_enroll::start_operator_enroll_server;
+use stellar_agent_approval_ui::operator_enroll::test_support::{
+    EnrollmentClient, SoftwareRegistrar,
+};
+use stellar_agent_approval_ui::operator_enroll::{
+    OperatorEnrollHandle, PendingOperatorEnrollment, start_operator_enroll_server,
+};
+use stellar_agent_approval_ui::{DecisionContext, ServeConfig, start_serve};
 use stellar_agent_core::approval::operator_credentials::{
     OperatorApprovalCredential, OperatorApprovalCredentialStore,
 };
+use stellar_agent_core::approval::{
+    ApprovalContext, ApprovalKind, DEFAULT_TTL_MS, PendingApprovalStore, fixtures,
+    process_uid_for_attestation,
+};
+use stellar_agent_core::audit_log::writer::AuditWriter;
+use stellar_agent_core::profile::owner_key::OwnerKeyContext;
+use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
+use stellar_agent_core::timefmt;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+#[path = "common/trusted_browser.rs"]
+mod trusted_browser;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RAII guards
@@ -114,9 +161,7 @@ impl Drop for BrowserGuard {
 }
 
 /// RAII guard that shuts down the operator-enroll server on drop.
-struct OperatorEnrollGuard(
-    Option<stellar_agent_approval_ui::operator_enroll::OperatorEnrollHandle>,
-);
+struct OperatorEnrollGuard(Option<OperatorEnrollHandle>);
 
 impl Drop for OperatorEnrollGuard {
     #[allow(
@@ -231,6 +276,56 @@ async fn poll_status_contains(page: &chromiumoxide::Page, needle: &str, deadline
     }
 }
 
+/// The confirmation code the page shows in `#confirmation-code`, or the
+/// empty string while the element is hidden.
+async fn displayed_code(page: &chromiumoxide::Page) -> String {
+    page.evaluate(evaluate_by_value(
+        "(function(){var el = document.getElementById('confirmation-code'); \
+         return el && !el.hidden ? el.textContent : '';})()",
+    ))
+    .await
+    .expect("evaluate must not error")
+    .into_value()
+    .expect("evaluate result must deserialise as String")
+}
+
+/// Awaits the registration the page posts to the server behind `guard` and
+/// returns the staged credential, after asserting that the page shows a
+/// well-formed confirmation code and that `store` is still empty.
+async fn staged_from_page(
+    guard: &mut OperatorEnrollGuard,
+    page: &chromiumoxide::Page,
+    store: &OperatorApprovalCredentialStore,
+) -> (PendingOperatorEnrollment, String) {
+    let pending = guard
+        .0
+        .as_mut()
+        .expect("handle must be present")
+        .await_completion(Duration::from_secs(30))
+        .await
+        .expect("the page's registration must verify within 30s");
+    poll_status_contains(
+        page,
+        "Awaiting confirmation",
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await;
+    let code = displayed_code(page).await;
+    let groups: Vec<&str> = code.split('-').collect();
+    assert_eq!(groups.len(), 4, "the page shows four groups: {code:?}");
+    assert!(
+        groups
+            .iter()
+            .all(|g| g.len() == 4 && g.bytes().all(|b| b.is_ascii_hexdigit())),
+        "each group holds four hex digits: {code:?}"
+    );
+    assert!(
+        store.list().expect("store must be readable").is_empty(),
+        "nothing is enrolled before the terminal confirmation"
+    );
+    (pending, code)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CDP binary decoding
 // ─────────────────────────────────────────────────────────────────────────────
@@ -255,16 +350,17 @@ fn decode_cdp_binary(bin: &chromiumoxide::Binary) -> Vec<u8> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Drives the real interactive enrollment ceremony through a headless
-/// Chromium end to end, cross-checks the persisted credential against the
-/// virtual authenticator's own record, and confirms the single-use latch
-/// refuses a second successful-shape POST on the same server.
+/// Chromium end to end: the server stages the verified registration, the
+/// page shows its code, nothing is stored until that code is confirmed, and
+/// the persisted credential matches the virtual authenticator's own record.
+/// A second POST without a session is refused on the same server.
 ///
 /// `flavor = "multi_thread"` is required for `tokio::task::block_in_place`
 /// (used by both RAII guards), mirroring the sibling suites.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "requires chromium and explicit --ignored flag"]
-async fn operator_enroll_browser_creates_and_persists_credential() {
+async fn operator_enroll_browser_confirms_then_persists_credential() {
     let dir = TempDir::new().expect("tempdir");
     let store_path = dir.path().join("default.toml");
 
@@ -328,23 +424,18 @@ async fn operator_enroll_browser_creates_and_persists_credential() {
         .await
         .expect("enroll button click must succeed");
 
-    // The Rust-side signal is authoritative: it resolves only after the
-    // POST handler's synchronous `store.enroll` call returns Ok, i.e. the
-    // credential is durably persisted before this await returns.
-    let mut enroll_handle_opt = enroll_guard.0.take();
-    {
-        let enroll_handle = enroll_handle_opt
-            .as_mut()
-            .expect("handle must be present before first await");
-        enroll_handle
-            .await_completion(Duration::from_secs(30))
-            .await
-            .expect("the ceremony must complete within 30s");
-    }
-    enroll_guard.0 = enroll_handle_opt;
+    // The server stages the verified registration and the page shows its
+    // code; the store stays empty until the operator types that code.
+    let store = OperatorApprovalCredentialStore::new(store_path.clone());
+    let (pending, code) = staged_from_page(&mut enroll_guard, &page, &store).await;
+    assert_eq!(pending.label(), "acceptance-test-laptop");
 
-    // The shipped frontend must ALSO reflect success — not just the backend.
-    poll_status_contains(&page, "Enrolled", Instant::now() + Duration::from_secs(5)).await;
+    // The operator types the displayed code at the terminal.
+    let enrolled = pending
+        .confirm(&code, std::time::Instant::now())
+        .expect("the displayed code confirms the staged credential")
+        .persist(&store)
+        .expect("the confirmed credential persists");
 
     // ── Rigorous cross-check ────────────────────────────────────────────
     let credentials = page
@@ -371,13 +462,14 @@ async fn operator_enroll_browser_creates_and_persists_credential() {
     let derived_pubkey_point = secret_key.public_key().to_encoded_point(false);
     let derived_pubkey_bytes = derived_pubkey_point.as_bytes();
 
-    let store = OperatorApprovalCredentialStore::new(store_path.clone());
-    let stored = store
-        .list()
-        .expect("store must be readable")
-        .into_iter()
-        .next()
-        .expect("exactly one credential must have been enrolled");
+    let listed = store.list().expect("store must be readable");
+    assert_eq!(listed.len(), 1, "exactly one credential is enrolled");
+    let stored = listed.into_iter().next().expect("one credential");
+    assert_eq!(
+        stored, enrolled,
+        "the store holds the record persist returned"
+    );
+    assert_eq!(stored.label, "acceptance-test-laptop");
 
     let stored_cred_id_bytes = URL_SAFE_NO_PAD
         .decode(&stored.credential_id_b64url)
@@ -400,8 +492,8 @@ async fn operator_enroll_browser_creates_and_persists_credential() {
         stored.sign_count,
         Some(cdp_sign_count),
         "the stored sign_count must EXACTLY equal CDP's own signCount — this validates the \
-         shipped JS's getAuthenticatorData()-based extraction against ground truth, not merely \
-         that some value was stored"
+         server's reading of the authenticator data inside the attestation object against \
+         ground truth, not merely that some value was stored"
     );
 
     // ── Session gate refuses an unauthenticated second POST ─────────────
@@ -424,7 +516,7 @@ async fn operator_enroll_browser_creates_and_persists_credential() {
         .post(format!("{base}/enroll/credential"))
         .header("Host", format!("127.0.0.1:{port}"))
         .header("Origin", &base)
-        .json(&synthetic_valid_body(200))
+        .json(&synthetic_valid_body(200, port))
         .send()
         .await
         .expect("POST must complete");
@@ -445,39 +537,50 @@ async fn operator_enroll_browser_creates_and_persists_credential() {
 // Negative paths against the real HTTP surface (no browser needed)
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn synthetic_valid_body(seed: u8) -> serde_json::Value {
-    let mut pubkey = vec![seed; 65];
-    pubkey[0] = 0x04;
-    serde_json::json!({
-        "credential_id_b64url": URL_SAFE_NO_PAD.encode([seed; 16]),
-        "public_key_sec1_b64": URL_SAFE_NO_PAD.encode(pubkey),
-        "label": "synthetic",
-        "sign_count": 1,
-    })
+/// A well-formed registration body from a software authenticator seeded with
+/// `seed`, over a challenge the server never issued, for requests the server
+/// must refuse before it reads the body.
+fn synthetic_valid_body(seed: u8, port: u16) -> serde_json::Value {
+    SoftwareRegistrar::new([seed; 32], vec![seed; 16])
+        .builder(&[seed; 32], &format!("http://localhost:{port}"))
+        .label("synthetic")
+        .json()
 }
 
-/// Extracts `csrfToken` from the `#enroll-data` JSON data island in a
-/// rendered `/enroll` page — mirrors the offline template tests' island
-/// parsing, applied here to a real HTTP response body.
-fn extract_csrf(html: &str) -> String {
-    let open = r#"<script type="application/json" id="enroll-data">"#;
-    let start = html.find(open).expect("data island opening tag present") + open.len();
+/// Parses the JSON data island `id` in a served page, as the offline
+/// template tests do, applied here to a real HTTP response body.
+///
+/// The opening tag is matched up to its `id` attribute and ends at the next
+/// `>`, so attributes after the `id`, such as `data-purpose`, are accepted.
+fn extract_island(html: &str, id: &str) -> serde_json::Value {
+    let open = format!(r#"<script type="application/json" id="{id}""#);
+    let tag = html.find(&open).expect("data island opening tag present");
+    let start = tag
+        + html[tag..]
+            .find('>')
+            .expect("data island opening tag end present")
+        + 1;
     let rest = &html[start..];
     let end = rest
         .find("</script>")
         .expect("data island closing tag present");
-    let value: serde_json::Value =
-        serde_json::from_str(&rest[..end]).expect("data island must be valid JSON");
-    value["csrfToken"]
+    serde_json::from_str(&rest[..end]).expect("data island must be valid JSON")
+}
+
+/// Extracts `csrfToken` from the `#enroll-data` JSON data island in a
+/// rendered `/enroll` page.
+fn extract_csrf(html: &str) -> String {
+    extract_island(html, "enroll-data")["csrfToken"]
         .as_str()
         .expect("csrfToken must be a string")
         .to_owned()
 }
 
-/// A `reqwest::Client` that does not auto-follow redirects, so the bootstrap
-/// exchange's `303 See Other` + `Set-Cookie` can be observed directly —
-/// mirrors `stellar-agent-mcp`'s `approve_serve_testnet_acceptance` helper of
-/// the same name for the sibling approval-inbox server's identical gate.
+/// A `reqwest::Client` that does not auto-follow redirects, so every
+/// response, the bootstrap exchange's `Set-Cookie` included, is observed
+/// directly. It mirrors the helper of the same name in `stellar-agent-mcp`'s
+/// `approve_serve_testnet_acceptance` for the sibling approval-inbox server's
+/// identical gate.
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -485,15 +588,22 @@ fn http_client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
+/// The session a bootstrap exchange establishes: the `name=value` cookie
+/// header and the session proof the bootstrap page hands its script.
+struct Session {
+    cookie: String,
+    proof: String,
+}
+
 /// Performs the one-time bootstrap exchange against `127.0.0.1:{port}` and
-/// returns the `name=value` session-cookie header. Bootstrap is a `GET`, so
+/// returns the session cookie and the session proof. Bootstrap is a `GET`, so
 /// only the Host allowlist applies (it accepts the loopback IP); the Origin
 /// allowlist guards state-changing methods only.
 async fn bootstrap_session(
     client: &reqwest::Client,
     port: u16,
     bootstrap_token_hex: &str,
-) -> String {
+) -> Session {
     let resp = client
         .get(format!(
             "http://127.0.0.1:{port}/bootstrap/{bootstrap_token_hex}"
@@ -504,25 +614,28 @@ async fn bootstrap_session(
         .expect("bootstrap GET must succeed");
     assert_eq!(
         resp.status(),
-        reqwest::StatusCode::SEE_OTHER,
-        "bootstrap exchange must redirect to /enroll"
+        reqwest::StatusCode::OK,
+        "bootstrap exchange must return the session bootstrap page"
     );
-    assert_eq!(
-        resp.headers().get(reqwest::header::LOCATION).unwrap(),
-        "/enroll"
-    );
-    let set_cookie = resp
+    let cookie = resp
         .headers()
         .get(reqwest::header::SET_COOKIE)
         .expect("bootstrap must set a session cookie")
         .to_str()
-        .expect("cookie header is ASCII");
-    set_cookie
+        .expect("cookie header is ASCII")
         .split(';')
         .next()
         .expect("cookie header carries a name=value pair")
         .trim()
-        .to_owned()
+        .to_owned();
+    let page = resp.text().await.expect("bootstrap body is text");
+    let island = extract_island(&page, "session-bootstrap-data");
+    assert_eq!(island["next"], "/enroll");
+    let proof = island["proof"]
+        .as_str()
+        .expect("the bootstrap page carries the session proof")
+        .to_owned();
+    Session { cookie, proof }
 }
 
 #[tokio::test]
@@ -545,7 +658,8 @@ async fn post_wrong_csrf_is_refused_over_real_server() {
     let base = format!("http://127.0.0.1:{port}");
 
     let client = http_client();
-    let cookie = bootstrap_session(&client, port, handle.bootstrap_token_hex()).await;
+    let Session { cookie, proof } =
+        bootstrap_session(&client, port, handle.bootstrap_token_hex()).await;
 
     let resp = client
         .post(format!("{base}/enroll/credential"))
@@ -553,7 +667,8 @@ async fn post_wrong_csrf_is_refused_over_real_server() {
         .header("Origin", &base)
         .header(reqwest::header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", "f".repeat(64))
-        .json(&synthetic_valid_body(1))
+        .header("x-session-proof", &proof)
+        .json(&synthetic_valid_body(1, port))
         .send()
         .await
         .expect("POST must complete");
@@ -564,28 +679,26 @@ async fn post_wrong_csrf_is_refused_over_real_server() {
     handle.shutdown().await.ok();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "part of the operator-enroll browser acceptance suite; run via --include-ignored"]
 async fn post_duplicate_credential_id_is_refused_over_real_server() {
     let dir = TempDir::new().expect("tempdir");
     let store_path = dir.path().join("default.toml");
 
-    let seed_store = OperatorApprovalCredentialStore::new(store_path.clone());
-    seed_store
-        .enroll(OperatorApprovalCredential {
-            credential_id_b64url: URL_SAFE_NO_PAD.encode([9u8; 16]),
-            public_key_sec1_b64: {
-                let mut b = vec![9u8; 65];
-                b[0] = 0x04;
-                URL_SAFE_NO_PAD.encode(b)
-            },
-            rp_id: "localhost".to_owned(),
-            label: "pre-existing".to_owned(),
-            registered_at_unix_ms: 1,
-            sign_count: None,
-        })
-        .expect("pre-seed must succeed");
+    // A real registration whose credential ID is already enrolled.
+    let duplicate = SoftwareRegistrar::new([9u8; 32], vec![9u8; 16]);
+    let store = OperatorApprovalCredentialStore::new(store_path.clone());
+    let seeded = OperatorApprovalCredential {
+        credential_id_b64url: duplicate.credential_id_b64url(),
+        public_key_sec1_b64: URL_SAFE_NO_PAD.encode(duplicate.public_key_sec1()),
+        rp_id: "localhost".to_owned(),
+        label: "pre-existing".to_owned(),
+        registered_at_unix_ms: 1,
+        sign_count: None,
+        source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
+    };
+    store.enroll(seeded.clone()).expect("pre-seed must succeed");
 
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     let handle = start_operator_enroll_server(
@@ -597,66 +710,715 @@ async fn post_duplicate_credential_id_is_refused_over_real_server() {
     )
     .await
     .expect("start must succeed");
+    let mut guard = OperatorEnrollGuard(Some(handle));
+    let (addr, token) = {
+        let handle = guard.0.as_ref().expect("handle present");
+        (handle.local_addr(), handle.bootstrap_token_hex().to_owned())
+    };
+    let client = EnrollmentClient::connect(addr, &token)
+        .await
+        .expect("bootstrap, page and CSRF over the real listener");
+
+    // The verified registration of an enrolled ID is refused before it is
+    // staged, and the store is unchanged.
+    let (reply, _) = client
+        .register(&duplicate, "attempted-duplicate")
+        .await
+        .expect("POST must complete");
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "duplicate_credential_id");
+    assert_eq!(store.list().expect("store readable"), vec![seeded.clone()]);
+
+    // The latch is not consumed: a distinct credential is staged, not
+    // enrolled, and enrolls once its code is confirmed.
+    let distinct = SoftwareRegistrar::new([77u8; 32], vec![77u8; 16]);
+    let (reply, code) = client
+        .register(&distinct, "distinct")
+        .await
+        .expect("second POST must complete");
+    assert_eq!(
+        reply.status, 200,
+        "the latch must not be consumed by a duplicate-id failure: {}",
+        reply.body
+    );
+    assert_eq!(reply.json()["status"], "awaiting_confirmation");
+    assert_eq!(store.list().expect("store readable"), vec![seeded.clone()]);
+    let pending = guard
+        .0
+        .as_mut()
+        .expect("handle present")
+        .await_completion(Duration::from_secs(5))
+        .await
+        .expect("the distinct registration is staged");
+    let enrolled = pending
+        .confirm(&code, std::time::Instant::now())
+        .expect("the page's code confirms the staged credential")
+        .persist(&store)
+        .expect("the confirmed credential persists");
+    assert_eq!(
+        enrolled.credential_id_b64url,
+        distinct.credential_id_b64url()
+    );
+    assert_eq!(
+        store.list().expect("store readable"),
+        vec![seeded, enrolled]
+    );
+
+    drop(guard);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-port isolation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `sessionStorage` key the inbox bootstrap stores its proof under.
+const INBOX_PROOF_KEY: &str = "stellar-agent-approval-session-proof";
+
+/// `sessionStorage` key the enrollment bootstrap stores its proof under.
+const ENROLL_PROOF_KEY: &str = "stellar-agent-operator-enroll-session-proof";
+
+/// A plain HTTP service on another loopback port, standing in for any local
+/// service the operator's browser visits. It serves one static page for every
+/// request and records each request head it receives, so the test can read
+/// the cookies the browser sent it.
+struct OtherPortService {
+    port: u16,
+    heads: Arc<StdMutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for OtherPortService {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl OtherPortService {
+    async fn start() -> Self {
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .expect("the other loopback service must bind");
+        let port = listener.local_addr().expect("bound address").port();
+        let heads = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = Arc::clone(&heads);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                        if head.len() > 64 * 1024 {
+                            return;
+                        }
+                    }
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&head).into_owned());
+                    let body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+                                <title>other service</title></head>\
+                                <body><p>another local service</p></body></html>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        Self { port, heads, task }
+    }
+
+    /// The `name=value` pair of the first cookie whose name starts with
+    /// `prefix` among the cookies the browser sent this service.
+    fn received_cookie(&self, prefix: &str) -> Option<String> {
+        self.heads.lock().unwrap().iter().find_map(|head| {
+            head.lines()
+                .filter_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("cookie")
+                        .then(|| value.trim().to_owned())
+                })
+                .flat_map(|value| {
+                    value
+                        .split(';')
+                        .map(|pair| pair.trim().to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .find(|pair| pair.starts_with(prefix))
+        })
+    }
+
+    /// Every request head the service received, joined.
+    fn all_heads(&self) -> String {
+        self.heads.lock().unwrap().join("\n")
+    }
+}
+
+/// Polls `expression` (which must evaluate to a string) until it returns
+/// `expected`, or panics after `deadline`.
+async fn poll_eval_equals(
+    page: &chromiumoxide::Page,
+    expression: &str,
+    expected: &str,
+    deadline: Instant,
+) {
+    loop {
+        let value: String = page
+            .evaluate(evaluate_by_value(expression))
+            .await
+            .expect("evaluate must not error")
+            .into_value()
+            .expect("evaluate result must deserialise as String");
+        if value == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{expression} never returned {expected:?} within the deadline; last value: {value:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The session proof the current page's origin holds under `key`, or the
+/// empty string when it holds none.
+async fn stored_proof(page: &chromiumoxide::Page, key: &str) -> String {
+    page.evaluate(evaluate_by_value(&format!(
+        "(function(){{var v = window.sessionStorage.getItem({key:?}); \
+         return v === null ? '' : v;}})()"
+    )))
+    .await
+    .expect("evaluate must not error")
+    .into_value()
+    .expect("evaluate result must deserialise as String")
+}
+
+/// How many `sessionStorage` items the current page's origin holds.
+async fn session_storage_len(page: &chromiumoxide::Page) -> String {
+    page.evaluate(evaluate_by_value("String(window.sessionStorage.length)"))
+        .await
+        .expect("evaluate must not error")
+        .into_value()
+        .expect("evaluate result must deserialise as String")
+}
+
+/// Starts Chromium and opens one blank page; the returned guard kills the
+/// browser, the task drives its CDP handler, and the directory is its
+/// profile.
+async fn browser_with_page() -> (
+    BrowserGuard,
+    chromiumoxide::Page,
+    tokio::task::JoinHandle<()>,
+    TempDir,
+) {
+    let (browser, mut handler, profile) = launch_chromium().await;
+    let handler_task = tokio::spawn(async move {
+        loop {
+            if handler.next().await.is_none() {
+                break;
+            }
+        }
+    });
+    let mut browser_guard = BrowserGuard(Some(browser));
+    let page = browser_guard
+        .0
+        .as_mut()
+        .expect("browser must be alive")
+        .new_page("about:blank")
+        .await
+        .expect("new page must open");
+    (browser_guard, page, handler_task, profile)
+}
+
+/// A service on another loopback port receives the enrollment session cookie
+/// from the operator's browser, but its page cannot read the session proof,
+/// and the cookie plus a valid CSRF value without the proof can neither
+/// request a registration challenge nor post a credential. The operator's own
+/// tab then registers, and its credential enrolls once the displayed code is
+/// confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "requires chromium and explicit --ignored flag"]
+async fn cross_port_cookie_does_not_authorize_enrollment() {
+    let dir = TempDir::new().expect("tempdir");
+    let store_path = dir.path().join("default.toml");
+    let handle = start_operator_enroll_server(
+        store_path.clone(),
+        "default",
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        None,
+        stellar_agent_approval_ui::PageIdentity::neutral(),
+    )
+    .await
+    .expect("start_operator_enroll_server must succeed");
+    let url = handle.enroll_url();
     let port = handle.local_addr().port();
+    let mut enroll_guard = OperatorEnrollGuard(Some(handle));
+    let other = OtherPortService::start().await;
+    assert_ne!(other.port, port);
+
+    let (browser_guard, page, handler_task, _profile) = browser_with_page().await;
+    page.execute(EnableParams::default())
+        .await
+        .expect("WebAuthn domain must enable");
+    add_virtual_authenticator(&page).await;
+
+    // The operator opens the enrollment link; the bootstrap page stores the
+    // proof in this tab and moves on to /enroll.
+    page.goto(&url).await.expect("bootstrap navigation");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    poll_eval_equals(&page, "window.location.pathname", "/enroll", deadline).await;
+    let proof = stored_proof(&page, ENROLL_PROOF_KEY).await;
+    assert_eq!(proof.len(), 64, "the operator's tab must hold the proof");
+
+    // The same tab visits the other service on the same host.
+    page.goto(&format!("http://localhost:{}/", other.port))
+        .await
+        .expect("navigation to the other service");
+    poll_eval_equals(&page, "document.title", "other service", deadline).await;
+    let stolen = other
+        .received_cookie("stellar_agent_operator_enroll_session_")
+        .unwrap_or_else(|| {
+            panic!(
+                "the browser must send the host-scoped session cookie to the other port; \
+                 received: {}",
+                other.all_heads()
+            )
+        });
+    assert_eq!(stored_proof(&page, ENROLL_PROOF_KEY).await, "");
+    assert_eq!(session_storage_len(&page).await, "0");
+    assert!(!other.all_heads().contains(&proof));
+
+    // The other service replays the cookie: it can read the enrollment page
+    // and its CSRF value, but cannot enroll without the proof.
     let base = format!("http://127.0.0.1:{port}");
-
     let client = http_client();
-    let cookie = bootstrap_session(&client, port, handle.bootstrap_token_hex()).await;
-
     let page_html = client
         .get(format!("{base}/enroll"))
-        .header("Host", format!("127.0.0.1:{port}"))
-        .header(reqwest::header::COOKIE, &cookie)
+        .header(reqwest::header::COOKIE, &stolen)
         .send()
         .await
-        .expect("GET /enroll must succeed")
+        .expect("GET /enroll must complete")
         .text()
         .await
         .expect("body must be readable");
     let csrf = extract_csrf(&page_html);
+    assert!(!page_html.contains(&proof));
+    for (path, body) in [
+        ("/enroll/challenge", serde_json::json!({})),
+        ("/enroll/credential", synthetic_valid_body(3, port)),
+    ] {
+        for attempt in [None, Some("f".repeat(64))] {
+            let mut request = client
+                .post(format!("{base}{path}"))
+                .header("Origin", &base)
+                .header(reqwest::header::COOKIE, &stolen)
+                .header("x-stellar-approval-csrf", &csrf)
+                .json(&body);
+            if let Some(wrong) = &attempt {
+                request = request.header("x-session-proof", wrong);
+            }
+            let resp = request.send().await.expect("POST must complete");
+            assert_eq!(resp.status().as_u16(), 403, "{path} {attempt:?}");
+            let refusal: serde_json::Value = resp.json().await.expect("body must be JSON");
+            assert_eq!(
+                refusal["error"], "session_proof_invalid",
+                "{path} {attempt:?}"
+            );
+        }
+    }
+    let store = OperatorApprovalCredentialStore::new(store_path.clone());
+    assert!(store.list().expect("store must be readable").is_empty());
 
-    // Same credential id as the pre-seeded entry: refused as a duplicate.
-    let dup_pubkey = {
-        let mut b = vec![9u8; 65];
-        b[0] = 0x04;
-        URL_SAFE_NO_PAD.encode(b)
-    };
-    let dup_body = serde_json::json!({
-        "credential_id_b64url": URL_SAFE_NO_PAD.encode([9u8; 16]),
-        "public_key_sec1_b64": dup_pubkey,
-        "label": "attempted-duplicate",
-        "sign_count": 1,
-    });
-    let resp = client
-        .post(format!("{base}/enroll/credential"))
-        .header("Host", format!("127.0.0.1:{port}"))
-        .header("Origin", &base)
-        .header(reqwest::header::COOKIE, &cookie)
-        .header("x-stellar-approval-csrf", &csrf)
-        .json(&dup_body)
-        .send()
+    // The operator's tab still holds the proof and enrolls.
+    page.goto(&format!("http://localhost:{port}/enroll"))
         .await
-        .expect("POST must complete");
-    assert_eq!(resp.status().as_u16(), 409);
-    let body: serde_json::Value = resp.json().await.expect("body must be JSON");
-    assert_eq!(body["error"], "duplicate_credential_id");
+        .expect("navigation back to the enrollment page");
+    assert_eq!(stored_proof(&page, ENROLL_PROOF_KEY).await, proof);
+    let label_input = page
+        .find_element("#label-input")
+        .await
+        .expect("#label-input must be present");
+    label_input.focus().await.expect("label input must focus");
+    label_input
+        .type_str("cross-port-operator")
+        .await
+        .expect("typing the label must succeed");
+    page.find_element("#enroll-btn")
+        .await
+        .expect("#enroll-btn must be present")
+        .click()
+        .await
+        .expect("enroll button click must succeed");
+    let (pending, code) = staged_from_page(&mut enroll_guard, &page, &store).await;
+    let confirmed = pending
+        .confirm(&code, std::time::Instant::now())
+        .expect("the displayed code confirms the staged credential")
+        .persist(&store)
+        .expect("the confirmed credential persists");
+    let enrolled = store.list().expect("store must be readable");
+    assert_eq!(enrolled, vec![confirmed]);
+    assert_eq!(enrolled[0].label, "cross-port-operator");
 
-    // The latch must still be available: a distinct id still succeeds.
-    let resp2 = client
-        .post(format!("{base}/enroll/credential"))
-        .header("Host", format!("127.0.0.1:{port}"))
-        .header("Origin", &base)
-        .header(reqwest::header::COOKIE, &cookie)
-        .header("x-stellar-approval-csrf", &csrf)
-        .json(&synthetic_valid_body(77))
-        .send()
-        .await
-        .expect("second POST must complete");
-    assert_eq!(
-        resp2.status().as_u16(),
-        200,
-        "the latch must not be consumed by a duplicate-id failure"
+    drop(enroll_guard);
+    drop(browser_guard);
+    handler_task.abort();
+}
+
+/// A service on another loopback port receives the approval-inbox session
+/// cookie from the operator's browser, but its page cannot read the session
+/// proof, and the cookie plus a valid CSRF value without the proof can neither
+/// approve nor reject; neither the store nor the audit log changes. The
+/// operator's own tab then approves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "requires chromium and explicit --ignored flag"]
+async fn cross_port_cookie_does_not_authorize_decision() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().expect("mock keyring store init");
+    let dir = TempDir::new().expect("tempdir");
+    let store_path = dir.path().join("default.toml");
+    let audit_path = dir.path().join("audit.log");
+    let service = "stellar-agent-attestation-cross-port";
+    keyring_core::Entry::new(service, "default")
+        .expect("keyring entry")
+        .set_password(&URL_SAFE_NO_PAD.encode([0x5Au8; 32]))
+        .expect("attestation key stored");
+
+    let entry = fixtures::payment_pending(
+        "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+        "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+        "XLM",
+        2_500_000,
+        None,
+        100,
+        1_234_567,
+        process_uid_for_attestation().expect("uid on test host"),
+        DEFAULT_TTL_MS,
     );
+    let nonce = entry.approval_nonce.clone();
+    PendingApprovalStore::open(store_path.clone())
+        .expect("store opens")
+        .insert(entry, timefmt::now_unix_ms().expect("clock"))
+        .expect("entry inserted");
 
-    handle.shutdown().await.ok();
+    let ctx = DecisionContext::new(
+        ApprovalContext::from_profile(
+            "cross-port-test",
+            &Profile::builder_testnet("svc", "default", "nonce", "default").build(),
+        ),
+        store_path.clone(),
+        KeyringEntryRef::new(service, "default"),
+        OwnerKeyContext::for_profile_name("cross-port-test"),
+        Arc::new(StdMutex::new(
+            AuditWriter::open(audit_path.clone(), None).expect("audit writer"),
+        )),
+        None,
+    );
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let serve = start_serve(ServeConfig::new(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        ctx,
+        tx,
+        false,
+    ))
+    .await
+    .expect("start_serve must succeed");
+    let port = serve.local_addr().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let other = OtherPortService::start().await;
+    assert_ne!(other.port, port);
+
+    let (browser_guard, page, handler_task, _profile) = browser_with_page().await;
+
+    // The operator opens the inbox link; the bootstrap page stores the proof
+    // in this tab and moves on to /inbox.
+    page.goto(&serve.bootstrap_url())
+        .await
+        .expect("bootstrap navigation");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    poll_eval_equals(&page, "window.location.pathname", "/inbox", deadline).await;
+    let proof = stored_proof(&page, INBOX_PROOF_KEY).await;
+    assert_eq!(proof.len(), 64, "the operator's tab must hold the proof");
+
+    // The same tab visits the other service on the same host.
+    page.goto(&format!("http://127.0.0.1:{}/", other.port))
+        .await
+        .expect("navigation to the other service");
+    poll_eval_equals(&page, "document.title", "other service", deadline).await;
+    let stolen = other
+        .received_cookie("stellar_agent_approval_session_")
+        .unwrap_or_else(|| {
+            panic!(
+                "the browser must send the host-scoped session cookie to the other port; \
+                 received: {}",
+                other.all_heads()
+            )
+        });
+    assert_eq!(stored_proof(&page, INBOX_PROOF_KEY).await, "");
+    assert_eq!(session_storage_len(&page).await, "0");
+    assert!(!other.all_heads().contains(&proof));
+
+    // The other service replays the cookie: it can read the detail page and
+    // its CSRF value, but can neither approve nor reject without the proof.
+    let client = http_client();
+    let detail = client
+        .get(format!("{base}/approval/{nonce}"))
+        .header(reqwest::header::COOKIE, &stolen)
+        .send()
+        .await
+        .expect("detail GET must complete");
+    assert_eq!(detail.status().as_u16(), 200);
+    let detail_html = detail.text().await.expect("detail body is text");
+    assert!(!detail_html.contains(&proof));
+    let csrf = extract_island(&detail_html, "approval-data")["csrf"]
+        .as_str()
+        .expect("detail page surfaces the CSRF value")
+        .to_owned();
+    let store_before = std::fs::read(&store_path).expect("store readable");
+    let audit_before = std::fs::read(&audit_path).ok();
+    for action in ["approve", "reject"] {
+        for attempt in [None, Some("f".repeat(64))] {
+            let mut request = client
+                .post(format!("{base}/approval/{nonce}/{action}"))
+                .header(reqwest::header::ORIGIN, &base)
+                .header(reqwest::header::COOKIE, &stolen)
+                .header("X-Stellar-Approval-CSRF", &csrf);
+            if let Some(wrong) = &attempt {
+                request = request.header("X-Session-Proof", wrong);
+            }
+            let resp = request.send().await.expect("POST must complete");
+            assert_eq!(resp.status().as_u16(), 403, "{action} {attempt:?}");
+            let body: serde_json::Value = resp.json().await.expect("body must be JSON");
+            assert_eq!(
+                body["error"], "session_proof_invalid",
+                "{action} {attempt:?}"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read(&store_path).expect("store readable"),
+        store_before
+    );
+    assert_eq!(std::fs::read(&audit_path).ok(), audit_before);
+
+    // The operator's tab still holds the proof and approves.
+    page.goto(&format!("{base}/approval/{nonce}"))
+        .await
+        .expect("navigation to the detail page");
+    assert_eq!(stored_proof(&page, INBOX_PROOF_KEY).await, proof);
+    page.find_element("#approve-btn")
+        .await
+        .expect("#approve-btn must be present")
+        .click()
+        .await
+        .expect("approve button click must succeed");
+    poll_eval_equals(
+        &page,
+        "document.documentElement.getAttribute('data-state') || ''",
+        "ok",
+        Instant::now() + Duration::from_secs(10),
+    )
+    .await;
+    {
+        let store = PendingApprovalStore::open(store_path.clone()).expect("store opens");
+        let decided = store.get(&nonce).expect("entry present");
+        assert!(matches!(
+            decided.kind,
+            ApprovalKind::PaymentSimulated { .. }
+        ));
+        assert!(
+            decided.attestation_blob_b64.is_some(),
+            "the operator's approve must mint the attestation"
+        );
+    }
+
+    drop(browser_guard);
+    handler_task.abort();
+    serve.shutdown().await.expect("serve shutdown");
+}
+
+/// The trust controls of this suite. Positive: Chromium loads a page whose
+/// leaf the runner's test authority issued, through ordinary certificate
+/// validation. Negative: the signed-origin enrollment listener serving a
+/// leaf from an authority Chromium does not hold fails certificate
+/// verification, its page never loads, and no registration is staged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "requires Chromium and the acceptance runner's test authority"]
+async fn signed_origin_enrollment_browser_trusts_only_the_test_authority() {
+    use stellar_agent_approval_remote::enroll_listener::{
+        SignedEnrollmentConfig, start_signed_enrollment,
+    };
+    use stellar_agent_approval_ui::operator_enroll::OperatorEnrollAwaitError;
+
+    let trust = trusted_browser::BrowserTrust::from_runner();
+    let chromium = trusted_browser::launch(&trust).await;
+    let page = chromium
+        .browser
+        .new_page("about:blank")
+        .await
+        .expect("new page must open");
+    trusted_browser::assert_trusted_page_loads(&page, &trust.trusted()).await;
+
+    let port = trusted_browser::free_port();
+    let pin = trust.untrusted_pin();
+    let fixture = trusted_browser::signed_fixture(
+        "enroll-trust",
+        port,
+        &trust.untrusted(),
+        &pin,
+        &[&stellar_agent_test_support::webauthn::fixture_authenticator()],
+    );
+    let origin = fixture
+        .current_policy()
+        .mainnet()
+        .expect("mainnet policy")
+        .approval_origin
+        .clone()
+        .expect("signed origin");
+    let mut handle = start_signed_enrollment(
+        SignedEnrollmentConfig::new(
+            fixture.name(),
+            fixture.profile().clone(),
+            origin,
+            pin,
+            Duration::from_secs(300),
+        ),
+        |_| {},
+    )
+    .await
+    .expect("the enrollment listener starts with its pinned leaf");
+    assert_eq!(handle.public_origin(), trusted_browser::origin_at(port));
+    trusted_browser::assert_authority_refused(&page, &handle.enroll_url()).await;
+    assert!(matches!(
+        handle
+            .await_completion_until(Instant::now() + Duration::from_millis(500))
+            .await,
+        Err(OperatorEnrollAwaitError::Timeout)
+    ));
+    handle.shutdown().await.expect("enrollment listener stops");
+    chromium.close().await;
+}
+
+/// Enrollment at the signed origin in Chromium: the terminal's enrollment
+/// code opens the shipped registration page, the browser creates the
+/// credential for the signed RP, and only the terminal confirmation of the
+/// displayed code exports it. Nothing enters a credential store, and the
+/// owner's signature alone admits the exported entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "requires Chromium and the acceptance runner's test authority"]
+async fn signed_origin_enrollment_browser_exports_policy_credential() {
+    use stellar_agent_approval_remote::enroll_listener::{
+        SignedEnrollmentConfig, start_signed_enrollment,
+    };
+    use stellar_agent_core::approval::mainnet_fixtures::SIGNED_RP_ID;
+
+    let trust = trusted_browser::BrowserTrust::from_runner();
+    let pin = trust.trusted_pin();
+    let port = trusted_browser::free_port();
+    let fixture = trusted_browser::signed_fixture(
+        "enroll-signed",
+        port,
+        &trust.trusted(),
+        &pin,
+        &[&stellar_agent_test_support::webauthn::fixture_authenticator()],
+    );
+    let origin = fixture
+        .current_policy()
+        .mainnet()
+        .expect("mainnet policy")
+        .approval_origin
+        .clone()
+        .expect("signed origin");
+    assert_eq!(origin.as_str(), trusted_browser::origin_at(port));
+    let printed = Arc::new(StdMutex::new(Vec::new()));
+    let sink = Arc::clone(&printed);
+    let mut handle = start_signed_enrollment(
+        SignedEnrollmentConfig::new(
+            fixture.name(),
+            fixture.profile().clone(),
+            origin.clone(),
+            pin,
+            Duration::from_secs(300),
+        ),
+        move |code| sink.lock().unwrap().push(code.to_owned()),
+    )
+    .await
+    .expect("the signed enrollment listener starts");
+    let code = handle.enrollment_code().to_owned();
+    assert_eq!(*printed.lock().unwrap(), vec![code.clone()]);
+    assert_eq!(handle.enroll_url(), format!("{}/enroll", origin.as_str()));
+
+    let chromium = trusted_browser::launch(&trust).await;
+    let (page, authenticator) = trusted_browser::authenticator_page(&chromium.browser).await;
+    let (pending, shown) =
+        trusted_browser::enroll_in_browser(&page, &mut handle, &code, "signed-laptop").await;
+    assert_eq!(pending.label(), "signed-laptop");
+    let counters =
+        stellar_agent_core::approval::RemoteApprovalAuthority::for_profile(fixture.name())
+            .unwrap()
+            .credentials_path()
+            .to_path_buf();
+    let policy = std::fs::read(fixture.policy_path()).unwrap();
+    let credential = pending
+        .confirm(&shown, Instant::now())
+        .expect("the displayed code confirms the staged credential")
+        .into_mainnet_policy_credential()
+        .expect("a mainnet approval credential");
+
+    let created = page
+        .execute(GetCredentialsParams::new(authenticator))
+        .await
+        .expect("getCredentials must succeed")
+        .result
+        .credentials
+        .clone();
+    assert_eq!(created.len(), 1, "the browser created one credential");
+    assert_eq!(created[0].rp_id.as_deref(), Some(SIGNED_RP_ID));
+    assert_eq!(
+        decode_cdp_binary(&created[0].credential_id),
+        URL_SAFE_NO_PAD
+            .decode(credential.credential_id_b64url())
+            .unwrap()
+    );
+    let key = SecretKey::from_pkcs8_der(&decode_cdp_binary(&created[0].private_key)).unwrap();
+    assert_eq!(
+        key.public_key().to_encoded_point(false).as_bytes(),
+        credential.public_key_sec1().as_slice()
+    );
+    assert!(!counters.exists(), "enrollment writes no credential store");
+    assert_eq!(std::fs::read(fixture.policy_path()).unwrap(), policy);
+    handle.shutdown().await.expect("enrollment listener stops");
+    assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+
+    trusted_browser::sign_origin_policy(
+        &fixture,
+        2,
+        port,
+        &pin,
+        &[],
+        &[credential.policy_entry_toml()],
+    );
+    let admitted = fixture.current_policy();
+    let entries = &admitted
+        .mainnet()
+        .expect("mainnet policy")
+        .approval_credentials;
+    assert_eq!(entries.len(), 1, "the owner's signature admits the entry");
+    chromium.close().await;
 }

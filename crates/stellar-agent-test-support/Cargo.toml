@@ -19,13 +19,15 @@ tracing-subscriber = { workspace = true }
 regex-lite = { workspace = true }
 memchr = { workspace = true }
 async-trait = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 stellar-strkey = { workspace = true, optional = true }
 stellar-xdr = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["net"], optional = true }
+tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "time"], optional = true }
 wiremock = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
+p256 = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
@@ -36,18 +38,27 @@ zeroize = { workspace = true, optional = true }
 # In-memory mock keyring store; full rationale in `src/keyring_mock.rs`.
 keyring-core = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# The error code of an unsupported address family, which tells the loopback
+# forwarder that the host has no IPv6 loopback.
+libc = { workspace = true, optional = true }
+
 [dev-dependencies]
 # Serialises tests that touch process-global state (the keyring default store
 # and the tracing subscriber).
 serial_test = { workspace = true }
 # Drives the wiremock responder self-test over HTTP (rustls/ring; no OpenSSL).
 reqwest = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "time", "test-util"] }
 
 [features]
 test-helpers = [
+    "dep:tempfile",
     "dep:async-trait",
+    "dep:base64",
     "dep:ed25519-dalek",
+    "dep:libc",
+    "dep:p256",
     "dep:serde_json",
     "dep:sha2",
     "dep:stellar-strkey",

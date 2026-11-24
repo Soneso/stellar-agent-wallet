@@ -197,6 +197,9 @@ fn minimal_create_account_envelope_b64(source: &str, dest: &str) -> String {
 #[test]
 #[serial]
 fn profile_name_for_approval_strips_prefix() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().ok();
     // Explicitly set Noop so WalletServer::new succeeds without a policy file
     // on disk (PolicyEngineKind::default() is V1).
@@ -225,6 +228,9 @@ fn profile_name_for_approval_strips_prefix() {
 #[test]
 #[serial]
 fn profile_name_for_approval_falls_back_to_default() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().ok();
     // Explicitly set Noop so WalletServer::new succeeds without a policy file
     // on disk (PolicyEngineKind::default() is V1).
@@ -255,6 +261,9 @@ fn profile_name_for_approval_falls_back_to_default() {
 #[tokio::test]
 #[serial]
 async fn stellar_pay_commit_require_approval_no_attestation_is_blocked() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().ok();
     let source = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
     let endpoint = local_endpoint_for(source).await;
@@ -277,11 +286,12 @@ async fn stellar_pay_commit_require_approval_no_attestation_is_blocked() {
         memo_hash_hex: None,
         memo_return_hex: None,
         // Unparseable nonce: triggers nonce.expired before attestation gate.
-        nonce: "not-a-valid-nonce".to_owned(),
-        expires_at_unix_ms: 9_999_999_999_000,
-        envelope_xdr,
+        nonce: Some("not-a-valid-nonce".to_owned()),
+        expires_at_unix_ms: Some(9_999_999_999_000),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let result = server
@@ -299,12 +309,16 @@ async fn stellar_pay_commit_require_approval_no_attestation_is_blocked() {
 // Test 4: stellar_create_account_commit with RequireApproval + absent attestation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The same setup for `stellar_create_account_commit`, whose nonce parse
-/// follows the policy gate directly and precedes its attestation gate: the
-/// un-parseable nonce refuses with `nonce.expired` before anything is signed.
+/// The same setup for `stellar_create_account_commit`, whose attestation gate
+/// follows the policy gate and precedes its nonce parse: the absent
+/// attestation refuses with `policy.approval_required` before the
+/// un-parseable nonce is read and before anything is signed.
 #[tokio::test]
 #[serial]
 async fn stellar_create_account_commit_require_approval_no_attestation_is_blocked() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().ok();
     let source = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
     let endpoint = local_endpoint_for(source).await;
@@ -320,11 +334,12 @@ async fn stellar_create_account_commit_require_approval_no_attestation_is_blocke
         source: source.to_owned(),
         destination: dest.to_owned(),
         starting_balance: serde_json::from_str(r#""1 XLM""#).expect("valid amount"),
-        nonce: "not-a-valid-nonce".to_owned(),
-        expires_at_unix_ms: 9_999_999_999_000,
-        envelope_xdr,
+        nonce: Some("not-a-valid-nonce".to_owned()),
+        expires_at_unix_ms: Some(9_999_999_999_000),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let result = server
@@ -336,8 +351,8 @@ async fn stellar_create_account_commit_require_approval_no_attestation_is_blocke
         );
     let (code, _message, text) = crate::common::assert_business_envelope(&result);
     assert_eq!(
-        code, "nonce.expired",
-        "the nonce parse refuses after the policy gate: {text}"
+        code, "policy.approval_required",
+        "the attestation gate refuses before the nonce parse: {text}"
     );
 }
 
@@ -356,6 +371,9 @@ async fn stellar_create_account_commit_require_approval_no_attestation_is_blocke
 #[tokio::test]
 #[serial]
 async fn stellar_pay_commit_allow_engine_no_attestation_gate() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().ok();
     let source = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
     let endpoint = local_endpoint_for(source).await;
@@ -373,11 +391,12 @@ async fn stellar_pay_commit_allow_engine_no_attestation_gate() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: "not-a-valid-nonce".to_owned(),
-        expires_at_unix_ms: 9_999_999_999_000,
-        envelope_xdr: minimal_payment_envelope_b64(source, dest),
+        nonce: Some("not-a-valid-nonce".to_owned()),
+        expires_at_unix_ms: Some(9_999_999_999_000),
+        envelope_xdr: Some(minimal_payment_envelope_b64(source, dest)),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let result = server
@@ -539,6 +558,9 @@ impl Respond for T7EchoIdResponder {
 #[tokio::test]
 #[serial]
 async fn commit_with_valid_nonce_but_no_attestation_returns_indistinguishable_approval_required() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::DEFAULT_CLASSIC_FEE_STROOPS;
     use stellar_agent_network::ClassicOpBuilder;
 
@@ -642,12 +664,13 @@ async fn commit_with_valid_nonce_but_no_attestation_returns_indistinguishable_ap
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: nonce_b64,
-        expires_at_unix_ms: expiry_ms,
-        envelope_xdr,
+        nonce: Some(nonce_b64),
+        expires_at_unix_ms: Some(expiry_ms),
+        envelope_xdr: Some(envelope_xdr),
         // Attestation fields absent — attestation gate must fire before nonce HMAC.
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let result = server

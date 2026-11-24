@@ -217,8 +217,8 @@ fn failed_outcome_leaves_sequence_unchanged() {
 fn size_zero_rejected() {
     let result = ChannelPool::from_records(vec![], vec![]);
     match result {
-        Err(PoolError::SizeOutOfRange { requested: 0 }) => {}
-        other => panic!("expected SizeOutOfRange(0), got {:?}", other),
+        Err(PoolError::SizeOutOfRange) => {}
+        other => panic!("expected SizeOutOfRange, got {:?}", other),
     }
 }
 
@@ -230,8 +230,8 @@ fn size_20_rejected() {
         .collect();
     let seqs: Vec<i64> = vec![100; 20];
     match ChannelPool::from_records(channels, seqs) {
-        Err(PoolError::SizeOutOfRange { requested: 20 }) => {}
-        other => panic!("expected SizeOutOfRange(20), got {:?}", other),
+        Err(PoolError::SizeOutOfRange) => {}
+        other => panic!("expected SizeOutOfRange, got {:?}", other),
     }
 }
 

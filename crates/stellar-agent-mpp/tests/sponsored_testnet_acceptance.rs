@@ -106,6 +106,19 @@ fn harness_dir() -> PathBuf {
         .expect("interop harness directory")
 }
 
+/// Creates a marked wallet home below the workspace target directory.
+///
+/// The window-state recorder resolves its path under `STELLAR_AGENT_HOME`,
+/// so each test holds this home behind a `StellarAgentHomeGuard`.
+fn storage_sandbox() -> TempDir {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/test-sandboxes");
+    std::fs::create_dir_all(&root).expect("sandbox root directory");
+    let home = tempfile::tempdir_in(root.canonicalize().expect("sandbox root resolves"))
+        .expect("storage sandbox");
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("marked storage sandbox");
+    home
+}
+
 fn prepare_harness(directory: &Path) {
     let node = Command::new("node")
         .args(["-p", "process.versions.node"])
@@ -179,27 +192,41 @@ impl CountingSigner {
 
 #[async_trait]
 impl Signer for CountingSigner {
-    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_tx_payload(
+        &self,
+        payload: &stellar_agent_network::signing::TxSigningPayload,
+    ) -> Result<[u8; 64], WalletError> {
         self.signatures.fetch_add(1, Ordering::SeqCst);
         self.inner.sign_tx_payload(payload).await
     }
 
-    async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_auth_digest(
+        &self,
+        digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
         self.signatures.fetch_add(1, Ordering::SeqCst);
         self.inner.sign_auth_digest(digest).await
     }
 
     async fn sign_soroban_address_auth_payload(
         &self,
-        payload: &[u8; 32],
+        payload: &stellar_agent_network::signing::SorobanAuthPayload,
     ) -> Result<[u8; 64], WalletError> {
         self.signatures.fetch_add(1, Ordering::SeqCst);
         self.inner.sign_soroban_address_auth_payload(payload).await
     }
 
+    async fn sign_message(
+        &self,
+        payload: &stellar_agent_network::signing::MessagePayload,
+    ) -> Result<[u8; 64], WalletError> {
+        self.signatures.fetch_add(1, Ordering::SeqCst);
+        self.inner.sign_message(payload).await
+    }
+
     async fn sign_webauthn_assertion(
         &self,
-        auth_digest: &[u8; 32],
+        auth_digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
         credential_id: &[u8],
     ) -> Result<WebAuthnAssertion, WalletError> {
         self.signatures.fetch_add(1, Ordering::SeqCst);
@@ -276,6 +303,9 @@ async fn native_balance(rpc: &StellarRpcClient, account: &str) -> i64 {
 #[tokio::test]
 #[serial]
 async fn released_server_accepts_wallet_credential_and_settles_exact_transfer() {
+    let storage_sandbox = storage_sandbox();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let harness = harness_dir();
     prepare_harness(&harness);
 
@@ -352,6 +382,7 @@ async fn released_server_accepts_wallet_credential_and_settles_exact_transfer() 
             None,
             None,
             None,
+            stellar_agent_core::policy::policy_now_ms().expect("policy clock"),
         )
         .expect("policy evaluation");
     assert!(matches!(evaluation.decision, Decision::Allow));
@@ -620,6 +651,9 @@ async fn owner_signed_v1_period_cap_refuses_charge_before_signing() {
     use stellar_agent_mpp::BeforeSignError;
     use stellar_agent_network::policy_state::{PersistedWindowStore, WindowStoreError};
 
+    let storage_sandbox = storage_sandbox();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let harness = harness_dir();
     prepare_harness(&harness);
     let (payer, payer_seed) = fresh_keypair();
@@ -664,8 +698,13 @@ async fn owner_signed_v1_period_cap_refuses_charge_before_signing() {
         format!("{body}\n[signature]\nowner_id = \"{owner_id}\"\nsig = \"{signature}\"\n"),
     )
     .expect("signed policy");
-    let document = load_signed_policy(&policy_path, name, &owner.verifying_key().to_bytes())
-        .expect("owner signature and policy load");
+    let document = load_signed_policy(
+        &policy_path,
+        name,
+        &owner.verifying_key().to_bytes(),
+        TESTNET_PASSPHRASE,
+    )
+    .expect("owner signature and policy load");
     let engine = PolicyEngineV1::new(document, name.to_owned());
     let mut profile = Profile::builder_testnet("svc", name, "nonce-svc", name).build();
     profile.policy.engine = PolicyEngineKind::V1;
@@ -697,6 +736,7 @@ async fn owner_signed_v1_period_cap_refuses_charge_before_signing() {
             None,
             None,
             None,
+            stellar_agent_core::policy::policy_now_ms().expect("policy clock"),
         )
         .expect("production V1 evaluation");
     match evaluation.decision {

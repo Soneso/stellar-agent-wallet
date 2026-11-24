@@ -41,13 +41,70 @@ pub(super) fn emit_keyring_key_written(
     public_address: Option<RedactedStrkey>,
     request_id: &str,
 ) {
+    with_profile_writer(profile, profile_name, "KeyringKeyWritten", |writer| {
+        emit_keyring_key_written_with_writer(
+            writer,
+            profile_name,
+            tool,
+            key_purpose,
+            written_entry,
+            public_address,
+            request_id,
+        );
+    });
+}
+
+/// Emits a `SignerIdentityEnrolled` row for the identity record just written
+/// at `identity_entry`.
+///
+/// Non-fatal, like [`emit_keyring_key_written`]: the record write has already
+/// committed. The row carries the record's coordinate, the redacted public
+/// address, and the role; never the seed.
+pub(super) fn emit_signer_identity_enrolled(
+    profile: &Profile,
+    profile_name: &str,
+    tool: &str,
+    identity_entry: &KeyringEntryRef,
+    public_address: RedactedStrkey,
+    request_id: &str,
+) {
+    with_profile_writer(profile, profile_name, "SignerIdentityEnrolled", |writer| {
+        let entry = AuditEntry::new_signer_identity_enrolled(
+            tool,
+            identity_entry.service.clone(),
+            identity_entry.account.clone(),
+            public_address,
+            stellar_agent_core::profile::signer_identity::SIGNER_IDENTITY_ROLE_AGENT,
+            request_id,
+        );
+        if let Err(e) = writer.write_entry(entry) {
+            tracing::warn!(
+                profile = %profile_name,
+                error = %e,
+                "key write audit: write_entry failed; SignerIdentityEnrolled NOT emitted"
+            );
+        }
+    });
+}
+
+/// Runs `write` with the profile's keyed audit writer from the registry.
+///
+/// Non-fatal: a failure to load the audit chain key, open the writer, or lock
+/// it logs a `tracing::warn!` naming `row` and skips `write`.
+fn with_profile_writer(
+    profile: &Profile,
+    profile_name: &str,
+    row: &'static str,
+    write: impl FnOnce(&mut AuditWriter),
+) {
     let access = match keyed_audit_access(profile, profile_name, BindingCheck::Enforce) {
         Ok(access) => access,
         Err(e) if crate::commands::value_audit::is_binding_refusal(&e) => {
             tracing::warn!(
                 profile = %profile_name,
                 code = %e.code(),
-                "key write audit: audit binding changed; KeyringKeyWritten NOT emitted"
+                row,
+                "key write audit: audit binding changed; row NOT emitted"
             );
             return;
         }
@@ -55,13 +112,12 @@ pub(super) fn emit_keyring_key_written(
             tracing::warn!(
                 profile = %profile_name,
                 error = %e,
-                "key write audit: could not load audit chain key; \
-                 KeyringKeyWritten NOT emitted"
+                row,
+                "key write audit: could not load audit chain key; row NOT emitted"
             );
             return;
         }
     };
-
     let writer_arc =
         match AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
         {
@@ -70,27 +126,19 @@ pub(super) fn emit_keyring_key_written(
                 tracing::warn!(
                     profile = %profile_name,
                     error = %e,
-                    "key write audit: could not open audit writer; \
-                     KeyringKeyWritten NOT emitted"
+                    row,
+                    "key write audit: could not open audit writer; row NOT emitted"
                 );
                 return;
             }
         };
-
     match writer_arc.lock() {
-        Ok(mut guard) => emit_keyring_key_written_with_writer(
-            &mut guard,
-            profile_name,
-            tool,
-            key_purpose,
-            written_entry,
-            public_address,
-            request_id,
-        ),
+        Ok(mut guard) => write(&mut guard),
         Err(_) => {
             tracing::warn!(
                 profile = %profile_name,
-                "key write audit: audit writer mutex poisoned; KeyringKeyWritten NOT emitted"
+                row,
+                "key write audit: audit writer mutex poisoned; row NOT emitted"
             );
         }
     }
@@ -197,6 +245,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_key_write_row_advances_the_tip_anchor() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::TipAnchorStore as _;
         use stellar_agent_network::keyring::KeyringTipAnchorStore;
 
@@ -231,7 +282,10 @@ mod tests {
             .load_anchor()
             .expect("read anchor")
             .expect("the row must be anchored");
-        assert_eq!(anchored.entry_count, 1, "the row advanced the anchor");
+        assert_eq!(
+            anchored.entry_count, 2,
+            "the row advanced the anchor past the open's boundary row"
+        );
         assert_eq!(
             anchored.end_offset,
             std::fs::metadata(&profile.audit_log_path)
@@ -249,6 +303,9 @@ mod tests {
     #[test]
     #[serial]
     fn emit_keyring_key_written_writes_a_key_written_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -277,11 +334,16 @@ mod tests {
             .map(|l| serde_json::from_str(&l.expect("line")).expect("valid JSON row"))
             .collect();
 
-        assert_eq!(rows.len(), 1, "one keyring_key_written row");
-        assert_eq!(rows[0]["kind"], "keyring_key_written", "row kind");
-        assert_eq!(rows[0]["key_purpose"], "nonce_hmac", "key purpose");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the open's boundary row and one keyring_key_written row"
+        );
+        assert_eq!(rows[0]["kind"], "audit_entry_tags_started");
+        assert_eq!(rows[1]["kind"], "keyring_key_written", "row kind");
+        assert_eq!(rows[1]["key_purpose"], "nonce_hmac", "key purpose");
         assert!(
-            rows[0].get("public_address").is_none(),
+            rows[1].get("public_address").is_none(),
             "an HMAC-key rotation row carries no public address"
         );
     }
@@ -292,6 +354,9 @@ mod tests {
     #[test]
     #[serial]
     fn load_audit_hmac_key_refuses_owner_key_forms() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         keyring_mock::install().expect("mock keyring");
         let name = "audit-emit-owner";

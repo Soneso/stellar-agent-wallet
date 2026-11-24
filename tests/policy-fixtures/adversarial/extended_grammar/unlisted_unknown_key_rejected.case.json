@@ -1,0 +1,11 @@
+{
+  "test_kind": "load_failure",
+  "name": "unlisted_unknown_key_rejected",
+  "category": "extended_grammar",
+  "description": "An unlisted table refuses a key outside its closed set.",
+  "load_signing_strategy": "grammar_refused",
+  "expected_load_ok": false,
+  "expected_load_error": "policy_file_parse_failed",
+  "expected_load_wire_code": "policy.policy_file_parse_failed",
+  "expected_load_detail": "rule[0].criteria[0].unlisted: unknown key; an `unlisted` table accepts mode, per_tx_stroops, per_period_stroops, asset, window"
+}

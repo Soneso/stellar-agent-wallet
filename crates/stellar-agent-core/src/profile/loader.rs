@@ -72,15 +72,15 @@ use crate::{asset_id::CanonicalAsset, cross_check::CrossCheckThresholds};
 
 /// A safe reference to the part of `[cross_check_thresholds]` a refusal
 /// names, without any rejected input.
+///
+/// An entry is named by its position, never by its key: a key the loader
+/// refuses, and a key whose entry the loader refuses, are both refused input.
 #[derive(Debug, Clone)]
 pub enum Entry {
     /// The field itself, when its value is not a table.
     Field,
-    /// One-based position in lexicographic key order, for a key that did not
-    /// parse.
+    /// One-based position in lexicographic key order.
     Position(usize),
-    /// The canonical identity of a key that parsed.
-    Asset(CanonicalAsset),
 }
 
 impl std::fmt::Display for Entry {
@@ -88,7 +88,6 @@ impl std::fmt::Display for Entry {
         match self {
             Self::Field => f.write_str("the field"),
             Self::Position(n) => write!(f, "entry {n} in key order"),
-            Self::Asset(asset) => write!(f, "entry '{asset}'"),
         }
     }
 }
@@ -187,6 +186,16 @@ const SUPPORTED_VERSION: u32 = 2;
 /// which chains. A variable whose suffix names no profile key, such as
 /// `STELLAR_AGENT_HOME`, is not an overlay and is ignored.
 const ENV_PREFIX: &str = "STELLAR_AGENT_";
+
+/// The environment-variable prefix of profile overrides, `STELLAR_AGENT_`,
+/// for tests that keep such variables out of a child process.
+///
+/// Compiled only with the `test-helpers` feature.
+#[cfg(feature = "test-helpers")]
+#[must_use]
+pub const fn env_prefix() -> &'static str {
+    ENV_PREFIX
+}
 
 /// How an environment or programmatic overlay may set one profile key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,14 +346,10 @@ pub enum ProfileLoadError {
         named_by: crate::profile::ProfileNameSource,
     },
 
-    /// The profile file was not found at the expected path.
-    #[error("profile '{name}' not found at '{path}'")]
-    NotFound {
-        /// The profile name as supplied by the caller.
-        name: String,
-        /// The full path that was checked.
-        path: PathBuf,
-    },
+    /// No profile file exists for the requested name. Neither the name nor
+    /// the path, which ends in the name, is kept.
+    #[error("the requested profile was not found in the wallet configuration")]
+    NotFound,
 
     /// The profile name is not safe to use as a filesystem path component.
     ///
@@ -358,10 +363,8 @@ pub enum ProfileLoadError {
     ///
     /// Use a profile name of at most 64 printable-ASCII characters containing
     /// no `/`, `\`, `:`, or `..`.
-    #[error("profile name '{name}' is not a valid profile name: {reason}")]
+    #[error("the profile name is not a valid profile name: {reason}")]
     InvalidName {
-        /// The rejected profile name as supplied by the caller.
-        name: String,
         /// Why it was rejected.
         reason: &'static str,
     },
@@ -374,15 +377,12 @@ pub enum ProfileLoadError {
     ///
     /// Fail-fast forward-compatibility: a profile written by a newer wallet is
     /// rejected rather than silently applying stale defaults.
+    /// The version found in the file is not shown.
     #[error(
-        "profile '{name}' has unsupported version {found}; \
+        "the profile file has an unsupported version; \
          this wallet supports version {supported}"
     )]
     VersionUnsupported {
-        /// The profile name as supplied by the caller.
-        name: String,
-        /// The `version` value found in the TOML file.
-        found: u32,
         /// The highest version this wallet supports.
         supported: u32,
     },
@@ -450,14 +450,38 @@ pub enum ProfileLoadError {
         detail: String,
     },
 
-    /// figment failed to extract or merge the configuration sources.
-    #[error("profile '{name}' could not be loaded: {source}")]
-    Figment {
-        /// The profile name as supplied by the caller.
-        name: String,
-        /// The underlying figment error (boxed to keep the enum variant small).
-        #[source]
-        source: Box<figment::Error>,
+    /// The stored `chain_id` and `rpc_url` of a profile file could not be
+    /// read.
+    ///
+    /// Produced by [`read_mainnet_view_on_disk`], which reads the stored
+    /// document without environment or CLI overlays.
+    #[error("profile chain and endpoint unreadable: {detail}")]
+    MainnetViewUnreadable {
+        /// Human-readable failure detail (path and cause; no secrets).
+        detail: String,
+    },
+
+    /// The profile file contains invalid TOML syntax.
+    #[error("the profile file is not valid TOML: {position}")]
+    TomlSyntax {
+        /// The line and column, without source text.
+        position: String,
+    },
+
+    /// The profile document does not match the schema.
+    ///
+    /// Schema field names may appear; values never appear. Operator key
+    /// segments outside the safe identifier grammar appear as `<key>`.
+    #[error("the profile document is not valid: {class}{}{}",
+        key.as_ref().map(|key| format!(" at `{key}`")).unwrap_or_default(),
+        if *count > 1 { format!(" (and {} more)", count - 1) } else { String::new() })]
+    Extraction {
+        /// A fixed description of the validation class.
+        class: &'static str,
+        /// The sanitized schema key path, if the error identifies one.
+        key: Option<String>,
+        /// The number of extraction errors.
+        count: usize,
     },
 
     /// The `smart_account_max_context_rule_scan_id` field exceeds the
@@ -472,14 +496,10 @@ pub enum ProfileLoadError {
     /// Lower `smart_account_max_context_rule_scan_id` in the profile TOML to a
     /// value ≤ 10,000.
     #[error(
-        "profile '{name}': smart_account_max_context_rule_scan_id value {value} \
-         exceeds upper bound {upper_bound} (DoS-defence cap)"
+        "smart_account_max_context_rule_scan_id exceeds upper bound {upper_bound} \
+         (DoS-defence cap)"
     )]
     InvalidScanIdBound {
-        /// The profile name as supplied by the caller.
-        name: String,
-        /// The value that was rejected.
-        value: u32,
         /// The safety cap (`UPPER_BOUND_MAX_SCAN_ID`).
         upper_bound: u32,
     },
@@ -497,14 +517,10 @@ pub enum ProfileLoadError {
     /// Lower `session_rule_max_horizon_ledgers` in the profile TOML to a
     /// value ≤ 10,000, or remove the field to use the 1000-ledger default.
     #[error(
-        "profile '{name}': session_rule_max_horizon_ledgers value {value} \
-         exceeds upper bound {upper_bound} (DoS-defence cap)"
+        "session_rule_max_horizon_ledgers exceeds upper bound {upper_bound} \
+         (DoS-defence cap)"
     )]
     InvalidHorizonBound {
-        /// The profile name as supplied by the caller.
-        name: String,
-        /// The value that was rejected.
-        value: u32,
         /// The safety cap (`UPPER_BOUND_HORIZON_LEDGERS`).
         upper_bound: u32,
     },
@@ -579,7 +595,7 @@ impl ProfileLoadError {
     /// Maps a loader refusal to its operator-facing validation error.
     /// Absolute paths are redacted once in the generic configuration message.
     #[must_use]
-    pub fn to_validation_error(&self, requested_name: &str) -> crate::error::ValidationError {
+    pub fn to_validation_error(&self) -> crate::error::ValidationError {
         use crate::error::ValidationError;
         match self {
             Self::NonOverlayableField { field } => {
@@ -594,10 +610,8 @@ impl ProfileLoadError {
                     named_by: *named_by,
                 }
             }
-            Self::NotFound { name, .. } => ValidationError::ProfileNotFound { name: name.clone() },
-            Self::MainnetRpcUrlRequired { name } => {
-                ValidationError::MainnetRpcUrlRequired { name: name.clone() }
-            }
+            Self::NotFound => ValidationError::ProfileNotFound,
+            Self::MainnetRpcUrlRequired { .. } => ValidationError::MainnetRpcUrlRequired,
             Self::InvalidProviderAttestation { name, source } => {
                 ValidationError::ProviderAttestationInvalid {
                     name: name.clone(),
@@ -607,7 +621,7 @@ impl ProfileLoadError {
             _ => ValidationError::ConfigInvalid {
                 component: "profile",
                 reason: crate::observability::redact_path_in_message(&format!(
-                    "profile '{requested_name}' failed to load: {self}"
+                    "the requested profile failed to load: {self}"
                 )),
             },
         }
@@ -627,7 +641,7 @@ impl ProfileLoadError {
     #[must_use]
     pub fn disposition(&self) -> ProfileLoadDisposition {
         match self {
-            Self::NotFound { .. } => ProfileLoadDisposition::NotFound,
+            Self::NotFound => ProfileLoadDisposition::NotFound,
             // Operator-authored input: the name, the file's syntax, its
             // version, or a field whose value is out of bounds.
             Self::NonOverlayableField { .. }
@@ -641,7 +655,9 @@ impl ProfileLoadError {
             | Self::InvalidCrossCheckThreshold { .. }
             | Self::MissingPolicySection { .. }
             | Self::SignerRefUnreadable { .. }
-            | Self::Figment { .. }
+            | Self::MainnetViewUnreadable { .. }
+            | Self::Extraction { .. }
+            | Self::TomlSyntax { .. }
             | Self::InvalidScanIdBound { .. }
             | Self::InvalidHorizonBound { .. }
             | Self::InvalidServedPageDisplayName { .. }
@@ -666,18 +682,14 @@ impl ProfileLoadError {
 /// the rule hold for all of them: a caller that forgets to validate still
 /// cannot reach outside the profile directory.
 pub(crate) fn guard_name_for_load(name: &str) -> Result<(), ProfileLoadError> {
-    validate_path_component_ascii_safe(name).map_err(|reason| ProfileLoadError::InvalidName {
-        name: name.to_owned(),
-        reason,
-    })
+    validate_path_component_ascii_safe(name)
+        .map_err(|reason| ProfileLoadError::InvalidName { reason })
 }
 
 /// Write-half counterpart of [`guard_name_for_load`].
 fn guard_name_for_save(name: &str) -> Result<(), ProfileSaveError> {
-    validate_path_component_ascii_safe(name).map_err(|reason| ProfileSaveError::InvalidName {
-        name: name.to_owned(),
-        reason,
-    })
+    validate_path_component_ascii_safe(name)
+        .map_err(|reason| ProfileSaveError::InvalidName { reason })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -748,17 +760,39 @@ pub fn load_from_dir(
     profile_dir: &Path,
     multicall_hook: Option<&dyn MulticallRegistryHook>,
 ) -> Result<Profile, ProfileLoadError> {
+    load_from_path(
+        name,
+        &stored_profile_path(name, profile_dir)?,
+        multicall_hook,
+    )
+}
+
+/// The path of the named profile's file in `profile_dir`, after the name
+/// guard, refusing a file that does not exist.
+fn stored_profile_path(name: &str, profile_dir: &Path) -> Result<PathBuf, ProfileLoadError> {
     guard_name_for_load(name)?;
     let path = profile_dir.join(format!("{name}.toml"));
-
     if !path.exists() {
-        return Err(ProfileLoadError::NotFound {
-            name: name.to_owned(),
-            path,
-        });
+        return Err(ProfileLoadError::NotFound);
     }
+    Ok(path)
+}
 
-    load_from_path(name, &path, multicall_hook)
+/// Loads and validates the stored profile without environment overlays.
+///
+/// # Errors
+/// Returns [`ProfileLoadError`] for a missing or invalid profile.
+pub fn load_from_dir_without_overlays(
+    name: &str,
+    profile_dir: &Path,
+    multicall_hook: Option<&dyn MulticallRegistryHook>,
+) -> Result<Profile, ProfileLoadError> {
+    load_from_path_with_overlays(
+        name,
+        &stored_profile_path(name, profile_dir)?,
+        figment::Figment::new(),
+        multicall_hook,
+    )
 }
 
 /// Loads a profile from an explicit file path.
@@ -786,6 +820,76 @@ pub fn load_from_path(
     load_from_path_with_overlays(name, path, Env::prefixed(ENV_PREFIX), multicall_hook)
 }
 
+/// Converts extraction errors to classes and sanitized schema paths.
+/// Schema field names may appear; rejected values never appear.
+///
+/// A `figment::Error` is its own first error, so the head of the chain is the
+/// first error and [`figment::Error::count`] counts the whole chain. A missing
+/// field is named by its full key path: the path of the table it belongs to
+/// followed by the field.
+pub(crate) fn extraction_error(e: figment::Error) -> ProfileLoadError {
+    use figment::error::Kind;
+    let count = e.count();
+    let (class, path) = match e.kind {
+        Kind::MissingField(field) => {
+            let mut path = e.path;
+            path.push(field.into_owned());
+            ("a required field is missing", path)
+        }
+        Kind::InvalidType(..) => ("a value has the wrong type", e.path),
+        Kind::InvalidValue(..) => ("a value is out of range", e.path),
+        Kind::InvalidLength(..) => ("a value has the wrong length", e.path),
+        Kind::UnknownField(..) => {
+            let mut parent = e.path;
+            parent.pop();
+            ("an unknown field", parent)
+        }
+        _ => ("the profile document does not match the schema", Vec::new()),
+    };
+    let key = (!path.is_empty()).then(|| {
+        path.iter()
+            .map(|segment| {
+                let bytes = segment.as_bytes();
+                if (1..=64).contains(&bytes.len())
+                    && bytes[0].is_ascii_lowercase()
+                    && bytes
+                        .iter()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+                {
+                    segment.as_str()
+                } else {
+                    "<key>"
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(".")
+    });
+    ProfileLoadError::Extraction { class, key, count }
+}
+
+/// Reads one profile document and checks syntax without retaining parser errors.
+/// Missing files provide an empty document, as the file provider specifies.
+pub(crate) fn read_profile_toml(path: &Path) -> Result<String, ProfileLoadError> {
+    use figment::Provider;
+    let metadata = Toml::file(path).metadata();
+    let Some(path) = metadata
+        .source
+        .as_ref()
+        .and_then(figment::Source::file_path)
+    else {
+        return Ok(String::new());
+    };
+    let body = std::fs::read_to_string(path).map_err(|_| ProfileLoadError::Extraction {
+        class: "the profile file cannot be read",
+        key: None,
+        count: 1,
+    })?;
+    toml::from_str::<toml::Value>(&body).map_err(|e| ProfileLoadError::TomlSyntax {
+        position: super::toml_diagnostic::toml_error_position(&body, e.span().map(|s| s.start)),
+    })?;
+    Ok(body)
+}
+
 /// Reads identity from the file before applying permitted overlays.
 /// The file is the operator's audited record. An overlay key is checked
 /// against `chain_id` first and then against [`OVERLAY_CLASSES`], after the
@@ -801,43 +905,39 @@ fn load_from_path_with_overlays(
     // figment error when the version is wrong.  figment does not allow us to
     // partially extract a single field without running the full extraction, so
     // we use a serde-based pre-check via a lightweight wrapper.
+    let body = read_profile_toml(path)?;
     let raw: RawVersion = Figment::new()
-        .merge(Toml::file(path))
+        .merge(Toml::string(&body))
         .extract()
-        .map_err(|e| ProfileLoadError::Figment {
-            name: name.to_owned(),
-            source: Box::new(e),
-        })?;
+        .map_err(extraction_error)?;
 
     if raw.version != SUPPORTED_VERSION {
         return Err(ProfileLoadError::VersionUnsupported {
-            name: name.to_owned(),
-            found: raw.version,
             supported: SUPPORTED_VERSION,
         });
     }
 
     // ── Step 2: read the file identity, refuse non-overlayable keys, and extract the profile.
     let on_disk: OnDiskChainId = Figment::new()
-        .merge(Toml::file(path))
+        .merge(Toml::string(&body))
         .extract()
-        .map_err(|e| ProfileLoadError::Figment {
-            name: name.to_owned(),
-            source: Box::new(e),
-        })?;
-    let overlay_data = overlays.data().map_err(|e| ProfileLoadError::Figment {
-        name: name.to_owned(),
-        source: Box::new(e),
-    })?;
+        .map_err(extraction_error)?;
+    let overlay_data = overlays.data().map_err(extraction_error)?;
     check_overlay_keys(&overlay_data, on_disk.chain_id)?;
+    let overlaid_fields = OVERLAY_CLASSES
+        .iter()
+        .filter_map(|&(field, _)| {
+            overlay_data
+                .values()
+                .any(|dict| dict.contains_key(field))
+                .then_some(field)
+        })
+        .collect();
     let partial: PartialProfile = Figment::new()
-        .merge(Toml::file(path))
+        .merge(Toml::string(&body))
         .merge(&overlays)
         .extract()
-        .map_err(|e| ProfileLoadError::Figment {
-            name: name.to_owned(),
-            source: Box::new(e),
-        })?;
+        .map_err(extraction_error)?;
     let policy = require_policy_section(partial.policy, path)?;
 
     // ── Step 3: resolve derived fields.  Only testnet has a default endpoint;
@@ -871,8 +971,6 @@ fn load_from_path_with_overlays(
         && scan_id > MIRRORED_UPPER_BOUND_MAX_SCAN_ID
     {
         return Err(ProfileLoadError::InvalidScanIdBound {
-            name: name.to_owned(),
-            value: scan_id,
             upper_bound: MIRRORED_UPPER_BOUND_MAX_SCAN_ID,
         });
     }
@@ -883,8 +981,6 @@ fn load_from_path_with_overlays(
         && horizon > MIRRORED_UPPER_BOUND_HORIZON_LEDGERS
     {
         return Err(ProfileLoadError::InvalidHorizonBound {
-            name: name.to_owned(),
-            value: horizon,
             upper_bound: MIRRORED_UPPER_BOUND_HORIZON_LEDGERS,
         });
     }
@@ -928,8 +1024,9 @@ fn load_from_path_with_overlays(
     // The provider credential rules compare against the wallet key references
     // of the merged profile and of the file alone, because a testnet overlay
     // can replace `mcp_signer_default`.
-    let file_key_refs = file_wallet_key_references(name, path)?;
+    let file_key_refs = wallet_key_references_from_toml(&body)?;
     let mut profile = Profile {
+        overlaid_fields,
         version: partial.version,
         chain_id,
         rpc_url,
@@ -1234,7 +1331,13 @@ pub fn set_pool_initialization(
     let dest = dir.join(format!("{name}.toml"));
     let raw = std::fs::read_to_string(&dest).map_err(ProfileSaveError::Io)?;
     let mut doc: toml::Value = toml::from_str(&raw).map_err(|e| {
-        ProfileSaveError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        ProfileSaveError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "the profile file is not valid TOML: {}",
+                super::toml_diagnostic::toml_error_position(&raw, e.span().map(|s| s.start))
+            ),
+        ))
     })?;
     let table = doc.as_table_mut().ok_or_else(|| {
         ProfileSaveError::Io(std::io::Error::new(
@@ -1293,43 +1396,157 @@ pub fn read_signer_ref_on_disk(
     guard_name_for_load(name)?;
     let path = dir.join(format!("{name}.toml"));
     if !path.exists() {
-        return Err(ProfileLoadError::NotFound {
-            name: name.to_owned(),
-            path,
-        });
+        return Err(ProfileLoadError::NotFound);
     }
-    let raw =
-        std::fs::read_to_string(&path).map_err(|e| ProfileLoadError::SignerRefUnreadable {
-            detail: format!("failed to read '{}': {e}", path.display()),
-        })?;
-    let doc: toml::Value =
-        toml::from_str(&raw).map_err(|e| ProfileLoadError::SignerRefUnreadable {
-            detail: format!("failed to parse '{}': {e}", path.display()),
-        })?;
-    let table =
-        doc.get("mcp_signer_default")
-            .ok_or_else(|| ProfileLoadError::SignerRefUnreadable {
-                detail: format!("'{}' has no [mcp_signer_default] table", path.display()),
-            })?;
+    let failure = |detail: String| ProfileLoadError::SignerRefUnreadable { detail };
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| failure(format!("failed to read the profile file: {e}")))?;
+    let doc: toml::Value = toml::from_str(&raw).map_err(|e| {
+        failure(format!(
+            "the profile file is not valid TOML: {}",
+            super::toml_diagnostic::toml_error_position(&raw, e.span().map(|s| s.start))
+        ))
+    })?;
+    let table = doc
+        .get("mcp_signer_default")
+        .ok_or_else(|| failure("the profile file has no [mcp_signer_default] table".to_owned()))?;
     let service = table
         .get("service")
         .and_then(toml::Value::as_str)
-        .ok_or_else(|| ProfileLoadError::SignerRefUnreadable {
-            detail: format!(
-                "'{}' [mcp_signer_default] has no string 'service' key",
-                path.display()
-            ),
+        .ok_or_else(|| {
+            failure(
+                "the profile file's [mcp_signer_default] has no string 'service' key".to_owned(),
+            )
         })?;
     let account = table
         .get("account")
         .and_then(toml::Value::as_str)
-        .ok_or_else(|| ProfileLoadError::SignerRefUnreadable {
-            detail: format!(
-                "'{}' [mcp_signer_default] has no string 'account' key",
-                path.display()
-            ),
+        .ok_or_else(|| {
+            failure(
+                "the profile file's [mcp_signer_default] has no string 'account' key".to_owned(),
+            )
         })?;
     Ok(super::schema::KeyringEntryRef::new(service, account))
+}
+
+/// The mainnet fields read directly from the profile file, without overlays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnDiskMainnetView {
+    /// The stored chain identity.
+    pub chain_id: super::caip2::Caip2,
+    /// The stored RPC endpoint.
+    pub rpc_url: String,
+    /// The stored oracle endpoint, when the file sets a string one.
+    pub oracle_provider_url: Option<String>,
+}
+
+/// Reads the stored chain, endpoint, and oracle endpoint without applying
+/// environment overlays. A missing or non-string oracle endpoint reads as
+/// `None`.
+///
+/// # Errors
+///
+/// - [`ProfileLoadError::InvalidName`] for a name the loader refuses.
+/// - [`ProfileLoadError::NotFound`] when the profile file is absent.
+/// - [`ProfileLoadError::MainnetViewUnreadable`] on I/O or TOML parse
+///   failure, or when `chain_id` or `rpc_url` is missing or invalid.
+pub fn read_mainnet_view_on_disk(
+    name: &str,
+    dir: &Path,
+) -> Result<OnDiskMainnetView, ProfileLoadError> {
+    guard_name_for_load(name)?;
+    let path = dir.join(format!("{name}.toml"));
+    if !path.exists() {
+        return Err(ProfileLoadError::NotFound);
+    }
+    let failure = |detail: String| ProfileLoadError::MainnetViewUnreadable { detail };
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| failure(format!("failed to read the profile file: {e}")))?;
+    let doc: toml::Value = toml::from_str(&raw).map_err(|e| {
+        failure(format!(
+            "the profile file is not valid TOML: {}",
+            super::toml_diagnostic::toml_error_position(&raw, e.span().map(|s| s.start))
+        ))
+    })?;
+    let field = |key: &'static str| {
+        doc.get(key)
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| failure(format!("the profile file has no string '{key}' key")))
+    };
+    let chain_id = field("chain_id")?
+        .parse()
+        .map_err(|_| failure("chain_id must be stellar:testnet or stellar:mainnet".to_owned()))?;
+    let rpc_url = field("rpc_url")?.to_owned();
+    let oracle_provider_url = doc
+        .get("oracle_provider_url")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
+    Ok(OnDiskMainnetView {
+        chain_id,
+        rpc_url,
+        oracle_provider_url,
+    })
+}
+
+/// The stored chain and endpoints, without environment or programmatic overlays.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OnDiskRpcEndpoints {
+    /// The stored chain identity.
+    pub chain_id: super::caip2::Caip2,
+    /// The complete stored primary URL.
+    pub rpc_url: String,
+    /// The complete stored secondary URL, when configured.
+    pub secondary_rpc_url: Option<String>,
+}
+
+/// Reads both endpoint roles directly from the selected profile file.
+///
+/// # Errors
+/// Refuses an invalid name, absent file, malformed TOML, or invalid endpoint fields.
+pub fn read_rpc_endpoints_on_disk(
+    name: &str,
+    dir: &Path,
+) -> Result<OnDiskRpcEndpoints, ProfileLoadError> {
+    guard_name_for_load(name)?;
+    let path = dir.join(format!("{name}.toml"));
+    let failure = || ProfileLoadError::MainnetViewUnreadable {
+        detail: "the stored RPC endpoint configuration is unreadable".into(),
+    };
+    let raw = std::fs::read_to_string(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ProfileLoadError::NotFound
+        } else {
+            failure()
+        }
+    })?;
+    let doc: toml::Value = toml::from_str(&raw).map_err(|_| failure())?;
+    let chain_id: super::caip2::Caip2 = doc
+        .get("chain_id")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(failure)?
+        .parse()
+        .map_err(|_| failure())?;
+    let rpc_url = match doc.get("rpc_url") {
+        Some(value) => value.as_str().ok_or_else(failure)?,
+        None => chain_id.default_rpc_url().ok_or_else(failure)?,
+    }
+    .to_owned();
+    let secondary_rpc_url = doc
+        .get("secondary_rpc_url")
+        .map(|value| value.as_str().map(str::to_owned).ok_or_else(failure))
+        .transpose()?;
+    for (field, url) in std::iter::once(("rpc_url", rpc_url.as_str())).chain(
+        secondary_rpc_url
+            .as_deref()
+            .map(|url| ("secondary_rpc_url", url)),
+    ) {
+        super::schema::check_endpoint_url(field, url, chain_id).map_err(|_| failure())?;
+    }
+    Ok(OnDiskRpcEndpoints {
+        chain_id,
+        rpc_url,
+        secondary_rpc_url,
+    })
 }
 
 /// Sets ONLY `mcp_signer_default.account` in the profile's on-disk TOML
@@ -1360,7 +1577,10 @@ pub fn pin_signer_account_on_disk(
     let mut doc: toml::Value = toml::from_str(&raw).map_err(|e| {
         ProfileSaveError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("failed to parse '{}': {e}", dest.display()),
+            format!(
+                "the profile file is not valid TOML: {}",
+                super::toml_diagnostic::toml_error_position(&raw, e.span().map(|s| s.start))
+            ),
         ))
     })?;
     let table = doc
@@ -1369,7 +1589,7 @@ pub fn pin_signer_account_on_disk(
         .ok_or_else(|| {
             ProfileSaveError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("'{}' has no [mcp_signer_default] table", dest.display()),
+                "the profile file has no [mcp_signer_default] table",
             ))
         })?;
     table.insert(
@@ -1378,7 +1598,8 @@ pub fn pin_signer_account_on_disk(
     );
 
     let toml_str = toml::to_string_pretty(&doc).map_err(ProfileSaveError::Serialize)?;
-    write_profile_document_atomically(dir, &dest, &toml_str)?;
+    write_profile_document_atomically(dir, &dest, &toml_str, |_| Ok::<_, std::io::Error>(()))
+        .map_err(ProfileSaveError::Io)?;
     Ok(dest)
 }
 
@@ -1419,13 +1640,16 @@ pub fn set_pool_state_on_disk(
     let mut doc: toml::Value = toml::from_str(&raw).map_err(|e| {
         ProfileSaveError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("failed to parse '{}': {e}", dest.display()),
+            format!(
+                "the profile file is not valid TOML: {}",
+                super::toml_diagnostic::toml_error_position(&raw, e.span().map(|s| s.start))
+            ),
         ))
     })?;
     let table = doc.as_table_mut().ok_or_else(|| {
         ProfileSaveError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("'{}' is not a TOML table document", dest.display()),
+            "the profile file is not a TOML table document",
         ))
     })?;
     table.insert(
@@ -1438,7 +1662,8 @@ pub fn set_pool_state_on_disk(
     );
 
     let toml_str = toml::to_string_pretty(&doc).map_err(ProfileSaveError::Serialize)?;
-    write_profile_document_atomically(dir, &dest, &toml_str)?;
+    write_profile_document_atomically(dir, &dest, &toml_str, |_| Ok::<_, std::io::Error>(()))
+        .map_err(ProfileSaveError::Io)?;
     Ok(dest)
 }
 
@@ -1507,17 +1732,19 @@ pub fn set_provider_credential_on_disk(
         ProfileSaveError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, detail))
     };
     let raw = std::fs::read_to_string(&dest).map_err(ProfileSaveError::Io)?;
-    let mut doc: toml_edit::DocumentMut = raw
-        .parse()
-        .map_err(|e| invalid(format!("failed to parse '{}': {e}", dest.display())))?;
+    let mut doc: toml_edit::DocumentMut = raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        invalid(format!(
+            "the profile file is not valid TOML: {}",
+            super::toml_diagnostic::toml_error_position(&raw, e.span().map(|s| s.start))
+        ))
+    })?;
     let record = doc
         .get_mut("providers")
         .and_then(|providers| providers.get_mut(role.as_str()))
         .filter(|record| record.is_table_like())
         .ok_or_else(|| {
             invalid(format!(
-                "'{}' has no [{}] table",
-                dest.display(),
+                "the profile file has no [{}] table",
                 role.record_field()
             ))
         })?;
@@ -1526,8 +1753,7 @@ pub fn set_provider_credential_on_disk(
         .is_some_and(|table| table.contains_key("credential") || table.contains_key("placement"));
     if names_credential {
         return Err(invalid(format!(
-            "'{}' [{}] already names a credential or a placement",
-            dest.display(),
+            "the profile file's [{}] already names a credential or a placement",
             role.record_field()
         )));
     }
@@ -1561,7 +1787,8 @@ pub fn set_provider_credential_on_disk(
     } else {
         rendered
     };
-    write_profile_document_atomically(dir, &dest, &text)?;
+    write_profile_document_atomically(dir, &dest, &text, |_| Ok::<_, std::io::Error>(()))
+        .map_err(ProfileSaveError::Io)?;
     Ok(dest)
 }
 
@@ -1606,26 +1833,114 @@ fn placement_inline_table(placement: &RpcCredentialPlacement) -> toml_edit::Inli
 }
 
 /// Writes `text` to the profile file `dest` in the directory `dir`
-/// atomically.
+/// atomically after validating the candidate.
 ///
 /// The text goes into a temporary file in `dir`, which is flushed to disk and
 /// renamed over `dest`, so a reader sees either the old file or the new one.
 /// On Unix the directory is flushed as well, so the rename survives a crash.
-fn write_profile_document_atomically(
+fn write_profile_document_atomically<T, E: From<std::io::Error>>(
     dir: &Path,
     dest: &Path,
     text: &str,
-) -> Result<(), ProfileSaveError> {
-    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(ProfileSaveError::Io)?;
-    std::io::Write::write_all(&mut tmp, text.as_bytes()).map_err(ProfileSaveError::Io)?;
-    tmp.as_file().sync_all().map_err(ProfileSaveError::Io)?;
-    tmp.persist(dest)
-        .map_err(|e| ProfileSaveError::Io(e.error))?;
+    validate: impl FnOnce(&Path) -> Result<T, E>,
+) -> Result<T, E> {
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    std::io::Write::write_all(&mut tmp, text.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    let validated = validate(tmp.path())?;
+    tmp.persist(dest).map_err(|e| e.error)?;
     #[cfg(unix)]
-    std::fs::File::open(dir)
-        .and_then(|file| file.sync_all())
-        .map_err(ProfileSaveError::Io)?;
-    Ok(())
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(validated)
+}
+
+/// A refusal or I/O failure while applying a profile fragment.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProfileFragmentError {
+    /// The fragment contains a key outside the allowed set.
+    #[error("the fragment names a protected profile field")]
+    KeyRefused,
+    /// The fragment or stored document is not valid TOML.
+    #[error("the profile fragment is not valid TOML")]
+    Syntax,
+    /// The candidate fails the profile loader.
+    #[error("the candidate profile fails validation: {0}")]
+    Load(#[from] ProfileLoadError),
+    /// Reading or persisting the profile fails.
+    #[error("the profile fragment cannot be persisted: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Replaces allowed fields with a fragment and validates before atomic persistence.
+///
+/// Only `oracle_provider_url`, `providers`, and `remote_approval` are accepted.
+/// Each supplied field replaces its whole stored value. Other text stays intact.
+/// The returned profile includes permitted runtime overlays; the file contains only stored text.
+///
+/// # Errors
+/// Refuses malformed TOML, protected keys, loader failures, and filesystem errors.
+pub fn apply_fragment_on_disk(
+    name: &str,
+    dir: &Path,
+    fragment: &str,
+    multicall_hook: Option<&dyn MulticallRegistryHook>,
+) -> Result<Profile, ProfileFragmentError> {
+    let dest = stored_profile_path(name, dir)?;
+    let raw = std::fs::read_to_string(&dest)?;
+    let mut doc = raw
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| ProfileFragmentError::Syntax)?;
+    let fragment = fragment
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| ProfileFragmentError::Syntax)?;
+    if fragment
+        .iter()
+        .any(|(key, _)| !matches!(key, "oracle_provider_url" | "providers" | "remote_approval"))
+    {
+        return Err(ProfileFragmentError::KeyRefused);
+    }
+    let mut trailing = if fragment.iter().any(|(_, value)| value.is_table()) {
+        let trailing = doc.trailing().as_str().unwrap_or_default().to_owned();
+        doc.set_trailing("");
+        Some(trailing)
+    } else {
+        None
+    };
+    for (key, value) in fragment.iter() {
+        let mut replacement = value.clone();
+        place_fragment_tables(&mut replacement, &mut trailing);
+        doc[key] = replacement;
+    }
+    let rendered = doc.to_string();
+    let text = if uses_crlf_throughout(&raw) {
+        rendered.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        rendered
+    };
+    write_profile_document_atomically(dir, &dest, &text, |candidate| {
+        load_from_path(name, candidate, multicall_hook).map_err(ProfileFragmentError::Load)
+    })
+}
+
+fn place_fragment_tables(item: &mut toml_edit::Item, trailing: &mut Option<String>) {
+    if let Some(table) = item.as_table_mut() {
+        table.set_position(None);
+        if !table.is_implicit()
+            && let Some(trailing) = trailing.take()
+        {
+            let prefix = table
+                .decor()
+                .prefix()
+                .and_then(toml_edit::RawString::as_str)
+                .unwrap_or_default();
+            let prefix = format!("{trailing}{prefix}");
+            table.decor_mut().set_prefix(prefix);
+        }
+        for (_, child) in table.iter_mut() {
+            place_fragment_tables(child, trailing);
+        }
+    }
 }
 
 /// Errors produced when saving a profile.
@@ -1638,11 +1953,9 @@ pub enum ProfileSaveError {
     /// ([`ProfileLoadError::InvalidName`]): a name is validated before it is
     /// joined into a destination path, so no file outside the profile
     /// directory can be created or patched.
-    #[error("profile name '{name}' is not a valid profile name: {reason}")]
+    #[error("the profile name is not a valid profile name: {reason}")]
     InvalidName {
-        /// The rejected profile name as supplied by the caller.
-        name: String,
-        /// Why it was rejected.
+        /// Why it was rejected. The rejected name is not kept.
         reason: &'static str,
     },
     /// The OS-conventional state directory could not be determined.
@@ -1716,10 +2029,7 @@ pub fn load_with_overlay_from_dir(
     let path = profile_dir.join(format!("{name}.toml"));
 
     if !path.exists() {
-        return Err(ProfileLoadError::NotFound {
-            name: name.to_owned(),
-            path,
-        });
+        return Err(ProfileLoadError::NotFound);
     }
 
     load_from_path_with_overlays(
@@ -1773,7 +2083,7 @@ pub fn load_default_or_testnet_fallback_from_dir(
     // pre-multicall startup convenience; no registry is available at this point.
     match load_from_dir("default", profile_dir, None) {
         Ok(profile) => Ok((profile, ProfileOrigin::Persisted)),
-        Err(ProfileLoadError::NotFound { .. }) => Ok((
+        Err(ProfileLoadError::NotFound) => Ok((
             synthesise_default_first_run_profile(),
             ProfileOrigin::Synthesized,
         )),
@@ -1862,17 +2172,16 @@ struct OnDiskChainId {
 /// Each field of [`WALLET_KEY_REFERENCE_FIELDS`] is decoded on its own and a
 /// malformed one is skipped, so this read never refuses a file the merged
 /// extraction accepts.
-fn file_wallet_key_references(
-    name: &str,
-    path: &Path,
-) -> Result<Vec<KeyringEntryRef>, ProfileLoadError> {
+fn file_wallet_key_references(path: &Path) -> Result<Vec<KeyringEntryRef>, ProfileLoadError> {
+    let body = read_profile_toml(path)?;
+    wallet_key_references_from_toml(&body)
+}
+
+fn wallet_key_references_from_toml(body: &str) -> Result<Vec<KeyringEntryRef>, ProfileLoadError> {
     let fields: serde_json::Map<String, serde_json::Value> = Figment::new()
-        .merge(Toml::file(path))
+        .merge(Toml::string(body))
         .extract()
-        .map_err(|e| ProfileLoadError::Figment {
-            name: name.to_owned(),
-            source: Box::new(e),
-        })?;
+        .map_err(extraction_error)?;
     Ok(WALLET_KEY_REFERENCE_FIELDS
         .iter()
         .filter_map(|field| fields.get(*field))
@@ -1930,7 +2239,9 @@ pub fn check_provider_credential_for_write(
 ///
 /// - [`ProfileLoadError::InvalidName`] when `name` is not safe as a path
 ///   component.
-/// - [`ProfileLoadError::Figment`] when the file cannot be read.
+/// - [`ProfileLoadError::TomlSyntax`] when the file is not valid TOML.
+/// - [`ProfileLoadError::Extraction`] when the file cannot be read or does not
+///   match the schema.
 /// - [`ProfileLoadError::InvalidProviderAttestation`] with the refused field,
 ///   including [`ProviderAttestationRejection::UrlRequired`] when the role has
 ///   no endpoint URL.
@@ -1943,7 +2254,7 @@ pub fn check_provider_credential_for_write_in_dir(
     placement: &RpcCredentialPlacement,
 ) -> Result<(), ProfileLoadError> {
     guard_name_for_load(name)?;
-    let file_refs = file_wallet_key_references(name, &dir.join(format!("{name}.toml")))?;
+    let file_refs = file_wallet_key_references(&dir.join(format!("{name}.toml")))?;
     let invalid = |source| ProfileLoadError::InvalidProviderAttestation {
         name: name.to_owned(),
         source,
@@ -2445,9 +2756,11 @@ fn parse_cross_check_thresholds(
         ));
     };
     let mut result = std::collections::BTreeMap::new();
-    for (position, (key, raw_value)) in entries.into_iter().enumerate() {
+    let mut positions = std::collections::BTreeMap::new();
+    for (index, (key, raw_value)) in entries.into_iter().enumerate() {
+        let position = index + 1;
         let asset = CanonicalAsset::parse_threshold_key(&key)
-            .map_err(|error| failure(Entry::Position(position + 1), error.to_string()))?;
+            .map_err(|error| failure(Entry::Position(position), error.to_string()))?;
         let value_text = match raw_value {
             Value::String(_, text) => Some(text),
             Value::Num(_, num) => num.to_u128_lossy().map(|n| n.to_string()),
@@ -2459,32 +2772,81 @@ fn parse_cross_check_thresholds(
             .and_then(|text| text.parse::<i128>().ok())
             .ok_or_else(|| {
                 failure(
-                    Entry::Asset(asset.clone()),
+                    Entry::Position(position),
                     "has a threshold that is not a non-negative integer".to_owned(),
                 )
             })?;
+        positions.entry(asset.clone()).or_insert(position);
         result.insert(asset, value);
     }
-    for asset in result.keys() {
+    // Every conflicting identity has an entry in positions; the field-level fallback
+    // keeps the refusal free of the key.
+    let entry_of = |asset: &CanonicalAsset| {
+        positions
+            .get(asset)
+            .map_or(Entry::Field, |position| Entry::Position(*position))
+    };
+    if let Some(conflict) =
+        threshold_identity_conflict(&result.keys().cloned().collect::<Vec<_>>(), passphrase)
+    {
+        return Err(match conflict {
+            ThresholdIdentityConflict::NativeContract { asset } => failure(
+                entry_of(&asset),
+                "names the native asset's contract; set cross_check_threshold_stroops instead"
+                    .to_owned(),
+            ),
+            ThresholdIdentityConflict::SameAsset { asset, other } => failure(
+                entry_of(&asset),
+                format!("names the same asset as {}", entry_of(&other)),
+            ),
+        });
+    }
+    CrossCheckThresholds::new(result).map_err(|error| failure(Entry::Field, error.to_string()))
+}
+
+/// Two threshold entries that name one asset under the network passphrase.
+pub(crate) enum ThresholdIdentityConflict {
+    /// `asset` is the native asset's contract, which the native threshold
+    /// already covers.
+    NativeContract {
+        /// The contract entry.
+        asset: CanonicalAsset,
+    },
+    /// `asset` is the contract of the classic asset `other`.
+    SameAsset {
+        /// The contract entry.
+        asset: CanonicalAsset,
+        /// The classic entry the contract wraps.
+        other: CanonicalAsset,
+    },
+}
+
+/// Returns the first contract entry that aliases the native asset or another
+/// entry's classic asset, so each caller can name the conflict in its own
+/// configuration terms.
+pub(crate) fn threshold_identity_conflict(
+    assets: &[CanonicalAsset],
+    passphrase: &str,
+) -> Option<ThresholdIdentityConflict> {
+    for asset in assets {
         if let CanonicalAsset::Contract(id) = asset {
             if CanonicalAsset::Native.sac_contract_id(passphrase).as_ref() == Some(id) {
-                return Err(failure(
-                    Entry::Asset(asset.clone()),
-                    "names the native asset's contract; set cross_check_threshold_stroops instead"
-                        .to_owned(),
-                ));
+                return Some(ThresholdIdentityConflict::NativeContract {
+                    asset: asset.clone(),
+                });
             }
-            for other in result.keys() {
-                if other.sac_contract_id(passphrase).as_ref() == Some(id) {
-                    return Err(failure(
-                        Entry::Asset(asset.clone()),
-                        format!("names the same asset as entry '{other}'"),
-                    ));
-                }
+            if let Some(other) = assets
+                .iter()
+                .find(|other| other.sac_contract_id(passphrase).as_ref() == Some(id))
+            {
+                return Some(ThresholdIdentityConflict::SameAsset {
+                    asset: asset.clone(),
+                    other: other.clone(),
+                });
             }
         }
     }
-    CrossCheckThresholds::new(result).map_err(|error| failure(Entry::Field, error.to_string()))
+    None
 }
 
 fn require_policy_section(
@@ -2512,9 +2874,16 @@ mod tests {
     use super::*;
     use crate::profile::schema::sentinel::{self, assert_no_sentinel};
     use crate::profile::schema::{EndpointUrlError, EndpointUrlRejection, MINIMUM_FLOOR};
+    use stellar_agent_test_support::rejected_value::{
+        CREDENTIAL_MARKER, assert_no_marker, seed_marker,
+    };
 
     #[test]
+    #[serial_test::serial]
     fn thresholds_refuse_native_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for key in ["native", "NATIVE", "xlm", "XlM"] {
             let input = format!(
                 "{}\n[cross_check_thresholds]\n\"{key}\" = 1",
@@ -2552,7 +2921,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn thresholds_invalid_inputs_never_reach_operator_text() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let issuer = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
         let key = format!("USD:{issuer}");
         let hostile = "https://user:credential-marker@example.invalid/private?token=secret-marker";
@@ -2586,7 +2959,7 @@ mod tests {
                     )
                 );
             }
-            let mapped = error.to_validation_error(&name);
+            let mapped = error.to_validation_error();
             assert_eq!(mapped.code(), "validation.config_invalid");
             let text = mapped.to_string();
             for forbidden in [
@@ -2602,7 +2975,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn thresholds_validate_values_and_sac_duplicates() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let issuer = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
         let classic = CanonicalAsset::classic("USD", &issuer).unwrap();
         let other = stellar_strkey::Contract([9; 32]).to_string();
@@ -2642,13 +3019,24 @@ mod tests {
             ));
             assert!(error.to_string().contains("not a non-negative integer"));
         }
-        for (asset, reason) in [
-            (CanonicalAsset::Native, "names the native asset's contract"),
-            (classic.clone(), "names the same asset as entry"),
-        ] {
+        // Entries are named by their one-based position in key order, so the
+        // expected text is computed from the sorted keys.
+        let position_of = |key: &str, other: &str| if key < other { 1 } else { 2 };
+        for asset in [CanonicalAsset::Native, classic.clone()] {
             let sac = asset
                 .sac_contract_id(Caip2::Testnet.network_passphrase())
                 .unwrap();
+            let classic_text = classic.to_string();
+            let sac_position = position_of(&sac, &classic_text);
+            let reason = if asset == CanonicalAsset::Native {
+                "names the native asset's contract; set cross_check_threshold_stroops instead"
+                    .to_owned()
+            } else {
+                format!(
+                    "names the same asset as entry {} in key order",
+                    position_of(&classic_text, &sac)
+                )
+            };
             let input = format!(
                 "{}\n[cross_check_thresholds]\n\"{classic}\" = 1\n\
                 \"{sac}\" = 2",
@@ -2656,8 +3044,99 @@ mod tests {
             );
             let (dir, name) = write_profile(&input);
             let error = load_from_dir(&name, dir.path(), None).unwrap_err();
-            assert!(error.to_string().contains(reason), "{error}");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "profile '{name}': [cross_check_thresholds] entry {sac_position} in key \
+                     order {reason}"
+                )
+            );
+            assert!(!error.to_string().contains(&sac), "{error}");
+            assert!(!error.to_string().contains(&classic_text), "{error}");
         }
+    }
+
+    /// A threshold entry whose key parses is still refused by its position:
+    /// neither a refused value nor an identity conflict names the key.
+    #[test]
+    #[serial_test::serial]
+    fn cross_check_threshold_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let issuer = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let classic = CanonicalAsset::classic(CREDENTIAL_MARKER, &issuer).unwrap();
+        let sac = classic
+            .sac_contract_id(Caip2::Testnet.network_passphrase())
+            .unwrap();
+        let (sac_position, classic_position) = if sac < classic.to_string() {
+            (1, 2)
+        } else {
+            (2, 1)
+        };
+        let cases = [
+            (
+                format!("\"{classic}\" = true"),
+                "entry 1 in key order has a threshold that is not a non-negative integer"
+                    .to_owned(),
+            ),
+            (
+                format!("\"{classic}\" = 1\n\"{sac}\" = 2"),
+                format!(
+                    "entry {sac_position} in key order names the same asset as entry \
+                     {classic_position} in key order"
+                ),
+            ),
+        ];
+        for (table, expected) in cases {
+            let input = format!("{}\n[cross_check_thresholds]\n{table}", minimal_toml());
+            let (dir, name) = write_profile(&input);
+            let error = load_from_dir(&name, dir.path(), None).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("profile '{name}': [cross_check_thresholds] {expected}")
+            );
+            assert_no_marker(&error, CREDENTIAL_MARKER);
+            assert_no_marker(&error, &sac);
+        }
+    }
+
+    /// The on-disk chain and endpoint reader reports its own error kind,
+    /// naming the missing field and not the file path, which embeds the name.
+    #[test]
+    fn mainnet_view_failure_names_the_field() {
+        let (dir, name) = write_profile("chain_id = \"stellar:testnet\"\n");
+        let error = read_mainnet_view_on_disk(&name, dir.path()).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ProfileLoadError::MainnetViewUnreadable { detail }
+                    if detail == "the profile file has no string 'rpc_url' key"
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// A stored `chain_id` the reader refuses is named by the accepted values;
+    /// the stored text is absent from the error, its Debug and the wallet
+    /// error it converts to.
+    #[test]
+    fn mainnet_view_refuses_an_unknown_chain_without_echoing_it() {
+        let (dir, name) = write_profile(&format!(
+            "chain_id = \"{CREDENTIAL_MARKER}\"\nrpc_url = \"https://rpc.example\"\n"
+        ));
+        let error = read_mainnet_view_on_disk(&name, dir.path()).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ProfileLoadError::MainnetViewUnreadable { detail }
+                    if detail == "chain_id must be stellar:testnet or stellar:mainnet"
+            ),
+            "{error:?}"
+        );
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+        let converted = crate::error::WalletError::Validation(error.to_validation_error());
+        assert_no_marker(&converted, CREDENTIAL_MARKER);
     }
 
     /// One constructed value per [`ProfileLoadError`] variant.
@@ -2688,12 +3167,8 @@ mod tests {
                 name: "p".to_owned(),
                 named_by: crate::profile::ProfileNameSource::Env,
             },
-            ProfileLoadError::NotFound {
-                name: "p".to_owned(),
-                path: PathBuf::from("/tmp/p.toml"),
-            },
+            ProfileLoadError::NotFound,
             ProfileLoadError::InvalidName {
-                name: "..".to_owned(),
                 reason: "must not contain '..'",
             },
             ProfileLoadError::NoStateDir(crate::profile::schema::StateDirError),
@@ -2709,31 +3184,26 @@ mod tests {
                     ),
                 },
             },
-            ProfileLoadError::Figment {
-                name: "p".to_owned(),
-                source: Box::new(figment::Error::from("bad toml".to_owned())),
+            ProfileLoadError::Extraction {
+                class: "the profile document does not match the schema",
+                key: None,
+                count: 1,
             },
-            ProfileLoadError::VersionUnsupported {
-                name: "p".to_owned(),
-                found: 99,
-                supported: 2,
+            ProfileLoadError::TomlSyntax {
+                position: "line 1, column 1".into(),
             },
+            ProfileLoadError::VersionUnsupported { supported: 2 },
             ProfileLoadError::MissingPolicySection {
                 path: PathBuf::from("/tmp/p.toml"),
             },
             ProfileLoadError::SignerRefUnreadable {
                 detail: "missing [mcp_signer_default]".to_owned(),
             },
-            ProfileLoadError::InvalidScanIdBound {
-                name: "p".to_owned(),
-                value: 1,
-                upper_bound: 0,
+            ProfileLoadError::MainnetViewUnreadable {
+                detail: "missing chain_id".to_owned(),
             },
-            ProfileLoadError::InvalidHorizonBound {
-                name: "p".to_owned(),
-                value: 1,
-                upper_bound: 0,
-            },
+            ProfileLoadError::InvalidScanIdBound { upper_bound: 0 },
+            ProfileLoadError::InvalidHorizonBound { upper_bound: 0 },
             ProfileLoadError::InvalidServedPageDisplayName {
                 name: "p".to_owned(),
                 chars: 200,
@@ -2774,7 +3244,7 @@ mod tests {
     fn only_a_missing_file_is_not_found() {
         for err in one_of_every_variant() {
             let expected = match err {
-                ProfileLoadError::NotFound { .. } => ProfileLoadDisposition::NotFound,
+                ProfileLoadError::NotFound => ProfileLoadDisposition::NotFound,
                 _ => ProfileLoadDisposition::OperatorCorrectable,
             };
             assert_eq!(err.disposition(), expected, "wrong disposition for {err:?}");
@@ -2957,7 +3427,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_secondary_rpc_url_overlay_loads() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = provider_load(
             minimal_toml(),
             "secondary_rpc_url",
@@ -2989,7 +3463,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_mcp_signer_default_overlay_loads() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = provider_load(
             minimal_toml(),
             "mcp_signer_default",
@@ -2997,10 +3475,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(profile.mcp_signer_default.account, "overlay-account");
+        assert!(profile.is_overlaid("mcp_signer_default"));
+        assert!(!profile.is_overlaid("rpc_url"));
+        let encoded = toml::to_string(&profile).unwrap();
+        assert!(!encoded.contains("overlaid_fields"));
+        let decoded: Profile = toml::from_str(&encoded).unwrap();
+        assert!(!decoded.is_overlaid("mcp_signer_default"));
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_rpc_overlay_loads() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = provider_load(
             minimal_toml(),
             "rpc_url",
@@ -3055,7 +3543,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_oracle_provider_url_overlay_loads() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = provider_load(
             minimal_toml(),
             "oracle_provider_url",
@@ -3069,7 +3561,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_unprotected_overlay_loads() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile =
             provider_load(&mainnet_toml(), "mcp_disabled", serde_json::json!(true)).unwrap();
         assert!(profile.mcp_disabled);
@@ -3179,7 +3675,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_only_overlays_load_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (key, value) in testnet_only_overlays() {
             let profile = provider_load(minimal_toml(), key, value.clone())
                 .unwrap_or_else(|e| panic!("testnet overlay of {key} must load: {e:?}"));
@@ -3205,7 +3705,11 @@ mod tests {
     /// neither spelling, refused on mainnet whether the file uses the alias
     /// or neither spelling.
     #[test]
+    #[serial_test::serial]
     fn usd_threshold_alias_follows_the_testnet_only_class() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(!minimal_toml().contains("threshold"));
         let profile = provider_load(minimal_toml(), "usd_threshold", serde_json::json!(4_242))
             .expect("testnet alias overlay loads");
@@ -3243,7 +3747,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn submit_timeout_overlay_loads_on_every_chain() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for file in [minimal_toml().to_owned(), mainnet_toml()] {
             let profile = provider_load(&file, "submit_timeout_seconds", serde_json::json!(47))
                 .expect("submit_timeout_seconds is overlayable on every chain");
@@ -3252,7 +3760,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mcp_disabled_overlay_may_only_tighten() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for file in [minimal_toml().to_owned(), mainnet_toml()] {
             let profile = provider_load(&file, "mcp_disabled", serde_json::json!(true))
                 .expect("an overlay may set mcp_disabled to true");
@@ -3283,7 +3795,11 @@ mod tests {
     /// The keys `Env::prefixed` yields for the non-profile `STELLAR_AGENT_*`
     /// variables name no profile key, so the class check ignores them.
     #[test]
+    #[serial_test::serial]
     fn non_profile_overlay_keys_are_ignored() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, name) = write_profile(&mainnet_toml());
         let overlay = HashMap::from([
             ("home", serde_json::json!("/tmp/home")),
@@ -3332,7 +3848,11 @@ mod tests {
 
     /// The programmatic overlay passes the same class check.
     #[test]
+    #[serial_test::serial]
     fn programmatic_overlay_applies_the_class_table() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, name) = write_profile(minimal_toml());
         let refused = load_with_overlay_from_dir(
             &name,
@@ -3469,7 +3989,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(ProfileLoadError::VersionUnsupported { found: 99, .. })
+                Err(ProfileLoadError::VersionUnsupported { supported: 2 })
             ),
             "{result:?}"
         );
@@ -3478,14 +3998,14 @@ mod tests {
     #[test]
     fn validation_mapping_preserves_protected_codes_and_redacts_paths() {
         for err in one_of_every_variant() {
-            let validation = err.to_validation_error("p");
+            let validation = err.to_validation_error();
             let expected = match &err {
                 ProfileLoadError::NonOverlayableField { .. }
                 | ProfileLoadError::OverlayMayOnlyTighten { .. } => "profile.non_overlayable_field",
                 ProfileLoadError::MainnetRequiresExplicitProfile { .. } => {
                     "profile.mainnet_requires_explicit_profile"
                 }
-                ProfileLoadError::NotFound { .. } => "validation.profile_not_found",
+                ProfileLoadError::NotFound => "validation.profile_not_found",
                 ProfileLoadError::MainnetRpcUrlRequired { .. } => {
                     "validation.mainnet_rpc_url_required"
                 }
@@ -3500,7 +4020,7 @@ mod tests {
         let error = ProfileLoadError::MissingPolicySection {
             path: PathBuf::from(&home).join("mapping-sentinel.toml"),
         };
-        let message = error.to_validation_error("p").to_string();
+        let message = error.to_validation_error().to_string();
         assert!(message.contains("<HOME>"), "home prefix must be redacted");
         assert!(!message.contains(home.as_str()));
         assert!(message.contains("mapping-sentinel.toml"));
@@ -3541,7 +4061,11 @@ account = "default"
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_minimal_valid_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, name) = write_profile(minimal_toml());
         let p = load_from_dir(&name, dir.path(), None).unwrap();
         assert_eq!(p.version, 2);
@@ -3574,7 +4098,11 @@ account = "default"
     /// A profile TOML that explicitly sets `[policy_window_state_key_id]`
     /// overrides the name-derived default.
     #[test]
+    #[serial_test::serial]
     fn load_explicit_policy_window_state_key_id_overrides_derived_default() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = format!(
             "{}\n[policy_window_state_key_id]\nservice = \"custom-window-service\"\naccount = \"custom-account\"\n",
             minimal_toml()
@@ -3628,7 +4156,11 @@ account = "default"
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_accepts_v2_profile_with_explicit_noop_policy() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = minimal_toml().replace("engine = \"v1\"", "engine = \"noop\"");
         let (dir, name) = write_profile(&toml);
         let p = load_from_dir(&name, dir.path(), None).unwrap();
@@ -3640,7 +4172,11 @@ account = "default"
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_accepts_v2_profile_with_v1_policy() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, name) = write_profile(minimal_toml());
         let p = load_from_dir(&name, dir.path(), None).unwrap();
 
@@ -3651,7 +4187,11 @@ account = "default"
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_rpc_url_defaults_from_chain_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::profile::caip2::TESTNET_RPC_URL;
         let (dir, name) = write_profile(minimal_toml());
         let p = load_from_dir(&name, dir.path(), None).unwrap();
@@ -3670,7 +4210,7 @@ account = "default"
             "unexpected error: {err:?}"
         );
         assert_eq!(
-            err.to_validation_error(&name).code(),
+            err.to_validation_error().code(),
             "validation.mainnet_rpc_url_required"
         );
     }
@@ -3732,7 +4272,11 @@ account = "default"
     /// fields, with the exact field and reason, and no sentinel component in
     /// the error's `Display`, its `Debug`, or the rendered envelope.
     #[test]
+    #[serial_test::serial]
     fn endpoint_rule_refuses_each_field_with_its_exact_reason() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut rows: Vec<(&str, Endpoints<'_>, &str, EndpointUrlRejection)> = Vec::new();
         for field in ["rpc_url", "secondary_rpc_url", "oracle_provider_url"] {
             let base = (field != "rpc_url").then_some(RULE_MAINNET_RPC);
@@ -3790,7 +4334,7 @@ account = "default"
             }
             assert_no_sentinel(&err.to_string());
             assert_no_sentinel(&format!("{err:?}"));
-            let validation = err.to_validation_error(&name);
+            let validation = err.to_validation_error();
             assert_eq!(validation.code(), "validation.config_invalid");
             let envelope = crate::envelope::Envelope::<()>::err(
                 &crate::error::WalletError::Validation(validation),
@@ -3802,7 +4346,11 @@ account = "default"
     /// Testnet accepts a plaintext loopback endpoint and a URL with userinfo
     /// in all three fields, so the mainnet-only checks stay mainnet-only.
     #[test]
+    #[serial_test::serial]
     fn endpoint_rule_accepts_testnet_plaintext_and_userinfo() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for value in [
             "http://127.0.0.1:8000",
             "https://user:pass@rpc.example.invalid/",
@@ -3826,7 +4374,11 @@ account = "default"
     /// The loader reports the first broken field in the order `rpc_url`,
     /// `secondary_rpc_url`, `oracle_provider_url`.
     #[test]
+    #[serial_test::serial]
     fn endpoint_rule_reports_the_first_broken_field() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (rpc_url, expected) in [
             ("http://rpc.example.invalid", "rpc_url"),
             (RULE_MAINNET_RPC, "secondary_rpc_url"),
@@ -3849,7 +4401,11 @@ account = "default"
     /// A mainnet file whose three endpoints pass the rule loads them as
     /// written, including an HTTPS loopback endpoint.
     #[test]
+    #[serial_test::serial]
     fn endpoint_rule_accepts_mainnet_https_endpoints() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let endpoints = Endpoints {
             rpc_url: Some("https://127.0.0.1:8443"),
             secondary_rpc_url: Some("https://secondary.example.invalid"),
@@ -3878,7 +4434,11 @@ account = "default"
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_explicit_rpc_url_overrides_default() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = r#"
 version = 2
 chain_id = "stellar:testnet"
@@ -3917,7 +4477,11 @@ engine = "v1"
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_explicit_oracle_provider_url_parses_url() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = r#"
 version = 2
 chain_id = "stellar:testnet"
@@ -3975,7 +4539,7 @@ account = "a"
         let (dir, name) = write_profile(toml);
         let err = load_from_dir(&name, dir.path(), None).unwrap_err();
         assert!(
-            matches!(err, ProfileLoadError::VersionUnsupported { found: 9, .. }),
+            matches!(err, ProfileLoadError::VersionUnsupported { supported: 2 }),
             "unexpected error: {err}"
         );
     }
@@ -3985,13 +4549,17 @@ account = "a"
         let dir = tempfile::tempdir().unwrap();
         let err = load_from_dir("nonexistent", dir.path(), None).unwrap_err();
         assert!(
-            matches!(err, ProfileLoadError::NotFound { .. }),
+            matches!(err, ProfileLoadError::NotFound),
             "unexpected error: {err}"
         );
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_invalid_rpc_url_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = r#"
 version = 2
 chain_id = "stellar:testnet"
@@ -4113,7 +4681,11 @@ account = "default"
     }
 
     #[test]
+    #[serial_test::serial]
     fn cross_check_threshold_stroops_defaults_to_minimum_floor_on_load() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // A profile TOML with no cross_check_threshold_stroops field should
         // default to 0 (the serde default), and
         // effective_cross_check_threshold_stroops() returns MINIMUM_FLOOR.
@@ -4141,7 +4713,7 @@ account = "a"
         let (dir, name) = write_profile(toml);
         let err = load_from_dir(&name, dir.path(), None).unwrap_err();
         assert!(
-            matches!(err, ProfileLoadError::VersionUnsupported { found: 1, .. }),
+            matches!(err, ProfileLoadError::VersionUnsupported { supported: 2 }),
             "expected VersionUnsupported for v1 profile, got {err}"
         );
     }
@@ -4149,7 +4721,11 @@ account = "a"
     /// The fallback reports a synthesized profile as `Synthesized` and an existing
     /// `default.toml` as `Persisted`, with the binding check each origin implies.
     #[test]
+    #[serial_test::serial]
     fn load_default_or_testnet_fallback_reports_the_origin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let (synthesized, origin) = load_default_or_testnet_fallback_from_dir(dir.path()).unwrap();
         assert_eq!(origin, ProfileOrigin::Synthesized);
@@ -4194,7 +4770,11 @@ account = "a"
     /// to fail.  A tautology test that rebuilds the chain inline would survive
     /// such a deletion silently.
     #[test]
+    #[serial_test::serial]
     fn load_default_or_testnet_fallback_synthesised_profile_retains_noop_engine() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::profile::schema::PolicyEngineKind;
 
         let synthesised = super::synthesise_default_first_run_profile();
@@ -4234,7 +4814,11 @@ account = "a"
     /// profile has no `secondary_rpc_url`, `load_from_dir` must refuse with
     /// `ProfileLoadError::MulticallRequiresSecondaryRpc`.
     #[test]
+    #[serial_test::serial]
     fn profile_load_refuses_when_multicall_registered_without_secondary_rpc_url() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // minimal_toml() has no secondary_rpc_url — it will trigger the guard.
         let (dir, name) = write_profile(minimal_toml());
         let hook = AlwaysPresentHook;
@@ -4276,7 +4860,11 @@ account = "a"
     /// When a multicall registry entry exists AND the profile has a
     /// `secondary_rpc_url`, loading must succeed (the guard must not fire).
     #[test]
+    #[serial_test::serial]
     fn profile_load_accepts_when_multicall_registered_with_secondary_rpc_url() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // Write a complete profile TOML that includes `secondary_rpc_url` at the
         // root level (before any `[section]` headers).  Building on `minimal_toml()`
         // via string substitution is fragile because the raw string has
@@ -4327,7 +4915,11 @@ engine = "v1"
     /// When no multicall registry entry exists (`NeverPresentHook`), the guard
     /// must not fire even when `secondary_rpc_url` is absent.
     #[test]
+    #[serial_test::serial]
     fn profile_load_accepts_when_no_multicall_registry_entry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, name) = write_profile(minimal_toml());
         let hook = NeverPresentHook;
 
@@ -4395,7 +4987,11 @@ engine = "v1"
     /// `smart_account_max_context_rule_scan_id` at exactly the upper bound
     /// (10_000) must be accepted.
     #[test]
+    #[serial_test::serial]
     fn load_scan_id_at_upper_bound_is_accepted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = minimal_toml_with_extra("smart_account_max_context_rule_scan_id = 10000");
         let (dir, name) = write_profile(&toml);
         let p = load_from_dir(&name, dir.path(), None).unwrap();
@@ -4405,7 +5001,11 @@ engine = "v1"
     /// `smart_account_max_context_rule_scan_id` exceeding the upper bound
     /// (10_001) must be rejected with `ProfileLoadError::InvalidScanIdBound`.
     #[test]
+    #[serial_test::serial]
     fn load_scan_id_above_upper_bound_is_rejected() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = minimal_toml_with_extra("smart_account_max_context_rule_scan_id = 10001");
         let (dir, name) = write_profile(&toml);
         let err = load_from_dir(&name, dir.path(), None).unwrap_err();
@@ -4414,17 +5014,15 @@ engine = "v1"
             matches!(
                 err,
                 ProfileLoadError::InvalidScanIdBound {
-                    value: 10_001,
                     upper_bound: 10_000,
-                    ..
                 }
             ),
-            "expected InvalidScanIdBound(10001), got: {err}"
+            "expected InvalidScanIdBound with the cap 10000, got: {err}"
         );
         let msg = err.to_string();
         assert!(
-            msg.contains("10001"),
-            "error message must include the rejected value; got: {msg}"
+            !msg.contains("10001"),
+            "error message must not repeat the rejected value; got: {msg}"
         );
         assert!(
             msg.contains("10000"),
@@ -4434,7 +5032,11 @@ engine = "v1"
 
     /// A large `smart_account_max_context_rule_scan_id` (u32::MAX) is rejected.
     #[test]
+    #[serial_test::serial]
     fn load_scan_id_max_u32_is_rejected() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = minimal_toml_with_extra(&format!(
             "smart_account_max_context_rule_scan_id = {}",
             u32::MAX
@@ -4450,7 +5052,11 @@ engine = "v1"
     /// `session_rule_max_horizon_ledgers` at exactly the upper bound (10_000)
     /// must be accepted.
     #[test]
+    #[serial_test::serial]
     fn load_horizon_at_upper_bound_is_accepted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = minimal_toml_with_extra("session_rule_max_horizon_ledgers = 10000");
         let (dir, name) = write_profile(&toml);
         let p = load_from_dir(&name, dir.path(), None).unwrap();
@@ -4460,7 +5066,11 @@ engine = "v1"
     /// `session_rule_max_horizon_ledgers` exceeding the upper bound (10_001)
     /// must be rejected with `ProfileLoadError::InvalidHorizonBound`.
     #[test]
+    #[serial_test::serial]
     fn load_horizon_above_upper_bound_is_rejected() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = minimal_toml_with_extra("session_rule_max_horizon_ledgers = 10001");
         let (dir, name) = write_profile(&toml);
         let err = load_from_dir(&name, dir.path(), None).unwrap_err();
@@ -4469,18 +5079,25 @@ engine = "v1"
             matches!(
                 err,
                 ProfileLoadError::InvalidHorizonBound {
-                    value: 10_001,
                     upper_bound: 10_000,
-                    ..
                 }
             ),
-            "expected InvalidHorizonBound(10001), got: {err}"
+            "expected InvalidHorizonBound with the cap 10000, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("10001"),
+            "error message must not repeat the rejected value; got: {msg}"
         );
     }
 
     /// A large `session_rule_max_horizon_ledgers` (u32::MAX) is rejected.
     #[test]
+    #[serial_test::serial]
     fn load_horizon_max_u32_is_rejected() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml =
             minimal_toml_with_extra(&format!("session_rule_max_horizon_ledgers = {}", u32::MAX));
         let (dir, name) = write_profile(&toml);
@@ -4497,14 +5114,22 @@ engine = "v1"
     /// identity: the pages render neutral rather than falling back to the
     /// project's own name and mark.
     #[test]
+    #[serial_test::serial]
     fn load_without_served_pages_block_yields_no_identity() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, name) = write_profile(minimal_toml());
         let p = load_from_dir(&name, dir.path(), None).unwrap();
         assert!(p.served_pages.is_none());
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_served_pages_block_carries_the_name_and_the_mark_flag() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = minimal_toml_with_extra(
             "[served_pages]\ndisplay_name = \"Acme Ops\"\nshow_project_mark = true",
         );
@@ -4517,7 +5142,11 @@ engine = "v1"
 
     /// A `display_name` at exactly the render bound is accepted.
     #[test]
+    #[serial_test::serial]
     fn load_served_page_display_name_at_bound_is_accepted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = minimal_toml_with_extra(&format!(
             "[served_pages]\ndisplay_name = \"{}\"",
             "n".repeat(MAX_SERVED_PAGE_DISPLAY_NAME_CHARS)
@@ -4535,7 +5164,11 @@ engine = "v1"
     /// A `display_name` past the render bound is refused rather than silently
     /// rendered as a prefix of what the operator wrote.
     #[test]
+    #[serial_test::serial]
     fn load_served_page_display_name_above_bound_is_rejected() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = minimal_toml_with_extra(&format!(
             "[served_pages]\ndisplay_name = \"{}\"",
             "n".repeat(MAX_SERVED_PAGE_DISPLAY_NAME_CHARS + 1)
@@ -4561,7 +5194,11 @@ engine = "v1"
     /// The bound counts characters, so a multi-byte name is measured the way
     /// the renderer truncates it.
     #[test]
+    #[serial_test::serial]
     fn load_served_page_display_name_bound_counts_characters() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = minimal_toml_with_extra(&format!(
             "[served_pages]\ndisplay_name = \"{}\"",
             "\u{4E2D}".repeat(MAX_SERVED_PAGE_DISPLAY_NAME_CHARS)
@@ -4576,7 +5213,11 @@ engine = "v1"
 
     /// When both bounds are at (or below) the limit, the profile loads successfully.
     #[test]
+    #[serial_test::serial]
     fn load_both_bounds_within_limits_accepted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let toml = minimal_toml_with_extra(
             "smart_account_max_context_rule_scan_id = 100\nsession_rule_max_horizon_ledgers = 1000",
         );
@@ -4758,7 +5399,11 @@ engine = "v1"
     /// A second `set_pool_state_on_disk` (the `pool init --force` shape)
     /// replaces the previous pool bookkeeping wholesale.
     #[test]
+    #[serial_test::serial]
     fn set_pool_state_on_disk_overwrites_previous_pool_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::profile::schema::{KeyringEntryRef, PoolChannelRecord, PoolConfig};
         let (dir, name) = write_profile(minimal_toml());
         let (master_ref, first_cfg) = pool_state_fixture();
@@ -4783,7 +5428,11 @@ engine = "v1"
     /// pool state as typed schema values (serde-shape parity with
     /// [`save`]'s full-profile serialisation).
     #[test]
+    #[serial_test::serial]
     fn set_pool_state_on_disk_round_trips_through_load() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, name) = write_profile(minimal_toml());
         let (master_ref, cfg) = pool_state_fixture();
         set_pool_state_on_disk(&name, dir.path(), &master_ref, &cfg).unwrap();
@@ -4798,7 +5447,11 @@ engine = "v1"
     /// the profile name the loader was asked for — never a host-global
     /// shared file.
     #[test]
+    #[serial_test::serial]
     fn load_unset_audit_log_path_defaults_per_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, name) = write_profile(minimal_toml());
         let loaded = load_from_dir(&name, dir.path(), None).unwrap();
         assert_eq!(
@@ -4853,7 +5506,11 @@ engine = "v1"
     /// present in the TOML.  We use `mcp_disabled` which is a bool and
     /// straightforward to serialize via `serde_json::Value`.
     #[test]
+    #[serial_test::serial]
     fn load_with_overlay_overrides_mcp_disabled() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, name) = write_profile(minimal_toml());
 
         let mut overlay: HashMap<&'static str, serde_json::Value> = HashMap::new();
@@ -4871,7 +5528,7 @@ engine = "v1"
         let overlay: HashMap<&'static str, serde_json::Value> = HashMap::new();
         let err = load_with_overlay_from_dir("ghost", dir.path(), overlay, None).unwrap_err();
         assert!(
-            matches!(err, ProfileLoadError::NotFound { .. }),
+            matches!(err, ProfileLoadError::NotFound),
             "expected NotFound, got: {err}"
         );
     }
@@ -4896,7 +5553,7 @@ account = "a"
         let overlay: HashMap<&'static str, serde_json::Value> = HashMap::new();
         let err = load_with_overlay_from_dir(&name, dir.path(), overlay, None).unwrap_err();
         assert!(
-            matches!(err, ProfileLoadError::VersionUnsupported { found: 9, .. }),
+            matches!(err, ProfileLoadError::VersionUnsupported { supported: 2 }),
             "expected VersionUnsupported, got: {err}"
         );
     }
@@ -4965,7 +5622,11 @@ account = "a"
     /// When `multicall_hook` is `None`, the multicall guard is not evaluated
     /// regardless of profile content (no secondary_rpc_url required).
     #[test]
+    #[serial_test::serial]
     fn multicall_guard_skipped_when_hook_is_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // minimal_toml has no secondary_rpc_url — would fail if guard fires.
         let (dir, name) = write_profile(minimal_toml());
         // Passing None should bypass the guard.
@@ -5076,7 +5737,7 @@ account = "a"
         let dir = tempfile::tempdir().unwrap();
         let result = read_signer_ref_on_disk("absent", dir.path());
         assert!(
-            matches!(result, Err(ProfileLoadError::NotFound { .. })),
+            matches!(result, Err(ProfileLoadError::NotFound)),
             "missing profile must be NotFound; got: {result:?}"
         );
     }
@@ -5093,7 +5754,11 @@ account = "a"
     /// `policy_window_state_key_id`, explicit `rpc_url`) is materialised
     /// into the document.
     #[test]
+    #[serial_test::serial]
     fn pin_signer_account_on_disk_patches_only_the_account() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         const PINNED_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
         let toml = format!("future_key = \"kept\"\n{}", minimal_toml());
         let (dir, name) = write_profile(&toml);
@@ -5125,6 +5790,148 @@ account = "a"
         let loaded = load_from_dir(&name, dir.path(), None).unwrap();
         assert_eq!(loaded.mcp_signer_default.account, PINNED_G);
         assert_eq!(loaded.mcp_signer_default.service, "stellar-agent-signer");
+    }
+
+    const PROVIDERS_FRAGMENT: &str = "oracle_provider_url = \"https://oracle.example.invalid\"\n\n[providers.primary]\noperator = \"primary\"\nhost = \"file.example\"\n\n[providers.oracle]\noperator = \"oracle\"\nhost = \"oracle.example.invalid\"\nindependent_of_primary = true\n";
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_fragment_merges_allowed_keys_through_the_loader() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for crlf in [false, true] {
+            let raw = format!(
+                "# retained comment\nfuture_key = 'retained' # retained suffix\n{}",
+                mainnet_toml()
+            );
+            let raw = if crlf { raw.replace('\n', "\r\n") } else { raw };
+            let (dir, name) = write_profile(&raw);
+            let loaded =
+                apply_fragment_on_disk(&name, dir.path(), PROVIDERS_FRAGMENT, None).unwrap();
+            assert_eq!(
+                loaded.oracle_provider_url.as_ref().map(url::Url::as_str),
+                Some("https://oracle.example.invalid/")
+            );
+            let path = dir.path().join(format!("{name}.toml"));
+            let written = std::fs::read_to_string(&path).unwrap();
+            for line in raw.lines() {
+                assert!(
+                    written.lines().any(|stored| stored == line),
+                    "unchanged stored line: {line}"
+                );
+            }
+            assert!(!written.contains("network_passphrase"));
+            if crlf {
+                assert!(uses_crlf_throughout(&written));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            let with_credential = PROVIDERS_FRAGMENT.replace("[providers.primary]", "[providers.primary]\ncredential = { service = 'provider', account = 'key' }\nplacement = { kind = 'header', name = 'X-Provider-Key' }");
+            apply_fragment_on_disk(&name, dir.path(), &with_credential, None).unwrap();
+            let loaded =
+                apply_fragment_on_disk(&name, dir.path(), PROVIDERS_FRAGMENT, None).unwrap();
+            assert!(
+                loaded
+                    .providers
+                    .unwrap()
+                    .primary
+                    .unwrap()
+                    .credential
+                    .is_none(),
+                "whole providers replacement removes stale fields"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_fragment_refuses_loader_failures_unchanged() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, name) = write_profile(&mainnet_toml());
+        let path = dir.path().join(format!("{name}.toml"));
+        let before = std::fs::read(&path).unwrap();
+        let cases = [
+            PROVIDERS_FRAGMENT.replace(
+                "oracle_provider_url = \"https://oracle.example.invalid\"\n",
+                "",
+            ),
+            PROVIDERS_FRAGMENT.replace("https://oracle", "http://oracle"),
+            PROVIDERS_FRAGMENT.replace("operator = \"oracle\"", "operator = \"\""),
+            PROVIDERS_FRAGMENT.replace(
+                "host = \"oracle.example.invalid\"",
+                "host = \"wrong.example.invalid\"",
+            ),
+            PROVIDERS_FRAGMENT.replace("independent_of_primary = true\n", ""),
+            PROVIDERS_FRAGMENT.replace("oracle.example.invalid", "file.example"),
+            PROVIDERS_FRAGMENT.replace("operator = \"oracle\"", "operator = \"primary\""),
+        ];
+        for fragment in cases {
+            let error = apply_fragment_on_disk(&name, dir.path(), &fragment, None).unwrap_err();
+            assert!(matches!(error, ProfileFragmentError::Load(_)), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                1,
+                "no candidate remains"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_fragment_refuses_other_keys() {
+        let (dir, name) = write_profile(&mainnet_toml());
+        let path = dir.path().join(format!("{name}.toml"));
+        let before = std::fs::read(&path).unwrap();
+        for key in [
+            "rpc_url",
+            "network_passphrase",
+            "mcp_signer_default",
+            "audit_log_path",
+        ] {
+            let error =
+                apply_fragment_on_disk(&name, dir.path(), &format!("{key} = 'protected'\n"), None)
+                    .unwrap_err();
+            assert!(matches!(error, ProfileFragmentError::KeyRefused), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        assert!(matches!(
+            apply_fragment_on_disk(&name, dir.path(), "[", None),
+            Err(ProfileFragmentError::Syntax)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_fragment_remote_approval_keeps_path_fields() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let raw = mainnet_toml();
+        let (dir, name) = write_profile(&raw);
+        let fragment = "[remote_approval]\nenabled = true\nbind = \"0.0.0.0:8443\"\nrp_id = \"approve.example.invalid\"\ncert_path = \"remote/cert.pem\"\nkey_path = \"remote/key.pem\"\n";
+        let loaded = apply_fragment_on_disk(&name, dir.path(), fragment, None).unwrap();
+        assert!(loaded.chain_id.is_mainnet());
+        assert!(loaded.remote_approval.unwrap().enabled);
+        let written = std::fs::read_to_string(dir.path().join(format!("{name}.toml"))).unwrap();
+        assert!(
+            written.contains(fragment),
+            "path fields and fragment formatting survive: {written}"
+        );
+        assert!(
+            written.starts_with(&raw),
+            "raw: {raw:?}; written: {written:?}"
+        );
     }
 
     /// Pinning against a missing profile file errors instead of creating one.
@@ -5161,7 +5968,11 @@ account = "a"
     /// loads via `#[serde(alias = "usd_threshold")]`, and the value populates
     /// `cross_check_threshold_stroops`.
     #[test]
+    #[serial_test::serial]
     fn legacy_usd_threshold_key_alias_loads_into_cross_check_threshold_stroops() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let above_floor = MINIMUM_FLOOR + 7;
         let toml = minimal_toml_with_extra(&format!("usd_threshold = {above_floor}"));
         let (dir, name) = write_profile(&toml);
@@ -5176,7 +5987,11 @@ account = "a"
     /// A v2 profile TOML written with the current `cross_check_threshold_stroops`
     /// key loads identically to the legacy-key form.
     #[test]
+    #[serial_test::serial]
     fn current_cross_check_threshold_stroops_key_loads() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let above_floor = MINIMUM_FLOOR + 7;
         let toml =
             minimal_toml_with_extra(&format!("cross_check_threshold_stroops = {above_floor}"));
@@ -5220,7 +6035,11 @@ account = "a"
     /// The `MulticallRequiresSecondaryRpc` error message contains the profile
     /// name and the network safe-name derived from the testnet passphrase.
     #[test]
+    #[serial_test::serial]
     fn multicall_error_message_contains_profile_and_network() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (dir, name) = write_profile(minimal_toml());
         let hook = AlwaysPresentHook;
         let err = load_from_dir(&name, dir.path(), Some(&hook)).unwrap_err();
@@ -5244,7 +6063,11 @@ account = "a"
     /// Tests that the constant used internally equals 2; if it drifts the
     /// VersionUnsupported tests above would need updating.
     #[test]
+    #[serial_test::serial]
     fn supported_version_is_2() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // Proxy test via the loader: a v2 TOML loads, a v3 does not.
         let (dir, name) = write_profile(minimal_toml());
         let p = load_from_dir(&name, dir.path(), None).unwrap();
@@ -5254,15 +6077,8 @@ account = "a"
         let (dir3, name3) = write_profile(&v3_toml);
         let err = load_from_dir(&name3, dir3.path(), None).unwrap_err();
         assert!(
-            matches!(
-                err,
-                ProfileLoadError::VersionUnsupported {
-                    found: 3,
-                    supported: 2,
-                    ..
-                }
-            ),
-            "expected VersionUnsupported found=3 supported=2, got: {err}"
+            matches!(err, ProfileLoadError::VersionUnsupported { supported: 2 }),
+            "expected VersionUnsupported supported=2, got: {err}"
         );
     }
 
@@ -5278,9 +6094,13 @@ account = "a"
     fn load_from_dir_refuses_a_traversal_name_before_touching_the_filesystem() {
         let dir = tempfile::tempdir().unwrap();
         let err = load_from_dir("../foo", dir.path(), None).unwrap_err();
+        assert_no_marker(&err, "../foo");
+        assert!(
+            err.to_string()
+                .starts_with("the profile name is not a valid profile name:")
+        );
         match err {
-            ProfileLoadError::InvalidName { name, reason } => {
-                assert_eq!(name, "../foo");
+            ProfileLoadError::InvalidName { reason } => {
                 assert!(!reason.is_empty(), "the refusal must carry a reason");
             }
             other => panic!("expected InvalidName, got: {other}"),
@@ -5309,7 +6129,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_from_dir_accepts_an_ordinary_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The guard must not refuse the names operators actually use.
         let (dir, name) = write_profile(minimal_toml());
         assert!(load_from_dir(&name, dir.path(), None).is_ok());
@@ -5337,7 +6161,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn save_to_dir_refuses_a_traversal_name_and_writes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let root = tempfile::tempdir().unwrap();
         let profile_dir = root.path().join("profiles");
         std::fs::create_dir_all(&profile_dir).unwrap();
@@ -5355,7 +6183,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn save_new_to_dir_refuses_a_traversal_name_and_writes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let root = tempfile::tempdir().unwrap();
         let profile_dir = root.path().join("profiles");
         std::fs::create_dir_all(&profile_dir).unwrap();
@@ -5454,7 +6286,7 @@ account = "a"
             err.disposition(),
             ProfileLoadDisposition::OperatorCorrectable
         );
-        let validation = err.to_validation_error("fixture");
+        let validation = err.to_validation_error();
         assert_eq!(validation.code(), "validation.provider_attestation_invalid");
         assert!(validation.to_string().contains(field));
         assert!(validation.to_string().contains("profile file"));
@@ -5475,7 +6307,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_provider_records_are_required_per_configured_role() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (role, field) in [
             ("secondary", "secondary_rpc_url"),
             ("oracle", "oracle_provider_url"),
@@ -5489,7 +6325,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_missing_provider_records_are_allowed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (secondary, oracle) in [
             (Some("https://primary.example/second"), None),
             (None, Some("https://primary.example/oracle")),
@@ -5514,7 +6354,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn provider_operator_must_name_an_organization() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for role in ["secondary", "oracle"] {
                 for operator in [None, Some(""), Some(" \t\n")] {
@@ -5549,7 +6393,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn provider_host_must_match_exactly() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for (role, url_field) in [
                 ("secondary", "secondary_rpc_url"),
@@ -5602,7 +6450,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn provider_host_requires_two_usable_hosts() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for (role, url_field) in [
                 ("secondary", "secondary_rpc_url"),
@@ -5638,7 +6490,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_provider_independence_must_be_true() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for role in ["secondary", "oracle"] {
             for omitted in [false, true] {
                 let mut record = provider_record("primary.example", false);
@@ -5663,7 +6519,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_provider_independence_may_be_false() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for role in ["secondary", "oracle"] {
             for omitted in [false, true] {
                 let mut record = provider_record("primary.example", false);
@@ -5687,7 +6547,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_provider_must_differ_from_primary() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (role, field, record_field) in [
             ("secondary", "secondary_rpc_url", "providers.secondary"),
             ("oracle", "oracle_provider_url", "providers.oracle"),
@@ -5717,7 +6581,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn provider_true_attestation_refuses_on_the_primary_host() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for (role, field, record_field) in [
                 ("secondary", "secondary_rpc_url", "providers.secondary"),
@@ -5738,7 +6606,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn provider_records_accept_distinct_hosts() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for role in ["secondary", "oracle"] {
                 for host in ["other.example", "child.primary.example"] {
@@ -5757,7 +6629,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn secondary_and_oracle_may_share_a_provider() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             let record = provider_record("shared.example", true);
             let file = provider_file(
@@ -5772,7 +6648,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn provider_url_absence_stays_optional() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for providers in [None, Some(serde_json::json!({}))] {
                 assert!(
@@ -5790,7 +6670,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn provider_record_requires_its_url() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for (role, url_field) in [
                 ("secondary", "secondary_rpc_url"),
@@ -5812,7 +6696,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn provider_shape_errors_name_fields_without_values() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for value in [
                 serde_json::json!("SECRET_SENTINEL"),
@@ -5853,7 +6741,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn provider_checks_follow_endpoint_checks() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let file = provider_file(
             "stellar:mainnet",
             "http://primary.example",
@@ -5956,7 +6848,7 @@ account = "a"
                 name: "fixture".into(),
                 source: source.clone(),
             };
-            let validation = error.to_validation_error("fixture");
+            let validation = error.to_validation_error();
             assert_eq!(validation.code(), "validation.provider_attestation_invalid");
             assert_eq!(validation.to_string(), error.to_string());
             assert!(
@@ -5993,7 +6885,11 @@ account = "a"
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_url_overlay_revalidates_provider_host() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for (role, field) in [
             ("secondary", "secondary_rpc_url"),
             ("oracle", "oracle_provider_url"),
@@ -6171,7 +7067,11 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::serial]
         fn primary_record_loads_on_both_chains() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for chain in CHAINS {
                 let file = provider_file(
                     chain,
@@ -6222,7 +7122,11 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::serial]
         fn primary_record_host_must_match_rpc_url() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let record =
                 serde_json::json!({"operator": "Primary RPC Ltd", "host": "primary.example"});
             for chain in CHAINS {
@@ -6304,7 +7208,11 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::serial]
         fn primary_record_requires_an_operator() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for chain in CHAINS {
                 for operator in [None, Some(""), Some(" \t\n")] {
                     let mut record = serde_json::json!({"host": "primary.example"});
@@ -6327,7 +7235,11 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::serial]
         fn primary_record_refuses_independent_of_primary() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for chain in CHAINS {
                 for value in [
                     serde_json::json!(true),
@@ -6355,7 +7267,11 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::serial]
         fn primary_record_is_required_on_mainnet() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let secondary = provider_record("secondary.example", true);
             let oracle = provider_record("oracle.example", true);
             for (secondary_url, oracle_url, providers) in [
@@ -6400,7 +7316,11 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::serial]
         fn provider_credential_and_placement_come_together() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for chain in CHAINS {
                 for role in ROLES {
                     let url = format!("https://{}", role_host(role));
@@ -6437,7 +7357,11 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::serial]
         fn provider_credential_reference_shape_is_exact() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for chain in CHAINS {
                 for role in ROLES {
                     let url = format!("https://{}", role_host(role));
@@ -6479,7 +7403,11 @@ account = "a"
         /// The reference bytes are printable ASCII without a leading or
         /// trailing space; a space inside is allowed.
         #[test]
+        #[serial_test::serial]
         fn provider_credential_reference_is_printable_ascii() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for role in ROLES {
                 let url = format!("https://{}", role_host(role));
                 for credential in [
@@ -6521,7 +7449,11 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::serial]
         fn provider_placement_shapes_are_exact() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for chain in CHAINS {
                 for role in ROLES {
                     let url = format!("https://{}", role_host(role));
@@ -6604,7 +7536,11 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::serial]
         fn provider_header_names_follow_the_token_rule() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for name in [
                 "",
                 "X API",
@@ -6628,7 +7564,11 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::serial]
         fn provider_header_names_refuse_transport_headers() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for name in [
                 "HOST",
                 "Content-Type",
@@ -6646,7 +7586,11 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::serial]
         fn provider_query_names_are_unreserved_characters() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for name in ["a b", "a&b", "=", "", "\u{e4}", "a+b", "a%20b", "a#b"] {
                 assert_placement_name(&query(name), true);
             }
@@ -6658,7 +7602,11 @@ account = "a"
         /// A query placement repeats no parameter of the endpoint URL,
         /// compared byte for byte after decoding.
         #[test]
+        #[serial_test::serial]
         fn query_placement_must_not_repeat_a_url_parameter() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for chain in CHAINS {
                 for role in ROLES {
                     let host = role_host(role);
@@ -6703,7 +7651,11 @@ account = "a"
         /// the host is a loopback address, from the file and from a testnet
         /// overlay alike.
         #[test]
+        #[serial_test::serial]
         fn credential_endpoint_must_use_https() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for role in ROLES {
                 let role_url = format!("http://{}:8000/rpc", role_host(role));
                 for (url, host) in [
@@ -6782,7 +7734,11 @@ account = "a"
         /// username or password: on testnet through this rule, on mainnet
         /// through the endpoint rule, which runs first.
         #[test]
+        #[serial_test::serial]
         fn credential_endpoint_refuses_userinfo() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for role in ROLES {
                 let host = role_host(role);
                 for url in [
@@ -6832,7 +7788,11 @@ account = "a"
         /// The service namespace of the wallet's own keys is reserved, in any
         /// ASCII case and in any `.`-separated part; the RPC namespace is not.
         #[test]
+        #[serial_test::serial]
         fn provider_credentials_refuse_the_wallet_key_namespace() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for chain in CHAINS {
                 for role in ROLES {
                     let url = format!("https://{}", role_host(role));
@@ -6882,7 +7842,11 @@ account = "a"
         /// A credential with the service of a wallet key reference refuses,
         /// outside the wallet key namespace too and in any ASCII case.
         #[test]
+        #[serial_test::serial]
         fn provider_credentials_refuse_a_wallet_key_service() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for chain in CHAINS {
                 for role in ROLES {
                     let url = format!("https://{}", role_host(role));
@@ -6921,7 +7885,11 @@ account = "a"
         /// refuses, so a store that joins the two with a `.` cannot be
         /// pointed at the wallet key under a dotted profile name.
         #[test]
+        #[serial_test::serial]
         fn provider_credentials_refuse_a_dotted_alias_of_a_wallet_key() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for (signer_service, alias) in [
                 (
                     "stellar-agent-signer-alice.main",
@@ -6962,7 +7930,11 @@ account = "a"
         /// the merged profile, so a testnet overlay of `mcp_signer_default`
         /// does not free the file's signer entry.
         #[test]
+        #[serial_test::serial]
         fn provider_credentials_refuse_the_file_signer_under_an_overlay() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for role in ROLES {
                 let url = format!("https://{}", role_host(role));
                 let file = with_signer(
@@ -6999,7 +7971,11 @@ account = "a"
         /// Default references load under dotted profile names and profile
         /// names with a space, and all three roles may name one entry.
         #[test]
+        #[serial_test::serial]
         fn provider_credentials_allow_the_default_entries() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for name in ["a.b", "alice.main", "my prod", "Alice.Main"] {
                 let service = format!("stellar-agent-rpc-{name}");
                 for chain in CHAINS {
@@ -7055,7 +8031,11 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::serial]
         fn mainnet_secondary_and_oracle_operators_differ_from_primary() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for role in ["secondary", "oracle"] {
                 for operator in ["Primary operator", "  primary OPERATOR\t"] {
                     let mut record = provider_record("other.example", true);
@@ -7089,7 +8069,11 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::serial]
         fn provider_operator_comparison_trims_and_folds_case() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for (primary, other, shared) in [
                 ("  Example RPC ", "EXAMPLE rpc", true),
                 ("Stra\u{df}e", "STRASSE", true),
@@ -7121,7 +8105,11 @@ account = "a"
         }
 
         #[test]
+        #[serial_test::serial]
         fn testnet_shared_operator_loads() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             for role in ["secondary", "oracle"] {
                 let mut record = provider_record("other.example", true);
                 record["operator"] = "Primary operator".into();
@@ -7141,7 +8129,11 @@ account = "a"
         /// userinfo, insecure endpoint, repeated query name, then the mainnet
         /// rules.
         #[test]
+        #[serial_test::serial]
         fn provider_credential_checks_follow_record_checks() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             use ProviderAttestationRejection as R;
             let reserved = entry("stellar-agent-signer-p", "default");
             for chain in CHAINS {
@@ -7266,7 +8258,11 @@ account = "a"
         /// service, account, operator, and URL parts stay out of every
         /// rendering, and the code stays the provider attestation code.
         #[test]
+        #[serial_test::serial]
         fn provider_credential_errors_echo_no_file_value() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             use ProviderAttestationRejection as R;
             for chain in CHAINS {
                 for role in ROLES {
@@ -7427,7 +8423,11 @@ account = "a"
         /// refuses a missing record, or one that already names either key,
         /// without touching the file.
         #[test]
+        #[serial_test::serial]
         fn set_provider_credential_patches_only_the_record() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let (head, record, tail) = oracle_record_fixture();
             let file = format!("{head}{record}\n{tail}");
             let dir = tempfile::tempdir().unwrap();
@@ -7504,7 +8504,11 @@ account = "a"
         /// patch yields the original text with the two record lines
         /// inserted, each ending in CRLF, and the result loads.
         #[test]
+        #[serial_test::serial]
         fn set_provider_credential_keeps_crlf_line_endings() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let (head, record, tail) = oracle_record_fixture();
             let crlf = |text: &str| text.replace('\n', "\r\n");
             let file = crlf(&format!("{head}{record}\n{tail}"));
@@ -7548,7 +8552,11 @@ account = "a"
         /// that inline table, in the form the loader reads, and each
         /// placement kind is written in its serde form.
         #[test]
+        #[serial_test::serial]
         fn set_provider_credential_patches_an_inline_record() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let base = endpoint_toml(
                 "stellar:testnet",
                 Endpoints {
@@ -7611,7 +8619,11 @@ account = "a"
         /// The write-side check runs the loader's credential rules against
         /// the loaded profile and the file's own wallet key references.
         #[test]
+        #[serial_test::serial]
         fn write_check_applies_the_loader_rules() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let file = with_signer(
                 &provider_file(
                     "stellar:testnet",
@@ -7716,7 +8728,11 @@ account = "a"
         /// All three placements serialize as tables with a `kind` key and
         /// load back equal.
         #[test]
+        #[serial_test::serial]
         fn provider_credentials_round_trip_through_toml() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             let providers = Providers {
                 primary: Some(
                     PrimaryProviderRecord::new("Primary RPC Ltd", "primary.example")
@@ -7759,5 +8775,514 @@ account = "a"
                 Some(providers)
             );
         }
+    }
+
+    #[test]
+    fn stored_testnet_endpoints_default_primary() {
+        let file = format!(
+            "secondary_rpc_url = \"https://secondary.example/rpc\"\n{}",
+            minimal_toml()
+        );
+        let (dir, name) = write_profile(&file);
+        let endpoints = read_rpc_endpoints_on_disk(&name, dir.path()).unwrap();
+        assert_eq!(endpoints.chain_id, super::super::caip2::Caip2::Testnet);
+        assert_eq!(
+            endpoints.rpc_url,
+            endpoints.chain_id.default_rpc_url().unwrap()
+        );
+        assert_eq!(
+            endpoints.secondary_rpc_url.as_deref(),
+            Some("https://secondary.example/rpc")
+        );
+        std::fs::write(
+            dir.path().join(format!("{name}.toml")),
+            "chain_id = \"stellar:mainnet\"\n",
+        )
+        .unwrap();
+        assert!(read_rpc_endpoints_on_disk(&name, dir.path()).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stored_endpoints_ignore_environment_and_overlay() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        const CHILD: &str = "STORED_ENDPOINTS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "profile::loader::tests::stored_endpoints_ignore_environment_and_overlay",
+                ])
+                .env(CHILD, "1")
+                .env("STELLAR_AGENT_RPC_URL", "https://env-primary.example")
+                .env(
+                    "STELLAR_AGENT_SECONDARY_RPC_URL",
+                    "https://env-secondary.example",
+                )
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout} {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("test result: ok. 1 passed;"), "{stdout}");
+            return;
+        }
+        let file = format!(
+            "rpc_url = \"https://stored-primary.example\"\nsecondary_rpc_url = \"https://stored-secondary.example/path?key=fixture\"\n{}",
+            minimal_toml()
+        );
+        let (dir, name) = write_profile(&file);
+        let stored = read_rpc_endpoints_on_disk(&name, dir.path()).unwrap();
+        let loaded = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(loaded.rpc_url, "https://env-primary.example");
+        assert_eq!(
+            loaded.secondary_rpc_url.as_deref(),
+            Some("https://env-secondary.example")
+        );
+        assert_ne!(stored.rpc_url, loaded.rpc_url);
+        assert_eq!(
+            stored.secondary_rpc_url.as_deref(),
+            Some("https://stored-secondary.example/path?key=fixture")
+        );
+        let overlay = HashMap::from([
+            (
+                "rpc_url",
+                serde_json::json!("https://overlay-primary.example"),
+            ),
+            (
+                "secondary_rpc_url",
+                serde_json::json!("https://overlay-secondary.example"),
+            ),
+        ]);
+        let merged = load_with_overlay_from_dir(&name, dir.path(), overlay, None).unwrap();
+        assert_eq!(merged.rpc_url, "https://overlay-primary.example");
+        assert_eq!(
+            merged.secondary_rpc_url.as_deref(),
+            Some("https://overlay-secondary.example")
+        );
+        let again = read_rpc_endpoints_on_disk(&name, dir.path()).unwrap();
+        assert!(stored == again);
+        let missing_secondary = format!(
+            "rpc_url = \"https://stored-primary.example\"\n{}",
+            minimal_toml()
+        );
+        let (missing_dir, missing_name) = write_profile(&missing_secondary);
+        assert!(
+            read_rpc_endpoints_on_disk(&missing_name, missing_dir.path())
+                .unwrap()
+                .secondary_rpc_url
+                .is_none()
+        );
+        for field in ["rpc_url", "secondary_rpc_url"] {
+            let valid_primary = if field == "secondary_rpc_url" {
+                "rpc_url = \"https://primary.example\"\n"
+            } else {
+                ""
+            };
+            let malformed = format!(
+                "chain_id = \"stellar:testnet\"\n{valid_primary}{field} = [\"https://secret.example\"]\n"
+            );
+            std::fs::write(dir.path().join(format!("{name}.toml")), malformed).unwrap();
+            let error = read_rpc_endpoints_on_disk(&name, dir.path()).err().unwrap();
+            assert!(!error.to_string().contains("secret.example"));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_without_overlays_ignores_env() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        if std::env::var_os("OVERLAY_LOADER_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "profile::loader::tests::load_without_overlays_ignores_env",
+                ])
+                .env("OVERLAY_LOADER_CHILD", "1")
+                .env("STELLAR_AGENT_RPC_URL", "https://overlay.example.invalid")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{stdout}");
+            assert!(stdout.contains("test result: ok. 1 passed;"), "{stdout}");
+            return;
+        }
+        let (dir, name) = write_profile(minimal_toml());
+        let stored = load_from_dir_without_overlays(&name, dir.path(), None).unwrap();
+        let merged = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(merged.rpc_url, "https://overlay.example.invalid");
+        assert_ne!(stored.rpc_url, merged.rpc_url);
+    }
+
+    #[test]
+    #[serial_test::parallel]
+    #[serial_test::serial]
+    fn environment_signer_overlay_is_ephemeral() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        const CHILD: &str = "MESSAGE_OVERLAY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "profile::loader::tests::environment_signer_overlay_is_ephemeral",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(
+                    "STELLAR_AGENT_MCP_SIGNER_DEFAULT",
+                    r#"{account="overlay-account"}"#,
+                )
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{stdout}");
+            assert!(stdout.contains("test result: ok. 1 passed;"), "{stdout}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("message.toml"), minimal_toml()).unwrap();
+        let plain = load_from_dir_without_overlays("message", dir.path(), None).unwrap();
+        assert!(!plain.is_overlaid("mcp_signer_default"));
+        let loaded = load_from_dir("message", dir.path(), None).unwrap();
+        assert!(loaded.is_overlaid("mcp_signer_default"));
+        assert_eq!(loaded.mcp_signer_default.account, "overlay-account");
+        let encoded = toml::to_string(&loaded).unwrap();
+        assert!(!encoded.contains("overlaid_fields"));
+        let forged = format!(
+            "overlaid_fields = [\"mcp_signer_default\"]\n{}",
+            minimal_toml()
+        );
+        std::fs::write(dir.path().join("message.toml"), forged).unwrap();
+        let loaded = load_from_dir_without_overlays("message", dir.path(), None).unwrap();
+        assert!(!loaded.is_overlaid("mcp_signer_default"));
+    }
+
+    const MALFORMED_PROFILE: &str = "version = 2\nchain_id = \"stellar:testnet\"\n\nrpc_url = \"https://user:CREDMARKER7@rpc.example";
+
+    #[test]
+    fn an_invalid_profile_name_is_not_echoed() {
+        let marker = seed_marker();
+        let dir = tempfile::tempdir().unwrap();
+        let err = load_from_dir(&format!("{marker}/"), dir.path(), None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("the profile name is not a valid profile name")
+        );
+        assert_no_marker(&err, &marker);
+    }
+
+    /// A save under a refused name states the rule with the load half's
+    /// message and never the name.
+    #[test]
+    #[serial_test::serial]
+    fn a_refused_save_name_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let marker = seed_marker();
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile::builder_testnet("s", "a", "n", "a").build();
+        let err = save_to_dir(&format!("{marker}/x"), &profile, dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ProfileSaveError::InvalidName { .. }),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("the profile name is not a valid profile name: "),
+            "{err}"
+        );
+        assert_no_marker(&err, &marker);
+    }
+
+    /// An absent profile is reported without the requested name or the path
+    /// that embeds it, before any conversion to a wallet error.
+    #[test]
+    fn an_absent_profile_names_neither_the_name_nor_the_path() {
+        let marker = seed_marker();
+        let dir = tempfile::tempdir().unwrap();
+        let err = load_from_dir(&marker, dir.path(), None).unwrap_err();
+        assert!(matches!(err, ProfileLoadError::NotFound), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "the requested profile was not found in the wallet configuration"
+        );
+        assert_no_marker(&err, &marker);
+        assert_no_marker(&err, &dir.path().display().to_string());
+    }
+
+    /// The version and bound refusals state the supported version or the cap,
+    /// never the profile name or the stored value.
+    #[test]
+    #[serial_test::serial]
+    fn version_and_bound_refusals_name_no_profile_or_value() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let marker = seed_marker();
+        let dir = tempfile::tempdir().unwrap();
+        for (body, expected) in [
+            (
+                "version = 31337\n".to_owned(),
+                "the profile file has an unsupported version; this wallet supports version 2",
+            ),
+            (
+                minimal_toml_with_extra("smart_account_max_context_rule_scan_id = 31337"),
+                "",
+            ),
+            (
+                minimal_toml_with_extra("session_rule_max_horizon_ledgers = 31337"),
+                "",
+            ),
+        ] {
+            std::fs::write(dir.path().join(format!("{marker}.toml")), &body).unwrap();
+            let err = load_from_dir(&marker, dir.path(), None).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ProfileLoadError::VersionUnsupported { .. }
+                        | ProfileLoadError::InvalidScanIdBound { .. }
+                        | ProfileLoadError::InvalidHorizonBound { .. }
+                ),
+                "{err:?}"
+            );
+            if !expected.is_empty() {
+                assert_eq!(err.to_string(), expected);
+            }
+            assert_no_marker(&err, &marker);
+            assert_no_marker(&err, "31337");
+        }
+    }
+
+    #[test]
+    fn a_syntax_error_reports_line_and_column_only() {
+        let (dir, name) = write_profile(MALFORMED_PROFILE);
+        let err = load_from_dir(&name, dir.path(), None).unwrap_err();
+        assert_no_marker(&err, "CREDMARKER7");
+        assert!(err.to_string().contains("line 4, column"));
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn a_type_error_names_the_key_not_the_value() {
+        let (dir, name) = write_profile(&format!(
+            "{}\n[wallet]\nunlock_ttl_seconds = \"CREDMARKER7\"\n",
+            minimal_toml()
+        ));
+        let err = load_from_dir(&name, dir.path(), None).unwrap_err();
+        assert_no_marker(&err, "CREDMARKER7");
+        assert!(
+            err.to_string()
+                .contains("a value has the wrong type at `wallet.unlock_ttl_seconds`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_unknown_field_names_only_its_parent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, name) = write_profile(&format!(
+            "{}\n[providers.oracle]\nCREDMARKER7 = 1\n",
+            minimal_toml()
+        ));
+        let err = load_from_dir(&name, dir.path(), None).unwrap_err();
+        assert_no_marker(&err, "CREDMARKER7");
+        assert!(err.to_string().contains("providers.oracle"));
+        #[derive(serde::Deserialize, Debug)]
+        struct ProviderDocument {
+            #[serde(rename = "providers")]
+            _providers: std::collections::BTreeMap<String, super::super::schema::ProviderRecord>,
+        }
+        let raw = Figment::new()
+            .merge(Toml::string("[providers.oracle]\nCREDMARKER7 = 1\n"))
+            .extract::<ProviderDocument>()
+            .unwrap_err();
+        let err = extraction_error(raw);
+        assert_no_marker(&err, "CREDMARKER7");
+        assert!(
+            err.to_string()
+                .contains("an unknown field at `providers.oracle`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn the_direct_readers_report_position_only() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let dir = default_profile_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("position.toml"), MALFORMED_PROFILE).unwrap();
+        let err = read_signer_ref_on_disk("position", &dir).unwrap_err();
+        assert_no_marker(&err, "CREDMARKER7");
+        assert!(err.to_string().contains("line 4, column"));
+        let key = super::super::schema::KeyringEntryRef {
+            service: "test".into(),
+            account: "test".into(),
+        };
+        let err = set_pool_initialization("position", &key, None).unwrap_err();
+        assert_no_marker(&err, "CREDMARKER7");
+        assert!(err.to_string().contains("line 4, column"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_valid_profile_still_loads() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, name) = write_profile(minimal_toml());
+        let profile = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(profile.version, SUPPORTED_VERSION);
+        assert_eq!(profile.chain_id, super::super::caip2::Caip2::Testnet);
+    }
+
+    #[test]
+    fn extraction_classes_and_keys_contain_no_values() {
+        use figment::error::Kind;
+        let cases = [
+            (
+                Kind::MissingField("version".into()),
+                "a required field is missing",
+                Some("wallet.<key>.limit.version"),
+            ),
+            (
+                Kind::InvalidValue(
+                    figment::error::Actual::Str("CREDMARKER7".into()),
+                    "expected".into(),
+                ),
+                "a value is out of range",
+                Some("wallet.<key>.limit"),
+            ),
+            (
+                Kind::InvalidLength(7, "CREDMARKER7".into()),
+                "a value has the wrong length",
+                Some("wallet.<key>.limit"),
+            ),
+            (
+                Kind::UnknownVariant("CREDMARKER7".into(), &[]),
+                "the profile document does not match the schema",
+                None,
+            ),
+            (
+                Kind::Message("CREDMARKER7".into()),
+                "the profile document does not match the schema",
+                None,
+            ),
+        ];
+        for (kind, expected_class, expected_key) in cases {
+            let err =
+                extraction_error(figment::Error::from(kind).with_path("wallet.CREDMARKER7.limit"));
+            assert_no_marker(&err, "CREDMARKER7");
+            let ProfileLoadError::Extraction { class, key, count } = err else {
+                panic!("expected extraction error")
+            };
+            assert_eq!(class, expected_class);
+            assert_eq!(key.as_deref(), expected_key);
+            assert_eq!(count, 1);
+        }
+        let single = extraction_error(figment::Error::from("CREDMARKER7"));
+        assert_no_marker(&single, "CREDMARKER7");
+    }
+
+    /// A key segment is shown only when it has the form of a schema key: one
+    /// to 64 bytes, a lowercase ASCII letter first, then lowercase letters,
+    /// digits or underscores. Every other segment is shown as `<key>`.
+    #[test]
+    fn extraction_key_segments_follow_the_schema_key_grammar() {
+        use figment::error::Kind;
+        let at_64 = format!("a{}", "b".repeat(63));
+        let at_65 = format!("a{}", "b".repeat(64));
+        let cases: [(&str, &str); 10] = [
+            ("wallet..limit", "wallet.<key>.limit"),
+            ("wallet.9lives.limit", "wallet.<key>.limit"),
+            ("wallet._lead.limit", "wallet.<key>.limit"),
+            ("wallet.a-b.limit", "wallet.<key>.limit"),
+            ("wallet.a b.limit", "wallet.<key>.limit"),
+            ("wallet.Upper.limit", "wallet.<key>.limit"),
+            ("wallet.caf\u{e9}.limit", "wallet.<key>.limit"),
+            ("wallet.a1_b2.limit", "wallet.a1_b2.limit"),
+            (
+                &format!("wallet.{at_64}.limit"),
+                &format!("wallet.{at_64}.limit"),
+            ),
+            (&format!("wallet.{at_65}.limit"), "wallet.<key>.limit"),
+        ];
+        for (path, expected) in cases {
+            let mut raw = figment::Error::from(Kind::InvalidLength(1, "x".into()));
+            raw.path = path.split('.').map(str::to_owned).collect();
+            let err = extraction_error(raw);
+            let ProfileLoadError::Extraction { key, .. } = &err else {
+                panic!("expected extraction error, got {err:?}")
+            };
+            assert_eq!(key.as_deref(), Some(expected), "{path:?}");
+        }
+    }
+
+    /// An empty profile file is reported by its first missing field.
+    #[test]
+    fn an_empty_profile_file_names_the_missing_version() {
+        let (dir, name) = write_profile("");
+        let err = load_from_dir(&name, dir.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ProfileLoadError::Extraction { class, key, .. }
+                    if *class == "a required field is missing" && key.as_deref() == Some("version")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn missing_profile_document_keeps_empty_provider_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.toml");
+        let body = read_profile_toml(&path).unwrap();
+        assert!(body.is_empty());
+        let file_error = Figment::new()
+            .merge(Toml::file(&path))
+            .extract::<RawVersion>()
+            .err()
+            .unwrap();
+        let string_error = Figment::new()
+            .merge(Toml::string(&body))
+            .extract::<RawVersion>()
+            .err()
+            .unwrap();
+        assert_eq!(
+            extraction_error(file_error).to_string(),
+            extraction_error(string_error).to_string()
+        );
+    }
+
+    #[test]
+    fn extraction_reports_the_first_class_and_total_count() {
+        let first = figment::Error::from(figment::error::Kind::MissingField("version".into()));
+        let err = extraction_error(figment::Error::from("CREDMARKER7").chain(first));
+        assert_eq!(
+            err.to_string(),
+            "the profile document is not valid: a required field is missing at `version` (and 1 more)"
+        );
+        assert_no_marker(&err, "CREDMARKER7");
     }
 }

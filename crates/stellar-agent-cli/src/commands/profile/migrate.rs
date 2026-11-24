@@ -159,14 +159,13 @@ pub async fn run(args: &MigrateArgs) -> i32 {
         // A load refusal is the operator's to repair, never a wallet defect:
         // it renders under the validation code the loader assigns it.
         Err(MigrateError::Load { ref source, .. }) => {
-            let wallet_err =
-                WalletError::Validation(source.to_validation_error(args.profile_name()));
+            let wallet_err = WalletError::Validation(source.to_validation_error());
             render::render_json(&Envelope::err(&wallet_err));
             1
         }
         Err(err) => {
             let wallet_err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("migration failed for '{}': {err}", args.profile_name()),
+                detail: format!("migration failed: {err}"),
             });
             render::render_json(&Envelope::err(&wallet_err));
             1

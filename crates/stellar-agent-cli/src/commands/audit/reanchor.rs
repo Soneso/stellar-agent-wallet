@@ -35,12 +35,22 @@
 //! - Binding equal or absent: `--acknowledge-rollback` is required and
 //!   `--acknowledge-binding-change` is ignored. The verb re-anchors, bumps the
 //!   counter, appends `rollback_acknowledged`, and records an absent binding.
-//! - Binding changed or unreadable, anchor absent or agreeing:
+//!   This row covers a disagreeing anchor (`audit.tip_anchor_mismatch`) and a
+//!   missing one (`audit.tip_anchor_missing`): an absent anchor on a log that
+//!   shows it was anchored before, through a recorded binding, a chain-root
+//!   sidecar, or an `audit_tip_anchored` row.
+//! - Binding changed or unreadable, anchor agreeing or absent without evidence:
 //!   `--acknowledge-binding-change` is required and `--acknowledge-rollback` is
 //!   ignored. The verb appends one `binding_changed` row.
-//! - Binding changed or unreadable, anchor disagreeing: both flags are
-//!   required. The verb appends `rollback_acknowledged`, then
-//!   `binding_changed`.
+//! - Binding changed or unreadable, anchor disagreeing, which includes an
+//!   absent anchor whose log shows prior anchoring: both flags are required.
+//!   The verb appends `rollback_acknowledged`, then `binding_changed`.
+//! - In every row of this matrix, an active file that ends in entries without
+//!   a valid entry tag, on a log whose entry tags are in force, also requires
+//!   `--acknowledge-unauthenticated-tail`. The verb keeps those entries and
+//!   appends an `audit_entries_quarantined` row naming their count directly
+//!   after them, before its `audit_tip_anchored` rows. Without such entries
+//!   the flag is ignored. The count is decided under the writer's lock.
 //!
 //! An anchor disagrees when the anchor-against-walk rule of `audit verify`
 //! refuses it, or when it cannot be parsed. A log that moved forward past its
@@ -48,6 +58,12 @@
 //! because opening creates the directory, the lock sidecar, and the log file.
 //! Disagreement is decided again under the writer's lock, and that decision is
 //! the one acted on.
+//!
+//! An absent anchor disagrees when a chain-root sidecar or an
+//! `audit_tip_anchored` row shows prior anchoring, and agrees otherwise. Both
+//! decisions apply this rule. The decision under the lock reads the rows from
+//! the writer's replay of the active file, the same facts the writer's own
+//! `audit.tip_anchor_missing` refusal reads.
 //!
 //! # What it does
 //!
@@ -62,7 +78,7 @@
 //! place and a rerun appends its rows again.
 //!
 //! After the last repair row, and before the new binding is stored, it drains
-//! the audit outbox. Consent rows queued while the log was refused follow the
+//! the audit outbox. Operator rows queued while the log was refused follow the
 //! repair rows. A drain refusal does not undo the repair: the verb succeeds
 //! and lists the refusal under `warnings`, led by its `audit.*` sub-code, and
 //! the rows stay queued. Without a required acknowledgement the log, the
@@ -71,7 +87,7 @@
 //! # Concurrency
 //!
 //! Repair takes the audit writer's exclusive sidecar lock. While an MCP server
-//! holds that profile's writer, this verb refuses with `audit.writer_locked`.
+//! holds any audit carrier, this verb refuses with `audit.carriers_busy`.
 //! Stop that server, repair, and start it again. The server acquires its writer
 //! when needed, including for V1 reservation reconciliation during simulation.
 //! The registry normally retains it until exit. A replaced-file refusal during acquisition marks
@@ -87,11 +103,12 @@ use serde::Serialize;
 use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::{
     audit_log::{
-        AuditBinding, AuditWriter, ReanchorAcknowledgement, ReanchorReport, RecordedBinding,
-        StoredTipAnchor, TipAnchor, WriterError, stored_anchor_disagrees_with_walk, verify_log,
+        AuditBinding, AuditWriter, BindingHistory, PriorAnchoring, ReanchorAcknowledgement,
+        ReanchorReport, RecordedBinding, StoredTipAnchor, TipAnchor, WriterError,
+        stored_anchor_disagrees_with_walk, verify_log,
     },
     envelope::Envelope,
-    error::{InternalError, ValidationError, WalletError},
+    error::{ValidationError, WalletError},
     profile::schema::Profile,
 };
 use stellar_agent_network::keyring::{
@@ -130,12 +147,20 @@ pub struct ReanchorArgs {
     /// otherwise. Without it the verb changes nothing and exits 1.
     #[arg(long)]
     pub acknowledge_binding_change: bool,
+
+    /// Keep the entries past the last authenticated entry and quarantine them.
+    ///
+    /// Required when the log's entry tags are in force and its active file
+    /// ends in entries without a valid entry tag, and ignored otherwise.
+    /// Without it the verb changes nothing and exits 1.
+    #[arg(long)]
+    pub acknowledge_unauthenticated_tail: bool,
 }
 
 /// Success payload for the `audit reanchor` envelope.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-struct ReanchorData {
+pub(crate) struct ReanchorData {
     /// Profile whose audit log was re-anchored.
     profile: String,
     /// Coordinates of the replaced anchor as `<entry count>:<end offset>`,
@@ -149,8 +174,11 @@ struct ReanchorData {
     /// once, whether it acknowledged a rollback, a binding change, or both.
     reanchor_count: u64,
     /// The conditions this run acknowledged, in the order their rows were
-    /// appended: `rollback`, `binding_change`.
+    /// appended: `unauthenticated_tail`, `rollback`, `binding_change`.
     acknowledged: Vec<&'static str>,
+    /// Number of entries the `audit_entries_quarantined` row of this run
+    /// covers; 0 when the run quarantined nothing.
+    quarantined_rows: u64,
     /// How the recorded audit binding compared with the profile before this
     /// run: `absent`, `equal`, `changed`, or `unreadable`.
     recorded_binding: &'static str,
@@ -165,7 +193,8 @@ struct ReanchorData {
     #[serde(skip_serializing_if = "Option::is_none")]
     outbox_drained: Option<usize>,
     /// Conditions the repair stood despite, each led by its `audit.*`
-    /// sub-code: `audit.outbox_unusable`, `audit.outbox_busy`, or the
+    /// sub-code: `audit.outbox_unusable`, `audit.outbox_busy`,
+    /// `audit.outbox_rows_missing`, or the
     /// condition an append of the drain refused on, such as
     /// `audit.io_error`. Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -216,7 +245,10 @@ where
 }
 
 /// Performs the repair and returns what the verb renders, or the refusal.
-fn reanchor<LoadProfile, InitKeyring>(
+///
+/// Crate-visible so the key rotation's tests drive the re-anchor that a
+/// lost-key recovery runs between its two rotation attempts.
+pub(crate) fn reanchor<LoadProfile, InitKeyring>(
     args: &ReanchorArgs,
     load_profile: LoadProfile,
     init_keyring: InitKeyring,
@@ -246,6 +278,7 @@ where
         .current_tip_anchor()
         .map_err(|e| writer_error(&e, &args.profile))?;
 
+    let quarantine = unauthenticated_tail_acknowledged(args, &writer)?;
     if !args.acknowledge_rollback {
         return Err(WalletError::Validation(
             ValidationError::AuditReanchorNotAcknowledged {
@@ -258,8 +291,16 @@ where
         ));
     }
 
+    let mut acknowledgements = Vec::with_capacity(2);
+    let mut acknowledged = Vec::with_capacity(2);
+    if quarantine {
+        acknowledgements.push(ReanchorAcknowledgement::UnauthenticatedTail);
+        acknowledged.push("unauthenticated_tail");
+    }
+    acknowledgements.push(ReanchorAcknowledgement::Rollback);
+    acknowledged.push("rollback");
     let report = writer
-        .reanchor()
+        .reanchor_acknowledging(&acknowledgements)
         .map_err(|e| writer_error(&e, &args.profile))?;
     // An absent binding is recorded after a successful repair.
     if recorded == RecordedBinding::Absent {
@@ -268,10 +309,42 @@ where
     Ok(reanchor_data(
         &args.profile,
         report,
-        vec!["rollback"],
+        acknowledged,
         recorded.label(),
         None,
     ))
+}
+
+/// Whether the repair quarantines an unauthenticated tail, decided under the
+/// lock `writer` holds.
+///
+/// `false` when the active file ends in no entry without a valid entry tag,
+/// whatever the flag says.
+///
+/// # Errors
+///
+/// [`ValidationError::AuditUnauthenticatedTailNotAcknowledged`] for such
+/// entries without `--acknowledge-unauthenticated-tail`, and the writer's
+/// failure to count them.
+fn unauthenticated_tail_acknowledged(
+    args: &ReanchorArgs,
+    writer: &AuditWriter,
+) -> Result<bool, WalletError> {
+    let count = writer
+        .unauthenticated_tail_count()
+        .map_err(|e| writer_error(&e, &args.profile))?;
+    if count == 0 {
+        return Ok(false);
+    }
+    if !args.acknowledge_unauthenticated_tail {
+        return Err(WalletError::Validation(
+            ValidationError::AuditUnauthenticatedTailNotAcknowledged {
+                profile: args.profile.clone(),
+                count,
+            },
+        ));
+    }
+    Ok(true)
 }
 
 /// The arm of [`reanchor`] for a binding that changed or does not parse.
@@ -287,34 +360,44 @@ fn reanchor_binding_change(
     expected: &AuditBinding,
     recorded: &RecordedBinding,
 ) -> Result<ReanchorData, WalletError> {
-    let refusal = |missing: &'static str| {
-        WalletError::Validation(ValidationError::AuditBindingChangeNotAcknowledged {
-            profile: args.profile.clone(),
-            missing,
-        })
-    };
-
-    let disagreeing = anchor_disagrees_before_open(profile)?;
+    let disagreeing = anchor_disagrees_with_log(profile, recorded.history())?;
     if let Some(missing) = missing_acknowledgements(args, disagreeing) {
-        return Err(refusal(missing));
+        return Err(binding_change_not_acknowledged(args, missing));
     }
 
     let mut writer = open_repair_writer(profile, &args.profile)?;
-    // Decided again under the lock; this decision is the one acted on.
+    reanchor_binding_change_locked(args, binding_store, expected, recorded, &mut writer)
+}
+
+/// Rechecks the acknowledgements and performs the repair under the writer lock.
+fn reanchor_binding_change_locked(
+    args: &ReanchorArgs,
+    binding_store: &KeyringAuditBindingStore,
+    expected: &AuditBinding,
+    recorded: &RecordedBinding,
+    writer: &mut AuditWriter,
+) -> Result<ReanchorData, WalletError> {
+    // Decided again under the lock from the writer's replay of the active
+    // file; this decision is the one acted on.
     let disagreeing = writer
-        .stored_anchor_disagrees()
+        .stored_anchor_disagrees(recorded.history())
         .map_err(|e| writer_error(&e, &args.profile))?;
     if let Some(missing) = missing_acknowledgements(args, disagreeing) {
-        return Err(refusal(missing));
+        return Err(binding_change_not_acknowledged(args, missing));
     }
+    let quarantine = unauthenticated_tail_acknowledged(args, writer)?;
 
     let previous_binding_anchor = match recorded {
         RecordedBinding::Changed(old) => previous_binding_anchor(old)?,
         RecordedBinding::Absent | RecordedBinding::Equal | RecordedBinding::Unparseable => None,
     };
 
-    let mut acknowledgements = Vec::with_capacity(2);
-    let mut acknowledged = Vec::with_capacity(2);
+    let mut acknowledgements = Vec::with_capacity(3);
+    let mut acknowledged = Vec::with_capacity(3);
+    if quarantine {
+        acknowledgements.push(ReanchorAcknowledgement::UnauthenticatedTail);
+        acknowledged.push("unauthenticated_tail");
+    }
     if disagreeing {
         acknowledgements.push(ReanchorAcknowledgement::Rollback);
         acknowledged.push("rollback");
@@ -339,6 +422,15 @@ fn reanchor_binding_change(
     ))
 }
 
+/// The refusal for a changed binding whose required flags are not all given;
+/// `missing` names the flags still needed.
+fn binding_change_not_acknowledged(args: &ReanchorArgs, missing: &'static str) -> WalletError {
+    WalletError::Validation(ValidationError::AuditBindingChangeNotAcknowledged {
+        profile: args.profile.clone(),
+        missing,
+    })
+}
+
 /// The acknowledgement flags a changed binding still needs, or `None` when
 /// every required flag is present.
 fn missing_acknowledgements(args: &ReanchorArgs, disagreeing: bool) -> Option<&'static str> {
@@ -355,22 +447,31 @@ fn missing_acknowledgements(args: &ReanchorArgs, disagreeing: bool) -> Option<&'
 /// without opening a writer.
 ///
 /// Reads the stored value and walks the log read-only. An absent anchor
-/// agrees; an unparseable one disagrees. A log that cannot be walked has no
+/// disagrees when evidence of prior anchoring survives. An unparseable anchor
+/// disagrees. A log that cannot be walked has no
 /// tip an anchor could agree with, so a present anchor disagrees with it.
-fn anchor_disagrees_before_open(profile: &Profile) -> Result<bool, WalletError> {
+fn anchor_disagrees_with_log(
+    profile: &Profile,
+    binding: BindingHistory,
+) -> Result<bool, WalletError> {
     let store = KeyringTipAnchorStore::new(
         &profile.audit_log_hash_chain_key_id,
         &profile.audit_log_path,
     );
     let raw = stellar_agent_core::audit_log::TipAnchorStore::load_raw(&store)
-        .map_err(|e| tip_anchor_unavailable(&e))?;
+        .map_err(|e| super::tip_anchor_unavailable(&e))?;
     let stored = StoredTipAnchor::from_raw(raw.as_deref());
-    if stored == StoredTipAnchor::Absent {
-        return Ok(false);
-    }
     let walked = verify_log(&profile.audit_log_path, None)
         .ok()
         .and_then(|ok| ok.active_tip);
+    if stored == StoredTipAnchor::Absent {
+        let (count, holds_row) = walked
+            .as_ref()
+            .map_or((0, false), |tip| (tip.entry_count, tip.holds_anchoring_row));
+        return Ok(
+            PriorAnchoring::find(binding, &profile.audit_log_path, count, holds_row).is_some(),
+        );
+    }
     Ok(
         stored_anchor_disagrees_with_walk(&profile.audit_log_path, &stored, walked.as_ref())
             .unwrap_or(true),
@@ -386,14 +487,8 @@ fn anchor_disagrees_before_open(profile: &Profile) -> Result<bool, WalletError> 
 fn previous_binding_anchor(old: &AuditBinding) -> Result<Option<String>, WalletError> {
     let store = KeyringTipAnchorStore::for_path_digest(&old.audit_key, &old.log_path_sha256);
     let raw = stellar_agent_core::audit_log::TipAnchorStore::load_raw(&store)
-        .map_err(|e| tip_anchor_unavailable(&e))?;
+        .map_err(|e| super::tip_anchor_unavailable(&e))?;
     Ok(StoredTipAnchor::from_raw(raw.as_deref()).coordinates())
-}
-
-fn tip_anchor_unavailable(e: &impl std::fmt::Display) -> WalletError {
-    WalletError::Internal(InternalError::UnexpectedState {
-        detail: format!("audit.tip_anchor_unavailable: {e}"),
-    })
 }
 
 /// The success payload for a completed repair.
@@ -415,6 +510,7 @@ fn reanchor_data(
             .as_ref()
             .map_or_else(|| "none".to_owned(), TipAnchor::coordinates),
         reanchor_count: report.reanchor_count,
+        quarantined_rows: report.quarantined,
         outbox_drained: report.outbox_drained,
         warnings: report.outbox_refusal.into_iter().collect(),
         acknowledged,
@@ -427,12 +523,8 @@ fn reanchor_data(
 /// envelope model.
 fn load_profile(profile_name: &str) -> Result<Profile, WalletError> {
     load_profile_reconciled(&ResolvedProfileName::from_flag(profile_name)).map_err(|e| {
-        tracing::debug!(
-            profile = %profile_name,
-            error = %e,
-            "profile access refused for audit reanchor"
-        );
-        e.to_wallet_error(profile_name)
+        tracing::debug!(error = %e, "profile access refused for audit reanchor");
+        e.to_wallet_error()
     })
 }
 
@@ -539,9 +631,13 @@ mod tests {
         let store = TestAnchorStore::shared(coord, &profile.audit_log_path);
         let key = load_audit_hmac_key(&profile, "test-profile").expect("load key");
         let snapshot = {
-            let mut writer =
-                AuditWriter::open_with_tip_anchor(profile.audit_log_path.clone(), Some(key), store)
-                    .expect("open anchored");
+            let mut writer = AuditWriter::open_with_tip_anchor(
+                profile.audit_log_path.clone(),
+                Some(key),
+                store,
+                stellar_agent_core::audit_log::BindingHistory::NotRecorded,
+            )
+            .expect("open anchored");
             writer.write_entry(sample_entry()).expect("append");
             writer.write_entry(sample_entry()).expect("append");
             let snapshot = std::fs::read(&profile.audit_log_path).expect("read log");
@@ -555,6 +651,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn without_the_acknowledgement_nothing_is_written_and_the_exit_code_is_one() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = rolled_back_profile("reanchor-gate", dir.path());
@@ -570,6 +669,7 @@ mod tests {
             profile: "reanchor-gate".to_owned(),
             acknowledge_rollback: false,
             acknowledge_binding_change: false,
+            acknowledge_unauthenticated_tail: false,
         };
         let cloned = profile.clone();
         let code = run_with_dependencies(&args, move |_| Ok(cloned.clone()), || Ok(())).await;
@@ -590,6 +690,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn with_the_acknowledgement_the_log_is_repaired_and_the_counter_advances() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = rolled_back_profile("reanchor-repair", dir.path());
@@ -604,6 +707,7 @@ mod tests {
             profile: "reanchor-repair".to_owned(),
             acknowledge_rollback: true,
             acknowledge_binding_change: false,
+            acknowledge_unauthenticated_tail: false,
         };
         let cloned = profile.clone();
         let code = run_with_dependencies(&args, move |_| Ok(cloned.clone()), || Ok(())).await;
@@ -635,6 +739,7 @@ mod tests {
                 &profile.audit_log_hash_chain_key_id,
                 &profile.audit_log_path,
             ),
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
         .expect("the repaired log must open cleanly");
     }
@@ -649,6 +754,7 @@ mod tests {
             profile: profile.to_owned(),
             acknowledge_rollback: rollback,
             acknowledge_binding_change: binding,
+            acknowledge_unauthenticated_tail: false,
         }
     }
 
@@ -670,15 +776,32 @@ mod tests {
         profile
     }
 
+    /// Records the current carriers of `profile`'s log in its keyring audit
+    /// state, for a fixture whose subject is not the enrollment.
+    fn enroll(profile: &Profile) {
+        stellar_agent_core::audit_log::test_helpers::enroll_carriers(
+            &profile.audit_log_path,
+            &TestAnchorStore::new(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        )
+        .unwrap();
+    }
+
     fn write_anchored(profile: &Profile, entries: usize) {
         let key = load_audit_hmac_key(profile, "test-profile").expect("load key");
         let store = TestAnchorStore::shared(
             &profile.audit_log_hash_chain_key_id,
             &profile.audit_log_path,
         );
-        let mut writer =
-            AuditWriter::open_with_tip_anchor(profile.audit_log_path.clone(), Some(key), store)
-                .expect("open anchored");
+        let mut writer = AuditWriter::open_with_tip_anchor(
+            profile.audit_log_path.clone(),
+            Some(key),
+            store,
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
+        )
+        .expect("open anchored");
         for _ in 0..entries {
             writer.write_entry(sample_entry()).expect("append");
         }
@@ -738,8 +861,14 @@ mod tests {
         vec![
             std::fs::read(&old.audit_log_path).ok(),
             std::fs::read(&new.audit_log_path).ok(),
-            std::fs::read(AuditOutbox::for_log(&old.audit_log_path).path()).ok(),
-            std::fs::read(AuditOutbox::for_log(&new.audit_log_path).path()).ok(),
+            std::fs::read(stellar_agent_core::audit_log::outbox_path(
+                &old.audit_log_path,
+            ))
+            .ok(),
+            std::fs::read(stellar_agent_core::audit_log::outbox_path(
+                &new.audit_log_path,
+            ))
+            .ok(),
             raw_anchor(old).map(String::into_bytes),
             raw_anchor(new).map(String::into_bytes),
             raw_binding(name).map(String::into_bytes),
@@ -747,18 +876,111 @@ mod tests {
         ]
     }
 
+    /// Appends `count` chained rows without an entry tag to `profile`'s log,
+    /// with every writer dropped.
+    fn forge_untagged_tail(profile: &Profile, count: usize) {
+        for _ in 0..count {
+            stellar_agent_core::audit_log::test_helpers::append_forged_entry(
+                &profile.audit_log_path,
+                sample_entry(),
+                |_| None,
+            );
+        }
+    }
+
+    /// Both arms of the matrix require `--acknowledge-unauthenticated-tail`
+    /// for an active file that ends in untagged entries: without it the run
+    /// refuses and writes nothing; with it the entries are quarantined and
+    /// the acknowledgement comes first.
+    #[test]
+    #[serial]
+    fn reanchor_requires_the_unauthenticated_tail_flag() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+
+        // Binding absent: the rollback arm.
+        let name = "tail-rollback";
+        let profile = anchored_profile(name, &dir.path().join("a"), 2);
+        forge_untagged_tail(&profile, 2);
+        let before = snapshot(name, &profile, &profile);
+        let mut args = args_with(name, true, false);
+        let refused = run_reanchor(&args, &profile).expect_err("the tail needs its flag");
+        assert_eq!(refused.code(), "validation.acknowledgement_required");
+        assert!(
+            refused
+                .to_string()
+                .contains("--acknowledge-unauthenticated-tail"),
+            "{refused}"
+        );
+        assert_eq!(
+            snapshot(name, &profile, &profile),
+            before,
+            "nothing is written"
+        );
+        args.acknowledge_unauthenticated_tail = true;
+        let data = run_reanchor(&args, &profile).expect("the repair runs");
+        assert_eq!(data.acknowledged, ["unauthenticated_tail", "rollback"]);
+        assert_eq!(data.quarantined_rows, 2);
+        let kinds: Vec<String> = log_rows(&profile)
+            .iter()
+            .map(|row| row["kind"].as_str().expect("kind").to_owned())
+            .collect();
+        assert_eq!(
+            kinds[kinds.len() - 2..],
+            ["audit_entries_quarantined", "audit_tip_anchored"]
+        );
+
+        // Binding changed, anchor agreeing: the binding-change arm.
+        let name = "tail-binding";
+        let profile = anchored_profile(name, &dir.path().join("b"), 2);
+        let mut previous = profile.clone();
+        previous.audit_log_path = dir.path().join("b").join("previous.jsonl");
+        record_binding(name, &previous);
+        forge_untagged_tail(&profile, 2);
+        let before = snapshot(name, &previous, &profile);
+        let mut args = args_with(name, false, true);
+        let refused = run_reanchor(&args, &profile).expect_err("the tail needs its flag");
+        assert_eq!(refused.code(), "validation.acknowledgement_required");
+        assert_eq!(
+            snapshot(name, &previous, &profile),
+            before,
+            "nothing is written"
+        );
+        args.acknowledge_unauthenticated_tail = true;
+        let data = run_reanchor(&args, &profile).expect("the repair runs");
+        assert_eq!(
+            data.acknowledged,
+            ["unauthenticated_tail", "binding_change"]
+        );
+        assert_eq!(data.quarantined_rows, 2);
+    }
+
     #[test]
     #[serial]
     fn rollback_flag_alone_on_a_changed_binding_refuses_and_writes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let old = anchored_profile("bind-refuse", dir.path(), 2);
         record_binding("bind-refuse", &old);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
-        AuditOutbox::for_log(&new.audit_log_path)
-            .append(&queued_consent("queued-refused"))
-            .expect("queue");
+        enroll(&new);
+        AuditOutbox::for_log(
+            &new.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &new.audit_log_hash_chain_key_id,
+                &new.audit_log_path,
+            ),
+        )
+        .append(&queued_consent("queued-refused"))
+        .expect("queue");
+        std::fs::remove_file(dir.path().join("new.jsonl.lock")).unwrap();
         let before = snapshot("bind-refuse", &old, &new);
 
         let err = run_reanchor(&args_with("bind-refuse", true, false), &new)
@@ -789,6 +1011,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_binding_flag_on_an_equal_binding_is_ignored_and_the_rollback_rule_applies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = anchored_profile("bind-equal", dir.path(), 2);
@@ -813,9 +1038,91 @@ mod tests {
         assert_eq!(rows[0]["reason"], "rollback_acknowledged");
     }
 
+    /// The anchor of a log that a keyed use reached is deleted and the log
+    /// truncated. Every keyed open refuses with `audit.tip_anchor_missing`;
+    /// `--acknowledge-rollback` is the way out, writes its row, and the next
+    /// keyed open succeeds.
+    #[test]
+    #[serial]
+    fn the_rollback_flag_clears_a_missing_anchor_and_writes_its_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = anchored_profile("missing-anchor", dir.path(), 3);
+        record_binding("missing-anchor", &profile);
+        let anchor_ref = TestAnchorStore::new(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        )
+        .anchor_entry_ref()
+        .clone();
+        keyring_core::Entry::new(&anchor_ref.service, &anchor_ref.account)
+            .and_then(|entry| entry.delete_credential())
+            .expect("delete the anchor");
+        let content = std::fs::read_to_string(&profile.audit_log_path).expect("read log");
+        let kept: String = content.split_inclusive('\n').take(2).collect();
+        std::fs::write(&profile.audit_log_path, kept).expect("truncate the log");
+
+        let open_keyed = || {
+            let access = stellar_agent_network::keyring::keyed_audit_access(
+                &profile,
+                "missing-anchor",
+                BindingCheck::Enforce,
+            )
+            .expect("keyed access");
+            AuditWriter::open(profile.audit_log_path.clone(), Some(access))
+        };
+        let refusal = open_keyed().expect_err("a missing anchor refuses the keyed open");
+        assert!(
+            matches!(refusal, WriterError::TipAnchorMissing { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            crate::commands::audit::audit_writer_error(
+                &refusal,
+                "audit.writer_unavailable",
+                "missing-anchor"
+            )
+            .code(),
+            "audit.tip_anchor_missing"
+        );
+        assert!(
+            raw_anchor(&profile).is_none(),
+            "the refusal writes no anchor"
+        );
+
+        let err = run_reanchor(&args_with("missing-anchor", false, false), &profile)
+            .expect_err("the rollback flag is required");
+        assert!(
+            matches!(
+                err,
+                WalletError::Validation(ValidationError::AuditReanchorNotAcknowledged { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(
+            raw_anchor(&profile).is_none(),
+            "a refused repair writes nothing"
+        );
+
+        let data = run_reanchor(&args_with("missing-anchor", true, false), &profile)
+            .expect("the acknowledged repair succeeds");
+        assert_eq!(data.acknowledged, vec!["rollback"]);
+        let rows = tip_rows(&profile);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["reason"], "rollback_acknowledged");
+        assert_eq!(counter(&profile), Some(1));
+        drop(open_keyed().expect("the repaired log opens under the keyed path"));
+    }
+
     #[test]
     #[serial]
     fn an_absent_binding_is_recorded_after_a_rollback_repair() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = anchored_profile("bind-absent", dir.path(), 2);
@@ -830,9 +1137,195 @@ mod tests {
         );
     }
 
+    fn changed_binding_without_anchor(name: &str, dir: &std::path::Path) -> Profile {
+        let profile = anchored_profile(name, dir, 2);
+        let mut previous = profile.clone();
+        previous.audit_log_path = dir.join("previous.jsonl");
+        record_binding(name, &previous);
+        let store = TestAnchorStore::new(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        );
+        let anchor = store.anchor_entry_ref();
+        keyring_core::Entry::new(&anchor.service, &anchor.account)
+            .unwrap()
+            .delete_credential()
+            .unwrap();
+        assert!(
+            profile
+                .audit_log_path
+                .with_extension("jsonl.root_hmac")
+                .is_file()
+        );
+        assert!(tip_rows(&profile).is_empty());
+        profile
+    }
+
+    #[test]
+    #[serial]
+    fn a_changed_binding_with_missing_anchor_requires_rollback_before_and_under_lock() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let name = "bind-missing-refuse";
+        let profile = changed_binding_without_anchor(name, dir.path());
+        let args = args_with(name, false, true);
+        let before = snapshot(name, &profile, &profile);
+        let err = run_reanchor(&args, &profile).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WalletError::Validation(ValidationError::AuditBindingChangeNotAcknowledged {
+                    missing: "--acknowledge-rollback",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(snapshot(name, &profile, &profile), before);
+
+        // The locked decision refuses on its own.
+        let store = TestBindingStore::for_profile(name);
+        let expected = AuditBinding::for_profile(&profile);
+        let recorded = store.classify(&expected).unwrap();
+        let mut writer = open_repair_writer(&profile, name).unwrap();
+        let err = reanchor_binding_change_locked(&args, &store, &expected, &recorded, &mut writer)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WalletError::Validation(ValidationError::AuditBindingChangeNotAcknowledged {
+                    missing: "--acknowledge-rollback",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(snapshot(name, &profile, &profile), before);
+    }
+
+    #[test]
+    #[serial]
+    fn a_changed_binding_with_missing_anchor_and_both_flags_writes_both_rows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let name = "bind-missing-both";
+        let profile = changed_binding_without_anchor(name, dir.path());
+        let data = run_reanchor(&args_with(name, true, true), &profile).unwrap();
+        assert_eq!(data.acknowledged, vec!["rollback", "binding_change"]);
+        let rows = tip_rows(&profile);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["reason"], "rollback_acknowledged");
+        assert_eq!(rows[1]["reason"], "binding_changed");
+        assert_eq!(counter(&profile), Some(1));
+        assert_eq!(
+            raw_binding(name),
+            Some(AuditBinding::for_profile(&profile).to_keyring_value())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_changed_binding_without_anchor_evidence_needs_only_the_binding_flag() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let name = "bind-no-evidence";
+        let mut profile = anchored_profile(name, dir.path(), 2);
+        record_binding(name, &profile);
+        profile.audit_log_path = dir.path().join("unkeyed.jsonl");
+        AuditWriter::open(profile.audit_log_path.clone(), None)
+            .unwrap()
+            .write_entry(sample_entry())
+            .unwrap();
+        let data = run_reanchor(&args_with(name, false, true), &profile).unwrap();
+        assert_eq!(data.acknowledged, vec!["binding_change"]);
+        let rows = tip_rows(&profile);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["reason"], "binding_changed");
+    }
+
+    /// An anchoring row in the active file shows prior anchoring when an
+    /// archive no longer verifies: the decision under the lock reads the
+    /// writer's replay of the active file, so the binding flag alone refuses
+    /// and nothing is written.
+    #[test]
+    #[serial]
+    fn an_anchoring_row_in_the_active_file_needs_rollback_despite_a_broken_archive() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_core::audit_log::TipAnchorReason;
+        use stellar_agent_core::audit_log::rotation::test_seam::set_rotation_threshold;
+        use stellar_agent_core::audit_log::test_helpers::break_newest_archive_link;
+
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let name = "bind-row-broken-archive";
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct")
+            .with_profile_name(name)
+            .build();
+        profile.audit_log_path = dir.path().join("rows.jsonl");
+        let mut previous = profile.clone();
+        previous.audit_log_path = dir.path().join("previous.jsonl");
+        record_binding(name, &previous);
+        {
+            let mut writer = AuditWriter::open(profile.audit_log_path.clone(), None).unwrap();
+            writer.write_entry(sample_entry()).unwrap();
+            writer.write_entry(sample_entry()).unwrap();
+            let size = std::fs::metadata(&profile.audit_log_path).unwrap().len();
+            let threshold = set_rotation_threshold(&profile.audit_log_path, size);
+            writer
+                .write_entry(AuditEntry::new_audit_tip_anchored(
+                    TipAnchorReason::RollbackAcknowledged,
+                    2,
+                    None,
+                    Some(1),
+                    uuid::Uuid::new_v4().to_string(),
+                ))
+                .unwrap();
+            drop(threshold);
+        }
+        break_newest_archive_link(&profile.audit_log_path);
+        assert!(verify_log(&profile.audit_log_path, None).is_err());
+        assert!(
+            !profile
+                .audit_log_path
+                .with_extension("jsonl.root_hmac")
+                .exists()
+        );
+        assert_eq!(tip_rows(&profile).len(), 1);
+        assert_eq!(raw_anchor(&profile), None);
+
+        let args = args_with(name, false, true);
+        let before = snapshot(name, &previous, &profile);
+        let err = run_reanchor(&args, &profile).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WalletError::Validation(ValidationError::AuditBindingChangeNotAcknowledged {
+                    missing: "--acknowledge-rollback",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(snapshot(name, &previous, &profile), before);
+    }
+
     #[test]
     #[serial]
     fn the_binding_flag_alone_accepts_a_changed_binding_with_an_agreeing_anchor() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let old = anchored_profile("bind-accept", dir.path(), 2);
@@ -840,11 +1333,18 @@ mod tests {
         let old_anchor = anchor_coordinates(&old);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
+        enroll(&new);
 
         for id in ["queued-1", "queued-2"] {
-            AuditOutbox::for_log(&new.audit_log_path)
-                .append(&queued_consent(id))
-                .expect("queue");
+            AuditOutbox::for_log(
+                &new.audit_log_path,
+                stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                    &new.audit_log_hash_chain_key_id,
+                    &new.audit_log_path,
+                ),
+            )
+            .append(&queued_consent(id))
+            .expect("queue");
         }
 
         let data = run_reanchor(&args_with("bind-accept", false, true), &new)
@@ -897,12 +1397,16 @@ mod tests {
     #[test]
     #[serial]
     fn the_rollback_flag_is_ignored_on_a_changed_binding_with_an_agreeing_anchor() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let old = anchored_profile("bind-ignore-rollback", dir.path(), 2);
         record_binding("bind-ignore-rollback", &old);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
+        enroll(&new);
 
         let data = run_reanchor(&args_with("bind-ignore-rollback", true, true), &new)
             .expect("both flags accept the change");
@@ -924,6 +1428,9 @@ mod tests {
     #[test]
     #[serial]
     fn both_flags_on_a_disagreeing_anchor_append_rollback_then_binding_changed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let old = anchored_profile("bind-both", dir.path(), 2);
@@ -931,12 +1438,19 @@ mod tests {
         let old_anchor = anchor_coordinates(&old);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
+        enroll(&new);
         write_anchored(&new, 2);
         roll_back(&new);
         let superseded = anchor_coordinates(&new);
-        AuditOutbox::for_log(&new.audit_log_path)
-            .append(&queued_consent("queued-refused"))
-            .expect("queue");
+        AuditOutbox::for_log(
+            &new.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &new.audit_log_hash_chain_key_id,
+                &new.audit_log_path,
+            ),
+        )
+        .append(&queued_consent("queued-refused"))
+        .expect("queue");
         let before = snapshot("bind-both", &old, &new);
 
         let err = run_reanchor(&args_with("bind-both", false, true), &new)
@@ -975,6 +1489,9 @@ mod tests {
     #[test]
     #[serial]
     fn both_flags_drain_queued_rows_after_both_repair_rows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let old = anchored_profile("bind-both-outbox", dir.path(), 2);
@@ -982,14 +1499,21 @@ mod tests {
         let old_anchor = anchor_coordinates(&old);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
+        enroll(&new);
         write_anchored(&new, 2);
         roll_back(&new);
         let superseded = anchor_coordinates(&new);
         let before = log_rows(&new);
         for id in ["queued-1", "queued-2"] {
-            AuditOutbox::for_log(&new.audit_log_path)
-                .append(&queued_consent(id))
-                .expect("queue");
+            AuditOutbox::for_log(
+                &new.audit_log_path,
+                stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                    &new.audit_log_hash_chain_key_id,
+                    &new.audit_log_path,
+                ),
+            )
+            .append(&queued_consent(id))
+            .expect("queue");
         }
 
         let data = run_reanchor(&args_with("bind-both-outbox", true, true), &new)
@@ -1033,6 +1557,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_refused_drain_on_a_binding_change_is_a_warning_and_the_binding_is_stored() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for rollback in [false, true] {
             keyring_mock::install().expect("mock keyring store");
             let dir = tempfile::tempdir().expect("tmp dir");
@@ -1041,16 +1568,22 @@ mod tests {
             let old_anchor = anchor_coordinates(&old);
             let mut new = old.clone();
             new.audit_log_path = dir.path().join("new.jsonl");
+            enroll(&new);
             if rollback {
                 write_anchored(&new, 2);
                 roll_back(&new);
             }
             let before = log_rows(&new);
-            let outbox = AuditOutbox::for_log(&new.audit_log_path);
-            outbox.append(&queued_consent("queued-1")).expect("queue");
-            let mut bytes = std::fs::read(outbox.path()).expect("outbox");
-            bytes.extend_from_slice(b"not an audit entry\n");
-            std::fs::write(outbox.path(), &bytes).expect("corrupt the outbox");
+            let outbox = AuditOutbox::for_log(
+                &new.audit_log_path,
+                stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                    &new.audit_log_hash_chain_key_id,
+                    &new.audit_log_path,
+                ),
+            );
+            // A committed row that is not an operator row: the drain refuses it.
+            outbox.append(&sample_entry()).expect("queue");
+            let bytes = std::fs::read(outbox.path()).expect("outbox");
 
             let data = run_reanchor(&args_with("bind-outbox-unusable", rollback, true), &new)
                 .expect("the repair stands");
@@ -1098,12 +1631,16 @@ mod tests {
     #[test]
     #[serial]
     fn an_unusable_stored_anchor_counts_as_disagreeing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let old = anchored_profile("bind-unusable", dir.path(), 2);
         record_binding("bind-unusable", &old);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
+        enroll(&new);
         stellar_agent_network::keyring::write_keyring_string(
             TestAnchorStore::new(&new.audit_log_hash_chain_key_id, &new.audit_log_path)
                 .anchor_entry_ref(),
@@ -1131,6 +1668,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_unparseable_record_gives_previous_anchor_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = anchored_profile("bind-garbage", dir.path(), 2);
@@ -1160,6 +1700,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_failed_binding_write_leaves_the_refusal_and_a_rerun_appends_again() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().expect("tmp dir");
         let coordinate =
             stellar_agent_core::profile::schema::KeyringEntryRef::default_audit_binding(
@@ -1182,10 +1725,17 @@ mod tests {
         write_anchored(&old, 2);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
+        enroll(&new);
 
-        AuditOutbox::for_log(&new.audit_log_path)
-            .append(&queued_consent("queued-before-binding-failure"))
-            .expect("queue");
+        AuditOutbox::for_log(
+            &new.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &new.audit_log_hash_chain_key_id,
+                &new.audit_log_path,
+            ),
+        )
+        .append(&queued_consent("queued-before-binding-failure"))
+        .expect("queue");
 
         let err = run_reanchor(&args_with("bind-rerun", false, true), &new)
             .expect_err("the binding write fails");
@@ -1250,18 +1800,30 @@ mod tests {
     }
 
     fn outbox_file(profile: &Profile) -> Vec<u8> {
-        std::fs::read(AuditOutbox::for_log(&profile.audit_log_path).path()).unwrap_or_default()
+        std::fs::read(stellar_agent_core::audit_log::outbox_path(
+            &profile.audit_log_path,
+        ))
+        .unwrap_or_default()
     }
 
     #[tokio::test]
     #[serial]
     async fn without_the_acknowledgement_the_log_the_anchor_and_the_outbox_are_unchanged() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = rolled_back_profile("reanchor-outbox-gate", dir.path());
-        AuditOutbox::for_log(&profile.audit_log_path)
-            .append(&queued_consent("queued-1"))
-            .expect("queue");
+        AuditOutbox::for_log(
+            &profile.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        )
+        .append(&queued_consent("queued-1"))
+        .expect("queue");
         let store = TestAnchorStore::new(
             &profile.audit_log_hash_chain_key_id,
             &profile.audit_log_path,
@@ -1274,6 +1836,7 @@ mod tests {
             profile: "reanchor-outbox-gate".to_owned(),
             acknowledge_rollback: false,
             acknowledge_binding_change: false,
+            acknowledge_unauthenticated_tail: false,
         };
         let cloned = profile.clone();
         let code = run_with_dependencies(&args, move |_| Ok(cloned.clone()), || Ok(())).await;
@@ -1294,6 +1857,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn with_the_acknowledgement_queued_rows_follow_the_repair_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = rolled_back_profile("reanchor-outbox-drain", dir.path());
@@ -1307,15 +1873,22 @@ mod tests {
             .expect("anchored")
             .coordinates();
         for id in ["queued-1", "queued-2"] {
-            AuditOutbox::for_log(&profile.audit_log_path)
-                .append(&queued_consent(id))
-                .expect("queue");
+            AuditOutbox::for_log(
+                &profile.audit_log_path,
+                stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                    &profile.audit_log_hash_chain_key_id,
+                    &profile.audit_log_path,
+                ),
+            )
+            .append(&queued_consent(id))
+            .expect("queue");
         }
 
         let args = ReanchorArgs {
             profile: "reanchor-outbox-drain".to_owned(),
             acknowledge_rollback: true,
             acknowledge_binding_change: false,
+            acknowledge_unauthenticated_tail: false,
         };
         let cloned = profile.clone();
         let code = run_with_dependencies(&args, move |_| Ok(cloned.clone()), || Ok(())).await;
@@ -1347,14 +1920,22 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_drain_refusal_after_the_repair_is_a_warning_and_the_repair_stands() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = rolled_back_profile("reanchor-outbox-unusable", dir.path());
-        let outbox = AuditOutbox::for_log(&profile.audit_log_path);
-        outbox.append(&queued_consent("queued-1")).expect("queue");
-        let mut bytes = std::fs::read(outbox.path()).expect("outbox");
-        bytes.extend_from_slice(b"not an audit entry\n");
-        std::fs::write(outbox.path(), &bytes).expect("corrupt the outbox");
+        let outbox = AuditOutbox::for_log(
+            &profile.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        );
+        // A committed row that is not an operator row: the drain refuses it.
+        outbox.append(&sample_entry()).expect("queue");
+        let bytes = std::fs::read(outbox.path()).expect("outbox");
 
         let mut writer = open_repair_writer(&profile, "reanchor-outbox-unusable").expect("open");
         let report = writer.reanchor().expect("the repair succeeds");
@@ -1378,11 +1959,27 @@ mod tests {
             "a refused drain reports no count: {data}"
         );
 
-        // The repair stands: the log opens cleanly under the ordinary path once
-        // the outbox is moved aside.
+        // Removing the committed row still refuses after a successful tip repair.
         std::fs::remove_file(outbox.path()).expect("move the outbox aside");
         let key = load_audit_hmac_key(&profile, "reanchor-outbox-unusable").expect("load key");
-        AuditWriter::open_with_tip_anchor(
+        let store = TestAnchorStore::shared(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        );
+        assert!(matches!(
+            AuditWriter::open_with_tip_anchor(
+                profile.audit_log_path.clone(),
+                Some(key.clone()),
+                store,
+                stellar_agent_core::audit_log::BindingHistory::NotRecorded
+            ),
+            Err(WriterError::OutboxRowsMissing {
+                recorded: 1,
+                found: 0
+            })
+        ));
+        // The repair itself stands: the anchor agrees with the repaired log.
+        let writer = AuditWriter::open_for_reanchor(
             profile.audit_log_path.clone(),
             Some(key),
             TestAnchorStore::shared(
@@ -1390,6 +1987,58 @@ mod tests {
                 &profile.audit_log_path,
             ),
         )
-        .expect("the repaired log opens cleanly");
+        .expect("the repaired log opens for inspection");
+        assert!(
+            !writer
+                .stored_anchor_disagrees(stellar_agent_core::audit_log::BindingHistory::NotRecorded)
+                .expect("decide"),
+            "the anchor agrees with the repaired log"
+        );
+    }
+
+    /// An anchor read the keyring refuses, at the current path or at the path
+    /// a previous binding named, reports the keyring's `auth.*` code.
+    #[test]
+    #[serial]
+    fn a_refused_anchor_read_reports_its_auth_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let mut profile = Profile::builder_testnet("reanchor-refused", "acct", "n-svc", "n-acct")
+            .with_profile_name("reanchor-refused")
+            .build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let refuse = |store: &TestAnchorStore| {
+            let anchor = store.anchor_entry_ref().clone();
+            keyring_mock::inject_error(
+                &anchor.service,
+                &anchor.account,
+                keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                    "credential store locked",
+                ))),
+            )
+            .expect("inject");
+        };
+
+        refuse(&TestAnchorStore::new(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        ));
+        let current = anchor_disagrees_with_log(
+            &profile,
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap_err();
+        assert_eq!(current.code(), "auth.keyring_platform_error", "{current}");
+
+        let old = AuditBinding::for_profile(&profile);
+        refuse(&TestAnchorStore::for_path_digest(
+            &old.audit_key,
+            &old.log_path_sha256,
+        ));
+        let previous = previous_binding_anchor(&old).unwrap_err();
+        assert_eq!(previous.code(), "auth.keyring_platform_error", "{previous}");
     }
 }

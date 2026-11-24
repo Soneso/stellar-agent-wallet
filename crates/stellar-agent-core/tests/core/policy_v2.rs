@@ -1,0 +1,3705 @@
+//! Signed policy, minimum restrictions, and installation binding regressions.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test fixtures fail loudly"
+)]
+
+use ed25519_dalek::{Signer as _, SigningKey};
+use serial_test::serial;
+use std::{
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
+use stellar_agent_core::{
+    mainnet::{
+        enablement::{normalize_endpoint_host, verify_enablement},
+        verified_policy::VerifiedPolicy,
+    },
+    policy::{
+        PolicyError,
+        pin::{self, Pin, PinScope, PinState},
+        state_lock::{StateLockError, WindowStoreLock},
+        v1::{
+            PolicyStateStore,
+            canonical::canonical_bytes,
+            mainnet_minimum::{self, RequirementStatus},
+            verified::{
+                self, OwnerKeySource, PinMode, PolicyLoad, acquire_state_lock,
+                inspect_verified_policy, load_verified_policy, with_pin_without_creating,
+            },
+        },
+    },
+    profile::{
+        loader,
+        name::ProfileNameSource,
+        schema::{Profile, policy_pin_entry_ref},
+    },
+};
+use stellar_agent_test_support::keyring_mock::{self, ReadHook};
+use toml_edit::{DocumentMut, value};
+const FULL: &str = include_str!("../fixtures/policy-v2.toml");
+const V1: &str = "version = 1\nscope = \"profile:operator\"\n[[rules]]\n\
+    match = {tool = \"stellar_balances\", chain = \"*\"}\ncriteria = []\ndecision = \"allow\"\n";
+
+fn profile(mainnet: bool) -> Profile {
+    if mainnet {
+        Profile::builder_mainnet_named(
+            "operator",
+            "https://rpc.example.invalid",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .build()
+    } else {
+        Profile::builder_testnet_named("operator", "s", "a", "n", "a").build()
+    }
+}
+fn signed(raw: &str, key: &SigningKey) -> String {
+    let mut doc = raw.parse::<DocumentMut>().unwrap();
+    doc.remove("signature");
+    let canonical = canonical_bytes(&doc.to_string()).unwrap();
+    let signature = key.sign(blake3::hash(&canonical).as_bytes());
+    format!(
+        "{doc}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+        stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()),
+        stellar_agent_core::hex::encode(&signature.to_bytes())
+    )
+}
+fn load(
+    dir: &Path,
+    raw: &str,
+    profile: &Profile,
+    key: &SigningKey,
+    mode: PinMode,
+) -> Result<VerifiedPolicy, PolicyError> {
+    std::fs::write(dir.join("policy.toml"), signed(raw, key)).unwrap();
+    load_file(dir, profile, key, OwnerKeySource::Keyring, mode)
+}
+/// Loads the policy file already in `dir` with the given owner-key source.
+fn load_file(
+    dir: &Path,
+    profile: &Profile,
+    key: &SigningKey,
+    owner_source: OwnerKeySource,
+    mode: PinMode,
+) -> Result<VerifiedPolicy, PolicyError> {
+    load_verified_policy(
+        &PolicyLoad {
+            path: &dir.join("policy.toml"),
+            profile,
+            profile_name: "operator",
+            owner_pubkey: &key.verifying_key().to_bytes(),
+            owner_source,
+            window_path: &dir.join("state.window"),
+        },
+        PolicyStateStore::new(),
+        mode,
+    )
+}
+fn pinned(dir: &Path, profile: &Profile) -> PinState {
+    let path = dir.join("state.window");
+    let lock = WindowStoreLock::acquire_for(&path, &profile.policy_window_state_key_id).unwrap();
+    pin::read(&lock, &PinScope::for_profile(&path, profile)).unwrap()
+}
+fn put_pin(dir: &Path, profile: &Profile, sequence: i64, digest: [u8; 32], owner: [u8; 32]) {
+    let path = dir.join("state.window");
+    let lock = WindowStoreLock::acquire_for(&path, &profile.policy_window_state_key_id).unwrap();
+    pin::write_for_test(
+        &lock,
+        &PinScope::for_profile(&path, profile),
+        &Pin::new(sequence, digest, owner).unwrap(),
+    )
+    .unwrap();
+}
+fn fixture() -> (tempfile::TempDir, Profile, SigningKey) {
+    keyring_mock::install().unwrap();
+    (
+        tempfile::tempdir().unwrap(),
+        profile(true),
+        SigningKey::from_bytes(&[11; 32]),
+    )
+}
+fn without_mainnet() -> String {
+    let mut doc = FULL.parse::<DocumentMut>().unwrap();
+    doc.remove("mainnet");
+    doc.to_string()
+}
+
+#[test]
+fn engine_selection_signature_binds_kind() {
+    use stellar_agent_core::policy::v1::loader::load_signed_policy_text;
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let body = V1.replace("version = 1", "version = 2\nsequence = 1");
+    let absent = canonical_bytes(&body).unwrap();
+    for kind in ["v1", "noop"] {
+        let selected = body.replace(
+            "sequence = 1",
+            &format!("sequence = 1\nengine = \"{kind}\""),
+        );
+        let canonical = canonical_bytes(&selected).unwrap();
+        assert_ne!(canonical, absent);
+        assert!(
+            String::from_utf8(canonical)
+                .unwrap()
+                .contains(&format!("sequence = 1\nengine = \"{kind}\""))
+        );
+        let text = signed(&selected, &key);
+        let load_text = |raw: &str| {
+            load_signed_policy_text(
+                raw,
+                "operator",
+                &key.verifying_key().to_bytes(),
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            )
+        };
+        load_text(&text).unwrap();
+        for changed in [
+            text.replace(&format!("engine = \"{kind}\"\n"), ""),
+            text.replace(
+                &format!("engine = \"{kind}\""),
+                &format!("engine = \"{}\"", if kind == "v1" { "noop" } else { "v1" }),
+            ),
+        ] {
+            assert!(matches!(
+                load_text(&changed),
+                Err(PolicyError::OwnerSignatureInvalid { .. })
+            ));
+        }
+    }
+    for value in ["\"other\"", "1", "true", "[]", "{}"] {
+        let raw = body.replace("sequence = 1", &format!("sequence = 1\nengine = {value}"));
+        assert!(
+            stellar_agent_core::policy::v1::validate_unsigned_policy(
+                &raw,
+                "operator",
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE
+            )
+            .is_err()
+        );
+    }
+    assert!(canonical_bytes(&V1.replace("version = 1", "version = 1\nengine = \"v1\"")).is_err());
+    assert_eq!(canonical_bytes(&body).unwrap(), absent);
+}
+
+#[test]
+#[serial]
+fn engine_selection_reuses_sequence_and_pin_freshness() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::profile::schema::PolicyEngineKind;
+    keyring_mock::install().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut profile = profile(false);
+    let owner = SigningKey::from_bytes(&[11; 32]);
+    let body = V1.replace("version = 1", "version = 2\nsequence = 1");
+    load(dir.path(), &body, &profile, &owner, PinMode::Advance).unwrap();
+    let before = pinned(dir.path(), &profile);
+    profile.policy.engine = PolicyEngineKind::Noop;
+    for mode in [PinMode::CompareOnly, PinMode::Advance] {
+        let error = load(dir.path(), &body, &profile, &owner, mode)
+            .err()
+            .unwrap();
+        assert_eq!(error.wire_code(), "policy.engine_selection_unsigned");
+        assert!(error.to_string().contains("engine selection"));
+        assert_eq!(pinned(dir.path(), &profile), before);
+    }
+    let noop = body.replace("sequence = 1", "sequence = 2\nengine = \"noop\"");
+    let inspection = inspect_verified_policy(
+        &PolicyLoad {
+            path: &dir.path().join("policy.toml"),
+            profile: &profile,
+            profile_name: "operator",
+            owner_pubkey: &owner.verifying_key().to_bytes(),
+            owner_source: OwnerKeySource::Keyring,
+            window_path: &dir.path().join("state.window"),
+        },
+        PolicyStateStore::new(),
+    );
+    assert_eq!(
+        inspection.verified.err().unwrap().wire_code(),
+        "policy.engine_selection_unsigned"
+    );
+    load(dir.path(), &noop, &profile, &owner, PinMode::Advance).unwrap();
+    let before = pinned(dir.path(), &profile);
+    for mode in [PinMode::CompareOnly, PinMode::Advance] {
+        for (raw, key, code) in [
+            (
+                noop.replace("sequence = 2", "sequence = 1"),
+                owner.clone(),
+                "policy.sequence_rollback",
+            ),
+            (
+                noop.replace("decision = \"allow\"", "decision = \"deny\""),
+                owner.clone(),
+                "policy.sequence_fork",
+            ),
+            (
+                noop.replace("sequence = 2", "sequence = 3"),
+                SigningKey::from_bytes(&[12; 32]),
+                "policy.owner_rotation_required",
+            ),
+        ] {
+            assert_eq!(
+                load(dir.path(), &raw, &profile, &key, mode)
+                    .err()
+                    .unwrap()
+                    .wire_code(),
+                code
+            );
+            assert_eq!(pinned(dir.path(), &profile), before);
+        }
+    }
+    profile.policy.engine = PolicyEngineKind::V1;
+    let next = noop.replace("sequence = 2", "sequence = 3");
+    assert_eq!(
+        load(dir.path(), &next, &profile, &owner, PinMode::Advance)
+            .err()
+            .unwrap()
+            .wire_code(),
+        "policy.engine_selection_unsigned"
+    );
+    assert_eq!(pinned(dir.path(), &profile), before);
+    load(
+        dir.path(),
+        &next.replace("engine = \"noop\"", "engine = \"v1\""),
+        &profile,
+        &owner,
+        PinMode::Advance,
+    )
+    .unwrap();
+}
+
+#[test]
+fn v2_canonical_full_literal() {
+    const EXPECTED: &str = r#"version = 2
+scope = "profile:operator"
+sequence = 7
+
+[mainnet]
+profile = "operator"
+endpoint_host = "rpc.example.invalid"
+oracle_host = "oracle.example.invalid"
+installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+classic_max_fee_per_op_stroops = 500
+authorization_ttl_seconds = 60
+approval_credentials = [{ credential_id_b64url = "WlpaWlpaWlpaWlpaWlpaWg", public_key_sec1_b64url = "BEYtuhrk_BqWi02s8gzdbb4frjSqlxUUpj00BcPRz9ODtYu7CMEzg0KMWFPHHEyFHhNLBWgh5Gj-Cpd6v0MT3eE" }]
+
+[mainnet.cross_check_thresholds]
+"USD:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" = "100"
+native = "10000000000"
+
+[[rules]]
+match = { chain = "stellar:mainnet", tool = "stellar_pay" }
+criteria = [{ assets = ["native"], kind = "asset_allowlist" }, { allowlist = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"], kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"] }, { asset = "native", kind = "per_tx_cap", max_stroops = "100" }, { asset = "native", kind = "per_period_cap", max_stroops = "200", window = "1d" }, { kind = "rate_limit", max_calls = 10, window = "1d" }]
+decision = "require_approval"
+reason = "review"
+ttl_secs = 3600
+allow_opaque_signing = false
+"#;
+    assert_eq!(
+        String::from_utf8(canonical_bytes(FULL).unwrap()).unwrap(),
+        EXPECTED
+    );
+}
+
+#[test]
+fn public_docs_cover_both_owner_ceremonies() {
+    const CLI: &str = include_str!("../../../../docs/cli-reference/profile-and-governance.md");
+    const AGENTS: &str = include_str!("../../../../docs/agents.md");
+    const PROFILES: &str = include_str!("../../../../docs/profiles.md");
+    for (document, sentence) in [
+        (
+            CLI,
+            "A profile with a policy pin or an enrolled owner requires the owner's signature, including testnet and mainnet profiles without an enablement nonce.",
+        ),
+        (
+            AGENTS,
+            "`profile reset-window-state` requires the owner's signature whenever a pin or enrolled owner exists, including testnet and nonce-free mainnet profiles.",
+        ),
+    ] {
+        let normalized = document.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains(sentence),
+            "reset requires owner authorization"
+        );
+    }
+    for document in [CLI, AGENTS] {
+        for rule in [
+            "--owner-secret-env",
+            "enrolled owner",
+            "pin",
+            "signature",
+            "testnet",
+            "nonce",
+            "ownerless",
+        ] {
+            assert!(document.contains(rule), "reset guidance: {rule}");
+        }
+        assert!(!document.contains("requires no owner signature until"));
+    }
+    for document in [CLI, PROFILES] {
+        let normalized = document.split_whitespace().collect::<Vec<_>>().join(" ");
+        for sentence in [
+            "Set `engine = \"noop\"` in the profile's `[policy]` table, then restart MCP.",
+            "To switch back, set the signed policy's top-level `engine = \"v1\"`, run the same signing command, set the profile selector to `v1`, and restart MCP.",
+            "Load the owner seed into `WALLET_OWNER_SK`, then sign:",
+        ] {
+            assert!(
+                normalized.contains(sentence),
+                "complete owner ceremony: {sentence}"
+            );
+        }
+        for rule in [
+            "signed policy's top-level `engine`",
+            "omitted signed selector means `v1`",
+            "engine = \"noop\"",
+            "engine = \"v1\"",
+            "stellar-agent profile sign-policy --profile <NAME> --secret-env WALLET_OWNER_SK",
+            "unset WALLET_OWNER_SK",
+            "To switch back",
+            "restart MCP",
+            "higher sequence",
+            "never advances the pin",
+            "policy.engine_selection_unsigned",
+            "no mainnet write authority",
+        ] {
+            assert!(document.contains(rule), "selection ceremony: {rule}");
+        }
+    }
+}
+
+macro_rules! minimum {
+    ($name:ident, $requirement:literal, $edit:expr) => {
+        #[test]
+        #[serial_test::serial]
+        fn $name() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let profile = profile(true);
+            let mut doc = FULL.parse::<DocumentMut>().unwrap();
+            assert!(mainnet_minimum::failures(&doc, &profile, "operator").is_empty());
+            ($edit)(&mut doc);
+            let failures = mainnet_minimum::failures(&doc, &profile, "operator");
+            assert!(
+                failures.iter().any(|error| matches!(
+                    error,
+                    PolicyError::MainnetMinimumUnmet {
+                        requirement: $requirement,
+                        ..
+                    }
+                )),
+                "{failures:?}"
+            );
+        }
+    };
+}
+/// The mainnet minimum requires one to sixteen well-formed, distinct
+/// approval credentials; an absent, empty, malformed or duplicated list is
+/// unmet with its own detail.
+#[test]
+#[serial_test::serial]
+fn mainnet_minimum_requires_approval_credentials() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let profile = profile(true);
+    let entry = |id: &str| {
+        format!(
+            "{{ credential_id_b64url = \"{id}\", public_key_sec1_b64url = \"BEYtuhrk_BqWi02s8gzdbb4frjSqlxUUpj00BcPRz9ODtYu7CMEzg0KMWFPHHEyFHhNLBWgh5Gj-Cpd6v0MT3eE\" }}"
+        )
+    };
+    let fixture = entry("WlpaWlpaWlpaWlpaWlpaWg");
+    let seventeen = (0..17_u8)
+        .map(|i| {
+            entry(&format!(
+                "WlpaWlpaWlpaWlpaWlpa{}",
+                [
+                    "AA", "AQ", "Ag", "Aw", "BA", "BQ", "Bg", "Bw", "CA", "CQ", "Cg", "Cw", "DA",
+                    "DQ", "Dg", "Dw", "EA"
+                ][usize::from(i)]
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cases = [
+        ("absent", None),
+        ("empty", Some("[]".to_owned())),
+        (
+            "malformed id",
+            Some(format!("[{}]", entry("WlpaWlpaWlpaWlpaWlpaWg=="))),
+        ),
+        ("duplicate", Some(format!("[{fixture}, {fixture}]"))),
+        ("seventeen", Some(format!("[{seventeen}]"))),
+    ];
+    for (label, array) in cases {
+        let mut doc = FULL.parse::<DocumentMut>().unwrap();
+        let mainnet = doc["mainnet"].as_table_like_mut().unwrap();
+        mainnet.remove("approval_credentials");
+        if let Some(array) = array {
+            let parsed = format!("v = {array}").parse::<DocumentMut>().unwrap();
+            mainnet.insert("approval_credentials", parsed["v"].clone());
+        }
+        let failures = mainnet_minimum::failures(&doc, &profile, "operator");
+        assert!(
+            failures.iter().any(|error| matches!(
+                error,
+                PolicyError::MainnetMinimumUnmet {
+                    requirement: "approval_credentials",
+                    rule: None,
+                }
+            )),
+            "{label}: {failures:?}"
+        );
+        let outcome = mainnet_minimum::evaluate(&doc, &profile, "operator")
+            .into_iter()
+            .find(|outcome| outcome.requirement == "approval_credentials")
+            .unwrap();
+        assert!(
+            matches!(outcome.status, RequirementStatus::Failed { .. }),
+            "{label}: {outcome:?}"
+        );
+    }
+    let doc = FULL.parse::<DocumentMut>().unwrap();
+    assert!(mainnet_minimum::failures(&doc, &profile, "operator").is_empty());
+}
+
+fn rule(doc: &mut DocumentMut) -> &mut toml_edit::Table {
+    doc["rules"]
+        .as_array_of_tables_mut()
+        .unwrap()
+        .get_mut(0)
+        .unwrap()
+}
+
+/// A signed outer payment rule has every payment minimum, while presets keep
+/// their explicit recipient-editing targets and wildcard tools still refuse.
+#[cfg(feature = "mainnet-write")]
+#[test]
+#[serial]
+fn signed_toolset_payment_rule_loads_with_payment_minimums() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let (dir, profile, key) = fixture();
+    let body = FULL.replace("stellar_pay", "stellar_toolset_invoke");
+    for decision in ["allow", "require_approval", "deny"] {
+        let mut doc = body.parse::<DocumentMut>().unwrap();
+        rule(&mut doc)["decision"] = value(decision);
+        if decision != "require_approval" {
+            rule(&mut doc).remove("ttl_secs");
+            rule(&mut doc).remove("reason");
+        }
+        let loaded = load(
+            dir.path(),
+            &doc.to_string(),
+            &profile,
+            &key,
+            PinMode::CompareOnly,
+        );
+        assert!(loaded.is_ok(), "signed outer {decision}: {loaded:?}");
+    }
+    for (kind, index) in [
+        ("asset_allowlist", 0),
+        ("destination", 1),
+        ("per_tx_cap", 2),
+        ("per_period_cap", 3),
+        ("rate_limit", 4),
+    ] {
+        let mut doc = body.parse::<DocumentMut>().unwrap();
+        rule(&mut doc)["criteria"]
+            .as_array_mut()
+            .unwrap()
+            .remove(index);
+        let result = load(
+            dir.path(),
+            &doc.to_string(),
+            &profile,
+            &key,
+            PinMode::CompareOnly,
+        );
+        assert!(
+            matches!(result, Err(PolicyError::MainnetMinimumUnmet { requirement, rule: Some(0) }) if requirement == kind),
+            "missing {kind}: {result:?}"
+        );
+    }
+    for (field, expected) in [
+        ("classic_max_fee_per_op_stroops", "fee_cap"),
+        ("cross_check_thresholds", "thresholds"),
+    ] {
+        let mut doc = body.parse::<DocumentMut>().unwrap();
+        if field == "cross_check_thresholds" {
+            doc["mainnet"][field]["native"] = value("0");
+        } else {
+            doc["mainnet"].as_table_like_mut().unwrap().remove(field);
+        }
+        let result = load(
+            dir.path(),
+            &doc.to_string(),
+            &profile,
+            &key,
+            PinMode::CompareOnly,
+        );
+        assert!(
+            matches!(result, Err(PolicyError::MainnetMinimumUnmet { requirement, rule: None }) if requirement == expected),
+            "missing {field}: {result:?}"
+        );
+    }
+    let mut deny = body.parse::<DocumentMut>().unwrap();
+    rule(&mut deny)["decision"] = value("deny");
+    rule(&mut deny).remove("ttl_secs");
+    rule(&mut deny).remove("reason");
+    rule(&mut deny)["criteria"] = value(toml_edit::Array::new());
+    assert!(
+        load(
+            dir.path(),
+            &deny.to_string(),
+            &profile,
+            &key,
+            PinMode::CompareOnly
+        )
+        .is_ok()
+    );
+    let wildcard = body.replace("stellar_toolset_invoke", "*");
+    assert!(matches!(
+        load(dir.path(), &wildcard, &profile, &key, PinMode::CompareOnly),
+        Err(PolicyError::MainnetMinimumUnmet {
+            requirement: "tool",
+            rule: Some(0)
+        })
+    ));
+    assert_eq!(
+        mainnet_minimum::MAINNET_VALUE_OUT_TOOLS,
+        [
+            "stellar_pay",
+            "stellar_pay_commit",
+            "stellar_create_account",
+            "stellar_create_account_commit",
+            "stellar_x402_create_payment",
+            "stellar_x402_authenticated_payment"
+        ]
+    );
+}
+minimum!(
+    minimum_body_version,
+    "body_version",
+    |d: &mut DocumentMut| {
+        d["version"] = value(1);
+    }
+);
+minimum!(minimum_sequence, "body_version", |d: &mut DocumentMut| {
+    d["sequence"] = value(0);
+});
+minimum!(
+    minimum_mainnet_table,
+    "mainnet_table",
+    |d: &mut DocumentMut| {
+        d.remove("mainnet");
+    }
+);
+minimum!(minimum_rules_empty, "rules_empty", |d: &mut DocumentMut| {
+    d.remove("rules");
+});
+minimum!(minimum_scope, "scope", |d: &mut DocumentMut| {
+    d["scope"] = value("profile:*");
+});
+minimum!(minimum_chain, "chain", |d: &mut DocumentMut| {
+    rule(d)["match"]["chain"] = value("*");
+});
+minimum!(minimum_tool, "tool", |d: &mut DocumentMut| {
+    rule(d)["match"]["tool"] = value("*");
+});
+minimum!(minimum_opaque, "opaque", |d: &mut DocumentMut| {
+    rule(d)["allow_opaque_signing"] = value(true);
+});
+minimum!(minimum_ttl_absent, "rule_ttl", |d: &mut DocumentMut| {
+    rule(d).remove("ttl_secs");
+});
+minimum!(minimum_ttl_above_day, "rule_ttl", |d: &mut DocumentMut| {
+    rule(d)["ttl_secs"] = value(86_401);
+});
+minimum!(
+    minimum_asset_allowlist,
+    "asset_allowlist",
+    |d: &mut DocumentMut| {
+        rule(d)["criteria"].as_array_mut().unwrap().remove(0);
+    }
+);
+minimum!(minimum_destination, "destination", |d: &mut DocumentMut| {
+    rule(d)["criteria"].as_array_mut().unwrap().remove(1);
+});
+minimum!(
+    minimum_known_issuer_only,
+    "destination",
+    |d: &mut DocumentMut| {
+        criterion(d, 1).insert(
+            "kinds",
+            toml_edit::Value::Array(["KNOWN_ISSUER"].into_iter().collect()),
+        );
+    }
+);
+minimum!(minimum_per_tx_cap, "per_tx_cap", |d: &mut DocumentMut| {
+    rule(d)["criteria"].as_array_mut().unwrap().remove(2);
+});
+minimum!(
+    minimum_per_period_cap,
+    "per_period_cap",
+    |d: &mut DocumentMut| {
+        rule(d)["criteria"].as_array_mut().unwrap().remove(3);
+    }
+);
+minimum!(minimum_rate_limit, "rate_limit", |d: &mut DocumentMut| {
+    rule(d)["criteria"].as_array_mut().unwrap().remove(4);
+});
+minimum!(minimum_fee_cap, "fee_cap", |d: &mut DocumentMut| {
+    d["mainnet"]
+        .as_table_like_mut()
+        .unwrap()
+        .remove("classic_max_fee_per_op_stroops");
+});
+minimum!(minimum_native_floor, "thresholds", |d: &mut DocumentMut| {
+    d["mainnet"]["cross_check_thresholds"]["native"] = value("9999999999");
+});
+minimum!(
+    minimum_positive_threshold,
+    "thresholds",
+    |d: &mut DocumentMut| {
+        d["mainnet"]["cross_check_thresholds"]["native"] = value("0");
+    }
+);
+minimum!(minimum_authorization_ttl, "ttl", |d: &mut DocumentMut| {
+    d["mainnet"]["authorization_ttl_seconds"] = value(121);
+});
+minimum!(
+    minimum_claim_has_no_assets,
+    "asset_allowlist",
+    |d: &mut DocumentMut| {
+        rule(d)["match"]["tool"] = value("stellar_claim");
+    }
+);
+
+minimum!(
+    minimum_duplicate_asset_allowlist,
+    "asset_allowlist",
+    |d: &mut DocumentMut| {
+        let extra = rule(d)["criteria"]
+            .as_array()
+            .unwrap()
+            .get(0)
+            .unwrap()
+            .clone();
+        rule(d)["criteria"].as_array_mut().unwrap().push(extra);
+    }
+);
+minimum!(
+    minimum_unpinned_asset,
+    "asset_allowlist",
+    |d: &mut DocumentMut| {
+        criterion(d, 0).insert(
+            "assets",
+            toml_edit::Value::Array(["USD"].into_iter().collect()),
+        );
+    }
+);
+minimum!(
+    minimum_authorization_ttl_zero,
+    "ttl",
+    |d: &mut DocumentMut| {
+        d["mainnet"]["authorization_ttl_seconds"] = value(0);
+    }
+);
+minimum!(
+    minimum_threshold_key,
+    "thresholds",
+    |d: &mut DocumentMut| {
+        d["mainnet"]["cross_check_thresholds"]["USD"] = value("1");
+    }
+);
+#[test]
+#[serial_test::serial]
+fn minimum_deny_rules_need_no_value_restrictions() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let profile = profile(true);
+    for tool in ["stellar_pay", "stellar_trustline"] {
+        let mut doc = FULL.parse::<DocumentMut>().unwrap();
+        rule(&mut doc)["match"]["tool"] = value(tool);
+        rule(&mut doc)["decision"] = value("deny");
+        rule(&mut doc).remove("reason");
+        rule(&mut doc).remove("ttl_secs");
+        rule(&mut doc)["criteria"] = value(toml_edit::Array::new());
+        stellar_agent_core::policy::v1::validate_unsigned_policy(
+            &doc.to_string(),
+            "operator",
+            &profile.network_passphrase,
+        )
+        .unwrap();
+        mainnet_minimum::validate(&doc, &profile, "operator").unwrap();
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn minimum_authorization_ttl_endpoints_pass() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let profile = profile(true);
+    for ttl in [1, 120] {
+        let mut doc = FULL.parse::<DocumentMut>().unwrap();
+        doc["mainnet"]["authorization_ttl_seconds"] = value(ttl);
+        mainnet_minimum::validate(&doc, &profile, "operator").unwrap();
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn minimum_read_only_and_trustline_requirements() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let profile = profile(true);
+    for tool in mainnet_minimum::MAINNET_READ_ONLY_TOOLS {
+        let mut doc = FULL.parse::<DocumentMut>().unwrap();
+        rule(&mut doc)["match"]["tool"] = value(*tool);
+        rule(&mut doc)["criteria"] = value(toml_edit::Array::new());
+        assert!(mainnet_minimum::validate(&doc, &profile, "operator").is_ok());
+    }
+    for tool in ["stellar_trustline", "stellar_claim"] {
+        let mut doc = FULL.parse::<DocumentMut>().unwrap();
+        rule(&mut doc)["match"]["tool"] = value(tool);
+        let criteria = rule(&mut doc)["criteria"].as_array_mut().unwrap();
+        criteria.retain(|c| {
+            let kind = c.as_inline_table().unwrap()["kind"].as_str().unwrap();
+            kind == "rate_limit" || (tool == "stellar_trustline" && kind == "asset_allowlist")
+        });
+        assert_eq!(criteria.len(), 1 + usize::from(tool == "stellar_trustline"));
+        assert!(mainnet_minimum::validate(&doc, &profile, "operator").is_ok());
+    }
+}
+
+/// The documented mainnet example: a payment rule needing approval for at
+/// most one day, and claim and trustline rules for both phases.
+const EXTENDED_MINIMUM: &str = include_str!("../fixtures/policy-v2-extended-minimum.toml");
+
+/// The rule indexes for which `doc` fails the mainnet `requirement`.
+fn failing_rules(doc: &DocumentMut, requirement: &str) -> Vec<Option<usize>> {
+    mainnet_minimum::failures(doc, &profile(true), "operator")
+        .into_iter()
+        .filter_map(|error| match error {
+            PolicyError::MainnetMinimumUnmet {
+                requirement: name,
+                rule,
+            } if name == requirement => Some(rule),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The example loads signed and meets the mainnet minimum. Every claim and
+/// trustline rule, commit phase included, fails without its own rate limit.
+/// The approval rule accepts an explicit lifetime of 1 through 86,400
+/// seconds only.
+#[test]
+#[serial_test::serial]
+fn documented_mainnet_minimum_examples() {
+    use stellar_agent_core::policy::v1::loader::load_signed_policy_text;
+    use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let key = SigningKey::from_bytes(&[11; 32]);
+    load_signed_policy_text(
+        &signed(EXTENDED_MINIMUM, &key),
+        "operator",
+        &key.verifying_key().to_bytes(),
+        MAINNET_PASSPHRASE,
+    )
+    .unwrap();
+    let doc = EXTENDED_MINIMUM.parse::<DocumentMut>().unwrap();
+    mainnet_minimum::validate(&doc, &profile(true), "operator").unwrap();
+
+    let tools: Vec<String> = doc["rules"]
+        .as_array_of_tables()
+        .unwrap()
+        .iter()
+        .map(|rule| rule["match"]["tool"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        tools,
+        [
+            "stellar_pay",
+            "stellar_claim",
+            "stellar_claim_commit",
+            "stellar_trustline",
+            "stellar_trustline_commit"
+        ]
+    );
+    for (index, tool) in tools.iter().enumerate().skip(1) {
+        let mut without = doc.clone();
+        let criteria = without["rules"]
+            .as_array_of_tables_mut()
+            .unwrap()
+            .get_mut(index)
+            .unwrap()["criteria"]
+            .as_array_mut()
+            .unwrap();
+        criteria.retain(|c| c.as_inline_table().unwrap()["kind"].as_str() != Some("rate_limit"));
+        assert_eq!(
+            failing_rules(&without, "rate_limit"),
+            [Some(index)],
+            "{tool}"
+        );
+    }
+
+    for (ttl, accepted) in [
+        (None, false),
+        (Some(0), false),
+        (Some(1), true),
+        (Some(86_400), true),
+        (Some(86_401), false),
+    ] {
+        let mut edited = doc.clone();
+        match ttl {
+            Some(ttl) => rule(&mut edited)["ttl_secs"] = value(ttl),
+            None => {
+                rule(&mut edited).remove("ttl_secs");
+            }
+        }
+        let expected: &[Option<usize>] = if accepted { &[] } else { &[Some(0)] };
+        assert_eq!(failing_rules(&edited, "rule_ttl"), expected, "{ttl:?}");
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn minimum_cap_coverage_uses_network_identity() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let profile = profile(true);
+    let classic = "USD:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    let sac = stellar_agent_core::asset_id::CanonicalAsset::parse_threshold_key(classic)
+        .unwrap()
+        .sac_contract_id(&profile.network_passphrase)
+        .unwrap();
+    let mut doc = FULL
+        .replace(
+            "assets = [\"native\"]",
+            &format!("assets = [\"{classic}\"]"),
+        )
+        .replace("asset = \"native\"", &format!("asset = \"{sac}\""))
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert!(mainnet_minimum::validate(&doc, &profile, "operator").is_ok());
+    criterion(&mut doc, 2).insert(
+        "asset",
+        stellar_agent_core::asset_id::CanonicalAsset::parse_threshold_key(&format!(
+            "USD:{}",
+            stellar_strkey::ed25519::PublicKey([8; 32])
+        ))
+        .unwrap()
+        .sac_contract_id(&profile.network_passphrase)
+        .unwrap()
+        .into(),
+    );
+    assert!(
+        mainnet_minimum::failures(&doc, &profile, "operator")
+            .iter()
+            .any(|e| matches!(
+                e,
+                PolicyError::MainnetMinimumUnmet {
+                    requirement: "per_tx_cap",
+                    rule: Some(0)
+                }
+            ))
+    );
+}
+
+#[test]
+#[serial]
+fn absent_v2_advances_and_equal_does_not_write() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    let first = load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap();
+    assert_eq!(first.sequence(), 7);
+    let before = pinned(dir.path(), &profile);
+    let coordinate = policy_pin_entry_ref(&profile.policy_window_state_key_id);
+    let raw = keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+        .unwrap()
+        .get_password()
+        .unwrap();
+    keyring_mock::install_with_write_error(
+        &coordinate.service,
+        &coordinate.account,
+        Some(&raw),
+        keyring_core::Error::NoEntry,
+    )
+    .unwrap();
+    let second = load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap();
+    assert_eq!(first.digest(), second.digest());
+    assert_eq!(pinned(dir.path(), &profile), before);
+}
+#[test]
+#[serial]
+fn honest_advance_accepts_and_rollback_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap();
+    let newer = FULL.replace("sequence = 7", "sequence = 8");
+    assert_eq!(
+        load(dir.path(), &newer, &profile, &key, PinMode::Advance)
+            .unwrap()
+            .sequence(),
+        8
+    );
+    assert!(matches!(
+        load(dir.path(), FULL, &profile, &key, PinMode::Advance),
+        Err(PolicyError::SequenceRollback)
+    ));
+    assert!(matches!(pinned(dir.path(), &profile), PinState::Present(pin) if pin.sequence() == 8));
+}
+#[test]
+#[serial]
+fn equal_sequence_digest_fork_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap();
+    assert!(matches!(
+        load(
+            dir.path(),
+            &FULL.replace("review", "changed"),
+            &profile,
+            &key,
+            PinMode::Advance
+        ),
+        Err(PolicyError::SequenceFork)
+    ));
+}
+#[test]
+#[serial]
+fn equal_sequence_owner_fork_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    let canonical = canonical_bytes(FULL).unwrap();
+    put_pin(
+        dir.path(),
+        &profile,
+        7,
+        *blake3::hash(&canonical).as_bytes(),
+        [0; 32],
+    );
+    assert!(matches!(
+        load(dir.path(), FULL, &profile, &key, PinMode::Advance),
+        Err(PolicyError::SequenceFork)
+    ));
+}
+#[test]
+#[serial]
+fn v1_absent_accepts_but_present_refuses_on_testnet() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, _, key) = fixture();
+    let profile = profile(false);
+    assert_eq!(
+        load(dir.path(), V1, &profile, &key, PinMode::Advance)
+            .unwrap()
+            .sequence(),
+        0
+    );
+    assert_eq!(pinned(dir.path(), &profile), PinState::Absent);
+    put_pin(
+        dir.path(),
+        &profile,
+        7,
+        [0; 32],
+        key.verifying_key().to_bytes(),
+    );
+    assert!(matches!(
+        load(dir.path(), V1, &profile, &key, PinMode::Advance),
+        Err(PolicyError::SequenceRollback)
+    ));
+}
+#[test]
+#[serial]
+fn invalid_body_never_advances() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap();
+    let before = pinned(dir.path(), &profile);
+    let invalid = FULL
+        .replace("sequence = 7", "sequence = 8")
+        .replace("max_calls = 10", "max_calls = -1");
+    assert!(load(dir.path(), &invalid, &profile, &key, PinMode::Advance).is_err());
+    assert_eq!(pinned(dir.path(), &profile), before);
+}
+#[test]
+#[serial]
+fn compare_only_never_writes_absent_or_advancing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    load(dir.path(), FULL, &profile, &key, PinMode::CompareOnly).unwrap();
+    assert_eq!(pinned(dir.path(), &profile), PinState::Absent);
+    put_pin(
+        dir.path(),
+        &profile,
+        1,
+        [0; 32],
+        key.verifying_key().to_bytes(),
+    );
+    let before = pinned(dir.path(), &profile);
+    load(dir.path(), FULL, &profile, &key, PinMode::CompareOnly).unwrap();
+    assert_eq!(pinned(dir.path(), &profile), before);
+}
+#[test]
+#[serial]
+fn failed_pin_write_returns_no_proof() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    let coordinate = policy_pin_entry_ref(&profile.policy_window_state_key_id);
+    keyring_mock::install_with_write_error(
+        &coordinate.service,
+        &coordinate.account,
+        None,
+        keyring_core::Error::NoEntry,
+    )
+    .unwrap();
+    let err = load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            PolicyError::PinUnusable { detail }
+                if detail.starts_with("the policy pin keyring entry could not be used: ")
+        ),
+        "{err:?}"
+    );
+    assert_eq!(err.wire_code(), "policy.pin_unusable");
+    assert_eq!(pinned(dir.path(), &profile), PinState::Absent);
+}
+#[test]
+#[serial]
+fn held_lock_refuses_with_busy_and_no_proof() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    let _lock = WindowStoreLock::acquire_for(
+        &dir.path().join("state.window"),
+        &profile.policy_window_state_key_id,
+    )
+    .unwrap();
+    let start = std::time::Instant::now();
+    assert!(matches!(
+        load(dir.path(), FULL, &profile, &key, PinMode::Advance),
+        Err(PolicyError::StateLockBusy)
+    ));
+    assert!(start.elapsed() >= std::time::Duration::from_millis(100));
+}
+#[test]
+#[serial]
+fn pin_read_is_guarded_against_interleaving() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    let coordinate = policy_pin_entry_ref(&profile.policy_window_state_key_id);
+    let path = dir.path().join("state.window");
+    let hook_profile = profile.clone();
+    let wrote = Arc::new(AtomicBool::new(false));
+    let observed = wrote.clone();
+    keyring_mock::install_with_read_hooks(vec![ReadHook::new(
+        &coordinate.service,
+        &coordinate.account,
+        Arc::new(move || {
+            if let Ok(lock) =
+                WindowStoreLock::acquire_for(&path, &hook_profile.policy_window_state_key_id)
+            {
+                pin::write_for_test(
+                    &lock,
+                    &PinScope::for_profile(&path, &hook_profile),
+                    &Pin::new(9, [9; 32], [9; 32]).unwrap(),
+                )
+                .unwrap();
+                observed.store(true, Ordering::SeqCst);
+            }
+        }),
+    )])
+    .unwrap();
+    put_pin(
+        dir.path(),
+        &profile,
+        6,
+        [6; 32],
+        key.verifying_key().to_bytes(),
+    );
+    let result = load(dir.path(), FULL, &profile, &key, PinMode::Advance);
+    if wrote.load(Ordering::SeqCst) {
+        assert!(matches!(result, Err(PolicyError::SequenceRollback)));
+        assert!(
+            matches!(pinned(dir.path(), &profile), PinState::Present(pin) if pin.sequence() == 9)
+        );
+    } else {
+        assert_eq!(result.unwrap().sequence(), 7);
+    }
+    assert!(
+        !wrote.load(Ordering::SeqCst),
+        "pin reads must hold the state lock"
+    );
+}
+/// An advance compares the pin again under the exclusive lock it writes
+/// under. A pin that another writer advanced after the shared comparison
+/// refuses the older policy as a rollback and stays as that writer left it.
+#[test]
+#[serial]
+fn advance_compares_the_pin_again_before_it_writes() {
+    let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        guard_home
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
+    let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+    let (dir, profile, key) = fixture();
+    let coordinate = policy_pin_entry_ref(&profile.policy_window_state_key_id);
+    let newer = format!(
+        "{{\"v\":1,\"sequence\":9,\"digest\":\"{}\",\"owner\":\"{}\"}}",
+        "09".repeat(32),
+        stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes())
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counted = reads.clone();
+    let entry = coordinate.clone();
+    keyring_mock::install_with_read_hooks(vec![ReadHook::new(
+        &coordinate.service,
+        &coordinate.account,
+        Arc::new(move || {
+            // The second read is the one under the exclusive lock: the pin
+            // a writer stored after the shared comparison is visible to it.
+            if counted.fetch_add(1, Ordering::SeqCst) == 1 {
+                keyring_core::Entry::new(&entry.service, &entry.account)
+                    .unwrap()
+                    .set_password(&newer)
+                    .unwrap();
+            }
+        }),
+    )])
+    .unwrap();
+    put_pin(
+        dir.path(),
+        &profile,
+        6,
+        [6; 32],
+        key.verifying_key().to_bytes(),
+    );
+    let result = load(dir.path(), FULL, &profile, &key, PinMode::Advance);
+    assert!(
+        matches!(result, Err(PolicyError::SequenceRollback)),
+        "{:?}",
+        result.map(|verified| verified.sequence())
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    assert!(matches!(pinned(dir.path(), &profile), PinState::Present(pin) if pin.sequence() == 9));
+}
+/// A second writer thread runs in the gap between the shared release and the
+/// exclusive acquisition of an advance. It takes the exclusive lock itself, so
+/// the advance holds no guard there. A newer pin it writes refuses the stale
+/// advance as a rollback and stays; an equal pin it writes is left unwritten.
+#[test]
+#[serial]
+fn a_writer_in_the_advance_gap_is_compared_before_the_write() {
+    let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        guard_home
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
+    let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+    let (dir, profile, key) = fixture();
+    let owner = key.verifying_key().to_bytes();
+    put_pin(dir.path(), &profile, 6, [6; 32], owner);
+    let root = dir.path().to_path_buf();
+    let writer_profile = profile.clone();
+    let wrote = Arc::new(AtomicBool::new(false));
+    let observed = wrote.clone();
+    verified::advance_gap_hook::install(move || {
+        std::thread::spawn(move || {
+            let path = root.join("state.window");
+            let lock =
+                WindowStoreLock::acquire_for(&path, &writer_profile.policy_window_state_key_id)
+                    .expect("the advance holds no guard in the gap");
+            pin::write_for_test(
+                &lock,
+                &PinScope::for_profile(&path, &writer_profile),
+                &Pin::new(9, [9; 32], owner).unwrap(),
+            )
+            .unwrap();
+            observed.store(true, Ordering::SeqCst);
+        })
+        .join()
+        .unwrap();
+    });
+    let result = load(dir.path(), FULL, &profile, &key, PinMode::Advance);
+    verified::advance_gap_hook::clear();
+    assert!(wrote.load(Ordering::SeqCst), "the writer ran in the gap");
+    assert!(
+        matches!(result, Err(PolicyError::SequenceRollback)),
+        "{:?}",
+        result.map(|verified| verified.sequence())
+    );
+    assert!(
+        matches!(pinned(dir.path(), &profile), PinState::Present(pin) if pin.sequence() == 9 && pin.digest() == [9; 32])
+    );
+
+    put_pin(dir.path(), &profile, 6, [6; 32], owner);
+    let root = dir.path().to_path_buf();
+    let writer_profile = profile.clone();
+    let writer_key = key.clone();
+    verified::advance_gap_hook::install(move || {
+        std::thread::spawn(move || {
+            load_file(
+                &root,
+                &writer_profile,
+                &writer_key,
+                OwnerKeySource::Keyring,
+                PinMode::Advance,
+            )
+            .map(|verified| verified.sequence())
+        })
+        .join()
+        .unwrap()
+        .expect("the second writer advances the pin to the same policy");
+    });
+    let result = load(dir.path(), FULL, &profile, &key, PinMode::Advance);
+    verified::advance_gap_hook::clear();
+    assert_eq!(result.unwrap().sequence(), 7);
+    assert!(
+        matches!(pinned(dir.path(), &profile), PinState::Present(pin) if pin.sequence() == 7 && pin.digest() != [6; 32])
+    );
+}
+#[test]
+#[serial]
+fn compare_runs_under_the_lock_the_pin_was_read_with() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    let path = dir.path().join("state.window");
+    let window_key = &profile.policy_window_state_key_id;
+    put_pin(
+        dir.path(),
+        &profile,
+        6,
+        [6; 32],
+        key.verifying_key().to_bytes(),
+    );
+    let (state, writer) = with_pin_without_creating(&path, &profile, |state| {
+        (
+            state,
+            WindowStoreLock::acquire_for(&path, window_key).map(drop),
+        )
+    })
+    .unwrap();
+    assert!(matches!(state, PinState::Present(ref pin) if pin.sequence() == 6));
+    assert_eq!(writer, Err(StateLockError::WriterLocked));
+    assert!(WindowStoreLock::acquire_for(&path, window_key).is_ok());
+
+    let fresh = dir.path().join("absent").join("state.window");
+    let state = with_pin_without_creating(&fresh, &profile, |state| state).unwrap();
+    assert_eq!(state, PinState::Absent);
+    assert!(!dir.path().join("absent").exists());
+}
+#[test]
+#[serial]
+fn compare_only_loads_hold_the_lock_against_a_writer() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    let coordinate = policy_pin_entry_ref(&profile.policy_window_state_key_id);
+    let path = dir.path().join("state.window");
+    let owner = key.verifying_key().to_bytes();
+    std::fs::write(dir.path().join("policy.toml"), signed(FULL, &key)).unwrap();
+    let hook_profile = profile.clone();
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let recorded = attempts.clone();
+    keyring_mock::install_with_read_hooks(vec![ReadHook::new(
+        &coordinate.service,
+        &coordinate.account,
+        Arc::new(move || {
+            let attempt = acquire_state_lock(&path, &hook_profile).and_then(|lock| {
+                pin::write_for_test(
+                    &lock,
+                    &PinScope::for_profile(&path, &hook_profile),
+                    &Pin::new(9, [9; 32], [9; 32]).unwrap(),
+                )
+                .map_err(PolicyError::from)
+            });
+            recorded
+                .lock()
+                .unwrap()
+                .push(attempt.map_err(|e| e.wire_code()));
+        }),
+    )])
+    .unwrap();
+    put_pin(dir.path(), &profile, 6, [6; 32], owner);
+
+    let loaded = load_file(
+        dir.path(),
+        &profile,
+        &key,
+        OwnerKeySource::Keyring,
+        PinMode::CompareOnly,
+    );
+    assert_eq!(loaded.unwrap().sequence(), 7);
+    let inspection = inspect_verified_policy(
+        &PolicyLoad {
+            path: &dir.path().join("policy.toml"),
+            profile: &profile,
+            profile_name: "operator",
+            owner_pubkey: &owner,
+            owner_source: OwnerKeySource::Keyring,
+            window_path: &dir.path().join("state.window"),
+        },
+        PolicyStateStore::new(),
+    );
+    assert!(matches!(inspection.pin, Some(PinState::Present(ref pin)) if pin.sequence() == 6));
+    assert_eq!(inspection.verified.unwrap().sequence(), 7);
+    assert_eq!(
+        *attempts.lock().unwrap(),
+        vec![Err("policy.state_lock_busy"), Err("policy.state_lock_busy")]
+    );
+    assert!(matches!(pinned(dir.path(), &profile), PinState::Present(pin) if pin.sequence() == 6));
+}
+#[test]
+#[serial]
+fn testnet_refuses_mainnet_table() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, _, key) = fixture();
+    assert!(matches!(
+        load(
+            dir.path(),
+            FULL,
+            &profile(false),
+            &key,
+            PinMode::CompareOnly
+        ),
+        Err(PolicyError::MainnetTableOnTestnet)
+    ));
+}
+
+#[test]
+#[serial]
+fn unknown_v2_keys_precede_signature_verification() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    // A credential-like key: the refusal names the location and the accepted
+    // keys, never the rejected key.
+    const MARKER: &str = "CREDMARKER7";
+    let (dir, profile, key) = fixture();
+    for place in [
+        "root",
+        "mainnet",
+        "thresholds",
+        "rule",
+        "match",
+        "criterion",
+        "signature",
+    ] {
+        for valid in [true, false] {
+            let mut doc = signed(FULL, &key).parse::<DocumentMut>().unwrap();
+            match place {
+                "root" => {
+                    doc[MARKER] = value(1);
+                }
+                "mainnet" => {
+                    doc["mainnet"][MARKER] = value(1);
+                }
+                "thresholds" => {
+                    doc["mainnet"]["cross_check_thresholds"][MARKER] = value("1");
+                }
+                "rule" => {
+                    rule(&mut doc)[MARKER] = value(1);
+                }
+                "match" => {
+                    rule(&mut doc)["match"][MARKER] = value(1);
+                }
+                "criterion" => {
+                    rule(&mut doc)["criteria"]
+                        .as_array_mut()
+                        .unwrap()
+                        .get_mut(0)
+                        .unwrap()
+                        .as_inline_table_mut()
+                        .unwrap()
+                        .insert(MARKER, 1.into());
+                }
+                _ => {
+                    doc["signature"][MARKER] = value(1);
+                }
+            }
+            let canon = canonical_bytes(&doc.to_string()).unwrap();
+            doc["signature"]["sig"] = value(stellar_agent_core::hex::encode(
+                &key.sign(blake3::hash(&canon).as_bytes()).to_bytes(),
+            ));
+            if !valid {
+                doc["signature"]["sig"] = value("00");
+            }
+            std::fs::write(dir.path().join("policy.toml"), doc.to_string()).unwrap();
+            let result = load_file(
+                dir.path(),
+                &profile,
+                &key,
+                OwnerKeySource::Keyring,
+                PinMode::Advance,
+            );
+            assert!(
+                matches!(
+                    &result,
+                    Err(PolicyError::PolicyFileParseFailed { detail })
+                        if detail.contains("unknown key; ") && !detail.contains(MARKER)
+                ),
+                "{place}: {result:?}"
+            );
+        }
+    }
+}
+#[test]
+#[serial]
+fn mainnet_configuration_condition() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    assert!(load(dir.path(), V1, &profile, &key, PinMode::CompareOnly).is_ok());
+    assert!(
+        load(
+            dir.path(),
+            &without_mainnet(),
+            &profile,
+            &key,
+            PinMode::CompareOnly
+        )
+        .is_ok()
+    );
+    let invalid = FULL.replace("ttl_secs = 3600", "ttl_secs = 86401");
+    assert_eq!(
+        load(dir.path(), &invalid, &profile, &key, PinMode::CompareOnly).is_err(),
+        cfg!(feature = "mainnet-write")
+    );
+}
+/// The engine of a verified policy carries the digest of the signed canonical
+/// bytes, which is the proof's digest and the epoch of a sized total entry.
+#[test]
+#[serial]
+fn policy_digest_matches_verified_policy() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::policy::v1::{
+        criteria::state_store::WindowLimit,
+        value::{ActionKind, ValueClass, ValueLeg},
+    };
+    let (dir, profile, key) = fixture();
+    let mut doc = without_mainnet().parse::<DocumentMut>().unwrap();
+    rule(&mut doc)["match"]["chain"] = value("*");
+    rule(&mut doc)["decision"] = value("allow");
+    rule(&mut doc).remove("reason");
+    rule(&mut doc).remove("ttl_secs");
+    rule(&mut doc)["criteria"].as_array_mut().unwrap().push(
+        "{ kind = \"total_budget\", asset = \"native\", max_stroops = 500 }"
+            .parse::<toml_edit::Value>()
+            .unwrap(),
+    );
+    let raw = doc.to_string();
+    let verified = load(dir.path(), &raw, &profile, &key, PinMode::CompareOnly).unwrap();
+    let digest = *blake3::hash(&canonical_bytes(&raw).unwrap()).as_bytes();
+    assert_eq!(verified.digest(), digest);
+    let engine = verified.engine();
+    assert_eq!(engine.policy_digest(), digest);
+
+    let value = ValueClass::single(ValueLeg {
+        kind: ActionKind::Payment,
+        amount: Some(50),
+        asset: Some("native".to_owned()),
+        destination: Some("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned()),
+    });
+    let entries = engine
+        .size_window_entries(&tool(), &profile, &value, 1_800_000_000_000)
+        .unwrap();
+    let total = entries
+        .iter()
+        .find(|entry| matches!(entry.limit(), WindowLimit::Total { .. }))
+        .unwrap();
+    assert_eq!(total.epoch(), Some(digest));
+    assert_eq!(total.amount(), 50);
+    assert!(
+        entries
+            .iter()
+            .filter(|entry| !matches!(entry.limit(), WindowLimit::Total { .. }))
+            .all(|entry| entry.epoch().is_none())
+    );
+}
+fn criterion(doc: &mut DocumentMut, index: usize) -> &mut toml_edit::InlineTable {
+    rule(doc)["criteria"]
+        .as_array_mut()
+        .unwrap()
+        .get_mut(index)
+        .unwrap()
+        .as_inline_table_mut()
+        .unwrap()
+}
+
+#[test]
+#[serial_test::serial]
+fn asset_equivalence_covers_classic_native_and_networks() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::{
+        asset_id::CanonicalAsset, policy::v1::asset_equivalence::assets_equivalent,
+    };
+    let mainnet = profile(true);
+    let testnet = profile(false);
+    let classic = "USD:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    let asset = CanonicalAsset::parse_threshold_key(classic).unwrap();
+    let sac = asset.sac_contract_id(&mainnet.network_passphrase).unwrap();
+    assert!(assets_equivalent(
+        classic,
+        &sac,
+        &mainnet.network_passphrase
+    ));
+    assert!(assets_equivalent(
+        &sac,
+        classic,
+        &mainnet.network_passphrase
+    ));
+    assert!(!assets_equivalent(
+        classic,
+        &sac,
+        &testnet.network_passphrase
+    ));
+    assert!(!assets_equivalent(
+        &sac,
+        &stellar_strkey::Contract([8; 32]).to_string(),
+        &mainnet.network_passphrase
+    ));
+    assert!(assets_equivalent(
+        "native",
+        "XLM",
+        &mainnet.network_passphrase
+    ));
+    assert!(assets_equivalent(
+        "native",
+        &CanonicalAsset::Native
+            .sac_contract_id(&mainnet.network_passphrase)
+            .unwrap(),
+        &mainnet.network_passphrase
+    ));
+}
+
+fn tool() -> stellar_agent_core::policy::ToolDescriptor {
+    use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor, ToolValueKind};
+    ToolDescriptor::from_registration(&McpToolRegistration {
+        name: "stellar_pay",
+        destructive_hint: true,
+        read_only_hint: false,
+        chain_id_required: true,
+        value_kind: ToolValueKind::MovesValue,
+    })
+}
+fn ctx<'a>(
+    tool: &'a stellar_agent_core::policy::ToolDescriptor,
+    profile: &'a Profile,
+    args: &'a serde_json::Value,
+    state: &'a PolicyStateStore,
+) -> stellar_agent_core::policy::v1::EvalContext<'a> {
+    stellar_agent_core::policy::v1::EvalContext::new(
+        tool,
+        args,
+        "operator",
+        profile,
+        state,
+        1_700_000_000_000,
+    )
+    .with_value(stellar_agent_core::policy::v1::value::derive_value_class(
+        "stellar_pay",
+        args,
+    ))
+}
+fn classic_and_sac(profile: &Profile) -> (String, String) {
+    let classic = "USD:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned();
+    let sac = stellar_agent_core::asset_id::CanonicalAsset::parse_threshold_key(&classic)
+        .unwrap()
+        .sac_contract_id(&profile.network_passphrase)
+        .unwrap();
+    (classic, sac)
+}
+#[test]
+#[serial_test::serial]
+fn asset_allowlist_testnet_equivalence_and_deny_code() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::policy::{
+        DenyReason,
+        v1::criteria::{Criterion, asset_allowlist::AssetAllowlistCriterion},
+    };
+    let profile = profile(false);
+    let tool = tool();
+    let state = PolicyStateStore::new();
+    let (classic, sac) = classic_and_sac(&profile);
+    let allowlist = AssetAllowlistCriterion::new(vec![classic]).unwrap();
+    let allowed = serde_json::json!({"asset": sac, "amount_stroops": "60"});
+    assert!(
+        allowlist
+            .evaluate(&ctx(&tool, &profile, &allowed, &state))
+            .unwrap()
+            .is_none()
+    );
+    let denied = serde_json::json!({"asset": "native", "amount_stroops": "60"});
+    let denial = allowlist
+        .evaluate(&ctx(&tool, &profile, &denied, &state))
+        .unwrap()
+        .unwrap();
+    assert_eq!(denial, DenyReason::AssetNotAllowlisted);
+    assert_eq!(denial.wire_code(), "policy.deny.asset_not_allowlisted");
+}
+#[test]
+#[serial_test::serial]
+fn per_transaction_cap_counts_equivalent_sac() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::policy::{
+        DenyReason,
+        v1::criteria::{Criterion, per_tx_cap::PerTxCapCriterion},
+    };
+    let profile = profile(false);
+    let tool = tool();
+    let state = PolicyStateStore::new();
+    let (classic, sac) = classic_and_sac(&profile);
+    let cap = PerTxCapCriterion::new(classic, 100);
+    let args = serde_json::json!({"asset": sac, "amount_stroops": "101"});
+    assert!(matches!(
+        cap.evaluate(&ctx(&tool, &profile, &args, &state)).unwrap(),
+        Some(DenyReason::PerTxCapExceeded {
+            attempted_stroops: 101,
+            ..
+        })
+    ));
+}
+#[test]
+#[serial_test::serial]
+fn period_accounting_sums_classic_and_sac() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::policy::{
+        DenyReason,
+        v1::criteria::{
+            Criterion,
+            per_period_cap::{PerPeriodCapCriterion, Window},
+        },
+    };
+    let profile = profile(false);
+    let tool = tool();
+    let state = PolicyStateStore::new();
+    let (classic, sac) = classic_and_sac(&profile);
+    let cap = PerPeriodCapCriterion::new(classic.clone(), Window::parse("1d").unwrap(), 100);
+    for asset in [&classic, &sac] {
+        let args = serde_json::json!({"asset": asset, "amount_stroops": "40"});
+        let context = ctx(&tool, &profile, &args, &state);
+        assert!(cap.evaluate(&context).unwrap().is_none());
+        assert_eq!(cap.record_confirmed(&context).unwrap().len(), 1);
+    }
+    let args = serde_json::json!({"asset": sac, "amount_stroops": "21"});
+    assert!(matches!(
+        cap.evaluate(&ctx(&tool, &profile, &args, &state)).unwrap(),
+        Some(DenyReason::PerPeriodCapExceeded {
+            period_used_stroops: 80,
+            ..
+        })
+    ));
+}
+#[test]
+#[serial_test::serial]
+fn bundle_period_overlay_counts_two_sac_inners() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::policy::{
+        DenyReason,
+        v1::{
+            bundle::{BundleStateOverlay, BundleView, InnerOpDescriptor},
+            criteria::{
+                Criterion,
+                per_period_cap::{PerPeriodCapCriterion, Window},
+            },
+        },
+    };
+    let profile = profile(false);
+    let tool = tool();
+    let state = PolicyStateStore::new();
+    let (classic, sac) = classic_and_sac(&profile);
+    let cap = PerPeriodCapCriterion::new(classic, Window::parse("1d").unwrap(), 100);
+    let args = serde_json::json!({"asset": sac, "amount_stroops": "60"});
+    let inner = InnerOpDescriptor::TokenTransfer {
+        asset: sac,
+        from: "sender".into(),
+        to: "recipient".into(),
+        amount: 60,
+    };
+    let inners = [inner.clone(), inner.clone()];
+    let mut overlay = BundleStateOverlay::default();
+    assert!(
+        cap.evaluate(&ctx(&tool, &profile, &args, &state))
+            .unwrap()
+            .is_none()
+    );
+    cap.accumulate_overlay(&ctx(&tool, &profile, &args, &state), &inner, &mut overlay);
+    let view = BundleView {
+        inners: &inners,
+        overlay: &overlay,
+    };
+    assert!(matches!(
+        cap.evaluate(&ctx(&tool, &profile, &args, &state).with_bundle(&view))
+            .unwrap(),
+        Some(DenyReason::PerPeriodCapExceeded { .. })
+    ));
+}
+#[test]
+#[serial_test::serial]
+fn bundle_caps_and_accounting_use_classic_sac_identity() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::policy::v1::{
+        bundle::{BundleStateOverlay, BundleView, InnerOpDescriptor},
+        criteria::{
+            Criterion, bundle_aggregate_cap::BundleAggregateCapCriterion,
+            bundle_per_period_cap::BundlePerPeriodCapCriterion,
+            bundle_per_tx_cap::BundlePerTxCapCriterion, per_period_cap::Window,
+        },
+    };
+    let profile = profile(false);
+    let tool = tool();
+    let state = PolicyStateStore::new();
+    let (classic, sac) = classic_and_sac(&profile);
+    let inners = [InnerOpDescriptor::TokenTransfer {
+        asset: sac,
+        from: "sender".into(),
+        to: "recipient".into(),
+        amount: 60,
+    }];
+    let overlay = BundleStateOverlay::default();
+    let view = BundleView {
+        inners: &inners,
+        overlay: &overlay,
+    };
+    let args = serde_json::Value::Null;
+    let context = ctx(&tool, &profile, &args, &state).with_bundle(&view);
+    assert!(
+        BundlePerTxCapCriterion::new(classic.clone(), 50)
+            .evaluate(&context)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        (BundleAggregateCapCriterion {
+            asset: Some(classic.clone()),
+            max_amount: 50
+        })
+        .evaluate(&context)
+        .unwrap()
+        .is_some()
+    );
+    let period = BundlePerPeriodCapCriterion::new(classic, Window::parse("1d").unwrap(), 100);
+    assert!(period.evaluate(&context).unwrap().is_none());
+    assert_eq!(period.record_confirmed(&context).unwrap().len(), 1);
+    assert!(period.evaluate(&context).unwrap().is_some());
+}
+
+/// The oracle URL of [`enabled_fixture`]'s profile, whose host the signed
+/// fixture policy names.
+const ORACLE_URL: &str = "https://oracle.example.invalid";
+
+/// `profile` with the oracle of [`ORACLE_URL`] and the provider records a
+/// mainnet profile with an oracle needs.
+fn with_oracle(profile: &Profile, oracle_url: &str) -> Profile {
+    use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
+    let mut profile = profile.clone();
+    let built = Profile::builder_mainnet_named(
+        "operator",
+        "https://rpc.example.invalid",
+        "s",
+        "a",
+        "n",
+        "a",
+    )
+    .primary_provider(PrimaryProviderRecord::new(
+        "Primary operator",
+        "rpc.example.invalid",
+    ))
+    .oracle_provider_url(url::Url::parse(oracle_url).unwrap())
+    .oracle_provider(ProviderRecord::new(
+        "Oracle operator",
+        url::Url::parse(oracle_url).unwrap().host_str().unwrap(),
+        true,
+    ))
+    .build();
+    profile.oracle_provider_url = built.oracle_provider_url;
+    profile.providers = built.providers;
+    profile
+}
+
+fn enabled_fixture() -> (tempfile::TempDir, Profile, VerifiedPolicy) {
+    use sha2::Digest as _;
+    let (dir, profile, key) = fixture();
+    let profile = with_oracle(&profile, ORACLE_URL);
+    loader::save_to_dir("operator", &profile, dir.path()).unwrap();
+    let digest = stellar_agent_core::hex::encode(&sha2::Sha256::digest(b"installation-nonce"));
+    let body = FULL.replace(&"0".repeat(64), &digest);
+    let verified = load(dir.path(), &body, &profile, &key, PinMode::CompareOnly).unwrap();
+    (dir, profile, verified)
+}
+fn nonce(
+    _: &stellar_agent_core::profile::schema::KeyringEntryRef,
+) -> Result<String, stellar_agent_core::error::ValidationError> {
+    Ok("installation-nonce".into())
+}
+#[test]
+#[serial]
+fn enablement_verifies_all_bindings() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, verified) = enabled_fixture();
+    let record = verify_enablement(
+        &verified,
+        "operator",
+        ProfileNameSource::Flag,
+        &profile,
+        dir.path(),
+        &nonce,
+    )
+    .unwrap();
+    assert_eq!(record.policy_sequence(), 7);
+    assert_eq!(record.profile(), "operator");
+    assert_eq!(record.endpoint_host(), "rpc.example.invalid");
+    assert_eq!(record.oracle_host(), "oracle.example.invalid");
+    assert_eq!(record.fee_cap(), 500);
+    assert_eq!(record.authorization_ttl(), Some(60));
+}
+#[test]
+#[serial]
+fn enablement_name_source_and_default_refuse() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, verified) = enabled_fixture();
+    for (name, source, binding) in [
+        ("other", ProfileNameSource::Flag, "profile"),
+        ("operator", ProfileNameSource::Env, "source"),
+        ("operator", ProfileNameSource::Default, "source"),
+    ] {
+        let err =
+            verify_enablement(&verified, name, source, &profile, dir.path(), &nonce).unwrap_err();
+        assert_eq!(err.code(), "profile.mainnet_enablement_invalid");
+        assert!(
+            matches!(
+                err,
+                stellar_agent_core::error::ValidationError::MainnetEnablementInvalid {
+                    binding: found
+                } if found == binding
+            ),
+            "{err:?}"
+        );
+    }
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let raw = FULL.replace("operator", "default");
+    let path = dir.path().join("policy.toml");
+    std::fs::write(&path, signed(&raw, &key)).unwrap();
+    let verified = load_verified_policy(
+        &PolicyLoad {
+            path: &path,
+            profile: &profile,
+            profile_name: "default",
+            owner_pubkey: &key.verifying_key().to_bytes(),
+            owner_source: OwnerKeySource::Keyring,
+            window_path: &dir.path().join("state.window"),
+        },
+        PolicyStateStore::new(),
+        PinMode::CompareOnly,
+    )
+    .unwrap();
+    assert!(
+        verify_enablement(
+            &verified,
+            "default",
+            ProfileNameSource::Flag,
+            &profile,
+            dir.path(),
+            &nonce
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("default")
+    );
+}
+#[test]
+#[serial]
+fn enablement_disk_and_merged_hosts_are_both_checked() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, mut profile, verified) = enabled_fixture();
+    profile.rpc_url = "https://another.example.invalid".into();
+    assert!(
+        verify_enablement(
+            &verified,
+            "operator",
+            ProfileNameSource::Flag,
+            &profile,
+            dir.path(),
+            &nonce
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("merged_host")
+    );
+    loader::save_to_dir("operator", &profile, dir.path()).unwrap();
+    profile.rpc_url = "https://rpc.example.invalid".into();
+    assert!(
+        verify_enablement(
+            &verified,
+            "operator",
+            ProfileNameSource::Flag,
+            &profile,
+            dir.path(),
+            &nonce
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("on_disk_host")
+    );
+}
+/// The binding a refused enablement names; another refusal reads as its
+/// error code, which names no binding.
+fn refused_binding(
+    verified: &VerifiedPolicy,
+    profile: &Profile,
+    dir: &Path,
+) -> Option<&'static str> {
+    match verify_enablement(
+        verified,
+        "operator",
+        ProfileNameSource::Flag,
+        profile,
+        dir,
+        &nonce,
+    ) {
+        Err(stellar_agent_core::error::ValidationError::MainnetEnablementInvalid { binding }) => {
+            Some(binding)
+        }
+        Err(other) => Some(other.code()),
+        Ok(_) => None,
+    }
+}
+/// The merged oracle URL must name the signed oracle host: another host, an
+/// absent URL, and a hostless URL refuse as `merged_oracle_host`, while a
+/// host differing only in case, path, or credentials enables.
+#[test]
+#[serial]
+fn enablement_refuses_a_merged_oracle_host_other_than_the_signed_one() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, verified) = enabled_fixture();
+    assert_eq!(refused_binding(&verified, &profile, dir.path()), None);
+    for oracle in [
+        Some("https://other-oracle.example.invalid"),
+        Some("https://oracle.example.invalid:8443"),
+        Some("data:oracle.example.invalid"),
+        None,
+    ] {
+        let mut merged = profile.clone();
+        merged.oracle_provider_url = oracle.map(|raw| url::Url::parse(raw).unwrap());
+        assert_eq!(
+            refused_binding(&verified, &merged, dir.path()),
+            Some("merged_oracle_host"),
+            "{oracle:?}"
+        );
+    }
+    let mut merged = profile.clone();
+    merged.oracle_provider_url =
+        Some(url::Url::parse("https://user:pw@ORACLE.example.invalid:443/rpc?q=1").unwrap());
+    assert_eq!(refused_binding(&verified, &merged, dir.path()), None);
+}
+/// The stored oracle URL must name the signed oracle host even when the
+/// merged one does: another stored host and a stored file without an oracle
+/// URL refuse as `on_disk_oracle_host`.
+#[test]
+#[serial]
+fn enablement_refuses_an_on_disk_oracle_host_other_than_the_signed_one() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, verified) = enabled_fixture();
+    let stored = with_oracle(&profile, "https://other-oracle.example.invalid");
+    loader::save_to_dir("operator", &stored, dir.path()).unwrap();
+    assert_eq!(
+        refused_binding(&verified, &profile, dir.path()),
+        Some("on_disk_oracle_host")
+    );
+    let path = dir.path().join("operator.toml");
+    let mut file = std::fs::read_to_string(&path)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert!(file.remove("oracle_provider_url").is_some());
+    std::fs::write(&path, file.to_string()).unwrap();
+    assert_eq!(
+        refused_binding(&verified, &profile, dir.path()),
+        Some("on_disk_oracle_host")
+    );
+    loader::save_to_dir("operator", &profile, dir.path()).unwrap();
+    assert_eq!(refused_binding(&verified, &profile, dir.path()), None);
+}
+#[test]
+fn endpoint_host_normalization() {
+    assert_eq!(
+        normalize_endpoint_host("https://ignored:credential@RPC.Example.Invalid:443/path?q=yes")
+            .unwrap(),
+        "rpc.example.invalid"
+    );
+    assert_eq!(
+        normalize_endpoint_host("https://RPC.Example.Invalid:8443/path").unwrap(),
+        "rpc.example.invalid:8443"
+    );
+    assert!(normalize_endpoint_host("missing-host").is_err());
+}
+#[test]
+#[serial]
+fn enablement_nonce_digest_and_absence_refuse() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, verified) = enabled_fixture();
+    let digest = verify_enablement(
+        &verified,
+        "operator",
+        ProfileNameSource::Flag,
+        &profile,
+        dir.path(),
+        &|_| Ok("different".into()),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            digest,
+            stellar_agent_core::error::ValidationError::MainnetEnablementInvalid {
+                binding: "nonce_digest"
+            }
+        ),
+        "{digest:?}"
+    );
+    let absent = verify_enablement(
+        &verified,
+        "operator",
+        ProfileNameSource::Flag,
+        &profile,
+        dir.path(),
+        &stellar_agent_core::mainnet::enablement::read_enablement_nonce,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            absent,
+            stellar_agent_core::error::ValidationError::MainnetEnablementInvalid {
+                binding: "nonce"
+            }
+        ),
+        "{absent:?}"
+    );
+}
+#[test]
+#[serial]
+fn malformed_nonce_digest_refuses_at_load() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    for malformed in ["A".repeat(64), "0".repeat(63), "g".repeat(64)] {
+        assert!(matches!(
+            load(
+                dir.path(),
+                &FULL.replace(&"0".repeat(64), &malformed),
+                &profile,
+                &key,
+                PinMode::Advance
+            ),
+            Err(PolicyError::PolicyFileParseFailed { .. })
+        ));
+        assert_eq!(pinned(dir.path(), &profile), PinState::Absent);
+    }
+}
+#[test]
+#[serial_test::serial]
+fn state_lock_retries_then_succeeds() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let dir = tempfile::tempdir().unwrap();
+    let profile = profile(false);
+    let path = dir.path().join("state.window");
+    let held = WindowStoreLock::acquire_for(&path, &profile.policy_window_state_key_id).unwrap();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            drop(held);
+        });
+        assert!(
+            WindowStoreLock::acquire_for_with_retry(&path, &profile.policy_window_state_key_id)
+                .is_ok()
+        );
+    });
+}
+#[test]
+#[serial_test::serial]
+fn state_lock_io_preserves_error_kind() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let dir = tempfile::tempdir().unwrap();
+    let profile = profile(false);
+    let err = stellar_agent_core::policy::v1::verified::acquire_state_lock(
+        &dir.path().join("absent/state.window"),
+        &profile,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        PolicyError::StateLockIo {
+            kind: std::io::ErrorKind::NotFound
+        }
+    ));
+    assert_eq!(err.wire_code(), "policy.state_lock_io");
+}
+#[test]
+#[serial_test::serial]
+fn signed_threshold_precedence_and_wide_values() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use std::collections::BTreeMap;
+    use stellar_agent_core::{
+        asset_id::CanonicalAsset,
+        cross_check::{
+            CrossCheckThresholds, CrossCheckValue, ThresholdSet, cross_check_requirement,
+        },
+        profile::{caip2::Caip2, schema::MINIMUM_FLOOR},
+    };
+    let mut profile = profile(true);
+    let (classic, sac) = classic_and_sac(&profile);
+    let asset = CanonicalAsset::parse_threshold_key(&classic).unwrap();
+    let sac = CanonicalAsset::contract(&sac).unwrap();
+    // The last column is the off-mainnet composition. On mainnet a token
+    // threshold the owner did not sign applies nothing.
+    for (configured, signed, expected, off_mainnet) in [
+        (None, Some(25), Some(25), Some(25)),
+        (Some(25), None, None, Some(25)),
+        (Some(50), Some(25), Some(25), Some(25)),
+        (Some(25), Some(50), Some(25), Some(25)),
+        (Some(25), Some(25), Some(25), Some(25)),
+        (None, None, None, None),
+        (None, Some(i128::MAX), Some(i128::MAX), Some(i128::MAX)),
+    ] {
+        profile.cross_check_thresholds =
+            CrossCheckThresholds::new(configured.map(|v| (asset.clone(), v)).into_iter().collect())
+                .unwrap();
+        let table: BTreeMap<_, _> = signed.map(|v| (classic.clone(), v)).into_iter().collect();
+        let thresholds = ThresholdSet::from_profile_and_signed(&profile, Some(&table));
+        assert_eq!(thresholds.threshold_for(profile.chain_id, &asset), expected);
+        assert_eq!(thresholds.threshold_for(profile.chain_id, &sac), expected);
+        assert_eq!(
+            thresholds.threshold_for(Caip2::Testnet, &asset),
+            off_mainnet
+        );
+        assert_eq!(thresholds.threshold_for(Caip2::Testnet, &sac), off_mainnet);
+        if expected.is_none() {
+            assert!(
+                cross_check_requirement(
+                    profile.chain_id,
+                    CrossCheckValue::Amount {
+                        asset: &asset,
+                        base_units: 1
+                    },
+                    &thresholds,
+                    true,
+                    false
+                )
+                .is_err()
+            );
+        }
+    }
+    for configured in [0, 9_000_000_000_000_000] {
+        profile.cross_check_threshold_stroops = configured;
+        assert_eq!(
+            ThresholdSet::from_profile_and_signed(&profile, None)
+                .threshold_for(profile.chain_id, &CanonicalAsset::Native),
+            Some(i128::from(MINIMUM_FLOOR))
+        );
+    }
+}
+#[test]
+#[serial_test::serial]
+fn signed_threshold_warns_when_profile_is_higher() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use std::collections::BTreeMap;
+    use stellar_agent_core::{
+        asset_id::CanonicalAsset,
+        cross_check::{CrossCheckThresholds, ThresholdSet},
+    };
+    let mut profile = profile(true);
+    let (classic, _) = classic_and_sac(&profile);
+    let asset = CanonicalAsset::parse_threshold_key(&classic).unwrap();
+    profile.cross_check_thresholds =
+        CrossCheckThresholds::new(BTreeMap::from([(asset.clone(), 50)])).unwrap();
+    let table = BTreeMap::from([(classic, 25)]);
+    let capture = stellar_agent_test_support::CaptureWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(capture.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+    assert_eq!(
+        ThresholdSet::from_profile_and_signed(&profile, Some(&table))
+            .threshold_for(profile.chain_id, &asset),
+        Some(25)
+    );
+    let output = capture.captured_str();
+    assert!(
+        output.contains("WARN")
+            && output.contains("profile cross-check threshold exceeds signed threshold"),
+        "{output}"
+    );
+}
+#[test]
+#[serial_test::serial]
+fn threshold_aliases_and_duplicate_identities_refuse() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let profile = profile(true);
+    let (classic, sac) = classic_and_sac(&profile);
+    let refusal = |doc: &DocumentMut| {
+        stellar_agent_core::policy::v1::verified::validate_profile_body(doc, &profile)
+            .unwrap_err()
+            .to_string()
+    };
+    let mut doc = FULL.parse::<DocumentMut>().unwrap();
+    doc["mainnet"]["cross_check_thresholds"][&sac] = value("100");
+    let error = refusal(&doc);
+    assert_eq!(
+        error,
+        "policy file parse failed: mainnet.cross_check_thresholds: multiple entries name the \
+         same asset; configure one threshold per asset"
+    );
+    assert!(!error.contains(&sac));
+    assert!(!error.contains(&classic));
+    // Beside a `native` key the native contract also names the same asset, so
+    // the native-contract refusal is checked without one.
+    let thresholds = doc["mainnet"]["cross_check_thresholds"]
+        .as_table_like_mut()
+        .unwrap();
+    for key in [sac.as_str(), classic.as_str(), "native"] {
+        thresholds.remove(key);
+    }
+    let native_sac = stellar_agent_core::asset_id::CanonicalAsset::Native
+        .sac_contract_id(&profile.network_passphrase)
+        .unwrap();
+    doc["mainnet"]["cross_check_thresholds"][&native_sac] = value("10000000000");
+    let error = refusal(&doc);
+    assert_eq!(
+        error,
+        "policy file parse failed: mainnet.cross_check_thresholds: an entry names the native \
+         asset's contract; set the native key instead"
+    );
+    assert!(!error.contains(&native_sac));
+    assert!(!error.contains(&classic));
+}
+#[test]
+fn verified_sequence_is_a_positive_toml_integer() {
+    use stellar_agent_core::policy::v1::validate_unsigned_policy;
+    use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+    for value in ["0", "-1", "\"1\"", "1.0"] {
+        assert!(
+            validate_unsigned_policy(
+                &without_mainnet().replace("sequence = 7", &format!("sequence = {value}")),
+                "operator",
+                MAINNET_PASSPHRASE,
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        validate_unsigned_policy(
+            &without_mainnet().replace("sequence = 7", "sequence = 9223372036854775807"),
+            "operator",
+            MAINNET_PASSPHRASE,
+        )
+        .is_ok()
+    );
+}
+/// A trustline leg without an asset is a liquidity pool share, which no
+/// allowlist entry can name, so the allowlist refuses it.
+#[test]
+#[serial_test::serial]
+fn asset_allowlist_refuses_an_assetless_trustline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::policy::DenyReason;
+    use stellar_agent_core::policy::v1::criteria::{
+        Criterion, asset_allowlist::AssetAllowlistCriterion,
+    };
+    use stellar_agent_core::policy::v1::value::{ActionKind, ValueClass, ValueLeg};
+    let profile = profile(false);
+    let tool = tool();
+    let state = PolicyStateStore::new();
+    let args = serde_json::json!({});
+    let context = ctx(&tool, &profile, &args, &state).with_value(ValueClass::single(ValueLeg {
+        kind: ActionKind::Trustline,
+        amount: None,
+        asset: None,
+        destination: None,
+    }));
+    assert_eq!(
+        AssetAllowlistCriterion::new(vec!["native".into()])
+            .unwrap()
+            .evaluate(&context)
+            .unwrap(),
+        Some(DenyReason::AssetNotAllowlisted)
+    );
+}
+#[test]
+#[serial_test::serial]
+fn asset_allowlist_leaves_assetless_claims_unrestricted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::policy::v1::criteria::{
+        Criterion, asset_allowlist::AssetAllowlistCriterion,
+    };
+    let profile = profile(false);
+    let tool = tool();
+    let state = PolicyStateStore::new();
+    let args = serde_json::json!({});
+    let context = ctx(&tool, &profile, &args, &state).with_value(
+        stellar_agent_core::policy::v1::value::derive_value_class("stellar_claim", &args),
+    );
+    assert!(
+        AssetAllowlistCriterion::new(vec!["native".into()])
+            .unwrap()
+            .evaluate(&context)
+            .unwrap()
+            .is_none()
+    );
+}
+/// `FULL` with one more criterion on its first rule.
+fn with_criterion(criterion: &str) -> String {
+    let mut doc = FULL.parse::<DocumentMut>().unwrap();
+    rule(&mut doc)["criteria"]
+        .as_array_mut()
+        .unwrap()
+        .push(criterion.parse::<toml_edit::Value>().unwrap());
+    doc.to_string()
+}
+fn pin_value(profile: &Profile) -> Option<String> {
+    let coordinate = policy_pin_entry_ref(&profile.policy_window_state_key_id);
+    keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+        .unwrap()
+        .get_password()
+        .ok()
+}
+/// Every path under `dir`, relative and sorted.
+fn listing(dir: &Path) -> Vec<std::path::PathBuf> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            out.push(path.strip_prefix(root).unwrap().to_path_buf());
+            if path.is_dir() {
+                walk(root, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+#[serial]
+fn home_domain_criteria_are_valid_but_fail_the_minimum() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    for criterion in [
+        r#"{ kind = "home_domain_resolved" }"#,
+        r#"{ kind = "counterparty_allowlist", kinds = ["HOME_DOMAIN"], allowlist = ["example.org"] }"#,
+    ] {
+        let (dir, profile, key) = fixture();
+        let body = with_criterion(criterion);
+        stellar_agent_core::policy::v1::validate_unsigned_policy(
+            &body,
+            "operator",
+            &profile.network_passphrase,
+        )
+        .unwrap();
+        let failures =
+            mainnet_minimum::failures(&body.parse::<DocumentMut>().unwrap(), &profile, "operator");
+        assert!(
+            matches!(
+                failures.as_slice(),
+                [PolicyError::MainnetMinimumUnmet {
+                    requirement: "home_domain",
+                    rule: Some(0)
+                }]
+            ),
+            "{criterion}: {failures:?}"
+        );
+        let result = load(dir.path(), &body, &profile, &key, PinMode::Advance);
+        if cfg!(feature = "mainnet-write") {
+            assert!(
+                matches!(
+                    result,
+                    Err(PolicyError::MainnetMinimumUnmet {
+                        requirement: "home_domain",
+                        rule: Some(0)
+                    })
+                ),
+                "{criterion}: {result:?}"
+            );
+        } else {
+            assert_eq!(result.unwrap().sequence(), 7, "{criterion}");
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn test_owner_source_refuses_an_enabled_mainnet_body_and_keeps_the_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    std::fs::write(dir.path().join("policy.toml"), signed(FULL, &key)).unwrap();
+    let refused = |dir: &Path| {
+        load_file(
+            dir,
+            &profile,
+            &key,
+            OwnerKeySource::TestFile,
+            PinMode::Advance,
+        )
+    };
+    if cfg!(feature = "mainnet-write") {
+        let err = refused(dir.path()).unwrap_err();
+        assert!(matches!(err, PolicyError::TestOwnerKeyRefused), "{err:?}");
+        assert_eq!(err.to_string(), "policy.engine_unavailable: test_owner_key");
+        assert_eq!(err.wire_code(), "policy.engine_unavailable");
+        assert_eq!(pin_value(&profile), None);
+        put_pin(
+            dir.path(),
+            &profile,
+            6,
+            [6; 32],
+            key.verifying_key().to_bytes(),
+        );
+        let before = pin_value(&profile);
+        assert!(matches!(
+            refused(dir.path()),
+            Err(PolicyError::TestOwnerKeyRefused)
+        ));
+        assert_eq!(pin_value(&profile), before);
+    } else {
+        assert_eq!(refused(dir.path()).unwrap().sequence(), 7);
+    }
+    let accepted = load_file(
+        dir.path(),
+        &profile,
+        &key,
+        OwnerKeySource::Keyring,
+        PinMode::Advance,
+    )
+    .unwrap();
+    assert_eq!(accepted.sequence(), 7);
+    assert!(matches!(pinned(dir.path(), &profile), PinState::Present(pin) if pin.sequence() == 7));
+}
+
+#[test]
+#[serial]
+fn test_owner_source_loads_outside_the_mainnet_condition() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, _, key) = fixture();
+    let testnet = profile(false);
+    std::fs::write(dir.path().join("policy.toml"), signed(V1, &key)).unwrap();
+    assert_eq!(
+        load_file(
+            dir.path(),
+            &testnet,
+            &key,
+            OwnerKeySource::TestFile,
+            PinMode::Advance
+        )
+        .unwrap()
+        .sequence(),
+        0
+    );
+    let mainnet = profile(true);
+    std::fs::write(
+        dir.path().join("policy.toml"),
+        signed(&without_mainnet(), &key),
+    )
+    .unwrap();
+    assert_eq!(
+        load_file(
+            dir.path(),
+            &mainnet,
+            &key,
+            OwnerKeySource::TestFile,
+            PinMode::Advance
+        )
+        .unwrap()
+        .sequence(),
+        7
+    );
+}
+
+#[test]
+#[serial]
+fn compare_only_creates_neither_the_window_directory_nor_the_lock_file() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    std::fs::write(dir.path().join("policy.toml"), signed(FULL, &key)).unwrap();
+    let owner = key.verifying_key().to_bytes();
+    for window in [
+        dir.path().join("absent").join("state.window"),
+        dir.path().join("state.window"),
+    ] {
+        let before = listing(dir.path());
+        let load = PolicyLoad {
+            path: &dir.path().join("policy.toml"),
+            profile: &profile,
+            profile_name: "operator",
+            owner_pubkey: &owner,
+            owner_source: OwnerKeySource::Keyring,
+            window_path: &window,
+        };
+        let inspection = inspect_verified_policy(&load, PolicyStateStore::new());
+        assert_eq!(
+            inspection.pin,
+            Some(PinState::Absent),
+            "{}",
+            window.display()
+        );
+        assert_eq!(inspection.verified.unwrap().sequence(), 7);
+        assert!(inspection.document.is_some());
+        assert_eq!(
+            load_verified_policy(&load, PolicyStateStore::new(), PinMode::CompareOnly)
+                .unwrap()
+                .sequence(),
+            7
+        );
+        assert_eq!(listing(dir.path()), before, "{}", window.display());
+    }
+}
+
+#[test]
+#[serial]
+fn inspection_reports_the_pin_it_compared_and_the_verified_document() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    std::fs::write(dir.path().join("policy.toml"), signed(FULL, &key)).unwrap();
+    put_pin(
+        dir.path(),
+        &profile,
+        9,
+        [9; 32],
+        key.verifying_key().to_bytes(),
+    );
+    let owner = key.verifying_key().to_bytes();
+    let load = PolicyLoad {
+        path: &dir.path().join("policy.toml"),
+        profile: &profile,
+        profile_name: "operator",
+        owner_pubkey: &owner,
+        owner_source: OwnerKeySource::Keyring,
+        window_path: &dir.path().join("state.window"),
+    };
+    let inspection = inspect_verified_policy(&load, PolicyStateStore::new());
+    assert!(matches!(inspection.pin, Some(PinState::Present(ref pin)) if pin.sequence() == 9));
+    assert!(matches!(
+        inspection.verified,
+        Err(PolicyError::SequenceRollback)
+    ));
+    assert_eq!(
+        inspection.document.unwrap()["sequence"].as_integer(),
+        Some(7)
+    );
+    let other = SigningKey::from_bytes(&[12; 32]).verifying_key().to_bytes();
+    let unverified = inspect_verified_policy(
+        &PolicyLoad {
+            owner_pubkey: &other,
+            ..load
+        },
+        PolicyStateStore::new(),
+    );
+    assert!(unverified.document.is_none());
+    assert!(unverified.pin.is_none());
+    assert!(matches!(
+        unverified.verified,
+        Err(PolicyError::OwnerSignatureInvalid { .. })
+    ));
+}
+
+#[test]
+#[serial_test::serial]
+fn minimum_report_lists_every_requirement_with_its_status() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let profile = profile(true);
+    let evaluate = |doc: &DocumentMut| mainnet_minimum::evaluate(doc, &profile, "operator");
+    let full = evaluate(&FULL.parse::<DocumentMut>().unwrap());
+    assert_eq!(
+        full.iter().map(|o| o.requirement).collect::<Vec<_>>(),
+        mainnet_minimum::REQUIREMENTS
+    );
+    assert!(
+        full.iter().all(|o| o.status == RequirementStatus::Passed),
+        "{full:?}"
+    );
+
+    for outcome in evaluate(&without_mainnet().parse::<DocumentMut>().unwrap()) {
+        let expected = if [
+            "mainnet_table",
+            "fee_cap",
+            "thresholds",
+            "ttl",
+            "approval_credentials",
+            "approval.cert_pin_without_origin",
+            "approval.origin_without_cert_pin",
+        ]
+        .contains(&outcome.requirement)
+        {
+            RequirementStatus::Failed {
+                rules: vec![],
+                detail: "the [mainnet] table is missing".into(),
+            }
+        } else {
+            RequirementStatus::Passed
+        };
+        assert_eq!(outcome.status, expected, "{}", outcome.requirement);
+    }
+
+    let value_requirements = [
+        "asset_allowlist",
+        "destination",
+        "per_tx_cap",
+        "per_period_cap",
+        "rate_limit",
+    ];
+    for (field, unmet, detail) in [
+        (
+            "approval_cert_spki_sha256",
+            "approval.cert_pin_without_origin",
+            "mainnet.approval_cert_spki_sha256 requires mainnet.approval_origin",
+        ),
+        (
+            "approval_origin",
+            "approval.origin_without_cert_pin",
+            "mainnet.approval_origin requires mainnet.approval_cert_spki_sha256",
+        ),
+    ] {
+        let mut singleton = FULL.parse::<DocumentMut>().unwrap();
+        singleton["mainnet"][field] = value(if field == "approval_origin" {
+            "https://approve.example.invalid"
+        } else {
+            "abababababababababababababababababababababababababababababababab"
+        });
+        for outcome in evaluate(&singleton) {
+            let expected = if outcome.requirement == unmet {
+                RequirementStatus::Failed {
+                    rules: vec![],
+                    detail: detail.into(),
+                }
+            } else {
+                RequirementStatus::Passed
+            };
+            assert_eq!(outcome.status, expected, "{field}: {}", outcome.requirement);
+        }
+    }
+
+    let mut read_only = FULL.parse::<DocumentMut>().unwrap();
+    rule(&mut read_only)["match"]["tool"] = value("stellar_balances");
+    rule(&mut read_only)["criteria"] = value(toml_edit::Array::new());
+    for outcome in evaluate(&read_only) {
+        let expected = if value_requirements.contains(&outcome.requirement) {
+            RequirementStatus::NotEvaluated {
+                detail: "no rule this requirement applies to",
+            }
+        } else {
+            RequirementStatus::Passed
+        };
+        assert_eq!(outcome.status, expected, "{}", outcome.requirement);
+    }
+
+    let mut ruleless = FULL.parse::<DocumentMut>().unwrap();
+    ruleless.remove("rules");
+    for outcome in evaluate(&ruleless) {
+        let expected = match outcome.requirement {
+            "rules_empty" => RequirementStatus::Failed {
+                rules: vec![],
+                detail: "the policy has no rules".into(),
+            },
+            "chain" | "tool" | "opaque" | "rule_ttl" | "home_domain" => {
+                RequirementStatus::NotEvaluated {
+                    detail: "the policy has no rules",
+                }
+            }
+            requirement if value_requirements.contains(&requirement) => {
+                RequirementStatus::NotEvaluated {
+                    detail: "the policy has no rules",
+                }
+            }
+            _ => RequirementStatus::Passed,
+        };
+        assert_eq!(outcome.status, expected, "{}", outcome.requirement);
+    }
+
+    let mut two_rules = FULL.parse::<DocumentMut>().unwrap();
+    rule(&mut two_rules)["match"]["chain"] = value("*");
+    let copy = two_rules["rules"]
+        .as_array_of_tables()
+        .unwrap()
+        .get(0)
+        .unwrap()
+        .clone();
+    two_rules["rules"]
+        .as_array_of_tables_mut()
+        .unwrap()
+        .push(copy);
+    let chain = evaluate(&two_rules)
+        .into_iter()
+        .find(|o| o.requirement == "chain")
+        .unwrap();
+    assert_eq!(
+        chain.status,
+        RequirementStatus::Failed {
+            rules: vec![0, 1],
+            detail: "rules 0, 1".into()
+        }
+    );
+}
+
+#[test]
+#[serial]
+fn higher_sequence_owner_rotation_is_accepted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap();
+    let rotated = SigningKey::from_bytes(&[12; 32]);
+    let newer = FULL.replace("sequence = 7", "sequence = 8");
+    let mut doc = newer.parse::<DocumentMut>().unwrap();
+    doc["owner_rotation"] = toml_edit::Item::Table(
+        stellar_agent_core::policy::v1::signature::build_owner_rotation(
+            &newer,
+            &key,
+            &rotated.verifying_key().to_bytes(),
+        )
+        .unwrap(),
+    );
+    let verified = load(
+        dir.path(),
+        &doc.to_string(),
+        &profile,
+        &rotated,
+        PinMode::Advance,
+    )
+    .unwrap();
+    assert_eq!(verified.sequence(), 8);
+    assert_eq!(verified.owner(), rotated.verifying_key().to_bytes());
+    assert!(matches!(
+        pinned(dir.path(), &profile),
+        PinState::Present(pin)
+            if pin.sequence() == 8 && pin.owner() == rotated.verifying_key().to_bytes()
+    ));
+}
+
+#[test]
+#[serial]
+fn integer_threshold_is_accepted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    let body = FULL.replace("native = \"10000000000\"", "native = 10000000000");
+    assert_ne!(body, FULL, "the threshold edit must apply");
+    let doc = body.parse::<DocumentMut>().unwrap();
+    assert!(mainnet_minimum::failures(&doc, &profile, "operator").is_empty());
+    stellar_agent_core::policy::v1::verified::validate_profile_body(&doc, &profile).unwrap();
+    let verified = load(dir.path(), &body, &profile, &key, PinMode::Advance).unwrap();
+    let thresholds = verified
+        .mainnet()
+        .unwrap()
+        .cross_check_thresholds
+        .clone()
+        .unwrap();
+    assert_eq!(thresholds.get("native"), Some(&10_000_000_000));
+}
+
+#[test]
+#[serial_test::serial]
+fn period_cap_coverage_is_checked_independently_of_the_transaction_cap() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let profile = profile(true);
+    let mut doc = FULL.parse::<DocumentMut>().unwrap();
+    criterion(&mut doc, 3).insert(
+        "asset",
+        stellar_agent_core::asset_id::CanonicalAsset::parse_threshold_key(&format!(
+            "USD:{}",
+            stellar_strkey::ed25519::PublicKey([8; 32])
+        ))
+        .unwrap()
+        .sac_contract_id(&profile.network_passphrase)
+        .unwrap()
+        .into(),
+    );
+    let failures = mainnet_minimum::failures(&doc, &profile, "operator");
+    assert!(
+        matches!(
+            failures.as_slice(),
+            [PolicyError::MainnetMinimumUnmet {
+                requirement: "per_period_cap",
+                rule: Some(0)
+            }]
+        ),
+        "{failures:?}"
+    );
+}
+
+const REMOTE_CANONICAL: &str = r#"version = 2
+scope = "profile:operator"
+sequence = 7
+
+[mainnet]
+profile = "operator"
+endpoint_host = "rpc.example.invalid"
+oracle_host = "oracle.example.invalid"
+installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+classic_max_fee_per_op_stroops = 500
+authorization_ttl_seconds = 60
+approval_credentials = [{ credential_id_b64url = "WlpaWlpaWlpaWlpaWlpaWg", public_key_sec1_b64url = "BEYtuhrk_BqWi02s8gzdbb4frjSqlxUUpj00BcPRz9ODtYu7CMEzg0KMWFPHHEyFHhNLBWgh5Gj-Cpd6v0MT3eE" }]
+approval_origin = "https://approve.example.invalid:8443"
+approval_cert_spki_sha256 = "abababababababababababababababababababababababababababababababab"
+
+[mainnet.cross_check_thresholds]
+"USD:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" = "100"
+native = "10000000000"
+
+[[rules]]
+match = { chain = "stellar:mainnet", tool = "stellar_pay" }
+criteria = [{ assets = ["native"], kind = "asset_allowlist" }, { allowlist = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"], kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"] }, { asset = "native", kind = "per_tx_cap", max_stroops = "100" }, { asset = "native", kind = "per_period_cap", max_stroops = "200", window = "1d" }, { kind = "rate_limit", max_calls = 10, window = "1d" }]
+decision = "require_approval"
+reason = "review"
+ttl_secs = 3600
+allow_opaque_signing = false
+"#;
+
+const REMOTE: &str = include_str!("../fixtures/policy-v2-remote-approval.toml");
+const ORIGIN: &str = "https://approve.example.invalid:8443";
+const CERT_PIN: &str = "abababababababababababababababababababababababababababababababab";
+
+fn approval_body(origin: Option<toml_edit::Item>, pin: Option<toml_edit::Item>) -> DocumentMut {
+    let mut doc = FULL.parse::<DocumentMut>().unwrap();
+    if let Some(origin) = origin {
+        doc["mainnet"]["approval_origin"] = origin;
+    }
+    if let Some(pin) = pin {
+        doc["mainnet"]["approval_cert_spki_sha256"] = pin;
+    }
+    doc
+}
+
+/// The origin and pin the bootstrap validator returns.
+type Bootstrap = Result<
+    (
+        Option<stellar_agent_core::policy::v1::approval_origin::ApprovalOrigin>,
+        Option<[u8; 32]>,
+    ),
+    PolicyError,
+>;
+
+fn bootstrap(doc: &DocumentMut) -> Bootstrap {
+    stellar_agent_core::policy::v1::approval_origin::validate_bootstrap(
+        doc["mainnet"].as_table_like().unwrap(),
+    )
+}
+
+/// Asserts that the grammar of `field` refused `result` with its fixed detail.
+fn assert_field_refused(result: &Bootstrap, field: &str, case: &str) {
+    assert!(result.is_err(), "{case}: {result:?}");
+    if let Err(error) = result {
+        assert_field_error(error, field, case);
+    }
+}
+
+/// Asserts that `error` is the fixed grammar refusal of `field`.
+fn assert_field_error(error: &PolicyError, field: &str, case: &str) {
+    let prefix = format!("mainnet.{field} must be");
+    assert!(
+        matches!(error, PolicyError::PolicyFileParseFailed { detail } if detail.starts_with(&prefix)),
+        "{case}: {error:?}"
+    );
+}
+
+fn assert_approval_parse_error(error: &PolicyError) {
+    assert!(
+        matches!(error, PolicyError::PolicyFileParseFailed { .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn approval_origin_grammar_matrix() {
+    let maximum_host = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
+    for host in [
+        "approve.example.invalid",
+        "a",
+        "a-b.invalid",
+        "0x.invalid",
+        "123.invalid",
+        maximum_host.as_str(),
+    ] {
+        for port in ["", ":1", ":442", ":444", ":8443", ":65535"] {
+            let origin = format!("https://{host}{port}");
+            let (parsed, pin) =
+                bootstrap(&approval_body(Some(value(&origin)), Some(value(CERT_PIN)))).unwrap();
+            assert_eq!(parsed.unwrap().as_str(), origin);
+            assert_eq!(pin, Some([0xab; 32]));
+        }
+    }
+    let long_label = format!("https://{}.invalid", "a".repeat(64));
+    let long_host = format!("https://{maximum_host}a");
+    for origin in [
+        "",
+        "approve.invalid",
+        "//approve.invalid",
+        "https:approve.invalid",
+        "https:/approve.invalid",
+        "http://approve.invalid",
+        "HTTPS://approve.invalid",
+        "ftp://approve.invalid",
+        "https://",
+        "https://approve.invalid/",
+        "https://approve.invalid/path",
+        "https://user@approve.invalid",
+        "https://user:pass@approve.invalid",
+        "https://approve.invalid?x",
+        "https://approve.invalid#x",
+        " https://approve.invalid",
+        "https://approve.invalid ",
+        "https://approve.\ninvalid",
+        "https://Approve.invalid",
+        "https://é.invalid",
+        "https://.invalid",
+        "https://a..invalid",
+        "https://a.invalid.",
+        "https://-a.invalid",
+        "https://a-.invalid",
+        "https://a_b.invalid",
+        "https://a%2einvalid",
+        "https://127.0.0.1",
+        "https://[::1]",
+        "https://::1",
+        "https://2130706433",
+        "https://a.123",
+        "https://a.0x7f",
+        "https://a.0x",
+        "https://0x",
+        "https://0x7f000001",
+        "https://0177.1",
+        "https://approve.invalid:0",
+        "https://approve.invalid:65536",
+        "https://approve.invalid:443",
+        "https://approve.invalid:0443",
+        "https://approve.invalid:08443",
+        "https://approve.invalid:+8443",
+        "https://approve.invalid:-1",
+        "https://approve.invalid:",
+        "https://approve.invalid:8a",
+        "https://approve.invalid:８",
+        "https://approve.invalid: 8443",
+        "https://approve.invalid:8443/",
+        long_label.as_str(),
+        long_host.as_str(),
+    ] {
+        let doc = approval_body(Some(value(origin)), Some(value(CERT_PIN)));
+        assert_field_refused(&bootstrap(&doc), "approval_origin", origin);
+    }
+    for pin in [
+        "".into(),
+        "ab".repeat(31),
+        "ab".repeat(33),
+        "AB".repeat(32),
+        "gg".repeat(32),
+        "cert.pem".into(),
+        "cert-name".into(),
+        format!("{} ", "a".repeat(63)),
+        "é".repeat(32),
+    ] {
+        assert_field_refused(
+            &bootstrap(&approval_body(Some(value(ORIGIN)), Some(value(&pin)))),
+            "approval_cert_spki_sha256",
+            &pin,
+        );
+    }
+    for item in [
+        value(42),
+        value(42.5),
+        value(true),
+        "v = 2000-01-01\n".parse::<DocumentMut>().unwrap()["v"].clone(),
+        value(toml_edit::InlineTable::new()),
+        toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
+        value(toml_edit::Array::new()),
+        toml_edit::Item::Table(toml_edit::Table::new()),
+    ] {
+        let case = format!("{item:?}");
+        assert_field_refused(
+            &bootstrap(&approval_body(Some(item.clone()), Some(value(CERT_PIN)))),
+            "approval_origin",
+            &case,
+        );
+        assert_field_refused(
+            &bootstrap(&approval_body(Some(value(ORIGIN)), Some(item.clone()))),
+            "approval_cert_spki_sha256",
+            &case,
+        );
+    }
+}
+
+#[test]
+fn approval_rp_id_is_origin_host() {
+    for (text, rp_id) in [
+        (
+            "https://sub.approve.example.invalid",
+            "sub.approve.example.invalid",
+        ),
+        (
+            "https://sub.approve.example.invalid:8443",
+            "sub.approve.example.invalid",
+        ),
+        (ORIGIN, "approve.example.invalid"),
+        ("https://a", "a"),
+    ] {
+        let (origin, _) =
+            bootstrap(&approval_body(Some(value(text)), Some(value(CERT_PIN)))).unwrap();
+        let origin = origin.unwrap();
+        assert_eq!(origin.as_str(), text);
+        assert_eq!(origin.rp_id(), rp_id, "{text}");
+    }
+}
+
+#[test]
+#[serial]
+fn remote_approval_fields_are_signed_and_canonical() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    let canonical = canonical_bytes(REMOTE).unwrap();
+    assert_eq!(canonical, REMOTE_CANONICAL.as_bytes());
+    assert_eq!(
+        blake3::hash(&canonical).to_hex().as_str(),
+        "bcb50aa361202b94a799b83b5207fed92adbadd08cfbc3b181ee57b0b53bc8ab"
+    );
+    // Without its `oracle_host` line the document has the canonical bytes
+    // and digest of a document that names no oracle host.
+    let oracle_line = "oracle_host = \"oracle.example.invalid\"\n";
+    let without = canonical_bytes(&REMOTE.replace(oracle_line, "")).unwrap();
+    assert_eq!(
+        without,
+        REMOTE_CANONICAL.replace(oracle_line, "").as_bytes()
+    );
+    assert_eq!(
+        blake3::hash(&without).to_hex().as_str(),
+        "da4a707e6f2542a1bb1cc0b9896e6e71385b3a9dc2eb6dff61e41e0901eb7658"
+    );
+    assert_eq!(
+        stellar_agent_core::hex::encode(&key.sign(blake3::hash(&canonical).as_bytes()).to_bytes()),
+        "87e898ca2ba99465335c0b98c6bb861e65c548162d2ce68edf6b7ff5864a340c990e3d0b0ad06623ac2146a7272d9ae8167147914c99ee0451900b8a4e1f9c02"
+    );
+    let signed_remote = signed(REMOTE, &key);
+    let baseline = load(dir.path(), REMOTE, &profile, &key, PinMode::CompareOnly).unwrap();
+    assert_eq!(baseline.digest(), *blake3::hash(&canonical).as_bytes());
+    let mut neither = REMOTE.parse::<DocumentMut>().unwrap();
+    let table = neither["mainnet"].as_table_mut().unwrap();
+    table.remove("approval_origin").unwrap();
+    table.remove("approval_cert_spki_sha256").unwrap();
+    let local = load(
+        dir.path(),
+        &neither.to_string(),
+        &profile,
+        &key,
+        PinMode::CompareOnly,
+    )
+    .unwrap();
+    assert_ne!(local.digest(), baseline.digest());
+    assert_ne!(local.fact_digest(), baseline.fact_digest());
+    let mut reordered = REMOTE.parse::<DocumentMut>().unwrap();
+    let table = reordered["mainnet"].as_table_mut().unwrap();
+    let origin = table.remove("approval_origin").unwrap();
+    let pin = table.remove("approval_cert_spki_sha256").unwrap();
+    table.insert("approval_cert_spki_sha256", pin);
+    table.insert("approval_origin", origin);
+    assert_eq!(canonical_bytes(&reordered.to_string()).unwrap(), canonical);
+    for field in ["approval_origin", "approval_cert_spki_sha256"] {
+        for operation in ["add", "change", "remove"] {
+            let mut doc = signed_remote.parse::<DocumentMut>().unwrap();
+            if operation == "add" {
+                let mut absent = REMOTE.parse::<DocumentMut>().unwrap();
+                absent["mainnet"].as_table_mut().unwrap().remove(field);
+                doc["signature"] = signed(&absent.to_string(), &key)
+                    .parse::<DocumentMut>()
+                    .unwrap()["signature"]
+                    .clone();
+            } else if operation == "remove" {
+                doc["mainnet"].as_table_mut().unwrap().remove(field);
+            } else {
+                doc["mainnet"][field] = value(if field == "approval_origin" {
+                    "https://other.invalid"
+                } else {
+                    "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+                });
+            }
+            let error = stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+                &doc.to_string(),
+                "operator",
+                &key.verifying_key().to_bytes(),
+                &profile.network_passphrase,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, PolicyError::OwnerSignatureInvalid { .. }),
+                "{field} {operation}: {error:?}"
+            );
+            if operation == "change" {
+                let changed = load(
+                    dir.path(),
+                    &doc.to_string(),
+                    &profile,
+                    &key,
+                    PinMode::CompareOnly,
+                )
+                .unwrap();
+                assert_ne!(changed.digest(), baseline.digest());
+                assert_ne!(changed.fact_digest(), baseline.fact_digest());
+            }
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn mainnet_minimum_pairs_origin_and_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    for (origin, pin, requirement) in [
+        (false, false, None),
+        (true, true, None),
+        (false, true, Some("approval.cert_pin_without_origin")),
+        (true, false, Some("approval.origin_without_cert_pin")),
+    ] {
+        let doc = approval_body(origin.then(|| value(ORIGIN)), pin.then(|| value(CERT_PIN)));
+        let failures = mainnet_minimum::failures(&doc, &profile(true), "operator");
+        if let Some(expected) = requirement {
+            assert_eq!(failures.len(), 1);
+            assert!(
+                matches!(&failures[0], PolicyError::MainnetMinimumUnmet { requirement, rule: None } if *requirement == expected)
+            );
+            assert_eq!(failures[0].wire_code(), "policy.mainnet_minimum_unmet");
+            assert!(
+                matches!(bootstrap(&doc), Err(PolicyError::MainnetMinimumUnmet { requirement, rule: None }) if requirement == expected)
+            );
+        } else {
+            assert!(failures.is_empty(), "{failures:?}");
+            bootstrap(&doc).unwrap();
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn mainnet_body_exposes_signed_origin_and_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, mut profile, key) = fixture();
+    for remote_settings in [false, true] {
+        if remote_settings {
+            profile.remote_approval = Some(serde_json::from_value(serde_json::json!({
+                "enabled": true, "bind": "127.0.0.1:9443", "rp_id": "profile.invalid", "allowed_credentials": []
+            })).unwrap());
+        }
+        let local = load(dir.path(), FULL, &profile, &key, PinMode::CompareOnly).unwrap();
+        assert_eq!(local.mainnet().unwrap().approval_origin, None);
+        assert_eq!(local.mainnet().unwrap().approval_cert_spki_sha256, None);
+        let remote = load(dir.path(), REMOTE, &profile, &key, PinMode::CompareOnly).unwrap();
+        assert_eq!(
+            remote
+                .mainnet()
+                .unwrap()
+                .approval_origin
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            ORIGIN
+        );
+        assert_eq!(
+            remote.mainnet().unwrap().approval_cert_spki_sha256,
+            Some([0xab; 32])
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn approval_fields_validate_at_policy_boundaries() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, key) = fixture();
+    stellar_agent_core::policy::v1::validate_unsigned_policy(
+        REMOTE,
+        "operator",
+        &profile.network_passphrase,
+    )
+    .unwrap();
+    stellar_agent_core::policy::v1::verified::validate_profile_body(
+        &REMOTE.parse::<DocumentMut>().unwrap(),
+        &profile,
+    )
+    .unwrap();
+    for (field, bad) in [
+        ("approval_origin", "http://marker.invalid"),
+        ("approval_cert_spki_sha256", "marker-cert"),
+    ] {
+        let mut doc = REMOTE.parse::<DocumentMut>().unwrap();
+        doc["mainnet"][field] = value(bad);
+        let mut invalid_signature = signed(&doc.to_string(), &key)
+            .parse::<DocumentMut>()
+            .unwrap();
+        invalid_signature["signature"]["sig"] = value("00".repeat(64));
+        assert!(matches!(
+            stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+                &invalid_signature.to_string(),
+                "operator",
+                &key.verifying_key().to_bytes(),
+                &profile.network_passphrase,
+            ),
+            Err(PolicyError::OwnerSignatureInvalid { .. })
+        ));
+        assert_field_error(
+            &load(
+                dir.path(),
+                &doc.to_string(),
+                &profile,
+                &key,
+                PinMode::CompareOnly,
+            )
+            .unwrap_err(),
+            field,
+            bad,
+        );
+        assert_field_error(
+            &stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+                &signed(&doc.to_string(), &key),
+                "operator",
+                &key.verifying_key().to_bytes(),
+                &profile.network_passphrase,
+            )
+            .unwrap_err(),
+            field,
+            bad,
+        );
+        assert_field_error(
+            &stellar_agent_core::policy::v1::validate_unsigned_policy(
+                &doc.to_string(),
+                "operator",
+                &profile.network_passphrase,
+            )
+            .unwrap_err(),
+            field,
+            bad,
+        );
+        assert_field_error(
+            &stellar_agent_core::policy::v1::verified::validate_profile_body(&doc, &profile)
+                .unwrap_err(),
+            field,
+            bad,
+        );
+        assert_field_error(&bootstrap(&doc).unwrap_err(), field, bad);
+    }
+    let bootstrap_doc = format!(
+        "[mainnet]\napproval_origin = \"{ORIGIN}\"\napproval_cert_spki_sha256 = \"{CERT_PIN}\"\n"
+    )
+    .parse::<DocumentMut>()
+    .unwrap();
+    let (origin, pin) = bootstrap(&bootstrap_doc).unwrap();
+    assert_eq!(origin.unwrap().as_str(), ORIGIN);
+    assert_eq!(pin, Some([0xab; 32]));
+    let mut unknown = bootstrap_doc;
+    unknown["mainnet"]["mode"] = value("remote");
+    assert!(
+        matches!(bootstrap(&unknown), Err(PolicyError::PolicyFileParseFailed { ref detail }) if detail.starts_with("mainnet: unknown key"))
+    );
+}
+
+#[test]
+#[serial]
+fn malformed_approval_fields_preserve_policy_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    for existing in [false, true] {
+        for (field, bad) in [
+            ("approval_origin", "http://marker.invalid"),
+            ("approval_cert_spki_sha256", "marker-cert"),
+        ] {
+            let (dir, profile, key) = fixture();
+            if existing {
+                load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap();
+            }
+            let before = pinned(dir.path(), &profile);
+            let mut doc = REMOTE.parse::<DocumentMut>().unwrap();
+            doc["sequence"] = value(8);
+            doc["mainnet"][field] = value(bad);
+            assert_field_error(
+                &load(
+                    dir.path(),
+                    &doc.to_string(),
+                    &profile,
+                    &key,
+                    PinMode::Advance,
+                )
+                .unwrap_err(),
+                field,
+                bad,
+            );
+            assert_eq!(pinned(dir.path(), &profile), before);
+            // The same sequence-8 body, well formed, advances the pin.
+            let mut valid = REMOTE.parse::<DocumentMut>().unwrap();
+            valid["sequence"] = value(8);
+            load(
+                dir.path(),
+                &valid.to_string(),
+                &profile,
+                &key,
+                PinMode::Advance,
+            )
+            .unwrap();
+            assert!(
+                matches!(pinned(dir.path(), &profile), PinState::Present(pin) if pin.sequence() == 8)
+            );
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn approval_field_refusals_are_redacted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let marker = "SYNTHETIC_REJECTED_MARKER";
+    // Lowercase hex passes the pin's character check and refuses on length.
+    let hex_marker = "5eed".repeat(5);
+    let host = format!("https://{marker}.invalid");
+    let port = format!("https://approve.invalid:{marker}");
+    let key = SigningKey::from_bytes(&[11; 32]);
+    for (field, rejected, marker) in [
+        ("approval_origin", marker, marker),
+        ("approval_origin", host.as_str(), marker),
+        ("approval_origin", port.as_str(), marker),
+        ("approval_cert_spki_sha256", marker, marker),
+        (
+            "approval_cert_spki_sha256",
+            hex_marker.as_str(),
+            hex_marker.as_str(),
+        ),
+        (marker, marker, marker),
+    ] {
+        let mut doc = REMOTE.parse::<DocumentMut>().unwrap();
+        doc["mainnet"][field] = value(rejected);
+        for error in [
+            stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+                &signed(&doc.to_string(), &key),
+                "operator",
+                &key.verifying_key().to_bytes(),
+                &profile(true).network_passphrase,
+            )
+            .unwrap_err(),
+            stellar_agent_core::policy::v1::validate_unsigned_policy(
+                &doc.to_string(),
+                "operator",
+                &profile(true).network_passphrase,
+            )
+            .unwrap_err(),
+            bootstrap(&doc).unwrap_err(),
+        ] {
+            assert!(!format!("{error}").contains(marker), "{rejected}");
+            assert!(!format!("{error:?}").contains(marker), "{rejected}");
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn approval_origin_closed_keys_precede_signature() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let key = SigningKey::from_bytes(&[11; 32]);
+    for field in [
+        "mode",
+        "rp_id",
+        "approval_rp_id",
+        "certificate_path",
+        "approval_cert_path",
+        "approval_tls_cert",
+    ] {
+        let mut doc = signed(REMOTE, &key).parse::<DocumentMut>().unwrap();
+        doc["mainnet"][field] = value("synthetic");
+        doc["signature"]["sig"] = value("00".repeat(64));
+        let error = stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+            &doc.to_string(),
+            "operator",
+            &key.verifying_key().to_bytes(),
+            &profile(true).network_passphrase,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PolicyError::PolicyFileParseFailed { ref detail } if detail.starts_with("mainnet: unknown key")),
+            "{error:?}"
+        );
+    }
+    let mut v1 = signed(V1, &key).parse::<DocumentMut>().unwrap();
+    v1["mainnet"] = REMOTE.parse::<DocumentMut>().unwrap()["mainnet"].clone();
+    v1["signature"]["sig"] = value("00".repeat(64));
+    assert_approval_parse_error(
+        &stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+            &v1.to_string(),
+            "operator",
+            &key.verifying_key().to_bytes(),
+            &profile(true).network_passphrase,
+        )
+        .unwrap_err(),
+    );
+}
+
+#[test]
+#[serial]
+fn runtime_binding_requirements_unchanged() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::policy::v1::verified::{check_owner_enrollment, validate_profile_body};
+    for source in [FULL, REMOTE] {
+        for removed in [
+            vec!["profile"],
+            vec!["endpoint_host"],
+            vec!["oracle_host"],
+            vec!["installation_nonce_sha256"],
+            vec![
+                "profile",
+                "endpoint_host",
+                "oracle_host",
+                "installation_nonce_sha256",
+            ],
+        ] {
+            let (dir, profile, key) = fixture();
+            let mut body = source.parse::<DocumentMut>().unwrap();
+            let table = body["mainnet"].as_table_like_mut().unwrap();
+            for field in &removed {
+                table.remove(field);
+            }
+            let invalid = body.to_string();
+            let strict = validate_profile_body(&body, &profile).unwrap_err();
+            assert_eq!(strict.wire_code(), "policy.policy_file_parse_failed");
+            let missing = if removed.contains(&"installation_nonce_sha256") {
+                "installation_nonce_sha256"
+            } else {
+                removed[0]
+            };
+            assert_eq!(
+                strict.to_string(),
+                PolicyError::PolicyFileParseFailed {
+                    detail: format!("mainnet.{missing} must be a string"),
+                }
+                .to_string()
+            );
+            for present in [false, true] {
+                if present {
+                    load(dir.path(), source, &profile, &key, PinMode::Advance).unwrap();
+                }
+                let before = pinned(dir.path(), &profile);
+                for mode in [PinMode::CompareOnly, PinMode::Advance] {
+                    assert_eq!(
+                        load(dir.path(), &invalid, &profile, &key, mode)
+                            .unwrap_err()
+                            .to_string(),
+                        strict.to_string()
+                    );
+                    assert_eq!(pinned(dir.path(), &profile), before);
+                }
+                let signed_bytes = std::fs::read(dir.path().join("policy.toml")).unwrap();
+                let request = PolicyLoad {
+                    path: &dir.path().join("policy.toml"),
+                    profile: &profile,
+                    profile_name: "operator",
+                    owner_pubkey: &key.verifying_key().to_bytes(),
+                    owner_source: OwnerKeySource::Keyring,
+                    window_path: &dir.path().join("state.window"),
+                };
+                let inspection = inspect_verified_policy(&request, PolicyStateStore::new());
+                assert_eq!(
+                    inspection.verified.unwrap_err().to_string(),
+                    strict.to_string()
+                );
+                assert_eq!(pinned(dir.path(), &profile), before);
+                assert_eq!(std::fs::read(request.path).unwrap(), signed_bytes);
+            }
+            let owner = SigningKey::from_bytes(&[12; 32]);
+            let pinned_owner = match pinned(dir.path(), &profile) {
+                PinState::Present(pin) => pin,
+                _ => unreachable!(),
+            };
+            body["sequence"] = value(8);
+            body["owner_rotation"] = toml_edit::Item::Table(
+                stellar_agent_core::policy::v1::signature::build_owner_rotation(
+                    &body.to_string(),
+                    &key,
+                    &owner.verifying_key().to_bytes(),
+                )
+                .unwrap(),
+            );
+            std::fs::write(
+                dir.path().join("policy.toml"),
+                signed(&body.to_string(), &owner),
+            )
+            .unwrap();
+            let request = PolicyLoad {
+                path: &dir.path().join("policy.toml"),
+                profile: &profile,
+                profile_name: "operator",
+                owner_pubkey: &owner.verifying_key().to_bytes(),
+                owner_source: OwnerKeySource::Keyring,
+                window_path: &dir.path().join("state.window"),
+            };
+            assert_eq!(
+                check_owner_enrollment(&request, &pinned_owner)
+                    .unwrap_err()
+                    .to_string(),
+                strict.to_string()
+            );
+            assert_eq!(
+                pinned(dir.path(), &profile),
+                PinState::Present(pinned_owner.clone())
+            );
+            let mut bound = source.parse::<DocumentMut>().unwrap();
+            bound["sequence"] = value(8);
+            bound["owner_rotation"] = toml_edit::Item::Table(
+                stellar_agent_core::policy::v1::signature::build_owner_rotation(
+                    &bound.to_string(),
+                    &key,
+                    &owner.verifying_key().to_bytes(),
+                )
+                .unwrap(),
+            );
+            validate_profile_body(&bound, &profile).unwrap();
+            std::fs::write(request.path, signed(&bound.to_string(), &owner)).unwrap();
+            check_owner_enrollment(&request, &pinned_owner).unwrap();
+            assert_eq!(
+                pinned(dir.path(), &profile),
+                PinState::Present(pinned_owner)
+            );
+            assert_eq!(
+                inspect_verified_policy(&request, PolicyStateStore::new())
+                    .verified
+                    .unwrap()
+                    .sequence(),
+                8
+            );
+            for mode in [PinMode::CompareOnly, PinMode::Advance] {
+                assert_eq!(
+                    load_verified_policy(&request, PolicyStateStore::new(), mode)
+                        .unwrap()
+                        .sequence(),
+                    8
+                );
+            }
+        }
+    }
+}

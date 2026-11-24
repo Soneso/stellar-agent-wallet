@@ -13,7 +13,7 @@
 //! # Output envelope (not found)
 //!
 //! ```json
-//! {"ok":false,"error":{"code":"credentials.not_found","message":"credential '<name>' not found"},"request_id":"..."}
+//! {"ok":false,"error":{"code":"credentials.not_found","message":"the requested credential was not found"},"request_id":"..."}
 //! ```
 
 use std::io::{self, BufRead as _, Write as _};
@@ -80,7 +80,7 @@ pub fn run(args: &DeleteArgs) -> i32 {
     if let Err(reason) = validate_path_component_ascii_safe(&profile) {
         return emit_error(
             "credentials.invalid_profile_name",
-            format!("invalid profile name '{profile}': {reason}"),
+            format!("the profile name is not a valid profile name: {reason}"),
         );
     }
 

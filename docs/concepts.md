@@ -1,5 +1,8 @@
 # Concepts: the security and governance model
 
+See [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This document explains how the Stellar Agent Wallet lets an autonomous agent transact over MCP within the wallet's controls. It covers key custody, the policy engine, the operator-approval spine, the audit log, and smart-account authorization rules. It is conceptual; for command syntax see the [CLI reference](cli-reference/profile-and-governance.md), and for profile fields see [Profiles](profiles.md).
 
 ## The problem this model solves
@@ -9,33 +12,32 @@ An AI agent calls wallet tools on its own initiative. The model does not assume 
 - A **policy engine** evaluates each gated call to allow, deny, or require approval, before any signature. Reads the decision needs, such as the source account, can run first.
 - Out-of-band **operator approval** is required for the cases the policy engine flags, and the approval is cryptographically bound to the exact transaction that will be signed.
 - A **hash-chained audit log** records transaction submissions, signed
-  authorizations, approvals, and explicit key-management and lifecycle events.
-  MCP balance reads and payment simulations produce no automatic invocation row.
-  Under V1, payment simulations can reconcile overdue reservations and write
-  settlement audit rows. Value-moving signing
+  authorizations, approvals, and explicit key-management and lifecycle events;
+  see [The hash-chained audit log](#the-hash-chained-audit-log). Value-moving signing
   verbs acquire the audit writer before touching the signing key or submitting.
   A persisted profile without its audit key refuses. A synthesized profile
   attempts keyed audit acquisition and tolerates an unavailable key or writer.
   A changed audit binding still refuses with `audit.log_binding_changed`.
   Synthesis applies when no profile is named and no `default.toml` exists.
-- **Key custody** keeps signing seeds out of the reach of an agent that accesses the wallet over MCP. Keyring signing loads a seed per signature into zeroize-on-drop buffers without memory locking. CLI environment-seed signing enters an unlock window; Ledger seeds stay on the device.
+- **Key custody** keeps signing seeds out of the reach of an agent that accesses the wallet over MCP. Seeds live in the platform keyring. Keyring signing loads a seed per signature into zeroize-on-drop buffers without memory locking. A CLI environment seed and its signing key stay in one zeroize-on-drop page, locked when the lock succeeds, until their wallet or signer drops them; Ledger seeds stay on the device.
 
-A fifth control addresses a different risk: which tool definitions the agent may load. **Toolsets** package third-party or untrusted tool definitions behind capability isolation: a toolset installs only after publisher-signature and hash verification, and a structural boundary keeps it from reaching a signing tool it was not granted. Where the four controls above constrain each action, toolsets constrain the surface an agent can act through. See [Toolsets](toolsets.md).
+A fifth control addresses a different risk: which tool definitions the agent may load. **Toolsets** package third-party or untrusted tool definitions and install only after publisher-signature and hash verification. The toolset's pin record is authenticated under an installation key in the platform keyring. A structural boundary keeps the dispatcher from routing a toolset to a signing tool it is not granted. A toolset narrows what the toolset dispatcher routes; it does not narrow the native tools the same server registers, and the caller chooses which toolset an invocation names. The four controls above bound native and routed calls alike. See [Toolsets](toolsets.md).
 
 A sixth control stops an agent outright. The per-profile **emergency stop**, `stellar-agent profile halt`, refuses every action on the profile that signs or submits until the operator runs `stellar-agent profile resume`, with no server restart and no key or policy change. See [Emergency stop](#emergency-stop).
 
-Two structural rules apply across all surfaces in this alpha. The default network is `stellar:testnet`: a command with no named profile and no `default.toml` runs on the zero-config testnet profile. Every write or signing command refuses `stellar:mainnet` with wire code `network.mainnet_write_forbidden`, except MPP, which refuses with `mpp.network_forbidden`. The transaction and smart-account write commands, `vault deposit`, `vault withdraw`, `trade`, `trustline`, and `pool init` refuse a mainnet profile before any RPC call or signer access. The MCP DeFi, sign-and-submit, commit, and rule-commit tools refuse it at entry, before the policy gate and any RPC request. At the submit layer, a declared mainnet network passphrase and a known mainnet RPC URL are each refused at zero RPC cost. Beyond those two, the submit layer asks the endpoint which network it serves and treats that answer as authoritative. Every signature on the envelope must verify under it, so an envelope signed for one network cannot be relayed onto another. `stellar:mainnet` remains accepted for read-only commands.
+The default network is `stellar:testnet`. With no named profile and no `default.toml`, `stellar-agent-mcp` and commands such as `pay`, `claim`, and `accounts create` run on an in-memory zero-config testnet profile. Default builds enable the `mainnet-write` feature. Only a typed authorization issued for the action can satisfy the mainnet-write guard, and each binary attests its feature state. These builds admit only the scope-table operations, after setup and any consent the governing policy requires. Policy evaluation, sealed authorization, signing checks, and submission checks are separate boundaries. The endpoint determines the network, and each envelope signature must verify under it. Read-only commands retain mainnet selection and key-scope requirements.
 
 ## Two account models
 
 The wallet operates against two different kinds of Stellar account, and each command belongs to one of them. Knowing which model a command uses tells you what you must have in place before it can run.
 
-**Classic account operations** work with a keyring-held ed25519 key on its own. There is no contract to deploy: the source account is a standard Stellar account and the signing key is the account's secret. These commands are `pay`, `balances`, `trustline`, `claim`, and `pool`. `fees` reads network fee statistics. `friendbot` provides unsigned faucet funding that changes on-chain account state, and `accounts create` creates a plain classic account. If you hold a funded classic key, you can run any of these directly.
+**Classic account operations** work with a keyring-held ed25519 key on its own. There is no contract to deploy: the source account is a standard Stellar account and the signing key is the account's secret. These commands are `pay`, `balances`, `trustline`, `claim`, `pool`, `mpp`, and `tx`. `fees` reads network fee statistics. `friendbot` provides unsigned faucet funding that changes on-chain account state, and `accounts create` creates a plain classic account. If you hold a funded classic key, you can run any of these directly.
 
-**Smart-account operations** center on a deployed OpenZeppelin smart-account contract. Its context rules govern which signers may authorize actions, alongside signer sets, thresholds, and policy attachments. The keyring key signs as a delegated signer. See [Smart-account context rules](#smart-account-context-rules). `trade`, vault writes, and smart-account administration require an existing contract address. This includes `rules`, `signers`, `list-rules`, `migrate-verifier`, `timelock`, `execute`, and `multicall`. Seven smart-account verbs need no deployed smart account. `list-verifiers` reads the verifier allowlist; `register-multicall` and `unregister-multicall` edit the router registry. `deploy-webauthn-verifier`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`, and `deploy-policy` deploy infrastructure from a classic deployer key.
+**Smart-account operations** center on a deployed OpenZeppelin smart-account contract. Its context rules govern which signers may authorize actions, alongside signer sets, thresholds, and policy attachments. The keyring key signs as a delegated signer. See [Smart-account context rules](#smart-account-context-rules). `trade`, vault writes, and smart-account administration require an existing contract address. This includes `rules`, `signers`, `list-rules`, `migrate-verifier`, `timelock`, `execute`, and `multicall`. Eight smart-account verbs need no deployed smart account. `list-verifiers` reads the verifier allowlist and `list-intents` the verified window state; `register-multicall` and `unregister-multicall` edit the router registry. `deploy-webauthn-verifier`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`, and `deploy-policy` deploy infrastructure from a classic deployer key.
 
 **Bootstrapping** bridges the two. `accounts deploy-c` is a classic operation:
-the deployer signs with a keyring key, and the output is a new smart-account
+the deployer signs with a secret key from an environment variable or with a
+Ledger device, and the output is a new smart-account
 contract address. Fund a classic key (`friendbot` on testnet), deploy the
 contract (`accounts deploy-c`), then install rules and signers (`smart-account
 rules`, `smart-account signers`). The agent can then trade or run vault writes
@@ -49,50 +51,61 @@ A handful of commands need neither model directly. `profile`, `credentials`, `ap
 |---|---|---|
 | `pay`, `trustline`, `claim`, `pool` | Classic | A funded classic keyring key (`friendbot` funds one on testnet). |
 | `balances`, `fees` | Classic | No key; both read public network state. |
+| `mpp` | Classic | A testnet profile with an enrolled keyring signer for `mpp charge authorize`. The other `mpp` verbs record or reconcile the charge state the profile stores. |
+| `tx` | Classic | No signing key. `tx status` reconciles a submitted transaction against the network, and `tx receipt clear` closes a submission record. |
 | `friendbot` | Classic | The G-address to fund on testnet or Futurenet; no key. |
-| `accounts create` | Classic | A new G-address, or `--generate`, which returns the new secret in the output. Friendbot mode needs no key. Sponsored mode signs with the sponsor key from `--secret-env` or `--sign-with-ledger`. |
+| `accounts create` | Classic | A new G-address, or `--generate`, which returns the new secret in the output and is refused on mainnet. Friendbot mode needs no key and is refused on mainnet. On testnet, sponsored mode signs with the sponsor key from `--secret-env` or `--sign-with-ledger`. On mainnet, it signs with the enrolled keyring seed or `--sign-with-ledger`. |
 | `accounts deploy-c` | Classic (bridge) | A funded classic deployer key; the command's output is the smart-account contract address. |
-| `smart-account` (alias `sa`) | Smart-account | For `rules`, `signers`, `list-rules`, `migrate-verifier`, `timelock`, `execute`, `multicall`: a deployed OZ smart-account contract address (from `accounts deploy-c`), plus at least one signer or context rule installed for write verbs. `list-verifiers`, `register-multicall`, `unregister-multicall`, `deploy-webauthn-verifier`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`, and `deploy-policy` need no deployed contract. |
+| `smart-account` (alias `sa`) | Smart-account | For `rules`, `signers`, `list-rules`, `migrate-verifier`, `timelock`, `execute`, `multicall`: a deployed OZ smart-account contract address (from `accounts deploy-c`), plus at least one signer or context rule installed for write verbs. `list-verifiers`, `list-intents`, `register-multicall`, `unregister-multicall`, `deploy-webauthn-verifier`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`, and `deploy-policy` need no deployed contract. |
 | `trade`, `vault` (writes) | Smart-account | A smart-account contract address with a context rule authorizing the operation. |
 | `profile`, `credentials`, `approve`, `audit`, `toolsets`, `counterparty` | Neither | An initialized profile; these operate at the profile/operator layer. |
 
 ## Key custody and the unlock window
 
-Keys are never stored in configuration. A profile is a per-environment TOML file (schema version 2) that binds a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no key material; each `*_key_id` field is a Keyring entry reference (a `service` + `account` pair) that names a platform-keyring secret. The signer seed, the nonce key, and every HMAC key live in the platform keyring (macOS Keychain, Linux Secret Service, Windows Credential Manager). An endpoint URL can embed a credential in its path or query on any network. Mainnet refuses only a username or password in the URL. The profile TOML is safe to back up only when no endpoint URL embeds a credential. The profile's `Debug` output additionally redacts `rpc_url`, `secondary_rpc_url` and `oracle_provider_url`, since those may embed RPC credentials.
+Keys are never stored in configuration. A profile is a per-environment TOML file (schema version 2) that binds a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no key material; each `*_key_id` field is a Keyring entry reference (a `service` + `account` pair) that names a platform-keyring secret. The signer seed, the nonce key, and every HMAC key live in the platform keyring (macOS Keychain, Linux Secret Service, Windows Credential Manager). An endpoint URL can embed a credential in its path or query on any network. Mainnet refuses only a username or password in the URL. The profile TOML is safe to back up only when no endpoint URL embeds a credential. The profile's `Debug` output additionally redacts `rpc_url`, `secondary_rpc_url`, and `oracle_provider_url`, since those may embed RPC credentials.
 
-When a CLI command signs with a seed read from a `--*-secret-env` variable, the 32-byte signing seed is loaded into a short Unlock window. Keyring signers, the Ledger, and the MCP server never enter it; a keyring signer loads its key for each signature into a zeroize-on-drop buffer without a memory lock. For transaction signing, the CLI copies the seed into an unpinned, zeroize-on-drop `SoftwareSigningKey` and disposes the window before returning the signer. The TTL does not bound that copy. `profile sign-policy` signs while the window is open. The window itself works as follows:
+When a CLI command signs with a seed read from a `--*-secret-env` variable, the 32-byte signing seed is loaded into a short Unlock window. Keyring signers, the Ledger, and the MCP server never enter it; a keyring signer loads its key for each signature into a zeroize-on-drop buffer without a memory lock. The window works as follows:
 
-- The seed is moved into a zeroize-on-drop buffer, and its backing page is pinned in physical RAM via `mlock` (Linux/macOS) or `VirtualLock` (Windows). When pinning succeeds, that page stays out of swap; the transaction signer's copy is not pinned.
-- The window is TTL-bounded. The default is 30 seconds; the configured value (profile `[wallet] unlock_ttl_seconds`) must be in the range 1 to 600 seconds, and a value of 0 or above 600 is refused when the window is constructed rather than clamped. A background timer fires at the TTL and marks the wallet disposed.
-- On every exit path, including normal return, error propagation, and panic-unwind, the seed is zeroized and the lock released.
+- The wallet allocates a zeroed, isolated home, attempts the configured memory lock, then copies the borrowed seed and builds its signing key in it.
+- The clock bounds wallet seed access and transfer to the unlock window. The default is 30 seconds; `wallet.unlock_ttl_seconds` accepts 1 to 600 seconds and refuses other values.
+- When the lock succeeds, the seed and the signing key built from it stay in one locked, zeroize-on-drop page while their wallet or signer holds them. That page is not written to swap, but a hibernation image of the whole memory still holds it. Drop zeroizes the key and seed before unlocking and freeing, including on errors and panic unwind.
+- The owner ceremony clears its parsing buffer before the signing operation runs. Copies that the strkey parser, signing library, and compiler make while a key is built or read or a signature is computed are not locked and are zeroized where those libraries allow. The wallet does not claim that no copy of a seed reaches swap.
+- Testnet environment signers keep the seed for the command, which can outlast the TTL.
+- An exported seed stays in the environment of the process and of every process the shell starts, for their whole life; copying and dropping it inside the wallet does not erase it. Mainnet transaction signing refuses `--secret-env` and signs with the enrolled seed in the keyring or with a Ledger that holds the enrolled key. On Linux the CLI marks itself non-dumpable before it starts any thread, so other processes of the same user cannot read its memory or environment or attach to it; the shell that exported the variable is not protected. On macOS and Windows the CLI sets no such flag.
 
 The `mlock_required` posture in `[wallet]` controls what happens when pinning fails. The value `true` (default on Linux/macOS) fails closed and aborts the unlock; `"warn"` (default on Windows) proceeds with unprotected memory and emits a warning; `false` proceeds silently, with the operator accepting the swap-disclosure risk. The posture is set in the profile file and is not overlayable. No path logs the seed.
 
 ```toml
 [wallet]
 mlock_required = true       # default on Linux/macOS
-unlock_ttl_seconds = 30     # default; must be in the range 1–600
+unlock_ttl_seconds = 30     # default; must be in the range 1 to 600
 ```
 
 ## The policy engine
 
 The active Policy engine evaluates each gated tool or command before it signs anything. Reads the decision needs, such as the source account state, can run first. Read-only CLI commands such as `balances` evaluate no policy. The engine returns one of three decisions:
 
-- **Allow**: the call proceeds.
-- **Deny**: the call is refused, carrying a typed reason.
-- **RequireApproval**: the call is held pending an out-of-band operator approval.
+- Allow: the call proceeds.
+- Deny: the call is refused, carrying a typed reason.
+- RequireApproval: the call is held pending an out-of-band operator approval.
 
 Which engine runs is selected per profile in `[policy]`. `pay`, `claim`,
 sponsored `accounts create`, `trade`, `vault`, `trustline`, and
 `smart-account multicall` evaluate policy before signing. `pay` and `claim`
 build or decode the envelope before evaluation. Sponsored `accounts create`
-and `trustline` evaluate before building their envelopes. `trade` and `vault`
+and `trustline` build the envelope before evaluation too, so the policy
+arguments carry its fee. `trade` and `vault`
 evaluate before their adapter submit paths construct transactions. Each of
 these verbs except `smart-account multicall` uses the same value descriptor as
 its MCP twin. `smart-account multicall` has no MCP twin; it evaluates the bundle
 under the tool name `wallet_multicall` and requires the V1 engine.
 `smart-account execute` submits an agent-key-signed `CallContract` invocation
-under an on-chain context rule; it does not evaluate the wallet policy engine.
+under an on-chain context rule. It evaluates no rule decision and no default
+deny. Under V1, it sizes the call as an unvalued contract call before signing,
+under the tool name `stellar_smart_account_execute`. A matching rule with a
+value criterion refuses the call with `policy.deny.unsizable_value_effect`
+unless the rule sets `allow_opaque_signing = true`. Count limits charge the
+call as one intent.
 `pay` and `claim` gate their default
 build-sign-submit flow and their `--build-only`, `--sign-only`, and
 `--submit-only` invocations. The staged flows use the MCP commit path's decoder
@@ -124,13 +137,13 @@ The Noop engine is the binding gate used when no full engine is configured. Its 
 A destructive tool on a mainnet profile cannot pass the Noop engine.
 `smart-account multicall` requires the V1 engine: on testnet it refuses a Noop
 profile with `policy.engine_required`, and on mainnet it refuses earlier with
-`network.mainnet_write_forbidden`. Newly minted profiles default to the V1 engine; profiles carried over from schema version 1 are set to Noop explicitly until the operator completes the key-rotation steps that stand up a V1 owner key. The engine choice governs the policy layer only: every mainnet write is additionally refused at the network layer (`network.mainnet_write_forbidden`) in this alpha, on Noop and V1 alike. MPP refuses mainnet with `mpp.network_forbidden` instead.
+`network.mainnet_write_forbidden`. Newly minted profiles default to the V1 engine; profiles carried over from schema version 1 are set to Noop explicitly until the operator completes the key-rotation steps that stand up a V1 owner key. The engine choice governs policy evaluation. Mainnet writes also need sealed authorization, checked independently by signing and submission. MPP refuses mainnet with `mpp.network_forbidden` instead.
 
 ### V1 engine
 
 The V1 engine evaluates a signed policy document against typed Criteria. The document carries an ed25519 owner signature over its canonical form, produced with `profile sign-policy` and verified against the owner public key enrolled with `profile enroll-owner-key`; an invalid signature, or a signature from a key that was re-enrolled after signing, is rejected. The online agent holds only the owner public key. The seed stays with the operator and is supplied to `sign-policy` at sign time.
 
-The signature covers every key the loader reads except the `[signature]` table itself. These are `version`, `scope`, and each rule's `match`, `criteria`, and `decision`, plus `reason`, `ttl_secs`, and `allow_opaque_signing` when the rule carries them. Each level of the file accepts a closed set of keys, and each criterion kind has its own set. The loader refuses any other key, naming the key and its location, before it checks the signature.
+The signature covers every key the loader reads except the `[signature]` table itself. These are `version`, `scope`, and each rule's `match`, `criteria`, and `decision`, plus `reason`, `ttl_secs`, and `allow_opaque_signing` when the rule carries them. The signature also covers `contract_transfer_max_fee_stroops` and `[owner_rotation]` when the file carries them. A version 2 file adds `sequence`, and `engine` and `[mainnet]` when present. Each level of the file accepts a closed set of keys, and each criterion kind has its own set. The loader refuses any other key before it checks the signature. The refusal names the key's location and the keys accepted there, never the key itself.
 CLI `pay`, `claim`, `accounts create`, `vault`, `trade`, and `smart-account multicall` report a policy that fails its initial load as `policy.engine_unavailable`.
 The message carries the loader's detail.
 On that load, `trustline` reports `trustline.policy_engine_unavailable`, and `mpp charge` reports `mpp.state_unavailable`.
@@ -151,7 +164,7 @@ Evaluation is **first-match, default-deny**:
 
 A Criterion is one typed check. Amount checks include per-transaction caps,
 approval-above thresholds, and per-period (windowed) caps. Other checks include
-rate limits, counterparty allowlists, and minimum-reserve guards.
+rate limits, asset allowlists, counterparty allowlists, and minimum-reserve guards.
 Counterparty allowlists match classic accounts, contract accounts, asset issuers,
 or resolved home domains. The `SEP10_IDENTITY` and `ONE_TIME_ADDRESS` kinds are
 reserved and are not evaluated.
@@ -166,6 +179,187 @@ every call.
 Reserve, identity, and counterparty-cache criteria receive external state
 through injected views; a missing required view refuses the call.
 
+A version 2 policy accepts four more restrictions: an `unlisted` table on
+`counterparty_allowlist`, `total_budget`, `balance_floor`, and `memo_binding`.
+A version 1 policy that uses one fails to load. A policy without them keeps
+its canonical bytes and its signature. The
+[spending presets](profiles.md#generated-policy-body) that
+`profile init` writes on mainnet use the first three.
+
+The `unlisted` table decides a payment to a well-formed, verified recipient
+outside the criterion's own list:
+
+```toml
+criteria = [
+  { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GA..."], unlisted = { mode = "budget", per_tx_stroops = 10_0000000, per_period_stroops = 50_0000000, window = "1d" } },
+  { kind = "per_tx_cap", asset = "native", max_stroops = 500_0000000 },
+]
+```
+
+`mode` is `deny`, `approval`, or `budget`, and an omitted mode denies.
+`deny` keeps the `policy.deny.counterparty_denied` refusal unchanged.
+`approval` requests approval at any amount, with the default approval lifetime
+and a reason that names no address.
+`budget` admits such payments without approval up to `per_tx_stroops` per call
+and `per_period_stroops` per rolling `window`.
+On a mainnet profile a payment beyond either bound requests a per-payment
+approval, and the approved payment counts in full against the budget.
+On every other network it is refused with
+`policy.deny.unlisted_budget_exceeded`, because no approval can complete it
+there.
+Every spelling of the budget asset, such as a classic asset and its asset
+contract, counts in one budget.
+`asset` sets the budget's asset and defaults to `native`. A debit in another
+asset keeps the counterparty refusal.
+`approval` and `budget` require `decision = "allow"`, and every other criterion
+of the rule still applies.
+`per_tx_stroops` must be below every `per_tx_cap` of the same asset in its rule.
+`per_period_stroops` must be below every `per_period_cap` of the same asset and
+window in its rule.
+Both bounds must be below every `total_budget` of the same asset in its rule.
+A rule carries at most one `unlisted` table.
+Several rules may carry one, and every table must equal the policy's first in
+mode, asset, both bounds, and window.
+Equal budget tables share one counter per asset across the rules that carry
+them. A rule without a table, its allow list, and its caps are unaffected.
+The unlisted counter survives re-signing and restart. Its key contains the
+asset and rolling window, with no signed-policy digest. Earlier classic-asset
+rows and SAC rows count together without rewriting their stored spelling.
+Address kinds are alternatives. G_ACCOUNT covers G and M; C_ACCOUNT covers C and W.
+A destination is listed only when its kind is selected and its exact string or
+base G or C appears in the list. An exact M or W entry covers only that mux id.
+A G entry covers that G and every M on its key. An M entry leaves its G base
+and every other mux id on that key unlisted.
+Issuer and verified-domain checks also apply before the mode.
+A missing destination or asset, an unverified home domain, a reserved kind,
+or a gated-inflow failure refuses in every mode.
+Other strkey forms and malformed strings return evaluation errors.
+Raw arguments keep their denials in every mode.
+The own-rule check of SEP-43 signing, undecodable staged pay or claim envelopes,
+and exempted generic bundle inners refuse under an address criterion.
+That check has no evaluated effects: no recipient class or amount exists for a
+budget or approval threshold to bind. The SEP-43 transaction tools then decide
+each decoded payment under its payment tool's rule, where these criteria
+apply to the signed recipient and amount.
+
+`total_budget` bounds the debits of one asset over the life of the signed
+policy:
+
+```toml
+criteria = [{ kind = "total_budget", asset = "native", max_stroops = 200_0000000 }]
+```
+
+The allocation never renews with time. A policy with a different signed digest
+starts a new allocation at zero. Every signing gives a version 2 body a new
+`sequence`, so each signature of it starts a new allocation; signing identical
+version 1 bytes keeps the allocation.
+Every spelling of one asset, such as `native` and its asset contract, counts
+against one allocation. The allocation persists across restarts, state
+refreshes, clock changes, and owner resets. A signed, sent, or confirmed debit
+stays counted. An operator clear keeps it counted. A checked failure or
+non-inclusion releases that attempt's debit and keeps its fee charged. An
+x402 or MPP debit stays counted for the life of the signed policy.
+Smart-account signing also charges total-budget legs under the pinned digest.
+Only cancellation with the original unexposed proof releases its intent charge.
+Replaying admission invalidates that proof, and binding prevents cancellation.
+Witnessed invocation or schedule closure stops future use but proves no historical non-use.
+Collection transfers the full charge into settled sums, preserving duplicate criterion debits.
+Linked submission records carry receipt bookkeeping and never add another total charge.
+A final charge is a debit no supported release changes: authorized x402 or MPP
+spend, and a classic payment with a checked success. One week after its date it
+folds into one settled sum for its policy digest, scope, and asset. The sum
+keeps the full amount through restarts, resets, and policy changes. A debit
+whose outcome is unresolved stays an individual record. An exhausted allocation refuses with
+`policy.deny.total_budget_exhausted`. Over MCP the message names the maximum
+and the remaining amount; the CLI message reads `<verb> operation denied by
+operator policy` and names no amount. The criterion requires `decision = "allow"`.
+An exhausted allocation denies the payment and requests no approval. An
+approval for a payment beyond an unlisted budget never lifts an allocation,
+a cap, or a rate limit.
+Period caps, total budgets, and unlisted budgets also refuse overflowing sums.
+Exact-cap use remains allowed, including the largest representable amount.
+An overflow under a period cap or total budget returns that limit's denial code.
+An unlisted-budget overflow refuses with `policy.accounting_overflow`.
+Diagnostics omit totals that cannot be represented exactly.
+`profile enable-mainnet --check` reports each signed bound's committed use
+and remaining amount in exact stroops, without changing wallet state. The
+report is `null` when the use is unknown, and never zero for unknown history.
+A confirmed `smart-account multicall` bundle counts each of its transfers
+against the allocation and against an unlisted budget.
+Under either criterion, a bundle with a call the wallet does not recognize as
+a transfer refuses with `policy.deny.bundle_contains_generic_kind`.
+
+`balance_floor` refuses a call that would leave the operating account's native
+balance below an absolute floor:
+
+```toml
+criteria = [{ kind = "balance_floor", min_stroops = 2_0000000 }]
+```
+
+The check subtracts effective native reservations, the native debit, and the
+account-paid fee from a live account read. A used authorization stays reserved
+until release evidence covers that balance read. Native aliases and the current
+network's native asset contract count alike. Debit and fee arithmetic is checked.
+A result below `min_stroops` refuses with `account.floor_refused`.
+A missing or future-dated read refuses with `account.unread`, and a read older than 120 seconds
+refuses with `account.stale`. Any decision may carry the criterion.
+Provisional evaluation skips the floor; the strict evaluation before signing
+runs it. The criterion is enforceable only where a caller supplies an observed
+read with its reservation sum. No caller supplies the read off mainnet, so on
+testnet a strict evaluation of a matched floor refuses with `account.unread`.
+On mainnet, the CLI `pay`, `claim`, `trustline`, and `accounts create` verbs
+and the MCP pay, claim, create-account, and trustline tools supply both.
+Signing resolution reads them again before the mint. On mainnet, both x402
+tools also read the payer and its reservations, so a breach refuses with
+`account.floor_refused`.
+The SEP-43 transaction tools supply a plain account view for payment legs, and
+a matched floor refuses there with `account.unread` too.
+
+The store can recheck bound floor facts under the mint lock against its latest
+authenticated reservations. A retained value obligation with missing amounts,
+or a zero Soroban reservation without a bound non-native payment intent,
+refuses floor use. Listing and recovery remain available. Retention and reset
+keep every value obligation without a release row, and the store records this
+with a native coverage marker. A store without the marker, or a balance read
+that closed before its admissible floors, refuses with `account.unread`. The
+first write that sets the marker requires a read closed at least 300 seconds
+later, past any envelope signed earlier. A transaction signed before the marker
+by a host whose clock later moved backward lies outside the coverage guarantee.
+A claimed obligation stored without amounts keeps floor use refused on its
+profile; use a new profile. A floor that passes on a covered store admits the
+action only if the mint, under its lock, finds the floor still met by the
+latest retained reservations. Re-signing and resetting do not reconstruct
+missing exposure.
+
+`memo_binding` requires the memo a destination expects, such as an exchange
+deposit's customer memo:
+
+```toml
+criteria = [
+  { kind = "memo_binding", bindings = [{ destination = "GA...", kind = "id", value = "123456" }] },
+]
+```
+
+A criterion carries 1 to 64 bindings with distinct `G...` destinations.
+`kind` is `text`, `id`, `hash`, `return`, or `any`.
+`value` is required for every kind except `any`, which refuses it.
+A text value holds at most 28 bytes; an id is a decimal without sign or
+leading zero; a hash or return value is 64 lowercase hex digits.
+A payment to a bound destination, or to a muxed address on it, needs a memo
+of that kind and value.
+Without one the call is refused with `policy.deny.memo_binding_mismatch`,
+which names the required kind only. Unbound and contract destinations pass.
+
+CLI and MCP payment preparation evaluate the parsed memo. Signing and commit
+evaluate the memo encoded in the envelope. Caller fields cannot replace that
+signed fact, and the MCP commit still checks that its rebuilt envelope matches
+the prepared bytes. An ID of zero is a present memo; IDs retain all 64 bits.
+Text, ID, hash, and return memos remain distinct even when their values look
+alike. An empty text memo in an existing envelope remains text, while an empty
+text argument in payment preparation means no memo. Account creation prepares
+with no memo. Creating an account at a bound destination is refused, since
+creation carries no memo.
+
 `approval_above` permits amounts at or below its threshold and requests
 approval above it. It uses `asset` and `max_stroops`, with the same units and
 asset matching as `per_tx_cap`. One XLM is 10,000,000 stroops.
@@ -178,7 +372,8 @@ refuses such a body with `sign_policy.policy_body_invalid`.
 The commit tool's rule is binding, so the example carries the criterion on both pay tools.
 The threshold applies to its configured asset.
 A payment in another asset passes it, as it passes `per_tx_cap`.
-Single-shot tools and multicall refuse an escalation with their existing approval-required refusal.
+Single-shot tools refuse an escalation with `policy.approval_required_unsupported`, and multicall refuses it with `multicall.approval_required`.
+The SEP-43 transaction tools carry the escalation of a single payment, path payment, account creation, or trustline change to a pending approval.
 A bundle is sized per inner transfer.
 
 These payment rules allow up to 500 XLM without approval, request approval
@@ -206,8 +401,9 @@ Omit `per_tx_cap` from both rules to request approval above 500 XLM without
 a per-payment ceiling. Other failing criteria deny, including period caps.
 The MCP payment tool stores the pending request with a reason naming
 `approval_above` and its threshold. Operators approve through the CLI approvals
-commands, terminal, inbox, or remote approver. The CLI `pay` command returns
-`policy.approval_required` and directs the caller to MCP.
+commands, terminal, inbox, or remote approver. On testnet, the CLI `pay`
+command returns `policy.approval_required` and directs the caller to MCP. On
+mainnet, full-mode CLI `pay` runs the passkey ceremony for the escalation.
 
 `rate_limit` caps how many counted calls a rolling window holds:
 
@@ -220,29 +416,50 @@ integer within the `u32` range. A call is denied with
 `policy.deny.rate_limit_exceeded` when the window already holds `max_calls`
 counted calls.
 A submission counts when the wallet reserves it immediately before the send.
-An x402 or MPP payment counts when the wallet records its authorization, before
-it signs.
+A testnet x402 or MPP payment counts when the wallet records its authorization,
+before it signs. A mainnet x402 intent reserves headroom when it is minted and
+records the debit when it is consumed.
 The policy gate only reads the count, so simulations and read-only calls do not
 count.
 A call refused before its submission is reserved or its authorization is
 recorded does not count either.
 A recorded x402 or MPP authorization stays counted when a later step fails,
 such as signing or delivering the credential.
-For x402 that includes a refused endpoint identity check.
-A submission that fails on chain or is refused at the send stops counting.
-One without a confirmed outcome counts until reconciliation settles it or an
-operator clears its receipt with `tx receipt clear`.
-A confirmed submission leaves the window measured from the close time of the
-ledger that applied it.
-Without a usable close time in the confirmation, the reservation stays pending
-and keeps counting.
+For testnet x402 that includes a refused endpoint identity check. On mainnet
+the endpoint identity check runs before the intent is minted.
+A sent submission keeps counting whatever the endpoint reports, a failure on
+chain or a refusal at the send included.
+A time-bounded one counts through its accounting horizon: the later of its
+signed time bound and the first local success observation, plus the window's
+duration.
+A reported ledger close time does not backdate that horizon.
+An untimed one counts until an operator clears its receipt with
+`tx receipt clear --acknowledge --acknowledge-unbounded`.
+The classic envelopes the wallet builds on testnet carry no time bound, so
+each testnet submission counts until that clear. Classic mainnet envelopes
+carry a deadline of at most 120 seconds, which bounds their horizon.
 The count is kept per profile and window, in the profile's window-state store.
 Every `rate_limit` and `bundle_rate_limit` criterion of the profile with the
 same window reads one shared count, whichever rule carries it.
 Each criterion compares that shared count against its own `max_calls`.
+A reservation that is still open also counts in the profile's count of every
+other window: an untimed one until its receipt is cleared, a time-bounded one
+through the later of its own accounting horizon and its accounting start plus
+that window's duration. A confirmed call counts only in the window it was
+recorded under.
 `bundle_rate_limit` counts each inner call of a multicall bundle.
 
-Value criteria size a call through a typed value descriptor derived at the dispatch gate. A rule matching a value-moving tool constrains every debit leg, and per-asset caps aggregate across legs. A matched call whose value cannot be sized (including raw signing tools) denies fail-closed with `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. `minimum_reserve` counts only native-XLM outflow legs. MCP pay/create-account/trustline/claim commits and CLI `pay` and `claim` with `--sign-only` or `--submit-only` include envelope fees in `minimum_reserve`. A debit leaving only reserve plus margin refuses `policy.deny.minimum_reserve_breached`. Full CLI pipelines, `--build-only`, and MCP simulations count no fee. Cap amounts are i128 and cross the wire as decimal strings.
+Value criteria size a call through a typed value descriptor derived at the dispatch gate. A rule matching a value-moving tool constrains every debit leg, and per-asset caps aggregate across legs. A matched call whose value cannot be sized (including raw signing tools) denies fail-closed with `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`.
+
+`minimum_reserve` requires the balance after the call's native debits and fee to stay at or above the reserve plus margin. The reserve is the account's reserve plus one base reserve for each trustline the call opens, two for a liquidity pool share trustline. A trustline the account read shows as held opens none, so its removal or limit change adds nothing; one the read cannot show counts as opened. The trustline commands judge the asset the transaction carries, the resolved `CODE:ISSUER`, whatever spelling the caller used.
+
+In a SEP-43 transaction, each operation sees the debits and trustlines of the operations before it, a pool share trustline counts for every operation, and another operation source's trustline adds nothing. The `stellar_trustline_commit` rule judges each wallet-sourced pool share `ChangeTrust` as its own trustline operation, with or without other operations, and one with a limit of 0 opens nothing. Its leg carries no asset, so an `asset_allowlist` on that rule refuses it with `policy.deny.asset_not_allowlisted`.
+
+Native aliases and the current network's native asset contract count alike as native debits. MCP pay/create-account/trustline/claim commits include envelope fees in `minimum_reserve`, as do CLI `pay`, `claim`, sponsored `accounts create`, and `trustline` for the envelope they build. A balance below that requirement refuses with `policy.deny.minimum_reserve_breached`; equality passes. MCP classic preparation selects the fee before the policy gate, so its `minimum_reserve` check counts `total_fee_stroops`. Its paired commit check uses the encoded envelope fee and can refuse preparation on mainnet.
+
+Cap amounts are i128 and cross the wire as decimal strings.
+
+In a multicall bundle, every call other than a typed transfer from the smart account has an unsizable value effect.
 
 Each Deny carries a structured reason with a stable wire code. At the MCP boundary, account, strkey, and contract-id fields inside a deny reason are redacted to first-five-last-five characters before they cross the wire.
 
@@ -250,7 +467,7 @@ The tool registry is also fail-closed at startup: a duplicate tool registration,
 
 ## The approval spine
 
-When the policy engine returns RequireApproval, the approval spine holds the action until the operator consents. The operator can run `approve --id <nonce> --profile <name>`, use the loopback inbox started by `approve serve`, or use the TLS-protected, passkey-authenticated inbox from `approve serve --remote`. The inbox lists pending entries, notifies the operator, and drives the same attestation path. `approve list` shows pending entries in the terminal. The spine consists of a pending-approval store for each profile and a cryptographic attestation minted at approve time. All three approval surfaces write the consent row to the audit log before the approval is persisted, and an approval whose row cannot be written does not take effect. When an MCP server or inbox holds that profile's audit writer, `approve --id` queues the row in the audit outbox. The running process appends it to the log before any process loads a signing key for the approved action. `approve --id` refuses beside a process that does not drain the outbox, and on any other audit failure. An inbox rejection writes its row, then replaces the entry with a short-lived rejection marker, and the agent's commit returns `policy.approval_rejected`.
+When the policy engine returns RequireApproval, the approval spine holds the action until the operator consents. The operator can run `approve --id <nonce> --profile <name>`, use the loopback inbox started by `approve serve`, or use the TLS-protected, passkey-authenticated inbox from `approve serve --remote`. The inbox lists pending entries, notifies the operator, and drives the same attestation path. On testnet, an x402 payment approval needs `approve --id`, and both inboxes refuse it with `approval.wrong_kind`; see [x402](mcp.md#x402). `approve list` shows pending entries in the terminal. The spine consists of a pending-approval store for each profile and a cryptographic attestation minted at approve time. All three approval surfaces write the consent row to the audit log before the approval is persisted, and an approval whose row cannot be written does not take effect. Each inbox page carries a digest of the request it renders, and an approve from that page attests only that request. When the pending request changed after the page loaded, the approve is refused with `approval.presence_changed` and attests nothing, and a reload shows the current request. When an MCP server or inbox holds that profile's audit writer, `approve --id` queues the row in the audit outbox. The running process appends it to the log before any process loads a signing key for the approved action. `approve --id` refuses beside a process that does not drain the outbox, and on any other audit failure. An inbox rejection writes its row, then replaces the entry with a short-lived rejection marker, and the agent's commit returns `policy.approval_rejected`.
 
 ### The pending-approval store
 
@@ -262,24 +479,22 @@ The store is a per-profile TOML file holding a flat list of pending entries:
 
 Entries are kinded. The kinds are `PaymentSimulated`, `TrustlineSimulated`,
 `ClaimSimulated`, `SignWithPasskey`, `RegisterPasskey`, `ToolsetFirstInvokeGate`,
-`TrustlineClawbackOptIn`, `RuleProposalSimulated`, `MppChargeSimulated`, `Rejected`,
-and `Consumed`.
+`TrustlineClawbackOptIn`, `RuleProposalSimulated`, `MppChargeSimulated`, `X402Payment`,
+`Rejected`, and `Consumed`.
 
 Trustline approvals name the holder, asset code, full issuer, and limit.
 An absent limit means unlimited; zero means removal.
 The MCP commit gate accepts only the approval kind of its tool.
 
-Processes sharing an approval store upgrade together.
-An older binary rejects the whole approval file when it contains a
-`trustline_simulated` entry, including unrelated entries.
-Expiry alone does not make that file loadable by an older binary.
-Trustline approvals minted before the upgrade remain flat payment entries.
-The trustline commit gate returns `policy.approval_required` for them;
-simulate and approve again to create a trustline approval.
+Every process that shares an approval store must run a build that reads
+`trustline_simulated` entries.
+The trustline commit gate refuses a flat payment approval with
+`policy.approval_required`; simulate and approve again to create a trustline
+approval.
 
 ### What `approve` does
 
-`stellar-agent approve --id <nonce> --profile <name>` loads the store and renders a wallet-controlled summary of the pending action. The destination G-strkey and asset are validated when the entry is deserialized, so a hostile entry cannot inject terminal-rendering content into that summary. The operator confirms at the terminal, and the command then computes and records the attestation. Recording is one-shot: a nonce that is expired, of the wrong kind, or already attested is rejected.
+`stellar-agent approve --id <nonce> --profile <name>` loads the store and renders a wallet-controlled summary of the pending action. A payment, claim, or trustline summary is decoded from the envelope whose digest the attestation binds, and an entry whose stored digest is not that envelope's digest is refused with `approval.entry_inconsistent`. Every value renders control characters as visible escapes, so a hostile entry cannot inject terminal-rendering content into that summary. On testnet the operator confirms at the terminal, and the command then computes and records the attestation. On mainnet a consent needs a verified passkey assertion from an approval credential in the owner-signed policy. The operator approves on the local passkey page or at the signed approval origin. Recording is one-shot: a nonce that is expired, of the wrong kind, or already attested is rejected.
 
 ### The attestation
 
@@ -299,44 +514,61 @@ The 37-byte tag has no length prefix or NUL terminator; the digest is 32 bytes w
 The tag separates this HMAC from every other use of the key.
 The profile name and CAIP-2 chain id make a blob unverifiable under another profile or chain.
 A layout change bumps the tag; blobs under the previous tag do not verify.
+Pending approvals use version 4 of this input, under the tag `stellar-agent-approval-attestation:v4`: the fields above, then the approval's kind, creation time, and expiry, then the approver, which is the local operator or the operator credential the remote-approval listener verified.
+Every testnet commit requires version 4, so an approval recorded under an earlier layout needs fresh consent.
+Mainnet consent to an envelope uses version 5, under the tag `stellar-agent-approval-attestation:v5`: the version 4 fields with a mainnet passkey approver, which names the approval credential's ID, followed by the SHA-256 digest of the stored presence receipt.
+Mainnet consent to a canonical intent digest uses version 6, under the tag `stellar-agent-approval-attestation:v6`, with the 32-byte intent digest in the subject slot.
+The receipt holds a consent request ID, the random challenge input, the policy sequence, digest, and owner, the expected origin, the issue, expiry, and verification times, and the raw WebAuthn assertion.
+The consent request ID names one ceremony; the approval nonce names the pending action.
+The commit witness verifies the receipt again: it recomputes the challenge from the stored record and binding, checks the raw assertion under the credential key of the current signed policy, and requires that policy to be the one the receipt names.
+A version 4 blob never verifies as version 5.
+Signed-origin mainnet consent persists version 5 for an envelope and version 6 for a canonical intent digest, each with a version 2 presence receipt and the listener's verified policy identity.
+Localhost ceremonies record signature counters without enforcing them.
+Signed-origin login and decisions enforce counters once per assertion; equal nonzero or lower counts refuse, while zero may follow zero.
+Receipt re-verification and commit do not update counters.
+Mainnet consent runs on the localhost passkey page, which needs a display or `--open-by-operator`, or on the HTTPS listener of a signed approval origin; see [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope).
 
 The length prefixes on the variable fields prevent boundary-collision attacks (two different nonce/uid pairs cannot collide into the same input). The `envelope_sha256` slot binds the attestation to the exact transaction envelope that will be signed. The `process_uid` (numeric OS uid on Unix) gives cross-account-on-host non-replay: a tag minted by one local user cannot be replayed by another.
 
-The MCP commit-path verifier recomputes the tag and compares it in constant time. It collapses the distinct internal outcomes (`Expired`, `NotFound`, `AlreadyAttested`) into the single wire code `policy.approval_required`, so a caller cannot probe which state a nonce is in; the distinction is kept only in internal debug tracing.
+Off mainnet, the MCP commit-path verifier recomputes the tag and compares it in constant time. On mainnet it verifies the proof against the approval's durable record. It reports an absent, malformed, unknown, expired, or mismatched approval with the single wire code `policy.approval_required`, so a caller cannot probe which of these states a nonce is in. Internal debug tracing keeps the distinction. A live rejection returns `policy.approval_rejected`. A live consumed testnet approval, an approval held by a submission receipt, or a mainnet proof of another operation returns `policy.approval_consumed`. A revoked mainnet approval returns `approval.revoked`. A verified mainnet approval whose queued consent row has no exact Delivered evidence returns `approval.consent_undelivered`.
 
-The attestation proves that **the keyring holder ran `approve`**, not that a human clicked "yes" in some agent-controlled UI. The agent's own UI is not a trust input; the wallet-controlled `approve` step is.
+On testnet the attestation proves that **the keyring holder ran `approve`**, not that a human clicked "yes" in some agent-controlled UI. A mainnet attestation also binds a user-verified passkey assertion over the exact consent, so the HMAC key alone records no mainnet consent. The agent's own UI is not a trust input; the wallet-controlled `approve` step is.
 
-What an attacker who can write to the store file can and cannot do: deleting a pending entry forces re-approval, which is a denial-of-service nuisance, not a bypass. The attacker cannot forge an attestation, because the HMAC key is in the keyring, not in the file. Rotating the attestation key invalidates all outstanding pending approvals.
+What an attacker who can write to the store file can and cannot do: deleting a pending entry forces re-approval, which is a denial-of-service nuisance, not a bypass. The attacker cannot forge an attestation, because the HMAC key is in the keyring, not in the file. After the attestation key rotates, attestations minted under the old key fail verification. Unattested pending requests can still be approved under the new key.
 
 ### Agent-proposed context rules
 
 `RuleProposalSimulated` uses the shared attestation with `proposal_sha256` in the digest slot.
-`stellar_rule_create` resolves and stores every signer, policy, context, expiry and `auth_rule_ids` in the pending proposal.
+`stellar_rule_create` resolves and stores every signer, policy, context, expiry, and `auth_rule_ids` in the pending proposal.
 The commit gate verifies the operator's attestation and compares the stored chain with the binding.
 The commit also compares that chain with the presented `args.chain_id`.
-It recomputes the proposal digest from the stored definition and refuses `simulation.divergence` on a mismatch.
-The CLI and both inboxes render the resolved definition, including account-wide authority and override warnings.
+The digest covers the account, network, chain, full resolved definition, and summary line.
+Every approval surface recomputes it and shows an inconsistent entry instead of the rule when it differs.
+Approval refuses with `approval.entry_inconsistent`; the commit recomputes the digest and refuses `simulation.divergence` on a mismatch.
+The CLI and both inboxes render consistent proposals in full, including account-wide authority and override warnings.
 
 ## First-invoke gate vs. per-action payment approval
 
 Toolset-routed payments use two distinct controls, and only one of them is suppressible.
 
-- The **first-invoke gate** fires the first time a toolset uses a signing-adjacent capability with no matching grant. It queues a one-time `ToolsetFirstInvokeGate` entry. Once the operator approves it, a time-boxed toolset grant is persisted (default TTL 30 days) and matched on later invocations by the toolset, capability, destination, asset, and an amount range, plus its TTL.
+- The **first-invoke gate** fires the first time a toolset uses a signing-adjacent capability with no matching grant. It queues a one-time `ToolsetFirstInvokeGate` entry. Once the operator approves it, a time-boxed toolset grant is persisted (default TTL 30 days) and matched on later invocations by the toolset, its installation, package version and digest, capability, destination, asset, and an amount range, plus its TTL.
 - The grant suppresses **only** the first-invoke re-prompt. It does not stand in for payment approval.
 
-The **per-action payment approval** (`PaymentSimulated`) fires unconditionally on every toolset-routed payment, and its attestation binds the actual executed envelope. A forged or tampered grant can at most suppress a re-prompt; it cannot bypass the per-action approval, because that approval is forced regardless of any grant and is bound to the real transaction. See [Toolsets](toolsets.md) for how toolsets route payments.
+A matching grant requires a version 3 HMAC that verifies under the profile's attestation key and profile/chain binding. It must be unexpired, with a lifetime of at most 30 days, and issued no later than the current time and at or after the second following the current installation. An invalid install time honors no grant. Consent issued in the install second re-prompts once. A forged or edited grant suppresses nothing.
+
+The **per-action payment approval** (`PaymentSimulated`) is required when the routed payment or outer toolset policy requires consent, and binds the actual executed envelope. On mainnet, for a payment that `stellar_pay` prepared, it binds that payment's stored intent instead. A composed `Allow` uses a current first-invoke grant without another payment approval. See [Toolsets](toolsets.md) for how toolsets route payments.
 
 ## The hash-chained audit log
 
 Audit rows come from explicit event-writing operations. MCP balance reads
 and payment simulations produce no automatic invocation row. Under V1, payment
-simulations can reconcile overdue reservations and write settlement audit rows.
+simulations can reconcile overdue reservations and deliver owed accounting events.
 Reconciliation acquires the audit writer, which can block audit-key rotation.
 The event-writing paths include:
 
 - Transaction submission and reconciliation: payment, account creation,
   claim, trustline, DEX, DeFindex, pool, and smart-account operations.
-- Signing and payment protocols: opaque SEP-43 transaction/auth-entry signing,
+- Signing and payment protocols: SEP-43 transaction and auth-entry signing,
   x402 authorization, and MPP authorization, receipt, settlement, and state operations.
 - Operator decisions: approvals and rejections, including remote consent.
 - Key and lifecycle changes: signer/owner enrollment, HMAC-key rotation,
@@ -355,15 +587,17 @@ Files rotate at a size bound with a fixed number of rotated files retained.
 
 ### What is recorded
 
-Each entry carries a timestamp, the tool name, the chain id, the **argument key names** (`arg_keys`), the envelope hash, and the nonce id. It also carries the policy decision (`allow` / `deny:<reason>` / `require_approval`), an optional decision reason, a request id, the event kind, and the previous entry's hash. The event kind enumerates tool invocations alongside smart-account lifecycle events (rule changes, signer-set and threshold changes, passkey registration and assertion, multicall, timelock, channel-pool, rotation handoff, and others). Recorded submissions write `value_action_pending` before sending, `value_action_submitted` on confirmation with the gate-sized value legs, and `value_action_failed` on definitive refusal or failure. An unknown outcome keeps its pending row for reconciliation. Key-writing profile commands record `keyring_key_written`. `x402_payment_authorized` is written before a signed x402 authorization leaves the wallet in the RPC re-simulation. `x402_authorization_withheld` is written when that payment then fails, paired with the authorized row by its request id. Approval rows (`approval_attested`, `approval_rejected`, and their remote twins) are written before the decision takes effect.
+Each entry carries a timestamp, the tool name, the chain id, the **argument key names** (`arg_keys`), the envelope hash, and the nonce id. It also carries the policy decision (`allow` / `deny:<reason>` / `require_approval`), an optional decision reason, a request id, the event kind, and the previous entry's hash. The event kind enumerates tool invocations alongside smart-account lifecycle events (rule changes, signer-set and threshold changes, passkey registration and assertion, multicall, timelock, channel-pool, rotation handoff, and others). Recorded submissions write `value_action_pending` with the gate-sized value legs before sending. No endpoint answer writes an outcome row: a reported success is recorded on the receipt, and the pending row stands. `value_action_failed` closes the pending row of a submission the wallet refused before the send. Key-writing profile commands record `keyring_key_written`. `x402_payment_authorized` is written before a signed x402 authorization leaves the wallet in the RPC re-simulation, and records the signature expiration ledger through which that authorization is valid on chain. `x402_authorization_withheld` is written when that payment then fails, paired with the authorized row by its request id. Approval rows (`approval_attested`, `approval_rejected`, and their remote twins) are written before the decision takes effect.
 
-Raw argument **values are never logged**: `arg_keys` holds only their key names. Typed event fields such as the value legs of `value_action_submitted` retain each leg's amount, asset, and redacted destination. Strkeys appearing in a decision reason are redacted to first-five-last-five and transaction hashes to first-eight-last-eight; the envelope hash is left intact because it is a SHA-256 digest carrying no user data.
+Raw argument **values are never logged**: `arg_keys` holds only their key names. Typed event fields such as the value legs of `value_action_pending` retain each leg's amount, asset, and redacted destination. Strkeys appearing in a decision reason are redacted to first-five-last-five and transaction hashes to first-eight-last-eight; the envelope hash is left intact because it is a SHA-256 digest carrying no user data.
 
 ### Tamper evidence
 
 Each entry's hash is computed over its own canonical JSON (with the previous-hash field treated as empty) concatenated with the previous entry's hash, chaining every entry to the one before it. The first entry of the very first file chains off a fixed zero block; the first entry of each later file chains off the prior file's rotation-handoff entry. Each file also carries a `root_hmac` sidecar signing the chain root with the profile's audit key.
 
-`audit verify` walks the files oldest-first and checks that each entry's recorded previous-hash matches the recomputed prior-entry hash, that each file's first entry chains correctly across the rotation boundary, that each rotation handoff names the actual next file (defeating file-substitution), and, when an HMAC key is supplied, that the chain-root sidecar verifies. Verification failures use a closed set of wire codes (for example `audit.chain_broken`, `audit.rotation_gap`, `audit.hmac_mismatch`), with line and file detail kept out of the code.
+A writer that holds the audit key also stores an `entry_tag` on every entry: an HMAC-SHA256 over the entry's hash under a key derived from the audit key. The tag is left out of the hashed body, so entry hashes are the same with or without it. The first keyed acquisition of a log appends an `audit_entry_tags_started` row; from that row on, every entry must carry a valid tag, and keyed writers refuse a tail without one.
+
+`audit verify` walks the files oldest-first and checks that each entry's recorded previous-hash matches the recomputed prior-entry hash, that each file's first entry chains correctly across the rotation boundary, that each rotation handoff names the actual next file (defeating file-substitution), and, when an HMAC key is supplied, that the chain-root sidecar verifies and that every entry past the boundary row carries a valid entry tag. `audit verify --profile` reports the tag check as `entry_tags_verified` and `entry_tags_boundary`; without `--profile` no tag is checked. Verification failures use a closed set of wire codes (for example `audit.chain_broken`, `audit.rotation_gap`, `audit.hmac_mismatch`, `audit.entry_tag_invalid`), with line and file detail kept out of the code.
 
 ### Fail-closed on an unminted audit key
 
@@ -374,19 +608,48 @@ before signing-key access or submission. An unavailable key or writer refuses
 with `audit.chain_key_unavailable`, subject to the specific audit refusals
 described in [Audit-log recovery](maintainers/audit-log-recovery.md).
 
-Post-confirmation `value_action_submitted` row failures remain non-fatal.
-Read-only tools and build/simulate stages do not reach the signing preflight.
+The submission recorder writes the pending row before the send, and a confirmed submission it records writes no further value-action outcome row.
+Read-only tools and simulate steps do not reach the signing preflight.
 V1 MCP payment simulations can still acquire the writer for reservation
-reconciliation and its settlement audit rows.
+reconciliation and owed accounting events.
 
 `pay`, `claim`, and `accounts create` synthesize a testnet profile when no
 profile is named and no `default.toml` exists. It attempts keyed audit
 acquisition and tolerates an unavailable key or writer. A changed audit
 binding still refuses with `audit.log_binding_changed` before signing or submission.
 
-The SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) runs the same
-preflight. It writes `opaque_payload_signed` when it produces the signature,
+The four sign-only tools (`stellar_sep43_sign_transaction`,
+`stellar_sep43_sign_auth_entry`, `stellar_sep43_sign_message`, and
+`stellar_sep53_sign_message`) run the same preflight. Each writes
+`opaque_payload_signed` when it produces the signature,
 recording the redacted payload digest and signer. The caller broadcasts externally.
+A transaction or auth-entry signature also records the allowed payment legs
+with amount, asset, and redacted destination. Empty legs are omitted, so
+message signatures and signatures without a payment keep their serialized row
+shape.
+
+Both SEP-43 transaction tools decide each payment the transaction authorizes
+under the rule of its payment tool, after the tool's own rule allows. They
+charge the policy windows for that usage before the signer loads; a later
+signer, signing, or send failure keeps the charge. Effects the wallet cannot
+value need `allow_opaque_signing = true` on the tool's own rule. A wallet
+payment to itself is a payment. A claimable balance counts only claimants
+other than its source and the wallet. A wallet merge and a signer or
+threshold change always refuse; another account's merge into the wallet has
+no value effect. An operation of another account counts only when that
+account's signer set, read at signing time, lists the wallet key. An
+approval requirement of one payment, path payment,
+account creation, or trustline change returns a pending approval, and the
+attested repeat signs and spends it. See
+[the MCP guide](./mcp.md#sep-43-transaction-effects).
+
+The auth-entry tool decides each token transfer, allowance, and burn that the
+signer's account authorizes in the preimage's invocation tree under the
+`stellar_pay_commit` rule, with the contract asset, the exact quantity, and the
+recipient. It charges those payments and its own count before the signer
+loads. A call it cannot value needs `allow_opaque_signing = true`, and an
+approval requirement refuses with `policy.approval_required_unsupported`. See
+[the MCP guide](./mcp.md#sep-43-auth-entry-effects).
 
 ## Emergency stop
 
@@ -441,9 +704,9 @@ Passkey (WebAuthn) ceremonies use a browser handoff. Registration and signing en
 
 **Signer-set baseline.** Every signature authorized by a rule other than rule 0 compares the live signer set with the state in the profile's audit log. The comparison holds the rule's lock and reads both RPC endpoints, which must agree. Rule 0, the bootstrap rule, is exempt from the rule lock, the signer-set check, and the pin check.
 
-Version 2 covers a signer added, removed, swapped in any byte of key data, or reassociated to another id. It covers a Delegated contract-address signer replaced, a simple-threshold value changed, and the simple-threshold policy attached or detached outside the wallet. Version 1 state, recorded under an earlier release, keeps only the first 16 bytes of an `External` signer's key data. It cannot represent a contract delegate. `signers refresh` records version 2 state.
+Version 2 covers a signer added, removed, swapped in any byte of key data, or reassociated to another id. It covers a Delegated contract-address signer replaced, a simple-threshold value changed, and the simple-threshold policy attached or detached outside the wallet. Version 1 signer-set state keeps only the first 16 bytes of an `External` signer's key data. It cannot represent a contract delegate. `signers refresh` records version 2 state.
 
-On a rule with a pin record, each live verifier is compared with the verifier pin, and each live policy with the policy pins. The first eight bytes of the live code hash must equal the pinned value; the record stores that prefix. An external reference must also match its pinned reference identity and resolved hash prefix. An empty policy-pin list checks no policy code, so pins do not detect a policyless rule gaining a policy outside the wallet. During a `migrate-verifier` pair, the migrating rule skips its verifier pin check. The attached policy set itself is not recorded. A policy attached outside the wallet with a matching pinned hash prefix and reference identity is not detected by pins. A rule without a pin record has no code check.
+On a rule with a pin record, each live verifier is compared with the verifier pin, and each live policy with the policy pins. All 32 bytes of the live code hash must equal the pinned hash, so two executables that share a hash prefix are two different codes. An external reference must also match its pinned reference identity and full resolved hash. A pin record that holds only eight-byte hash prefixes cannot authenticate code: signing under the rule refuses with `sa.wasm_pin_incomplete` until the rule is reinstalled through an independently authorized rule such as rule 0. An empty policy-pin list checks no policy code, so pins do not detect a policyless rule gaining a policy outside the wallet. During a `migrate-verifier` pair, the migrating rule skips its verifier pin check. The attached policy set itself is not recorded. A policy attached outside the wallet whose full code hash and reference identity match a pin is not detected by pins. A rule without a pin record has no code check.
 
 The comparison does not cover rule 0, weighted-policy weights and thresholds, spending-limit configuration, arbitrary policy storage, or rule scope and expiry. A weighted-threshold or spending-limit policy attached or detached outside the wallet is not covered, subject to the code check above. Shared administration or a shared stale view can defeat the comparison even when endpoint hosts differ. The host predicate is a naming convention; the operator's provider attestation carries responsibility for independence. Changes between observation and the ledger that settles the transaction are not covered. Re-simulation before submission does not prove equality at execution. See [signer-set lifecycle](cli-reference/smart-account.md#smart-account-signers--signer-set-lifecycle).
 
@@ -467,11 +730,11 @@ states. See [Agent payments with MPP](agent-payments.md).
 | Profile | Per-environment TOML config (schema version 2) binding a CAIP-2 chain, RPC endpoint, keyring entry references, thresholds, and the active policy engine. Holds no keys; an endpoint URL can still embed a credential. |
 | CAIP-2 chain id | `stellar:testnet` or `stellar:mainnet`; drives passphrase resolution and the mainnet-write gate. |
 | Keyring entry reference | A `service` + `account` pair naming a platform-keyring secret; never the secret itself. |
-| Unlock window | A TTL-bounded seed buffer, pinned when the memory-lock posture succeeds. CLI transaction signing uses an unpinned copy after disposing this window; `profile sign-policy` signs while it is open. See [Key custody and the unlock window](#key-custody-and-the-unlock-window). |
+| Unlock window | The clock-checked period when a wallet permits seed access or transfer. Seed residency lasts until its wallet or signer drops. See [Key custody and the unlock window](#key-custody-and-the-unlock-window). |
 | Policy engine | Evaluates each tool/command to Allow, Deny, or RequireApproval. Noop and V1 are the two engines. |
-| Criterion | One typed check inside a V1 policy rule, such as a cap, rate limit, allowlist, or minimum-reserve guard. Quorum and session-active criteria refuse in shipped dispatch paths because their required views are absent. |
+| Criterion | One typed check inside a rule of a version 1 or version 2 policy that the V1 engine evaluates, such as a cap, rate limit, allowlist, or minimum-reserve guard. The `unlisted` table, `total_budget`, `balance_floor`, and `memo_binding` require version 2. Quorum and session-active criteria refuse in shipped dispatch paths because their required views are absent. |
 | Approval spine | The storage and cryptographic substrate recording out-of-band operator approvals: a per-profile pending-approval store plus an HMAC attestation minted at approve time. |
-| Attestation | An HMAC-SHA256 tag, keyed by the profile attestation key, over a length-prefixed input binding the profile name, chain id, approval nonce, envelope SHA-256, and process uid. Proves the keyring holder ran `approve`. Constant-time verified. |
+| Attestation | An HMAC-SHA256 tag, keyed by the profile attestation key, over a length-prefixed input. It binds the profile name, chain id, approval nonce, subject digest, process uid, approval kind, lifetime, and approver. A mainnet attestation also binds a passkey presence receipt. On testnet it proves the keyring holder ran `approve`. See [The attestation](#the-attestation). |
 | Audit log | A per-profile append-only hash-chained JSONL record of transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events; raw argument values are never logged, while typed value legs keep amounts and assets. Verified with `audit verify`. |
 | Context rule | An on-chain OpenZeppelin smart-account authorization rule, identified by a `u32` rule id; governs which signers may authorize which actions. |
 | Auth digest | `sha256(signature_payload || context_rule_ids_xdr)`; the value a smart-account signer signs, binding the rule ids to close a downgrade attack. |
@@ -479,6 +742,26 @@ states. See [Agent payments with MPP](agent-payments.md).
 | Spending-limit policy | A context-rule policy enforcing a rolling-window cap on SEP-41 `transfer` amount, evaluated during authorization on a `CallContract`-scoped rule. |
 | Threshold policy | A context-rule policy requiring at least `N` of the rule's signers to authorize, evaluated by signer COUNT regardless of which specific signers are present. |
 | Weighted-threshold policy | A context-rule policy assigning each signer an independent weight and requiring the sum of the WEIGHTS of the signers present in an authorization to meet a configured threshold. Retuned via `smart-account signers set-weighted-threshold` / `set-signer-weight`: see [Agent delegation](agent-delegation.md#weighted-quorums-for-multiple-agents). |
-| Halt marker | The file `profiles/<name>.halt` that `profile halt` writes and `profile resume` removes. While it exists, every action that signs or submits, and every MCP tool that is not read-only, refuses with `profile.halted`; the CLI verbs that only record or reconcile local state stay usable. See [Emergency stop](#emergency-stop). |
+| Halt marker | The file `profiles/<name>.halt` that `profile halt` writes and `profile resume` removes. While it exists, every action that signs or submits, and every MCP tool that is not read-only, refuses with `profile.halted`; the CLI verbs that only record or reconcile local state stay usable. `stellar_toolset_invoke` applies the check to the tool its action routes to, so a read-only routed action answers. See [Emergency stop](#emergency-stop). |
 | First-invoke gate | A one-time gate on a toolset's first use of a signing-adjacent capability; once approved, a time-boxed grant suppresses only that re-prompt. |
-| Per-action payment approval | The payment approval that fires unconditionally on every toolset-routed payment and binds the actual executed envelope. |
+| Per-action payment approval | Policy-required consent bound to the actual executed payment envelope. |
+
+## Retained smart-account charges
+
+A bounded invocation charge closes when a later policy check or admission witnesses both profile endpoints above every authorization and envelope bound.
+
+Each queried window counts a closed charge through the later of its observation plus that window and its admitted accounting horizon.
+
+A closed intent record remains until more than one week has passed since its observation.
+
+A schedule charge closes when both endpoints, above every authorization expiration, report its operation done or unset.
+
+Intents without an authenticated purpose remain open. Calls whose authorization tree names `approve`, `increase_allowance`, or `approve_for_all` retain their charges without closure by authorization expiry.
+
+Reset refuses while an intent remains open or retained. A closed and pruned intent does not block reset.
+
+An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
+
+When an intent is open and the profile stores no `secondary_rpc_url`, the intent view reports that retained intents cannot close and asks for one.
+
+When an intent is open and the stored endpoint configuration cannot load, the intent view reports that only stored endpoints that load close retained intents.

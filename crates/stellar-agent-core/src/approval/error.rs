@@ -27,18 +27,19 @@ pub enum ApprovalError {
 
     /// A TOML parse or serialise error occurred.
     ///
-    /// `detail` is a non-secret diagnostic string derived from the TOML error.
+    /// Parse diagnostics name only the position of the error.
     #[error("approval TOML error: {detail}")]
     Toml {
-        /// Non-secret diagnostic detail string.
+        /// Non-secret diagnostic; parse errors name the position only.
         detail: String,
     },
 
-    /// The approval store file is locked by another writer.
+    /// The approval store or toolset grant store is locked by another handle.
     ///
-    /// Only one `PendingApprovalStore` per store file is permitted across all
-    /// processes.  The caller should retry after a short delay or surface
-    /// `approval.writer_locked` to the user.
+    /// Only one `PendingApprovalStore` per store file, and one
+    /// `ToolsetGrantStore` per grant file, is permitted across all processes.
+    /// A `ToolsetGrantReader` also excludes grant writers. The caller should
+    /// retry after a short delay or surface `approval.writer_locked` to the user.
     #[error("approval store is locked by another writer (approval.writer_locked)")]
     WriterLocked,
 
@@ -64,6 +65,20 @@ pub enum ApprovalError {
     /// (indistinguishability invariant).
     #[error("approval entry has expired")]
     Expired,
+
+    /// The operator rejected the retained payment approval.
+    #[error("approval was rejected")]
+    Rejected,
+
+    /// The retained payment approval was already spent.
+    #[error("approval was consumed")]
+    Consumed,
+
+    /// A payment recovery binding does not match its stored approval entry.
+    ///
+    /// Only the payment that uses this binding is refused.
+    #[error("the payment recovery binding is inconsistent")]
+    RecoveryInconsistent,
 
     /// The attestation blob has already been set on this entry.
     ///
@@ -202,6 +217,39 @@ pub enum ApprovalError {
         /// The counter value previously stored for this credential.
         stored: u32,
     },
+
+    /// A stored record names a payment destination that is not a canonical
+    /// G account or M address, so this use of it refuses.
+    ///
+    /// The record stays stored unchanged. [`super::attest::record_error`]
+    /// maps this to `approval.entry_inconsistent`.
+    #[error(
+        "approval record {nonce_redacted} names a payment destination that is not a canonical \
+         G account or M address"
+    )]
+    DestinationRefused {
+        /// Redacted approval nonce (first-5-last-5 characters, or the full
+        /// value if it has at most 10 characters).
+        nonce_redacted: String,
+    },
+}
+
+/// Names a TOML error's line and character column without including input text.
+///
+/// A missing start or a start outside a character boundary gives the fixed
+/// diagnostic `TOML parse error`.
+pub(crate) fn toml_error_position(body: &str, start: Option<usize>) -> String {
+    let Some(prefix) = start.and_then(|start| body.get(..start)) else {
+        return "TOML parse error".to_owned();
+    };
+    let line = prefix.matches('\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, tail)| tail)
+        .chars()
+        .count()
+        + 1;
+    format!("TOML parse error at line {line}, column {column}")
 }
 
 impl ApprovalError {
@@ -248,6 +296,14 @@ impl ApprovalError {
         }
     }
 
+    /// Constructs an [`ApprovalError::DestinationRefused`] with the nonce
+    /// redacted.
+    pub(crate) fn destination_refused(nonce: &str) -> Self {
+        Self::DestinationRefused {
+            nonce_redacted: redact_nonce(nonce),
+        }
+    }
+
     /// Constructs a [`ApprovalError::SignCounterRegression`] with the
     /// credential ID redacted.
     pub(crate) fn sign_counter_regression(
@@ -267,6 +323,8 @@ impl ApprovalError {
 ///
 /// Returns first-5-last-5 characters separated by `"..."` if the nonce is
 /// longer than 10 characters; otherwise returns the full nonce unchanged.
+/// Characters are Unicode scalar values, so any UTF-8 text redacts without
+/// splitting a character.
 ///
 /// # Examples
 ///
@@ -277,8 +335,10 @@ impl ApprovalError {
 /// assert_eq!(redact_nonce("abcdefghijk"), "abcde...ghijk");
 /// ```
 pub fn redact_nonce(nonce: &str) -> String {
-    if nonce.len() > 10 {
-        let (head, tail) = (&nonce[..5], &nonce[nonce.len() - 5..]);
+    let count = nonce.chars().count();
+    if count > 10 {
+        let head: String = nonce.chars().take(5).collect();
+        let tail: String = nonce.chars().skip(count - 5).collect();
         format!("{head}...{tail}")
     } else {
         nonce.to_owned()
@@ -294,6 +354,44 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
     use super::*;
+
+    /// Eleven two-byte characters redact by character, without a panic.
+    #[test]
+    fn redaction_keeps_utf8_characters_whole() {
+        let id = "ééééééééééé";
+        assert_eq!(id.len(), 22);
+        assert_eq!(redact_nonce(id), "ééééé...ééééé");
+        assert_eq!(redact_nonce("éééééééééé"), "éééééééééé");
+        let err = ApprovalError::destination_refused(id);
+        assert!(err.to_string().contains("ééééé...ééééé"), "{err}");
+    }
+
+    #[test]
+    fn toml_error_position_names_line_and_character_column() {
+        assert_eq!(
+            toml_error_position("a\néébc", Some(7)),
+            "TOML parse error at line 2, column 4"
+        );
+        assert_eq!(
+            toml_error_position("a = 1\nb = ", Some(10)),
+            "TOML parse error at line 2, column 5"
+        );
+        assert_eq!(
+            toml_error_position("", Some(0)),
+            "TOML parse error at line 1, column 1"
+        );
+    }
+
+    #[test]
+    fn toml_error_position_without_a_start_names_no_position() {
+        assert_eq!(toml_error_position("abc", None), "TOML parse error");
+    }
+
+    #[test]
+    fn toml_error_position_outside_a_character_boundary_names_no_position() {
+        assert_eq!(toml_error_position("aéb", Some(2)), "TOML parse error");
+        assert_eq!(toml_error_position("abc", Some(4)), "TOML parse error");
+    }
 
     #[test]
     fn redact_nonce_short_passes_through() {
@@ -341,7 +439,11 @@ mod tests {
 
     #[test]
     fn from_io_display_omits_embedded_path() {
-        let path = "/home/alice/.local/share/stellar-agent/approvals/default.toml";
+        let path = format!(
+            "/home/alice/{}/approvals/default.toml",
+            stellar_agent_test_support::sandbox::LINUX_WALLET_SUFFIX.trim()
+        );
+        let path = path.as_str();
         let source = std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("open(\"{path}\"): permission denied"),

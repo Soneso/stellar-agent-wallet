@@ -1,0 +1,754 @@
+//! Durable unlisted-recipient and native floor accounting: canonical buckets,
+//! checked sums, allowance admission and observed native exposure.
+//!
+//! Stored rows keep the bucket text the writing build gave them. Comparison,
+//! hydration and admission map that text to the bucket the evaluation keys,
+//! so no stored byte changes.
+
+use std::borrow::Cow;
+
+use stellar_agent_core::WalletError;
+use stellar_agent_core::mainnet::decision::{MainnetDecision, MainnetRefusal};
+use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
+use stellar_agent_core::policy::v1::asset_equivalence::total_budget_identity;
+use stellar_agent_core::policy::v1::criteria::balance_floor::BalanceFloorCriterion;
+use stellar_agent_core::policy::v1::{
+    AccountReservesView, FloorInput, ObservedAccount, PolicyEngineV1, PolicyRule,
+};
+use stellar_agent_core::policy::{DenyReason, ToolDescriptor};
+use stellar_agent_core::profile::schema::Profile;
+
+use super::WindowStoreError;
+use super::store::ChainScope;
+use super::{ledger, operations};
+use crate::account::AccountView;
+
+fn unread() -> WindowStoreError {
+    WindowStoreError::PolicyDenied {
+        reason: Box::new(DenyReason::AccountUnread),
+    }
+}
+
+/// Counts retained native obligations at the balance read's observation.
+/// Release evidence is applied before requiring amounts. Neither a used
+/// disposition nor a later reconciliation observation releases this balance.
+/// A file without the native coverage marker, or an observation below an
+/// admissible floor, may miss an obligation and refuses.
+pub(super) fn floor_reserved(
+    wire: &super::store::WireFile,
+    observation: &operations::WindowObservation,
+) -> Result<u64, WindowStoreError> {
+    if wire.native_coverage.is_none()
+        || wire
+            .admissible_floor_ledger
+            .is_some_and(|floor| observation.ledger < floor)
+        || wire
+            .admissible_floor_close_time_ms
+            .is_some_and(|floor| observation.close_time_floor_ms < floor)
+    {
+        return Err(unread());
+    }
+    let mut sum = 0_i128;
+    for auth in &wire.authorizations {
+        if auth
+            .native_release
+            .is_some_and(|row| operations::row_releases(&row, Some(observation)))
+            || auth.domain.hold_owner() == crate::mainnet::HoldOwner::NoHolds
+        {
+            continue;
+        }
+        let amounts = auth.native_reservation.ok_or_else(unread)?;
+        if amounts.debit_stroops < 0 || amounts.fee_stroops < 0 {
+            return Err(WindowStoreError::AccountingInvalid);
+        }
+        if auth.domain == crate::mainnet::AuthorizationDomain::Soroban
+            && amounts.debit_stroops == 0
+            && !proved_non_native(wire, auth)
+        {
+            return Err(unread());
+        }
+        sum = sum
+            .checked_add(amounts.total_stroops())
+            .ok_or(WindowStoreError::AccountingOverflow)?;
+    }
+    u64::try_from(sum).map_err(|_| WindowStoreError::AccountingOverflow)
+}
+
+/// An old zero-valued Soroban record needs its bound payment facts: the
+/// producer could also have written zero for a native asset transfer.
+fn proved_non_native(wire: &super::store::WireFile, auth: &ledger::WireAuthorization) -> bool {
+    let Some(link) = auth.operation else {
+        return false;
+    };
+    operations::records(wire).iter().any(|record| {
+        let operations::IntentSlot::X402 {
+            intent_digest,
+            intent,
+        } = &record.intent
+        else {
+            return false;
+        };
+        record.id == link.operation_id
+            && record.chain_id == auth.chain
+            && intent.network
+                == if auth.chain.is_mainnet() {
+                    "stellar:pubnet"
+                } else {
+                    "stellar:testnet"
+                }
+            && auth.binding
+                == ledger::DomainBinding::Soroban {
+                    intent_digest: *intent_digest,
+                }
+            && stellar_strkey::ed25519::PublicKey::from_string(&intent.payer).is_ok()
+            && intent
+                .amount
+                .parse::<i128>()
+                .is_ok_and(|amount| amount >= 0)
+            && stellar_strkey::Contract::from_string(&intent.asset).is_ok()
+            && total_budget_identity(&intent.asset, auth.chain.network_passphrase()) != "native"
+    })
+}
+
+/// A signed floor and the observed, action-bound facts used at locked mint.
+///
+/// Construct this after authoritative action decoding and an observed account
+/// read. The store computes reservations from its locked successor. No amount
+/// from this input is persisted as a second counter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedFloor {
+    minimum: i128,
+    balance: i64,
+    observation: operations::WindowObservation,
+    chain: stellar_agent_core::profile::caip2::Caip2,
+    consumer: crate::mainnet::MainnetConsumer,
+    profile: String,
+    policy_digest: [u8; 32],
+    policy_sequence: i64,
+    signer: [u8; 32],
+    content: [u8; 32],
+    amounts: ledger::NativeReservation,
+}
+
+impl CheckedFloor {
+    #[cfg(test)]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "test fixture requires explicit native amounts"
+    )]
+    pub(super) fn for_test(
+        request: &ledger::MintRequest,
+        profile: &str,
+        now: u64,
+        balance: i64,
+    ) -> Self {
+        Self {
+            minimum: 20,
+            balance,
+            observation: operations::WindowObservation {
+                ledger: 100,
+                close_time_floor_ms: now - 5_000,
+                observed_at_ms: now,
+            },
+            chain: request.chain,
+            consumer: request.consumer,
+            profile: profile.to_owned(),
+            policy_digest: request.policy_digest,
+            policy_sequence: request.policy_sequence,
+            signer: request.bindings.signer,
+            content: request.binding.content_digest(),
+            amounts: request.native_reservation.unwrap(),
+        }
+    }
+
+    /// Binds the first matching verified rule's strongest floor to this mint.
+    /// The observed account must be the enrolled operating signer, and cover
+    /// the readiness ledger and close-time floor of the same endpoint read.
+    /// `request.native_reservation` must come from authenticated action facts.
+    /// A rule without a floor returns `None`.
+    ///
+    /// # Errors
+    ///
+    /// `account.unread` for mismatched policy, source, rule, chain or coverage,
+    /// absent amounts or an unreadable balance. Invalid amounts refuse with
+    /// `policy.accounting_invalid`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "binds independent checked proofs"
+    )]
+    pub fn for_mint(
+        context: &crate::MainnetWriteContext,
+        policy: &stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
+        tool: &stellar_agent_core::policy::ToolDescriptor,
+        evaluation: &stellar_agent_core::policy::Evaluation,
+        signer: &crate::keyring::EnrolledSigner,
+        observed: &stellar_agent_core::policy::v1::ObservedAccount<crate::account::AccountView>,
+        readiness: &crate::operational::OperationalReport,
+        request: &ledger::MintRequest,
+    ) -> Result<Option<Self>, WindowStoreError> {
+        let expected_tool = crate::mainnet::resolve::classic_consumer_tools(request.consumer)
+            .map(|tools| tools.policy_tool)
+            .or(match request.consumer {
+                crate::mainnet::MainnetConsumer::X402Create => Some("stellar_x402_create_payment"),
+                crate::mainnet::MainnetConsumer::X402Authenticated => {
+                    Some("stellar_x402_authenticated_payment")
+                }
+                _ => None,
+            });
+        if expected_tool != Some(tool.name.as_str()) || tool.chain_id != context.chain().caip2_str()
+        {
+            return Err(unread());
+        }
+        let engine = policy.engine();
+        let rules = engine.effective_rules();
+        let (ordinal, rule) = rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| rule.matches_tool(tool))
+            .ok_or_else(unread)?;
+        if evaluation.provisional
+            || evaluation.rule_ordinal != Some(ordinal)
+            || matches!(
+                evaluation.decision,
+                stellar_agent_core::policy::Decision::Deny(_)
+            )
+        {
+            return Err(unread());
+        }
+        let Some(minimum) = rule_floor(rule) else {
+            return Ok(None);
+        };
+        let observation = observed.observation().ok_or_else(unread)?;
+        if request.chain != context.chain()
+            || request.policy_digest != policy.digest()
+            || request.policy_sequence != policy.sequence()
+            || request.bindings.signer != signer.fact_digest()
+            || observed.view().account_id
+                != stellar_strkey::ed25519::PublicKey(signer.public_key())
+                    .to_string()
+                    .as_str()
+            || observation.ledger_sequence < readiness.latest_ledger
+            || observation.close_time_floor_ms
+                < readiness
+                    .close_time_unix
+                    .checked_mul(1_000)
+                    .ok_or_else(unread)?
+        {
+            return Err(unread());
+        }
+        let amounts = request.native_reservation.ok_or_else(unread)?;
+        if amounts.debit_stroops < 0 || amounts.fee_stroops < 0 {
+            return Err(WindowStoreError::AccountingInvalid);
+        }
+        Ok(Some(Self {
+            minimum,
+            balance: observed.balance_stroops().map_err(|_| unread())?,
+            observation: operations::WindowObservation {
+                ledger: observation.ledger_sequence,
+                close_time_floor_ms: observation.close_time_floor_ms,
+                observed_at_ms: observation.observed_at_ms,
+            },
+            chain: request.chain,
+            consumer: request.consumer,
+            profile: context.profile_name().to_owned(),
+            policy_digest: policy.digest(),
+            policy_sequence: policy.sequence(),
+            signer: signer.fact_digest(),
+            content: request.binding.content_digest(),
+            amounts,
+        }))
+    }
+
+    pub(super) fn check(
+        &self,
+        wire: &super::store::WireFile,
+        profile: &stellar_agent_core::profile::schema::Profile,
+        request: &ledger::MintRequest,
+        now: u64,
+    ) -> Result<(), WindowStoreError> {
+        if self.chain != request.chain
+            || self.consumer != request.consumer
+            || self.profile != stellar_agent_core::profile::name::profile_name_for_approval(profile)
+            || self.policy_digest != request.policy_digest
+            || self.policy_sequence != request.policy_sequence
+            || self.signer != request.bindings.signer
+            || self.content != request.binding.content_digest()
+            || Some(self.amounts) != request.native_reservation
+        {
+            return Err(unread());
+        }
+        let age_ms = now
+            .checked_sub(self.observation.observed_at_ms)
+            .ok_or_else(unread)?;
+        if age_ms > stellar_agent_core::policy::v1::criteria::balance_floor::MAX_OBSERVATION_AGE_MS
+        {
+            return Err(WindowStoreError::PolicyDenied {
+                reason: Box::new(DenyReason::AccountStale { age_ms }),
+            });
+        }
+        let reservations = floor_reserved(wire, &self.observation)?;
+        let after = i128::from(self.balance)
+            .checked_sub(i128::from(reservations))
+            .and_then(|after| after.checked_sub(self.amounts.total_stroops()))
+            .ok_or(WindowStoreError::AccountingOverflow)?;
+        if after < self.minimum {
+            return Err(WindowStoreError::PolicyDenied {
+                reason: Box::new(DenyReason::AccountFloorRefused {
+                    min_stroops: self.minimum,
+                    balance_after_stroops: after,
+                }),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The strongest `balance_floor` of `rule`, in stroops.
+fn rule_floor(rule: &PolicyRule) -> Option<i128> {
+    rule.criteria
+        .iter()
+        .filter_map(|criterion| {
+            (criterion.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<BalanceFloorCriterion>()
+                .map(BalanceFloorCriterion::min_stroops)
+        })
+        .max()
+}
+
+/// Whether the first effective rule matching `tool` carries a
+/// `balance_floor`, so that a strict evaluation of `tool` reads a
+/// [`FloorSource`].
+#[must_use]
+pub fn floor_rule_matches(engine: &PolicyEngineV1, tool: &ToolDescriptor) -> bool {
+    floor_rule_minimum(engine, tool).is_some()
+}
+
+/// The strongest native `balance_floor` of the first effective rule
+/// matching `tool`, in stroops, or `None` when that rule carries none.
+#[must_use]
+pub fn floor_rule_minimum(engine: &PolicyEngineV1, tool: &ToolDescriptor) -> Option<i128> {
+    engine
+        .effective_rules()
+        .into_iter()
+        .find(|rule| rule.matches_tool(tool))
+        .and_then(rule_floor)
+}
+
+/// Whether the first effective rule matching `tool` carries a
+/// `minimum_reserve`, so that a strict evaluation of `tool` needs the
+/// operating account's view.
+#[must_use]
+pub fn reserve_rule_matches(engine: &PolicyEngineV1, tool: &ToolDescriptor) -> bool {
+    use stellar_agent_core::policy::v1::criteria::minimum_reserve::MinimumReserveCriterion;
+    engine
+        .effective_rules()
+        .into_iter()
+        .find(|rule| rule.matches_tool(tool))
+        .is_some_and(|rule| {
+            rule.criteria.iter().any(|criterion| {
+                (criterion.as_ref() as &dyn std::any::Any)
+                    .downcast_ref::<MinimumReserveCriterion>()
+                    .is_some()
+            })
+        })
+}
+
+/// The account input of an x402 preparation: a [`FloorSource`] under a
+/// `balance_floor`, and a plain read of the payer under a
+/// `minimum_reserve` alone.
+#[derive(Debug)]
+pub enum PayerView {
+    /// The observed payer and its retained native exposure.
+    Floor(FloorSource),
+    /// The payer's account, read within the readiness deadline.
+    Plain(AccountView),
+}
+
+impl AccountReservesView for PayerView {
+    fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+        match self {
+            Self::Floor(floor) => floor.reserves_stroops(base_reserve_stroops),
+            Self::Plain(view) => crate::policy_view::AccountViewAdapter::new(view)
+                .reserves_stroops(base_reserve_stroops),
+        }
+    }
+
+    fn balance_stroops(
+        &self,
+    ) -> Result<i64, stellar_agent_core::policy::v1::AccountReserveLookupError> {
+        match self {
+            Self::Floor(floor) => floor.balance_stroops(),
+            Self::Plain(view) => {
+                crate::policy_view::AccountViewAdapter::new(view).balance_stroops()
+            }
+        }
+    }
+
+    fn observation(&self) -> Option<stellar_agent_core::policy::v1::AccountObservation> {
+        match self {
+            Self::Floor(floor) => floor.observation(),
+            Self::Plain(_) => None,
+        }
+    }
+
+    fn effective_native_reservations_stroops(&self) -> Option<u64> {
+        match self {
+            Self::Floor(floor) => floor.effective_native_reservations_stroops(),
+            Self::Plain(_) => None,
+        }
+    }
+}
+
+/// The refusal of a permitting strict decision whose deciding rule, at
+/// `rule_ordinal` among the effective rules, carries a `balance_floor`, as
+/// [`refuse_uncovered_floor`] states.
+#[must_use]
+pub(crate) fn uncovered_floor_use(
+    engine: &PolicyEngineV1,
+    rule_ordinal: usize,
+    account_view: Option<&dyn AccountReservesView>,
+) -> Option<DenyReason> {
+    let covered = account_view.is_some_and(|view| {
+        view.observation().is_some() && view.effective_native_reservations_stroops().is_some()
+    });
+    engine
+        .effective_rules()
+        .get(rule_ordinal)
+        .and_then(|rule| rule_floor(rule))
+        .filter(|_| !covered)
+        .map(|_| DenyReason::AccountUnread)
+}
+
+/// Refuses a permitting mainnet `decision` of `policy` whose deciding rule
+/// carries a `balance_floor`, unless `account_view` carries an observation
+/// and the retained native exposure at it.
+///
+/// Only a [`FloorSource`] carries that exposure, and its projection refuses
+/// unless the verified image carries the native coverage marker and the
+/// observation lies at or past both admissible floors. The mint repeats the
+/// projection on its locked image through [`CheckedFloor`]. Every other
+/// floor that passes refuses its use with `account.unread`.
+///
+/// # Errors
+///
+/// [`MainnetRefusal::Denied`] with `account.unread` and the deciding rule.
+pub fn refuse_uncovered_floor(
+    policy: &VerifiedPolicy,
+    decision: MainnetDecision,
+    account_view: Option<&dyn AccountReservesView>,
+) -> Result<MainnetDecision, MainnetRefusal> {
+    let rule_index = decision.rule_index();
+    match usize::try_from(rule_index)
+        .ok()
+        .and_then(|ordinal| uncovered_floor_use(&policy.engine(), ordinal, account_view))
+    {
+        Some(reason) => Err(MainnetRefusal::Denied {
+            rule_index: Some(rule_index),
+            reason,
+        }),
+        None => Ok(decision),
+    }
+}
+
+/// The observed operating account and the retained native exposure at that
+/// read: the account input of a strict evaluation under a `balance_floor`.
+#[derive(Debug)]
+pub struct FloorSource {
+    observed: ObservedAccount<AccountView>,
+    reserved_stroops: u64,
+    readiness: crate::operational::OperationalReport,
+}
+
+/// Why a [`FloorSource`] could not be read.
+#[derive(Debug)]
+pub enum FloorSourceError {
+    /// The readiness check or the account read failed.
+    Read(WalletError),
+    /// The verified window could not project its native exposure.
+    Store(WindowStoreError),
+}
+
+impl From<FloorSourceError> for WalletError {
+    fn from(error: FloorSourceError) -> Self {
+        match error {
+            FloorSourceError::Read(error) => error,
+            FloorSourceError::Store(error) => crate::operation_entry::operation_refusal(error),
+        }
+    }
+}
+
+impl FloorSource {
+    /// Checks the readiness of `client`'s endpoint, reads `account_id` after
+    /// it, and projects the verified window of `profile` at that read's
+    /// observation. Every request ends by `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// [`FloorSourceError::Read`] with the readiness, deadline and account
+    /// read errors, and [`FloorSourceError::Store`] with the projection's
+    /// refusals: `account.unread` for an unquantifiable retained obligation
+    /// or deficient release coverage, the accounting refusals, and every
+    /// verified read error.
+    pub async fn read(
+        client: &crate::StellarRpcClient,
+        account_id: &str,
+        store: &super::PersistedWindowStore,
+        profile: &Profile,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, FloorSourceError> {
+        Self::read_requesting(client, account_id, &[], store, profile, deadline).await
+    }
+
+    /// [`FloorSource::read`] whose account read also requests the trustlines
+    /// of `trustline_assets`, so the source tells whether each exists.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`FloorSource::read`].
+    pub async fn read_requesting(
+        client: &crate::StellarRpcClient,
+        account_id: &str,
+        trustline_assets: &[crate::Asset],
+        store: &super::PersistedWindowStore,
+        profile: &Profile,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, FloorSourceError> {
+        let report = crate::operational::operational_check_single(client, deadline)
+            .await
+            .map_err(FloorSourceError::Read)?;
+        let observed = crate::operational::read_within_readiness_deadline(
+            deadline,
+            crate::account::fetch_account_observed_requesting(
+                client,
+                account_id,
+                trustline_assets,
+                &report,
+            ),
+        )
+        .await
+        .map_err(FloorSourceError::Read)?;
+        let observation = observed
+            .observation()
+            .map(|seen| operations::WindowObservation {
+                ledger: seen.ledger_sequence,
+                close_time_floor_ms: seen.close_time_floor_ms,
+                observed_at_ms: seen.observed_at_ms,
+            });
+        let reserved_stroops = operations::OperationStatus::new(store, profile)
+            .floor_reserved_stroops(observation)
+            .map_err(FloorSourceError::Store)?;
+        Ok(Self {
+            observed,
+            reserved_stroops,
+            readiness: report,
+        })
+    }
+
+    /// The [`CheckedFloor`] that binds this read to `request` at its locked
+    /// mint, as [`CheckedFloor::for_mint`] states.
+    ///
+    /// # Errors
+    ///
+    /// The refusals of [`CheckedFloor::for_mint`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "forwards the independent checked proofs"
+    )]
+    pub fn checked_floor(
+        &self,
+        context: &crate::MainnetWriteContext,
+        policy: &VerifiedPolicy,
+        tool: &ToolDescriptor,
+        evaluation: &stellar_agent_core::policy::Evaluation,
+        signer: &crate::keyring::EnrolledSigner,
+        request: &ledger::MintRequest,
+    ) -> Result<Option<CheckedFloor>, WindowStoreError> {
+        CheckedFloor::for_mint(
+            context,
+            policy,
+            tool,
+            evaluation,
+            signer,
+            &self.observed,
+            &self.readiness,
+            request,
+        )
+    }
+
+    /// `floor` when the evaluation reads one, and `plain` otherwise.
+    #[must_use]
+    pub fn view_or<'a>(
+        floor: Option<&'a Self>,
+        plain: &'a dyn AccountReservesView,
+    ) -> &'a dyn AccountReservesView {
+        match floor {
+            Some(floor) => floor,
+            None => plain,
+        }
+    }
+
+    fn input(&self) -> FloorInput<'_, AccountView> {
+        FloorInput {
+            observed: &self.observed,
+            effective_reservations_stroops: self.reserved_stroops,
+        }
+    }
+}
+
+/// The [`FloorInput`] of the observed account and its reservations.
+impl AccountReservesView for FloorSource {
+    fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+        self.input().reserves_stroops(base_reserve_stroops)
+    }
+
+    fn balance_stroops(
+        &self,
+    ) -> Result<i64, stellar_agent_core::policy::v1::AccountReserveLookupError> {
+        self.input().balance_stroops()
+    }
+
+    fn observation(&self) -> Option<stellar_agent_core::policy::v1::AccountObservation> {
+        self.input().observation()
+    }
+
+    fn effective_native_reservations_stroops(&self) -> Option<u64> {
+        self.input().effective_native_reservations_stroops()
+    }
+
+    fn holds_trustline(&self, asset: &str, network_passphrase: &str) -> Option<bool> {
+        self.input().holds_trustline(asset, network_passphrase)
+    }
+}
+
+const UNLISTED: &str = "unlisted:";
+
+/// The bucket a row stored under `bucket` counts in on the network of
+/// `scope`.
+///
+/// An `unlisted:` bucket names its asset by [`total_budget_identity`], as
+/// the evaluation keys it, so a classic asset and its asset contract share
+/// one bucket. Every other bucket, and a file without a scope, keeps its
+/// text.
+pub(super) fn counted_bucket(bucket: &str, scope: Option<ChainScope>) -> Cow<'_, str> {
+    match (bucket.strip_prefix(UNLISTED), scope) {
+        (Some(asset), Some(scope)) => Cow::Owned(format!(
+            "{UNLISTED}{}",
+            total_budget_identity(asset, scope.chain().network_passphrase())
+        )),
+        _ => Cow::Borrowed(bucket),
+    }
+}
+
+/// Whether `bucket` is an unlisted-recipient bucket.
+fn is_unlisted(bucket: &str) -> bool {
+    bucket.starts_with(UNLISTED)
+}
+
+/// A window sum and call count.
+///
+/// The sum of an unlisted bucket is checked: a negative amount refuses with
+/// [`WindowStoreError::AccountingInvalid`] and an overflow with
+/// [`WindowStoreError::AccountingOverflow`]. Other sums also check overflow;
+/// admission maps that failure to the entry's governing limit.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Tally {
+    pub(super) sum: i128,
+    pub(super) count: u32,
+    checked: bool,
+}
+
+impl Tally {
+    /// An empty tally for `bucket`.
+    pub(super) fn for_bucket(bucket: &str) -> Self {
+        Self {
+            checked: is_unlisted(bucket),
+            ..Self::default()
+        }
+    }
+
+    /// Adds one entry of `amount`.
+    pub(super) fn add(&mut self, amount: i128) -> Result<(), WindowStoreError> {
+        self.add_all(amount, 1)
+    }
+
+    /// Adds `count` entries summing to `amount`.
+    pub(super) fn add_all(&mut self, amount: i128, count: u32) -> Result<(), WindowStoreError> {
+        self.sum = if self.checked {
+            if amount < 0 {
+                return Err(WindowStoreError::AccountingInvalid);
+            }
+            self.sum
+                .checked_add(amount)
+                .ok_or(WindowStoreError::AccountingOverflow)?
+        } else {
+            self.sum
+                .checked_add(amount)
+                .ok_or(WindowStoreError::AccountingOverflow)?
+        };
+        self.count = self.count.saturating_add(count);
+        Ok(())
+    }
+}
+
+/// How durable admission treats the unattended allowance of an unlisted
+/// entry. Every other limit, the entry's own unlisted sum included, applies
+/// in every mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Admission {
+    /// A write outside a mainnet mint: an exceeded allowance refuses with
+    /// the policy denial.
+    Restrictive,
+    /// A mint under policy authority: an exceeded allowance refuses with
+    /// [`WindowStoreError::UnlistedApprovalRequired`].
+    Policy,
+    /// A mint whose own authority is a verified per-payment approval: the
+    /// allowance admits the full debit, which still counts.
+    Approved,
+}
+
+#[cfg(all(test, feature = "mainnet-write"))]
+#[path = "accounting_floor_tests.rs"]
+mod floor_tests;
+
+#[cfg(test)]
+mod floor_source_tests {
+    use super::*;
+    use crate::account::{AssetView, BalanceView, ThresholdsView};
+
+    /// The floor source answers the trustline question of the account it read.
+    #[test]
+    fn the_floor_source_answers_the_observed_trustlines() {
+        const ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+        let trustline = BalanceView::new(
+            AssetView::credit("USDC", ISSUER),
+            "0".to_owned(),
+            None,
+            "0".to_owned(),
+            "0".to_owned(),
+        );
+        let view = AccountView::new(
+            ISSUER.to_owned(),
+            1,
+            1,
+            vec![trustline],
+            ThresholdsView::new(1, 1, 1, 1),
+            vec![],
+            None,
+            None,
+        );
+        let source = FloorSource {
+            observed: ObservedAccount::new(view, 100, 1_000, 900),
+            reserved_stroops: 0,
+            readiness: crate::operational::OperationalReport {
+                latest_ledger: 100,
+                close_time_unix: 1,
+                close_lag_seconds: 0,
+            },
+        };
+        let passphrase = stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+        assert_eq!(
+            source.holds_trustline(&format!("USDC:{ISSUER}"), passphrase),
+            Some(true)
+        );
+    }
+}

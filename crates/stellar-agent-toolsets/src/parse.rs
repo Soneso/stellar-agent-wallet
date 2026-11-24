@@ -581,7 +581,7 @@ impl FrontmatterReceiver {
 
                         // Duplicate-key detection.
                         if !self.top_level_seen_keys.insert(key.clone()) {
-                            self.set_error(ToolsetFormatError::DuplicateKey { key });
+                            self.set_error(ToolsetFormatError::DuplicateKey);
                             return;
                         }
 
@@ -669,13 +669,13 @@ impl FrontmatterReceiver {
 
                         // Duplicate-key detection within metadata.
                         if !self.metadata_seen_keys.insert(key.clone()) {
-                            self.set_error(ToolsetFormatError::DuplicateKey { key });
+                            self.set_error(ToolsetFormatError::DuplicateKey);
                             return;
                         }
 
                         // Reserved-prefix check.
                         if key.starts_with(RESERVED_PREFIX) && key != CAPABILITY_KEY {
-                            self.set_error(ToolsetFormatError::ReservedMetadataKey { key });
+                            self.set_error(ToolsetFormatError::ReservedMetadataKey);
                             return;
                         }
 
@@ -716,7 +716,8 @@ impl FrontmatterReceiver {
                         let detail = if key == CAPABILITY_KEY {
                             "stellar-agent-capabilities value must be a string, not a mapping or sequence".to_owned()
                         } else {
-                            format!("metadata value for key '{key}' must be a string")
+                            "a metadata value must be a string, not a mapping or sequence"
+                                .to_owned()
                         };
 
                         if key == CAPABILITY_KEY {
@@ -778,10 +779,7 @@ fn validate_name(name: &Option<String>, dir_name: &str) -> Result<(), ToolsetFor
     // non-ASCII characters, the byte-exact comparison will fail here, which is
     // the correct behaviour (homoglyph dir-spoof defence).
     if n != dir_name {
-        return Err(ToolsetFormatError::NameDirMismatch {
-            name: n.to_owned(),
-            dir: dir_name.to_owned(),
-        });
+        return Err(ToolsetFormatError::NameDirMismatch);
     }
 
     Ok(())
@@ -939,7 +937,7 @@ mod tests {
     #[test]
     fn name_dir_mismatch_refused() {
         let err = validate_name(&Some("my-toolset".to_owned()), "other-toolset").unwrap_err();
-        assert!(matches!(err, ToolsetFormatError::NameDirMismatch { .. }));
+        assert!(matches!(err, ToolsetFormatError::NameDirMismatch));
     }
 
     #[test]
@@ -948,7 +946,7 @@ mod tests {
         // the ASCII 'i' in the name field.
         let cyrillic_dir = "my-sk\u{0456}ll"; // Cyrillic і
         let err = validate_name(&Some("my-toolset".to_owned()), cyrillic_dir).unwrap_err();
-        assert!(matches!(err, ToolsetFormatError::NameDirMismatch { .. }));
+        assert!(matches!(err, ToolsetFormatError::NameDirMismatch));
     }
 
     // ── Description validation ────────────────────────────────────────────────
@@ -1027,7 +1025,7 @@ mod tests {
         let yaml = "name: foo\ndescription: bar\nname: baz\n";
         let err = parse_frontmatter(yaml).unwrap_err();
         assert!(
-            matches!(err, ToolsetFormatError::DuplicateKey { .. }),
+            matches!(err, ToolsetFormatError::DuplicateKey),
             "expected DuplicateKey, got {err:?}"
         );
     }
@@ -1037,7 +1035,7 @@ mod tests {
         let yaml = "name: foo\ndescription: bar\nmetadata:\n  author: a\n  author: b\n";
         let err = parse_frontmatter(yaml).unwrap_err();
         assert!(
-            matches!(err, ToolsetFormatError::DuplicateKey { .. }),
+            matches!(err, ToolsetFormatError::DuplicateKey),
             "expected DuplicateKey, got {err:?}"
         );
     }
@@ -1059,7 +1057,7 @@ mod tests {
         let yaml = "name: foo\ndescription: bar\nmetadata:\n  stellar-agent-policy: x\n";
         let err = parse_frontmatter(yaml).unwrap_err();
         assert!(
-            matches!(err, ToolsetFormatError::ReservedMetadataKey { .. }),
+            matches!(err, ToolsetFormatError::ReservedMetadataKey),
             "expected ReservedMetadataKey, got {err:?}"
         );
     }
@@ -1098,7 +1096,7 @@ mod tests {
     fn skip_state_inner_key_not_inserted_into_top_level_seen() {
         let result = parse_frontmatter(SKIP_STATE_YAML);
         assert!(
-            !matches!(result, Err(ToolsetFormatError::DuplicateKey { .. })),
+            !matches!(result, Err(ToolsetFormatError::DuplicateKey)),
             "inner key must not produce false DuplicateKey: {result:?}"
         );
     }

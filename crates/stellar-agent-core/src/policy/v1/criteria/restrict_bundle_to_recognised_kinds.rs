@@ -3,7 +3,7 @@
 //! [`RestrictBundleToRecognisedKindsCriterion`] fails-CLOSED on any bundle
 //! containing a [`crate::policy::v1::bundle::InnerOpDescriptor::Generic`] inner.
 //! When enabled, it ensures that only operations whose ABI shape has been
-//! recognised by [`crate::policy::v1::bundle::decompose_bundle`] (currently:
+//! recognised by [`crate::policy::v1::bundle::decompose_bundle_calls`] (currently:
 //! SAC token transfers) are permitted in a multicall bundle.
 //!
 //! # Relationship to the value-summing bundle caps
@@ -177,12 +177,19 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: view,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: 1_700_000_000_000,
         }
     }
 
     /// T-A: enabled + all TokenTransfer → Allow.
     #[test]
+    #[serial_test::serial]
     fn enabled_all_token_transfer_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -204,7 +211,11 @@ mod tests {
 
     /// T-B: enabled + 1 Generic → Deny with correct inner_index.
     #[test]
+    #[serial_test::serial]
     fn enabled_with_generic_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -230,7 +241,11 @@ mod tests {
 
     /// T-C: disabled + Generic → Allow.
     #[test]
+    #[serial_test::serial]
     fn disabled_with_generic_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -252,7 +267,11 @@ mod tests {
 
     /// Single-tx path (bundle=None) passes regardless of enabled state.
     #[test]
+    #[serial_test::serial]
     fn single_tx_bundle_none_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -268,7 +287,11 @@ mod tests {
 
     /// Reports the index of the FIRST Generic inner, not the last.
     #[test]
+    #[serial_test::serial]
     fn reports_first_generic_index() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();

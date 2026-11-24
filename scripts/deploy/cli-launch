@@ -1,0 +1,479 @@
+#!/bin/bash -p
+# Runs the operator forms of the wallet CLI as the dedicated wallet account.
+#
+# The operator calls it through sudo:
+#   sudo -n -u @ACCOUNT@ @PREFIX@/cli-launch <form>
+#
+# Forms (tier, eligibility):
+#   keychain-unlock                                   B, exempt
+#   keychain-lock                                     R, Y
+#   keychain-access-lists (macOS)                     B, exempt
+#   profile show                                      R, Y
+#   profile enable-mainnet --check                    R, Y
+#   profile enable-mainnet --state                    B, exempt
+#   audit verify                                      R, Y
+#   approve credential enroll --open-by-operator      P, Y
+#   approve credential enroll --origin-from-installed P, Y
+#   approve serve --open-by-operator                  R, Y
+#   approve serve --remote --confirm-remote-exposure  R, Y
+#   approve --id <id> --open-by-operator              R, Y
+#   approve --id <id>                                 R, Y
+#
+# keychain-access-lists prints the item attributes and access lists of the
+# login keychain through security dump-keychain -a, which prints no secret
+# data. It takes no further token; any other token refuses with exit 64.
+#
+# This file is a template. bootstrap.sh renders it into a self-contained
+# installed file and fills each placeholder with a fixed value. The
+# installed file reads no path, root, or switch from the environment.
+
+WRAPPER=cli-launch
+PREFIX='@PREFIX@'
+
+# --- shared wrapper checks: begin ---
+# The text up to the end marker is identical in the three wrappers.
+
+# Privileged mode (-p) ignores BASH_ENV, SHELLOPTS, and exported functions.
+# A wrapper whose environment holds anything beyond what bash itself sets
+# runs itself again under an empty environment.
+ENV_TOOL='@ENV@'
+IFS=$' \t\n'
+for exported in $(compgen -e); do
+  case "$exported" in
+    PWD | SHLVL | _) ;;
+    *) exec "$ENV_TOOL" -i /bin/bash -p "$PREFIX/$WRAPPER" ${1+"$@"} ;;
+  esac
+done
+unset exported
+export -n PWD SHLVL
+unset OLDPWD
+set -euo pipefail
+umask 077
+
+PLATFORM='@PLATFORM@'
+ACCOUNT='@ACCOUNT@'
+ACCOUNT_HOME='@HOME@'
+DATA_ROOT='@DATA_ROOT@'
+PROFILE='@PROFILE@'
+PROJECT_FILE='@PROJECT_FILE@'
+TTY='@TTY@'
+# shellcheck disable=SC2034 # Each wrapper uses a subset of these names.
+{
+  CLI="$PREFIX/bin/stellar-agent"
+  MCP="$PREFIX/bin/stellar-agent-mcp"
+  CLI_PATTERN='^@PREFIX_RE@/bin/stellar-agent( |$)'
+  MCP_PATTERN='^@PREFIX_RE@/bin/stellar-agent-mcp( |$)'
+  PROFILE_FILE="$DATA_ROOT/profiles/$PROFILE.toml"
+  POLICY_FILE="$DATA_ROOT/policies/$PROFILE.toml"
+  RUN_DIR="$ACCOUNT_HOME/run"
+}
+# shellcheck disable=SC2123 # The wrapper sets its own search path.
+PATH='@PATH@'
+export PATH
+
+# Prints one refusal line from the fixed reason list and exits with $1.
+# A reason never holds a caller token.
+refuse() {
+  printf 'stellar-agent-wrapper: refused: %s\n' "$2" >&2
+  exit "$1"
+}
+
+# Succeeds when the arguments after the first equal the space-separated
+# words of the first, one by one.
+form_is() {
+  local IFS=' ' want word index=0
+  set -f
+  # shellcheck disable=SC2206 # The form words split on spaces by design.
+  want=($1)
+  set +f
+  shift
+  [ "$#" -eq "${#want[@]}" ] || return 1
+  for word in "$@"; do
+    [ "$word" = "${want[index]}" ] || return 1
+    index=$((index + 1))
+  done
+}
+
+# Succeeds when $1 is a project name: one or more characters without
+# whitespace, quotes, or control characters.
+valid_project() {
+  local pattern='^[^[:space:][:cntrl:]"'"'"']+$'
+  [[ "$1" =~ $pattern ]]
+}
+
+# Prints the owner UID and permission bits of $1, as "<uid> <octal mode>".
+owner_and_mode() {
+  case "$PLATFORM" in
+    macos) stat -f '%u %Lp' "$1" ;;
+    linux) stat -c '%u %a' "$1" ;;
+  esac
+}
+
+# Succeeds when $1 carries an extended ACL entry. Only macOS checks ACLs.
+has_acl() {
+  local listing first
+  [ "$PLATFORM" = macos ] || return 1
+  listing=$(ls -lde "$1") || return 0
+  first=${listing%%$'\n'*}
+  first=${first%% *}
+  case "$first" in
+    *+*) return 0 ;;
+  esac
+  [ "$listing" != "${listing%%$'\n'*}" ]
+}
+
+# Refuses unless $1 exists, is no symlink, belongs to the wallet account,
+# has mode $2, and carries no extended ACL. $3 names it in the refusal.
+require_private() {
+  local facts
+  if [ -L "$1" ]; then
+    refuse 65 "$3 is a symlink"
+  fi
+  if [ ! -e "$1" ]; then
+    refuse 65 "$3 is missing"
+  fi
+  facts=$(owner_and_mode "$1") || refuse 65 "$3 cannot be inspected"
+  if [ "${facts%% *}" != "$ACCOUNT_UID" ]; then
+    refuse 65 "$3 is not owned by the wallet account"
+  fi
+  if [ "${facts#* }" != "$2" ]; then
+    refuse 65 "$3 does not have mode 0$2"
+  fi
+  if has_acl "$1"; then
+    refuse 65 "$3 carries an access control list"
+  fi
+}
+
+# Runs the ownership checks of tier $1: B accepts the profile absent or
+# account-owned; P and R require it account-owned with mode 0600.
+require_tier() {
+  local facts
+  require_private "$ACCOUNT_HOME" 700 "the home directory"
+  require_private "$DATA_ROOT" 700 "the data root"
+  case "$1" in
+    B)
+      if [ -L "$PROFILE_FILE" ]; then
+        refuse 65 "the profile is a symlink"
+      fi
+      if [ -e "$PROFILE_FILE" ]; then
+        facts=$(owner_and_mode "$PROFILE_FILE") || refuse 65 "the profile cannot be inspected"
+        if [ "${facts%% *}" != "$ACCOUNT_UID" ]; then
+          refuse 65 "the profile is not owned by the wallet account"
+        fi
+      fi
+      ;;
+    P | R) require_private "$PROFILE_FILE" 600 "the profile" ;;
+  esac
+}
+
+# Runs a native command with the built environment only: env drops the
+# variables bash adds for a child.
+native() {
+  "$ENV_TOOL" -u _ -u SHLVL "$@"
+}
+
+# Replaces the wrapper with a native command, so its signals and exit code
+# are the native command's.
+exec_native() {
+  exec "$ENV_TOOL" -u _ -u SHLVL "$@"
+}
+
+# Runs the eligibility predicate for eligibility $1: E skips it, Y admits
+# both states, N admits only the absent state.
+require_eligible() {
+  local rc=0 state
+  [ "$1" != E ] || return 0
+  native "$CLI" profile enable-mainnet --profile "$PROFILE" --state </dev/null >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) state=enabled ;;
+    3) state=absent ;;
+    *) refuse 65 "the mainnet state is unreadable; run cli-launch profile enable-mainnet --state" ;;
+  esac
+  if [ "$1" = N ] && [ "$state" = enabled ]; then
+    refuse 65 "mainnet is enabled, and this form runs only before enablement"
+  fi
+}
+
+# Refuses with 66 while a wallet-account process whose command line starts
+# with the installed binary of pattern $1 runs. $2 names it.
+refuse_while_running() {
+  local rc=0
+  pgrep -u "$ACCOUNT" -f "$1" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) refuse 66 "$2 is running" ;;
+    1) ;;
+    *) refuse 66 "the process check failed" ;;
+  esac
+}
+
+# Reads one line from the operator's terminal without echo into SECRET.
+# $1 is the prompt, which names no caller token. The prompt and the line
+# break after the answer go to the terminal, so standard error carries no
+# more than the one refusal line.
+prompt_secret() {
+  if [ ! -e "$TTY" ] || ! { : <"$TTY" && : >>"$TTY"; } 2>/dev/null; then
+    refuse 65 "no terminal is available for the prompt"
+  fi
+  if ! { printf '%s: ' "$1" >>"$TTY"; } 2>/dev/null; then
+    refuse 65 "the terminal does not take the prompt"
+  fi
+  SECRET=""
+  IFS= read -r -s SECRET <"$TTY" || true
+  if ! { printf '\n' >>"$TTY"; } 2>/dev/null; then
+    refuse 65 "the terminal does not take the prompt"
+  fi
+  if [ -z "$SECRET" ]; then
+    refuse 65 "the prompt received no value"
+  fi
+}
+
+# Refuses unless the wrapper runs as the wallet account with a valid project
+# file, then exports the built environment and enters the home directory.
+prepare_account() {
+  local project
+  if [ "$(id -un)" != "$ACCOUNT" ]; then
+    refuse 65 "the wrapper does not run as the wallet account"
+  fi
+  ACCOUNT_UID=$(id -u)
+  if [ -L "$PROJECT_FILE" ] || [ ! -f "$PROJECT_FILE" ]; then
+    refuse 65 "the project file is missing"
+  fi
+  project=$(cat "$PROJECT_FILE") || refuse 65 "the project file is unreadable"
+  if ! valid_project "$project"; then
+    refuse 65 "the project file does not hold one project name"
+  fi
+  HOME=$ACCOUNT_HOME
+  TMPDIR="$ACCOUNT_HOME/tmp"
+  STELLAR_AGENT_PROJECT=$project
+  export HOME TMPDIR STELLAR_AGENT_PROJECT
+  if [ "$PLATFORM" = linux ]; then
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$RUN_DIR/bus"
+    GNOME_KEYRING_CONTROL="$RUN_DIR/keyring"
+    export DBUS_SESSION_BUS_ADDRESS GNOME_KEYRING_CONTROL
+  fi
+  cd "$ACCOUNT_HOME" 2>/dev/null || refuse 65 "the home directory is not accessible"
+}
+# --- shared wrapper checks: end ---
+
+SECURITY='@SECURITY@'
+DBUS_DAEMON='@DBUS_DAEMON@'
+GNOME_KEYRING_DAEMON='@GNOME_KEYRING_DAEMON@'
+KEYCHAIN="$ACCOUNT_HOME/Library/Keychains/login.keychain-db"
+
+# Classifies the installed policy as local-only or signed-origin into
+# ORIGIN. A missing policy is local-only; native policy-check reads it on
+# standard input and answers 0 for local-only and 3 for signed-origin.
+classify_origin() {
+  local rc=0
+  if [ -L "$POLICY_FILE" ]; then
+    refuse 65 "the installed policy is a symlink"
+  fi
+  if [ ! -e "$POLICY_FILE" ]; then
+    ORIGIN=local
+    return 0
+  fi
+  if [ ! -f "$POLICY_FILE" ] || [ ! -r "$POLICY_FILE" ]; then
+    refuse 65 "the installed policy is unreadable"
+  fi
+  native "$CLI" profile policy-check --profile "$PROFILE" --origin <"$POLICY_FILE" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) ORIGIN=local ;;
+    3) ORIGIN=signed ;;
+    *) refuse 65 "the policy origin is unreadable" ;;
+  esac
+}
+
+# The three operator-open forms run only on a local-only profile.
+require_operator_open() {
+  classify_origin
+  if [ "$ORIGIN" = signed ]; then
+    refuse 65 "the profile has a signed origin, and operator-open forms are unavailable"
+  fi
+}
+
+# Succeeds when the process in PID file $1 runs and its command line holds
+# the argument $2, which only the daemon this wrapper started carries.
+daemon_alive() {
+  local pid args
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  pid=$(cat "$1") || return 1
+  case "$pid" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  args=$(ps -ww -o args= -p "$pid" 2>/dev/null) || return 1
+  case " $args " in
+    *" $2 "*) return 0 ;;
+  esac
+  return 1
+}
+
+# Stops the daemon in PID file $1 when daemon_alive confirms it with $2,
+# then removes the PID file.
+stop_daemon() {
+  if daemon_alive "$1" "$2"; then
+    kill "$(cat "$1")" 2>/dev/null || true
+  fi
+  rm -f "$1"
+}
+
+# Waits up to five seconds for path $1 to appear.
+wait_for() {
+  local tries=0
+  while [ ! -e "$1" ]; do
+    tries=$((tries + 1))
+    [ "$tries" -le 50 ] || return 1
+    sleep 0.1
+  done
+}
+
+linux_keychain_unlock() {
+  local bus_arg="--address=unix:path=$RUN_DIR/bus"
+  local control_arg="--control-directory=$RUN_DIR/keyring"
+  local rc=0
+  require_private "$RUN_DIR" 700 "the run directory"
+  prompt_secret "Keyring password"
+  if daemon_alive "$RUN_DIR/dbus.pid" "$bus_arg" && daemon_alive "$RUN_DIR/keyring.pid" "$control_arg"; then
+    printf '%s\n' "$SECRET" | "$GNOME_KEYRING_DAEMON" --unlock --components=secrets "$control_arg" >/dev/null 2>&1 || rc=$?
+    SECRET=""
+    if [ "$rc" -ne 0 ]; then
+      refuse 65 "the keyring did not unlock"
+    fi
+    return 0
+  fi
+  stop_daemon "$RUN_DIR/keyring.pid" "$control_arg"
+  stop_daemon "$RUN_DIR/dbus.pid" "$bus_arg"
+  rm -f "$RUN_DIR/bus"
+  if [ ! -d "$RUN_DIR/keyring" ]; then
+    mkdir -m 700 "$RUN_DIR/keyring"
+  fi
+  require_private "$RUN_DIR/keyring" 700 "the keyring control directory"
+  rm -f "$RUN_DIR/keyring/control"
+  setsid "$DBUS_DAEMON" --session "$bus_arg" --nofork --nopidfile </dev/null >/dev/null 2>&1 &
+  printf '%s\n' "$!" >"$RUN_DIR/dbus.pid"
+  if ! wait_for "$RUN_DIR/bus"; then
+    stop_daemon "$RUN_DIR/dbus.pid" "$bus_arg"
+    refuse 65 "the session bus did not start"
+  fi
+  printf '%s\n' "$SECRET" | setsid "$GNOME_KEYRING_DAEMON" --foreground --unlock --components=secrets \
+    "$control_arg" >/dev/null 2>&1 &
+  printf '%s\n' "$!" >"$RUN_DIR/keyring.pid"
+  SECRET=""
+  if ! wait_for "$RUN_DIR/keyring/control"; then
+    stop_daemon "$RUN_DIR/keyring.pid" "$control_arg"
+    stop_daemon "$RUN_DIR/dbus.pid" "$bus_arg"
+    refuse 65 "the keyring daemon did not start"
+  fi
+}
+
+linux_keychain_lock() {
+  stop_daemon "$RUN_DIR/keyring.pid" "--control-directory=$RUN_DIR/keyring"
+  stop_daemon "$RUN_DIR/dbus.pid" "--address=unix:path=$RUN_DIR/bus"
+}
+
+# The keychain password reaches security only through its own prompt or
+# its standard input; no call passes -p. security prompts on the terminal
+# itself, and its other output stays with the wrapper, so a failed call
+# shows only the refusal line.
+macos_keychain_unlock() {
+  if [ ! -e "$KEYCHAIN" ]; then
+    if [ ! -d "$ACCOUNT_HOME/Library/Keychains" ]; then
+      mkdir -m 700 "$ACCOUNT_HOME/Library/Keychains"
+    fi
+    "$SECURITY" create-keychain "$KEYCHAIN" >/dev/null 2>&1 || refuse 65 "the login keychain was not created"
+  fi
+  "$SECURITY" default-keychain -s "$KEYCHAIN" >/dev/null 2>&1 || refuse 65 "the login keychain was not selected"
+  "$SECURITY" unlock-keychain "$KEYCHAIN" >/dev/null 2>&1 || refuse 65 "the login keychain did not unlock"
+  exec "$SECURITY" set-keychain-settings "$KEYCHAIN"
+}
+
+FORM=""
+TIER=""
+ELIGIBILITY=""
+ID=""
+if form_is keychain-unlock "$@"; then
+  FORM=keychain-unlock TIER=B ELIGIBILITY=E
+elif form_is keychain-lock "$@"; then
+  FORM=keychain-lock TIER=R ELIGIBILITY=Y
+elif [ "$PLATFORM" = macos ] && form_is keychain-access-lists "$@"; then
+  FORM=keychain-access-lists TIER=B ELIGIBILITY=E
+elif form_is "profile show" "$@"; then
+  FORM=profile-show TIER=R ELIGIBILITY=Y
+elif form_is "profile enable-mainnet --check" "$@"; then
+  FORM=enable-check TIER=R ELIGIBILITY=Y
+elif form_is "profile enable-mainnet --state" "$@"; then
+  FORM=enable-state TIER=B ELIGIBILITY=E
+elif form_is "audit verify" "$@"; then
+  FORM=audit-verify TIER=R ELIGIBILITY=Y
+elif form_is "approve credential enroll --open-by-operator" "$@"; then
+  FORM=enroll-open TIER=P ELIGIBILITY=Y
+elif form_is "approve credential enroll --origin-from-installed" "$@"; then
+  FORM=enroll-installed TIER=P ELIGIBILITY=Y
+elif form_is "approve serve --open-by-operator" "$@"; then
+  FORM=serve-open TIER=R ELIGIBILITY=Y
+elif form_is "approve serve --remote --confirm-remote-exposure" "$@"; then
+  FORM=serve-remote TIER=R ELIGIBILITY=Y
+elif [ "$#" -ge 3 ] && [ "$#" -le 4 ] && [ "$1" = approve ] && [ "$2" = --id ]; then
+  if [ "$#" -eq 4 ] && [ "$4" != --open-by-operator ]; then
+    refuse 64 "the form is not one of the listed forms"
+  fi
+  if [[ ! "$3" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+    refuse 64 "the approval id does not match the id grammar"
+  fi
+  ID=$3
+  if [ "$#" -eq 4 ]; then
+    FORM=approve-open TIER=R ELIGIBILITY=Y
+  else
+    FORM=approve TIER=R ELIGIBILITY=Y
+  fi
+fi
+if [ -z "$FORM" ]; then
+  refuse 64 "the form is not one of the listed forms"
+fi
+
+prepare_account
+require_tier "$TIER"
+case "$FORM" in
+  serve-open | serve-remote) refuse_while_running "$MCP_PATTERN" "the wallet MCP server" ;;
+esac
+require_eligible "$ELIGIBILITY"
+case "$FORM" in
+  keychain-unlock)
+    if [ "$PLATFORM" = macos ]; then
+      macos_keychain_unlock
+    fi
+    linux_keychain_unlock
+    ;;
+  keychain-lock)
+    if [ "$PLATFORM" = macos ]; then
+      exec "$SECURITY" lock-keychain "$KEYCHAIN"
+    fi
+    linux_keychain_lock
+    ;;
+  keychain-access-lists) exec "$SECURITY" dump-keychain -a "$KEYCHAIN" ;;
+  profile-show) exec_native "$CLI" profile show --profile "$PROFILE" ;;
+  enable-check) exec_native "$CLI" profile enable-mainnet --check --profile "$PROFILE" ;;
+  enable-state) exec_native "$CLI" profile enable-mainnet --state --profile "$PROFILE" ;;
+  audit-verify) exec_native "$CLI" audit verify "$DATA_ROOT/audit/$PROFILE.jsonl" --profile "$PROFILE" ;;
+  enroll-open)
+    require_operator_open
+    exec_native "$CLI" approve credential enroll --open-by-operator --profile "$PROFILE"
+    ;;
+  enroll-installed) exec_native "$CLI" approve credential enroll --origin-from "$POLICY_FILE" --profile "$PROFILE" ;;
+  serve-open)
+    require_operator_open
+    exec_native "$CLI" approve serve --open-by-operator --profile "$PROFILE"
+    ;;
+  serve-remote) exec_native "$CLI" approve serve --remote --confirm-remote-exposure --profile "$PROFILE" ;;
+  approve-open)
+    require_operator_open
+    exec_native "$CLI" approve --id "$ID" --open-by-operator --profile "$PROFILE"
+    ;;
+  approve)
+    classify_origin
+    if [ "$ORIGIN" = local ]; then
+      refuse 65 "the profile is local-only; use approve --id <approval-id> --open-by-operator"
+    fi
+    exec_native "$CLI" approve --id "$ID" --profile "$PROFILE"
+    ;;
+esac

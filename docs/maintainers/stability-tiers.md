@@ -1,10 +1,15 @@
 # Stability tiers
 
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 What each workspace crate is for, how settled its API is, and what a
 deployer can rely on. Tiers express support intent and relative maturity.
 They are not SemVer guarantees. Every crate is pre-1.0: any surface may
-change between alpha releases, and the CHANGELOG records every change that
-matters. What the tiers add is where change is likely, where it is avoided,
+change between alpha releases. `CHANGELOG.md` and the pending fragments in
+`changelog.d/` record every change that matters.
+Release preparation folds them into the versioned CHANGELOG.
+What the tiers add is where change is likely, where it is avoided,
 and where a report of breakage is treated as a bug rather than as expected
 churn.
 
@@ -16,85 +21,88 @@ Facts that apply to every crate:
   description say what that does and does not mean.
 - The unpublished `stellar-agent-smart-account-acceptance` member holds live
   acceptance suites only. It has no tier and no row in the Crates table.
-- Mainnet writes are structurally refused by every surface today, at the
-  network layer. The mainnet column below records the intended posture once
-  the constrained-mainnet capability ships, not present behavior.
-- The `stellar-agent` and `stellar-agent-mcp` binaries bundle every surface
+- Default builds of `stellar-agent` and `stellar-agent-mcp` from this repository
+  carry `mainnet-write`. Release v0.1.0-alpha.13 and earlier releases do not have
+  the feature. The CLI crate and
+  the `stellar-agent-mcp` library enable it by default. The other library
+  crates leave it off. The mainnet column describes the scope of builds
+  with the feature on. See
+  [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope).
+- The `stellar-agent` executable, which holds the CLI and the MCP server, bundles every surface
   during alpha. Cargo feature groups (`payments`, `smart-account`,
   `anchors`, `wallet-protocols`, `high-throughput`, `claimable-balances`)
   are intended for later; they are not implemented yet.
 
 ## Tier definitions
 
-- **Level 1, stable core.** The agent-payment runtime. Strongest
+- Level 1, stable core: the agent-payment runtime. Strongest
   compatibility intent: breaking changes are avoided where possible, always
   called out with migration notes, and breakage reports are treated as
   bugs. Covered by the full acceptance gates on every release.
-- **Level 2, supported optional.** Maintained and tested with the same
+- Level 2, supported optional: maintained and tested with the same
   gates, but the API may evolve before 1.0 with less ceremony. Protocol
   surfaces (SEPs), operational tooling, and the approval interfaces live
   here.
-- **Level 3, experimental.** Best effort, testnet-first. APIs and formats
+- Level 3, experimental: best effort, testnet-first. APIs and formats
   may change without migration notes. Guaranteed maintenance of a Level 3
   surface requires sponsorship.
-- **Internal.** Workspace machinery published only because crates.io
+- Internal: workspace machinery published only because crates.io
   requires it. No API stability promise of any kind; do not depend on these
   directly. Each carries this language in its crate description.
-- **Removed.** Previously shipped, no longer part of the wallet. Published
-  versions remain installable on crates.io; no new versions are published.
+- Removed: a removed crate is not part of the wallet. Its published
+  versions remain installable on crates.io, and no new version is published.
 
 ## Crates
 
 | Crate | Tier | Surface | Mainnet posture |
 |---|---|---|---|
-| `stellar-agent-core` | 1 | profile, policy engine, audit chain, envelopes | pending capability |
-| `stellar-agent-network` | 1 | RPC client, submit, retry, keyring stores | pending capability |
-| `stellar-agent-nonce` | 1 | replay protection for MCP tools | pending capability |
-| `stellar-agent-smart-account` | 1 | C-account deploy, rules, signers, submit | pending capability |
-| `stellar-agent-cli` | 1 | the `stellar-agent` binary | pending capability |
-| `stellar-agent-mcp` | 1 | the `stellar-agent-mcp` binary | pending capability |
-| `stellar-agent-x402` | 1 | x402 exact-payment scheme | pending capability |
-| `stellar-agent-mpp` | 1 | machine-payable-page charge lifecycle | pending capability |
-| `stellar-agent-x402-identity` | 2 | SEP-10 gate for authenticated x402 | pending capability |
-| `stellar-agent-stablecoin` | 2 | issuer registry, trustline verb (payments support) | pending capability |
-| `stellar-agent-pool` | 2 | channel-account pool | pending capability |
-| `stellar-agent-claimable` | 2 | claimable balances | pending capability |
-| `stellar-agent-anchor` | 2 | SEP-6 / SEP-24 anchor flows | pending capability |
-| `stellar-agent-sep5` | 2 | key derivation vectors | n/a |
-| `stellar-agent-sep7` | 2 | URI parsing | n/a |
-| `stellar-agent-sep10` | 2 | web authentication | pending capability |
-| `stellar-agent-sep43` | 2 | wallet-interface signing | pending capability |
-| `stellar-agent-sep45` | 2 | contract-account authentication | pending capability |
-| `stellar-agent-sep48` | 2 | invocation preview | n/a (read-only) |
-| `stellar-agent-sep53` | 2 | message signing | pending capability |
-| `stellar-agent-approval-ui` | 2 | loopback approval pages and decision spine | pending capability |
-| `stellar-agent-approval-remote` | 2 | network-reachable approval listener | pending capability |
-| `stellar-agent-loopback-http` | 2 | loopback HTTP substrate for served pages | n/a |
-| `stellar-agent-webauthn-bridge` | 2 | local WebAuthn registration bridge | n/a |
-| `stellar-agent-headless-keyring` | 2 | env-key keyring backend for headless hosts | pending capability |
-| `stellar-agent-defi` | 3 | DeFi adapter substrate (pins, preview, dispatch) | testnet-first |
-| `stellar-agent-defindex` | 3 | DeFindex vault adapter | testnet-first |
-| `stellar-agent-dex` | 3 | Soroswap swap adapter | testnet-first |
-| `stellar-agent-toolsets` | 3 | toolset package format (no format-stability promise) | testnet-first |
-| `stellar-agent-toolsets-install` | 3 | toolset install and attestation | testnet-first |
-| `stellar-agent-toolsets-runtime` | 3 | toolset invocation runtime | testnet-first |
-| `stellar-agent-mcp-macros` | internal | proc-macros for the MCP registry | n/a |
-| `stellar-agent-soroban-auth` | internal | Soroban authorization preimages and signature payloads | n/a |
-| `stellar-agent-test-support` | internal | test harness and fixtures | n/a |
-| `stellar-agent-windows-identity` | internal | Win32 SID / DPAPI wrappers | n/a |
-| `stellar-agent-xdr-limits` | internal | XDR decode bounds | n/a |
+| `stellar-agent-core` | 1 | profile, policy engine, audit chain, envelopes | supports admitted beta operations through policy and authorization proofs |
+| `stellar-agent-network` | 1 | RPC client, submit, retry, keyring stores | supports admitted beta operations through authorized signing and submission |
+| `stellar-agent-nonce` | 1 | replay protection for MCP tools | supports admitted beta operations through MCP replay protection |
+| `stellar-agent-smart-account` | 1 | C-account deploy, rules, signers, submit | excluded from beta for writes; read or local only |
+| `stellar-agent-cli` | 1 | the `stellar-agent` executable, also delivered as `stellar-agent-mcp` | supports admitted beta operations through the listed full-mode verbs |
+| `stellar-agent-mcp` | 1 | the MCP server library the executable runs | supports admitted beta operations through the listed tools |
+| `stellar-agent-x402` | 1 | x402 exact-payment scheme | supports admitted beta operations through authorized x402 payments |
+| `stellar-agent-mpp` | 1 | Machine Payments Protocol charge lifecycle | excluded from beta |
+| `stellar-agent-x402-identity` | 2 | SEP-10 gate for authenticated x402 | supports admitted beta operations through authenticated x402 payments |
+| `stellar-agent-stablecoin` | 2 | issuer registry, trustline verb (payments support) | supports admitted beta operations through trustline actions; issuer queries are read-only |
+| `stellar-agent-pool` | 2 | channel-account pool | excluded from beta for submission; read or local only |
+| `stellar-agent-claimable` | 2 | claimable balances | supports admitted beta operations through claim actions |
+| `stellar-agent-anchor` | 2 | SEP-6 / SEP-24 anchor flows | read or local only; anchor flows grant no mainnet signing authority |
+| `stellar-agent-sep5` | 2 | key derivation vectors | read or local only; key derivation grants no mainnet signing authority |
+| `stellar-agent-sep7` | 2 | URI parsing | read or local only; URI parsing grants no mainnet signing authority |
+| `stellar-agent-sep10` | 2 | web authentication | supports admitted beta operations only through bound x402 identity authentication |
+| `stellar-agent-sep43` | 2 | wallet-interface signing | excluded from beta for public signing tools; its authorized primitive supports admitted x402 payments |
+| `stellar-agent-sep45` | 2 | contract-account authentication | excluded from beta |
+| `stellar-agent-sep48` | 2 | invocation preview | read or local only; invocation preview grants no signing authority |
+| `stellar-agent-sep53` | 2 | message signing | excluded from beta for message signing; verification is read-only |
+| `stellar-agent-approval-ui` | 2 | loopback approval pages and decision spine | supports admitted beta operations through supported classic and x402 approval attestations |
+| `stellar-agent-approval-remote` | 2 | network-reachable approval listener | supports admitted beta operations through supported classic and x402 approval attestations |
+| `stellar-agent-loopback-http` | 2 | loopback HTTP substrate for served pages | read or local only; HTTP transport grants no signing authority |
+| `stellar-agent-webauthn-bridge` | 2 | local WebAuthn registration bridge | read or local only; registration grants no transaction authority |
+| `stellar-agent-headless-keyring` | 2 | file-backed keyring backend for headless hosts (env key or Windows DPAPI) | excluded from beta; mainnet readiness refuses it with `network.mainnet_keyring_backend_unsupported` |
+| `stellar-agent-defi` | 3 | DeFi adapter substrate (pins, preview, dispatch) | excluded from beta |
+| `stellar-agent-defindex` | 3 | DeFindex vault adapter | excluded from beta |
+| `stellar-agent-dex` | 3 | Soroswap swap adapter | excluded from beta |
+| `stellar-agent-toolsets` | 3 | toolset package format (no format-stability promise) | read or local only; toolset packages admit no mainnet signing |
+| `stellar-agent-toolsets-install` | 3 | toolset install and attestation | read or local only; installation admits no mainnet signing |
+| `stellar-agent-toolsets-runtime` | 3 | toolset invocation runtime | supports admitted beta operations through exact toolset payment actions; other signing actions refuse mainnet |
+| `stellar-agent-mcp-macros` | internal | proc-macros for the MCP registry | supports admitted beta operations through its MCP registry consumers |
+| `stellar-agent-soroban-auth` | internal | Soroban authorization preimages and signature payloads | supports admitted beta operations through its authorized Soroban consumers |
+| `stellar-agent-test-support` | internal | test harness and fixtures | supports tests of admitted beta operations; grants no production authority |
+| `stellar-agent-windows-identity` | internal | Win32 SID / DPAPI wrappers | supports admitted beta operations through its Windows identity consumers |
+| `stellar-agent-xdr-limits` | internal | XDR decode bounds | supports admitted beta operations through its bounded XDR decoders |
 
-"Pending capability" means the surface participates in signing or
-submission and will sit behind the constrained-mainnet capability gate when
-it ships; until then it operates on testnet, and mainnet writes are refused
-structurally. "Testnet-first" means the surface has no committed mainnet
-plan; Level 3 surfaces are excluded from the initial mainnet-write
-allowlist regardless.
+"Supports admitted beta operations" limits support to the operations and
+consumers listed in the scope table. Supporting infrastructure does not grant
+authority by itself. "Excluded from beta" means the capability does not admit
+that signing or write surface. "Read or local only" grants no transaction-write
+authority. These descriptions do not change maturity tiers.
 
 ## Removed
 
-- **`stellar-agent-blend` (Blend lending), removed in the v0.1.0-alpha.7
-  cycle.** The lending verb depended on Blend's backstop for depositor
+- `stellar-agent-blend` (Blend lending), removed in the v0.1.0-alpha.7
+  cycle: the lending verb depended on Blend's backstop for depositor
   protection; the August 2026 Comet pool exploit drained that backstop and
   the protocol's pools are winding down. Re-integration would require a
   published post-mortem, a backstop rebuilt on an audited AMM, and a fresh
@@ -103,10 +111,10 @@ allowlist regardless.
 
 ## External dependents
 
-Verified 2026-09-02 against crates.io reverse dependencies: no crate in
-this workspace has an external dependent (the only registered dependents
-are workspace siblings). In particular `stellar-agent-approval-remote`,
-the crate most likely to attract external integration, has none. Its API
+On 2026-09-02, the crates.io reverse-dependency listing showed no external
+dependent for any crate in this workspace. Its only registered dependents
+were workspace siblings. No repository check repeats this query. In
+particular `stellar-agent-approval-remote`, the crate most likely to attract external integration, has none. Its API
 may evolve under Level 2 rules without external coordination.
 
 ## Intent, not yet implemented

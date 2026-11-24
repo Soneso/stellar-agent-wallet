@@ -13,7 +13,7 @@
     reason = "test-only; assertions panic on violation"
 )]
 
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 use serde_json::Value;
 
@@ -24,17 +24,21 @@ const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 /// as its standard output. `profile list` renders through the shared JSON
 /// renderer and needs no network.
 fn profile_list(stdout: Stdio) -> Output {
-    let home = tempfile::tempdir().expect("temp home");
-    Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(["profile", "list"])
-        .env("STELLAR_AGENT_HOME", home.path())
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-        .stdout(stdout)
-        .stderr(Stdio::piped())
-        .output()
-        .expect("binary runs")
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+    stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child")
+    .args(["profile", "list"])
+    .env("STELLAR_AGENT_HOME", home.path())
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .stdout(stdout)
+    .stderr(Stdio::piped())
+    .output()
+    .expect("binary runs")
 }
 
 #[test]
@@ -49,6 +53,93 @@ fn an_envelope_that_cannot_be_written_exits_one_and_names_the_failure() {
             .lines()
             .any(|line| line.starts_with("stellar-agent: writing the command output failed: ")),
         "stderr must name the output failure: {stderr}"
+    );
+}
+
+/// A draft edit whose envelope cannot be written exits `1` after the replace,
+/// and the policy file holds the complete change.
+#[test]
+#[serial_test::serial]
+fn draft_output_failure_exits_1() {
+    let guard_home =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("temporary home");
+    assert!(
+        guard_home
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
+    let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+    use stellar_agent_core::profile::loader::save_new_to_dir;
+    use stellar_agent_core::profile::schema::Profile;
+
+    const NAME: &str = "output-draft";
+    const RECIPIENT: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
+    let _child_home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    let profile = Profile::builder_testnet_named(NAME, "s", "a", "n", "a")
+        .audit_log_path(home.path().join("audit").join(format!("{NAME}.jsonl")))
+        .build();
+    save_new_to_dir(NAME, &profile, &home.path().join("profiles")).expect("profile saved");
+    let policies = home.path().join("policies");
+    std::fs::create_dir_all(&policies).expect("policy directory");
+    let path = policies.join(format!("{NAME}.toml"));
+    let draft = format!(
+        "version = 2\nscope = \"profile:{NAME}\"\nsequence = 1\n\n[[rules]]\nmatch = {{ tool = \
+         \"stellar_pay\", chain = \"*\" }}\ncriteria = [{{ kind = \"counterparty_allowlist\", \
+         kinds = [\"G_ACCOUNT\"], allowlist = [] }}]\ndecision = \"allow\"\n"
+    );
+    std::fs::write(&path, &draft).expect("draft written");
+
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child")
+    .args([
+        "profile",
+        "policy",
+        "add-counterparty",
+        "--profile",
+        NAME,
+        "--recipient",
+        RECIPIENT,
+    ])
+    .env("STELLAR_AGENT_HOME", home.path())
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .stdout(Stdio::from(writer))
+    .stderr(Stdio::piped())
+    .output()
+    .expect("binary runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr={stderr}");
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("stellar-agent: writing the command output failed: ")),
+        "stderr must name the output failure: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "Next: stellar-agent profile sign-policy --profile {NAME} --secret-env <VAR>"
+        )),
+        "{stderr}"
+    );
+    let written = std::fs::read_to_string(&path).expect("policy readable");
+    assert_eq!(
+        written,
+        draft.replace("allowlist = []", &format!("allowlist = [\"{RECIPIENT}\"]"))
     );
 }
 

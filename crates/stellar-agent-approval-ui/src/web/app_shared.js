@@ -182,16 +182,14 @@ var stellarAgentApproval = (function () {
     return dayLabel(date, new Date()) + " " + clockText(date);
   }
 
-  // The remaining-time phrase for an expiry that has NOT passed. The server
-  // selects the sentence this fills, so a passed expiry is the caller's
-  // `absoluteText` case and never composes into "expires expired (...)".
+  // The approval deadline and remaining time for a live request.
   function remainingText(unixMs) {
     // A bare clock time is ambiguous once the expiry is not today, so the day
     // label comes along in that case.
     var date = new Date(unixMs);
     var day = dayLabel(date, new Date());
     var when = day === "today" ? clockText(date) : day + " " + clockText(date);
-    return "in " + longDuration(unixMs - Date.now()) + " (" + when + ")";
+    return when + " (in " + longDuration(unixMs - Date.now()) + ")";
   }
 
   // ── Approval summaries ─────────────────────────────────────────────────
@@ -206,14 +204,17 @@ var stellarAgentApproval = (function () {
     register_passkey: "PASSKEY",
     toolset_first_invoke_gate: "TOOLSET GATE",
     trustline_clawback_opt_in: "CLAWBACK OPT-IN",
+    inconsistent: "INCONSISTENT",
     rejected: "REJECTED",
   };
 
   // The two passkey kinds take the amber pill: their ceremony runs in the
-  // browser bridge, so they are the kinds an inbox cannot approve.
-  function isPasskeyKind(view) {
+  // browser bridge, so they are the kinds an inbox cannot approve. An
+  // inconsistent entry takes it too: no surface can approve it.
+  function isWarnKind(view) {
     var kind = (view.summary || {}).kind;
-    return kind === "sign_with_passkey" || kind === "register_passkey";
+    return kind === "sign_with_passkey" || kind === "register_passkey" ||
+      kind === "inconsistent";
   }
 
   function kindLabel(view) {
@@ -224,7 +225,18 @@ var stellarAgentApproval = (function () {
     return String(view.kind_name || "approval").toUpperCase();
   }
 
-  // The row's headline: what this request is, in one line. Total over the ten
+  function memoText(memo) {
+    if (!memo || memo.kind === "none") return "none";
+    if (memo.kind === "text") return 'text "' + memo.value + '"';
+    if (memo.kind === "hash" || memo.kind === "return") {
+      return memo.kind + " " + memo.value.map(function (byte) {
+        return byte.toString(16).padStart(2, "0");
+      }).join("");
+    }
+    return memo.kind + " " + memo.value;
+  }
+
+  // The row's headline: what this request is, in one line. Total over the eleven
   // kinds, with a plain fallback for a kind this build does not know.
   function headlineText(view) {
     var s = view.summary || {};
@@ -232,8 +244,10 @@ var stellarAgentApproval = (function () {
       case "trustline":
         return "Trustline " + s.asset_code + ":" + s.asset_issuer;
       case "payment":
+        return (s.dest_asset ? "maximum sent " : "") +
+          (amountText(s.amount_stroops, s.asset) || kindLabel(view));
       case "claim":
-        return amountText(s.amount_stroops, s.asset) || kindLabel(view);
+        return "Claim balance " + s.balance_id_strkey;
       case "mpp_charge":
         // Base units of an arbitrary token contract, whose decimal scale the
         // wallet does not have here.
@@ -250,6 +264,8 @@ var stellarAgentApproval = (function () {
         return "Toolset capability request";
       case "trustline_clawback_opt_in":
         return "Clawback opt-in for " + s.code;
+      case "inconsistent":
+        return "Inconsistent " + s.original_kind_name;
       case "rejected":
         return "Rejected " + s.original_kind_name;
       default:
@@ -257,7 +273,8 @@ var stellarAgentApproval = (function () {
     }
   }
 
-  // The row's second line: the identifying detail, truncated by CSS when long.
+  // The row's identifying detail: toolset gates and muxed destinations wrap;
+  // other kinds truncate.
   function metaText(view) {
     var s = view.summary || {};
     switch (s.kind) {
@@ -265,11 +282,15 @@ var stellarAgentApproval = (function () {
         var limit = s.limit_stroops == null ? "unlimited"
           : s.limit_stroops === "0" ? "0 stroops (remove)"
           : s.limit_stroops + " stroops";
-        return "limit " + limit + " for " + s.holder;
+        return "limit " + limit + " for " + s.holder + " · memo " + memoText(s.memo);
       case "payment":
-        return "to " + s.to;
+        return "to " + s.to + (s.dest_asset
+          ? " · destination receives at least " + amountText(s.dest_amount_stroops, s.dest_asset) : "") +
+          " · memo " + memoText(s.memo);
       case "claim":
-        return "balance " + s.balance_id_strkey;
+        return "source " + s.source + " · fee " + s.fee_stroops +
+          " stroops · sequence " + s.seq_num +
+          " · asset and amount: not part of the signed claim transaction · memo " + memoText(s.memo);
       case "mpp_charge":
         // authority and target are separate bound fields (an HTTPS authority
         // and a path, or an MCP server and an operation name); concatenating
@@ -281,14 +302,27 @@ var stellarAgentApproval = (function () {
       case "register_passkey":
         return s.smart_account_redacted + " " + MIDDOT + " rp " + s.rp_id;
       case "toolset_first_invoke_gate":
-        return s.toolset_name + " requests " + s.capability;
+        return s.toolset_name + " " + s.package_version + " " + MIDDOT +
+          " sha256 " + s.package_shasum_short + " " + MIDDOT +
+          " install " + s.install_id + " " + MIDDOT + " requests " + s.capability +
+          " " + MIDDOT + " to " + s.destination;
       case "trustline_clawback_opt_in":
         return s.code + " " + MIDDOT + " " + s.issuer_redacted;
+      case "inconsistent":
+        return "cannot be approved";
       case "rejected":
         return "no action required";
       default:
         return String(view.kind_name || "");
     }
+  }
+
+  // The base account of a muxed payment or toolset gate destination, or null.
+  function muxedBase(view) {
+    var s = view.summary || {};
+    var base = s.kind === "payment" ? s.to_base
+      : s.kind === "toolset_first_invoke_gate" ? s.destination_base : null;
+    return typeof base === "string" && base !== "" ? base : null;
   }
 
   // ── Inbox ──────────────────────────────────────────────────────────────
@@ -303,7 +337,7 @@ var stellarAgentApproval = (function () {
       el.appendChild(gone);
       return;
     }
-    el.appendChild(document.createTextNode("expires in"));
+    el.appendChild(document.createTextNode("approve within"));
     el.appendChild(document.createElement("br"));
     var value = document.createElement("b");
     if (remaining < TEN_MINUTES_MS) {
@@ -319,7 +353,7 @@ var stellarAgentApproval = (function () {
     row.href = "/approval/" + encodeURIComponent(view.approval_nonce);
 
     var kind = document.createElement("span");
-    kind.className = isPasskeyKind(view) ? "kind warn" : "kind";
+    kind.className = isWarnKind(view) ? "kind warn" : "kind";
     kind.textContent = kindLabel(view);
     row.appendChild(kind);
 
@@ -330,9 +364,18 @@ var stellarAgentApproval = (function () {
     title.textContent = headlineText(view);
     main.appendChild(title);
     var meta = document.createElement("div");
-    meta.className = "ap-meta";
+    var gate = view.summary && view.summary.kind === "toolset_first_invoke_gate";
+    var base = muxedBase(view);
+    meta.className = "ap-meta" + (gate ? " toolset-gate" : base ? " muxed" : "");
     meta.textContent = metaText(view);
     main.appendChild(meta);
+    if (base) {
+      // A muxed destination shows in full, with its base account on its own row.
+      var baseRow = document.createElement("div");
+      baseRow.className = "ap-meta muxed";
+      baseRow.textContent = "base account " + base;
+      main.appendChild(baseRow);
+    }
     row.appendChild(main);
 
     var expiry = document.createElement("div");
@@ -380,7 +423,7 @@ var stellarAgentApproval = (function () {
   //
   // The server chooses the surrounding sentence and marks it with
   // `data-expiry-form`: "remaining" for a live request, "absolute" for one that
-  // can no longer be approved. This only fills the two slots.
+  // can no longer be approved. Execution window text is final server text.
   function refreshTimestamps() {
     var line = document.getElementById("expiry-line");
     if (!line) {
@@ -446,9 +489,11 @@ var stellarAgentApproval = (function () {
   }
 
   // Renders a decision the server REFUSED. A refusal is not a status to read
-  // past: a rejected passkey assertion, a stale CSRF value, or an entry that
-  // resolved elsewhere all mean nothing was signed, and the panel has to say so
-  // in its own treatment rather than as "Status: unknown".
+  // past: a rejected passkey assertion, a stale CSRF value, a page whose request
+  // changed, or an entry that resolved elsewhere all mean nothing was signed,
+  // and the panel has to say so in its own treatment rather than as "Status:
+  // unknown". The server's fixed message, when it sends one, follows the code
+  // as its own paragraph.
   function renderRefusal(result, data, fallback) {
     result.textContent = "";
     result.className = "result refused";
@@ -458,6 +503,11 @@ var stellarAgentApproval = (function () {
       ? "Not recorded: " + detail
       : "Not recorded: " + fallback;
     result.appendChild(line);
+    if (data && typeof data.message === "string" && data.message) {
+      var message = document.createElement("p");
+      message.textContent = data.message;
+      result.appendChild(message);
+    }
   }
 
   // The ceremony state the brand mark reads. "ok" / "error" / "busy".

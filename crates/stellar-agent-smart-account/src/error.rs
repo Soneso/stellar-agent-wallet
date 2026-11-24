@@ -20,8 +20,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::signers::types::{ThresholdAffectingOp, WasmHashSummary};
-use stellar_agent_core::audit_log::schema::ContractKind;
+use stellar_agent_core::audit_log::schema::{ContractKind, WasmHashPin};
 use stellar_agent_core::audit_log::signer_set::SignerSetView;
 pub use stellar_agent_core::error::AuthMismatchReason;
 use stellar_agent_core::observability::RedactedStrkey;
@@ -32,8 +31,9 @@ use stellar_agent_core::observability::RedactedStrkey;
 /// `admin_or_owner_key` field on [`SaError::VerifierMutable`] and
 /// [`SaError::PolicyMutable`]: the operator can admit such a contract with
 /// `--accept-mutable-verifier`. `UndecodableInstance`, `NonWasmExecutable`,
-/// `ExternalRefUnresolved` and `ExecutableChanged` populate the `reason` field
-/// on [`SaError::ContractInstanceUnsupported`], which no flag overrides.
+/// `ExternalRefUnresolved`, `ExecutableChanged` and `NoWasmCode`
+/// populate the `reason` field on [`SaError::ContractInstanceUnsupported`],
+/// which no flag overrides.
 ///
 /// # Wire format
 ///
@@ -66,15 +66,18 @@ pub enum AdminOrOwnerKey {
     /// observed by the mutability probe differ in kind or in external
     /// reference, so the install has no single observation to pin.
     ExecutableChanged,
+    /// No instance at the address, or a built-in executable such as the
+    /// Stellar Asset Contract. Neither has a Wasm hash to pin, and absent
+    /// Wasm code never matches a pin.
+    NoWasmCode,
 }
 
 impl AdminOrOwnerKey {
     /// Returns `true` for an instance whose code the wallet cannot pin.
     ///
-    /// An existing instance that does not decode as a Wasm contract instance
-    /// has no Wasm hash to pin, and the signing-time drift check compares
-    /// against the zero hash, so a later code change stays invisible. An
-    /// external reference with no live tag entry resolves to no hash. An
+    /// An existing instance that does not decode as a Wasm contract
+    /// instance, a contract with no Wasm code, and an external
+    /// reference with no live tag entry have no Wasm code hash to pin. An
     /// executable that changed between the identification fetch and the
     /// mutability probe leaves no single observation to pin. Rule install
     /// refuses such a contract with no override.
@@ -88,7 +91,8 @@ impl AdminOrOwnerKey {
             Self::UndecodableInstance
             | Self::NonWasmExecutable
             | Self::ExternalRefUnresolved
-            | Self::ExecutableChanged => true,
+            | Self::ExecutableChanged
+            | Self::NoWasmCode => true,
             Self::Admin | Self::Owner | Self::ExternalRefExecutable => false,
         }
     }
@@ -104,6 +108,7 @@ impl std::fmt::Display for AdminOrOwnerKey {
             Self::ExternalRefExecutable => f.write_str("owner-managed external reference"),
             Self::ExternalRefUnresolved => f.write_str("external reference with no live tag entry"),
             Self::ExecutableChanged => f.write_str("executable changed during install"),
+            Self::NoWasmCode => f.write_str("no Wasm code"),
         }
     }
 }
@@ -151,14 +156,6 @@ fn after_transaction_suffix(tx_hash: &Option<String>) -> String {
     tx_hash
         .as_deref()
         .map_or_else(String::new, |hash| format!(" after transaction {hash}"))
-}
-
-/// Renders an optional bounded detail as a parenthesised Display suffix, or
-/// nothing when absent.
-fn paren_suffix(detail: &Option<String>) -> String {
-    detail
-        .as_deref()
-        .map_or_else(String::new, |detail| format!(" ({detail})"))
 }
 
 /// Byte cap of [`SaError::PinCheckUnavailable`]'s `reason`.
@@ -301,6 +298,39 @@ pub enum PostSubmitVerificationKind {
               variant size is intentional diagnostic richness"
 )]
 pub enum SaError {
+    /// The pinned total-budget epoch cannot be authenticated.
+    #[error("Total-budget policy state is unavailable: {detail}")]
+    #[serde(rename = "policy.total_epoch_unavailable")]
+    TotalEpochUnavailable {
+        /// The state refusal detail.
+        detail: String,
+    },
+    /// The evaluated policy no longer matches the pin.
+    #[error("The total-budget policy epoch is stale. Reload the pinned policy.")]
+    #[serde(rename = "policy.total_epoch_stale")]
+    TotalEpochStale,
+    /// Earlier state has no trustworthy history for this allocation.
+    #[error("The total-budget policy epoch is retired. Different signed authority is required.")]
+    #[serde(rename = "policy.total_epoch_retired")]
+    TotalEpochRetired,
+    /// Intent accounting cannot establish a durable charge.
+    #[error(
+        "Smart-account intent recording is unavailable ({class}). Existing exposed charges remain."
+    )]
+    #[serde(rename = "submission.intent_record_unavailable")]
+    IntentRecordUnavailable {
+        /// The fixed failure class.
+        class: &'static str,
+    },
+    /// A signing request or final envelope differs from the admitted authority.
+    #[error(
+        "The signing request or final transaction does not match its admitted intent ({field}). Existing exposed charges remain."
+    )]
+    #[serde(rename = "submission.intent_binding_mismatch")]
+    IntentBindingMismatch {
+        /// The fixed mismatching field.
+        field: &'static str,
+    },
     /// Removing or adding a signer would produce an unreachable threshold.
     ///
     /// Fired when the requested `requested_op` would leave the rule with fewer
@@ -315,9 +345,8 @@ pub enum SaError {
     /// `stellar_agent_core::observability::redact_strkey_first5_last5` at the
     /// call site.
     #[error(
-        "threshold unreachable: rule {rule_id} has {current_signer_count} signers / \
-         threshold {current_threshold}; requested op {requested_op:?} would brick; \
-         {safe_ordering_hint}"
+        "threshold unreachable: the operation must leave at least as many signers as the rule \
+         threshold; {safe_ordering_hint}"
     )]
     #[serde(rename = "sa.threshold_unreachable")]
     ThresholdUnreachable {
@@ -327,8 +356,6 @@ pub enum SaError {
         current_signer_count: u32,
         /// Current threshold that would become unreachable.
         current_threshold: u32,
-        /// The operation that triggered the refusal.
-        requested_op: ThresholdAffectingOp,
         /// Human-readable safe ordering hint for the two-command sequence.
         ///
         /// Example: `"run 'smart-account signers set-threshold --rule-id 1 --threshold 2' \
@@ -352,14 +379,13 @@ pub enum SaError {
     ///
     /// `smart_account_redacted` and `deploy_address_redacted` MUST be passed
     /// through `stellar_agent_core::observability::redact_strkey_first5_last5`
-    /// at the call site.  `pinned_hash_first8` and
-    /// `observed_hash_first8` carry the first-8 hex chars (16 hex characters)
-    /// of the respective 32-byte wasm hashes — sufficient for forensic
-    /// correlation without leaking the full preimage.
+    /// at the call site.  `pinned_hash` carries the full 32-byte pin. The
+    /// observed executable failed to match the pin, so the error holds no
+    /// part of it; the `SaVerifierHashDrift` audit row written before the
+    /// error returns records the observed hash and executable.
     #[error(
-        "verifier wasm-hash drift detected for rule {rule_id}: \
-         pinned={pinned_hash_first8}, observed={observed_hash_first8}{}",
-        paren_suffix(.observed_executable)
+        "verifier executable must match the pinned executable for rule {rule_id}: \
+         pinned={pinned_hash}"
     )]
     #[serde(rename = "sa.verifier_hash_drift")]
     VerifierHashDrift {
@@ -376,18 +402,8 @@ pub enum SaError {
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         deploy_address_redacted: RedactedStrkey,
-        /// First-8 hex chars of the wasm hash pinned at rule-install time.
-        pinned_hash_first8: String,
-        /// First-8 hex chars of the effective hash observed on-chain via
-        /// two-RPC re-fetch: the Wasm hash, the hash an external reference
-        /// resolved to, or the zero hash for no code or an unresolved
-        /// reference.
-        observed_hash_first8: String,
-        /// Bounded summary of the observed executable (`wasm`, `no code`, or
-        /// `external reference owner <redacted> tag "<bounded>" resolved
-        /// <first-8 or unset>`); appended to the Display when present.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        observed_executable: Option<String>,
+        /// The full wasm hash of the rule's pin.
+        pinned_hash: WasmHashPin,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
@@ -403,11 +419,13 @@ pub enum SaError {
     ///
     /// `smart_account_redacted` and `deploy_address_redacted` MUST be passed
     /// through `stellar_agent_core::observability::redact_strkey_first5_last5`
-    /// at the call site.
+    /// at the call site.  `pinned_hash` carries the full 32-byte pin. The
+    /// observed executable failed to match the pin, so the error holds no
+    /// part of it; the `SaPolicyHashDrift` audit row written before the
+    /// error returns records the observed hash and executable.
     #[error(
-        "policy wasm-hash drift detected for rule {rule_id}: \
-         pinned={pinned_hash_first8}, observed={observed_hash_first8}{}",
-        paren_suffix(.observed_executable)
+        "policy executable must match the pinned executable for rule {rule_id}: \
+         pinned={pinned_hash}"
     )]
     #[serde(rename = "sa.policy_hash_drift")]
     PolicyHashDrift {
@@ -424,18 +442,8 @@ pub enum SaError {
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         deploy_address_redacted: RedactedStrkey,
-        /// First-8 hex chars of the wasm hash pinned at rule-install time.
-        pinned_hash_first8: String,
-        /// First-8 hex chars of the effective hash observed on-chain via
-        /// two-RPC re-fetch: the Wasm hash, the hash an external reference
-        /// resolved to, or the zero hash for no code or an unresolved
-        /// reference.
-        observed_hash_first8: String,
-        /// Bounded summary of the observed executable (`wasm`, `no code`, or
-        /// `external reference owner <redacted> tag "<bounded>" resolved
-        /// <first-8 or unset>`); appended to the Display when present.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        observed_executable: Option<String>,
+        /// The full wasm hash of the rule's pin.
+        pinned_hash: WasmHashPin,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
@@ -446,8 +454,7 @@ pub enum SaError {
     /// Fired at signing time by `verify_pinned_verifier_against_chain` or
     /// `verify_pinned_policy_against_chain` when the audit-log pin record for
     /// `(rule_id, smart_account_redacted)` contains more than one entry in the
-    /// `pinned_verifier_wasm_hashes_first8` or `pinned_policy_wasm_hashes_first8`
-    /// list.  Multi-hash rules can arise if a future install path creates
+    /// `pinned_verifier_wasm_hashes` or `pinned_policy_wasm_hashes` list.  Multi-hash rules can arise if a future install path creates
     /// multiple distinct verifier or policy addresses in a single rule.
     ///
     /// # Why a typed variant instead of `DeploymentFailed { phase: "pin_check" }`
@@ -560,6 +567,41 @@ pub enum SaError {
         request_id: String,
     },
 
+    /// The rule's selected pin record holds eight-byte hash prefixes, not
+    /// full 32-byte hashes.
+    ///
+    /// A prefix pin cannot authenticate the code a verifier or policy runs:
+    /// two different hashes can share the prefix. Every reader of the rule's
+    /// pin record refuses it before anything is signed or written: the
+    /// signing-time drift check, `verify-pins`, `signers refresh`, signer
+    /// addition, policy addition and removal, and verifier migration. No
+    /// override flag bypasses it, and no byte of a pin is taken from an RPC
+    /// observation, an allowlist entry or a prefix match. Recovery is a
+    /// reviewed reinstall of the rule, authorized under an independently
+    /// authorized rule such as rule `0`, after checking the intended full
+    /// hashes; the reinstall runs the allowlist and mutability checks of any
+    /// install.
+    ///
+    /// # Forensic spine
+    ///
+    /// `smart_account_redacted` MUST be passed through
+    /// `stellar_agent_core::observability::redact_strkey_first5_last5`
+    /// at the call site.
+    #[error(
+        "rule {rule_id} has a pin record of eight-byte hash prefixes, which cannot \
+         authenticate the code it pins; nothing was signed. Review the intended full hashes \
+         and reinstall the rule under an independently authorized rule such as rule 0"
+    )]
+    #[serde(rename = "sa.wasm_pin_incomplete")]
+    WasmPinIncomplete {
+        /// Context-rule identifier whose pin record is incomplete.
+        rule_id: u32,
+        /// Redacted smart-account contract address (first-5-last-5 C-strkey).
+        smart_account_redacted: RedactedStrkey,
+        /// Per-request correlation identifier (UUIDv4).
+        request_id: String,
+    },
+
     /// The pre-signing drift check of a rule-authorized submission could not
     /// run to a verdict.
     ///
@@ -571,9 +613,9 @@ pub enum SaError {
     /// (`sa.multiple_pinned_hashes_unsupported`), an unpinnable instance, or
     /// the check exceeding the pre-submit budget. Nothing is signed. The
     /// check's own refusals, [`SaError::VerifierHashDrift`],
-    /// [`SaError::PolicyHashDrift`], [`SaError::PinnedPolicyAbsent`] and
-    /// [`SaError::PinnedVerifierAbsent`], propagate as themselves and are
-    /// never folded into this variant. The
+    /// [`SaError::PolicyHashDrift`], [`SaError::PinnedPolicyAbsent`],
+    /// [`SaError::PinnedVerifierAbsent`] and [`SaError::WasmPinIncomplete`],
+    /// propagate as themselves and are never folded into this variant. The
     /// signer-set steps that run beside the pin check propagate as themselves
     /// too: [`SaError::SignerSetMissingBaseline`],
     /// [`SaError::SignerSetDiverged`], [`SaError::NetworkRpcDivergence`] and
@@ -620,15 +662,12 @@ pub enum SaError {
     ///
     /// # Forensic spine
     ///
-    /// `smart_account_redacted` and `contract_address_redacted` MUST be passed
-    /// through `stellar_agent_core::observability::redact_strkey_first5_last5`
-    /// at the call site.  `admin_or_owner_key` is a typed storage key, not secret.
+    /// `smart_account_redacted` MUST be passed through
+    /// `stellar_agent_core::observability::redact_strkey_first5_last5` at the
+    /// call site.  `admin_or_owner_key` is a typed storage key, not secret.
     #[error(
-        "verifier contract is mutable{}: \
-         contract={contract_address_redacted}, reason={admin_or_owner_key}{}; \
-         --accept-mutable-verifier is required",
-        rule_suffix(.rule_id),
-        paren_suffix(.detail)
+        "verifier address must identify an immutable contract; use --accept-mutable-verifier \
+         only when you accept that its code can change."
     )]
     #[serde(rename = "sa.verifier_mutable")]
     VerifierMutable {
@@ -642,12 +681,6 @@ pub enum SaError {
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         smart_account_redacted: RedactedStrkey,
-        /// Redacted address of the mutable verifier contract
-        /// (first-5-last-5 C-strkey).
-        ///
-        /// MUST be redacted at the call site via
-        /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
-        contract_address_redacted: RedactedStrkey,
         /// Why the contract is mutable: an active `Admin` or `Owner` storage
         /// key, or an `ExternalRefExecutable`.
         admin_or_owner_key: AdminOrOwnerKey,
@@ -671,15 +704,12 @@ pub enum SaError {
     ///
     /// # Forensic spine
     ///
-    /// `smart_account_redacted` and `contract_address_redacted` MUST be passed
-    /// through `stellar_agent_core::observability::redact_strkey_first5_last5`
-    /// at the call site.
+    /// `smart_account_redacted` MUST be passed through
+    /// `stellar_agent_core::observability::redact_strkey_first5_last5` at the
+    /// call site.
     #[error(
-        "policy contract is mutable{}: \
-         contract={contract_address_redacted}, reason={admin_or_owner_key}{}; \
-         --accept-mutable-verifier is required",
-        rule_suffix(.rule_id),
-        paren_suffix(.detail)
+        "policy address must identify an immutable contract; use --accept-mutable-verifier only \
+         when you accept that its code can change."
     )]
     #[serde(rename = "sa.policy_mutable")]
     PolicyMutable {
@@ -693,12 +723,6 @@ pub enum SaError {
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         smart_account_redacted: RedactedStrkey,
-        /// Redacted address of the mutable policy contract
-        /// (first-5-last-5 C-strkey).
-        ///
-        /// MUST be redacted at the call site via
-        /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
-        contract_address_redacted: RedactedStrkey,
         /// Why the contract is mutable: an active `Admin` or `Owner` storage
         /// key, or an `ExternalRefExecutable`.
         admin_or_owner_key: AdminOrOwnerKey,
@@ -733,15 +757,13 @@ pub enum SaError {
     ///
     /// # Forensic spine
     ///
-    /// `smart_account_redacted` and `contract_address_redacted` MUST be passed
-    /// through `stellar_agent_core::observability::redact_strkey_first5_last5`
-    /// at the call site.  `contract_kind` and `reason` are typed closed sets,
-    /// not secret.
+    /// `smart_account_redacted` MUST be passed through
+    /// `stellar_agent_core::observability::redact_strkey_first5_last5` at the
+    /// call site.  `contract_kind` and `reason` are typed closed sets, not
+    /// secret.
     #[error(
-        "{contract_kind} contract instance is unsupported{}: \
-         contract={contract_address_redacted}, reason={reason}; \
-         the wallet cannot pin this contract's code",
-        rule_suffix(.rule_id)
+        "verifier or policy address must identify a deployed contract with a supported, \
+         resolvable Wasm executable; repair the deployment or select another contract."
     )]
     #[serde(rename = "sa.contract_instance_unsupported")]
     ContractInstanceUnsupported {
@@ -757,14 +779,9 @@ pub enum SaError {
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         smart_account_redacted: RedactedStrkey,
-        /// Redacted address of the unsupported contract (first-5-last-5 C-strkey).
-        ///
-        /// MUST be redacted at the call site via
-        /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
-        contract_address_redacted: RedactedStrkey,
         /// Instance shape that prevents pinning (`UndecodableInstance`,
-        /// `NonWasmExecutable`, `ExternalRefUnresolved` or
-        /// `ExecutableChanged`).
+        /// `NonWasmExecutable`, `ExternalRefUnresolved`, `ExecutableChanged`
+        /// or `NoWasmCode`).
         reason: AdminOrOwnerKey,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
@@ -784,19 +801,11 @@ pub enum SaError {
     ///
     /// `smart_account_redacted` MUST be passed through
     /// `stellar_agent_core::observability::redact_strkey_first5_last5` at the
-    /// call site.  `observed_hash_first8` carries the first-8
-    /// hex chars of the observed wasm hash.
-    ///
-    /// # Forensic sentinels
-    ///
-    /// `observed_hash_first8 = "none"` signals that the ledger entry for the
-    /// verifier contract is absent or not a deployed contract instance (i.e. the
-    /// rule references a contract that was never deployed at that address).
-    /// A hex value signals that the contract IS deployed but its wasm hash is
-    /// not in the wallet's `VERIFIER_ALLOWLIST`.
+    /// call site. The observed hash failed the allowlist, so the error holds
+    /// no part of it.
     #[error(
-        "verifier wasm hash not in VERIFIER_ALLOWLIST{}: \
-         observed={observed_hash_first8}; --accept-unknown-verifier is required",
+        "verifier wasm hash must be in VERIFIER_ALLOWLIST{}; \
+         --accept-unknown-verifier is required for a hash outside it",
         rule_suffix(.rule_id)
     )]
     #[serde(rename = "sa.verifier_wasm_not_in_allowlist")]
@@ -811,9 +820,6 @@ pub enum SaError {
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         smart_account_redacted: RedactedStrkey,
-        /// First-8 hex chars of the wasm hash observed on-chain but absent
-        /// from the allowlist.
-        observed_hash_first8: String,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
@@ -831,17 +837,11 @@ pub enum SaError {
     ///
     /// `smart_account_redacted` MUST be passed through
     /// `stellar_agent_core::observability::redact_strkey_first5_last5` at the
-    /// call site.
-    ///
-    /// # Forensic sentinels
-    ///
-    /// `observed_hash_first8 = "none"` signals that the ledger entry for the
-    /// policy contract is absent or not a deployed contract instance.
-    /// A hex value signals that the contract IS deployed but its wasm hash is
-    /// not the hash of a vendored policy Wasm.
+    /// call site. The observed hash failed the check, so the error holds no
+    /// part of it.
     #[error(
-        "policy wasm hash is not a policy Wasm the wallet vendors{}: \
-         observed={observed_hash_first8}; --accept-unknown-verifier is required",
+        "policy wasm hash must be the hash of a policy Wasm the wallet vendors{}; \
+         --accept-unknown-verifier is required for another hash",
         rule_suffix(.rule_id)
     )]
     #[serde(rename = "sa.policy_wasm_not_in_allowlist")]
@@ -856,9 +856,6 @@ pub enum SaError {
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         smart_account_redacted: RedactedStrkey,
-        /// First-8 hex chars of the wasm hash observed on-chain but absent
-        /// from the allowlist.
-        observed_hash_first8: String,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
@@ -877,7 +874,9 @@ pub enum SaError {
     ///
     /// Signing aborts before signature bytes are produced when simulation context
     /// and the envelope-to-sign disagree. Guards against context-rule-ID binding
-    /// tampering and Soroban auth-entry manipulation between simulate and sign.
+    /// tampering and against a simulated invocation tree other than the one the
+    /// wallet built: a root on another contract, function or argument, or
+    /// sub-invocations the caller did not declare.
     #[error("simulation divergence: {sub_code:?} ({redacted_reason})")]
     #[serde(rename = "simulation.divergence")]
     SimulationDivergence {
@@ -1031,10 +1030,10 @@ pub enum SaError {
     /// `phase` is drawn from a compile-time closed set enforced by
     /// `deployment::ALL_EMITTED_PHASES` + the `phase_string_constant_set_is_closed`
     /// test in `error.rs::tests`. `redacted_reason` is pre-redacted at the call
-    /// site (no raw account-id, contract-id, signature bytes, or hash prefix
-    /// exceeding 8 hex chars, except for the documented `post_deploy_verification`
-    /// mismatch case which carries first-8 hex prefixes of both observed and
-    /// expected for operator triage).
+    /// site (no raw account-id, contract-id or signature bytes). Hash prefixes
+    /// contain at most eight hex characters, except for the expected hash in
+    /// `post_deploy_verification`, which uses eight bytes (16 hex characters)
+    /// beside the redacted contract address.
     #[error("smart-account deployment failed at phase {phase}: {redacted_reason}")]
     #[serde(rename = "sa.deployment_failed")]
     DeploymentFailed {
@@ -1113,9 +1112,48 @@ pub enum SaError {
     /// [`Self::NetworkRpcDivergence`], [`Self::SubmissionUnresolved`], and
     /// [`Self::PolicyDenied`] are, so every mainnet refusal carries one code.
     /// The serde tag carries the same code.
-    #[error("mainnet writes are structurally refused in this alpha")]
+    #[error("this mainnet write is structurally refused")]
     #[serde(rename = "network.mainnet_write_forbidden")]
     MainnetWriteForbidden,
+
+    /// A signing path found no usable independent ledger observation, and
+    /// nothing was signed.
+    ///
+    /// Raised when the secondary endpoint is absent, malformed, on the
+    /// primary's host, on another network or unreachable, when the primary
+    /// gives no observation, and when the observations are stale or the
+    /// pre-submit deadline elapsed. The fix is an operator's: configure a
+    /// reachable secondary RPC on the same network.
+    ///
+    /// # Redaction
+    ///
+    /// `reason` is a fixed string. It never carries endpoint input, which can
+    /// hold a credential.
+    #[error("ledger witness unavailable: {reason}")]
+    #[serde(rename = "smart_account.ledger_witness_unavailable")]
+    LedgerWitnessUnavailable {
+        /// Fixed description of what is missing.
+        reason: &'static str,
+    },
+
+    /// The ledger observations of a signing path disagree, and nothing was
+    /// signed.
+    ///
+    /// Raised when the two endpoints differ by more than the skew tolerance
+    /// in either order, when a height is out of bounds, when the simulation
+    /// height contradicts the observations, and when the signature
+    /// expiration ledger overflows.
+    ///
+    /// # Redaction
+    ///
+    /// `reason` is a fixed string. It carries neither endpoint input nor a
+    /// reported height.
+    #[error("ledger witness mismatch: {reason}")]
+    #[serde(rename = "simulation.divergence.ledger_skew")]
+    LedgerWitnessMismatch {
+        /// Fixed description of the disagreement.
+        reason: &'static str,
+    },
 
     /// Local `ScAddress` XDR encoding failed while building an injective cache key.
     ///
@@ -1160,17 +1198,15 @@ pub enum SaError {
     /// so the registry entry and the pinned SHA-256 stay in sync.
     ///
     /// `network` is the Stellar network passphrase (not secret).
-    /// `recorded` and `attempted` are 64-char lowercase hex SHA-256 digests (not secret).
+    /// `attempted` is a 64-char lowercase hex SHA-256 digest (not secret).
     #[error(
-        "WebAuthn-verifier sha256 drift for network {network}: \
-         registry records {recorded}, attempted deployment uses {attempted}"
+        "webauthn_verifier_wasm_sha256 must match the binary vendored Wasm SHA-256 pin; verify the \
+         deployment and correct the registry entry."
     )]
     #[serde(rename = "sa.webauthn_verifier_sha256_drift")]
     WebAuthnVerifierSha256Drift {
         /// The Stellar network passphrase for which the registry entry exists.
         network: String,
-        /// The SHA-256 hex string already recorded in the registry for this network.
-        recorded: String,
         /// The SHA-256 hex string of the WASM that the caller attempted to record.
         attempted: String,
     },
@@ -1208,17 +1244,15 @@ pub enum SaError {
     /// pinned SHA-256 stay in sync.
     ///
     /// `network` is the Stellar network passphrase (not secret).
-    /// `recorded` and `attempted` are 64-char lowercase hex SHA-256 digests (not secret).
+    /// `attempted` is a 64-char lowercase hex SHA-256 digest (not secret).
     #[error(
-        "Ed25519-verifier sha256 drift for network {network}: \
-         registry records {recorded}, attempted deployment uses {attempted}"
+        "ed25519_verifier_wasm_sha256 must match the binary vendored Wasm SHA-256 pin; verify the \
+         deployment and correct the registry entry."
     )]
     #[serde(rename = "sa.ed25519_verifier_sha256_drift")]
     Ed25519VerifierSha256Drift {
         /// The Stellar network passphrase for which the registry entry exists.
         network: String,
-        /// The SHA-256 hex string already recorded in the registry for this network.
-        recorded: String,
         /// The SHA-256 hex string of the WASM that the caller attempted to record.
         attempted: String,
     },
@@ -1255,17 +1289,15 @@ pub enum SaError {
     /// pinned SHA-256 stay in sync.
     ///
     /// `network` is the Stellar network passphrase (not secret).
-    /// `recorded` and `attempted` are 64-char lowercase hex SHA-256 digests (not secret).
+    /// `attempted` is a 64-char lowercase hex SHA-256 digest (not secret).
     #[error(
-        "spending-limit-policy sha256 drift for network {network}: \
-         registry records {recorded}, attempted deployment uses {attempted}"
+        "spending_limit_policy_wasm_sha256 must match the binary vendored Wasm SHA-256 pin; verify the \
+         deployment and correct the registry entry."
     )]
     #[serde(rename = "sa.spending_limit_policy_sha256_drift")]
     SpendingLimitPolicySha256Drift {
         /// The Stellar network passphrase for which the registry entry exists.
         network: String,
-        /// The SHA-256 hex string already recorded in the registry for this network.
-        recorded: String,
         /// The SHA-256 hex string of the WASM that the caller attempted to record.
         attempted: String,
     },
@@ -1334,16 +1366,16 @@ pub enum SaError {
     /// pick which attached address to operate on; the operator must remove
     /// the duplicate attachment via `smart-account rules remove-policy`.
     ///
-    /// `observed_wasm_hashes_summary` carries `count` (number of policies
-    /// observed on the rule) and `first_first8` (first 8 bytes of the first
-    /// observed hash) for forensic correlation without leaking full hash
-    /// preimages.
+    /// `observed_policy_count` is the number of policies attached to the
+    /// rule. The observed policy hashes failed to identify one policy, so
+    /// the error holds none of them, whole or in part.
     ///
     /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
     /// at the call site.
     #[error(
-        "spending-limit-policy identification failed on rule {rule_id}: \
-         observed {observed_wasm_hashes_summary}"
+        "spending-limit-policy identification failed on rule {rule_id}: rule must identify \
+         exactly one supported spending-limit policy (attached policies: \
+         {observed_policy_count})"
     )]
     #[serde(rename = "sa.spending_limit_policy_identification_failed")]
     SpendingLimitPolicyIdentificationFailed {
@@ -1351,8 +1383,8 @@ pub enum SaError {
         rule_id: u32,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         smart_account_redacted: RedactedStrkey,
-        /// Summary of observed wasm-hashes for forensic correlation.
-        observed_wasm_hashes_summary: WasmHashSummary,
+        /// Number of policies attached to the rule.
+        observed_policy_count: u32,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
@@ -1420,17 +1452,15 @@ pub enum SaError {
     /// simple-threshold-policy deploy path.
     ///
     /// `network` is the Stellar network passphrase (not secret).
-    /// `recorded` and `attempted` are 64-char lowercase hex SHA-256 digests (not secret).
+    /// `attempted` is a 64-char lowercase hex SHA-256 digest (not secret).
     #[error(
-        "simple-threshold-policy sha256 drift for network {network}: \
-         registry records {recorded}, attempted deployment uses {attempted}"
+        "simple_threshold_policy_wasm_sha256 must match the binary vendored Wasm SHA-256 pin; verify the \
+         deployment and correct the registry entry."
     )]
     #[serde(rename = "sa.simple_threshold_policy_sha256_drift")]
     SimpleThresholdPolicySha256Drift {
         /// The Stellar network passphrase for which the registry entry exists.
         network: String,
-        /// The SHA-256 hex string already recorded in the registry for this network.
-        recorded: String,
         /// The SHA-256 hex string of the WASM that the caller attempted to record.
         attempted: String,
     },
@@ -1466,17 +1496,15 @@ pub enum SaError {
     /// weighted-threshold-policy deploy path.
     ///
     /// `network` is the Stellar network passphrase (not secret).
-    /// `recorded` and `attempted` are 64-char lowercase hex SHA-256 digests (not secret).
+    /// `attempted` is a 64-char lowercase hex SHA-256 digest (not secret).
     #[error(
-        "weighted-threshold-policy sha256 drift for network {network}: \
-         registry records {recorded}, attempted deployment uses {attempted}"
+        "weighted_threshold_policy_wasm_sha256 must match the binary vendored Wasm SHA-256 pin; verify the \
+         deployment and correct the registry entry."
     )]
     #[serde(rename = "sa.weighted_threshold_policy_sha256_drift")]
     WeightedThresholdPolicySha256Drift {
         /// The Stellar network passphrase for which the registry entry exists.
         network: String,
-        /// The SHA-256 hex string already recorded in the registry for this network.
-        recorded: String,
         /// The SHA-256 hex string of the WASM that the caller attempted to record.
         attempted: String,
     },
@@ -1526,8 +1554,9 @@ pub enum SaError {
     /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
     /// at the call site.
     #[error(
-        "weighted-threshold-policy identification failed on rule {rule_id}: \
-         observed {observed_wasm_hashes_summary}"
+        "weighted-threshold-policy identification failed on rule {rule_id}: rule must \
+         identify exactly one supported weighted-threshold policy (attached policies: \
+         {observed_policy_count})"
     )]
     #[serde(rename = "sa.weighted_threshold_policy_identification_failed")]
     WeightedThresholdPolicyIdentificationFailed {
@@ -1535,8 +1564,8 @@ pub enum SaError {
         rule_id: u32,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         smart_account_redacted: RedactedStrkey,
-        /// Summary of observed wasm-hashes for forensic correlation.
-        observed_wasm_hashes_summary: WasmHashSummary,
+        /// Number of policies attached to the rule.
+        observed_policy_count: u32,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
@@ -1556,9 +1585,11 @@ pub enum SaError {
     /// File I/O error reading or writing `<canonical_data_root>/networks.toml`
     /// (or the `STELLAR_AGENT_NETWORKS_TOML` override path).
     ///
-    /// `path` is the filesystem path that failed; `source` is the underlying
-    /// `std::io::Error`.  Neither carries secret material.
-    #[error("networks.toml I/O error at {path}: {source}")]
+    /// `source` is the underlying `std::io::Error`, which carries no path.
+    #[error(
+        "networks.toml must be a readable file with a writable parent directory; correct the \
+         registry path and retry."
+    )]
     #[serde(rename = "sa.networks_toml_io")]
     NetworksTomlIo {
         /// The `io::Error` from the failed filesystem operation.
@@ -1568,8 +1599,6 @@ pub enum SaError {
         #[source]
         #[serde(serialize_with = "serialize_display")]
         source: io::Error,
-        /// Filesystem path on which the operation failed.
-        path: PathBuf,
     },
 
     /// The audit-log writer could not be opened for a smart-account manager
@@ -1600,18 +1629,14 @@ pub enum SaError {
     /// TOML parse error reading `<canonical_data_root>/networks.toml`
     /// (or the `STELLAR_AGENT_NETWORKS_TOML` override path).
     ///
-    /// `path` is the filesystem path that failed to parse; `source` is the
-    /// underlying `toml::de::Error`.  Neither carries secret material.
-    #[error("networks.toml TOML parse error at {path}: {source}")]
+    /// `path` is the filesystem path that failed to parse; `position` is the
+    /// line and column of the failure. The parser's error is not kept: its
+    /// `Display` prints the offending line, which can hold a credential.
+    #[error("networks.toml is not valid TOML: {position}")]
     #[serde(rename = "sa.networks_toml_parse")]
     NetworksTomlParse {
-        /// The `toml::de::Error` describing the parse failure.
-        ///
-        /// Serialised as a human-readable string because `toml::de::Error` does not
-        /// implement `serde::Serialize`.
-        #[source]
-        #[serde(serialize_with = "serialize_display")]
-        source: toml::de::Error,
+        /// The line and column of the parse failure, without source text.
+        position: String,
         /// Filesystem path whose contents failed to parse.
         path: PathBuf,
     },
@@ -1686,8 +1711,9 @@ pub enum SaError {
     /// - `"strkey_parse"` — signer public-key strkey parse failure during
     ///   auth-entry construction. Surfaces from
     ///   `managers/signers.rs`.
-    /// - `"quorum_external_contract_guard"` — external-contract quorum guard
-    ///   failure (reject if any quorum entry is an unregistered external contract).
+    /// - `"quorum_external_contract_guard"`: the quorum path signs the
+    ///   wallet's own entrypoints only; refused when the host function targets
+    ///   another contract or the simulated tree carries sub-invocations.
     ///   Surfaces from `submit.rs`.
     /// - `"quorum_signatures"` — quorum-signature collection failure (too few
     ///   registered signers could sign). Surfaces from `submit.rs`.
@@ -1715,6 +1741,9 @@ pub enum SaError {
     /// - `"signer_set_compare"`: the pre-submit deadline elapsed during a
     ///   rule's signer-set comparison. Surfaces from `submit.rs` and
     ///   `managers/credentials.rs`.
+    /// - `"credential_variant"`: a timelock simulation returns AddressV2 or
+    ///   AddressWithDelegates credentials. Surfaces from `timelock_submit.rs`
+    ///   before any signature.
     ///
     /// # Security
     ///
@@ -1737,6 +1766,27 @@ pub enum SaError {
         ///
         /// The caller is responsible for passing a reason free of secret material.
         redacted_reason: String,
+    },
+
+    /// A pre-signature auth entry does not match the facts it commits to, or
+    /// names another network than the passphrase of the call. Nothing was
+    /// signed.
+    ///
+    /// `field` is `"signature_payload"` or `"auth_digest"` when
+    /// `PartialSorobanAuthorizationEntry::validate` recomputes that digest
+    /// from the entry's network ID, nonce, expiration, root invocation and
+    /// context-rule IDs and the stored value differs, and `"network_id"` when
+    /// the entry's network ID differs from the network ID of the passphrase
+    /// a signing function was given. It is `"checked_signing_rules"` when the
+    /// entry's smart account, network ID or rule set differs from the one the
+    /// consumed `CheckedSigningRules` was produced for. Every case is refused
+    /// before any signer key access.
+    #[error("auth entry {field} does not match its signing context; nothing was signed")]
+    #[serde(rename = "sa.auth_entry_binding_mismatch")]
+    AuthEntryBindingMismatch {
+        /// The mismatching field: `"signature_payload"`, `"auth_digest"`,
+        /// `"network_id"` or `"checked_signing_rules"`.
+        field: &'static str,
     },
 
     /// The rule has no simple-threshold policy, whether other policies are present or absent.
@@ -1780,13 +1830,11 @@ pub enum SaError {
     /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
     /// at the call site.
     #[error(
-        "signer-set missing baseline: rule {rule_id} has no audit-log baseline; \
-         run 'smart-account signers list --rule-id {rule_id}' to record one"
+        "rule_id must identify a rule with a recorded signer-set baseline; run 'smart-account \
+         signers list --rule-id <RULE_ID>' to record one before retrying."
     )]
     #[serde(rename = "sa.signer_set_missing_baseline")]
     SignerSetMissingBaseline {
-        /// Context-rule identifier for which no baseline exists.
-        rule_id: u32,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         smart_account_redacted: RedactedStrkey,
         /// Per-request correlation identifier (UUIDv4).
@@ -1949,16 +1997,16 @@ pub enum SaError {
     /// The refusal fails closed; the operator must ensure exactly one
     /// recognized policy hash is attached to the rule.
     ///
-    /// `observed_wasm_hashes_summary` carries `count` (number of policies
-    /// observed) and `first_first8` (first 8 bytes of the first observed hash,
-    /// typed `Option<[u8; 8]>`) for forensic correlation without leaking full
-    /// hash preimages.
+    /// `observed_policy_count` is the number of policies attached to the
+    /// rule. The observed policy hashes failed to identify one policy, so
+    /// the error holds none of them, whole or in part.
     ///
     /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
     /// at the call site.
     #[error(
-        "threshold-policy identification failed on rule {rule_id}: \
-         observed {observed_wasm_hashes_summary}"
+        "threshold-policy identification failed on rule {rule_id}: rule must identify \
+         exactly one supported threshold policy (attached policies: \
+         {observed_policy_count})"
     )]
     #[serde(rename = "sa.threshold_policy_identification_failed")]
     ThresholdPolicyIdentificationFailed {
@@ -1966,8 +2014,8 @@ pub enum SaError {
         rule_id: u32,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         smart_account_redacted: RedactedStrkey,
-        /// Summary of observed wasm-hashes for forensic correlation.
-        observed_wasm_hashes_summary: WasmHashSummary,
+        /// Number of policies attached to the rule.
+        observed_policy_count: u32,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
@@ -2011,16 +2059,14 @@ pub enum SaError {
     /// `primary_view_digest_first8` and `secondary_view_digest_first8` carry a
     /// short per-RPC view fingerprint for operator triage.  The exact form is
     /// producer-specific: the storage-view divergence paths emit the first
-    /// 8 hex chars of a SHA-256 digest of the raw view; the WASM-hash fetch
+    /// 8 hex chars of a SHA-256 digest of the raw view; the executable fetch
     /// path (`fetch_observed_executable`, delegating to
-    /// `stellar_agent_network::fetch_contract_wasm_hash`) emits the first
-    /// 8 hex chars of the observed WASM hash itself, the literal sentinel
-    /// `<SAC>` / `<Absent>`, or a bounded external-reference summary (redacted
-    /// owner, bounded tag, resolved first-8) when that side's view is not a
-    /// plain-WASM contract.
-    /// Consumers treat the field as an opaque comparison token; the two sides
-    /// of one error are always produced the same way and are directly
-    /// comparable to each other.
+    /// `stellar_agent_network::fetch_contract_wasm_hash`) refuses both fetched
+    /// outcomes and emits a kind summary that holds no part of a fetched hash:
+    /// `<Wasm>`, `<SAC>`, `<Absent>`, or
+    /// `external-ref(owner=<redacted> tag="<bounded>")`.
+    /// Executable-fetch fields describe kinds; equal summaries can accompany
+    /// different executables.
     ///
     /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
     /// at the call site.
@@ -2039,9 +2085,12 @@ pub enum SaError {
         rule_id: Option<u32>,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         smart_account_redacted: RedactedStrkey,
-        /// First-8 hex chars of the primary RPC's view digest.
+        /// First-8 hex chars of the primary RPC's view digest; an executable
+        /// fetch fills it with the kind summary of the primary outcome.
         primary_view_digest_first8: String,
-        /// First-8 hex chars of the secondary RPC's view digest.
+        /// First-8 hex chars of the secondary RPC's view digest; an
+        /// executable fetch fills it with the kind summary of the secondary
+        /// outcome.
         secondary_view_digest_first8: String,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
@@ -2144,35 +2193,35 @@ pub enum SaError {
 
     /// Verifier wasm hash is allowlisted but flagged as Revoked.
     ///
-    /// Fired at install-time and at `migrate-verifier --to <hash>` destination
-    /// validation when the wasm hash is in `VERIFIER_ALLOWLIST` with
-    /// `VerifierAuditStatus::Revoked { revoked_at, reason }`. Unconditional
-    /// refusal — no opt-in flag overrides a Revoked entry. The operator response
-    /// is `smart-account migrate-verifier` to a non-revoked hash, NOT bypass.
+    /// Refused when signer and rule commands install or refresh a verifier pin,
+    /// when signing under a rule whose pin record pins the hash, and at the
+    /// migration destination check.
+    /// No flag overrides this status. Use `smart-account migrate-verifier` to
+    /// move away from the hash, or authorize a repair through rule `0`.
     ///
     /// # Forensic spine
     ///
     /// `smart_account_redacted` MUST be passed through
     /// `stellar_agent_core::observability::redact_strkey_first5_last5` at the
-    /// call site. `verifier_hash_first8` is the first-8 hex chars of the revoked
-    /// hash. `revoked_reason` is the string from
-    /// `VerifierAuditStatus::Revoked { reason }` — owned because envelope
-    /// serialisation is producer-side.
+    /// call site. `revoked_reason` is the string from
+    /// `VerifierAuditStatus::Revoked { reason }`: owned because envelope
+    /// serialisation is producer-side. The refused hash is named in no field:
+    /// the operator identifies the verifier by the rule and the allowlist.
     #[error(
-        "verifier wasm hash flagged as revoked for rule_id={rule_id}: \
-         hash_first8={verifier_hash_first8}, reason='{revoked_reason}'"
+        "verifier wasm hash flagged as revoked{}: reason='{revoked_reason}'",
+        rule_suffix(.rule_id)
     )]
     #[serde(rename = "sa.verifier_wasm_revoked")]
     VerifierWasmRevoked {
-        /// Context-rule identifier for which the revoked check fired.
-        rule_id: u32,
+        /// Context-rule identifier for which the revoked check fired; `None`
+        /// when no rule exists yet (a rule being created, or the migration
+        /// destination).
+        rule_id: Option<u32>,
         /// Redacted smart-account C-strkey (first-5-last-5).
         ///
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         smart_account_redacted: RedactedStrkey,
-        /// First-8 hex chars of the revoked verifier wasm hash.
-        verifier_hash_first8: String,
         /// Reason string from `VerifierAuditStatus::Revoked { reason }`.
         ///
         /// Owned (not `&'static str`) because envelope serialisation is
@@ -2183,34 +2232,32 @@ pub enum SaError {
         request_id: String,
     },
 
-    /// Verifier wasm hash flagged as Retired — 24-month rotation past Revoked.
+    /// Verifier wasm hash flagged as Retired: 24-month rotation past Revoked.
     ///
-    /// Fired at install-time and at migration-destination time. Unconditional
-    /// refusal — Retired status retains the startup-advisory + install-time gate
-    /// behaviour of Revoked. The long-form revocation reason text is absent from
-    /// `VerifierAuditStatus::Retired`, so this variant carries only the
-    /// audit-status class and hash projection.
+    /// Refused when signer and rule commands install or refresh a verifier pin,
+    /// when signing under a rule whose pin record pins the hash, and at the
+    /// migration destination check.
+    /// No flag overrides this status. Use `smart-account migrate-verifier` to
+    /// move away from the hash, or authorize a repair through rule `0`.
     ///
     /// # Forensic spine
     ///
     /// `smart_account_redacted` MUST be passed through
     /// `stellar_agent_core::observability::redact_strkey_first5_last5` at the
-    /// call site.
-    #[error(
-        "verifier wasm hash flagged as retired for rule_id={rule_id}: \
-         hash_first8={verifier_hash_first8}"
-    )]
+    /// call site. The refused hash is named in no field: the operator
+    /// identifies the verifier by the rule and the allowlist.
+    #[error("verifier wasm hash flagged as retired{}", rule_suffix(.rule_id))]
     #[serde(rename = "sa.verifier_wasm_retired")]
     VerifierWasmRetired {
-        /// Context-rule identifier for which the retired check fired.
-        rule_id: u32,
+        /// Context-rule identifier for which the retired check fired; `None`
+        /// when no rule exists yet (a rule being created, or the migration
+        /// destination).
+        rule_id: Option<u32>,
         /// Redacted smart-account C-strkey (first-5-last-5).
         ///
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         smart_account_redacted: RedactedStrkey,
-        /// First-8 hex chars of the retired verifier wasm hash.
-        verifier_hash_first8: String,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
@@ -2372,24 +2419,15 @@ pub enum SaError {
     ///
     /// # Fields
     ///
-    /// - `attempted` — the SHA-256 that was presented (hex, 64 chars).
     /// - `expected` — the binary const from `MULTICALL_WASM_SHA256` (hex, 64 chars).
-    /// - `existing` — the SHA-256 already in the registry, if any (hex or None).
     #[error(
-        "multicall WASM SHA-256 drift: attempted {attempted} \
-         does not match expected {expected}"
+        "wasm_sha256 must match MULTICALL_WASM_SHA256; verify the router deployment and correct \
+         the registry hash."
     )]
     #[serde(rename = "sa.multicall_sha256_drift")]
     MulticallSha256Drift {
-        /// SHA-256 that was presented at register/lookup/check time (lowercase hex).
-        attempted: String,
         /// The expected binary const from `MULTICALL_WASM_SHA256` (lowercase hex).
         expected: String,
-        /// SHA-256 already stored in the registry for this network, if any.
-        ///
-        /// `None` when there was no pre-existing entry (register-time first conflict).
-        /// `Some(sha)` when an existing entry had a different SHA (re-register drift).
-        existing: Option<String>,
     },
 
     /// No multicall router is registered for the given network safename.
@@ -2440,12 +2478,11 @@ pub enum SaError {
     /// A `Timelock::cancel` call failed.
     ///
     /// `failure_reason` is a typed discriminator identifying the OZ-level cause.
-    /// `operation_id_redacted` carries the first-8-last-8 hex of the operation
-    /// identifier that failed to cancel.
     ///
     /// Wire-code is `sa.timelock_cancel_failed`.
     #[error(
-        "timelock cancel failed ({failure_reason}) for op {operation_id_redacted}: {redacted_reason}"
+        "timelock cancel failed ({failure_reason}): {redacted_reason}; operation_id must identify \
+         a pending scheduled operation"
     )]
     #[serde(rename = "sa.timelock_cancel_failed")]
     TimelockCancelFailed {
@@ -2453,8 +2490,6 @@ pub enum SaError {
         failure_reason: TimelockCancelFailureReason,
         /// Human-readable description with all strkeys pre-redacted.
         redacted_reason: String,
-        /// Redacted operation identifier (first-8-last-8 hex).
-        operation_id_redacted: String,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
@@ -2462,21 +2497,15 @@ pub enum SaError {
     /// A `Timelock::execute` call failed.
     ///
     /// `failure_reason` is a typed discriminator identifying the OZ-level cause.
-    /// `operation_id_redacted` carries the first-8-last-8 hex of the operation
-    /// identifier that failed to execute.
     ///
     /// Wire-code is `sa.timelock_execute_failed`.
-    #[error(
-        "timelock execute failed ({failure_reason}) for op {operation_id_redacted}: {redacted_reason}"
-    )]
+    #[error("timelock execute failed ({failure_reason}): {redacted_reason}")]
     #[serde(rename = "sa.timelock_execute_failed")]
     TimelockExecuteFailed {
         /// Typed discriminator identifying the execute failure sub-cause.
         failure_reason: TimelockExecuteFailureReason,
         /// Human-readable description with all strkeys pre-redacted.
         redacted_reason: String,
-        /// Redacted operation identifier (first-8-last-8 hex).
-        operation_id_redacted: String,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
@@ -2622,7 +2651,7 @@ pub(crate) const ALL_AUTH_ENTRY_STAGES: &[&str] = &[
     "quorum_external_contract_guard",
     "quorum_signatures",
     "ed25519_rule_signer_quorum_guard",
-    "rule_proposal_digest",
+    "rule_definition_snapshot",
     "pin_check_required",
     "migrating_rule_mismatch",
     "multicall_check_undeclared",
@@ -2631,6 +2660,7 @@ pub(crate) const ALL_AUTH_ENTRY_STAGES: &[&str] = &[
     "rule_lock_missing",
     "baseline_read",
     "signer_set_compare",
+    "credential_variant",
 ];
 
 /// Which unresolved-submission condition [`SaError::SubmissionUnresolved`]
@@ -2680,7 +2710,10 @@ pub enum SimulationDivergenceSubCode {
     /// `context_rule_ids` order or membership differs between simulation and
     /// the to-be-submitted envelope.
     ContextRuleIds,
-    /// `auth_contexts` array (per-context invocation list) differs.
+    /// The simulated invocation tree is not the tree the wallet signs: its
+    /// root differs from the host function, its sub-invocations fall outside
+    /// the caller's declaration, or the per-node `auth_contexts`
+    /// fingerprints of the simulated and the signed tree differ.
     AuthContexts,
     /// Network identity (passphrase + ledger-version + chain-id) differs.
     Network,
@@ -2929,13 +2962,7 @@ pub enum TimelockExecuteFailureReason {
     ///
     /// Indicates the user supplied an incorrect hex string for the operation they
     /// intend to execute. The execute call is aborted before submission.
-    OperationIdMismatch {
-        /// The operation_id supplied by the caller (64-char hex).
-        user_supplied: String,
-        /// The authoritative operation_id derived by simulating `hash_operation`
-        /// on-chain (64-char hex).
-        simulate_derived: String,
-    },
+    OperationIdMismatch,
 }
 
 impl std::fmt::Display for TimelockExecuteFailureReason {
@@ -2959,13 +2986,7 @@ impl std::fmt::Display for TimelockExecuteFailureReason {
             Self::EventConfirmationMissing => f.write_str("event_confirmation_missing"),
             Self::Other => f.write_str("other"),
             Self::AuditWriterPoisoned => f.write_str("audit_writer_poisoned"),
-            Self::OperationIdMismatch {
-                user_supplied,
-                simulate_derived,
-            } => write!(
-                f,
-                "operation_id_mismatch(user={user_supplied},derived={simulate_derived})"
-            ),
+            Self::OperationIdMismatch => f.write_str("operation_id_mismatch"),
         }
     }
 }
@@ -3011,12 +3032,18 @@ impl SaError {
     #[must_use]
     pub fn wire_code(&self) -> &'static str {
         match self {
+            Self::TotalEpochUnavailable { .. } => "policy.total_epoch_unavailable",
+            Self::TotalEpochStale => "policy.total_epoch_stale",
+            Self::TotalEpochRetired => "policy.total_epoch_retired",
+            Self::IntentRecordUnavailable { .. } => "submission.intent_record_unavailable",
+            Self::IntentBindingMismatch { .. } => "submission.intent_binding_mismatch",
             Self::ThresholdUnreachable { .. } => "sa.threshold_unreachable",
             Self::VerifierHashDrift { .. } => "sa.verifier_hash_drift",
             Self::PolicyHashDrift { .. } => "sa.policy_hash_drift",
             Self::MultiplePinnedHashesUnsupported { .. } => "sa.multiple_pinned_hashes_unsupported",
             Self::PinnedPolicyAbsent { .. } => "sa.pinned_policy_absent",
             Self::PinnedVerifierAbsent { .. } => "sa.pinned_verifier_absent",
+            Self::WasmPinIncomplete { .. } => "sa.wasm_pin_incomplete",
             Self::PinCheckUnavailable { .. } => "sa.pin_check_unavailable",
             Self::VerifierMutable { .. } => "sa.verifier_mutable",
             Self::PolicyMutable { .. } => "sa.policy_mutable",
@@ -3040,8 +3067,11 @@ impl SaError {
             Self::SubmissionUnresolved { kind, .. } => kind.wire_code(),
             Self::PolicyDenied { reason } => reason.wire_code(),
             Self::MainnetWriteForbidden => "network.mainnet_write_forbidden",
+            Self::LedgerWitnessUnavailable { .. } => "smart_account.ledger_witness_unavailable",
+            Self::LedgerWitnessMismatch { .. } => "simulation.divergence.ledger_skew",
             Self::ScAddressEncodingFailed { .. } => "sa.scaddress_encoding_failed",
             Self::AuthEntryConstructionFailed { .. } => "sa.auth_entry_construction_failed",
+            Self::AuthEntryBindingMismatch { .. } => "sa.auth_entry_binding_mismatch",
             Self::WebAuthnVerifierProvenanceMismatch { .. } => {
                 "sa.webauthn_verifier_provenance_mismatch"
             }
@@ -3155,8 +3185,6 @@ mod tests {
     };
     use stellar_agent_core::audit_log::verify::VerifyError;
 
-    use crate::signers::types::{ThresholdAffectingOp, WasmHashSummary};
-
     use super::*;
 
     /// Asserts that `wire_code()` returns the correct stable string for each variant.
@@ -3171,7 +3199,6 @@ mod tests {
                     rule_id: 1,
                     current_signer_count: 3,
                     current_threshold: 3,
-                    requested_op: ThresholdAffectingOp::RemoveSigner { signer_id: 2 },
                     safe_ordering_hint: "run 'smart-account signers set-threshold --rule-id 1 \
                         --threshold 2' first, then retry remove"
                         .to_owned(),
@@ -3185,9 +3212,7 @@ mod tests {
                     rule_id: 1,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                    pinned_hash_first8: "aabbccdd".to_owned(),
-                    observed_hash_first8: "11223344".to_owned(),
-                    observed_executable: None,
+                    pinned_hash: WasmHashPin::new([0xaa; 32]),
                     request_id: "test-req-drift-001".to_owned(),
                 },
             ),
@@ -3197,9 +3222,7 @@ mod tests {
                     rule_id: 2,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                    pinned_hash_first8: "aabbccdd".to_owned(),
-                    observed_hash_first8: "11223344".to_owned(),
-                    observed_executable: None,
+                    pinned_hash: WasmHashPin::new([0xaa; 32]),
                     request_id: "test-req-drift-002".to_owned(),
                 },
             ),
@@ -3208,9 +3231,6 @@ mod tests {
                 SaError::VerifierMutable {
                     rule_id: Some(3),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    contract_address_redacted: RedactedStrkey::from_already_redacted(
-                        "CBBBB...YYYYY",
-                    ),
                     admin_or_owner_key: AdminOrOwnerKey::Admin,
                     detail: None,
                     request_id: "test-req-mut-001".to_owned(),
@@ -3221,9 +3241,6 @@ mod tests {
                 SaError::PolicyMutable {
                     rule_id: Some(4),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    contract_address_redacted: RedactedStrkey::from_already_redacted(
-                        "CBBBB...YYYYY",
-                    ),
                     admin_or_owner_key: AdminOrOwnerKey::Owner,
                     detail: None,
                     request_id: "test-req-mut-002".to_owned(),
@@ -3235,9 +3252,6 @@ mod tests {
                     rule_id: Some(4),
                     contract_kind: ContractKind::Verifier,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    contract_address_redacted: RedactedStrkey::from_already_redacted(
-                        "CBBBB...YYYYY",
-                    ),
                     reason: AdminOrOwnerKey::NonWasmExecutable,
                     request_id: "test-req-unsupported-001".to_owned(),
                 },
@@ -3271,6 +3285,14 @@ mod tests {
                 },
             ),
             (
+                "sa.wasm_pin_incomplete",
+                SaError::WasmPinIncomplete {
+                    rule_id: 7,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    request_id: "test-req-pin-incomplete-001".to_owned(),
+                },
+            ),
+            (
                 "sa.pin_check_unavailable",
                 SaError::PinCheckUnavailable {
                     rule_id: 7,
@@ -3284,7 +3306,6 @@ mod tests {
                 SaError::VerifierWasmNotInAllowlist {
                     rule_id: Some(5),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    observed_hash_first8: "deadbeef".to_owned(),
                     request_id: "test-req-allow-001".to_owned(),
                 },
             ),
@@ -3293,7 +3314,6 @@ mod tests {
                 SaError::PolicyWasmNotInAllowlist {
                     rule_id: Some(6),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    observed_hash_first8: "cafebabe".to_owned(),
                     request_id: "test-req-allow-002".to_owned(),
                 },
             ),
@@ -3423,6 +3443,12 @@ mod tests {
                 },
             ),
             (
+                "sa.auth_entry_binding_mismatch",
+                SaError::AuthEntryBindingMismatch {
+                    field: "auth_digest",
+                },
+            ),
+            (
                 "sa.webauthn_assertion_invalid:wrong_type",
                 SaError::WebAuthnAssertionInvalid {
                     reason: WebAuthnInvalidReason::WrongType,
@@ -3487,7 +3513,6 @@ mod tests {
                 "sa.webauthn_verifier_sha256_drift",
                 SaError::WebAuthnVerifierSha256Drift {
                     network: "Test SDF Network ; September 2015".to_owned(),
-                    recorded: "abc".to_owned(),
                     attempted: "def".to_owned(),
                 },
             ),
@@ -3502,7 +3527,6 @@ mod tests {
                 "sa.ed25519_verifier_sha256_drift",
                 SaError::Ed25519VerifierSha256Drift {
                     network: "Test SDF Network ; September 2015".to_owned(),
-                    recorded: "abc".to_owned(),
                     attempted: "def".to_owned(),
                 },
             ),
@@ -3517,7 +3541,6 @@ mod tests {
                 "sa.spending_limit_policy_sha256_drift",
                 SaError::SpendingLimitPolicySha256Drift {
                     network: "Test SDF Network ; September 2015".to_owned(),
-                    recorded: "abc".to_owned(),
                     attempted: "def".to_owned(),
                 },
             ),
@@ -3540,10 +3563,7 @@ mod tests {
                 SaError::SpendingLimitPolicyIdentificationFailed {
                     rule_id: 1,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    observed_wasm_hashes_summary: WasmHashSummary {
-                        count: 2,
-                        first_first8: Some([0xabu8; 8]),
-                    },
+                    observed_policy_count: 2,
                     request_id: "test-req-sl-002".to_owned(),
                 },
             ),
@@ -3570,7 +3590,6 @@ mod tests {
                 "sa.simple_threshold_policy_sha256_drift",
                 SaError::SimpleThresholdPolicySha256Drift {
                     network: "Test SDF Network ; September 2015".to_owned(),
-                    recorded: "abc".to_owned(),
                     attempted: "def".to_owned(),
                 },
             ),
@@ -3585,7 +3604,6 @@ mod tests {
                 "sa.weighted_threshold_policy_sha256_drift",
                 SaError::WeightedThresholdPolicySha256Drift {
                     network: "Test SDF Network ; September 2015".to_owned(),
-                    recorded: "abc".to_owned(),
                     attempted: "def".to_owned(),
                 },
             ),
@@ -3602,10 +3620,7 @@ mod tests {
                 SaError::WeightedThresholdPolicyIdentificationFailed {
                     rule_id: 1,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    observed_wasm_hashes_summary: WasmHashSummary {
-                        count: 2,
-                        first_first8: Some([0xabu8; 8]),
-                    },
+                    observed_policy_count: 2,
                     request_id: "test-req-wt-002".to_owned(),
                 },
             ),
@@ -3619,7 +3634,6 @@ mod tests {
                 "sa.networks_toml_io",
                 SaError::NetworksTomlIo {
                     source: io::Error::other("mock io error"),
-                    path: PathBuf::from("/mock/path"),
                 },
             ),
             (
@@ -3632,7 +3646,7 @@ mod tests {
             (
                 "sa.networks_toml_parse",
                 SaError::NetworksTomlParse {
-                    source: toml::from_str::<toml::Value>("invalid = ").unwrap_err(),
+                    position: "line 1, column 11".to_owned(),
                     path: PathBuf::from("/mock/path"),
                 },
             ),
@@ -3676,9 +3690,8 @@ mod tests {
             (
                 "sa.verifier_wasm_revoked",
                 SaError::VerifierWasmRevoked {
-                    rule_id: 2,
+                    rule_id: Some(2),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    verifier_hash_first8: "cafebabe".to_owned(),
                     revoked_reason: "critical vulnerability in signature verification".to_owned(),
                     request_id: "req-rev-001".to_owned(),
                 },
@@ -3686,9 +3699,8 @@ mod tests {
             (
                 "sa.verifier_wasm_retired",
                 SaError::VerifierWasmRetired {
-                    rule_id: 3,
+                    rule_id: Some(3),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    verifier_hash_first8: "11223344".to_owned(),
                     request_id: "req-ret-001".to_owned(),
                 },
             ),
@@ -3744,9 +3756,7 @@ mod tests {
             (
                 "sa.multicall_sha256_drift",
                 SaError::MulticallSha256Drift {
-                    attempted: "aabbccdd".to_owned(),
                     expected: "267e94a0".to_owned(),
-                    existing: None,
                 },
             ),
             (
@@ -3769,7 +3779,6 @@ mod tests {
                 SaError::TimelockCancelFailed {
                     failure_reason: TimelockCancelFailureReason::SimulationFailed,
                     redacted_reason: "simulate returned error".to_owned(),
-                    operation_id_redacted: "deadbeef...cafebabe".to_owned(),
                     request_id: "test-req-tl-cancel-001".to_owned(),
                 },
             ),
@@ -3778,7 +3787,6 @@ mod tests {
                 SaError::TimelockExecuteFailed {
                     failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                     redacted_reason: "simulate returned error".to_owned(),
-                    operation_id_redacted: "deadbeef...cafebabe".to_owned(),
                     request_id: "test-req-tl-exec-001".to_owned(),
                 },
             ),
@@ -3801,6 +3809,15 @@ mod tests {
                 "network.mainnet_write_forbidden",
                 SaError::MainnetWriteForbidden,
             ),
+            // Ledger witness refusals.
+            (
+                "smart_account.ledger_witness_unavailable",
+                SaError::LedgerWitnessUnavailable { reason: "fixed" },
+            ),
+            (
+                "simulation.divergence.ledger_skew",
+                SaError::LedgerWitnessMismatch { reason: "fixed" },
+            ),
         ];
 
         for (expected_code, err) in cases {
@@ -3809,6 +3826,25 @@ mod tests {
                 *expected_code,
                 "wire_code mismatch for variant: {err:?}"
             );
+        }
+    }
+
+    /// A witness refusal serialises under its code with its fixed reason.
+    #[test]
+    fn a_witness_refusal_serialises_under_its_wire_code() {
+        for (error, code) in [
+            (
+                SaError::LedgerWitnessUnavailable { reason: "fixed" },
+                "smart_account.ledger_witness_unavailable",
+            ),
+            (
+                SaError::LedgerWitnessMismatch { reason: "fixed" },
+                "simulation.divergence.ledger_skew",
+            ),
+        ] {
+            let value = serde_json::to_value(&error).unwrap();
+            assert_eq!(value["wire_code"], code, "{value}");
+            assert!(error.to_string().contains("fixed"), "{error}");
         }
     }
 
@@ -3851,7 +3887,6 @@ mod tests {
                     rule_id: 1,
                     current_signer_count: 3,
                     current_threshold: 3,
-                    requested_op: ThresholdAffectingOp::RemoveSigner { signer_id: 2 },
                     safe_ordering_hint: "run set-threshold first, then retry remove".to_owned(),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     request_id: "test-req-001".to_owned(),
@@ -3860,7 +3895,6 @@ mod tests {
                     "rule_id",
                     "current_signer_count",
                     "current_threshold",
-                    "requested_op",
                     "safe_ordering_hint",
                     "smart_account_redacted",
                     "request_id",
@@ -3872,17 +3906,14 @@ mod tests {
                     rule_id: 1,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                    pinned_hash_first8: "aabbccdd".to_owned(),
-                    observed_hash_first8: "11223344".to_owned(),
-                    observed_executable: None,
+                    pinned_hash: WasmHashPin::new([0xaa; 32]),
                     request_id: "test-req-drift-001".to_owned(),
                 },
                 &[
                     "rule_id",
                     "smart_account_redacted",
                     "deploy_address_redacted",
-                    "pinned_hash_first8",
-                    "observed_hash_first8",
+                    "pinned_hash",
                     "request_id",
                 ],
             ),
@@ -3892,17 +3923,14 @@ mod tests {
                     rule_id: 2,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                    pinned_hash_first8: "aabbccdd".to_owned(),
-                    observed_hash_first8: "11223344".to_owned(),
-                    observed_executable: None,
+                    pinned_hash: WasmHashPin::new([0xaa; 32]),
                     request_id: "test-req-drift-002".to_owned(),
                 },
                 &[
                     "rule_id",
                     "smart_account_redacted",
                     "deploy_address_redacted",
-                    "pinned_hash_first8",
-                    "observed_hash_first8",
+                    "pinned_hash",
                     "request_id",
                 ],
             ),
@@ -3911,9 +3939,6 @@ mod tests {
                 SaError::VerifierMutable {
                     rule_id: Some(3),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    contract_address_redacted: RedactedStrkey::from_already_redacted(
-                        "CBBBB...YYYYY",
-                    ),
                     admin_or_owner_key: AdminOrOwnerKey::Admin,
                     detail: None,
                     request_id: "test-req-mut-001".to_owned(),
@@ -3921,7 +3946,6 @@ mod tests {
                 &[
                     "rule_id",
                     "smart_account_redacted",
-                    "contract_address_redacted",
                     "admin_or_owner_key",
                     "request_id",
                 ],
@@ -3931,9 +3955,6 @@ mod tests {
                 SaError::PolicyMutable {
                     rule_id: Some(4),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    contract_address_redacted: RedactedStrkey::from_already_redacted(
-                        "CBBBB...YYYYY",
-                    ),
                     admin_or_owner_key: AdminOrOwnerKey::Owner,
                     detail: None,
                     request_id: "test-req-mut-002".to_owned(),
@@ -3941,50 +3962,7 @@ mod tests {
                 &[
                     "rule_id",
                     "smart_account_redacted",
-                    "contract_address_redacted",
                     "admin_or_owner_key",
-                    "request_id",
-                ],
-            ),
-            (
-                "sa.verifier_hash_drift",
-                SaError::VerifierHashDrift {
-                    rule_id: 1,
-                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                    pinned_hash_first8: "aabbccdd00112233".to_owned(),
-                    observed_hash_first8: "aabbccdd00112233".to_owned(),
-                    observed_executable: Some("wasm".to_owned()),
-                    request_id: "test-req-drift-003".to_owned(),
-                },
-                &[
-                    "rule_id",
-                    "smart_account_redacted",
-                    "deploy_address_redacted",
-                    "pinned_hash_first8",
-                    "observed_hash_first8",
-                    "observed_executable",
-                    "request_id",
-                ],
-            ),
-            (
-                "sa.policy_hash_drift",
-                SaError::PolicyHashDrift {
-                    rule_id: 2,
-                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                    pinned_hash_first8: "aabbccdd00112233".to_owned(),
-                    observed_hash_first8: "0000000000000000".to_owned(),
-                    observed_executable: Some("no code".to_owned()),
-                    request_id: "test-req-drift-004".to_owned(),
-                },
-                &[
-                    "rule_id",
-                    "smart_account_redacted",
-                    "deploy_address_redacted",
-                    "pinned_hash_first8",
-                    "observed_hash_first8",
-                    "observed_executable",
                     "request_id",
                 ],
             ),
@@ -3993,9 +3971,6 @@ mod tests {
                 SaError::VerifierMutable {
                     rule_id: Some(3),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    contract_address_redacted: RedactedStrkey::from_already_redacted(
-                        "CBBBB...YYYYY",
-                    ),
                     admin_or_owner_key: AdminOrOwnerKey::ExternalRefExecutable,
                     detail: Some("owner GAAAA...AAWHF, tag \"v1\"".to_owned()),
                     request_id: "test-req-mut-003".to_owned(),
@@ -4003,7 +3978,6 @@ mod tests {
                 &[
                     "rule_id",
                     "smart_account_redacted",
-                    "contract_address_redacted",
                     "admin_or_owner_key",
                     "detail",
                     "request_id",
@@ -4014,9 +3988,6 @@ mod tests {
                 SaError::PolicyMutable {
                     rule_id: Some(4),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    contract_address_redacted: RedactedStrkey::from_already_redacted(
-                        "CBBBB...YYYYY",
-                    ),
                     admin_or_owner_key: AdminOrOwnerKey::Owner,
                     detail: Some("GCCCC...CCCCC".to_owned()),
                     request_id: "test-req-mut-004".to_owned(),
@@ -4024,7 +3995,6 @@ mod tests {
                 &[
                     "rule_id",
                     "smart_account_redacted",
-                    "contract_address_redacted",
                     "admin_or_owner_key",
                     "detail",
                     "request_id",
@@ -4036,9 +4006,6 @@ mod tests {
                     rule_id: Some(4),
                     contract_kind: ContractKind::Policy,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    contract_address_redacted: RedactedStrkey::from_already_redacted(
-                        "CBBBB...YYYYY",
-                    ),
                     reason: AdminOrOwnerKey::UndecodableInstance,
                     request_id: "test-req-unsupported-002".to_owned(),
                 },
@@ -4046,7 +4013,6 @@ mod tests {
                     "rule_id",
                     "contract_kind",
                     "smart_account_redacted",
-                    "contract_address_redacted",
                     "reason",
                     "request_id",
                 ],
@@ -4099,6 +4065,15 @@ mod tests {
                 ],
             ),
             (
+                "sa.wasm_pin_incomplete",
+                SaError::WasmPinIncomplete {
+                    rule_id: 77,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    request_id: "test-req-pin-incomplete-002".to_owned(),
+                },
+                &["rule_id", "smart_account_redacted", "request_id"],
+            ),
+            (
                 "sa.pin_check_unavailable",
                 SaError::PinCheckUnavailable {
                     rule_id: 77,
@@ -4113,30 +4088,18 @@ mod tests {
                 SaError::VerifierWasmNotInAllowlist {
                     rule_id: Some(5),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    observed_hash_first8: "deadbeef".to_owned(),
                     request_id: "test-req-allow-001".to_owned(),
                 },
-                &[
-                    "rule_id",
-                    "smart_account_redacted",
-                    "observed_hash_first8",
-                    "request_id",
-                ],
+                &["rule_id", "smart_account_redacted", "request_id"],
             ),
             (
                 "sa.policy_wasm_not_in_allowlist",
                 SaError::PolicyWasmNotInAllowlist {
                     rule_id: Some(6),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    observed_hash_first8: "cafebabe".to_owned(),
                     request_id: "test-req-allow-002".to_owned(),
                 },
-                &[
-                    "rule_id",
-                    "smart_account_redacted",
-                    "observed_hash_first8",
-                    "request_id",
-                ],
+                &["rule_id", "smart_account_redacted", "request_id"],
             ),
             (
                 "sa.rule_id_mismatch",
@@ -4297,6 +4260,13 @@ mod tests {
                 &["stage", "redacted_reason"],
             ),
             (
+                "sa.auth_entry_binding_mismatch",
+                SaError::AuthEntryBindingMismatch {
+                    field: "network_id",
+                },
+                &["field"],
+            ),
+            (
                 "sa.webauthn_assertion_invalid",
                 SaError::WebAuthnAssertionInvalid {
                     reason: WebAuthnInvalidReason::WrongType,
@@ -4315,10 +4285,9 @@ mod tests {
                 "sa.webauthn_verifier_sha256_drift",
                 SaError::WebAuthnVerifierSha256Drift {
                     network: "Test SDF Network ; September 2015".to_owned(),
-                    recorded: "abc".to_owned(),
                     attempted: "def".to_owned(),
                 },
-                &["network", "recorded", "attempted"],
+                &["network", "attempted"],
             ),
             (
                 "sa.ed25519_verifier_provenance_mismatch",
@@ -4332,10 +4301,9 @@ mod tests {
                 "sa.ed25519_verifier_sha256_drift",
                 SaError::Ed25519VerifierSha256Drift {
                     network: "Test SDF Network ; September 2015".to_owned(),
-                    recorded: "abc".to_owned(),
                     attempted: "def".to_owned(),
                 },
-                &["network", "recorded", "attempted"],
+                &["network", "attempted"],
             ),
             (
                 "sa.spending_limit_policy_provenance_mismatch",
@@ -4349,10 +4317,9 @@ mod tests {
                 "sa.spending_limit_policy_sha256_drift",
                 SaError::SpendingLimitPolicySha256Drift {
                     network: "Test SDF Network ; September 2015".to_owned(),
-                    recorded: "abc".to_owned(),
                     attempted: "def".to_owned(),
                 },
-                &["network", "recorded", "attempted"],
+                &["network", "attempted"],
             ),
             (
                 "sa.spending_limit_install_refused",
@@ -4375,16 +4342,13 @@ mod tests {
                 SaError::SpendingLimitPolicyIdentificationFailed {
                     rule_id: 1,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    observed_wasm_hashes_summary: WasmHashSummary {
-                        count: 2,
-                        first_first8: Some([0xabu8; 8]),
-                    },
+                    observed_policy_count: 2,
                     request_id: "test-req-sl-002".to_owned(),
                 },
                 &[
                     "rule_id",
                     "smart_account_redacted",
-                    "observed_wasm_hashes_summary",
+                    "observed_policy_count",
                     "request_id",
                 ],
             ),
@@ -4414,10 +4378,9 @@ mod tests {
                 "sa.simple_threshold_policy_sha256_drift",
                 SaError::SimpleThresholdPolicySha256Drift {
                     network: "Test SDF Network ; September 2015".to_owned(),
-                    recorded: "abc".to_owned(),
                     attempted: "def".to_owned(),
                 },
-                &["network", "recorded", "attempted"],
+                &["network", "attempted"],
             ),
             (
                 "sa.weighted_threshold_policy_provenance_mismatch",
@@ -4431,10 +4394,9 @@ mod tests {
                 "sa.weighted_threshold_policy_sha256_drift",
                 SaError::WeightedThresholdPolicySha256Drift {
                     network: "Test SDF Network ; September 2015".to_owned(),
-                    recorded: "abc".to_owned(),
                     attempted: "def".to_owned(),
                 },
-                &["network", "recorded", "attempted"],
+                &["network", "attempted"],
             ),
             (
                 "sa.weighted_threshold_not_installed",
@@ -4450,16 +4412,13 @@ mod tests {
                 SaError::WeightedThresholdPolicyIdentificationFailed {
                     rule_id: 1,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    observed_wasm_hashes_summary: WasmHashSummary {
-                        count: 2,
-                        first_first8: Some([0xabu8; 8]),
-                    },
+                    observed_policy_count: 2,
                     request_id: "test-req-wt-002".to_owned(),
                 },
                 &[
                     "rule_id",
                     "smart_account_redacted",
-                    "observed_wasm_hashes_summary",
+                    "observed_policy_count",
                     "request_id",
                 ],
             ),
@@ -4474,9 +4433,8 @@ mod tests {
                 "sa.networks_toml_io",
                 SaError::NetworksTomlIo {
                     source: io::Error::other("mock io error"),
-                    path: PathBuf::from("/mock/path"),
                 },
-                &["source", "path"],
+                &["source"],
             ),
             (
                 "sa.audit_writer_io",
@@ -4489,10 +4447,10 @@ mod tests {
             (
                 "sa.networks_toml_parse",
                 SaError::NetworksTomlParse {
-                    source: toml::from_str::<toml::Value>("invalid = ").unwrap_err(),
+                    position: "line 1, column 11".to_owned(),
                     path: PathBuf::from("/mock/path"),
                 },
-                &["source", "path"],
+                &["position", "path"],
             ),
             (
                 "sa.threshold_read_failed",
@@ -4530,16 +4488,14 @@ mod tests {
             (
                 "sa.verifier_wasm_revoked",
                 SaError::VerifierWasmRevoked {
-                    rule_id: 2,
+                    rule_id: Some(2),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    verifier_hash_first8: "cafebabe".to_owned(),
                     revoked_reason: "critical vulnerability in signature verification".to_owned(),
                     request_id: "req-rev-001".to_owned(),
                 },
                 &[
                     "rule_id",
                     "smart_account_redacted",
-                    "verifier_hash_first8",
                     "revoked_reason",
                     "request_id",
                 ],
@@ -4547,17 +4503,11 @@ mod tests {
             (
                 "sa.verifier_wasm_retired",
                 SaError::VerifierWasmRetired {
-                    rule_id: 3,
+                    rule_id: Some(3),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                    verifier_hash_first8: "11223344".to_owned(),
                     request_id: "req-ret-001".to_owned(),
                 },
-                &[
-                    "rule_id",
-                    "smart_account_redacted",
-                    "verifier_hash_first8",
-                    "request_id",
-                ],
+                &["rule_id", "smart_account_redacted", "request_id"],
             ),
             (
                 "sa.verifier_migration_failed",
@@ -4617,11 +4567,9 @@ mod tests {
             (
                 "sa.multicall_sha256_drift",
                 SaError::MulticallSha256Drift {
-                    attempted: "aabbccdd".to_owned(),
                     expected: "267e94a0".to_owned(),
-                    existing: Some("deadbeef".to_owned()),
                 },
-                &["attempted", "expected", "existing"],
+                &["expected"],
             ),
             (
                 "sa.multicall_registry_entry_not_found",
@@ -4662,7 +4610,7 @@ mod tests {
         }
     }
 
-    /// `detail`, `observed_executable` and the optional `rule_id` are omitted
+    /// `detail` and the optional `rule_id` are omitted
     /// from the context when `None` and serialised when `Some`; a present
     /// detail is appended to the Display in parentheses and a present rule id
     /// as ` for rule <id>`.
@@ -4671,18 +4619,8 @@ mod tests {
         let mutable = |detail: Option<&str>| SaError::VerifierMutable {
             rule_id: Some(3),
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
             admin_or_owner_key: AdminOrOwnerKey::ExternalRefExecutable,
             detail: detail.map(ToOwned::to_owned),
-            request_id: "req".to_owned(),
-        };
-        let drift = |observed: Option<&str>| SaError::PolicyHashDrift {
-            rule_id: 2,
-            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-            pinned_hash_first8: "1111111111111111".to_owned(),
-            observed_hash_first8: "1111111111111111".to_owned(),
-            observed_executable: observed.map(ToOwned::to_owned),
             request_id: "req".to_owned(),
         };
 
@@ -4690,42 +4628,22 @@ mod tests {
         assert!(without["context"].get("detail").is_none(), "{without}");
         assert_eq!(
             mutable(None).to_string(),
-            "verifier contract is mutable for rule 3: contract=CBBBB...YYYYY, \
-             reason=owner-managed external reference; --accept-mutable-verifier is required"
+            "verifier address must identify an immutable contract; use \
+             --accept-mutable-verifier only when you accept that its code can change."
         );
         let detail = "owner GAAAA...AAWHF, tag \"v1\"";
         let with = serde_json::to_value(mutable(Some(detail))).unwrap();
         assert_eq!(with["context"]["detail"], detail);
         assert_eq!(
             mutable(Some(detail)).to_string(),
-            "verifier contract is mutable for rule 3: contract=CBBBB...YYYYY, \
-             reason=owner-managed external reference (owner GAAAA...AAWHF, tag \"v1\"); \
-             --accept-mutable-verifier is required"
-        );
-
-        let without = serde_json::to_value(drift(None)).unwrap();
-        assert!(
-            without["context"].get("observed_executable").is_none(),
-            "{without}"
-        );
-        assert_eq!(
-            drift(None).to_string(),
-            "policy wasm-hash drift detected for rule 2: \
-             pinned=1111111111111111, observed=1111111111111111"
-        );
-        let with = serde_json::to_value(drift(Some("wasm"))).unwrap();
-        assert_eq!(with["context"]["observed_executable"], "wasm");
-        assert_eq!(
-            drift(Some("wasm")).to_string(),
-            "policy wasm-hash drift detected for rule 2: \
-             pinned=1111111111111111, observed=1111111111111111 (wasm)"
+            "verifier address must identify an immutable contract; use \
+             --accept-mutable-verifier only when you accept that its code can change."
         );
 
         // The optional rule id of the pre-install refusals.
         let verifier_mutable = |rule_id: Option<u32>| SaError::VerifierMutable {
             rule_id,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
             admin_or_owner_key: AdminOrOwnerKey::Admin,
             detail: None,
             request_id: "req".to_owned(),
@@ -4733,7 +4651,6 @@ mod tests {
         let policy_mutable = |rule_id: Option<u32>| SaError::PolicyMutable {
             rule_id,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
             admin_or_owner_key: AdminOrOwnerKey::Owner,
             detail: None,
             request_id: "req".to_owned(),
@@ -4742,20 +4659,17 @@ mod tests {
             rule_id,
             contract_kind: ContractKind::Policy,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
             reason: AdminOrOwnerKey::UndecodableInstance,
             request_id: "req".to_owned(),
         };
         let verifier_not_allowlisted = |rule_id: Option<u32>| SaError::VerifierWasmNotInAllowlist {
             rule_id,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            observed_hash_first8: "deadbeef".to_owned(),
             request_id: "req".to_owned(),
         };
         let policy_not_allowlisted = |rule_id: Option<u32>| SaError::PolicyWasmNotInAllowlist {
             rule_id,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            observed_hash_first8: "cafebabe".to_owned(),
             request_id: "req".to_owned(),
         };
         let rpc_divergence = |rule_id: Option<u32>| SaError::NetworkRpcDivergence {
@@ -4770,39 +4684,38 @@ mod tests {
         let cases: [RuleIdCase; 6] = [
             (
                 verifier_mutable,
-                "verifier contract is mutable: contract=CBBBB...YYYYY, reason=Admin; \
-                 --accept-mutable-verifier is required",
-                "verifier contract is mutable for rule 7: contract=CBBBB...YYYYY, \
-                 reason=Admin; --accept-mutable-verifier is required",
+                "verifier address must identify an immutable contract; use \
+                 --accept-mutable-verifier only when you accept that its code can change.",
+                "verifier address must identify an immutable contract; use \
+                 --accept-mutable-verifier only when you accept that its code can change.",
             ),
             (
                 policy_mutable,
-                "policy contract is mutable: contract=CBBBB...YYYYY, reason=Owner; \
-                 --accept-mutable-verifier is required",
-                "policy contract is mutable for rule 7: contract=CBBBB...YYYYY, \
-                 reason=Owner; --accept-mutable-verifier is required",
+                "policy address must identify an immutable contract; use \
+                 --accept-mutable-verifier only when you accept that its code can change.",
+                "policy address must identify an immutable contract; use \
+                 --accept-mutable-verifier only when you accept that its code can change.",
             ),
             (
                 unsupported,
-                "policy contract instance is unsupported: contract=CBBBB...YYYYY, \
-                 reason=undecodable instance; the wallet cannot pin this contract's code",
-                "policy contract instance is unsupported for rule 7: \
-                 contract=CBBBB...YYYYY, reason=undecodable instance; \
-                 the wallet cannot pin this contract's code",
+                "verifier or policy address must identify a deployed contract with a supported, \
+                 resolvable Wasm executable; repair the deployment or select another contract.",
+                "verifier or policy address must identify a deployed contract with a supported, \
+                 resolvable Wasm executable; repair the deployment or select another contract.",
             ),
             (
                 verifier_not_allowlisted,
-                "verifier wasm hash not in VERIFIER_ALLOWLIST: observed=deadbeef; \
-                 --accept-unknown-verifier is required",
-                "verifier wasm hash not in VERIFIER_ALLOWLIST for rule 7: observed=deadbeef; \
-                 --accept-unknown-verifier is required",
+                "verifier wasm hash must be in VERIFIER_ALLOWLIST; \
+                 --accept-unknown-verifier is required for a hash outside it",
+                "verifier wasm hash must be in VERIFIER_ALLOWLIST for rule 7; \
+                 --accept-unknown-verifier is required for a hash outside it",
             ),
             (
                 policy_not_allowlisted,
-                "policy wasm hash is not a policy Wasm the wallet vendors: observed=cafebabe; \
-                 --accept-unknown-verifier is required",
-                "policy wasm hash is not a policy Wasm the wallet vendors for rule 7: \
-                 observed=cafebabe; --accept-unknown-verifier is required",
+                "policy wasm hash must be the hash of a policy Wasm the wallet vendors; \
+                 --accept-unknown-verifier is required for another hash",
+                "policy wasm hash must be the hash of a policy Wasm the wallet vendors for \
+                 rule 7; --accept-unknown-verifier is required for another hash",
             ),
             (
                 rpc_divergence,
@@ -4887,6 +4800,84 @@ mod tests {
         );
     }
 
+    /// The incomplete-pin refusal names the rule, states that nothing was
+    /// signed and names the recovery.
+    #[test]
+    fn wasm_pin_incomplete_display_names_the_rule_and_the_recovery() {
+        let err = SaError::WasmPinIncomplete {
+            rule_id: 3,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            request_id: "req".to_owned(),
+        };
+        assert_eq!(err.wire_code(), "sa.wasm_pin_incomplete");
+        assert_eq!(
+            err.to_string(),
+            "rule 3 has a pin record of eight-byte hash prefixes, which cannot authenticate \
+             the code it pins; nothing was signed. Review the intended full hashes and \
+             reinstall the rule under an independently authorized rule such as rule 0"
+        );
+    }
+
+    /// The drift refusals name the rule and the full pinned hash and hold no
+    /// part of the observed executable: the Display is the fixed text and the
+    /// serialized context has exactly the rule, the two redacted addresses,
+    /// the pin and the request id.
+    #[test]
+    fn drift_errors_name_the_full_pin_and_hold_no_observed_executable() {
+        let pinned = [0x42u8; 32];
+        let full = hex::encode(pinned);
+        let cases = [
+            (
+                SaError::VerifierHashDrift {
+                    rule_id: 1,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+                    pinned_hash: WasmHashPin::new(pinned),
+                    request_id: "req".to_owned(),
+                },
+                format!(
+                    "verifier executable must match the pinned executable for rule 1: \
+                     pinned={full}"
+                ),
+            ),
+            (
+                SaError::PolicyHashDrift {
+                    rule_id: 1,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+                    pinned_hash: WasmHashPin::new(pinned),
+                    request_id: "req".to_owned(),
+                },
+                format!(
+                    "policy executable must match the pinned executable for rule 1: \
+                     pinned={full}"
+                ),
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
+            let value = serde_json::to_value(&err).unwrap();
+            assert_eq!(value["context"]["pinned_hash"], full);
+            let mut keys: Vec<&str> = value["context"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "deploy_address_redacted",
+                    "pinned_hash",
+                    "request_id",
+                    "rule_id",
+                    "smart_account_redacted"
+                ]
+            );
+        }
+    }
+
     /// The pin-check reason leads with the inner wire code, carries the
     /// inner Display, and is capped at `PIN_CHECK_REASON_MAX_BYTES`.
     #[test]
@@ -4933,7 +4924,6 @@ mod tests {
                 rule_id: 1,
                 current_signer_count: 3,
                 current_threshold: 3,
-                requested_op: ThresholdAffectingOp::RemoveSigner { signer_id: 2 },
                 safe_ordering_hint: "run set-threshold first, then retry remove".to_owned(),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 request_id: "test-req-001".to_owned(),
@@ -4942,18 +4932,14 @@ mod tests {
                 rule_id: 1,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                pinned_hash_first8: "aabbccdd".to_owned(),
-                observed_hash_first8: "11223344".to_owned(),
-                observed_executable: None,
+                pinned_hash: WasmHashPin::new([0xaa; 32]),
                 request_id: "test-req-drift-001".to_owned(),
             },
             SaError::PolicyHashDrift {
                 rule_id: 2,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                pinned_hash_first8: "aabbccdd".to_owned(),
-                observed_hash_first8: "11223344".to_owned(),
-                observed_executable: None,
+                pinned_hash: WasmHashPin::new([0xaa; 32]),
                 request_id: "test-req-drift-002".to_owned(),
             },
             SaError::MultiplePinnedHashesUnsupported {
@@ -4975,6 +4961,11 @@ mod tests {
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 request_id: "test-req-verifier-absent-003".to_owned(),
             },
+            SaError::WasmPinIncomplete {
+                rule_id: 88,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                request_id: "test-req-pin-incomplete-003".to_owned(),
+            },
             SaError::PinCheckUnavailable {
                 rule_id: 88,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
@@ -4984,7 +4975,6 @@ mod tests {
             SaError::VerifierMutable {
                 rule_id: Some(3),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                 admin_or_owner_key: AdminOrOwnerKey::Admin,
                 detail: None,
                 request_id: "test-req-mut-001".to_owned(),
@@ -4992,7 +4982,6 @@ mod tests {
             SaError::PolicyMutable {
                 rule_id: Some(4),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                 admin_or_owner_key: AdminOrOwnerKey::Owner,
                 detail: None,
                 request_id: "test-req-mut-002".to_owned(),
@@ -5001,20 +4990,17 @@ mod tests {
                 rule_id: Some(4),
                 contract_kind: ContractKind::Verifier,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                contract_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                 reason: AdminOrOwnerKey::UndecodableInstance,
                 request_id: "test-req-unsupported-001".to_owned(),
             },
             SaError::VerifierWasmNotInAllowlist {
                 rule_id: Some(5),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                observed_hash_first8: "deadbeef".to_owned(),
                 request_id: "test-req-allow-001".to_owned(),
             },
             SaError::PolicyWasmNotInAllowlist {
                 rule_id: Some(6),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                observed_hash_first8: "cafebabe".to_owned(),
                 request_id: "test-req-allow-002".to_owned(),
             },
             SaError::RuleIdMismatch {
@@ -5087,6 +5073,9 @@ mod tests {
                 stage: "context_rule_ids",
                 redacted_reason: "context_rule_ids XDR encode failed before signing".to_owned(),
             },
+            SaError::AuthEntryBindingMismatch {
+                field: "signature_payload",
+            },
             SaError::WebAuthnAssertionInvalid {
                 reason: WebAuthnInvalidReason::WrongType,
             },
@@ -5120,7 +5109,6 @@ mod tests {
             },
             SaError::WebAuthnVerifierSha256Drift {
                 network: "Test SDF Network ; September 2015".to_owned(),
-                recorded: "abc".to_owned(),
                 attempted: "def".to_owned(),
             },
             SaError::Ed25519VerifierProvenanceMismatch {
@@ -5129,7 +5117,6 @@ mod tests {
             },
             SaError::Ed25519VerifierSha256Drift {
                 network: "Test SDF Network ; September 2015".to_owned(),
-                recorded: "abc".to_owned(),
                 attempted: "def".to_owned(),
             },
             SaError::SpendingLimitPolicyProvenanceMismatch {
@@ -5138,7 +5125,6 @@ mod tests {
             },
             SaError::SpendingLimitPolicySha256Drift {
                 network: "Test SDF Network ; September 2015".to_owned(),
-                recorded: "abc".to_owned(),
                 attempted: "def".to_owned(),
             },
             SaError::SpendingLimitInstallRefused {
@@ -5152,10 +5138,7 @@ mod tests {
             SaError::SpendingLimitPolicyIdentificationFailed {
                 rule_id: 1,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                observed_wasm_hashes_summary: WasmHashSummary {
-                    count: 2,
-                    first_first8: Some([0xabu8; 8]),
-                },
+                observed_policy_count: 2,
                 request_id: "test-req-sl-002".to_owned(),
             },
             SaError::SimpleThresholdInstallRefused {
@@ -5170,7 +5153,6 @@ mod tests {
             },
             SaError::SimpleThresholdPolicySha256Drift {
                 network: "Test SDF Network ; September 2015".to_owned(),
-                recorded: "abc".to_owned(),
                 attempted: "def".to_owned(),
             },
             SaError::WeightedThresholdPolicyProvenanceMismatch {
@@ -5179,7 +5161,6 @@ mod tests {
             },
             SaError::WeightedThresholdPolicySha256Drift {
                 network: "Test SDF Network ; September 2015".to_owned(),
-                recorded: "abc".to_owned(),
                 attempted: "def".to_owned(),
             },
             SaError::WeightedThresholdNotInstalled {
@@ -5190,10 +5171,7 @@ mod tests {
             SaError::WeightedThresholdPolicyIdentificationFailed {
                 rule_id: 1,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                observed_wasm_hashes_summary: WasmHashSummary {
-                    count: 2,
-                    first_first8: Some([0xabu8; 8]),
-                },
+                observed_policy_count: 2,
                 request_id: "test-req-wt-002".to_owned(),
             },
             SaError::BatchSignerAddRefused {
@@ -5201,14 +5179,13 @@ mod tests {
             },
             SaError::NetworksTomlIo {
                 source: io::Error::other("mock io error"),
-                path: PathBuf::from("/mock/path"),
             },
             SaError::AuditWriterIo {
                 detail: "mock io error".to_owned(),
                 path: PathBuf::from("/mock/path/audit/default.jsonl"),
             },
             SaError::NetworksTomlParse {
-                source: toml::from_str::<toml::Value>("invalid = ").unwrap_err(),
+                position: "line 1, column 11".to_owned(),
                 path: PathBuf::from("/mock/path"),
             },
             SaError::ThresholdPolicyNotInstalled {
@@ -5217,7 +5194,6 @@ mod tests {
                 request_id: "test-req-002".to_owned(),
             },
             SaError::SignerSetMissingBaseline {
-                rule_id: 2,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 request_id: "test-req-003".to_owned(),
             },
@@ -5248,10 +5224,7 @@ mod tests {
             SaError::ThresholdPolicyIdentificationFailed {
                 rule_id: 3,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                observed_wasm_hashes_summary: WasmHashSummary {
-                    count: 1,
-                    first_first8: Some([0xabu8; 8]),
-                },
+                observed_policy_count: 1,
                 request_id: "test-req-004".to_owned(),
             },
             SaError::NetworkRpcDivergence {
@@ -5281,16 +5254,14 @@ mod tests {
                 request_id: "req-div-req-001".to_owned(),
             },
             SaError::VerifierWasmRevoked {
-                rule_id: 2,
+                rule_id: Some(2),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                verifier_hash_first8: "cafebabe".to_owned(),
                 revoked_reason: "critical vulnerability in signature verification".to_owned(),
                 request_id: "req-rev-001".to_owned(),
             },
             SaError::VerifierWasmRetired {
-                rule_id: 3,
+                rule_id: Some(3),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                verifier_hash_first8: "11223344".to_owned(),
                 request_id: "req-ret-001".to_owned(),
             },
             SaError::VerifierMigrationFailed {
@@ -5320,9 +5291,7 @@ mod tests {
                 post_submit_kind: None,
             },
             SaError::MulticallSha256Drift {
-                attempted: "aabbccdd".to_owned(),
                 expected: "267e94a0".to_owned(),
-                existing: None,
             },
             SaError::MulticallRegistryEntryNotFound {
                 network_safename: "test-sdf-network---september-2015".to_owned(),
@@ -5336,13 +5305,11 @@ mod tests {
             SaError::TimelockCancelFailed {
                 failure_reason: TimelockCancelFailureReason::OperationNotScheduled,
                 redacted_reason: "operation not found on-chain".to_owned(),
-                operation_id_redacted: "deadbeef...cafebabe".to_owned(),
                 request_id: "test-req-tl-cancel-001".to_owned(),
             },
             SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::InvalidOperationState,
                 redacted_reason: "operation already executed".to_owned(),
-                operation_id_redacted: "deadbeef...cafebabe".to_owned(),
                 request_id: "test-req-tl-exec-001".to_owned(),
             },
             // list_pending RPC failure.
@@ -5355,6 +5322,8 @@ mod tests {
             },
             // Canonical mainnet refusal.
             SaError::MainnetWriteForbidden,
+            SaError::LedgerWitnessUnavailable { reason: "fixed" },
+            SaError::LedgerWitnessMismatch { reason: "fixed" },
         ];
 
         // Verify each variant's wire_code matches the exhaustive closed set.
@@ -5365,6 +5334,7 @@ mod tests {
             "sa.multiple_pinned_hashes_unsupported",
             "sa.pinned_policy_absent",
             "sa.pinned_verifier_absent",
+            "sa.wasm_pin_incomplete",
             "sa.pin_check_unavailable",
             "sa.verifier_mutable",
             "sa.policy_mutable",
@@ -5383,6 +5353,7 @@ mod tests {
             "sa.deployment_failed",
             "sa.scaddress_encoding_failed",
             "sa.auth_entry_construction_failed",
+            "sa.auth_entry_binding_mismatch",
             "sa.webauthn_assertion_invalid:wrong_type",
             "sa.webauthn_assertion_invalid:challenge_mismatch",
             "sa.webauthn_assertion_invalid:wrong_rp_id",
@@ -5447,6 +5418,9 @@ mod tests {
             "sa.auth_mismatch",
             // Canonical mainnet refusal.
             "network.mainnet_write_forbidden",
+            // Ledger witness refusals.
+            "smart_account.ledger_witness_unavailable",
+            "simulation.divergence.ledger_skew",
         ];
 
         assert_eq!(
@@ -5468,7 +5442,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 80, "closed set must have exactly 80 wire codes");
+        assert_eq!(seen.len(), 84, "closed set must have exactly 84 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.
@@ -5554,6 +5528,7 @@ mod tests {
         "owner-managed external reference",
         "external reference with no live tag entry",
         "executable changed during install",
+        "no Wasm code",
     ];
 
     #[test]
@@ -5566,6 +5541,7 @@ mod tests {
             AdminOrOwnerKey::ExternalRefExecutable,
             AdminOrOwnerKey::ExternalRefUnresolved,
             AdminOrOwnerKey::ExecutableChanged,
+            AdminOrOwnerKey::NoWasmCode,
         ]
         .iter()
         .map(std::string::ToString::to_string)
@@ -5577,6 +5553,14 @@ mod tests {
         assert_eq!(
             rendered, expected,
             "mutability reason Display output must match the emitted reason set"
+        );
+        assert_eq!(
+            serde_json::to_value(AdminOrOwnerKey::NoWasmCode).unwrap(),
+            "NoWasmCode"
+        );
+        assert_eq!(
+            serde_json::from_str::<AdminOrOwnerKey>(r#""NoWasmCode""#).unwrap(),
+            AdminOrOwnerKey::NoWasmCode
         );
     }
 
@@ -5591,6 +5575,7 @@ mod tests {
         assert!(AdminOrOwnerKey::NonWasmExecutable.is_unpinnable_instance());
         assert!(AdminOrOwnerKey::ExternalRefUnresolved.is_unpinnable_instance());
         assert!(AdminOrOwnerKey::ExecutableChanged.is_unpinnable_instance());
+        assert!(AdminOrOwnerKey::NoWasmCode.is_unpinnable_instance());
     }
 
     /// Verifies that every `stage: "<literal>"` emit site in the crate's
@@ -5747,12 +5732,12 @@ mod tests {
             stray_literals.join("\n")
         );
 
-        // Also assert that ALL_AUTH_ENTRY_STAGES has the expected 17 entries
+        // Also assert that ALL_AUTH_ENTRY_STAGES has the expected 18 entries
         // so a silent truncation of the const is caught.
         assert_eq!(
             ALL_AUTH_ENTRY_STAGES.len(),
-            17,
-            "ALL_AUTH_ENTRY_STAGES must contain exactly 17 entries"
+            18,
+            "ALL_AUTH_ENTRY_STAGES must contain exactly 18 entries"
         );
     }
 
@@ -6044,7 +6029,6 @@ mod tests {
     #[test]
     fn signer_set_missing_baseline_round_trip() {
         let err = SaError::SignerSetMissingBaseline {
-            rule_id: 3,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
             request_id: "req-def".to_owned(),
         };
@@ -6177,10 +6161,7 @@ mod tests {
         let err = SaError::ThresholdPolicyIdentificationFailed {
             rule_id: 2,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            observed_wasm_hashes_summary: WasmHashSummary {
-                count: 2,
-                first_first8: Some([0x11u8; 8]),
-            },
+            observed_policy_count: 2,
             request_id: "req-ghi".to_owned(),
         };
         assert_eq!(err.wire_code(), "sa.threshold_policy_identification_failed");
@@ -6219,10 +6200,7 @@ mod tests {
         let err = SaError::SpendingLimitPolicyIdentificationFailed {
             rule_id: 2,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            observed_wasm_hashes_summary: WasmHashSummary {
-                count: 2,
-                first_first8: Some([0x11u8; 8]),
-            },
+            observed_policy_count: 2,
             request_id: "req-sl-002".to_owned(),
         };
         assert_eq!(
@@ -6264,10 +6242,7 @@ mod tests {
         let err = SaError::WeightedThresholdPolicyIdentificationFailed {
             rule_id: 2,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            observed_wasm_hashes_summary: WasmHashSummary {
-                count: 2,
-                first_first8: Some([0x11u8; 8]),
-            },
+            observed_policy_count: 2,
             request_id: "req-wt-002".to_owned(),
         };
         assert_eq!(
@@ -6280,6 +6255,67 @@ mod tests {
             value.get("wire_code").and_then(|v| v.as_str()),
             Some("sa.weighted_threshold_policy_identification_failed")
         );
+    }
+
+    /// The policy identification refusals state the check and the number of
+    /// attached policies, and serialize the count as the only field beside
+    /// the rule, the redacted account and the request id.
+    #[test]
+    fn policy_identification_errors_state_the_check_and_the_count() {
+        let account = || RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ");
+        let cases = [
+            (
+                SaError::ThresholdPolicyIdentificationFailed {
+                    rule_id: 2,
+                    smart_account_redacted: account(),
+                    observed_policy_count: 3,
+                    request_id: "req".to_owned(),
+                },
+                "threshold-policy identification failed on rule 2: rule must identify exactly \
+                 one supported threshold policy (attached policies: 3)",
+            ),
+            (
+                SaError::SpendingLimitPolicyIdentificationFailed {
+                    rule_id: 2,
+                    smart_account_redacted: account(),
+                    observed_policy_count: 3,
+                    request_id: "req".to_owned(),
+                },
+                "spending-limit-policy identification failed on rule 2: rule must identify \
+                 exactly one supported spending-limit policy (attached policies: 3)",
+            ),
+            (
+                SaError::WeightedThresholdPolicyIdentificationFailed {
+                    rule_id: 2,
+                    smart_account_redacted: account(),
+                    observed_policy_count: 3,
+                    request_id: "req".to_owned(),
+                },
+                "weighted-threshold-policy identification failed on rule 2: rule must identify \
+                 exactly one supported weighted-threshold policy (attached policies: 3)",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
+            let value = serde_json::to_value(&err).unwrap();
+            assert_eq!(value["context"]["observed_policy_count"], 3);
+            let mut keys: Vec<&str> = value["context"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "observed_policy_count",
+                    "request_id",
+                    "rule_id",
+                    "smart_account_redacted"
+                ]
+            );
+        }
     }
 
     /// Verifies that a `NetworkRpcDivergence` error round-trips via serde
@@ -6345,7 +6381,6 @@ mod tests {
 
         // Also verify via InvalidVerifierContract path.
         let inner2 = stellar_agent_core::audit_log::signer_set::SignerSetCanonicalBodyError::InvalidVerifierContract {
-            strkey: "not_a_valid_cstrkey".to_owned(),
             source: stellar_strkey::Contract::from_string("not_a_valid_cstrkey").unwrap_err(),
         };
         let err2: SaError = inner2.into();
@@ -6417,13 +6452,17 @@ mod tests {
     #[test]
     fn verifier_wasm_revoked_round_trip() {
         let err = SaError::VerifierWasmRevoked {
-            rule_id: 2,
+            rule_id: Some(2),
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            verifier_hash_first8: "cafebabe".to_owned(),
             revoked_reason: "critical vulnerability in signature verification".to_owned(),
             request_id: "req-rev-rt-001".to_owned(),
         };
         assert_eq!(err.wire_code(), "sa.verifier_wasm_revoked");
+        assert_eq!(
+            err.to_string(),
+            "verifier wasm hash flagged as revoked for rule 2: \
+             reason='critical vulnerability in signature verification'"
+        );
         let json = serde_json::to_string(&err).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
@@ -6440,6 +6479,10 @@ mod tests {
             Some("critical vulnerability in signature verification"),
             "revoked_reason must round-trip: {json}"
         );
+        assert!(
+            ctx.get("verifier_hash_first8").is_none(),
+            "the refused hash is named in no field: {json}"
+        );
     }
 
     /// Verifies that `VerifierWasmRetired` round-trips via serde and has the
@@ -6447,12 +6490,15 @@ mod tests {
     #[test]
     fn verifier_wasm_retired_round_trip() {
         let err = SaError::VerifierWasmRetired {
-            rule_id: 3,
+            rule_id: Some(3),
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            verifier_hash_first8: "11223344".to_owned(),
             request_id: "req-ret-rt-001".to_owned(),
         };
         assert_eq!(err.wire_code(), "sa.verifier_wasm_retired");
+        assert_eq!(
+            err.to_string(),
+            "verifier wasm hash flagged as retired for rule 3"
+        );
         let json = serde_json::to_string(&err).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
@@ -6462,7 +6508,11 @@ mod tests {
         );
         let ctx = value.get("context").unwrap();
         assert_eq!(ctx.get("rule_id").and_then(|v| v.as_u64()), Some(3));
-        assert!(ctx.get("verifier_hash_first8").is_some());
+        assert!(ctx.get("smart_account_redacted").is_some());
+        assert!(
+            ctx.get("verifier_hash_first8").is_none(),
+            "the refused hash is named in no field: {json}"
+        );
     }
 
     /// Verifies that `VerifierMigrationFailed` round-trips via serde and has

@@ -1,9 +1,12 @@
-//! Every value verb settles what stands open before its own policy gate.
+//! Every value verb runs the bounded reconciliation pass before its own
+//! policy gate.
 //!
 //! A submission whose outcome never came back holds a spending-window
-//! reservation, and that reservation counts against the operator's caps until
-//! something settles it. The bounded pass is what settles it without the
-//! operator asking, so a value verb that skips it lets a stale hold shrink
+//! reservation when the policy produced window entries for it. That
+//! reservation counts against the operator's caps through its accounting
+//! horizon or, without a time bound, until an operator clears it. The bounded pass is what expires a time-bounded one at its
+//! horizon without the operator asking, so a value verb that skips it lets a
+//! stale hold shrink
 //! every later action's headroom. Two public documents state the rule for
 //! every value verb, so the scan is what keeps the statement true.
 //!
@@ -22,20 +25,22 @@
 
 /// The value verbs and the source that has to call the pass.
 ///
-/// `pay` and `claim` carry two pipelines each (the full one and
-/// `--submit-only`), which the occurrence count covers.
+/// `pay` and `claim` carry three pipelines each (the full one,
+/// `--submit-only` and the mainnet one), and `trustline` and sponsored
+/// `accounts create` two each (the full one and the mainnet one), which the
+/// occurrence count covers.
 const VALUE_VERB_SOURCES: &[(&str, &str, usize)] = &[
-    ("pay", include_str!("../../src/commands/pay.rs"), 2),
-    ("claim", include_str!("../../src/commands/claim.rs"), 2),
+    ("pay", include_str!("../../src/commands/pay.rs"), 3),
+    ("claim", include_str!("../../src/commands/claim.rs"), 3),
     (
         "trustline",
         include_str!("../../src/commands/trustline.rs"),
-        1,
+        2,
     ),
     (
         "accounts create",
         include_str!("../../src/commands/accounts/create.rs"),
-        1,
+        2,
     ),
     ("trade", include_str!("../../src/commands/trade.rs"), 1),
     ("vault", include_str!("../../src/commands/vault.rs"), 2),

@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::submit::{SubmitInvokeArgs, submit_signed_invoke};
+use stellar_agent_test_support::second_loopback_host;
 use stellar_xdr::{ContractId, Hash, HostFunction, InvokeContractArgs, ScAddress, ScSymbol, VecM};
 use wiremock::{
     Mock, MockServer,
@@ -59,25 +60,31 @@ struct AllZeroPubkeySigner;
 impl stellar_agent_network::signing::Signer for AllZeroPubkeySigner {
     async fn sign_tx_payload(
         &self,
-        _: &[u8; 32],
+        _: &stellar_agent_network::signing::TxSigningPayload,
     ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
         unimplemented!("not exercised before the simulate short-circuit")
     }
     async fn sign_auth_digest(
         &self,
-        _: &[u8; 32],
+        _: &stellar_agent_network::signing::SmartAccountAuthDigest,
     ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
         unimplemented!("not exercised before the simulate short-circuit")
     }
     async fn sign_soroban_address_auth_payload(
         &self,
-        _: &[u8; 32],
+        _: &stellar_agent_network::signing::SorobanAuthPayload,
+    ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
+        unimplemented!("not exercised before the simulate short-circuit")
+    }
+    async fn sign_message(
+        &self,
+        _: &stellar_agent_network::signing::MessagePayload,
     ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
         unimplemented!("not exercised before the simulate short-circuit")
     }
     async fn sign_webauthn_assertion(
         &self,
-        _: &[u8; 32],
+        _: &stellar_agent_network::signing::SmartAccountAuthDigest,
         _: &[u8],
     ) -> Result<stellar_agent_network::WebAuthnAssertion, stellar_agent_core::error::WalletError>
     {
@@ -126,7 +133,9 @@ fn dummy_host_function() -> HostFunction {
 /// returns promptly right after the fetch, without needing a full
 /// simulate/auth/submit success fixture.
 #[tokio::test]
+#[serial_test::serial]
 async fn initial_fetch_consults_the_sequence_floor_hook() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let ledger_resp = build_ledger_entries_account(SOURCE_G);
     let simulate_error = serde_json::json!({
@@ -145,11 +154,15 @@ async fn initial_fetch_consults_the_sequence_floor_hook() {
 
     let result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(DUMMY_C_STRKEY)
             .auth_rule_ids(&auth_rule_ids)
             .host_function(dummy_host_function())
             .signer(&signer)
             .primary_rpc_url(server.uri().as_str())
+            .secondary_rpc_url(second_loopback_host(&server.uri()).as_str())
             .network_passphrase(NETWORK_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(std::time::Duration::from_secs(10))
@@ -184,7 +197,9 @@ async fn initial_fetch_consults_the_sequence_floor_hook() {
 /// paths) reproduces the identical error and consults no hook — the
 /// back-compat default.
 #[tokio::test]
+#[serial_test::serial]
 async fn no_hook_reproduces_plain_fetch_behaviour() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let ledger_resp = build_ledger_entries_account(SOURCE_G);
     let simulate_error = serde_json::json!({
@@ -202,11 +217,15 @@ async fn no_hook_reproduces_plain_fetch_behaviour() {
 
     let result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(DUMMY_C_STRKEY)
             .auth_rule_ids(&auth_rule_ids)
             .host_function(dummy_host_function())
             .signer(&signer)
             .primary_rpc_url(server.uri().as_str())
+            .secondary_rpc_url(second_loopback_host(&server.uri()).as_str())
             .network_passphrase(NETWORK_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(std::time::Duration::from_secs(10))

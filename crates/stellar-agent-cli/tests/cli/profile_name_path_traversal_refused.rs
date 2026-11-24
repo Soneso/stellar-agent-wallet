@@ -25,15 +25,16 @@
     reason = "test-only; refusal is asserted via panic-on-violation"
 )]
 
-use std::process::Command;
-
 use serde_json::Value;
 
 /// Runs `stellar-agent profile show --profile <name>` and returns
 /// `(exit_code, parsed_stdout_json)`.
 fn run_show(profile: &str) -> (i32, Value) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
-    let output = Command::new(bin_path)
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture directory");
+    let output = stellar_agent_test_support::cli_child::cli_command(bin_path, home.path())
+        .expect("isolated CLI child")
+        .env("STELLAR_AGENT_HOME", home.path())
         .args(["profile", "show", "--profile", profile])
         // Never touch the login keychain: the refusal happens before any
         // keyring access, and this keeps the subprocess hermetic regardless.
@@ -91,7 +92,9 @@ fn an_ordinary_missing_name_is_still_reported_as_not_found() {
 /// the loader guard never runs for them; these pin their call-site guards.
 fn run_approve(subcommand: &str, profile: &str) -> (i32, Value) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
-    let output = Command::new(bin_path)
+    let child_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().expect("sandbox");
+    let output = stellar_agent_test_support::cli_child::cli_command(bin_path, child_sandbox.path())
+        .expect("isolated CLI child")
         .args(["approve", subcommand, "--profile", profile])
         .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
         .env(

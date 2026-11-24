@@ -1,0 +1,29 @@
+{
+  "test_kind": "sequence",
+  "name": "unlisted_explicit_deny",
+  "category": "extended_grammar",
+  "description": "unlisted = { mode = \"deny\" } refuses an unlisted recipient with exactly the refusal of a table-less allowlist (unlisted_default_deny).",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": {
+        "kind": "Deny",
+        "deny_reason": "counterparty_denied",
+        "wire_code": "policy.deny.counterparty_denied",
+        "reason": { "CounterpartyDenied": { "kind": "G_ACCOUNT", "value": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" } }
+      }
+    }
+  ]
+}

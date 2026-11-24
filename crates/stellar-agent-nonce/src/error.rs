@@ -36,12 +36,12 @@ use stellar_agent_core::error::AuthError;
 pub enum NonceError {
     /// The HMAC tag on the nonce does not match the recomputed tag.
     ///
-    /// Causes: wrong envelope_xdr, wrong tool_name, wrong chain_id, a process
-    /// restart (boot_nonce changed), or key rotation since mint time.
+    /// Causes: a wrong envelope_xdr, expiry or tool_name, a changed salt or
+    /// tag, a process restart (boot_nonce changed), or key rotation since mint
+    /// time.
     ///
-    /// Map to `nonce.expired` when the salt is fresh to the replay window
-    /// (indicating a post-restart verification); map to `nonce.hmac_mismatch`
-    /// otherwise.
+    /// Wire code: `nonce.expired`, indistinguishable from `Expired` regardless
+    /// of replay-window state.
     #[error("nonce HMAC tag does not match")]
     HmacMismatch,
 
@@ -51,7 +51,8 @@ pub enum NonceError {
     #[error("nonce has expired")]
     Expired,
 
-    /// The nonce salt has already been seen in the replay window.
+    /// The full 48-byte nonce (salt and tag) is already present in the replay
+    /// window.
     ///
     /// Wire code: `nonce.replayed`.
     #[error("nonce has already been used (replay detected)")]
@@ -60,14 +61,10 @@ pub enum NonceError {
     /// The `tool_name` argument is not in the registered tool catalogue.
     ///
     /// Tool validation happens before engaging key state.
-    /// The `tool` field is non-secret (it is the caller-supplied tool string).
     ///
     /// Wire code: `tool.unknown`.
-    #[error("tool not registered: {tool}")]
-    InvalidTool {
-        /// The unregistered tool name supplied by the caller.
-        tool: String,
-    },
+    #[error("tool_name must name a registered tool")]
+    InvalidTool,
 
     /// The `envelope_xdr` slice is empty or cannot be hashed.
     ///
@@ -78,16 +75,13 @@ pub enum NonceError {
     /// The caller-supplied `chain_id` does not match the profile's configured
     /// CAIP-2 chain identifier.
     ///
-    /// CAIP-2 strings (`stellar:testnet`, `stellar:mainnet`) are
-    /// non-secret public identifiers.
+    /// The text names the configured chain and never the caller's value.
     ///
     /// Wire code: `nonce.chain_mismatch`.
-    #[error("chain_id mismatch: expected {expected}, got {got}")]
+    #[error("chain_id must match the configured profile chain; expected {expected}")]
     ChainMismatch {
         /// The chain_id configured in the profile.
         expected: String,
-        /// The chain_id supplied by the caller.
-        got: String,
     },
 
     /// The requested TTL (`expiry_unix_ms - now_unix_ms`) exceeds the profile's
@@ -228,7 +222,7 @@ impl NonceError {
             // from the agent's perspective; do NOT distinguish them via the wire
             // code.  The underlying reason is logged at tracing::debug! only.
             NonceError::Expired | NonceError::HmacMismatch => "nonce.expired",
-            NonceError::InvalidTool { .. } => "tool.unknown",
+            NonceError::InvalidTool => "tool.unknown",
             NonceError::InvalidEnvelope => "nonce.invalid_envelope",
             NonceError::ChainMismatch { .. } => "nonce.chain_mismatch",
             NonceError::TtlExceeded { .. } => "nonce.ttl_exceeded",
@@ -274,13 +268,7 @@ mod tests {
 
     #[test]
     fn wire_code_invalid_tool() {
-        assert_eq!(
-            NonceError::InvalidTool {
-                tool: "bogus".to_owned()
-            }
-            .wire_code(),
-            "tool.unknown"
-        );
+        assert_eq!(NonceError::InvalidTool.wire_code(), "tool.unknown");
     }
 
     #[test]
@@ -296,7 +284,6 @@ mod tests {
         assert_eq!(
             NonceError::ChainMismatch {
                 expected: "stellar:testnet".to_owned(),
-                got: "stellar:mainnet".to_owned(),
             }
             .wire_code(),
             "nonce.chain_mismatch"
@@ -332,7 +319,7 @@ mod tests {
         use stellar_agent_core::error::AuthError;
         assert_eq!(
             NonceError::KeyringError(AuthError::KeyringNotFound {
-                name: "nonce-key".to_owned()
+                cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry
             })
             .wire_code(),
             "keyring.error"
@@ -391,13 +378,10 @@ mod tests {
             NonceError::HmacMismatch,
             NonceError::Expired,
             NonceError::Replayed,
-            NonceError::InvalidTool {
-                tool: "stellar_pay".to_owned(),
-            },
+            NonceError::InvalidTool,
             NonceError::InvalidEnvelope,
             NonceError::ChainMismatch {
                 expected: "stellar:testnet".to_owned(),
-                got: "stellar:mainnet".to_owned(),
             },
             NonceError::TtlExceeded {
                 max_ms: 300_000,
@@ -408,7 +392,7 @@ mod tests {
                 requested_ms: 1_000,
             },
             NonceError::KeyringError(AuthError::KeyringNotFound {
-                name: "stellar-agent-nonce-test".to_owned(),
+                cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
             }),
             NonceError::KeyTooShort { actual: 10 },
             NonceError::InputTooLong {

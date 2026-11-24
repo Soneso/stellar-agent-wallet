@@ -83,9 +83,11 @@ use crate::error::{
 };
 use crate::managers::credentials::AuditWriterPoisonContext;
 use crate::managers::rules::{
-    BASE_FEE_STROOPS, augment_with_oz_error_name, parse_c_strkey_to_smart_account,
+    BASE_FEE_STROOPS, augment_with_oz_error_name, parse_c_strkey_to_smart_account, refusal_text,
 };
+use crate::signing::ledger_witness::checked_secondary_rpc_url;
 use crate::submit::refuse_mainnet_sa;
+use crate::timelock_submit::TimelockSubmitFailure;
 
 // ── OZ Timelock error codes ───────────────────────────────────────────────────
 // Referenced as `OzTimelockError::Variant as u32`.
@@ -239,6 +241,8 @@ pub struct PendingTimelockOperation {
 #[derive(bon::Builder)]
 #[non_exhaustive]
 pub struct TimelockScheduleArgs<'a> {
+    /// Charges the intent before its first signature.
+    pub submission_recorder: &'a dyn stellar_agent_network::SubmissionRecorder,
     /// C-strkey of the timelock controller contract.
     pub timelock_contract_strkey: &'a str,
     /// C-strkey of the target contract to invoke when the operation executes.
@@ -257,10 +261,11 @@ pub struct TimelockScheduleArgs<'a> {
     pub signer: &'a (dyn Signer + Send + Sync),
     /// Primary Soroban RPC URL (simulate + submit).
     pub primary_rpc_url: &'a str,
-    /// Secondary Soroban RPC URL for `cross_confirm_event` dual-RPC defence.
+    /// Secondary Soroban RPC URL: the ledger witness of the signature and the
+    /// second endpoint of `cross_confirm_event`.
     ///
-    /// Use the same URL as `primary_rpc_url` to disable divergence detection.
-    /// A warning is emitted at INFO level when primary and secondary are equal.
+    /// Must be on a host other than the primary's and serve the same
+    /// network; signing refuses otherwise.
     pub secondary_rpc_url: &'a str,
     /// Stellar network passphrase.
     pub network_passphrase: &'a str,
@@ -276,6 +281,8 @@ pub struct TimelockScheduleArgs<'a> {
 #[derive(bon::Builder)]
 #[non_exhaustive]
 pub struct TimelockCancelArgs<'a> {
+    /// Charges the intent before its first signature.
+    pub intent_admission: &'a stellar_agent_network::NoValueAdmission,
     /// C-strkey of the timelock controller contract.
     pub timelock_contract_strkey: &'a str,
     /// The operation identifier to cancel (must be in `Pending` state).
@@ -284,7 +291,11 @@ pub struct TimelockCancelArgs<'a> {
     pub signer: &'a (dyn Signer + Send + Sync),
     /// Primary Soroban RPC URL (simulate + submit).
     pub primary_rpc_url: &'a str,
-    /// Secondary Soroban RPC URL for `cross_confirm_event` dual-RPC defence.
+    /// Secondary Soroban RPC URL: the ledger witness of the signature and the
+    /// second endpoint of `cross_confirm_event`.
+    ///
+    /// Must be on a host other than the primary's and serve the same
+    /// network; signing refuses otherwise.
     pub secondary_rpc_url: &'a str,
     /// Stellar network passphrase.
     pub network_passphrase: &'a str,
@@ -318,7 +329,11 @@ pub struct TimelockExecuteArgs<'a> {
     pub signer: &'a (dyn Signer + Send + Sync),
     /// Primary Soroban RPC URL (simulate + submit).
     pub primary_rpc_url: &'a str,
-    /// Secondary Soroban RPC URL for cross-RPC state pre-check + event confirm.
+    /// Secondary Soroban RPC URL: the ledger witness of the signature, the
+    /// cross-RPC state pre-check and the event confirmation.
+    ///
+    /// Must be on a host other than the primary's and serve the same
+    /// network; signing refuses otherwise.
     pub secondary_rpc_url: &'a str,
     /// Stellar network passphrase.
     pub network_passphrase: &'a str,
@@ -334,7 +349,7 @@ pub struct TimelockExecuteArgs<'a> {
     /// ID is available; state check is deferred to after hash derivation.
     pub expected_operation_id: Option<&'a TimelockOperationId>,
     /// Records an execution's signed transaction and settles its outcome.
-    pub submission_recorder: Option<&'a dyn stellar_agent_network::SubmissionRecorder>,
+    pub submission_recorder: &'a dyn stellar_agent_network::SubmissionRecorder,
 }
 
 // ── Salt derivation ───────────────────────────────────────────────────────────
@@ -454,40 +469,77 @@ fn classify_execute_error(sim_error: &str) -> TimelockExecuteFailureReason {
 
 // ── Submission error mappers ─────────────────────────────────────────────────
 
+/// Whether a refusal raised before anything was signed keeps its own wire code
+/// through every timelock mapper. Pre-signing refusals retain their wire codes
+/// across timelock verbs so operators receive the same actionable reason.
+fn keeps_its_wire_code(e: &SaError) -> bool {
+    matches!(
+        e,
+        SaError::MainnetWriteForbidden
+            | SaError::TotalEpochUnavailable { .. }
+            | SaError::TotalEpochStale
+            | SaError::TotalEpochRetired
+            | SaError::PolicyDenied { .. }
+            | SaError::IntentRecordUnavailable { .. }
+            | SaError::IntentBindingMismatch { .. }
+            | SaError::LedgerWitnessUnavailable { .. }
+            | SaError::LedgerWitnessMismatch { .. }
+    )
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub(crate) fn total_intent_error_routes(error: &stellar_agent_core::WalletError) -> Vec<SaError> {
+    let mapped = || crate::submit::map_admission_error(error, "intent-total");
+    vec![
+        schedule_submit_error(mapped(), "検証-é"),
+        cancel_submit_error(mapped(), "検証-é"),
+        execute_submit_error(mapped(), "検証-é"),
+    ]
+}
+
 /// Maps a failure of the `schedule` submission into the schedule error surface.
 ///
-/// [`SaError::MainnetWriteForbidden`] passes through unchanged and keeps the
-/// canonical code. Every other error becomes
-/// [`SaError::TimelockScheduleFailed`], classified from its text.
-fn schedule_submit_error(e: SaError, request_id: &str) -> SaError {
-    if matches!(e, SaError::MainnetWriteForbidden) {
-        return e;
+/// Mainnet, policy, intent, and ledger witness refusals keep their codes.
+/// Every other error becomes
+/// [`SaError::TimelockScheduleFailed`], classified from its text error.
+fn schedule_submit_error(e: impl Into<TimelockSubmitFailure>, request_id: &str) -> SaError {
+    let f = e.into();
+    if keeps_its_wire_code(f.text_error()) {
+        return f.into_shown();
     }
 
-    let reason = format!("{e}");
+    let reason = format!("{}", f.text_error());
     let classified = classify_schedule_error(&reason);
     SaError::TimelockScheduleFailed {
         failure_reason: classified,
-        redacted_reason: augment_with_oz_error_name(&reason),
+        redacted_reason: shown_reason(f, &reason),
         request_id: request_id.to_owned(),
+    }
+}
+
+/// The reason a timelock failure shows: the shown error's rendering
+/// unchanged when the failure is described, and the text error's rendering
+/// `reason` with its OZ name otherwise.
+fn shown_reason(f: TimelockSubmitFailure, reason: &str) -> String {
+    if f.is_described() {
+        format!("{}", f.into_shown())
+    } else {
+        augment_with_oz_error_name(reason)
     }
 }
 
 /// Maps a failure of the `cancel` submission into the cancel error surface.
 ///
-/// [`SaError::MainnetWriteForbidden`] passes through unchanged and keeps the
-/// canonical code. Every other error becomes [`SaError::TimelockCancelFailed`],
-/// classified from its text.
-fn cancel_submit_error(
-    e: SaError,
-    operation_id: &TimelockOperationId,
-    request_id: &str,
-) -> SaError {
-    if matches!(e, SaError::MainnetWriteForbidden) {
-        return e;
+/// Mainnet, policy, intent, and ledger witness refusals keep their codes.
+/// Every other error becomes
+/// [`SaError::TimelockCancelFailed`], classified from its text error.
+fn cancel_submit_error(e: impl Into<TimelockSubmitFailure>, request_id: &str) -> SaError {
+    let f = e.into();
+    if keeps_its_wire_code(f.text_error()) {
+        return f.into_shown();
     }
 
-    let reason = format!("{e}");
+    let reason = format!("{}", f.text_error());
     let classified = classify_cancel_error(&reason);
     // OZ `cancel_operation` fires `InvalidOperationState` (4002) for any
     // non-pending op (including never-scheduled ones). Code 4006
@@ -496,35 +548,29 @@ fn cancel_submit_error(
     // `classify_cancel_error` which extracts the OZ code internally.
     SaError::TimelockCancelFailed {
         failure_reason: classified,
-        redacted_reason: augment_with_oz_error_name(&reason),
-        operation_id_redacted: operation_id.redacted(),
+        redacted_reason: shown_reason(f, &reason),
         request_id: request_id.to_owned(),
     }
 }
 
 /// Maps a failure of the `execute` submission into the execute error surface.
 ///
-/// [`SaError::SubmissionUnresolved`] and [`SaError::MainnetWriteForbidden`]
-/// pass through unchanged and keep their codes. Every other error becomes
-/// [`SaError::TimelockExecuteFailed`], classified from its text.
-fn execute_submit_error(
-    e: SaError,
-    operation_id: &TimelockOperationId,
-    request_id: &str,
-) -> SaError {
-    if matches!(
-        e,
-        SaError::SubmissionUnresolved { .. } | SaError::MainnetWriteForbidden
-    ) {
-        return e;
+/// Unresolved submissions, mainnet, policy, intent, and ledger witness refusals
+/// keep their codes. Every other error becomes [`SaError::TimelockExecuteFailed`],
+/// classified from its text error.
+fn execute_submit_error(e: impl Into<TimelockSubmitFailure>, request_id: &str) -> SaError {
+    let f = e.into();
+    if matches!(f.text_error(), SaError::SubmissionUnresolved { .. })
+        || keeps_its_wire_code(f.text_error())
+    {
+        return f.into_shown();
     }
 
-    let reason = format!("{e}");
+    let reason = format!("{}", f.text_error());
     let classified = classify_execute_error(&reason);
     SaError::TimelockExecuteFailed {
         failure_reason: classified,
-        redacted_reason: augment_with_oz_error_name(&reason),
-        operation_id_redacted: operation_id.redacted(),
+        redacted_reason: shown_reason(f, &reason),
         request_id: request_id.to_owned(),
     }
 }
@@ -705,115 +751,15 @@ async fn query_operation_ready_ledger(
     operation_id: &TimelockOperationId,
     network_passphrase: &str,
 ) -> Result<u32, String> {
-    // Build a dummy simulate transaction targeting `get_operation_ledger`.
-    // This is a read-only view function on the OZ timelock contract.
-    // Timelock::get_operation_ledger(e, operation_id: BytesN<32>) -> u32
-    // OZ mod.rs:116 (SHA a9c4216).
-    //
-    // We cannot use the stellar-governance crate's types directly here because
-    // that crate provides a soroban-sdk `contracttrait` which requires a host
-    // `Env` that only exists inside a soroban-sdk simulation environment.
-    // Instead, we construct the InvokeHostFunction XDR directly, which is the
-    // established pattern in this codebase (see rules.rs::simulate_read_only).
-
-    let server =
-        Client::new(rpc.url()).map_err(|e| format!("RPC Client construction failed: {e}"))?;
-
-    // Encode operation_id as ScVal::Bytes(BytesM<32>)
-    let op_id_bytes: BytesM<32> = operation_id
-        .inner
-        .to_vec()
-        .try_into()
-        .map_err(|e| format!("operation_id BytesM encoding failed: {e:?}"))?;
-    let op_id_scval = ScVal::Bytes(stellar_xdr::ScBytes(
-        op_id_bytes
-            .as_slice()
-            .to_vec()
-            .try_into()
-            .map_err(|e| format!("ScBytes encoding failed: {e:?}"))?,
-    ));
-
-    let timelock_sc_address = parse_c_strkey_to_smart_account(timelock_contract_strkey)
-        .map_err(|e| format!("timelock address parse failed: {e:?}"))?;
-
-    // The OZ Timelock trait method is `get_operation_ledger`
-    // (`packages/governance/src/timelock/mod.rs:116`, SHA `a9c4216`).
-    // Soroban Symbols permit up to 32 chars; `get_operation_ledger` is 21 chars
-    // and fits. Any abbreviated name triggers "function not found" at simulate-time,
-    // silently breaking the ready-window pre-check and list_pending cross-RPC query.
-    let fn_name = ScSymbol::try_from("get_operation_ledger")
-        .map_err(|e| format!("function name encoding failed: {e:?}"))?;
-    let args_vecm: VecM<ScVal> = vec![op_id_scval]
-        .try_into()
-        .map_err(|e| format!("args VecM encoding failed: {e:?}"))?;
-
-    let host_fn = HostFunction::InvokeContract(InvokeContractArgs {
-        contract_address: timelock_sc_address.clone(),
-        function_name: fn_name,
-        args: args_vecm,
-    });
-
-    let op = Operation {
-        source_account: None,
-        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
-            host_function: host_fn,
-            auth: VecM::default(),
-        }),
-    };
-
-    // Build a fee-less transaction for simulation. We use a minimal placeholder
-    // for the source account since the `get_operation_ledger` view function does
-    // not require auth and cannot be auth-gated. `BaselibAccount::new` requires a
-    // G-strkey (not a C-strkey) so we use the zero-pubkey G-strkey constant —
-    // structurally valid and accepted by Soroban RPC for fee-less view-function
-    // simulate calls (resourceFee=0; sequence-number 0 is acceptable for read-only
-    // simulate of view functions).
-    let dummy_source_g_strkey: String = stellar_strkey::ed25519::PublicKey([0u8; 32])
-        .to_string()
-        .as_str()
-        .to_owned();
-    let source_account = BaselibAccount::new(&dummy_source_g_strkey, "0")
-        .map_err(|e| format!("BaselibAccount: {e:?}"))?;
-    let mut source_account_mut = source_account;
-
-    // The caller-supplied `network_passphrase` is used (not a hard-coded network
-    // string) so this path works correctly on mainnet and testnet alike.
-    let mut tx_builder = TransactionBuilder::new(&mut source_account_mut, network_passphrase, None);
-    tx_builder.fee(BASE_FEE_STROOPS);
-    tx_builder.add_operation(op);
-    let tx_for_sim = tx_builder.build_for_simulation();
-
-    let sim_envelope = tx_for_sim
-        .to_envelope()
-        .map_err(|e| format!("to_envelope failed: {e:?}"))?;
-    let sim_response = server
-        .simulate_transaction_envelope(&sim_envelope, None)
-        .await
-        .map_err(|e| format!("simulate_transaction_envelope failed: {e}"))?;
-
-    if let Some(err) = &sim_response.error {
-        // If the operation is unscheduled, OZ `get_operation_ledger` returns
-        // UNSET_LEDGER (0) directly — it does not panic. Any simulation error
-        // here indicates a real RPC failure, not an "operation not found".
-        return Err(format!("simulation error: {err}"));
-    }
-
-    let return_val = sim_response
-        .results()
-        .map_err(|e| format!("simulate results decode failed: {e}"))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "simulate returned no result".to_owned())?
-        .xdr;
-
-    match return_val {
-        ScVal::U32(n) => Ok(n),
-        other => Err(unexpected_return_reason(
-            "get_operation_ledger",
-            "U32",
-            &other,
-        )),
-    }
+    stellar_agent_network::signing::ledger_witness::read_operation_ledger(
+        rpc,
+        timelock_contract_strkey,
+        &operation_id.inner,
+        network_passphrase,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// Reason for a contract call whose return value has an unexpected shape.
@@ -970,7 +916,6 @@ fn emit_cancelled_audit(
                 "audit writer poisoned: {}",
                 AuditWriterPoisonContext::TimelockCancelEmission
             ),
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         }
     })?;
@@ -1041,7 +986,6 @@ fn emit_executed_audit(
                 "audit writer poisoned: {}",
                 AuditWriterPoisonContext::TimelockExecuteEmission
             ),
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         }
     })?;
@@ -1531,6 +1475,7 @@ pub async fn schedule_upgrade(
     refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url)?;
 
     let TimelockScheduleArgs {
+        submission_recorder,
         timelock_contract_strkey,
         target_strkey,
         function,
@@ -1702,37 +1647,50 @@ pub async fn schedule_upgrade(
     // calls were failing at `build_authorization_entry` (empty rule_ids rejected
     // with `SaError::RuleIdMismatch`). Use the direct G-key auth path instead.
     // OZ mod.rs:180-181 (SHA a9c4216): `proposer.require_auth()`.
-    let result = crate::timelock_submit::submit_timelock_invoke_with_g_key_auth(
+    let operation_id = simulate_hash_operation(
+        timelock_contract_strkey,
+        target_strkey,
+        function,
+        &args,
+        &predecessor,
+        &salt_bytes,
+        primary_rpc_url,
+        secondary_rpc_url,
+        network_passphrase,
+        request_id,
+        true,
+    )
+    .await
+    .map_err(|error| match error {
+        SaError::TimelockExecuteFailed {
+            redacted_reason, ..
+        } => SaError::TimelockScheduleFailed {
+            failure_reason: TimelockScheduleFailureReason::SimulationFailed,
+            redacted_reason,
+            request_id: request_id.to_owned(),
+        },
+        other => other,
+    })?;
+    let result = crate::timelock_submit::submit_timelock_invoke_described(
         crate::timelock_submit::TimelockSubmitArgs {
+            schedule_identity: Some((timelock_contract_strkey, operation_id.inner)),
             host_function,
             signer,
             primary_rpc_url,
+            secondary_rpc_url,
             network_passphrase,
             timeout: std::time::Duration::from_secs(60),
             op_label: "timelock_schedule",
-            submission_recorder: None,
+            admission: stellar_agent_network::SigningAdmission::Recorded(submission_recorder),
         },
     )
     .await
     .map_err(|e| schedule_submit_error(e, request_id))?;
 
-    // Extract the returned BytesN<32> operation_id from the ScVal return.
-    let operation_id_bytes: [u8; 32] = match &result.return_val {
-        ScVal::Bytes(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(b.as_slice());
-            arr
-        }
-        other => {
-            return Err(SaError::TimelockScheduleFailed {
-                failure_reason: TimelockScheduleFailureReason::Other,
-                redacted_reason: unexpected_return_reason("schedule", "32-byte Bytes", other),
-                request_id: request_id.to_owned(),
-            });
-        }
-    };
-
-    let operation_id = TimelockOperationId::from_bytes(operation_id_bytes);
+    if !matches!(&result.return_val, ScVal::Bytes(bytes) if bytes.as_slice() == operation_id.inner)
+    {
+        return Err(SaError::IntentBindingMismatch { field: "purpose" });
+    }
 
     // Cross-confirm OperationScheduled event on BOTH primary and secondary RPCs.
     cross_confirm_event(
@@ -1835,6 +1793,7 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
     refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url)?;
 
     let TimelockCancelArgs {
+        intent_admission,
         timelock_contract_strkey,
         operation_id,
         signer,
@@ -1850,7 +1809,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
             SaError::TimelockCancelFailed {
                 failure_reason: TimelockCancelFailureReason::SimulationFailed,
                 redacted_reason: format!("timelock address parse failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             }
         })?;
@@ -1863,7 +1821,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
         .map_err(|e| SaError::TimelockCancelFailed {
             failure_reason: TimelockCancelFailureReason::SimulationFailed,
             redacted_reason: format!("canceller public key fetch failed: {e}"),
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         })?;
     let canceller_sc_address = {
@@ -1872,7 +1829,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
             Strkey::from_string(&canceller_strkey).map_err(|e| SaError::TimelockCancelFailed {
                 failure_reason: TimelockCancelFailureReason::SimulationFailed,
                 redacted_reason: format!("canceller strkey parse failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             })?;
         match strkey {
@@ -1883,7 +1839,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
                 return Err(SaError::TimelockCancelFailed {
                     failure_reason: TimelockCancelFailureReason::SimulationFailed,
                     redacted_reason: "canceller must be a G-strkey".to_owned(),
-                    operation_id_redacted: operation_id.redacted(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -1896,7 +1851,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
             SaError::TimelockCancelFailed {
                 failure_reason: TimelockCancelFailureReason::SimulationFailed,
                 redacted_reason: format!("operation_id ScBytes failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             }
         })?);
@@ -1913,7 +1867,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
             .map_err(|e| SaError::TimelockCancelFailed {
                 failure_reason: TimelockCancelFailureReason::SimulationFailed,
                 redacted_reason: format!("cancel args VecM encoding failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             })?;
 
@@ -1921,7 +1874,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
         ScSymbol::try_from(FN_CANCEL).map_err(|e| SaError::TimelockCancelFailed {
             failure_reason: TimelockCancelFailureReason::SimulationFailed,
             redacted_reason: format!("'cancel' symbol encoding failed: {e:?}"),
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         })?;
 
@@ -1934,19 +1886,21 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
     // The OZ TimelockController is NOT a smart-account; `cancel` calls
     // `canceller.require_auth()` on the G-key Address argument.
     // OZ mod.rs:292 (SHA a9c4216): `canceller.require_auth()`.
-    let result = crate::timelock_submit::submit_timelock_invoke_with_g_key_auth(
+    let result = crate::timelock_submit::submit_timelock_invoke_described(
         crate::timelock_submit::TimelockSubmitArgs {
+            schedule_identity: None,
             host_function,
             signer,
             primary_rpc_url,
+            secondary_rpc_url,
             network_passphrase,
             timeout: std::time::Duration::from_secs(60),
             op_label: "timelock_cancel",
-            submission_recorder: None,
+            admission: stellar_agent_network::SigningAdmission::NoValue(intent_admission),
         },
     )
     .await
-    .map_err(|e| cancel_submit_error(e, operation_id, request_id))?;
+    .map_err(|e| cancel_submit_error(e, request_id))?;
 
     // Cross-confirm OperationCancelled event on BOTH primary and secondary RPCs.
     cross_confirm_event(
@@ -1963,7 +1917,6 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
         CrossConfirmError::EventMissing(reason) => SaError::TimelockCancelFailed {
             failure_reason: TimelockCancelFailureReason::EventConfirmationMissing,
             redacted_reason: reason,
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         },
         CrossConfirmError::Divergence {
@@ -2052,6 +2005,13 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
 ///   submit-layer refusal of an endpoint that reports mainnet.
 pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
     refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url)?;
+    // `execute` reads the operation from both endpoints before it reaches the
+    // submit, so an endpoint that cannot be a witness refuses before those reads.
+    checked_secondary_rpc_url(
+        args.primary_rpc_url,
+        Some(args.secondary_rpc_url),
+        args.network_passphrase,
+    )?;
 
     let TimelockExecuteArgs {
         timelock_contract_strkey,
@@ -2076,14 +2036,12 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         StellarRpcClient::new(primary_rpc_url).map_err(|e| SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("primary RPC client construction failed: {e}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         })?;
     let secondary_rpc =
         StellarRpcClient::new(secondary_rpc_url).map_err(|e| SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("secondary RPC client construction failed: {e}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         })?;
 
@@ -2113,7 +2071,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                 redacted_reason: "fetch_latest_ledger returned None for primary RPC; \
                                   cannot determine operation readiness"
                     .to_owned(),
-                operation_id_redacted: pre_check_id.redacted(),
                 request_id: request_id.to_owned(),
             }
         })?;
@@ -2138,7 +2095,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                         "operation is Waiting; ready at ledger {ready_ledger}, \
                          current {current_ledger}"
                     ),
-                    operation_id_redacted: pre_check_id.redacted(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -2153,7 +2109,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                     },
                     redacted_reason: "operation is Unset (not scheduled or already cancelled)"
                         .to_owned(),
-                    operation_id_redacted: pre_check_id.redacted(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -2161,7 +2116,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                 return Err(SaError::TimelockExecuteFailed {
                     failure_reason: TimelockExecuteFailureReason::InvalidOperationState,
                     redacted_reason: "operation is already Done (already executed)".to_owned(),
-                    operation_id_redacted: pre_check_id.redacted(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -2183,6 +2137,7 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         secondary_rpc_url,
         network_passphrase,
         request_id,
+        false,
     )
     .await?;
 
@@ -2194,18 +2149,12 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         && *expected != operation_id
     {
         return Err(SaError::TimelockExecuteFailed {
-            failure_reason: TimelockExecuteFailureReason::OperationIdMismatch {
-                user_supplied: expected.to_hex(),
-                simulate_derived: operation_id.to_hex(),
-            },
-            redacted_reason: format!(
-                "caller-supplied operation_id {} does not match \
-                 simulate-derived {} — check --operation-id, --target, \
-                 --function, --salt, and predecessor match the scheduled operation",
-                expected.redacted(),
-                operation_id.redacted()
-            ),
-            operation_id_redacted: expected.redacted(),
+            failure_reason: TimelockExecuteFailureReason::OperationIdMismatch,
+            redacted_reason: "operation_id must match the operation derived from the scheduled \
+                              target, function, arguments, salt and predecessor; check \
+                              --operation-id, --target, --function, --salt and predecessor \
+                              against the scheduled operation."
+                .to_owned(),
             request_id: request_id.to_owned(),
         });
     }
@@ -2235,7 +2184,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                 redacted_reason: "fetch_latest_ledger returned None for primary RPC; \
                                   cannot determine operation readiness"
                     .to_owned(),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             }
         })?;
@@ -2259,7 +2207,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                         "operation is Waiting; ready at ledger {ready_ledger}, \
                          current {current_ledger}"
                     ),
-                    operation_id_redacted: operation_id.redacted(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -2273,7 +2220,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                     },
                     redacted_reason: "operation is Unset (not scheduled or already cancelled)"
                         .to_owned(),
-                    operation_id_redacted: operation_id.redacted(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -2281,7 +2227,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
                 return Err(SaError::TimelockExecuteFailed {
                     failure_reason: TimelockExecuteFailureReason::InvalidOperationState,
                     redacted_reason: "operation is already Done (already executed)".to_owned(),
-                    operation_id_redacted: operation_id.redacted(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -2298,7 +2243,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
             SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("timelock address parse failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             }
         })?;
@@ -2307,7 +2251,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("target address parse failed: {e:?}"),
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         }
     })?;
@@ -2315,7 +2258,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
     let fn_sym = ScSymbol::try_from(function).map_err(|e| SaError::TimelockExecuteFailed {
         failure_reason: TimelockExecuteFailureReason::SimulationFailed,
         redacted_reason: format!("function symbol encoding failed: {e:?}"),
-        operation_id_redacted: operation_id.redacted(),
         request_id: request_id.to_owned(),
     })?;
 
@@ -2324,7 +2266,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
             SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("predecessor ScBytes failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             }
         })?);
@@ -2332,7 +2273,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("salt ScBytes failed: {e:?}"),
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         }
     })?);
@@ -2343,7 +2283,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
             .map_err(|e| SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("target-function args VecM encoding failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             })?;
     let args_scval = ScVal::Vec(Some(ScVec(args_vecm)));
@@ -2370,7 +2309,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
             .map_err(|e| SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("execute args VecM encoding failed: {e:?}"),
-                operation_id_redacted: operation_id.redacted(),
                 request_id: request_id.to_owned(),
             })?;
 
@@ -2378,7 +2316,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         ScSymbol::try_from(FN_EXECUTE).map_err(|e| SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("'execute' symbol encoding failed: {e:?}"),
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         })?;
 
@@ -2392,19 +2329,21 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
     // `executor.require_auth()` on the G-key Address argument (only when an
     // explicit executor is supplied; open execution passes None).
     // OZ mod.rs:244-245 (SHA a9c4216): `if let Some(ref exec) = executor { exec.require_auth() }`.
-    let result = crate::timelock_submit::submit_timelock_invoke_with_g_key_auth(
+    let result = crate::timelock_submit::submit_timelock_invoke_described(
         crate::timelock_submit::TimelockSubmitArgs {
+            schedule_identity: None,
             host_function,
             signer,
             primary_rpc_url,
+            secondary_rpc_url,
             network_passphrase,
             timeout: std::time::Duration::from_secs(60),
             op_label: "timelock_execute",
-            submission_recorder,
+            admission: stellar_agent_network::SigningAdmission::Recorded(submission_recorder),
         },
     )
     .await
-    .map_err(|e| execute_submit_error(e, &operation_id, request_id))?;
+    .map_err(|e| execute_submit_error(e, request_id))?;
 
     // Cross-confirm OperationExecuted event on BOTH primary and secondary RPCs.
     cross_confirm_event(
@@ -2421,7 +2360,6 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         CrossConfirmError::EventMissing(reason) => SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::EventConfirmationMissing,
             redacted_reason: reason,
-            operation_id_redacted: operation_id.redacted(),
             request_id: request_id.to_owned(),
         },
         CrossConfirmError::Divergence {
@@ -2611,6 +2549,55 @@ fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
     stellar_agent_core::hex::decode_hex32(hex).ok()
 }
 
+/// Checks endpoint identity and reads one bounded operation hash.
+async fn checked_hash_simulation(
+    client: &StellarRpcClient,
+    envelope: &stellar_xdr::TransactionEnvelope,
+    passphrase: &str,
+    deadline: tokio::time::Instant,
+    request_id: &str,
+    witness_refusal: bool,
+) -> Result<stellar_rpc_client::SimulateTransactionResponse, SaError> {
+    let unavailable = |reason: &'static str| {
+        if witness_refusal {
+            SaError::LedgerWitnessUnavailable { reason }
+        } else {
+            SaError::TimelockExecuteFailed {
+                failure_reason: TimelockExecuteFailureReason::SimulationFailed,
+                redacted_reason: reason.into(),
+                request_id: request_id.into(),
+            }
+        }
+    };
+    tokio::time::timeout_at(deadline, async {
+        client
+            .endpoint_identity(passphrase, deadline)
+            .await
+            .map_err(|error| match error {
+                stellar_agent_core::WalletError::Network(
+                    stellar_agent_core::NetworkError::MainnetWriteForbidden,
+                ) => SaError::MainnetWriteForbidden,
+                stellar_agent_core::WalletError::Network(
+                    stellar_agent_core::NetworkError::EndpointNetworkMismatch { .. },
+                ) => SaError::LedgerWitnessUnavailable {
+                    reason: "operation hash endpoint serves another network",
+                },
+                stellar_agent_core::WalletError::Network(
+                    stellar_agent_core::NetworkError::UnsupportedProtocolVersion { .. },
+                ) => SaError::LedgerWitnessUnavailable {
+                    reason: "operation hash endpoint uses an unsupported protocol",
+                },
+                _ => unavailable("operation hash endpoint identity is unavailable"),
+            })?;
+        client
+            .simulate_transaction_envelope(envelope)
+            .await
+            .map_err(|_| unavailable("operation hash simulation is unavailable"))
+    })
+    .await
+    .map_err(|_| unavailable("operation hash simulation deadline elapses"))?
+}
+
 /// Derives the OZ timelock operation ID by simulating `hash_operation` on-chain
 /// against BOTH primary and secondary RPCs concurrently.
 ///
@@ -2646,6 +2633,7 @@ async fn simulate_hash_operation(
     secondary_rpc_url: &str,
     network_passphrase: &str,
     request_id: &str,
+    signing_schedule: bool,
 ) -> Result<TimelockOperationId, SaError> {
     // Build the shared transaction body once; both RPC simulations use the same tx.
     let timelock_sc_address =
@@ -2653,7 +2641,6 @@ async fn simulate_hash_operation(
             SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("timelock address parse failed: {e:?}"),
-                operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
             }
         })?;
@@ -2661,14 +2648,12 @@ async fn simulate_hash_operation(
         SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("target address parse failed: {e:?}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         }
     })?;
     let fn_sym = ScSymbol::try_from(function).map_err(|e| SaError::TimelockExecuteFailed {
         failure_reason: TimelockExecuteFailureReason::SimulationFailed,
         redacted_reason: format!("function symbol encoding failed: {e:?}"),
-        operation_id_redacted: "unknown".to_owned(),
         request_id: request_id.to_owned(),
     })?;
 
@@ -2679,7 +2664,6 @@ async fn simulate_hash_operation(
             .map_err(|e| SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("args VecM encoding failed: {e:?}"),
-                operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
             })?;
     let args_scval = ScVal::Vec(Some(ScVec(args_vecm)));
@@ -2689,7 +2673,6 @@ async fn simulate_hash_operation(
             SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("predecessor ScBytes encoding failed: {e:?}"),
-                operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
             }
         })?);
@@ -2697,7 +2680,6 @@ async fn simulate_hash_operation(
         SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("salt ScBytes encoding failed: {e:?}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         }
     })?);
@@ -2718,7 +2700,6 @@ async fn simulate_hash_operation(
             .map_err(|e| SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("invoke args VecM encoding failed: {e:?}"),
-                operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
             })?;
 
@@ -2726,7 +2707,6 @@ async fn simulate_hash_operation(
         ScSymbol::try_from("hash_operation").map_err(|e| SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("'hash_operation' symbol encoding failed: {e:?}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         })?;
 
@@ -2756,7 +2736,6 @@ async fn simulate_hash_operation(
         SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("BaselibAccount: {e:?}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         }
     })?;
@@ -2769,62 +2748,66 @@ async fn simulate_hash_operation(
     tx_builder.add_operation(op);
     let tx_for_sim = tx_builder.build_for_simulation();
 
-    let build_rpc_server = |url: &str| Client::new(url);
     let primary_server =
-        build_rpc_server(primary_rpc_url).map_err(|e| SaError::TimelockExecuteFailed {
+        StellarRpcClient::new(primary_rpc_url).map_err(|_| SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
-            redacted_reason: format!("primary RPC Client construction failed: {e}"),
-            operation_id_redacted: "unknown".to_owned(),
+            redacted_reason: "the primary operation hash client is unavailable".to_owned(),
             request_id: request_id.to_owned(),
         })?;
-    let secondary_server =
-        build_rpc_server(secondary_rpc_url).map_err(|e| SaError::TimelockExecuteFailed {
-            failure_reason: TimelockExecuteFailureReason::SimulationFailed,
-            redacted_reason: format!("secondary RPC Client construction failed: {e}"),
-            operation_id_redacted: "unknown".to_owned(),
-            request_id: request_id.to_owned(),
-        })?;
-
-    // Simulate concurrently on both RPCs.
+    let secondary_server = StellarRpcClient::new(secondary_rpc_url).map_err(|_| {
+        SaError::LedgerWitnessUnavailable {
+            reason: "the secondary operation hash client is unavailable",
+        }
+    })?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Primary transport failures use the operation's simulation error.
+    // The secondary schedule probe keeps the witness refusal.
     let sim_envelope = tx_for_sim
         .to_envelope()
         .map_err(|e| SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
             redacted_reason: format!("to_envelope failed: {e:?}"),
-            operation_id_redacted: "unknown".to_owned(),
             request_id: request_id.to_owned(),
         })?;
     let (primary_sim, secondary_sim) = tokio::join!(
-        primary_server.simulate_transaction_envelope(&sim_envelope, None),
-        secondary_server.simulate_transaction_envelope(&sim_envelope, None),
+        checked_hash_simulation(
+            &primary_server,
+            &sim_envelope,
+            network_passphrase,
+            deadline,
+            request_id,
+            false
+        ),
+        checked_hash_simulation(
+            &secondary_server,
+            &sim_envelope,
+            network_passphrase,
+            deadline,
+            request_id,
+            signing_schedule
+        ),
     );
 
-    let primary_sim = primary_sim.map_err(|e| SaError::TimelockExecuteFailed {
-        failure_reason: TimelockExecuteFailureReason::SimulationFailed,
-        redacted_reason: format!("primary simulate_transaction_envelope failed: {e}"),
-        operation_id_redacted: "unknown".to_owned(),
-        request_id: request_id.to_owned(),
-    })?;
-    let secondary_sim = secondary_sim.map_err(|e| SaError::TimelockExecuteFailed {
-        failure_reason: TimelockExecuteFailureReason::SimulationFailed,
-        redacted_reason: format!("secondary simulate_transaction_envelope failed: {e}"),
-        operation_id_redacted: "unknown".to_owned(),
-        request_id: request_id.to_owned(),
-    })?;
+    let primary_sim = primary_sim?;
+    let secondary_sim = secondary_sim?;
 
     if let Some(err) = &primary_sim.error {
         return Err(SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
-            redacted_reason: format!("primary simulation error: {err}"),
-            operation_id_redacted: "unknown".to_owned(),
+            redacted_reason: format!(
+                "primary simulation error: {}",
+                refusal_text(err, &primary_sim.events, &sim_envelope)
+            ),
             request_id: request_id.to_owned(),
         });
     }
     if let Some(err) = &secondary_sim.error {
         return Err(SaError::TimelockExecuteFailed {
             failure_reason: TimelockExecuteFailureReason::SimulationFailed,
-            redacted_reason: format!("secondary simulation error: {err}"),
-            operation_id_redacted: "unknown".to_owned(),
+            redacted_reason: format!(
+                "secondary simulation error: {}",
+                refusal_text(err, &secondary_sim.events, &sim_envelope)
+            ),
             request_id: request_id.to_owned(),
         });
     }
@@ -2838,7 +2821,6 @@ async fn simulate_hash_operation(
             .map_err(|e| SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("{label} simulate results decode failed: {e}"),
-                operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
             })?
             .into_iter()
@@ -2846,7 +2828,6 @@ async fn simulate_hash_operation(
             .ok_or_else(|| SaError::TimelockExecuteFailed {
                 failure_reason: TimelockExecuteFailureReason::SimulationFailed,
                 redacted_reason: format!("{label} simulate returned no result"),
-                operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
             })?
             .xdr;
@@ -2865,7 +2846,6 @@ async fn simulate_hash_operation(
                             "{label} hash_operation returned {} bytes, expected 32",
                             slice.len()
                         ),
-                        operation_id_redacted: "unknown".to_owned(),
                         request_id: request_id.to_owned(),
                     })
                 }
@@ -2877,7 +2857,6 @@ async fn simulate_hash_operation(
                     "32-byte Bytes",
                     &other,
                 ),
-                operation_id_redacted: "unknown".to_owned(),
                 request_id: request_id.to_owned(),
             }),
         }
@@ -2975,6 +2954,42 @@ mod tests {
     #![allow(clippy::panic, reason = "test-only: panics are correct failure mode")]
 
     use super::*;
+
+    /// Witness and intent refusals keep their codes through every timelock mapper.
+    #[test]
+    fn the_submit_error_mappers_keep_a_witness_refusal() {
+        for (error, code) in [
+            (
+                || SaError::LedgerWitnessUnavailable { reason: "fixed" },
+                "smart_account.ledger_witness_unavailable",
+            ),
+            (
+                || SaError::LedgerWitnessMismatch { reason: "fixed" },
+                "simulation.divergence.ledger_skew",
+            ),
+            (
+                || SaError::IntentRecordUnavailable {
+                    class: "window_unavailable",
+                },
+                "submission.intent_record_unavailable",
+            ),
+            (
+                || SaError::IntentBindingMismatch {
+                    field: "signing_request",
+                },
+                "submission.intent_binding_mismatch",
+            ),
+        ] as [(fn() -> SaError, &str); 4]
+        {
+            for mapped in [
+                schedule_submit_error(error(), "req"),
+                cancel_submit_error(error(), "req"),
+                execute_submit_error(error(), "req"),
+            ] {
+                assert_eq!(mapped.wire_code(), code, "{mapped:?}");
+            }
+        }
+    }
 
     /// The reason for an unexpected return value names its variant and never
     /// renders the value, so a 10 KiB ledger payload yields a short reason.
@@ -3424,27 +3439,33 @@ mod tests {
     impl Signer for PanickingSigner {
         async fn sign_tx_payload(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::TxSigningPayload,
         ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
             panic!("a refused mainnet timelock call must not reach sign_tx_payload")
         }
         async fn sign_auth_digest(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SmartAccountAuthDigest,
         ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
             panic!("a refused mainnet timelock call must not reach sign_auth_digest")
         }
         async fn sign_soroban_address_auth_payload(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SorobanAuthPayload,
         ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
             panic!(
                 "a refused mainnet timelock call must not reach sign_soroban_address_auth_payload"
             )
         }
+        async fn sign_message(
+            &self,
+            _: &stellar_agent_network::signing::MessagePayload,
+        ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+            panic!("a refused mainnet timelock call must not reach sign_message")
+        }
         async fn sign_webauthn_assertion(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SmartAccountAuthDigest,
             _: &[u8],
         ) -> Result<stellar_agent_network::WebAuthnAssertion, stellar_agent_core::WalletError>
         {
@@ -3473,12 +3494,207 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn schedule_identity_is_frozen_before_admission() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use stellar_agent_network::signing::test_doubles::CountingSigner;
+        use stellar_agent_test_support::signed_envelope::{
+            account_id_for_seed, get_network_result, ledger_entries_result_for,
+        };
+        use stellar_xdr::{ReadXdr as _, WriteXdr as _};
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        async fn endpoint(byte: u8) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = match body["method"].as_str().unwrap() {
+                    "getNetwork" => get_network_result(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE),
+                    "getLatestLedger" => serde_json::json!({"id":"ab".repeat(32),"sequence":1000,"protocolVersion":27}),
+                    "getLedgerEntries" => ledger_entries_result_for(&[account_id_for_seed([0x51;32]).as_str()]),
+                    "simulateTransaction" => serde_json::json!({"latestLedger":1000,"minResourceFee":"100","transactionData":stellar_xdr::SorobanTransactionData::default().to_xdr_base64(stellar_xdr::Limits::none()).unwrap(),"results":[{"auth":[],"xdr":ScVal::Bytes(vec![byte;32].try_into().unwrap()).to_xdr_base64(stellar_xdr::Limits::none()).unwrap()}]}),
+                    _ => panic!("only unsigned checked hash requests precede divergence"),
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+            }).mount(&server).await;
+            server
+        }
+        struct CountingRecorder {
+            inner: crate::signing::intent_test_helpers::NoLimitRecorder,
+            admissions: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl stellar_agent_network::SubmissionRecorder for CountingRecorder {
+            async fn admit_signed_intent(
+                &self,
+                plan: &stellar_agent_network::SignedIntentPlan,
+            ) -> Result<stellar_agent_network::IntentProof, stellar_agent_core::WalletError>
+            {
+                self.admissions.fetch_add(1, Ordering::SeqCst);
+                self.inner.admit_signed_intent(plan).await
+            }
+            async fn cancel_unexposed(
+                &self,
+                proof: stellar_agent_network::IntentProof,
+            ) -> Result<(), stellar_agent_core::WalletError> {
+                self.inner.cancel_unexposed(proof).await
+            }
+            async fn pre_send_bound(
+                &self,
+                intent: &stellar_agent_network::SubmissionIntent,
+                binding: &stellar_agent_network::IntentBinding<'_>,
+            ) -> Result<(), stellar_agent_core::WalletError> {
+                self.inner.pre_send_bound(intent, binding).await
+            }
+            async fn pre_send(
+                &self,
+                intent: &stellar_agent_network::SubmissionIntent,
+            ) -> Result<(), stellar_agent_core::WalletError> {
+                self.inner.pre_send(intent).await
+            }
+            async fn outcome(
+                &self,
+                intent: &stellar_agent_network::SubmissionIntent,
+                outcome: &stellar_agent_network::SubmissionOutcome,
+            ) {
+                self.inner.outcome(intent, outcome).await;
+            }
+        }
+        let primary = endpoint(7).await;
+        let agreed = endpoint(7).await;
+        let hash = simulate_hash_operation(
+            ZERO_CONTRACT,
+            ZERO_CONTRACT,
+            "upgrade",
+            &[ScVal::U32(9)],
+            &[2; 32],
+            &[3; 32],
+            &primary.uri(),
+            &stellar_agent_test_support::second_loopback_host(&agreed.uri()),
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            "hash-agree",
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hash.inner, [7; 32]);
+        let requests_a = primary.received_requests().await.unwrap();
+        let requests_b = agreed.received_requests().await.unwrap();
+        let simulation = |requests: &[wiremock::Request]| {
+            assert_eq!(requests.len(), 2);
+            let bodies: Vec<serde_json::Value> = requests
+                .iter()
+                .map(|r| serde_json::from_slice(&r.body).unwrap())
+                .collect();
+            assert_eq!(bodies[0]["method"], "getNetwork");
+            assert_eq!(bodies[1]["method"], "simulateTransaction");
+            bodies[1]["params"]["transaction"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let a = simulation(&requests_a);
+        assert_eq!(a, simulation(&requests_b));
+        let stellar_xdr::TransactionEnvelope::Tx(tx) =
+            stellar_xdr::TransactionEnvelope::from_xdr_base64(&a, stellar_xdr::Limits::none())
+                .unwrap()
+        else {
+            panic!("V1")
+        };
+        assert!(tx.signatures.is_empty());
+        let direct_primary = endpoint(7).await;
+        let direct_divergent = endpoint(8).await;
+        let mismatch = simulate_hash_operation(
+            ZERO_CONTRACT,
+            ZERO_CONTRACT,
+            "upgrade",
+            &[ScVal::U32(9)],
+            &[2; 32],
+            &[3; 32],
+            &direct_primary.uri(),
+            &stellar_agent_test_support::second_loopback_host(&direct_divergent.uri()),
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            "direct-hash-divergence",
+            true,
+        )
+        .await;
+        assert!(
+            matches!(mismatch, Err(SaError::NetworkRpcDivergence { .. })),
+            "a divergent checked hash pair refuses before admission"
+        );
+        assert_eq!(
+            mismatch.err().unwrap().wire_code(),
+            "network.rpc_divergence"
+        );
+        assert_eq!(
+            simulation(&direct_primary.received_requests().await.unwrap()),
+            simulation(&direct_divergent.received_requests().await.unwrap())
+        );
+        let divergent = endpoint(8).await;
+        let signer = CountingSigner::new([0x51; 32]);
+        let recorder = CountingRecorder {
+            inner: crate::signing::intent_test_helpers::NoLimitRecorder,
+            admissions: AtomicUsize::new(0),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let writer = audit_writer(&dir);
+        let error = schedule_upgrade(
+            TimelockScheduleArgs::builder()
+                .submission_recorder(&recorder)
+                .timelock_contract_strkey(ZERO_CONTRACT)
+                .target_strkey(ZERO_CONTRACT)
+                .function("upgrade")
+                .delay_ledgers(10)
+                .signer(&signer)
+                .primary_rpc_url(&primary.uri())
+                .secondary_rpc_url(&stellar_agent_test_support::second_loopback_host(
+                    &divergent.uri(),
+                ))
+                .network_passphrase(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE)
+                .audit_writer(&writer)
+                .request_id("hash-divergence")
+                .build(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            matches!(error, SaError::NetworkRpcDivergence { .. }),
+            "{error:?}"
+        );
+        assert_eq!(error.wire_code(), "network.rpc_divergence");
+        assert_eq!(recorder.admissions.load(Ordering::SeqCst), 0);
+        assert_eq!(signer.sign_calls(), 0);
+        let requests = divergent.received_requests().await.unwrap();
+        let transaction = simulation(&requests);
+        let stellar_xdr::TransactionEnvelope::Tx(tx) =
+            stellar_xdr::TransactionEnvelope::from_xdr_base64(
+                transaction,
+                stellar_xdr::Limits::none(),
+            )
+            .unwrap()
+        else {
+            panic!("V1")
+        };
+        let stellar_xdr::OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+            panic!("invoke")
+        };
+        let HostFunction::InvokeContract(call) = &op.host_function else {
+            panic!("contract")
+        };
+        assert_eq!(call.function_name.0.as_slice(), b"hash_operation");
+        assert!(op.auth.is_empty());
+        assert!(tx.signatures.is_empty());
+    }
+
+    #[tokio::test]
     async fn schedule_upgrade_refuses_mainnet_before_signer_and_request() {
         let mock = wiremock::MockServer::start().await;
         let uri = mock.uri();
         let dir = tempfile::tempdir().unwrap();
         let writer = audit_writer(&dir);
         let args = TimelockScheduleArgs::builder()
+            .submission_recorder(&crate::signing::intent_test_helpers::NoLimitRecorder)
             .timelock_contract_strkey(ZERO_CONTRACT)
             .target_strkey(ZERO_CONTRACT)
             .function("upgrade")
@@ -3500,13 +3716,19 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn cancel_refuses_mainnet_before_signer_and_request() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let operation_id = TimelockOperationId::from_bytes([3u8; 32]);
         let mock = wiremock::MockServer::start().await;
         let uri = mock.uri();
         let dir = tempfile::tempdir().unwrap();
         let writer = audit_writer(&dir);
-        let operation_id = TimelockOperationId::from_bytes([3u8; 32]);
         let args = TimelockCancelArgs::builder()
+            .intent_admission(crate::signing::intent_test_helpers::no_value_admission())
             .timelock_contract_strkey(ZERO_CONTRACT)
             .operation_id(&operation_id)
             .signer(&PanickingSigner)
@@ -3532,6 +3754,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let writer = audit_writer(&dir);
         let args = TimelockExecuteArgs::builder()
+            .submission_recorder(&crate::signing::intent_test_helpers::NoLimitRecorder)
             .timelock_contract_strkey(ZERO_CONTRACT)
             .target_strkey(ZERO_CONTRACT)
             .function("upgrade")
@@ -3575,31 +3798,344 @@ mod tests {
 
     #[test]
     fn cancel_submit_error_passes_the_mainnet_refusal_through() {
-        let operation_id = TimelockOperationId::from_bytes([3u8; 32]);
-        let mapped = cancel_submit_error(SaError::MainnetWriteForbidden, &operation_id, "req-2");
+        let mapped = cancel_submit_error(SaError::MainnetWriteForbidden, "req-2");
         assert!(
             matches!(mapped, SaError::MainnetWriteForbidden),
             "the mainnet refusal must keep its variant, got {mapped:?}"
         );
-        let wrapped = cancel_submit_error(other_submit_error(), &operation_id, "req-2");
+        let wrapped = cancel_submit_error(other_submit_error(), "req-2");
         assert!(
             matches!(wrapped, SaError::TimelockCancelFailed { ref request_id, .. } if request_id == "req-2"),
             "another error must still be wrapped, got {wrapped:?}"
         );
     }
 
+    /// Answers as a testnet endpoint whose timelock panics with
+    /// `InvalidOperationState` on every simulation, which is what the contract
+    /// does for an operation that was never scheduled.
+    struct NeverScheduled;
+
+    impl wiremock::Respond for NeverScheduled {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            use stellar_agent_test_support::signed_envelope::{
+                account_id_for_seed, get_network_result, ledger_entries_result_for,
+            };
+
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "getNetwork" => {
+                    get_network_result(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE)
+                }
+                "getLatestLedger" => serde_json::json!({
+                    "id": "ab".repeat(32), "sequence": 1000, "protocolVersion": 27
+                }),
+                "getLedgerEntries" => {
+                    ledger_entries_result_for(&[account_id_for_seed([0x51; 32]).as_str()])
+                }
+                "simulateTransaction" => serde_json::json!({
+                    "error": "HostError: Error(Contract, #4002)", "latestLedger": 1000
+                }),
+                other => panic!("the fixture does not serve {other}"),
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": body["id"], "result": result
+            }))
+        }
+    }
+
+    /// A cancel of an operation that was never scheduled is refused with the
+    /// check, and neither end of the identifier reaches the returned error, its
+    /// Debug form or any event.
+    #[test]
+    #[serial_test::serial]
+    fn cancelling_a_never_scheduled_operation_states_the_check() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        use stellar_agent_test_support::rejected_value::{
+            assert_no_marker, assert_no_marker_in_text,
+        };
+
+        let mut bytes = [0xab; 32];
+        bytes[..4].copy_from_slice(&[0xc0, 0xff, 0xee, 0x42]);
+        bytes[28..].copy_from_slice(&[0x1c, 0xed, 0x7e, 0xa5]);
+        let operation_id = TimelockOperationId::from_bytes(bytes);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let writer = audit_writer(&dir);
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x51; 32]);
+        let mut returned = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            returned = Some(runtime.block_on(async {
+                let server = wiremock::MockServer::start().await;
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .respond_with(NeverScheduled)
+                    .mount(&server)
+                    .await;
+                let uri = server.uri();
+                let secondary = stellar_agent_test_support::second_loopback_host(&uri);
+                cancel(
+                    TimelockCancelArgs::builder()
+                        .intent_admission(crate::signing::intent_test_helpers::no_value_admission())
+                        .timelock_contract_strkey(ZERO_CONTRACT)
+                        .operation_id(&operation_id)
+                        .signer(&signer)
+                        .primary_rpc_url(&uri)
+                        .secondary_rpc_url(&secondary)
+                        .network_passphrase(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE)
+                        .audit_writer(&writer)
+                        .request_id("req-never-scheduled")
+                        .build(),
+                )
+                .await
+            }));
+        });
+        let error = returned.unwrap().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SaError::TimelockCancelFailed {
+                    failure_reason: TimelockCancelFailureReason::InvalidOperationState,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .ends_with("; operation_id must identify a pending scheduled operation"),
+            "{error}"
+        );
+        for fragment in ["c0ffee42", "1ced7ea5"] {
+            assert_no_marker(&error, fragment);
+            assert_no_marker_in_text(&logs, fragment);
+        }
+    }
+
     #[test]
     fn execute_submit_error_passes_the_mainnet_refusal_through() {
-        let operation_id = TimelockOperationId::from_bytes([3u8; 32]);
-        let mapped = execute_submit_error(SaError::MainnetWriteForbidden, &operation_id, "req-3");
+        let mapped = execute_submit_error(SaError::MainnetWriteForbidden, "req-3");
         assert!(
             matches!(mapped, SaError::MainnetWriteForbidden),
             "the mainnet refusal must keep its variant, got {mapped:?}"
         );
-        let wrapped = execute_submit_error(other_submit_error(), &operation_id, "req-3");
+        let wrapped = execute_submit_error(other_submit_error(), "req-3");
         assert!(
             matches!(wrapped, SaError::TimelockExecuteFailed { ref request_id, .. } if request_id == "req-3"),
             "another error must still be wrapped, got {wrapped:?}"
         );
+    }
+
+    /// A refusal of the timelock with `label`, whose text is the RPC 30.0.1
+    /// host error and whose event carries `code`.
+    fn described_refusal(label: &str, code: u32) -> TimelockSubmitFailure {
+        use crate::managers::rules::event_reason_tests::{encode, error_topics, invoke_envelope};
+        let envelope = invoke_envelope(
+            &ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash([0x52; 32]))),
+            vec![],
+            vec![],
+        );
+        crate::managers::rules::simulation_refusal(
+            crate::managers::rules::event_reason_tests::RPC30_ERROR,
+            &encode(&[(Some([0x52; 32]), error_topics(code), ScVal::Void)]),
+            &envelope,
+            |class| SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!("{label} simulation returned error: {class}"),
+            },
+        )
+    }
+
+    /// The rendering of the shown error of [`described_refusal`].
+    fn shown_text(label: &str, code: u32) -> String {
+        format!("{}", described_refusal(label, code).into_shown())
+    }
+
+    /// Asserts that `reason` is `expected` with exactly one OZ annotation.
+    fn assert_one_annotation(reason: &str, expected: &str) {
+        assert_eq!(reason, expected);
+        assert_eq!(reason.matches("[OZ:").count(), 1, "{reason}");
+    }
+
+    /// The failure labels and wire codes come from the text error; the
+    /// reason is the shown error's rendering, passed unchanged.
+    #[test]
+    fn timelock_labels_ignore_event_reasons() {
+        let text_only = |label: &str| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!(
+                "{label} simulation returned error: Error(Auth, InvalidAction)"
+            ),
+        };
+        for code in [4004, 4002, 4005] {
+            let schedule = schedule_submit_error(described_refusal("schedule", code), "req");
+            assert_eq!(
+                schedule.wire_code(),
+                schedule_submit_error(text_only("schedule"), "req").wire_code()
+            );
+            match schedule {
+                SaError::TimelockScheduleFailed {
+                    failure_reason: TimelockScheduleFailureReason::SimulationFailed,
+                    redacted_reason,
+                    ..
+                } => assert_one_annotation(&redacted_reason, &shown_text("schedule", code)),
+                other => panic!("schedule keeps the simulation label, got {other:?}"),
+            }
+            let cancel = cancel_submit_error(described_refusal("cancel", code), "req");
+            assert_eq!(
+                cancel.wire_code(),
+                cancel_submit_error(text_only("cancel"), "req").wire_code()
+            );
+            match cancel {
+                SaError::TimelockCancelFailed {
+                    failure_reason: TimelockCancelFailureReason::SimulationFailed,
+                    redacted_reason,
+                    ..
+                } => assert_one_annotation(&redacted_reason, &shown_text("cancel", code)),
+                other => panic!("cancel keeps the simulation label, got {other:?}"),
+            }
+            let execute = execute_submit_error(described_refusal("execute", code), "req");
+            assert_eq!(
+                execute.wire_code(),
+                execute_submit_error(text_only("execute"), "req").wire_code()
+            );
+            match execute {
+                SaError::TimelockExecuteFailed {
+                    failure_reason: TimelockExecuteFailureReason::SimulationFailed,
+                    redacted_reason,
+                    ..
+                } => assert_one_annotation(&redacted_reason, &shown_text("execute", code)),
+                other => panic!("execute keeps the simulation label, got {other:?}"),
+            }
+        }
+
+        let old = |code: u32| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("simulation returned error: Error(Contract, #{code})"),
+        };
+        assert!(matches!(
+            schedule_submit_error(old(4004), "req"),
+            SaError::TimelockScheduleFailed {
+                failure_reason: TimelockScheduleFailureReason::Unauthorized,
+                ..
+            }
+        ));
+        assert!(matches!(
+            cancel_submit_error(old(4004), "req"),
+            SaError::TimelockCancelFailed {
+                failure_reason: TimelockCancelFailureReason::Unauthorized,
+                ..
+            }
+        ));
+        assert!(matches!(
+            cancel_submit_error(old(4002), "req"),
+            SaError::TimelockCancelFailed {
+                failure_reason: TimelockCancelFailureReason::InvalidOperationState,
+                ..
+            }
+        ));
+        assert!(matches!(
+            execute_submit_error(old(4002), "req"),
+            SaError::TimelockExecuteFailed {
+                failure_reason: TimelockExecuteFailureReason::InvalidOperationState,
+                ..
+            }
+        ));
+    }
+
+    /// A checked hash endpoint that refuses with the RPC 30.0.1 host error and
+    /// a timelock event carrying 4004 when `refuses`, and answers a hash
+    /// otherwise.
+    async fn hash_endpoint(refuses: bool) -> wiremock::MockServer {
+        use crate::managers::rules::event_reason_tests::{
+            RPC30_ERROR, encode, error_topics, refusal_result,
+        };
+        use stellar_agent_test_support::signed_envelope::get_network_result;
+        use stellar_xdr::WriteXdr as _;
+        let server = wiremock::MockServer::start().await;
+        let refusal = refusal_result(
+            RPC30_ERROR,
+            &encode(&[(
+                Some(
+                    stellar_strkey::Contract::from_string(ZERO_CONTRACT)
+                        .unwrap()
+                        .0,
+                ),
+                error_topics(4004),
+                ScVal::Void,
+            )]),
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = match body["method"].as_str().unwrap() {
+                    "getNetwork" => {
+                        get_network_result(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE)
+                    }
+                    "simulateTransaction" if refuses => refusal.clone(),
+                    "simulateTransaction" => serde_json::json!({
+                        "latestLedger": 1000,
+                        "minResourceFee": "100",
+                        "transactionData": stellar_xdr::SorobanTransactionData::default()
+                            .to_xdr_base64(stellar_xdr::Limits::none())
+                            .unwrap(),
+                        "results": [{
+                            "auth": [],
+                            "xdr": ScVal::Bytes(vec![7; 32].try_into().unwrap())
+                                .to_xdr_base64(stellar_xdr::Limits::none())
+                                .unwrap(),
+                        }],
+                    }),
+                    other => panic!("unexpected method {other}"),
+                };
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": result,
+                }))
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Both `hash_operation` refusals show the timelock's event code and keep
+    /// the fixed simulation label.
+    #[tokio::test]
+    async fn hash_operation_refusal_shows_the_event_code() {
+        for (primary_refuses, prefix) in [(true, "primary"), (false, "secondary")] {
+            let primary = hash_endpoint(primary_refuses).await;
+            let secondary = hash_endpoint(!primary_refuses).await;
+            let result = simulate_hash_operation(
+                ZERO_CONTRACT,
+                ZERO_CONTRACT,
+                "upgrade",
+                &[ScVal::U32(9)],
+                &[2; 32],
+                &[3; 32],
+                &primary.uri(),
+                &stellar_agent_test_support::second_loopback_host(&secondary.uri()),
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                "hash-refusal",
+                false,
+            )
+            .await;
+            match result {
+                Err(SaError::TimelockExecuteFailed {
+                    failure_reason: TimelockExecuteFailureReason::SimulationFailed,
+                    redacted_reason,
+                    ..
+                }) => assert_eq!(
+                    redacted_reason,
+                    format!("{prefix} simulation error: Error(Contract, #4004) [OZ:Unauthorized]")
+                ),
+                other => panic!("{prefix}: expected the simulation refusal, got {other:?}"),
+            }
+        }
     }
 }

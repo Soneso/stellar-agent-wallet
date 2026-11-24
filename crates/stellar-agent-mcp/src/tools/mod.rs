@@ -37,13 +37,18 @@
 // Shared decimal-string <-> i128 parse helpers for the DeFi tool args (dex,
 // vault, dex) and other i128-carrying wire fields.
 pub(crate) mod amount_wire;
+pub(crate) mod approval_status;
 pub(crate) mod balances;
+pub(crate) mod business_entry;
+pub(crate) mod canonical_commit;
 pub(crate) mod common;
 pub(crate) mod create_account;
 pub(crate) mod fee_stats;
 pub(crate) mod friendbot;
+pub(crate) mod message_signing;
 pub(crate) mod mpp;
 pub(crate) mod pay;
+pub(crate) mod sep43_effects;
 pub(crate) mod sep43_get_address;
 pub(crate) mod sep43_get_network;
 pub(crate) mod sep43_sign_and_submit_transaction;
@@ -88,3 +93,34 @@ pub(crate) mod rule_create;
 // The mainnet refusal at entry of the commit and sign-and-submit tools.
 #[cfg(test)]
 mod mainnet_entry_refusal_tests;
+
+// The authenticated x402 payment on an enabled mainnet profile.
+#[cfg(all(test, feature = "mainnet-write"))]
+mod x402_authenticated_mainnet_tests;
+
+// Mainnet consent at the commit boundary: presence-backed version 5 proofs only.
+#[cfg(all(test, feature = "mainnet-write"))]
+mod mainnet_presence_tests;
+
+// Business ids at the value tools: replay, conflict, mismatch and testnet echo.
+#[cfg(all(test, feature = "mainnet-write"))]
+mod operation_replay_tests;
+
+#[cfg(all(test, feature = "mainnet-write"))]
+mod toolsets_mainnet_tests;
+// Canonical preparation and commit of the create-account, trustline and claim tools.
+#[cfg(all(test, feature = "mainnet-write"))]
+mod canonical_commit_tests;
+
+// The status views and the audit outbox of every mainnet value kind.
+#[cfg(all(test, feature = "mainnet-write"))]
+mod proof_row_status_tests;
+
+#[cfg(test)]
+pub(crate) mod identity_fixture;
+
+#[cfg(test)]
+mod message_signing_tests;
+
+/// Read-only retained intent view.
+pub mod signed_intents;

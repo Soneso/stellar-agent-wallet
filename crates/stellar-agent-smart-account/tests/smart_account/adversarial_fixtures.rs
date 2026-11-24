@@ -27,6 +27,7 @@
 //! | [`contract_mutability_non_address_admin_value`] | fail-closed Mutable on non-address Admin value |
 //! | [`contract_mutability_non_map_instance_storage`] | fail-closed Mutable on a non-instance value under the instance key |
 //! | [`divergence_failure_self_audit_writer`] | write-path divergence failures emit via `self.audit_writer` |
+//! | [`v1_baseline_malformed_verifier_contract`] | `AuditLog` refusal of a version-1 row's malformed verifier contract, without its fragments, on the signers and passkey paths |
 //! | [`wasm_hash_canonicalisation_parity`] | WASM hash canonicalisation regression-lock: byte-identical no-drift + idempotence + first8 formatter determinism |
 //! | [`rule_id_downgrade`] | Rule-ID downgrade regression-lock: 5 divergence sub-codes + wire-code mapping + comparator ordering |
 //! | [`multicall_inner_invocation_count_cap_51_inner`] | Amplification-defence via `evaluate_bundle` (51-inner deny + 49/50 boundary) |
@@ -127,6 +128,9 @@ mod contract_mutability_non_map_instance_storage;
 
 #[path = "../smart-account-fixtures/adversarial/divergence_failure_self_audit_writer.rs"]
 mod divergence_failure_self_audit_writer;
+
+#[path = "../smart-account-fixtures/adversarial/v1_baseline_malformed_verifier_contract.rs"]
+mod v1_baseline_malformed_verifier_contract;
 
 #[cfg(feature = "test-helpers")]
 #[path = "../smart-account-fixtures/adversarial/wasm_hash_canonicalisation_parity.rs"]

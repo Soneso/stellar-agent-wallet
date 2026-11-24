@@ -1,0 +1,41 @@
+{
+  "test_kind": "sequence",
+  "name": "floor_fresh_boundary",
+  "category": "extended_grammar",
+  "description": "The floor is absolute: balance 10000 minus reservations 3000 minus debit 2000 and fee 500 leaves exactly the 4500 floor, which passes with a 120000 ms old observation. One more stroop of debit or of fee refuses.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "amount_stroops": "2000", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", "total_fee_stroops": 500 },
+      "account": { "balance_stroops": 10000, "observed_age_ms": 120000, "reservations_stroops": 3000 },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "2001", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", "total_fee_stroops": 500 },
+      "account": { "balance_stroops": 10000, "observed_age_ms": 0, "reservations_stroops": 3000 },
+      "expected": {
+        "kind": "Deny",
+        "deny_reason": "account.floor_refused",
+        "wire_code": "account.floor_refused",
+        "reason": { "AccountFloorRefused": { "min_stroops": "4500", "balance_after_stroops": "4499" } }
+      }
+    },
+    {
+      "args": { "amount_stroops": "2000", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", "total_fee_stroops": 501 },
+      "account": { "balance_stroops": 10000, "observed_age_ms": 0, "reservations_stroops": 3000 },
+      "expected": {
+        "kind": "Deny",
+        "deny_reason": "account.floor_refused",
+        "wire_code": "account.floor_refused",
+        "reason": { "AccountFloorRefused": { "min_stroops": "4500", "balance_after_stroops": "4499" } }
+      }
+    }
+  ]
+}

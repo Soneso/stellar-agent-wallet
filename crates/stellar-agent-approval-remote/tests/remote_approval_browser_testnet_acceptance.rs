@@ -15,6 +15,8 @@
 //! 1. `stellar_pay` (under a `RequireApproval` policy) parks a real payment
 //!    approval against funded testnet accounts — the same production path
 //!    `approve_serve_testnet_acceptance.rs` exercises for the loopback server.
+//!    A signed, verified fixture policy binds the entry for recovery; a
+//!    direct preparation queues a new payment approval only under one.
 //! 2. `start_remote_serve` binds the real TLS listener on loopback with
 //!    `rp_id = "localhost"` and a real `rcgen` self-signed certificate, with
 //!    an EMPTY credential allowlist — enrollment does not require one, and
@@ -72,10 +74,6 @@
     clippy::panic,
     reason = "test-only; panics and unwraps are acceptable in testnet acceptance tests"
 )]
-#![allow(
-    unsafe_code,
-    reason = "test-only STELLAR_AGENT_HOME override for isolated TLS cert storage, matching stellar_agent_approval_remote::tls's own test convention"
-)]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -102,20 +100,18 @@ use stellar_agent_core::approval::operator_credentials::{
 use stellar_agent_core::audit_log::schema::EventKind;
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
 use stellar_agent_core::audit_log::writer::AuditWriter;
-use stellar_agent_core::policy::v1::{
-    AccountIdentityView, AccountReservesView, CounterpartyCacheView, Sep10SessionView,
-    Sep45SessionView,
-};
-use stellar_agent_core::policy::{
-    ApprovalRequest, Decision as PolicyDecision, PolicyEngine, PolicyError, ToolDescriptor,
-};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::timefmt;
 use stellar_agent_mcp::server::{StellarPayArgs, StellarPayCommitArgs, WalletServer};
-use stellar_agent_network::{StellarRpcClient, fetch_account};
+use stellar_agent_network::{AssetType, StellarRpcClient, fetch_account};
+use stellar_agent_test_support::StellarAgentHomeGuard;
 use stellar_agent_test_support::keyring_mock;
+use stellar_agent_test_support::sandbox::StateSandbox;
 use tempfile::TempDir;
 use zeroize::Zeroizing;
+
+mod common;
+use common::RequireApprovalEngine;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -133,30 +129,8 @@ const PAYMENT_STROOPS: i64 = 10_000_000; // 1 XLM
 /// resolves from `localhost` on any standard host.
 const TEST_RP_ID: &str = "localhost";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RequireApproval policy engine — forces stellar_pay to park a pending entry
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct RequireApprovalEngine;
-
-impl PolicyEngine for RequireApprovalEngine {
-    fn evaluate(
-        &self,
-        _tool: &ToolDescriptor,
-        _args: &serde_json::Value,
-        _profile: &Profile,
-        _account_view: Option<&dyn AccountReservesView>,
-        _identity_view: Option<&dyn AccountIdentityView>,
-        _counterparty_cache: Option<&dyn CounterpartyCacheView>,
-        _sep10_sessions: Option<&dyn Sep10SessionView>,
-        _sep45_sessions: Option<&dyn Sep45SessionView>,
-    ) -> Result<PolicyDecision, PolicyError> {
-        Ok(PolicyDecision::RequireApproval(ApprovalRequest::new(
-            "remote-approval-browser-testnet-acceptance".into(),
-            600,
-        )))
-    }
-}
+/// The reason every pending approval of this suite carries.
+const REQUIRE_APPROVAL_REASON: &str = "remote-approval-browser-testnet-acceptance";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Testnet helpers
@@ -173,14 +147,9 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 2xx for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 async fn wait_until_queryable(g_strkey: &str) {
@@ -201,7 +170,7 @@ async fn native_balance_stroops(g_strkey: &str) -> i64 {
         .expect("fetch_account must succeed for a funded, queryable account");
     view.balances
         .iter()
-        .find(|b| b.asset.asset_type == "native")
+        .find(|b| b.asset.asset_type == AssetType::Native)
         .map(|b| b.balance_stroops().expect("native balance parses"))
         .unwrap_or(0)
 }
@@ -226,6 +195,20 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .expect("signer keyring entry")
         .set_password(&s_strkey)
         .expect("set signing key");
+    // The identity record an enrollment stores beside the seed.
+    stellar_agent_network::keyring::write_keyring_string(
+        &stellar_agent_core::profile::schema::signer_identity_entry_ref(signer_ref),
+        &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .to_bytes(),
+            stellar_agent_core::profile::name::profile_name_for_approval(profile),
+            profile.chain_id,
+        )
+        .render()
+        .expect("an agent record renders"),
+    )
+    .expect("set identity record");
 
     let nonce_ref = &profile.mcp_nonce_key_alias;
     let nonce_key_b64 = URL_SAFE_NO_PAD.encode([0x42u8; 32]);
@@ -363,9 +346,8 @@ async fn launch_chromium() -> (Browser, chromiumoxide::Handler, TempDir) {
 /// Takes the full allowlist (rather than a single id) because this suite
 /// starts the listener TWICE: once with an empty allowlist for the
 /// enrollment ceremony (which needs none), and again with the
-/// just-enrolled credential id once it is known — mirroring how
-/// `allowed_credentials` is read once at real listener startup and requires
-/// a restart to pick up a newly enrolled credential.
+/// just-enrolled credential id once it is known. Each start writes the
+/// served profile with that list, which the listener reads at every check.
 async fn start_remote_serve_for_profile(
     server: &WalletServer,
     profile: &Profile,
@@ -394,15 +376,30 @@ async fn start_remote_serve_for_profile(
     let tls = provision_or_load("remote-approval-browser-testnet-acceptance", TEST_RP_ID)
         .expect("TLS cert must provision");
 
-    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let config = RemoteServeConfig::new(
-        bind_addr,
-        TEST_RP_ID,
-        allowed_credentials,
-        ctx,
-        operator_credentials_path,
-        tls,
+    // The listener reads its allowlist from the profile file at every
+    // check, so the served profile is written with `allowed_credentials`.
+    let profile_dir = approval_dir.path().join("profiles");
+    let mut served = profile.clone();
+    served.remote_approval = Some(
+        serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "bind": "127.0.0.1:0",
+            "rp_id": TEST_RP_ID,
+            "allowed_credentials": allowed_credentials,
+        }))
+        .expect("remote approval config"),
     );
+    stellar_agent_core::profile::loader::save_to_dir(&profile_name, &served, &profile_dir)
+        .expect("write the served profile");
+    let authority = stellar_agent_core::approval::RemoteApprovalAuthority::from_paths(
+        profile_name.clone(),
+        profile_dir,
+        operator_credentials_path,
+    )
+    .expect("remote approval authority");
+
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let config = RemoteServeConfig::new(bind_addr, TEST_RP_ID, authority, ctx, tls);
     start_remote_serve(config)
         .await
         .expect("start_remote_serve must succeed")
@@ -567,6 +564,10 @@ async fn assert_result_status_attested(page: &chromiumoxide::Page) {
 #[serial]
 #[ignore = "requires testnet, chromium, and explicit --ignored flag"]
 async fn remote_approval_browser_drives_real_payment_commit() {
+    // The marked home holds TLS and wallet state for the whole body; the
+    // guard restores the inherited value on drop, also after a panic.
+    let tls_home_dir = StateSandbox::new().expect("TLS home sandbox");
+    let _home = StellarAgentHomeGuard::new(tls_home_dir.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (payer_g, payer_seed) = fresh_keypair();
@@ -580,30 +581,7 @@ async fn remote_approval_browser_drives_real_payment_commit() {
 
     let attestation_key = [0x33u8; 32];
     let approval_dir = TempDir::new().expect("approval temp dir");
-    let tls_home_dir = TempDir::new().expect("TLS home temp dir");
     let operator_credentials_path = approval_dir.path().join("operator_credentials.toml");
-
-    // Isolated TLS cert storage: `provision_or_load`'s STELLAR_AGENT_HOME
-    // override only compiles under `cfg(test)` or `test-helpers` — both
-    // active for this crate under the `testnet-acceptance` feature.
-    //
-    // RAII guard ensures the env var is cleared even if this test panics
-    // partway through (otherwise a panic here leaks it for the rest of the
-    // process's lifetime, affecting any sibling test that reads it) —
-    // mirrors the `ProxyGuard` pattern used for the same class of problem in
-    // `stellar-agent-smart-account`'s `list_rules_no_indexer_call_mock.rs`.
-    struct StellarAgentHomeGuard;
-    impl Drop for StellarAgentHomeGuard {
-        fn drop(&mut self) {
-            unsafe {
-                std::env::remove_var("STELLAR_AGENT_HOME");
-            }
-        }
-    }
-    let _stellar_agent_home_guard = StellarAgentHomeGuard;
-    unsafe {
-        std::env::set_var("STELLAR_AGENT_HOME", tls_home_dir.path());
-    }
 
     let mut profile =
         Profile::builder_testnet("stellar-agent", &payer_g, "stellar-agent-nonce", &payer_g)
@@ -614,7 +592,12 @@ async fn remote_approval_browser_drives_real_payment_commit() {
 
     let mut server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     server.set_approval_dir_for_test(approval_dir.path().to_path_buf());
-    server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine));
+    server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine {
+        reason: REQUIRE_APPROVAL_REASON,
+    }));
+    // A direct preparation queues a new payment approval only under a
+    // signed, verified policy; the synthetic engine above carries none.
+    server.set_payment_recovery_policy_for_test(common::payment_recovery_policy(&server));
 
     // ── 1. Simulate under RequireApproval: parks a real pending entry ───────
     let sim = server
@@ -630,6 +613,7 @@ async fn remote_approval_browser_drives_real_payment_commit() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate must succeed against funded accounts");
@@ -751,6 +735,7 @@ async fn remote_approval_browser_drives_real_payment_commit() {
             label: "test-browser-authenticator".to_owned(),
             registered_at_unix_ms: timefmt::now_unix_ms().expect("clock read"),
             sign_count: None,
+            source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
         })
         .expect("operator credential enrollment must succeed with the page-displayed values");
 
@@ -842,6 +827,18 @@ async fn remote_approval_browser_drives_real_payment_commit() {
         .expect("attestation decodes as base64")
         .try_into()
         .expect("attestation is 32 bytes");
+    let stored = stellar_agent_core::approval::PendingApprovalStore::open(
+        approval_dir
+            .path()
+            .join(format!("{}.toml", server.profile_name_for_approval())),
+    )
+    .expect("open approval store")
+    .get(&approval_nonce)
+    .expect("the approved request is persisted")
+    .clone();
+    let scope = stored
+        .attestation_scope()
+        .expect("the approved request names a readable attestation layout");
     assert!(
         stellar_agent_core::approval::verify_attestation(
             &attestation_key,
@@ -852,6 +849,7 @@ async fn remote_approval_browser_drives_real_payment_commit() {
             &approval_nonce,
             &envelope_sha256,
             &uid,
+            &scope,
             &attestation_bytes,
         ),
         "the browser-surfaced attestation must verify against the attestation key"
@@ -903,11 +901,12 @@ async fn remote_approval_browser_drives_real_payment_commit() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce,
-            expires_at_unix_ms,
-            envelope_xdr,
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: Some(approval_nonce),
             approval_attestation: Some(attestation_b64),
+            business_id: None,
         })
         .await
         .expect("commit must pass the gate and submit on-chain");

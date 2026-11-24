@@ -33,7 +33,11 @@ use super::rpc_mock_helpers::{
 /// signer-set / threshold-policy paths, it is a pure read against the rule's
 /// `policies` list.
 #[tokio::test]
+#[serial_test::serial]
 async fn unknown_wasm_hash_returns_spending_limit_not_installed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     let policy = policy_sc_address();
@@ -88,7 +92,11 @@ async fn unknown_wasm_hash_returns_spending_limit_not_installed() {
 /// An empty `policies` list also returns `SpendingLimitNotInstalled` — there is
 /// nothing to check, and the operator action is identical to the zero-match case.
 #[tokio::test]
+#[serial_test::serial]
 async fn empty_policies_list_returns_spending_limit_not_installed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     // ContextRule has NO policies attached.

@@ -32,7 +32,6 @@
 
 use std::sync::Arc;
 
-use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
 use serial_test::serial;
@@ -42,6 +41,7 @@ use stellar_agent_core::policy::v1::{
 use stellar_agent_core::policy::{
     Decision, DenyReason, McpToolRegistration, PolicyEngine, ToolDescriptor,
 };
+use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 use stellar_agent_core::profile::schema::{PolicyConfig, PolicyEngineKind, Profile};
 use stellar_agent_mcp::server::{StellarBalancesArgs, WalletServer};
 use tempfile::TempDir;
@@ -67,6 +67,126 @@ fn sign_policy_toml(policy_body: &str, sk: &SigningKey, owner_id: &str) -> Strin
     let sig: [u8; 64] = sk.sign(&d).to_bytes();
     let sig_hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
     format!("{policy_body}\n[signature]\nowner_id = \"{owner_id}\"\nsig = \"{sig_hex}\"\n")
+}
+
+#[test]
+#[serial_test::serial]
+fn signed_policy_admits_muxed_x402_without_rewriting_bytes() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::policy::{
+        ToolValueKind,
+        v1::value::{ActionKind, ValueClass, ValueLeg},
+    };
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let owner = stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()).to_string();
+    let asset = stellar_agent_core::asset_id::CanonicalAsset::Native
+        .sac_contract_id(TESTNET_PASSPHRASE)
+        .unwrap();
+    let contract = stellar_strkey::Contract([3; 32]).to_string();
+    let w = stellar_strkey::MuxedContract {
+        contract_id: [3; 32],
+        id: 7,
+    }
+    .to_string();
+    let m = stellar_strkey::ed25519::MuxedAccount {
+        ed25519: [1; 32],
+        id: 7,
+    }
+    .to_string();
+    let g = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+    for (payee, kinds, listed, budget) in [
+        (w.as_str(), "C_ACCOUNT", contract.as_str(), false),
+        (w.as_str(), "C_ACCOUNT", w.as_str(), false),
+        (w.as_str(), "G_ACCOUNT", g.as_str(), true),
+        (w.as_str(), "C_ACCOUNT", "", true),
+        (w.as_str(), "", "", false),
+        (m.as_str(), "G_ACCOUNT", g.as_str(), false),
+        (m.as_str(), "C_ACCOUNT", contract.as_str(), true),
+    ] {
+        let unlisted = if budget {
+            format!(
+                ", unlisted = {{ mode = \"budget\", asset = \"{asset}\", per_tx_stroops = 10, per_period_stroops = 20, window = \"1d\" }}"
+            )
+        } else {
+            String::new()
+        };
+        let criterion = if kinds.is_empty() {
+            String::new()
+        } else {
+            let list = if listed.is_empty() {
+                String::new()
+            } else {
+                format!("\"{listed}\"")
+            };
+            format!(
+                "{{ kind = \"counterparty_allowlist\", kinds = [\"{kinds}\"], allowlist = [{list}]{unlisted} }},"
+            )
+        };
+        let body = format!(
+            "version = 2\nscope = \"profile:muxed\"\nsequence = 1\n[[rules]]\nmatch = {{ tool = \"*\", chain = \"*\" }}\ncriteria = [{criterion}{{kind = \"per_tx_cap\", asset = \"{asset}\", max_stroops = 100}}, {{kind = \"per_period_cap\", asset = \"{asset}\", max_stroops = 100, window = \"1d\"}}]\ndecision = \"allow\"\n"
+        );
+        let signed = sign_policy_toml(&body, &key, &owner);
+        let before = canonical_bytes(&signed).unwrap();
+        for name in [
+            "stellar_x402_create_payment",
+            "stellar_x402_authenticated_payment",
+        ] {
+            let document = stellar_agent_core::policy::v1::loader::load_signed_policy_text(
+                &signed,
+                "muxed",
+                &key.verifying_key().to_bytes(),
+                TESTNET_PASSPHRASE,
+            )
+            .unwrap();
+            let engine = PolicyEngineV1::new(document, "muxed".into());
+            let requirements = stellar_agent_x402::wire::PaymentRequirements {
+                scheme: "exact".into(),
+                network: "stellar:testnet".into(),
+                asset: asset.clone(),
+                amount: "1".into(),
+                pay_to: payee.into(),
+                max_timeout_seconds: 60,
+                extra: serde_json::json!({"areFeesSponsored": true}),
+            };
+            let amount = stellar_agent_x402::exact::validate_requirements_for_payment(
+                &requirements,
+                TESTNET_PASSPHRASE,
+            )
+            .unwrap();
+            let tool = ToolDescriptor::from_registration(&McpToolRegistration {
+                name,
+                destructive_hint: true,
+                read_only_hint: false,
+                chain_id_required: true,
+                value_kind: ToolValueKind::MovesValue,
+            });
+            let profile = Profile::builder_testnet_named("muxed", "s", "a", "n", "a").build();
+            let decision = engine
+                .evaluate_with_value(
+                    &tool,
+                    &serde_json::json!({"chain_id": "stellar:testnet"}),
+                    &profile,
+                    ValueClass::single(ValueLeg {
+                        kind: ActionKind::X402Payment,
+                        amount: Some(amount),
+                        asset: Some(requirements.asset),
+                        destination: Some(requirements.pay_to),
+                    }),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1_700_000_000_000,
+                )
+                .unwrap();
+            assert_eq!(decision, Decision::Allow, "{name}: {payee}");
+            assert_eq!(canonical_bytes(&signed).unwrap(), before);
+            assert_eq!(sign_policy_toml(&body, &key, &owner), signed);
+        }
+    }
 }
 
 /// Writes `content` to `<dir>/<name>` and returns the path.
@@ -97,6 +217,183 @@ fn balances_args_value() -> serde_json::Value {
         "account_id": "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
         "assets_count": 0,
     })
+}
+
+#[test]
+#[serial]
+fn keyringless_profiles_serve_reads_and_refuse_signing() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    for named in [false, true] {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let mut command = crate::common::server_binary::server_command(home.path());
+        if named {
+            std::fs::create_dir(home.path().join("profiles")).unwrap();
+            std::fs::write(
+                home.path().join("profiles/readonly.toml"),
+                stellar_agent_test_support::profile_fixtures::noop_profile_toml(
+                    "readonly",
+                    "stellar:testnet",
+                    "https://testnet.example.invalid",
+                ),
+            )
+            .unwrap();
+            command.args(["--profile", "readonly"]);
+        }
+        let mut child = command
+            .env("STELLAR_AGENT_HOME", home.path())
+            .env_remove("STELLAR_AGENT_PROFILE")
+            .env_remove("STELLAR_AGENT_CHAIN_ID")
+            .env_remove("STELLAR_AGENT_RPC_URL")
+            .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+            .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", "invalid-key")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut call = |message: serde_json::Value| {
+            writeln!(stdin, "{message}").unwrap();
+            stdin.flush().unwrap();
+            let mut line = String::new();
+            assert!(
+                stdout.read_line(&mut line).unwrap() > 0,
+                "server starts without a backend"
+            );
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+        let init = call(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "readonly-test", "version": "1"} }
+        }));
+        assert!(
+            init["result"]["capabilities"]["tools"].is_object(),
+            "{init}"
+        );
+        let read = call(serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "stellar_sep43_get_network", "arguments": {} }
+        }));
+        let envelope: serde_json::Value =
+            serde_json::from_str(read["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["data"]["networkPassphrase"], TESTNET_PASSPHRASE);
+        let signed = call(serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "stellar_sep43_sign_message",
+                "arguments": { "chain_id": "stellar:testnet", "message": "read-only host" } }
+        }));
+        let envelope: serde_json::Value =
+            serde_json::from_str(signed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            envelope["error"]["code"], "auth.keyring_platform_error",
+            "{envelope}"
+        );
+        drop(stdin);
+        assert!(child.wait_with_output().unwrap().status.success());
+    }
+}
+
+#[test]
+#[serial]
+fn engine_selection_refuses_unreadable_owner_state() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let mut profile = build_v1_profile("unreadable_selection");
+    profile.policy.engine = PolicyEngineKind::Noop;
+    let entry = &profile.policy_owner_key_id;
+    stellar_agent_test_support::keyring_mock::inject_error(
+        &entry.service,
+        &entry.account,
+        keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked"))),
+    )
+    .unwrap();
+    let error = WalletServer::new_with_policy_dir_for_test(profile, TempDir::new().unwrap().path())
+        .err()
+        .unwrap();
+    let stellar_agent_core::policy::BuildRegistryError::OwnerKeyringReadFailed { code, .. } = error
+    else {
+        panic!("typed keyring error required: {error}");
+    };
+    assert_eq!(code, "auth.keyring_platform_error");
+}
+
+#[test]
+#[serial]
+fn unsigned_engine_selection_refuses_before_payment() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    let suffix = "engine_selection";
+    let name = test_profile_name(suffix);
+    let (key, owner) = fresh_keypair();
+    install_owner_key_in_mock_keyring(suffix, &owner);
+    let mut profile = build_v1_profile(suffix);
+    let dir = TempDir::new().unwrap();
+    let body = format!(
+        "version = 2\nscope = \"profile:{name}\"\nsequence = 1\n[[rules]]\nmatch = {{tool = \"stellar_pay\", chain = \"*\"}}\ncriteria = [{{kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"1\"}}]\ndecision = \"allow\"\n"
+    );
+    write_policy_file(
+        &dir,
+        &format!("{name}.toml"),
+        &sign_policy_toml(&body, &key, "owner"),
+    );
+    WalletServer::new_with_policy_dir_for_test(profile.clone(), dir.path()).unwrap();
+    profile.policy.engine = PolicyEngineKind::Noop;
+    let error = WalletServer::new_with_policy_dir_for_test(profile.clone(), dir.path())
+        .err()
+        .unwrap();
+    let stellar_agent_core::policy::BuildRegistryError::PolicyFileLoadFailed { source, .. } = error
+    else {
+        panic!("typed policy error required");
+    };
+    assert_eq!(source.wire_code(), "policy.engine_selection_unsigned");
+    assert!(source.to_string().contains("engine selection"));
+    assert!(
+        !stellar_agent_core::profile::schema::default_policy_window_state_path_for(&name).exists()
+    );
+    let authorized = body.replace("sequence = 1", "sequence = 2\nengine = \"noop\"");
+    write_policy_file(
+        &dir,
+        &format!("{name}.toml"),
+        &sign_policy_toml(&authorized, &key, "owner"),
+    );
+    WalletServer::new_with_policy_dir_for_test(profile, dir.path()).unwrap();
+}
+
+#[test]
+#[serial]
+fn engine_selection_refusal_preserves_typed_code() {
+    unsigned_engine_selection_refuses_before_payment();
+}
+
+#[test]
+#[serial]
+fn engine_authorization_keeps_unrelated_behavior() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let mut profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+        .with_noop_engine()
+        .build();
+    profile.policy_owner_key_id.service = "custom-owner-coordinate".into();
+    assert!(
+        stellar_agent_core::profile::owner_key::read_enrolled_owner(&profile)
+            .unwrap()
+            .is_none()
+    );
+    WalletServer::new(profile).unwrap();
 }
 
 /// Builds a testnet `WalletServer` with its policy engine swapped for the
@@ -133,6 +430,9 @@ fn balances_args() -> StellarBalancesArgs {
 #[test]
 #[serial]
 fn signed_allow_rule_evaluates_to_allow() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const BODY: &str = r#"version = 1
 scope = "profile:default"
 
@@ -147,7 +447,8 @@ decision = "allow"
     let signed = sign_policy_toml(BODY, &sk, "GABCDE");
     let path = write_policy_file(&dir, "default.toml", &signed);
 
-    let document = load_signed_policy(&path, "default", &pk).expect("policy must load");
+    let document =
+        load_signed_policy(&path, "default", &pk, TESTNET_PASSPHRASE).expect("policy must load");
     assert!(
         document.signature.is_some(),
         "verified doc must carry signature"
@@ -165,6 +466,7 @@ decision = "allow"
             None,
             None,
             None,
+            1_700_000_000_000,
         )
         .expect("engine evaluation must not error");
 
@@ -184,6 +486,9 @@ decision = "allow"
 #[test]
 #[serial]
 fn signed_deny_rule_evaluates_to_explicit_rule_deny() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const BODY: &str = r#"version = 1
 scope = "profile:default"
 
@@ -198,7 +503,8 @@ decision = "deny"
     let signed = sign_policy_toml(BODY, &sk, "GABCDE");
     let path = write_policy_file(&dir, "default.toml", &signed);
 
-    let document = load_signed_policy(&path, "default", &pk).expect("policy must load");
+    let document =
+        load_signed_policy(&path, "default", &pk, TESTNET_PASSPHRASE).expect("policy must load");
     let engine = PolicyEngineV1::new(document, "default".into());
     let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
 
@@ -212,6 +518,7 @@ decision = "deny"
             None,
             None,
             None,
+            1_700_000_000_000,
         )
         .expect("engine evaluation must not error");
 
@@ -226,6 +533,9 @@ decision = "deny"
 #[test]
 #[serial]
 fn signed_require_approval_rule_evaluates_to_require_approval() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const BODY: &str = r#"version = 1
 scope = "profile:default"
 
@@ -240,7 +550,8 @@ decision = "require_approval"
     let signed = sign_policy_toml(BODY, &sk, "GABCDE");
     let path = write_policy_file(&dir, "default.toml", &signed);
 
-    let document = load_signed_policy(&path, "default", &pk).expect("policy must load");
+    let document =
+        load_signed_policy(&path, "default", &pk, TESTNET_PASSPHRASE).expect("policy must load");
     let engine = PolicyEngineV1::new(document, "default".into());
     let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
 
@@ -254,6 +565,7 @@ decision = "require_approval"
             None,
             None,
             None,
+            1_700_000_000_000,
         )
         .expect("engine evaluation must not error");
 
@@ -275,6 +587,9 @@ decision = "require_approval"
 #[test]
 #[serial]
 fn empty_rules_default_deny_evaluates_to_no_matching_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const BODY: &str = r#"version = 1
 scope = "profile:default"
 "#;
@@ -284,7 +599,8 @@ scope = "profile:default"
     let signed = sign_policy_toml(BODY, &sk, "GABCDE");
     let path = write_policy_file(&dir, "default.toml", &signed);
 
-    let document = load_signed_policy(&path, "default", &pk).expect("policy must load");
+    let document =
+        load_signed_policy(&path, "default", &pk, TESTNET_PASSPHRASE).expect("policy must load");
     let engine = PolicyEngineV1::new(document, "default".into());
     let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
 
@@ -298,6 +614,7 @@ scope = "profile:default"
             None,
             None,
             None,
+            1_700_000_000_000,
         )
         .expect("engine evaluation must not error");
 
@@ -325,7 +642,7 @@ scope = "profile:default"
     let signed = sign_policy_toml(BODY, &sk, "GABCDE");
     let path = write_policy_file(&dir, "default.toml", &signed);
 
-    let err = load_signed_policy(&path, "default", &pk_other)
+    let err = load_signed_policy(&path, "default", &pk_other, TESTNET_PASSPHRASE)
         .expect_err("verification with wrong key must fail");
     use stellar_agent_core::policy::PolicyError;
     assert!(
@@ -358,7 +675,7 @@ decision = "allow"
     let tampered = signed.replace("decision = \"allow\"", "decision = \"deny\"");
     let path = write_policy_file(&dir, "default.toml", &tampered);
 
-    let err = load_signed_policy(&path, "default", &pk)
+    let err = load_signed_policy(&path, "default", &pk, TESTNET_PASSPHRASE)
         .expect_err("tampered body must fail signature verification");
     use stellar_agent_core::policy::PolicyError;
     assert!(
@@ -384,6 +701,9 @@ decision = "allow"
 #[tokio::test]
 #[serial]
 async fn dispatch_gate_routes_v1_deny_to_wire_code() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const BODY: &str = r#"version = 1
 scope = "profile:default"
 
@@ -398,7 +718,8 @@ decision = "deny"
     let signed = sign_policy_toml(BODY, &sk, "GABCDE");
     let path = write_policy_file(&dir, "default.toml", &signed);
 
-    let document = load_signed_policy(&path, "default", &pk).expect("policy must load");
+    let document =
+        load_signed_policy(&path, "default", &pk, TESTNET_PASSPHRASE).expect("policy must load");
     // Engine carries profile_name "default" — but PolicyEngineV1::evaluate
     // resolves scope against `self.profile_name`.  The loader's scope was
     // `profile:default`, so we must construct the engine with the same name
@@ -438,6 +759,9 @@ decision = "deny"
 #[tokio::test]
 #[serial]
 async fn dispatch_gate_routes_v1_require_approval_to_wire_code() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     const BODY: &str = r#"version = 1
 scope = "profile:default"
 
@@ -452,7 +776,8 @@ decision = "require_approval"
     let signed = sign_policy_toml(BODY, &sk, "GABCDE");
     let path = write_policy_file(&dir, "default.toml", &signed);
 
-    let document = load_signed_policy(&path, "default", &pk).expect("policy must load");
+    let document =
+        load_signed_policy(&path, "default", &pk, TESTNET_PASSPHRASE).expect("policy must load");
     let engine = PolicyEngineV1::new(document, "default".into());
     let server = make_server_with_v1_engine(engine);
 
@@ -535,12 +860,9 @@ fn test_profile_name(suffix: &str) -> String {
     format!("{TEST_PROFILE_PREFIX}_{suffix}")
 }
 
-/// Returns the URL-safe base64-encoded (no padding) form of a 32-byte public key.
-///
-/// This matches the format stored by `stellar-agent policy sign` and expected
-/// by `fetch_owner_pubkey_from_keyring` in `server.rs`.
+/// Encodes an enrolled owner's public key in the G-strkey form.
 fn encode_owner_pubkey(pk_bytes: &[u8; 32]) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pk_bytes)
+    stellar_agent_core::profile::owner_key::encode_owner_public_key(pk_bytes)
 }
 
 /// Installs the in-memory mock keyring and populates the
@@ -589,7 +911,17 @@ decision = "allow"
     );
     let signed = sign_policy_toml(&body, &sk, "GABCDE");
 
-    let policy_dir = TempDir::new().unwrap();
+    // One scratch home holds the policy directory and, through
+    // STELLAR_AGENT_HOME, the policy-window state the engine opens.
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    let policy_dir = TempDir::new_in(home.path()).unwrap();
     let policy_filename = format!("{profile_name}.toml");
     write_policy_file(&policy_dir, &policy_filename, &signed);
     install_owner_key_in_mock_keyring(suffix, &pk);
@@ -619,6 +951,9 @@ decision = "allow"
 #[test]
 #[serial]
 fn build_policy_engine_v1_fails_when_owner_key_absent_from_keyring() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let suffix = "missing_keyring";
     let profile_name = test_profile_name(suffix);
 
@@ -662,6 +997,9 @@ scope = "profile:{profile_name}"
 #[test]
 #[serial]
 fn build_policy_engine_v1_fails_when_policy_file_absent() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let suffix = "missing_policy";
     let (_sk, pk) = fresh_keypair();
     install_owner_key_in_mock_keyring(suffix, &pk);

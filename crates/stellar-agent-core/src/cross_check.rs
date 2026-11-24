@@ -3,7 +3,10 @@
 use crate::{
     asset_id::CanonicalAsset,
     error::{NetworkError, WitnessUnavailableReason},
-    profile::{caip2::Caip2, schema::Profile},
+    profile::{
+        caip2::Caip2,
+        schema::{MINIMUM_FLOOR, Profile},
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
@@ -128,6 +131,8 @@ pub enum CrossCheckRequirement {
 pub struct ThresholdSet<'a> {
     /// Effective native threshold, in stroops.
     pub native_stroops: u64,
+    /// Signed per-asset thresholds, which a profile may only tighten.
+    pub signed: Option<&'a BTreeMap<String, i128>>,
     /// Per-asset thresholds.
     pub table: &'a CrossCheckThresholds,
     /// Network used to derive SAC identities.
@@ -140,14 +145,87 @@ impl<'a> ThresholdSet<'a> {
     pub fn from_profile(profile: &'a Profile) -> Self {
         Self {
             native_stroops: profile.effective_cross_check_threshold_stroops(),
+            signed: None,
             table: &profile.cross_check_thresholds,
             network_passphrase: &profile.network_passphrase,
         }
     }
 
+    /// Combines profile and signed restrictions without narrowing signed integers.
+    #[must_use]
+    pub fn from_profile_and_signed(
+        profile: &'a Profile,
+        signed: Option<&'a BTreeMap<String, i128>>,
+    ) -> Self {
+        Self {
+            signed,
+            ..Self::from_profile(profile)
+        }
+    }
+
+    /// Looks up each source using asset equivalence and chooses the smaller threshold.
+    ///
+    /// Off mainnet one available value suffices. On mainnet the result never
+    /// exceeds the value that applies without a profile value: the signed
+    /// threshold, else [`MINIMUM_FLOOR`] for XLM and its SAC, else none, which
+    /// the requirement rule refuses. An unsigned profile value can only lower it.
+    #[must_use]
+    pub fn threshold_for(&self, chain: Caip2, asset: &CanonicalAsset) -> Option<i128> {
+        let profile = self.profile_threshold_for(asset);
+        let signed = self.signed.and_then(|table| {
+            table
+                .iter()
+                .filter(|(key, _)| {
+                    crate::policy::v1::asset_equivalence::assets_equivalent(
+                        key,
+                        &asset.to_string(),
+                        self.network_passphrase,
+                    )
+                })
+                .map(|(_, value)| *value)
+                .min()
+        });
+        let composed = match (profile, signed) {
+            (Some(profile), Some(signed)) => {
+                if profile > signed {
+                    tracing::warn!(
+                        "profile cross-check threshold exceeds signed threshold; using signed \
+                            threshold"
+                    );
+                }
+                Some(profile.min(signed))
+            }
+            (profile, signed) => profile.or(signed),
+        };
+        match chain {
+            Caip2::Testnet => composed,
+            Caip2::Mainnet => {
+                let unprofiled =
+                    signed.or_else(|| self.is_native(asset).then_some(i128::from(MINIMUM_FLOOR)));
+                composed
+                    .zip(unprofiled)
+                    .map(|(value, bound)| value.min(bound))
+            }
+        }
+    }
+
+    /// Whether `asset` is XLM or the native SAC on the set's network.
+    fn is_native(&self, asset: &CanonicalAsset) -> bool {
+        match asset {
+            CanonicalAsset::Native => true,
+            CanonicalAsset::Contract(id) => {
+                CanonicalAsset::Native
+                    .sac_contract_id(self.network_passphrase)
+                    .as_ref()
+                    == Some(id)
+            }
+            CanonicalAsset::Classic { .. } => false,
+        }
+    }
+
     /// Looks up direct identities, classic SAC equivalents, then the native SAC.
     #[must_use]
-    pub fn threshold_for(&self, asset: &CanonicalAsset) -> Option<i128> {
+    fn profile_threshold_for(&self, asset: &CanonicalAsset) -> Option<i128> {
         if *asset == CanonicalAsset::Native {
             return Some(i128::from(self.native_stroops));
         }
@@ -188,7 +266,7 @@ pub fn cross_check_requirement(
     memo_check: bool,
 ) -> Result<CrossCheckRequirement, NetworkError> {
     let threshold = match value {
-        CrossCheckValue::Amount { asset, .. } => thresholds.threshold_for(asset),
+        CrossCheckValue::Amount { asset, .. } => thresholds.threshold_for(chain, asset),
         CrossCheckValue::Unvalued => None,
     };
     let missing_asset = match value {
@@ -366,6 +444,7 @@ mod tests {
     ) -> Result<CrossCheckRequirement, NetworkError> {
         let table = CrossCheckThresholds::default();
         let thresholds = ThresholdSet {
+            signed: None,
             native_stroops: 100,
             table: &table,
             network_passphrase: TESTNET_PASSPHRASE,
@@ -468,6 +547,7 @@ mod tests {
     fn requirement_testnet_asset_without_threshold_skips() {
         let table = CrossCheckThresholds::default();
         let thresholds = ThresholdSet {
+            signed: None,
             native_stroops: 100,
             table: &table,
             network_passphrase: TESTNET_PASSPHRASE,
@@ -509,13 +589,22 @@ mod tests {
         let asset = classic();
         let contract =
             CanonicalAsset::contract(&asset.sac_contract_id(TESTNET_PASSPHRASE).unwrap()).unwrap();
+        let signed = BTreeMap::from([(asset.to_string(), 300)]);
         let table = CrossCheckThresholds::new(BTreeMap::from([(asset, 200)])).unwrap();
         let thresholds = ThresholdSet {
+            signed: Some(&signed),
             native_stroops: 100,
             table: &table,
             network_passphrase: TESTNET_PASSPHRASE,
         };
-        assert_eq!(thresholds.threshold_for(&contract), Some(200));
+        assert_eq!(
+            thresholds.threshold_for(Caip2::Testnet, &contract),
+            Some(200)
+        );
+        assert_eq!(
+            thresholds.threshold_for(Caip2::Mainnet, &contract),
+            Some(200)
+        );
         assert_eq!(
             cross_check_requirement(
                 Caip2::Mainnet,
@@ -533,7 +622,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn requirement_direct_contract_and_native_sac_use_their_thresholds() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let asset =
             CanonicalAsset::contract(&stellar_strkey::Contract([9; 32]).to_string()).unwrap();
         let mut profile = Profile::builder_testnet("signer", "witness", "nonce", "witness").build();
@@ -541,7 +634,7 @@ mod tests {
         profile.cross_check_thresholds =
             CrossCheckThresholds::new(BTreeMap::from([(asset.clone(), 500)])).unwrap();
         let thresholds = ThresholdSet::from_profile(&profile);
-        assert_eq!(thresholds.threshold_for(&asset), Some(500));
+        assert_eq!(thresholds.threshold_for(Caip2::Testnet, &asset), Some(500));
         let native_sac = CanonicalAsset::contract(
             &CanonicalAsset::Native
                 .sac_contract_id(TESTNET_PASSPHRASE)
@@ -549,10 +642,88 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            thresholds.threshold_for(&native_sac),
+            thresholds.threshold_for(Caip2::Testnet, &native_sac),
             Some(i128::from(crate::profile::schema::MINIMUM_FLOOR))
         );
     }
+
+    /// On mainnet an unsigned profile value never raises a threshold above
+    /// the value without it: the signed one, else the floor for XLM and its
+    /// SAC, else none. Off mainnet the profile value applies alone.
+    #[test]
+    fn mainnet_unsigned_profile_thresholds_only_tighten() {
+        let native_sac = CanonicalAsset::contract(
+            &CanonicalAsset::Native
+                .sac_contract_id(TESTNET_PASSPHRASE)
+                .unwrap(),
+        )
+        .unwrap();
+        let floor = i128::from(MINIMUM_FLOOR);
+        let table = CrossCheckThresholds::new(BTreeMap::from([(classic(), 7)])).unwrap();
+        let raised = ThresholdSet {
+            signed: None,
+            native_stroops: 9_000_000_000_000_000,
+            table: &table,
+            network_passphrase: TESTNET_PASSPHRASE,
+        };
+        for asset in [&CanonicalAsset::Native, &native_sac] {
+            assert_eq!(raised.threshold_for(Caip2::Mainnet, asset), Some(floor));
+            assert_eq!(
+                raised.threshold_for(Caip2::Testnet, asset),
+                Some(9_000_000_000_000_000)
+            );
+        }
+        assert_eq!(raised.threshold_for(Caip2::Mainnet, &classic()), None);
+        assert_eq!(raised.threshold_for(Caip2::Testnet, &classic()), Some(7));
+        let lowered = ThresholdSet {
+            native_stroops: 100,
+            ..raised
+        };
+        assert_eq!(
+            lowered.threshold_for(Caip2::Mainnet, &CanonicalAsset::Native),
+            Some(100)
+        );
+        let signed = BTreeMap::from([("native".to_owned(), 50), (classic().to_string(), 5)]);
+        let signed_set = ThresholdSet {
+            signed: Some(&signed),
+            ..lowered
+        };
+        assert_eq!(
+            signed_set.threshold_for(Caip2::Mainnet, &CanonicalAsset::Native),
+            Some(50)
+        );
+        assert_eq!(
+            signed_set.threshold_for(Caip2::Mainnet, &classic()),
+            Some(5)
+        );
+        let large = CrossCheckValue::Amount {
+            asset: &classic(),
+            base_units: i128::MAX,
+        };
+        for memo in [false, true] {
+            assert!(matches!(
+                cross_check_requirement(Caip2::Mainnet, large, &raised, true, memo),
+                Err(NetworkError::WitnessUnavailable {
+                    reason: WitnessUnavailableReason::NoThresholdForAsset { .. }
+                })
+            ));
+        }
+        assert_eq!(
+            cross_check_requirement(
+                Caip2::Mainnet,
+                CrossCheckValue::Amount {
+                    asset: &CanonicalAsset::Native,
+                    base_units: floor,
+                },
+                &raised,
+                true,
+                false
+            )
+            .unwrap(),
+            CrossCheckRequirement::Required
+        );
+    }
+
     #[test]
     fn thresholds_constructor_refuses_native_and_negative_entries() {
         let table = CrossCheckThresholds::new(BTreeMap::from([(classic(), 0)])).unwrap();

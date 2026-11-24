@@ -37,6 +37,7 @@
 //! both crates are already in scope.
 
 use crate::policy::v1::bundle::{BundleStateOverlay, BundleView};
+use crate::policy::v1::criteria::counterparty_allowlist::RecipientClass;
 use crate::policy::{Decision, DenyReason, PolicyEngine, PolicyError, ToolDescriptor};
 use crate::profile::schema::Profile;
 use serde_json::Value;
@@ -74,7 +75,7 @@ pub struct AccountReserveLookupError {
 /// Bundle decomposition and overlay substrate for multicall policy evaluation.
 ///
 /// Provides [`bundle::BundleView`], [`bundle::InnerOpDescriptor`], `BundleStateOverlay`, and
-/// [`bundle::decompose_bundle`].  Consumed by `PolicyEngineV1::evaluate_bundle` and
+/// [`bundle::decompose_bundle_calls`].  Consumed by `PolicyEngineV1::evaluate_bundle` and
 /// injected into `EvalContext::bundle` for bundle-level criteria.
 pub mod bundle;
 
@@ -89,14 +90,28 @@ pub mod value;
 /// Owner-signed policy file loader.
 pub mod loader;
 
+/// The signed approval credentials of a mainnet policy.
+pub mod approval_credentials;
+/// The signed approval origin and certificate pin.
+pub mod approval_origin;
+/// Network-aware classic and contract asset identities.
+pub mod asset_equivalence;
 /// Canonical-form serializer for owner-signature pre-image.
 pub mod canonical;
+/// The required restrictions of a mainnet policy.
+pub mod mainnet_minimum;
+/// Signature verification and guarded policy pin advancement.
+pub mod verified;
 
 /// Owner-signature verification.
 pub mod signature;
 
 /// Closed key sets of the policy file, checked before the owner signature.
 pub mod schema;
+
+/// Mainnet spending presets: derivation, generated policy body, spending
+/// summary, and funding plan.
+pub mod presets;
 
 /// Proptest strategy generators for property tests.  Gate-guarded; excluded
 /// from release builds.
@@ -115,10 +130,13 @@ pub mod proptest_strategies;
 #[cfg(test)]
 mod proptest_properties;
 
+pub use approval_credentials::parse_approval_credentials;
 pub use criteria::Criterion;
 pub use criteria::PolicyStateStore;
 pub use loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId, validate_unsigned_policy};
 pub use schema::validate_policy_keys;
+mod sizing;
+pub use sizing::{CheckedSizing, SizingBasis, SizingOutcome};
 pub use value::{
     ActionKind, OpaqueReason, ValueClass, ValueEffects, ValueGate, ValueLeg, classify_value,
 };
@@ -417,6 +435,211 @@ pub trait AccountReservesView: Send + Sync {
     /// The `detail` field of the error MUST NOT include key material or other
     /// secret input.
     fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError>;
+
+    /// Returns the ledger and time facts of the live account read this view
+    /// carries, or `None` when the view records no read.
+    ///
+    /// The `balance_floor` criterion refuses without an observation and
+    /// checks its age. Only [`ObservedAccount`] supplies one.
+    fn observation(&self) -> Option<AccountObservation> {
+        None
+    }
+
+    /// Returns the native reservations of the profile's open authorizations
+    /// that count against this account, in stroops, or `None` when the view
+    /// carries no sum.
+    ///
+    /// The `balance_floor` criterion subtracts the sum from the balance and
+    /// refuses without one. [`FloorInput`] supplies it.
+    fn effective_native_reservations_stroops(&self) -> Option<u64> {
+        None
+    }
+
+    /// Returns whether the account holds a trustline for `asset`, a canonical
+    /// policy asset id compared under `network_passphrase`.
+    ///
+    /// `Some(true)` when the view shows the trustline, `Some(false)` when the
+    /// view shows that it is absent, and `None` when the view cannot tell.
+    /// The `minimum_reserve` criterion adds one base reserve for a trustline
+    /// leg unless the answer is `Some(true)`.
+    fn holds_trustline(&self, _asset: &str, _network_passphrase: &str) -> Option<bool> {
+        None
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AccountObservation / ObservedAccount / FloorInput
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The ledger and time facts of one live account read.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::v1::AccountObservation;
+///
+/// let observation = AccountObservation {
+///     ledger_sequence: 100,
+///     observed_at_ms: 1_700_000_000_000,
+///     close_time_floor_ms: 1_699_999_995_000,
+/// };
+/// assert_eq!(observation.ledger_sequence, 100);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountObservation {
+    /// The ledger the account read reflects.
+    pub ledger_sequence: u32,
+    /// The host time of the read, in unix milliseconds.
+    pub observed_at_ms: u64,
+    /// A lower bound of that ledger's close time, in unix milliseconds.
+    pub close_time_floor_ms: u64,
+}
+
+/// An account view together with the facts of the live read that produced it.
+///
+/// [`Self::new`] records a live account read: the network crate's account
+/// fetch constructs it right after the read, from the response and the
+/// readiness report of the same client. No other source of the observation
+/// is valid, because the floor check trusts its ledger and its age.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::v1::{
+///     AccountReserveLookupError, AccountReservesView, ObservedAccount,
+/// };
+///
+/// struct Balance(i64);
+/// impl AccountReservesView for Balance {
+///     fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+///         2 * base_reserve_stroops
+///     }
+///     fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+///         Ok(self.0)
+///     }
+/// }
+///
+/// let observed = ObservedAccount::new(Balance(50), 100, 1_000, 900);
+/// assert_eq!(observed.balance_stroops().unwrap(), 50);
+/// assert_eq!(observed.observation().unwrap().ledger_sequence, 100);
+/// ```
+#[derive(Debug, Clone)]
+pub struct ObservedAccount<V: AccountReservesView> {
+    view: V,
+    ledger_sequence: u32,
+    observed_at_ms: u64,
+    close_time_floor_ms: u64,
+}
+
+impl<V: AccountReservesView> ObservedAccount<V> {
+    /// Records a live account read of `view` at `ledger_sequence`, made at
+    /// host time `observed_at_ms`, whose ledger closed no earlier than
+    /// `close_time_floor_ms`.
+    ///
+    /// Callers construct it only from a live account read, immediately after
+    /// the read returns.
+    #[must_use]
+    pub fn new(
+        view: V,
+        ledger_sequence: u32,
+        observed_at_ms: u64,
+        close_time_floor_ms: u64,
+    ) -> Self {
+        Self {
+            view,
+            ledger_sequence,
+            observed_at_ms,
+            close_time_floor_ms,
+        }
+    }
+
+    /// Returns the account view the read produced.
+    #[must_use]
+    pub fn view(&self) -> &V {
+        &self.view
+    }
+}
+
+impl<V: AccountReservesView> AccountReservesView for ObservedAccount<V> {
+    fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+        self.view.reserves_stroops(base_reserve_stroops)
+    }
+
+    fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+        self.view.balance_stroops()
+    }
+
+    fn observation(&self) -> Option<AccountObservation> {
+        Some(AccountObservation {
+            ledger_sequence: self.ledger_sequence,
+            observed_at_ms: self.observed_at_ms,
+            close_time_floor_ms: self.close_time_floor_ms,
+        })
+    }
+
+    fn holds_trustline(&self, asset: &str, network_passphrase: &str) -> Option<bool> {
+        self.view.holds_trustline(asset, network_passphrase)
+    }
+}
+
+/// The account input of the `balance_floor` criterion: an observed account
+/// and the native reservations that count against it.
+///
+/// Callers pass it as the `account_view` of an evaluation. It delegates the
+/// reserve, balance, and observation facts to `observed` and supplies
+/// `effective_reservations_stroops` as the reservation sum.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::v1::{
+///     AccountReserveLookupError, AccountReservesView, FloorInput, ObservedAccount,
+/// };
+///
+/// struct Balance(i64);
+/// impl AccountReservesView for Balance {
+///     fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+///         2 * base_reserve_stroops
+///     }
+///     fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+///         Ok(self.0)
+///     }
+/// }
+///
+/// let observed = ObservedAccount::new(Balance(50), 100, 1_000, 900);
+/// let input = FloorInput { observed: &observed, effective_reservations_stroops: 7 };
+/// assert_eq!(input.effective_native_reservations_stroops(), Some(7));
+/// assert_eq!(input.observation(), observed.observation());
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct FloorInput<'a, V: AccountReservesView> {
+    /// The observed operating account.
+    pub observed: &'a ObservedAccount<V>,
+    /// The native reservations of the profile's authorizations that count
+    /// against the account, in stroops.
+    pub effective_reservations_stroops: u64,
+}
+
+impl<V: AccountReservesView> AccountReservesView for FloorInput<'_, V> {
+    fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+        self.observed.reserves_stroops(base_reserve_stroops)
+    }
+
+    fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+        self.observed.balance_stroops()
+    }
+
+    fn observation(&self) -> Option<AccountObservation> {
+        self.observed.observation()
+    }
+
+    fn effective_native_reservations_stroops(&self) -> Option<u64> {
+        Some(self.effective_reservations_stroops)
+    }
+
+    fn holds_trustline(&self, asset: &str, network_passphrase: &str) -> Option<bool> {
+        self.observed.holds_trustline(asset, network_passphrase)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -581,12 +804,29 @@ pub struct EvalContext<'a> {
     /// `None` on the single-tx path (standard `PolicyEngineV1::evaluate`
     /// call); `Some(&view)` during [`PolicyEngineV1::evaluate_bundle`] where
     /// the view carries the full set of inner descriptors and the in-flight
-    /// state overlay.  Bundle-level criteria check this field; stateful
-    /// criteria (`per_period_cap`, `rate_limit`) add `overlay.get(&state_key)`
-    /// to the persisted window total to account for earlier inners in the same
-    /// bundle.
+    /// state overlay. Stateful criteria combine the overlay with persisted
+    /// usage to account for earlier inners. Amount criteria require an exact
+    /// overlay sum; rate limits retain the count projection.
     ///
     pub bundle: Option<&'a BundleView<'a>>,
+    /// The BLAKE3 digest of the signed policy's canonical bytes.
+    ///
+    /// The epoch of a `total_budget` allocation. All zeros for an engine built
+    /// outside the verified loader; `total_budget` then refuses rather than
+    /// count against an unidentified epoch.
+    pub policy_digest: [u8; 32],
+    /// Whether the evaluation defers the account-dependent criteria.
+    ///
+    /// Set only by [`crate::policy::PolicyEngine::evaluate_provisional`].
+    /// `minimum_reserve` and `balance_floor` pass while it is set; no other
+    /// criterion reads it.
+    pub provisional: bool,
+    /// The evaluation instant in Unix milliseconds.
+    ///
+    /// One evaluation reads time once and every criterion reads this field,
+    /// never the clock, so window queries, session expiry and recorded
+    /// timestamps all agree on a single instant.
+    pub now_ms: u64,
 }
 
 impl<'a> EvalContext<'a> {
@@ -611,6 +851,10 @@ impl<'a> EvalContext<'a> {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use stellar_agent_core::policy::v1::{EvalContext, PolicyStateStore};
     /// use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor};
     /// use stellar_agent_core::profile::schema::Profile;
@@ -625,13 +869,14 @@ impl<'a> EvalContext<'a> {
     /// let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
     /// let args = serde_json::Value::Null;
     /// let store = PolicyStateStore::new();
-    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store);
+    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000);
     /// assert!(ctx.bundle.is_none());
     /// assert!(ctx.account_view.is_none());
     /// assert!(ctx.identity_view.is_none());
     /// assert!(ctx.quorum.is_none());
     /// assert!(ctx.counterparty_cache.is_none());
     /// assert!(ctx.sep45_sessions.is_none());
+    /// # }
     /// ```
     #[must_use]
     pub fn new(
@@ -640,6 +885,7 @@ impl<'a> EvalContext<'a> {
         profile_name: &'a str,
         profile: &'a Profile,
         state_store: &'a PolicyStateStore,
+        now_ms: u64,
     ) -> Self {
         Self {
             tool,
@@ -655,7 +901,30 @@ impl<'a> EvalContext<'a> {
             sep45_sessions: None,
             state_store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms,
         }
+    }
+
+    /// Returns `self` with the `policy_digest` field set.
+    ///
+    /// Builder-style; consumes and returns `self`. Supply the digest of the
+    /// signed policy when a `total_budget` criterion is evaluated directly.
+    #[must_use]
+    pub fn with_policy_digest(mut self, policy_digest: [u8; 32]) -> Self {
+        self.policy_digest = policy_digest;
+        self
+    }
+
+    /// Returns `self` with the `provisional` field set.
+    ///
+    /// Builder-style; consumes and returns `self`. A provisional context lets
+    /// `minimum_reserve` and `balance_floor` pass without an account read.
+    #[must_use]
+    pub fn with_provisional(mut self, provisional: bool) -> Self {
+        self.provisional = provisional;
+        self
     }
 
     /// Returns `self` with the `value` field set.
@@ -698,6 +967,10 @@ impl<'a> EvalContext<'a> {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use stellar_agent_core::policy::v1::{EvalContext, PolicyStateStore, QuorumView};
     /// use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor};
     /// use stellar_agent_core::profile::schema::Profile;
@@ -719,9 +992,10 @@ impl<'a> EvalContext<'a> {
     /// let args = serde_json::Value::Null;
     /// let store = PolicyStateStore::new();
     /// let view = AlwaysSatisfied;
-    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
     ///     .with_quorum(&view);
     /// assert!(ctx.quorum.is_some());
+    /// # }
     /// ```
     #[must_use]
     pub fn with_quorum(mut self, view: &'a dyn QuorumView) -> Self {
@@ -741,6 +1015,10 @@ impl<'a> EvalContext<'a> {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use stellar_agent_core::policy::v1::{
     ///     CounterpartyCacheView, EvalContext, PolicyStateStore,
     /// };
@@ -763,9 +1041,10 @@ impl<'a> EvalContext<'a> {
     /// let args = serde_json::Value::Null;
     /// let store = PolicyStateStore::new();
     /// let cache = EmptyCache;
-    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
     ///     .with_counterparty_cache(&cache);
     /// assert!(ctx.counterparty_cache.is_some());
+    /// # }
     /// ```
     #[must_use]
     pub fn with_counterparty_cache(mut self, cache: &'a dyn CounterpartyCacheView) -> Self {
@@ -781,6 +1060,10 @@ impl<'a> EvalContext<'a> {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use stellar_agent_core::policy::v1::{
     ///     Sep10SessionView, EvalContext, PolicyStateStore,
     /// };
@@ -803,9 +1086,10 @@ impl<'a> EvalContext<'a> {
     /// let args = serde_json::Value::Null;
     /// let store = PolicyStateStore::new();
     /// let sessions = AlwaysActive;
-    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
     ///     .with_sep10_sessions(&sessions);
     /// assert!(ctx.sep10_sessions.is_some());
+    /// # }
     /// ```
     #[must_use]
     pub fn with_sep10_sessions(mut self, view: &'a dyn Sep10SessionView) -> Self {
@@ -821,6 +1105,10 @@ impl<'a> EvalContext<'a> {
     /// # Examples
     ///
     /// ```
+    /// # #[serial_test::serial]
+    /// # fn main() {
+    /// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    /// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     /// use stellar_agent_core::policy::v1::{
     ///     Sep45SessionView, EvalContext, PolicyStateStore,
     /// };
@@ -843,9 +1131,10 @@ impl<'a> EvalContext<'a> {
     /// let args = serde_json::Value::Null;
     /// let store = PolicyStateStore::new();
     /// let sessions = AlwaysActive;
-    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+    /// let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
     ///     .with_sep45_sessions(&sessions);
     /// assert!(ctx.sep45_sessions.is_some());
+    /// # }
     /// ```
     #[must_use]
     pub fn with_sep45_sessions(mut self, view: &'a dyn Sep45SessionView) -> Self {
@@ -927,9 +1216,25 @@ pub struct PolicyEngineV1 {
     /// store when sharing state across engine instances.  The default constructor
     /// allocates a fresh per-engine store.
     state_store: PolicyStateStore,
+    /// The BLAKE3 digest of the signed policy's canonical bytes, the epoch of
+    /// its `total_budget` allocations.
+    ///
+    /// Set by the verified loader through `new_verified`; all zeros for an
+    /// engine built with [`PolicyEngineV1::new`] or
+    /// [`PolicyEngineV1::new_with_store`].
+    policy_digest: [u8; 32],
 }
 
 impl PolicyEngineV1 {
+    /// Whether a rule explicitly names `tool` or matches all tools.
+    #[must_use]
+    pub fn has_rule_for_tool(&self, tool: &str) -> bool {
+        self.document
+            .rules
+            .iter()
+            .any(|rule| rule.r#match.tool == "*" || rule.r#match.tool == tool)
+    }
+
     /// Constructs a `PolicyEngineV1` from a verified [`PolicyDocument`] and
     /// the owning profile name.
     ///
@@ -959,6 +1264,7 @@ impl PolicyEngineV1 {
             profile_name,
             project_id,
             state_store: PolicyStateStore::new(),
+            policy_digest: [0; 32],
         }
     }
 
@@ -997,7 +1303,42 @@ impl PolicyEngineV1 {
             profile_name,
             project_id,
             state_store,
+            policy_digest: [0; 32],
         }
+    }
+
+    /// Constructs the engine of a verified policy, recording the digest of
+    /// `canonical_bytes`, the bytes its owner signature covers.
+    ///
+    /// The digest is the one [`crate::mainnet::verified_policy::VerifiedPolicy::digest`]
+    /// reports, so `total_budget` counts against the policy the loader
+    /// verified.
+    pub(crate) fn new_verified(
+        document: PolicyDocument,
+        profile_name: String,
+        state_store: PolicyStateStore,
+        canonical_bytes: &[u8],
+    ) -> Self {
+        Self {
+            policy_digest: crate::mainnet::verified_policy::policy_digest(canonical_bytes),
+            ..Self::new_with_store(document, profile_name, state_store)
+        }
+    }
+
+    /// Returns the engine with `policy_digest` set, for tests that evaluate a
+    /// `total_budget` criterion without the verified loader.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    pub fn with_policy_digest_for_test(mut self, policy_digest: [u8; 32]) -> Self {
+        self.policy_digest = policy_digest;
+        self
+    }
+
+    /// Returns the BLAKE3 digest of the signed policy's canonical bytes, or
+    /// all zeros for an engine built outside the verified loader.
+    #[must_use]
+    pub fn policy_digest(&self) -> [u8; 32] {
+        self.policy_digest
     }
 
     /// Returns all rules from `self.document` when the document scope matches
@@ -1061,6 +1402,13 @@ impl PolicyEngineV1 {
         }
     }
 
+    /// The rules selected by admission, using the profile and project cached
+    /// when this engine was constructed.
+    #[must_use]
+    pub fn effective_rules(&self) -> Vec<&PolicyRule> {
+        self.matching_rules(&self.profile_name, self.project_id.as_deref())
+    }
+
     /// Kept for back-compat during parallel-track merging.
     ///
     /// Delegates to [`PolicyEngineV1::matching_rules`].  Callers in existing
@@ -1077,6 +1425,44 @@ impl PolicyEngineV1 {
 }
 
 impl PolicyEngine for PolicyEngineV1 {
+    fn opaque_signing_opted_in(&self, tool: &ToolDescriptor) -> bool {
+        self.matching_rules(&self.profile_name, self.project_id.as_deref())
+            .into_iter()
+            .find(|rule| rule.matches_tool(tool))
+            .is_some_and(|rule| rule.allow_opaque_signing)
+    }
+
+    fn evaluate_in_snapshot(
+        &self,
+        inputs: crate::policy::PolicyEvaluationInputs<'_>,
+        snapshot: &crate::policy::PolicyEvaluationSnapshot,
+    ) -> Result<crate::policy::Evaluation, PolicyError> {
+        let value = inputs
+            .value
+            .unwrap_or_else(|| value::derive_value_class(&inputs.tool.name, inputs.args));
+        self.assert_value_kind_populated(inputs.tool, &value);
+        let (decision, class, rule_ordinal) = self.evaluate_inner(
+            inputs.tool,
+            inputs.args,
+            inputs.profile,
+            &value,
+            inputs.account_view,
+            inputs.identity_view,
+            inputs.counterparty_cache,
+            inputs.sep10_sessions,
+            inputs.sep45_sessions,
+            inputs.provisional,
+            snapshot.now_ms(),
+            &snapshot.state,
+        )?;
+        Ok(crate::policy::Evaluation {
+            value_effects: value_effects_on_permitted_decision(&decision, &value, class),
+            decision,
+            provisional: inputs.provisional,
+            rule_ordinal,
+        })
+    }
+
     /// Evaluates whether the given tool call is permitted under the active profile.
     ///
     /// Uses first-match stop-semantics over the rules in the scope resolved
@@ -1111,6 +1497,7 @@ impl PolicyEngine for PolicyEngineV1 {
         counterparty_cache: Option<&dyn CounterpartyCacheView>,
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         self.evaluate_full(
             tool,
@@ -1121,6 +1508,7 @@ impl PolicyEngine for PolicyEngineV1 {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            now_ms,
         )
         .map(|e| e.decision)
     }
@@ -1135,6 +1523,7 @@ impl PolicyEngine for PolicyEngineV1 {
         counterparty_cache: Option<&dyn CounterpartyCacheView>,
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<crate::policy::Evaluation, PolicyError> {
         // Derive the typed value descriptor from the same (tool, args) the
         // criteria gate on. Two-phase classic tools carry the resolved keys in
@@ -1143,7 +1532,7 @@ impl PolicyEngine for PolicyEngineV1 {
         // supply their resolved effects via `evaluate_with_value_full` instead.
         let value = value::derive_value_class(&tool.name, args);
         self.assert_value_kind_populated(tool, &value);
-        let decision = self.evaluate_inner(
+        let (decision, class, rule_ordinal) = self.evaluate_inner(
             tool,
             args,
             profile,
@@ -1153,10 +1542,15 @@ impl PolicyEngine for PolicyEngineV1 {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            false,
+            now_ms,
+            &self.state_store,
         )?;
         Ok(crate::policy::Evaluation {
-            value_effects: value_effects_on_permitted_decision(&decision, &value),
+            value_effects: value_effects_on_permitted_decision(&decision, &value, class),
             decision,
+            provisional: false,
+            rule_ordinal,
         })
     }
 
@@ -1171,6 +1565,7 @@ impl PolicyEngine for PolicyEngineV1 {
         counterparty_cache: Option<&dyn CounterpartyCacheView>,
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         self.evaluate_with_value_full(
             tool,
@@ -1182,6 +1577,7 @@ impl PolicyEngine for PolicyEngineV1 {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            now_ms,
         )
         .map(|e| e.decision)
     }
@@ -1197,12 +1593,13 @@ impl PolicyEngine for PolicyEngineV1 {
         counterparty_cache: Option<&dyn CounterpartyCacheView>,
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
+        now_ms: u64,
     ) -> Result<crate::policy::Evaluation, PolicyError> {
         // The dispatch site resolved the value from the SAME decoded requirements
         // it signs (the single-decode invariant); use it as-is and echo it back
         // for allowed and approval-required calls so recording uses the gate sizing.
         self.assert_value_kind_populated(tool, &value);
-        let decision = self.evaluate_inner(
+        let (decision, class, rule_ordinal) = self.evaluate_inner(
             tool,
             args,
             profile,
@@ -1212,10 +1609,55 @@ impl PolicyEngine for PolicyEngineV1 {
             counterparty_cache,
             sep10_sessions,
             sep45_sessions,
+            false,
+            now_ms,
+            &self.state_store,
         )?;
         Ok(crate::policy::Evaluation {
-            value_effects: value_effects_on_permitted_decision(&decision, &value),
+            value_effects: value_effects_on_permitted_decision(&decision, &value, class),
             decision,
+            provisional: false,
+            rule_ordinal,
+        })
+    }
+
+    /// Evaluates with `minimum_reserve` and `balance_floor` deferred: both pass
+    /// without an account read, and every other criterion decides as in
+    /// [`PolicyEngine::evaluate_with_value_full`], escalations included. The
+    /// result is marked provisional.
+    fn evaluate_provisional(
+        &self,
+        tool: &ToolDescriptor,
+        args: &Value,
+        profile: &Profile,
+        value: value::ValueClass,
+        account_view: Option<&dyn AccountReservesView>,
+        identity_view: Option<&dyn AccountIdentityView>,
+        counterparty_cache: Option<&dyn CounterpartyCacheView>,
+        sep10_sessions: Option<&dyn Sep10SessionView>,
+        sep45_sessions: Option<&dyn Sep45SessionView>,
+        now_ms: u64,
+    ) -> Result<crate::policy::Evaluation, PolicyError> {
+        self.assert_value_kind_populated(tool, &value);
+        let (decision, class, rule_ordinal) = self.evaluate_inner(
+            tool,
+            args,
+            profile,
+            &value,
+            account_view,
+            identity_view,
+            counterparty_cache,
+            sep10_sessions,
+            sep45_sessions,
+            true,
+            now_ms,
+            &self.state_store,
+        )?;
+        Ok(crate::policy::Evaluation {
+            value_effects: value_effects_on_permitted_decision(&decision, &value, class),
+            decision,
+            provisional: true,
+            rule_ordinal,
         })
     }
 
@@ -1230,6 +1672,61 @@ impl PolicyEngine for PolicyEngineV1 {
         PolicyEngineV1::record_confirmed(self, tool, profile, value)
     }
 
+    fn size_unvalued_call(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        reason: OpaqueReason,
+        now_ms: u64,
+    ) -> Result<SizingOutcome, PolicyError> {
+        if let Some(reason) = self.unvalued_refusal(tool, profile, reason, now_ms)? {
+            return Ok(SizingOutcome::Refused(reason));
+        }
+        let effective = self.effective_unvalued(tool, reason);
+        let basis = self.sizing_basis(tool, SizingBasis::Unvalued);
+        let entries = self.size_window_entries(tool, profile, &effective, now_ms)?;
+        Ok(SizingOutcome::Sized(CheckedSizing::new(basis, entries)?))
+    }
+
+    fn record_confirmed_checked(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &ValueClass,
+    ) -> Result<SizingOutcome, PolicyError> {
+        let now_ms = sample_policy_instant("record_confirmed_checked")?;
+        let (basis, effective) = match value {
+            ValueClass::Value(_) => (SizingBasis::MeasuredValue, value.clone()),
+            ValueClass::ReadOnly => (SizingBasis::NoValue, ValueClass::ReadOnly),
+            ValueClass::Opaque(reason) => {
+                if let Some(reason) = self.unvalued_refusal(tool, profile, *reason, now_ms)? {
+                    return Ok(SizingOutcome::Refused(reason));
+                }
+                (
+                    SizingBasis::Unvalued,
+                    self.effective_unvalued(tool, *reason),
+                )
+            }
+        };
+        let entries = self.record_confirmed_at(tool, profile, &effective, now_ms)?;
+        Ok(SizingOutcome::Sized(CheckedSizing::new(
+            self.sizing_basis(tool, basis),
+            entries,
+        )?))
+    }
+
+    fn size_no_value(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        now_ms: u64,
+    ) -> Result<CheckedSizing, PolicyError> {
+        CheckedSizing::new(
+            self.sizing_basis(tool, SizingBasis::NoValue),
+            self.size_window_entries(tool, profile, &ValueClass::ReadOnly, now_ms)?,
+        )
+    }
+
     /// Returns `Some(&self.state_store)` — see the trait method's
     /// documentation for why a caller needs this to refresh a long-lived
     /// engine's window state before evaluation.
@@ -1239,17 +1736,49 @@ impl PolicyEngine for PolicyEngineV1 {
 }
 
 /// Carries the resolved value effects for calls that may proceed after any
-/// required approval. Denials and calls without sized value carry no effects.
+/// required approval, with the recipient class the evaluation assigned.
+/// Denials and calls without sized value carry no effects.
 fn value_effects_on_permitted_decision(
     decision: &Decision,
     value: &value::ValueClass,
+    class: Option<RecipientClass>,
 ) -> Option<value::ValueEffects> {
     match (decision, value) {
         (Decision::Allow | Decision::RequireApproval(_), value::ValueClass::Value(effects)) => {
-            Some(effects.clone())
+            Some(effects.clone().with_recipient_class(class))
         }
         _ => None,
     }
+}
+
+/// Returns the strictest recipient class the counterparty criteria of `rule`
+/// assign to the call, or `None` when no counterparty criterion classifies it.
+///
+/// The criteria are found by type, as the loader finds them.
+fn strictest_recipient_class(
+    rule: &PolicyRule,
+    ctx: &EvalContext<'_>,
+) -> Result<Option<RecipientClass>, PolicyError> {
+    let mut strictest = None;
+    for criterion in &rule.criteria {
+        let Some(counterparty) = (criterion.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<criteria::CounterpartyAllowlistCriterion>()
+        else {
+            continue;
+        };
+        strictest = RecipientClass::stricter(strictest, counterparty.recipient_class(ctx)?);
+    }
+    Ok(strictest)
+}
+
+/// Samples the policy instant for an entry point that receives none, so the
+/// whole operation observes that one sample. A failure is a criterion
+/// evaluation failure naming the operation, since no criterion can run
+/// without an instant.
+fn sample_policy_instant(operation: &str) -> Result<u64, PolicyError> {
+    crate::policy::policy_now_ms().map_err(|error| PolicyError::CriterionEvaluationFailed {
+        detail: format!("{operation}: {error}"),
+    })
 }
 
 impl PolicyEngineV1 {
@@ -1279,6 +1808,13 @@ impl PolicyEngineV1 {
     /// (which derives `value`) and [`PolicyEngine::evaluate_with_value`] (which
     /// receives it). Honours the per-rule `allow_opaque_signing` exemption by
     /// treating an opaque value as read-only for a rule that opted in.
+    ///
+    /// Returns the decision; for a permitted decision, the strictest
+    /// recipient class of the matched rule's counterparty criteria; and the
+    /// zero-based document position of the rule that decided it. The position
+    /// counts every rule in the resolved scope, before tool filtering, and is
+    /// `None` for the default-deny. `provisional` defers the account-dependent
+    /// criteria.
     #[allow(clippy::too_many_arguments)]
     fn evaluate_inner(
         &self,
@@ -1291,12 +1827,15 @@ impl PolicyEngineV1 {
         counterparty_cache: Option<&dyn CounterpartyCacheView>,
         sep10_sessions: Option<&dyn Sep10SessionView>,
         sep45_sessions: Option<&dyn Sep45SessionView>,
-    ) -> Result<Decision, PolicyError> {
-        // project_id is cached at engine construction time from STELLAR_AGENT_PROJECT.
-        let rules = self.matching_rules(&self.profile_name, self.project_id.as_deref());
+        provisional: bool,
+        now_ms: u64,
+        state_store: &PolicyStateStore,
+    ) -> Result<(Decision, Option<RecipientClass>, Option<usize>), PolicyError> {
+        let rules = self.effective_rules();
 
-        // First-match stop-semantics.
-        for rule in rules {
+        // First-match stop-semantics. The ordinal is taken before the tool
+        // filter so it names the rule's position in the document.
+        for (ordinal, rule) in rules.into_iter().enumerate() {
             if !rule.matches_tool(tool) {
                 continue;
             }
@@ -1326,30 +1865,41 @@ impl PolicyEngineV1 {
                 counterparty_cache,
                 sep10_sessions,
                 sep45_sessions,
-                state_store: &self.state_store,
+                state_store,
                 // Single-tx path: no bundle view.
                 bundle: None,
+                policy_digest: self.policy_digest,
+                provisional,
+                now_ms,
             };
 
             let mut escalation = None;
             for criterion in &rule.criteria {
                 match criterion.evaluate_decision(&ctx)? {
                     Decision::Allow => {}
-                    Decision::Deny(deny) => return Ok(Decision::Deny(deny)),
+                    Decision::Deny(deny) => {
+                        return Ok((Decision::Deny(deny), None, Some(ordinal)));
+                    }
                     Decision::RequireApproval(request) => {
                         escalation.get_or_insert(request);
                     }
                 }
             }
 
-            return Ok(match (&rule.decision, escalation) {
+            let decision = match (&rule.decision, escalation) {
                 (Decision::Allow, Some(request)) => Decision::RequireApproval(request),
                 _ => rule.decision.clone(),
-            });
+            };
+            let class = if matches!(decision, Decision::Deny(_)) {
+                None
+            } else {
+                strictest_recipient_class(rule, &ctx)?
+            };
+            return Ok((decision, class, Some(ordinal)));
         }
 
         // No matching rule — default-deny.
-        Ok(Decision::Deny(DenyReason::NoMatchingRule))
+        Ok((Decision::Deny(DenyReason::NoMatchingRule), None, None))
     }
 
     /// Returns the profile name this engine was constructed for.
@@ -1375,7 +1925,7 @@ impl PolicyEngineV1 {
     /// single-derivation invariant).
     ///
     /// `value` MUST be the SAME [`value::ValueClass`] the original gate
-    /// evaluated (the `value_action_submitted` audit row's `ValueEffects`
+    /// evaluated (the `value_action_pending` audit row's `ValueEffects`
     /// wrapped back into a `ValueClass::Value`, or `ValueClass::ReadOnly` for
     /// a call that carries no resolved value effects) — never re-derived.
     ///
@@ -1392,14 +1942,120 @@ impl PolicyEngineV1 {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] if any criterion's
-    /// `record_confirmed` fails (state-store lock poisoning or a clock read
-    /// failure).
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] if the policy clock
+    /// cannot be sampled or any criterion's `record_confirmed` fails
+    /// (state-store lock poisoning).
     pub fn record_confirmed(
         &self,
         tool: &ToolDescriptor,
         profile: &Profile,
         value: &value::ValueClass,
+    ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
+        let now_ms = sample_policy_instant("record_confirmed")?;
+        self.record_confirmed_at(tool, profile, value, now_ms)
+    }
+
+    /// Records a confirmed call at the supplied instant; every criterion of the
+    /// matched rule stamps its entries with `now_ms`.
+    fn record_confirmed_at(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &value::ValueClass,
+        now_ms: u64,
+    ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
+        self.accounting_entries(tool, profile, value, now_ms, |criterion, ctx| {
+            criterion.record_confirmed(ctx)
+        })
+    }
+
+    /// Sizes the first matching rule's holds without changing its state store.
+    ///
+    /// # Errors
+    /// Returns the criterion's sizing error.
+    pub fn size_window_entries(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &value::ValueClass,
+        now_ms: u64,
+    ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
+        self.accounting_entries(tool, profile, value, now_ms, |criterion, ctx| {
+            criterion
+                .size(ctx, now_ms)
+                .map(|entry| entry.into_iter().collect())
+        })
+    }
+
+    fn sizing_basis(&self, tool: &ToolDescriptor, applicable: SizingBasis) -> SizingBasis {
+        if self
+            .matching_rules(&self.profile_name, self.project_id.as_deref())
+            .into_iter()
+            .find(|rule| rule.matches_tool(tool))
+            .is_some_and(|rule| rule.criteria.iter().any(|criterion| criterion.windowed()))
+        {
+            applicable
+        } else {
+            SizingBasis::NoApplicableLimit
+        }
+    }
+
+    fn unvalued_refusal(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        reason: OpaqueReason,
+        now_ms: u64,
+    ) -> Result<Option<DenyReason>, PolicyError> {
+        let effective = self.effective_unvalued(tool, reason);
+        if matches!(effective, ValueClass::Opaque(_)) {
+            // Count admission uses the durable store under its lock.
+            // The value refusal walk cannot prune the engine's live entries.
+            let refusal_store = PolicyStateStore::new();
+            let mut ctx = EvalContext::new(
+                tool,
+                &Value::Null,
+                &self.profile_name,
+                profile,
+                &refusal_store,
+                now_ms,
+            );
+            ctx.value = effective.clone();
+            if let Some(rule) = self
+                .matching_rules(&self.profile_name, self.project_id.as_deref())
+                .into_iter()
+                .find(|rule| rule.matches_tool(tool))
+            {
+                for criterion in &rule.criteria {
+                    if let Some(reason @ DenyReason::UnsizableValueEffect { .. }) =
+                        criterion.evaluate(&ctx)?
+                    {
+                        return Ok(Some(reason));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn effective_unvalued(&self, tool: &ToolDescriptor, reason: OpaqueReason) -> ValueClass {
+        if self.opaque_signing_opted_in(tool) {
+            ValueClass::ReadOnly
+        } else {
+            ValueClass::Opaque(reason)
+        }
+    }
+
+    fn accounting_entries(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &value::ValueClass,
+        now_ms: u64,
+        mut account: impl FnMut(
+            &dyn Criterion,
+            &EvalContext<'_>,
+        ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError>,
     ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
         let rules = self.matching_rules(&self.profile_name, self.project_id.as_deref());
         for rule in rules {
@@ -1420,10 +2076,13 @@ impl PolicyEngineV1 {
                 sep45_sessions: None,
                 state_store: &self.state_store,
                 bundle: None,
+                policy_digest: self.policy_digest,
+                provisional: false,
+                now_ms,
             };
             let mut recorded = Vec::new();
             for criterion in &rule.criteria {
-                recorded.extend(criterion.record_confirmed(&ctx)?);
+                recorded.extend(account(criterion.as_ref(), &ctx)?);
             }
             return Ok(recorded);
         }
@@ -1447,7 +2106,9 @@ impl PolicyEngineV1 {
     ///
     /// 1. Reject bundles with `> 50` inners (hard floor; amplification defence).
     /// 2. Resolve the matching rule via [`Self::matching_rules`].  If no rule
-    ///    matches, return `Deny(NoMatchingRule)`.
+    ///    matches, return `Deny(NoMatchingRule)`. When a criterion of the rule
+    ///    records each inner ([`Criterion::records_bundle_inners`]), a `Generic`
+    ///    inner returns `Deny(BundleContainsGenericKind)`.
     /// 3. Build a mutable [`BundleStateOverlay`].
     /// 4. Phase 1 — per-inner evaluation of non-bundle-level criteria.
     ///    For each inner descriptor in `bundle.inners`:
@@ -1496,9 +2157,9 @@ impl PolicyEngineV1 {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] if any criterion's
-    /// `evaluate` call returns an error (e.g. i128 overflow in
-    /// `bundle_aggregate_cap`).
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] if the policy clock
+    /// cannot be sampled or any criterion's `evaluate` call returns an error
+    /// (e.g. i128 overflow in `bundle_aggregate_cap`).
     ///
     pub fn evaluate_bundle(
         &self,
@@ -1506,6 +2167,20 @@ impl PolicyEngineV1 {
         args: &Value,
         profile: &Profile,
         bundle: &BundleView<'_>,
+    ) -> Result<Decision, PolicyError> {
+        let now_ms = sample_policy_instant("evaluate_bundle")?;
+        self.evaluate_bundle_at(tool, args, profile, bundle, now_ms)
+    }
+
+    /// Evaluates a bundle at the supplied instant; every per-inner and
+    /// bundle-level context carries `now_ms`.
+    fn evaluate_bundle_at(
+        &self,
+        tool: &ToolDescriptor,
+        args: &Value,
+        profile: &Profile,
+        bundle: &BundleView<'_>,
+        now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         use crate::policy::v1::criteria::inner_invocation_count_cap::DEFAULT_INNER_INVOCATION_COUNT_CAP;
 
@@ -1528,6 +2203,20 @@ impl PolicyEngineV1 {
             return Ok(Decision::Deny(DenyReason::NoMatchingRule));
         };
 
+        // A criterion that records each inner of a confirmed bundle cannot
+        // size an unrecognized inner at confirmation, so the bundle refuses
+        // before any inner is evaluated and is never submitted unrecordable.
+        if rule.criteria.iter().any(|c| c.records_bundle_inners())
+            && let Some(index) = bundle
+                .inners
+                .iter()
+                .position(|inner| matches!(inner, bundle::InnerOpDescriptor::Generic { .. }))
+        {
+            return Ok(Decision::Deny(DenyReason::BundleContainsGenericKind {
+                inner_index: u32::try_from(index).unwrap_or(u32::MAX),
+            }));
+        }
+
         // Build a mutable overlay for accumulating per-inner state.
         let mut overlay = BundleStateOverlay::default();
 
@@ -1549,10 +2238,14 @@ impl PolicyEngineV1 {
                     inners: bundle.inners,
                     overlay: &overlay,
                 };
-                // Populate the value axis from this inner's typed descriptor so
-                // value criteria read ctx.value uniformly. Generic inners map to
-                // ReadOnly (they contribute nothing to value caps).
+                // The matched rule can exempt unsizable calls from its value criteria.
                 let value = value::value_class_for_inner(inner);
+                let value =
+                    if rule.allow_opaque_signing && matches!(value, value::ValueClass::Opaque(_)) {
+                        value::ValueClass::ReadOnly
+                    } else {
+                        value
+                    };
                 let ctx = EvalContext {
                     tool,
                     args,
@@ -1567,6 +2260,9 @@ impl PolicyEngineV1 {
                     sep45_sessions: None,
                     state_store: &self.state_store,
                     bundle: Some(&inner_view),
+                    policy_digest: self.policy_digest,
+                    provisional: false,
+                    now_ms,
                 };
                 let mut per_inner_deny: Option<DenyReason> = None;
                 for criterion in &rule.criteria {
@@ -1623,6 +2319,9 @@ impl PolicyEngineV1 {
                     sep45_sessions: None,
                     state_store: &self.state_store,
                     bundle: None,
+                    policy_digest: self.policy_digest,
+                    provisional: false,
+                    now_ms,
                 };
                 for criterion in &rule.criteria {
                     if criterion.is_bundle_level() {
@@ -1658,6 +2357,9 @@ impl PolicyEngineV1 {
             sep45_sessions: None,
             state_store: &self.state_store,
             bundle: Some(&final_view),
+            policy_digest: self.policy_digest,
+            provisional: false,
+            now_ms,
         };
 
         // Implicit coupling: any value-summing bundle cap on the matched rule
@@ -1721,18 +2423,40 @@ impl PolicyEngineV1 {
     /// while `BundlePerPeriodCapCriterion` / `BundleRateLimitCriterion` record
     /// once per matching inner.
     ///
+    /// A criterion whose [`Criterion::records_bundle_inners`] is true
+    /// (`total_budget`, and `counterparty_allowlist` with an unlisted budget)
+    /// instead records each inner as a call of its own. Its context carries
+    /// the inner's value and the recipient class the rule's counterparty
+    /// criteria assign it without views, as [`Self::evaluate_bundle`] and the
+    /// bundle overlay saw it.
+    ///
     /// Mutates `self.state_store` in place and returns every
     /// `(key, timestamp_ms, amount)` tuple appended, for the caller to persist.
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] if any criterion's
-    /// `record_confirmed` fails.
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] if the policy clock
+    /// cannot be sampled, if any criterion's `record_confirmed` fails, or if a
+    /// criterion that records each inner meets an inner that is not a
+    /// recognized transfer.
     pub fn record_confirmed_bundle(
         &self,
         tool: &ToolDescriptor,
         profile: &Profile,
         bundle: &BundleView<'_>,
+    ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
+        let now_ms = sample_policy_instant("record_confirmed_bundle")?;
+        self.record_confirmed_bundle_at(tool, profile, bundle, now_ms)
+    }
+
+    /// Records a confirmed bundle at the supplied instant; every criterion of
+    /// the matched rule stamps its entries with `now_ms`.
+    fn record_confirmed_bundle_at(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        bundle: &BundleView<'_>,
+        now_ms: u64,
     ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
         let rules = self.matching_rules(&self.profile_name, self.project_id.as_deref());
         for rule in rules {
@@ -1753,14 +2477,95 @@ impl PolicyEngineV1 {
                 sep45_sessions: None,
                 state_store: &self.state_store,
                 bundle: Some(bundle),
+                policy_digest: self.policy_digest,
+                provisional: false,
+                now_ms,
             };
             let mut recorded = Vec::new();
             for criterion in &rule.criteria {
-                recorded.extend(criterion.record_confirmed(&ctx)?);
+                if criterion.records_bundle_inners() {
+                    for inner in bundle.inners {
+                        recorded.extend(self.record_confirmed_inner(
+                            rule,
+                            criterion.as_ref(),
+                            tool,
+                            profile,
+                            inner,
+                            now_ms,
+                        )?);
+                    }
+                } else {
+                    recorded.extend(criterion.record_confirmed(&ctx)?);
+                }
             }
             return Ok(recorded);
         }
         Ok(Vec::new())
+    }
+
+    /// Records one inner of a confirmed bundle for a criterion that records
+    /// each inner as a call of its own.
+    ///
+    /// The inner's value carries the strictest recipient class of the rule's
+    /// counterparty criteria, classified without views as the bundle
+    /// evaluation classified it. Every inner records at the bundle's instant
+    /// `now_ms`.
+    fn record_confirmed_inner(
+        &self,
+        rule: &PolicyRule,
+        criterion: &dyn Criterion,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        inner: &bundle::InnerOpDescriptor,
+        now_ms: u64,
+    ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
+        let value::ValueClass::Value(effects) = value::value_class_for_inner(inner) else {
+            return Err(PolicyError::CriterionEvaluationFailed {
+                detail: format!(
+                    "{}: a confirmed bundle of tool '{}' carries an inner that is not a \
+                     recognized transfer and cannot be recorded",
+                    criterion.kind(),
+                    tool.name
+                ),
+            });
+        };
+        let mut ctx = EvalContext {
+            tool,
+            args: &Value::Null,
+            profile_name: &self.profile_name,
+            profile,
+            value: value::ValueClass::Value(effects.clone()),
+            account_view: None,
+            identity_view: None,
+            quorum: None,
+            counterparty_cache: None,
+            sep10_sessions: None,
+            sep45_sessions: None,
+            state_store: &self.state_store,
+            bundle: None,
+            policy_digest: self.policy_digest,
+            provisional: false,
+            now_ms,
+        };
+        let class = strictest_recipient_class(rule, &ctx)?;
+        ctx.value = value::ValueClass::Value(effects.with_recipient_class(class));
+        criterion.record_confirmed(&ctx)
+    }
+
+    /// Records a bundle and certifies the basis of its window entries.
+    ///
+    /// # Errors
+    /// Returns an error when a criterion cannot record its entries.
+    pub fn record_confirmed_bundle_checked(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        bundle: &BundleView<'_>,
+    ) -> Result<SizingOutcome, PolicyError> {
+        Ok(SizingOutcome::Sized(CheckedSizing::new(
+            self.sizing_basis(tool, SizingBasis::MeasuredValue),
+            self.record_confirmed_bundle(tool, profile, bundle)?,
+        )?))
     }
 }
 
@@ -1780,8 +2585,43 @@ mod tests {
     use crate::policy::v1::bundle::InnerOpDescriptor;
     use crate::policy::{McpToolRegistration, ToolDescriptor};
 
+    /// The fixed evaluation instant of the tests that supply one. Tests that
+    /// also reach a sampling entry point fix the policy clock at it.
+    const TEST_NOW_MS: u64 = 1_700_000_000_000;
+
     struct ReserveOnlyView;
     struct WithIdentityView;
+
+    /// A view that holds a trustline for every asset.
+    struct TrustingView;
+
+    impl AccountReservesView for TrustingView {
+        fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+            base_reserve_stroops.saturating_mul(3)
+        }
+
+        fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+            Ok(100_000_000)
+        }
+
+        fn holds_trustline(&self, _asset: &str, _network_passphrase: &str) -> Option<bool> {
+            Some(true)
+        }
+    }
+
+    /// The observed account and the floor input answer the trustline
+    /// question of the view they wrap.
+    #[test]
+    fn observed_and_floor_views_answer_the_wrapped_trustlines() {
+        let observed = ObservedAccount::new(TrustingView, 100, 1_000, 900);
+        let input = FloorInput {
+            observed: &observed,
+            effective_reservations_stroops: 0,
+        };
+        let passphrase = crate::profile::caip2::TESTNET_PASSPHRASE;
+        assert_eq!(observed.holds_trustline("USDC:G", passphrase), Some(true));
+        assert_eq!(input.holds_trustline("USDC:G", passphrase), Some(true));
+    }
 
     impl AccountReservesView for ReserveOnlyView {
         fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
@@ -2087,7 +2927,11 @@ mod tests {
     // ── PolicyEngineV1::evaluate — empty document → NoMatchingRule ──────────
 
     #[test]
+    #[serial_test::serial]
     fn evaluate_empty_document_returns_no_matching_rule() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let doc = PolicyDocument {
             version: 1,
             scope: ScopeId::AllProfiles,
@@ -2107,6 +2951,7 @@ mod tests {
                 None,
                 None,
                 None,
+                TEST_NOW_MS,
             )
             .unwrap();
         assert_eq!(result, Decision::Deny(DenyReason::NoMatchingRule));
@@ -2114,7 +2959,11 @@ mod tests {
 
     /// A single allow-all rule with no criteria → Decision::Allow.
     #[test]
+    #[serial_test::serial]
     fn evaluate_allow_rule_no_criteria_returns_allow() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let doc = PolicyDocument {
             version: 1,
             scope: ScopeId::AllProfiles,
@@ -2141,13 +2990,18 @@ mod tests {
                 None,
                 None,
                 None,
+                TEST_NOW_MS,
             )
             .unwrap();
         assert_eq!(result, Decision::Allow);
     }
 
     #[test]
+    #[serial_test::serial]
     fn approval_above_escalates_only_above_threshold_and_preserves_hard_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use criteria::{ApprovalAboveCriterion, PerTxCapCriterion};
 
         for with_cap in [false, true] {
@@ -2184,6 +3038,7 @@ mod tests {
                             None,
                             None,
                             None,
+                            TEST_NOW_MS,
                         )
                         .unwrap();
                     let expected = if with_cap && amount > 500 {
@@ -2211,7 +3066,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn approval_above_preserves_non_allow_rule_decisions() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for decision in [
             Decision::Deny(DenyReason::ExplicitRuleDeny),
             Decision::RequireApproval(
@@ -2238,6 +3097,7 @@ mod tests {
                             None,
                             None,
                             None,
+                            TEST_NOW_MS,
                         )
                         .unwrap(),
                     decision
@@ -2264,7 +3124,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn approval_above_preserves_value_errors_and_asset_matching() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use criteria::ApprovalAboveCriterion;
         let engine = PolicyEngineV1::new(
             allow_all_doc_with_criteria(vec![Box::new(ApprovalAboveCriterion::new(
@@ -2278,11 +3142,31 @@ mod tests {
         let args = serde_json::json!({"amount_stroops": "150", "asset": "USDC:GISSUER"});
         assert_eq!(
             engine
-                .evaluate(&td, &args, &profile, None, None, None, None, None)
+                .evaluate(
+                    &td,
+                    &args,
+                    &profile,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    TEST_NOW_MS
+                )
                 .unwrap(),
             Decision::Allow
         );
-        let result = engine.evaluate(&td, &Value::Null, &profile, None, None, None, None, None);
+        let result = engine.evaluate(
+            &td,
+            &Value::Null,
+            &profile,
+            None,
+            None,
+            None,
+            None,
+            None,
+            TEST_NOW_MS,
+        );
         assert!(
             matches!(result, Err(PolicyError::CriterionEvaluationFailed { .. })),
             "{result:?}"
@@ -2310,7 +3194,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn full_evaluations_carry_exact_effects_for_allow_and_approval_only() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = testnet_profile();
         let td = tool("stellar_pay", "stellar:testnet");
         let args = serde_json::json!({
@@ -2333,7 +3221,17 @@ mod tests {
             doc.rules[0].decision = decision.clone();
             let engine = PolicyEngineV1::new(doc, "alice".into());
             let evaluation = engine
-                .evaluate_full(&td, &args, &profile, None, None, None, None, None)
+                .evaluate_full(
+                    &td,
+                    &args,
+                    &profile,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    TEST_NOW_MS,
+                )
                 .unwrap();
             assert_eq!(evaluation.decision, decision);
             let value::ValueClass::Value(ref effects) = derived else {
@@ -2354,6 +3252,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    TEST_NOW_MS,
                 )
                 .unwrap();
             assert_eq!(evaluation.decision, decision);
@@ -2378,7 +3277,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn approval_above_bundle_escalation_yields_to_later_denial() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use criteria::{
             ApprovalAboveCriterion, InnerInvocationCountCapCriterion, PerTxCapCriterion,
         };
@@ -2450,7 +3353,11 @@ mod tests {
     /// `InnerInvocationCountCapExceeded` directly — NOT wrapped in `BundleDenied`.
     ///
     #[test]
+    #[serial_test::serial]
     fn evaluate_bundle_count_cap_fires_at_phase2_not_wrapped() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::InnerInvocationCountCapCriterion;
 
         let doc = allow_all_doc_with_criteria(vec![Box::new(InnerInvocationCountCapCriterion {
@@ -2490,7 +3397,11 @@ mod tests {
     /// evaluate_bundle: all criteria pass → rule decision (Allow) is returned.
     ///
     #[test]
+    #[serial_test::serial]
     fn evaluate_bundle_all_pass_runs_bundle_level_criteria() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::InnerInvocationCountCapCriterion;
 
         // cap = 5: a 3-inner bundle must pass.
@@ -2527,7 +3438,11 @@ mod tests {
     /// Verifies the first-match stop-semantics when the rule's tool filter
     /// does not match the submitted tool.
     #[test]
+    #[serial_test::serial]
     fn evaluate_bundle_no_matching_rule_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // Rule only matches "stellar_pay"; submit "stellar_multicall".
         let doc = PolicyDocument {
             version: 1,
@@ -2569,7 +3484,11 @@ mod tests {
     /// Confirms that a plain `evaluate()` call does not inject overlay state —
     /// the bundle field in EvalContext is None on the single-tx path.
     #[test]
+    #[serial_test::serial]
     fn evaluate_bundle_overlay_zero_on_single_tx() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let doc = allow_all_doc_with_criteria(vec![]);
         let engine = PolicyEngineV1::new(doc, "alice".into());
         let td = tool("stellar_pay", "stellar:testnet");
@@ -2578,7 +3497,17 @@ mod tests {
         // Calling evaluate() (single-tx path) must produce Allow with no
         // overlay side-effects.
         let result = engine
-            .evaluate(&td, &Value::Null, &profile, None, None, None, None, None)
+            .evaluate(
+                &td,
+                &Value::Null,
+                &profile,
+                None,
+                None,
+                None,
+                None,
+                None,
+                TEST_NOW_MS,
+            )
             .unwrap();
         assert_eq!(
             result,
@@ -2594,7 +3523,11 @@ mod tests {
     /// directly — NOT wrapped in `BundleDenied`.
     ///
     #[test]
+    #[serial_test::serial]
     fn evaluate_bundle_aggregate_cap_denies_at_phase2_not_wrapped() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::BundleAggregateCapCriterion;
 
         // Cap = 100 stroops; submit 3 inners of 50 each → total 150 > 100.
@@ -2634,7 +3567,11 @@ mod tests {
     /// on the rule) still denies a bundle containing a `Generic` inner, with the
     /// restrict criterion's own deny code — the implicit coupling.
     #[test]
+    #[serial_test::serial]
     fn evaluate_bundle_aggregate_cap_alone_denies_generic_inner() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::BundleAggregateCapCriterion;
 
         let doc = allow_all_doc_with_criteria(vec![Box::new(BundleAggregateCapCriterion {
@@ -2669,7 +3606,11 @@ mod tests {
     /// inners, so without the coupling a Generic-decoding inner would escape
     /// it.
     #[test]
+    #[serial_test::serial]
     fn evaluate_bundle_per_tx_cap_alone_denies_generic_inner() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::BundlePerTxCapCriterion;
 
         let doc = allow_all_doc_with_criteria(vec![Box::new(BundlePerTxCapCriterion::new(
@@ -2704,7 +3645,11 @@ mod tests {
     /// inners, so without the coupling a Generic-decoding inner would escape
     /// it.
     #[test]
+    #[serial_test::serial]
     fn evaluate_bundle_per_period_cap_alone_denies_generic_inner() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::BundlePerPeriodCapCriterion;
         use crate::policy::v1::criteria::per_period_cap::Window;
 
@@ -2739,7 +3684,11 @@ mod tests {
     /// evaluate_bundle: `bundle_aggregate_cap` alone allows an all-recognised
     /// bundle within the cap — the implicit coupling does not over-deny.
     #[test]
+    #[serial_test::serial]
     fn evaluate_bundle_aggregate_cap_alone_allows_recognised_within_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::BundleAggregateCapCriterion;
 
         let doc = allow_all_doc_with_criteria(vec![Box::new(BundleAggregateCapCriterion {
@@ -2772,7 +3721,11 @@ mod tests {
     /// `inner_index` as the cap-alone case — the implicit check and the
     /// explicit criterion cannot diverge in the deny shape an operator sees.
     #[test]
+    #[serial_test::serial]
     fn evaluate_bundle_aggregate_cap_with_explicit_enabled_guard_single_deny() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::{
             BundleAggregateCapCriterion, RestrictBundleToRecognisedKindsCriterion,
         };
@@ -2811,7 +3764,11 @@ mod tests {
     /// `restrict_bundle_to_recognised_kinds` still denies — the implicit
     /// coupling wins over an explicit opt-out.
     #[test]
+    #[serial_test::serial]
     fn evaluate_bundle_aggregate_cap_with_explicit_disabled_guard_still_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::{
             BundleAggregateCapCriterion, RestrictBundleToRecognisedKindsCriterion,
         };
@@ -2846,11 +3803,65 @@ mod tests {
         );
     }
 
+    /// evaluate_bundle: a per-call value criterion denies a Generic inner,
+    /// whose value effect the wallet cannot size, at its index.
+    #[test]
+    #[serial_test::serial]
+    fn evaluate_bundle_per_tx_cap_denies_an_unvalued_inner() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let result = evaluate_unvalued_inner(false);
+        assert!(
+            matches!(result, Decision::Deny(DenyReason::BundleDenied { inner_index: 0, deny_reason }) if matches!(*deny_reason, DenyReason::UnsizableValueEffect { .. }))
+        );
+    }
+
+    /// evaluate_bundle: `allow_opaque_signing` exempts the Generic inner from
+    /// the rule's per-call value criteria, as it does for a single call.
+    #[test]
+    #[serial_test::serial]
+    fn evaluate_bundle_allow_opaque_signing_admits_an_unvalued_inner() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        assert_eq!(evaluate_unvalued_inner(true), Decision::Allow);
+    }
+
+    /// Evaluates a one-inner Generic bundle under a rule with a per-call cap.
+    fn evaluate_unvalued_inner(allow_opaque_signing: bool) -> Decision {
+        use crate::policy::v1::criteria::per_tx_cap::PerTxCapCriterion;
+        let mut doc = allow_all_doc_with_criteria(vec![Box::new(PerTxCapCriterion::new(
+            "native".to_owned(),
+            20,
+        ))]);
+        doc.rules[0].allow_opaque_signing = allow_opaque_signing;
+        let engine = PolicyEngineV1::new(doc, "alice".into());
+        let inners = vec![generic_inner()];
+        let overlay = BundleStateOverlay::default();
+        let view = BundleView {
+            inners: &inners,
+            overlay: &overlay,
+        };
+        engine
+            .evaluate_bundle(
+                &tool("stellar_multicall", "stellar:testnet"),
+                &Value::Null,
+                &testnet_profile(),
+                &view,
+            )
+            .unwrap()
+    }
+
     /// evaluate_bundle: no `bundle_aggregate_cap`, no
     /// `restrict_bundle_to_recognised_kinds` on the rule — a Generic inner is
     /// allowed. Existing behavior is unchanged when the cap is absent.
     #[test]
+    #[serial_test::serial]
     fn evaluate_bundle_no_cap_no_guard_allows_generic_inner() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let doc = allow_all_doc_with_criteria(vec![]);
         let engine = PolicyEngineV1::new(doc, "alice".into());
         let td = tool("stellar_multicall", "stellar:testnet");
@@ -2879,7 +3890,11 @@ mod tests {
     /// The hard floor is applied before rule resolution and is unconditional —
     /// policy authors cannot raise it above 50.
     #[test]
+    #[serial_test::serial]
     fn evaluate_bundle_hard_floor_denies_above_default_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // No inner_invocation_count_cap criterion in the rule.
         let doc = allow_all_doc_with_criteria(vec![]);
         let engine = PolicyEngineV1::new(doc, "alice".into());
@@ -2929,7 +3944,11 @@ mod tests {
     ///
     #[test]
     #[allow(clippy::unwrap_used)]
+    #[serial_test::serial]
     fn evaluate_bundle_per_period_cap_overlay_accumulates() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
         use serde_json::json;
 
@@ -2981,7 +4000,11 @@ mod tests {
     ///
     #[test]
     #[allow(clippy::unwrap_used)]
+    #[serial_test::serial]
     fn evaluate_bundle_per_period_cap_overlay_fires_with_1h_window() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
         use serde_json::json;
 
@@ -3034,7 +4057,11 @@ mod tests {
     ///
     #[test]
     #[allow(clippy::unwrap_used)]
+    #[serial_test::serial]
     fn evaluate_bundle_rate_limit_overlay_accumulates_calls() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::per_period_cap::Window;
         use crate::policy::v1::criteria::rate_limit::RateLimitCriterion;
 
@@ -3085,20 +4112,22 @@ mod tests {
     ///
     #[test]
     #[allow(clippy::unwrap_used)]
+    #[serial_test::serial]
     fn evaluate_bundle_rate_limit_boundary_does_not_double_deny() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::per_period_cap::Window;
         use crate::policy::v1::criteria::rate_limit::RateLimitCriterion;
-        use crate::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use crate::policy::v1::criteria::state_store::{
+            PolicyStateStore, StateKey, set_query_time_for_test,
+        };
 
         // Seed the store with 4 calls — one below the cap of 5.
+        let _clock = set_query_time_for_test(TEST_NOW_MS);
         let store = PolicyStateStore::new();
         let state_key = StateKey::new("alice", 1, "rate_limit", 60);
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let t = now_ms.saturating_sub(1_000); // 1 second ago — inside the window
+        let t = TEST_NOW_MS - 1_000; // One second before the evaluation instant, inside the window.
         for _ in 0..4 {
             store.append(&state_key, t, 1).unwrap();
         }
@@ -3134,6 +4163,83 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn size_equals_record_confirmed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use criteria::{
+            per_period_cap::{PerPeriodCapCriterion, Window},
+            rate_limit::RateLimitCriterion,
+            state_store::{StateKey, WindowEntry, WindowLimit},
+        };
+        use value::{ActionKind, ValueClass, ValueLeg};
+        let value = ValueClass::single(ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(600),
+            asset: Some("native".into()),
+            destination: None,
+        });
+        let criteria: Vec<(Box<dyn Criterion>, WindowEntry)> = vec![
+            (
+                Box::new(PerPeriodCapCriterion::new(
+                    "native".into(),
+                    Window::parse("1d").unwrap(),
+                    1000,
+                )),
+                WindowEntry::new(
+                    StateKey::new("sizing", 1, "native", 86400),
+                    0,
+                    600,
+                    WindowLimit::Amount {
+                        asset: "native".into(),
+                        window: "1d".into(),
+                        max_stroops: 1000,
+                    },
+                ),
+            ),
+            (
+                Box::new(RateLimitCriterion::new(Window::parse("1m").unwrap(), 3)),
+                WindowEntry::new(
+                    StateKey::new("sizing", 1, "rate_limit", 60),
+                    0,
+                    1,
+                    WindowLimit::Count {
+                        window: "1m".into(),
+                        max_calls: 3,
+                    },
+                ),
+            ),
+        ];
+        for (criterion, golden) in criteria {
+            let engine = PolicyEngineV1::new(
+                allow_all_doc_with_criteria(vec![criterion]),
+                "sizing".into(),
+            );
+            let td = tool("stellar_pay", "stellar:testnet");
+            let profile = testnet_profile();
+            let recorded = engine.record_confirmed(&td, &profile, &value).unwrap();
+            assert_eq!(recorded.len(), 1);
+            let entry = &recorded[0];
+            assert_eq!(
+                engine
+                    .size_window_entries(&td, &profile, &value, entry.timestamp_ms())
+                    .unwrap(),
+                recorded
+            );
+            assert_eq!(
+                WindowEntry::new(
+                    entry.key().clone(),
+                    0,
+                    entry.amount(),
+                    entry.limit().clone()
+                ),
+                golden
+            );
+        }
+    }
+
     // ── PolicyEngineV1::record_confirmed / record_confirmed_bundle ──────────
 
     /// The success-then-deny round-trip: a `per_period_cap` rule allows a
@@ -3141,7 +4247,12 @@ mod tests {
     /// second call is then DENIED because the accumulated total now exceeds
     /// the cap — pinning that recording actually feeds back into evaluation.
     #[test]
+    #[serial_test::serial]
     fn record_confirmed_per_period_cap_accumulates_then_second_call_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let _clock = criteria::state_store::set_query_time_for_test(TEST_NOW_MS);
         use crate::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
@@ -3171,6 +4282,7 @@ mod tests {
                 None,
                 None,
                 None,
+                TEST_NOW_MS,
             )
             .unwrap();
         assert_eq!(d1, Decision::Allow, "first call must be allowed");
@@ -3195,6 +4307,7 @@ mod tests {
                 None,
                 None,
                 None,
+                TEST_NOW_MS,
             )
             .unwrap();
         assert!(
@@ -3206,7 +4319,12 @@ mod tests {
     /// `rate_limit` counts calls: three confirmed calls under a cap of 3
     /// exhaust it; a fourth is denied.
     #[test]
+    #[serial_test::serial]
     fn record_confirmed_rate_limit_accumulates_calls_until_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let _clock = criteria::state_store::set_query_time_for_test(TEST_NOW_MS);
         use crate::policy::v1::criteria::per_period_cap::Window;
         use crate::policy::v1::criteria::rate_limit::RateLimitCriterion;
         use crate::policy::v1::value::ValueClass;
@@ -3230,6 +4348,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    TEST_NOW_MS,
                 )
                 .unwrap();
             assert_eq!(d, Decision::Allow, "call {i} must be allowed");
@@ -3250,6 +4369,7 @@ mod tests {
                 None,
                 None,
                 None,
+                TEST_NOW_MS,
             )
             .unwrap();
         assert!(
@@ -3262,7 +4382,11 @@ mod tests {
     /// `PerPeriodCapCriterion` when `value` is `ReadOnly` (e.g. the bundle
     /// path, which records via `record_confirmed_bundle` instead).
     #[test]
+    #[serial_test::serial]
     fn record_confirmed_read_only_value_is_noop_for_per_period_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
         use crate::policy::v1::value::ValueClass;
 
@@ -3283,7 +4407,11 @@ mod tests {
     /// inner for `BundlePerPeriodCapCriterion`, and the recorded total then
     /// denies a subsequent bundle that would tip the cap.
     #[test]
+    #[serial_test::serial]
     fn record_confirmed_bundle_per_period_cap_accumulates_then_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::criteria::bundle_per_period_cap::BundlePerPeriodCapCriterion;
         use crate::policy::v1::criteria::per_period_cap::Window;
 
@@ -3342,7 +4470,11 @@ mod tests {
     /// record for a call that was never actually permitted under this
     /// engine's document).
     #[test]
+    #[serial_test::serial]
     fn record_confirmed_no_matching_rule_returns_empty() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::ValueClass;
 
         let doc = PolicyDocument {
@@ -3358,5 +4490,613 @@ mod tests {
             .record_confirmed(&td, &profile, &ValueClass::ReadOnly)
             .unwrap();
         assert!(recorded.is_empty());
+    }
+
+    fn checked_engine(exemption: bool, rate: bool, cap: bool) -> PolicyEngineV1 {
+        use criteria::{PerPeriodCapCriterion, RateLimitCriterion, per_period_cap::Window};
+        let mut criteria: Vec<Box<dyn Criterion>> = Vec::new();
+        if rate {
+            criteria.push(Box::new(RateLimitCriterion::new(
+                Window::parse("1d").unwrap(),
+                1,
+            )));
+        }
+        if cap {
+            criteria.push(Box::new(PerPeriodCapCriterion::new(
+                "native".into(),
+                Window::parse("1d").unwrap(),
+                1000,
+            )));
+        }
+        let mut doc = allow_all_doc_with_criteria(criteria);
+        doc.rules[0].allow_opaque_signing = exemption;
+        PolicyEngineV1::new(doc, "alice".into())
+    }
+
+    #[allow(clippy::panic, reason = "a fixture requires a successful sizing")]
+    fn sized(outcome: SizingOutcome) -> CheckedSizing {
+        let SizingOutcome::Sized(sizing) = outcome else {
+            panic!("expected checked sizing");
+        };
+        sizing
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn checked_unvalued_sizing_refuses_value_rules_and_keeps_count_charges() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut td = tool("stellar_smart_account_execute", "stellar:testnet");
+        td.value_kind = crate::policy::ToolValueKind::OpaqueSign;
+        let profile = testnet_profile();
+        let reason = OpaqueReason::UnvaluedContractCall;
+        let engine = checked_engine(false, true, true);
+        assert!(matches!(
+            engine
+                .size_unvalued_call(&td, &profile, reason, 1000)
+                .unwrap(),
+            SizingOutcome::Refused(DenyReason::UnsizableValueEffect { .. })
+        ));
+        let engine = checked_engine(true, true, true);
+        let sizing = sized(
+            engine
+                .size_unvalued_call(&td, &profile, reason, 1000)
+                .unwrap(),
+        );
+        assert_eq!(sizing.basis(), SizingBasis::Unvalued);
+        assert_eq!(sizing.entries().len(), 1);
+        let entry = &sizing.entries()[0];
+        assert!(matches!(entry.limit(), criteria::WindowLimit::Count { .. }));
+        assert_eq!(
+            engine
+                .state_store()
+                .query_window(entry.key(), 1000)
+                .unwrap(),
+            (0, 0)
+        );
+        let engine = checked_engine(false, false, false);
+        assert_eq!(
+            sized(
+                engine
+                    .size_unvalued_call(&td, &profile, reason, 1000)
+                    .unwrap()
+            )
+            .basis(),
+            SizingBasis::NoApplicableLimit
+        );
+        let engine = PolicyEngineV1::new(
+            PolicyDocument {
+                version: 1,
+                scope: ScopeId::AllProfiles,
+                rules: Vec::new(),
+                signature: None,
+            },
+            "alice".into(),
+        );
+        let sizing = sized(
+            engine
+                .size_unvalued_call(&td, &profile, reason, 1000)
+                .unwrap(),
+        );
+        assert_eq!(sizing.basis(), SizingBasis::NoApplicableLimit);
+        assert!(sizing.entries().is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn checked_unvalued_sizing_preserves_existing_state_and_honors_exemptions() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use criteria::state_store::StateKey;
+        let td = tool("stellar_smart_account_execute", "stellar:testnet");
+        let profile = testnet_profile();
+        let reason = OpaqueReason::UnvaluedContractCall;
+        let engine = checked_engine(false, true, false);
+        let key = StateKey::new("alice", 1, "rate_limit", 86_400);
+        engine.state_store().append(&key, 1000, 1).unwrap();
+        let sizing = sized(
+            engine
+                .size_unvalued_call(&td, &profile, reason, 1000)
+                .unwrap(),
+        );
+        assert_eq!(sizing.entries().len(), 1);
+        assert_eq!(
+            engine.state_store().query_window(&key, 1000).unwrap(),
+            (1, 1)
+        );
+        for exemption in [false, true] {
+            let mut doc = allow_all_doc_with_criteria(vec![Box::new(
+                criteria::MinimumReserveCriterion::new(0),
+            )]);
+            doc.rules[0].allow_opaque_signing = exemption;
+            let engine = PolicyEngineV1::new(doc, "alice".into());
+            let result = engine
+                .size_unvalued_call(&td, &profile, reason, 1000)
+                .unwrap();
+            if exemption {
+                assert_eq!(sized(result).basis(), SizingBasis::NoApplicableLimit);
+            } else {
+                assert!(matches!(
+                    result,
+                    SizingOutcome::Refused(DenyReason::UnsizableValueEffect { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn checked_no_value_sizing_only_carries_counts() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let td = tool("stellar_smart_account_rules", "stellar:testnet");
+        let profile = testnet_profile();
+        for rate in [false, true] {
+            let engine = checked_engine(false, rate, true);
+            let sizing = engine.size_no_value(&td, &profile, 1000).unwrap();
+            assert_eq!(sizing.basis(), SizingBasis::NoValue);
+            assert_eq!(sizing.entries().len(), usize::from(rate));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn checked_recording_refuses_opaque_value_before_mutation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut td = tool("stellar_smart_account_execute", "stellar:testnet");
+        td.value_kind = crate::policy::ToolValueKind::OpaqueSign;
+        let profile = testnet_profile();
+        let engine = checked_engine(false, true, true);
+        let value = ValueClass::Opaque(OpaqueReason::UnvaluedContractCall);
+        assert!(matches!(
+            engine
+                .record_confirmed_checked(&td, &profile, &value)
+                .unwrap(),
+            SizingOutcome::Refused(DenyReason::UnsizableValueEffect { .. })
+        ));
+        let entries = engine
+            .size_window_entries(&td, &profile, &ValueClass::ReadOnly, 1000)
+            .unwrap();
+        for entry in entries {
+            assert_eq!(
+                engine
+                    .state_store()
+                    .query_window(entry.key(), 1000)
+                    .unwrap(),
+                (0, 0)
+            );
+        }
+        let engine = checked_engine(true, true, true);
+        let sizing = sized(
+            engine
+                .record_confirmed_checked(&td, &profile, &value)
+                .unwrap(),
+        );
+        assert_eq!(sizing.basis(), SizingBasis::Unvalued);
+        assert_eq!(sizing.entries().len(), 1);
+        let entry = &sizing.entries()[0];
+        assert_eq!(
+            engine
+                .state_store()
+                .query_window(entry.key(), entry.timestamp_ms())
+                .unwrap(),
+            (1, 1)
+        );
+        let value = ValueClass::single(ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(600),
+            asset: Some("native".into()),
+            destination: None,
+        });
+        let engine = checked_engine(false, false, true);
+        let sizing = sized(
+            engine
+                .record_confirmed_checked(&td, &profile, &value)
+                .unwrap(),
+        );
+        assert_eq!(sizing.basis(), SizingBasis::MeasuredValue);
+        assert_eq!(sizing.entries()[0].amount(), 600);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn checked_engine_defaults_refuse_and_noop_certifies_no_limit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        struct EvaluateOnly;
+        impl PolicyEngine for EvaluateOnly {
+            fn evaluate(
+                &self,
+                _tool: &ToolDescriptor,
+                _args: &Value,
+                _profile: &Profile,
+                _account: Option<&dyn AccountReservesView>,
+                _identity: Option<&dyn AccountIdentityView>,
+                _counterparty: Option<&dyn CounterpartyCacheView>,
+                _sep10: Option<&dyn Sep10SessionView>,
+                _sep45: Option<&dyn Sep45SessionView>,
+                _now_ms: u64,
+            ) -> Result<Decision, PolicyError> {
+                Ok(Decision::Allow)
+            }
+        }
+        let td = tool("stellar_smart_account_execute", "stellar:testnet");
+        let profile = testnet_profile();
+        let value = ValueClass::ReadOnly;
+        let reason = OpaqueReason::UnvaluedContractCall;
+        for result in [
+            EvaluateOnly
+                .record_confirmed_checked(&td, &profile, &value)
+                .map(|_| ()),
+            EvaluateOnly
+                .size_unvalued_call(&td, &profile, reason, 0)
+                .map(|_| ()),
+            EvaluateOnly.size_no_value(&td, &profile, 0).map(|_| ()),
+        ] {
+            assert!(
+                matches!(result, Err(PolicyError::CriterionEvaluationFailed { detail })
+                if detail == "checked sizing is unsupported by this engine")
+            );
+        }
+        let noop = crate::policy::NoopPolicyEngine;
+        for sizing in [
+            sized(
+                noop.record_confirmed_checked(&td, &profile, &value)
+                    .unwrap(),
+            ),
+            sized(noop.size_unvalued_call(&td, &profile, reason, 0).unwrap()),
+            noop.size_no_value(&td, &profile, 0).unwrap(),
+        ] {
+            assert_eq!(sizing.basis(), SizingBasis::NoApplicableLimit);
+            assert!(sizing.entries().is_empty());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn size_leaves_store_untouched() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use criteria::{
+            per_period_cap::{PerPeriodCapCriterion, Window},
+            rate_limit::RateLimitCriterion,
+        };
+        use value::{ActionKind, ValueClass, ValueLeg};
+        let engine = PolicyEngineV1::new(
+            allow_all_doc_with_criteria(vec![
+                Box::new(PerPeriodCapCriterion::new(
+                    "native".into(),
+                    Window::parse("1d").unwrap(),
+                    1000,
+                )),
+                Box::new(RateLimitCriterion::new(Window::parse("1m").unwrap(), 3)),
+            ]),
+            "sizing".into(),
+        );
+        let value = ValueClass::single(ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(600),
+            asset: Some("native".into()),
+            destination: None,
+        });
+        let entries = engine
+            .size_window_entries(
+                &tool("stellar_pay", "stellar:testnet"),
+                &testnet_profile(),
+                &value,
+                1_000_000,
+            )
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key().bucket(), "native");
+        assert_eq!(entries[1].key().bucket(), "rate_limit");
+        for entry in entries {
+            assert_eq!(
+                engine
+                    .state_store()
+                    .query_window(entry.key(), 1_000_000)
+                    .unwrap(),
+                (0, 0)
+            );
+        }
+    }
+
+    /// A `KNOWN_ISSUER` allowlist refuses a malformed asset argument with a
+    /// detail that names the check, the expected form and the tool, and the
+    /// asset text appears nowhere in the error.
+    #[test]
+    #[serial_test::serial]
+    fn counterparty_asset_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use crate::policy::v1::criteria::counterparty_allowlist::{
+            CounterpartyAllowlistCriterion, CounterpartyKind,
+        };
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+
+        const ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+        const DESTINATION: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let cases = [
+            (
+                CREDENTIAL_MARKER.to_owned(),
+                "counterparty_allowlist: non-native asset must be in CODE:Gissuer format for \
+                 tool 'stellar_pay'",
+            ),
+            (
+                format!("USD:{CREDENTIAL_MARKER}"),
+                "counterparty_allowlist: asset issuer must be a valid G-strkey for tool \
+                 'stellar_pay'",
+            ),
+        ];
+        for (asset, expected) in cases {
+            let engine = PolicyEngineV1::new(
+                allow_all_doc_with_criteria(vec![Box::new(CounterpartyAllowlistCriterion::new(
+                    vec![CounterpartyKind::KnownIssuer],
+                    vec![format!("USDC:{ISSUER}")],
+                ))]),
+                "alice".into(),
+            );
+            let args = serde_json::json!({
+                "amount_stroops": "10000000",
+                "asset": asset,
+                "destination": DESTINATION,
+            });
+            let err = engine
+                .evaluate(
+                    &tool("stellar_pay", "stellar:testnet"),
+                    &args,
+                    &testnet_profile(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    TEST_NOW_MS,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    PolicyError::CriterionEvaluationFailed { detail } if detail == expected
+                ),
+                "{err:?}"
+            );
+            assert_no_marker(&err, CREDENTIAL_MARKER);
+        }
+    }
+
+    /// A document whose payment rule records a rate limit and a period cap
+    /// and whose multicall rule records their bundle forms: every recording
+    /// path of the engine writes window entries under it.
+    fn recording_document() -> PolicyDocument {
+        use criteria::{
+            BundlePerPeriodCapCriterion, BundleRateLimitCriterion, PerPeriodCapCriterion,
+            RateLimitCriterion, per_period_cap::Window,
+        };
+        let rule = |tool: &str, criteria: Vec<Box<dyn Criterion>>| PolicyRule {
+            r#match: RuleMatch {
+                tool: tool.into(),
+                chain: "*".into(),
+            },
+            criteria,
+            decision: Decision::Allow,
+            allow_opaque_signing: false,
+        };
+        PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            rules: vec![
+                rule(
+                    "stellar_pay",
+                    vec![
+                        Box::new(RateLimitCriterion::new(Window::parse("1m").unwrap(), 2)),
+                        Box::new(PerPeriodCapCriterion::new(
+                            "native".into(),
+                            Window::parse("1d").unwrap(),
+                            1_000,
+                        )),
+                    ],
+                ),
+                rule(
+                    "stellar_multicall",
+                    vec![
+                        Box::new(BundlePerPeriodCapCriterion::new(
+                            "native".into(),
+                            Window::parse("1d").unwrap(),
+                            1_000,
+                        )),
+                        Box::new(BundleRateLimitCriterion::new(
+                            Window::parse("1m").unwrap(),
+                            5,
+                        )),
+                    ],
+                ),
+            ],
+            signature: None,
+        }
+    }
+
+    /// One evaluation reads one instant. The instant lies far from the host
+    /// clock and the window entries sit relative to it, so a criterion that
+    /// read the host clock would see them as skewed into the future and fail.
+    /// Single and bundle evaluations decide by the instant they receive, and
+    /// both record paths stamp every entry with the one sample they take.
+    #[test]
+    #[serial_test::serial]
+    fn evaluation_reads_one_sampled_instant() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use criteria::state_store::{StateKey, set_query_time_for_test};
+
+        const FAR: u64 = 4_000_000_000_000;
+        let _clock = set_query_time_for_test(FAR);
+        let profile = testnet_profile();
+        let pay = tool("stellar_pay", "stellar:testnet");
+        let args = serde_json::json!({"amount_stroops": "10", "asset": "native"});
+
+        let engine = PolicyEngineV1::new(recording_document(), "alice".into());
+        let rate_key = StateKey::new("alice", 1, "rate_limit", 60);
+        engine
+            .state_store()
+            .append(&rate_key, FAR - 1_000, 1)
+            .unwrap();
+        engine
+            .state_store()
+            .append(&rate_key, FAR - 2_000, 1)
+            .unwrap();
+        let evaluate = |now_ms| {
+            engine
+                .evaluate(&pay, &args, &profile, None, None, None, None, None, now_ms)
+                .unwrap()
+        };
+        assert!(matches!(
+            evaluate(FAR),
+            Decision::Deny(DenyReason::RateLimitExceeded { .. })
+        ));
+        assert_eq!(evaluate(FAR + 61_000), Decision::Allow);
+
+        let value = value::derive_value_class("stellar_pay", &args);
+        let recorded = engine.record_confirmed(&pay, &profile, &value).unwrap();
+        assert_eq!(recorded.len(), 2);
+        let checked = sized(
+            engine
+                .record_confirmed_checked(&pay, &profile, &value)
+                .unwrap(),
+        );
+        assert_eq!(checked.entries().len(), 2);
+        for entry in recorded.iter().chain(checked.entries()) {
+            assert_eq!(entry.timestamp_ms(), FAR);
+        }
+
+        let engine = PolicyEngineV1::new(recording_document(), "alice".into());
+        let period_key = StateKey::new("alice", 1, "native", 86_400);
+        engine
+            .state_store()
+            .append(&period_key, FAR - 1_000, 995)
+            .unwrap();
+        let multicall = tool("stellar_multicall", "stellar:testnet");
+        let inners = [token_transfer_inner(4), token_transfer_inner(10)];
+        let overlay = BundleStateOverlay::default();
+        let view = BundleView {
+            inners: &inners,
+            overlay: &overlay,
+        };
+        assert!(matches!(
+            engine
+                .evaluate_bundle(&multicall, &Value::Null, &profile, &view)
+                .unwrap(),
+            Decision::Deny(DenyReason::BundleDenied { inner_index: 1, .. })
+        ));
+        let recorded = engine
+            .record_confirmed_bundle(&multicall, &profile, &view)
+            .unwrap();
+        assert_eq!(recorded.len(), 4);
+        let checked = sized(
+            engine
+                .record_confirmed_bundle_checked(&multicall, &profile, &view)
+                .unwrap(),
+        );
+        assert_eq!(checked.entries().len(), 4);
+        for entry in recorded.iter().chain(checked.entries()) {
+            assert_eq!(entry.timestamp_ms(), FAR);
+        }
+    }
+
+    /// A clock failure at each of the five entry points that sample their own
+    /// instant refuses with a criterion evaluation failure naming the
+    /// operation, and none of them writes to the state store.
+    #[test]
+    #[serial_test::serial]
+    fn a_policy_clock_failure_refuses_sampling_entry_points() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use criteria::state_store::{
+            StateKey, set_policy_clock_error_for_test, set_query_time_for_test,
+        };
+
+        let profile = testnet_profile();
+        let pay = tool("stellar_pay", "stellar:testnet");
+        let args = serde_json::json!({"amount_stroops": "10", "asset": "native"});
+        let value = value::derive_value_class("stellar_pay", &args);
+        let multicall = tool("stellar_multicall", "stellar:testnet");
+        let inners = [token_transfer_inner(4)];
+        let overlay = BundleStateOverlay::default();
+        let view = BundleView {
+            inners: &inners,
+            overlay: &overlay,
+        };
+
+        // The keys both recording paths write under a readable clock.
+        let keys: std::collections::HashSet<StateKey> = {
+            let _clock = set_query_time_for_test(TEST_NOW_MS);
+            let control = PolicyEngineV1::new(recording_document(), "alice".into());
+            control
+                .record_confirmed(&pay, &profile, &value)
+                .unwrap()
+                .into_iter()
+                .chain(
+                    control
+                        .record_confirmed_bundle(&multicall, &profile, &view)
+                        .unwrap(),
+                )
+                .map(|entry| entry.key().clone())
+                .collect()
+        };
+        assert!(!keys.is_empty());
+
+        let engine = PolicyEngineV1::new(recording_document(), "alice".into());
+        let _broken = set_policy_clock_error_for_test();
+        assert!(crate::policy::policy_now_ms().is_err());
+        let refusals: [(&str, Result<(), PolicyError>); 5] = [
+            (
+                "record_confirmed",
+                engine.record_confirmed(&pay, &profile, &value).map(drop),
+            ),
+            (
+                "record_confirmed_checked",
+                engine
+                    .record_confirmed_checked(&pay, &profile, &value)
+                    .map(drop),
+            ),
+            (
+                "evaluate_bundle",
+                engine
+                    .evaluate_bundle(&multicall, &Value::Null, &profile, &view)
+                    .map(drop),
+            ),
+            (
+                "record_confirmed_bundle",
+                engine
+                    .record_confirmed_bundle(&multicall, &profile, &view)
+                    .map(drop),
+            ),
+            (
+                "record_confirmed_bundle",
+                engine
+                    .record_confirmed_bundle_checked(&multicall, &profile, &view)
+                    .map(drop),
+            ),
+        ];
+        for (operation, result) in refusals {
+            assert!(
+                matches!(&result, Err(PolicyError::CriterionEvaluationFailed { detail })
+                    if detail.starts_with(&format!("{operation}: wallet clock error"))),
+                "{operation}: {result:?}"
+            );
+        }
+        // A query at instant zero evicts nothing, so it counts every entry.
+        for key in &keys {
+            assert_eq!(engine.state_store().query_window(key, 0).unwrap(), (0, 0));
+        }
     }
 }

@@ -639,6 +639,108 @@ async fn malformed_simulation_response_without_min_fee_returns_simulate_phase_er
     );
 }
 
+/// Runs `deploy_smart_account` against a responder whose simulation answers
+/// `simulate_result`, with the WASM already on chain, and returns its error.
+async fn deployment_error(simulate_result: serde_json::Value) -> SaError {
+    let server = MockServer::start().await;
+    let (deployer_g, seed) = fresh_keypair();
+    Mock::given(method("POST"))
+        .respond_with(SorobanRpcResponder::new(
+            serde_json::json!({
+                "entries": [{
+                    "key": account_key_xdr(&deployer_g),
+                    "xdr": account_entry_xdr(&deployer_g, 100),
+                    "lastModifiedLedgerSeq": 100,
+                    "liveUntilLedgerSeq": 10000
+                }],
+                "latestLedger": 100
+            }),
+            simulate_result,
+        ))
+        .mount(&server)
+        .await;
+    let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> =
+        Box::new(SoftwareSigningKey::new_from_zeroizing(seed));
+    let args = DeploymentArgs {
+        deployer: DeployerKeypair::SecretEnv {
+            var_name: "test-sim-refusal".to_owned(),
+            signer,
+        },
+        initial_signer: INITIAL_SIGNER_G.to_owned(),
+        salt: [0xCD; 32],
+        network_passphrase: TESTNET_PASSPHRASE.to_owned(),
+        rpc_url: server.uri(),
+        timeout: Duration::from_secs(5),
+        fee: ResolvedFeePerOp {
+            stroops: 100,
+            percentile_label: "profile_default".to_owned(),
+        },
+        dry_run: false,
+        genesis_signer_scval_override: None,
+    };
+    deploy_smart_account(args, None)
+        .await
+        .expect_err("a refused simulation must return an error")
+}
+
+/// A create envelope names no event origin: an old-form code that only the
+/// event log carries is never shown, with or without events.
+#[tokio::test]
+async fn deployment_simulation_error_shows_the_top_level_error() {
+    use stellar_xdr::{
+        ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, ContractId,
+        DiagnosticEvent, ExtensionPoint, Hash, Limits, ScError, ScSymbol, ScVal, WriteXdr,
+    };
+    let old_text = "HostError: Error(Value, InvalidInput)\n\nEvent log (newest first):\n   \
+                    0: [Diagnostic Event] topics:[error, Error(Contract, #3000)], data:Void\n";
+    let event = DiagnosticEvent {
+        in_successful_contract_call: false,
+        event: ContractEvent {
+            ext: ExtensionPoint::V0,
+            contract_id: Some(ContractId(Hash([0x44; 32]))),
+            type_: ContractEventType::Diagnostic,
+            body: ContractEventBody::V0(ContractEventV0 {
+                topics: vec![
+                    ScVal::Symbol(ScSymbol::try_from("error").unwrap()),
+                    ScVal::Error(ScError::Contract(3000)),
+                ]
+                .try_into()
+                .unwrap(),
+                data: ScVal::Void,
+            }),
+        },
+    }
+    .to_xdr_base64(Limits::none())
+    .unwrap();
+    for (events, expected) in [
+        (
+            vec![event],
+            "deploy simulation returned error: Error(Value, InvalidInput)",
+        ),
+        (
+            vec![],
+            "deploy simulation returned error: Error(Value, InvalidInput)",
+        ),
+    ] {
+        let error = deployment_error(serde_json::json!({
+            "latestLedger": 100,
+            "error": old_text,
+            "events": events,
+        }))
+        .await;
+        assert!(
+            matches!(
+                &error,
+                SaError::DeploymentFailed {
+                    phase: "simulate",
+                    redacted_reason,
+                } if redacted_reason == expected
+            ),
+            "expected the simulate refusal with {expected:?}, got {error:?}"
+        );
+    }
+}
+
 /// Asserts that a `simulateTransaction` response WITH valid `minResourceFee`
 /// and `transactionData` causes the deployment to proceed past the pre-check
 /// and fail at the `submit` phase (because the mock `sendTransaction` returns
@@ -1055,7 +1157,10 @@ struct FailingSigner {
 
 #[async_trait]
 impl Signer for FailingSigner {
-    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_tx_payload(
+        &self,
+        payload: &stellar_agent_network::signing::TxSigningPayload,
+    ) -> Result<[u8; 64], WalletError> {
         let call = self.sign_calls.fetch_add(1, Ordering::AcqRel) + 1;
         if call == self.fail_on_sign_call {
             return Err(WalletError::Auth(AuthError::HardwareUserRefused));
@@ -1063,7 +1168,10 @@ impl Signer for FailingSigner {
         self.signing_key.sign_tx_payload(payload).await
     }
 
-    async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_auth_digest(
+        &self,
+        digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
         // FailingSigner is used by deploy-c tests which exercise
         // sign_tx_payload only; auth-digest signing is unreachable here.
         // Provide a faithful pass-through to keep the trait satisfied.
@@ -1072,7 +1180,7 @@ impl Signer for FailingSigner {
 
     async fn sign_soroban_address_auth_payload(
         &self,
-        payload: &[u8; 32],
+        payload: &stellar_agent_network::signing::SorobanAuthPayload,
     ) -> Result<[u8; 64], WalletError> {
         // FailingSigner is used by deploy-c tests which exercise
         // sign_tx_payload only; Soroban address-auth signing is unreachable
@@ -1082,9 +1190,19 @@ impl Signer for FailingSigner {
             .await
     }
 
+    async fn sign_message(
+        &self,
+        payload: &stellar_agent_network::signing::MessagePayload,
+    ) -> Result<[u8; 64], WalletError> {
+        // FailingSigner is used by deploy-c tests which exercise
+        // sign_tx_payload only; message signing is unreachable here.
+        // Pass-through preserves the trait.
+        self.signing_key.sign_message(payload).await
+    }
+
     async fn sign_webauthn_assertion(
         &self,
-        _auth_digest: &[u8; 32],
+        _auth_digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
         _credential_id: &[u8],
     ) -> Result<stellar_agent_network::WebAuthnAssertion, WalletError> {
         // FailingSigner is used by deploy-c tests which exercise

@@ -1,0 +1,8 @@
+version = 2
+sequence = 1
+scope = "profile:contract"
+
+[[rules]]
+match = { tool = "stellar_pay_commit", chain = "stellar:testnet" }
+criteria = [{ kind = "counterparty_allowlist", kinds = ["G_ACCOUNT", "C_ACCOUNT"], allowlist = ["GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H", "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ"] }]
+decision = "allow"

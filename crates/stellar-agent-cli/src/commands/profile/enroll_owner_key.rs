@@ -6,10 +6,8 @@
 //! (see `fetch_owner_pubkey_from_keyring` in `stellar-agent-mcp` and
 //! `build_v1_policy_engine` in this crate).  The stored value is the public
 //! key's G-strkey. A G-strkey decodes as URL-safe base64 to 42 bytes, so no
-//! 32-byte symmetric-key loader accepts it. Every owner reader also accepts
-//! the older form, URL-safe base64 of the 32 key bytes, and this command
-//! rewrites the older-form owner entry of every other profile in the profile
-//! directory, best effort.
+//! 32-byte symmetric-key loader accepts it. Owner readers refuse older base64
+//! entries until the owner public key is enrolled again.
 //!
 //! # Why the online agent holds only the public key
 //!
@@ -54,8 +52,11 @@ use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::observability::RedactedStrkey;
+use stellar_agent_core::policy::state_lock::{WindowStoreLock, window_lock_path};
 use stellar_agent_core::profile::loader;
-use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
+use stellar_agent_core::profile::schema::{
+    KeyringEntryRef, Profile, default_policy_window_state_path_for,
+};
 use stellar_agent_network::Signer as _;
 use stellar_agent_network::keyring::{KeyringOperation, init_platform_keyring_store};
 use uuid::Uuid;
@@ -78,6 +79,7 @@ pub(crate) struct EnrollOwnerKeyArgs {
     /// Profile whose owner public key should be enrolled.
     ///
     /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    /// A mainnet profile must be named with this flag.
     #[arg(long = "profile", value_name = "NAME")]
     pub(crate) profile: Option<String>,
 
@@ -125,6 +127,14 @@ struct EnrollOwnerKeyData {
     replaced: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's observation, run once on this thread right before the owner
+    /// entry write, while the enrollment holds its authorization locks.
+    static BEFORE_OWNER_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Runs `stellar-agent profile enroll-owner-key`.
 ///
 /// Returns `0` on success, `1` on error.
@@ -166,8 +176,8 @@ where
     let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e, &profile_name));
+            tracing::debug!(error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e));
             return 1;
         }
     };
@@ -221,7 +231,7 @@ where
         if stellar_strkey::ed25519::PublicKey::from_string(expected).is_err() {
             render::render_json(&Envelope::<()>::err_raw(
                 "enroll_owner_key.expected_address_invalid",
-                format!("--expected-address is not a valid G-strkey: {expected}"),
+                "--expected-address is not a valid G-strkey",
             ));
             return 1;
         }
@@ -230,7 +240,7 @@ where
                 "enroll_owner_key.expected_address_mismatch",
                 format!(
                     "the seed in '{}' derives to {owner_address}, which does not match \
-                     --expected-address {expected}; no entry was written",
+                     --expected-address; no entry was written",
                     args.secret_env
                 ),
             ));
@@ -289,6 +299,16 @@ where
         return 1;
     }
 
+    // Hold every pin lock through the owner write so a concurrent load cannot
+    // change the owner that authorizes this enrollment.
+    let rotation_locks = match authorize_owner_write(&profile, &profile_name, &owner_pubkey.0) {
+        Ok(locks) => locks,
+        Err(refusal) => {
+            render::render_json(&refusal);
+            return 1;
+        }
+    };
+
     // ── Write the PUBLIC key to the owner coordinate as its G-strkey ──────────
     // A G-strkey decodes as URL-safe base64 to 42 bytes, so no 32-byte
     // symmetric-key loader accepts this entry. Every owner reader decodes it.
@@ -296,6 +316,10 @@ where
     let encoded: Zeroizing<String> = Zeroizing::new(
         stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner_pubkey.0),
     );
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_OWNER_WRITE.with_borrow_mut(Option::take) {
+        hook();
+    }
     if let Err(e) = entry.set_password(&encoded) {
         tracing::debug!("enroll-owner-key: set_password failed");
         // Classify the write failure: a non-interactive Windows session must
@@ -311,20 +335,7 @@ where
         return 1;
     }
 
-    // Every other profile's older-form owner entry is rewritten as its
-    // G-strkey, best effort: a missing or unreadable entry is skipped with a
-    // warn and never fails the enrolment.
-    match stellar_agent_core::profile::schema::default_profile_dir() {
-        Ok(dir) => stellar_agent_core::profile::owner_key::rewrite_older_form_owner_entries_in_dir(
-            &dir,
-            Some(&profile_name),
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "enroll-owner-key: no profile directory; the owner key rewrite of other profiles \
-             was skipped"
-        ),
-    }
+    drop(rotation_locks);
 
     let request_id = Uuid::new_v4().to_string();
     emit_keyring_key_written(
@@ -351,6 +362,184 @@ where
     0
 }
 
+/// Authorizes the owner entry write of an installation that holds owner
+/// continuity records and returns every pin lock to hold across it. An
+/// installation without continuity records returns an empty vector.
+///
+/// The records are the mainnet enablement nonce and the policy pin. The
+/// profile's configured window-state entry is checked when it holds either
+/// one. Its default entry `stellar-agent-policy-window-<profile>` / `default`,
+/// when it differs, is checked when it holds a nonce, whatever chain the
+/// profile file names: a nonce exists only after `profile enable-mainnet`, and
+/// a mainnet profile cannot move its window-state entry, so an edit of the
+/// chain or of the window-state entry in the profile file does not hide the
+/// records of an enabled installation. A pin alone at that default entry is
+/// left to the pin rule of the next load there. Each checked coordinate must
+/// hold a present pin. The pinned owner may always be written back; any other key
+/// needs the installed policy signed by that key with a valid statement from
+/// the pinned owner. A missing owner entry is no exception.
+///
+/// # Errors
+///
+/// The refusal envelope: `enroll_owner_key.rotation_statement_required` for
+/// an absent or invalid statement or a policy the key does not sign,
+/// `policy.pin_absent` naming a missing lock file or a missing pin, and the
+/// own code of every other cause, such as `policy.state_lock_busy`,
+/// `policy.state_lock_io`, `policy.pin_unusable`,
+/// `profile.mainnet_enablement_invalid` for an unreadable nonce entry, or
+/// `policy.sequence_rollback`.
+fn authorize_owner_write(
+    profile: &Profile,
+    profile_name: &str,
+    new_owner: &[u8; 32],
+) -> Result<Vec<WindowStoreLock>, Envelope<()>> {
+    use stellar_agent_core::{
+        mainnet::enablement::has_enablement_nonce,
+        policy::{PolicyError, pin},
+    };
+    let configured = profile.policy_window_state_key_id.clone();
+    let default = KeyringEntryRef::default_policy_window_state_key(profile_name);
+    let mut coordinates = vec![(configured, true)];
+    if coordinates[0].0 != default {
+        coordinates.push((default, false));
+    }
+    let window = default_policy_window_state_path_for(profile_name);
+    let mut held = Vec::new();
+    for (coordinate, is_configured) in coordinates {
+        let mut scoped = profile.clone();
+        scoped.policy_window_state_key_id = coordinate;
+        let nonce = has_enablement_nonce(&scoped)
+            .map_err(|error| Envelope::<()>::err(&WalletError::from(error)))?;
+        // A pin alone selects only the configured coordinate: the pin rule
+        // guards it on the next load there. At a distinct default coordinate
+        // only a nonce selects, and its pin entry is read only then.
+        let pin = if is_configured || nonce {
+            pin::entry_present(&scoped.policy_window_state_key_id)
+                .map_err(|e| policy_refusal(PolicyError::from(e)))?
+        } else {
+            false
+        };
+        if nonce || pin {
+            // Each entry has its own lock and the owner write runs under every guard.
+            // Two spellings of one entry answer one lock file, and the guard is not
+            // reentrant, so the later acquisition replaces the earlier guard.
+            let lock = window_lock_path(&window, &scoped.policy_window_state_key_id);
+            held.retain(|guard: &WindowStoreLock| guard.path() != lock);
+            held.push(authorize_at(&scoped, profile_name, new_owner, nonce, pin)?);
+        }
+    }
+    Ok(held)
+}
+
+/// The refusal envelope of a policy error in [`authorize_owner_write`]: the
+/// statement and signature causes as
+/// `enroll_owner_key.rotation_statement_required`, every other cause with its
+/// own code.
+fn policy_refusal(error: stellar_agent_core::policy::PolicyError) -> Envelope<()> {
+    use stellar_agent_core::policy::PolicyError;
+    match error {
+        PolicyError::OwnerRotationRequired
+        | PolicyError::OwnerRotationInvalid
+        | PolicyError::OwnerSignatureInvalid { .. } => Envelope::<()>::err_raw(
+            "enroll_owner_key.rotation_statement_required",
+            format!(
+                "install a policy signed by the new owner with a valid owner_rotation statement \
+                 from the pinned owner before enrollment ({}); no entry was written",
+                error.wire_code()
+            ),
+        ),
+        other => {
+            Envelope::<()>::err_raw(other.wire_code(), format!("{other}; no entry was written"))
+        }
+    }
+}
+
+/// Applies the enabled-installation rules at the window-state coordinate of
+/// `scoped`, which holds an enablement nonce (`nonce`) or a pin entry
+/// (`pin`), and returns the lock the pin was read under.
+fn authorize_at(
+    scoped: &Profile,
+    profile_name: &str,
+    new_owner: &[u8; 32],
+    nonce: bool,
+    pin: bool,
+) -> Result<WindowStoreLock, Envelope<()>> {
+    use stellar_agent_core::{
+        policy::{
+            PolicyError,
+            pin::{self, PinScope, PinState},
+            v1::verified::{
+                OwnerKeySource, PolicyLoad, acquire_existing_state_lock, check_owner_enrollment,
+            },
+        },
+        profile::schema::{default_policy_dir, mainnet_enablement_entry_ref, policy_pin_entry_ref},
+    };
+    let window_key = &scoped.policy_window_state_key_id;
+    let pin_absent = || {
+        let pin_entry = policy_pin_entry_ref(window_key);
+        let detail = if nonce {
+            let nonce_entry = mainnet_enablement_entry_ref(window_key);
+            format!(
+                "profile '{profile_name}' holds a mainnet enablement nonce at keyring service \
+                 '{}' account '{}' but stores no policy pin at account '{}'; remove the nonce \
+                 entry with the platform keyring tool, run `stellar-agent profile \
+                 enable-mainnet --profile {profile_name}`, and sign the rebound policy",
+                nonce_entry.service, nonce_entry.account, pin_entry.account
+            )
+        } else {
+            format!(
+                "profile '{profile_name}' stores no policy pin at keyring service '{}' account \
+                 '{}' any more",
+                pin_entry.service, pin_entry.account
+            )
+        };
+        Envelope::<()>::err_raw(
+            PolicyError::PinAbsent.wire_code(),
+            format!("{detail}; no entry was written"),
+        )
+    };
+    if !pin {
+        return Err(pin_absent());
+    }
+    let window = default_policy_window_state_path_for(profile_name);
+    let Some(lock) = acquire_existing_state_lock(&window, scoped).map_err(policy_refusal)? else {
+        return Err(Envelope::<()>::err_raw(
+            PolicyError::PinAbsent.wire_code(),
+            format!(
+                "the policy-state lock file of profile '{profile_name}' is missing, so its \
+                 policy pin cannot be read; a command that builds the V1 policy engine \
+                 recreates the lock file of the configured window key; a pin under another \
+                 window key needs that key configured again; no entry was written"
+            ),
+        ));
+    };
+    let PinState::Present(pinned) = pin::read(&lock, &PinScope::for_profile(&window, scoped))
+        .map_err(|e| policy_refusal(PolicyError::from(e)))?
+    else {
+        return Err(pin_absent());
+    };
+    let path = default_policy_dir()
+        .map_err(|e| {
+            policy_refusal(PolicyError::PolicyFileLoadFailed {
+                detail: format!("policy directory: {e}"),
+            })
+        })?
+        .join(format!("{profile_name}.toml"));
+    check_owner_enrollment(
+        &PolicyLoad {
+            path: &path,
+            profile: scoped,
+            profile_name,
+            owner_pubkey: new_owner,
+            owner_source: OwnerKeySource::Keyring,
+            window_path: &window,
+        },
+        &pinned,
+    )
+    .map_err(policy_refusal)?;
+    Ok(lock)
+}
+
 /// Resolves the owner keyring coordinate the V1 engine reads for `profile`.
 ///
 /// Mirrors the engine: recover the profile name from
@@ -367,10 +556,9 @@ where
 /// requested name, so the key is enrolled under the name the operator
 /// selected — never under another profile's trust anchor.
 fn owner_coordinate(profile: &Profile) -> Result<KeyringEntryRef, String> {
-    let service = &profile.policy_owner_key_id.service;
     let profile_name = derive_profile_name_from_owner_key(profile).ok_or_else(|| {
         format!(
-            "the profile's owner-key service '{service}' does not start with the expected \
+            "the profile's policy_owner_key_id.service does not start with the expected \
              prefix '{OWNER_KEY_SERVICE_PREFIX}'; the profile was not constructed with the \
              standard owner coordinate and cannot be enrolled"
         )
@@ -477,6 +665,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn enroll_happy_path_stores_pubkey_the_engine_can_read() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let profile_name = "enroll-owner-happy";
         let (s_strkey, derived_g, pk_bytes) = seed_material([0x11u8; 32]);
@@ -507,13 +698,8 @@ mod tests {
             Some(42),
             "a G-strkey decodes as URL-safe base64 to 42 bytes"
         );
-        let (decoded, form) =
-            stellar_agent_core::profile::owner_key::decode_owner_public_key(&stored)
-                .expect("the engine decodes the stored form");
-        assert_eq!(
-            form,
-            stellar_agent_core::profile::owner_key::OwnerKeyForm::Strkey
-        );
+        let decoded = stellar_agent_core::profile::owner_key::decode_owner_public_key(&stored)
+            .expect("the engine decodes the stored form");
         assert!(decoded == pk_bytes, "stored value must be the public key");
         assert!(
             decoded != [0x11u8; 32],
@@ -521,18 +707,23 @@ mod tests {
         );
     }
 
-    /// Enrolment rewrites the older-form owner entry of every other profile in
-    /// the profile directory, and leaves an entry already in the stored form.
+    /// Enrollment leaves every sibling owner entry byte-identical.
     #[tokio::test]
     #[serial]
-    async fn enroll_rewrites_other_profiles_older_form_entries() {
+    async fn enroll_preserves_other_profiles_older_form_entries() {
         keyring_mock::install().expect("mock store");
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let profile_dir =
             stellar_agent_core::profile::schema::default_profile_dir().expect("profile dir");
         std::fs::create_dir_all(&profile_dir).unwrap();
-        let (_s_b, g_b, pk_b) = seed_material([0x51u8; 32]);
+        let (_s_b, _g_b, pk_b) = seed_material([0x51u8; 32]);
         let (_s_c, g_c, _pk_c) = seed_material([0x52u8; 32]);
         for (name, value) in [
             ("enroll-other-b", URL_SAFE_NO_PAD.encode(pk_b)),
@@ -546,9 +737,9 @@ mod tests {
                 .unwrap();
         }
 
-        let profile_name = "enroll-owner-sweep";
+        let profile_name = "enroll-owner-siblings";
         let (s_strkey, _g, _pk) = seed_material([0x53u8; 32]);
-        let var = unique_var("SWEEP");
+        let var = unique_var("SIBLINGS");
         let _guard = EnvGuard::set(var.clone(), &s_strkey);
         let profile = profile_for(profile_name);
         let code = run_with_dependencies(
@@ -566,13 +757,16 @@ mod tests {
                 .get_password()
                 .unwrap()
         };
-        assert!(read("enroll-other-b") == g_b, "the older form is rewritten");
+        assert_eq!(read("enroll-other-b"), URL_SAFE_NO_PAD.encode(pk_b));
         assert!(read("enroll-other-c") == g_c, "the stored form is left");
     }
 
     #[tokio::test]
     #[serial]
     async fn expected_address_mismatch_refuses_without_writing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let profile_name = "enroll-owner-expected";
         let (s_strkey, _derived_g, _pk) = seed_material([0x22u8; 32]);
@@ -599,9 +793,120 @@ mod tests {
         );
     }
 
+    /// A malformed and a mismatched `--expected-address` refuse by the flag
+    /// and the derived address, and neither refusal repeats the flag value.
+    #[tokio::test]
+    #[serial]
+    async fn expected_address_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        keyring_mock::install().expect("mock store");
+        let profile_name = "enroll-owner-marker";
+        let (s_strkey, derived_g, _pk) = seed_material([0x23u8; 32]);
+        let var = unique_var("MARKER");
+        let _guard = EnvGuard::set(var.clone(), &s_strkey);
+        let (_other_s, other_g, _other_pk) = seed_material([0x34u8; 32]);
+        let cases = [
+            (
+                CREDENTIAL_MARKER.to_owned(),
+                "enroll_owner_key.expected_address_invalid",
+                "--expected-address is not a valid G-strkey".to_owned(),
+            ),
+            (
+                other_g.clone(),
+                "enroll_owner_key.expected_address_mismatch",
+                format!(
+                    "the seed in '{var}' derives to {derived_g}, which does not match \
+                     --expected-address; no entry was written"
+                ),
+            ),
+        ];
+        for (expected, code, message) in cases {
+            crate::common::render::take_rendered_for_test();
+            let profile = profile_for(profile_name);
+            let status = run_with_dependencies(
+                &args(profile_name, &var, Some(&expected), false),
+                move |_n| Ok(profile.clone()),
+                || Ok(()),
+            )
+            .await;
+            assert_eq!(status, 1);
+            let rendered = crate::common::render::take_rendered_for_test();
+            assert_eq!(rendered.len(), 1, "{rendered:?}");
+            assert_eq!(rendered[0]["error"]["code"], code);
+            assert_eq!(rendered[0]["error"]["message"], message.as_str());
+            assert_no_marker_in_text(&rendered[0].to_string(), &expected);
+        }
+    }
+
+    /// The owner service reaches neither the name-mismatch refusal of the
+    /// command nor the coordinate refusal behind it.
+    #[tokio::test]
+    #[serial]
+    async fn owner_service_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let mut profile = profile_for("enroll-owner-service-marker");
+        profile.policy_owner_key_id = KeyringEntryRef::new(CREDENTIAL_MARKER, "default");
+        let message = owner_coordinate(&profile).unwrap_err();
+        assert_eq!(
+            message,
+            format!(
+                "the profile's policy_owner_key_id.service does not start with the expected \
+                 prefix '{OWNER_KEY_SERVICE_PREFIX}'; the profile was not constructed with the \
+                 standard owner coordinate and cannot be enrolled"
+            )
+        );
+        assert_no_marker_in_text(&message, CREDENTIAL_MARKER);
+        render::take_rendered_for_test();
+        let status = run_with_dependencies(
+            &args("enroll-owner-service-marker", "UNUSED", None, false),
+            move |_| Ok(profile.clone()),
+            || Ok(()),
+        )
+        .await;
+        assert_eq!(status, 1);
+        let output = render::take_rendered_for_test();
+        assert_eq!(output[0]["error"]["code"], "profile.name_mismatch");
+        let message = output[0]["error"]["message"].as_str().unwrap();
+        assert_no_marker_in_text(&format!("{output:?}"), CREDENTIAL_MARKER);
+        assert!(message.contains(
+            "policy_owner_key_id.service does not carry the 'stellar-agent-owner-' prefix"
+        ));
+        assert_no_marker_in_text(message, CREDENTIAL_MARKER);
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+            &capture.captured_str(),
+            "CREDMARKER7",
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn overwrite_without_force_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let profile_name = "enroll-owner-noforce";
         let (s_strkey, _g, _pk) = seed_material([0x44u8; 32]);
@@ -632,6 +937,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn force_replaces_existing_entry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock store");
         let profile_name = "enroll-owner-force";
         let (s_strkey, derived_g, pk_bytes) = seed_material([0x11u8; 32]);
@@ -642,9 +950,9 @@ mod tests {
         let coord = KeyringEntryRef::default_owner_key(profile_name);
 
         // Pre-seed with a different valid public key.
-        let (_other_s, other_g, other_pk) = seed_material([0x66u8; 32]);
+        let (_other_s, other_g, _other_pk) = seed_material([0x66u8; 32]);
         let pre = KeyringEntry::new(&coord.service, &coord.account).unwrap();
-        pre.set_password(&URL_SAFE_NO_PAD.encode(other_pk)).unwrap();
+        pre.set_password(&other_g).unwrap();
         assert_ne!(derived_g, other_g);
 
         let code = run_with_dependencies(
@@ -661,7 +969,7 @@ mod tests {
             stored == derived_g,
             "coordinate must hold the new public key"
         );
-        let (decoded, _form) =
+        let decoded =
             stellar_agent_core::profile::owner_key::decode_owner_public_key(&stored).unwrap();
         assert!(
             decoded == pk_bytes,
@@ -669,9 +977,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn enroll_nonexistent_profile_returns_exit_1() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let args = EnrollOwnerKeyArgs {
             profile: Some("__nonexistent_enroll_owner_key__".to_owned()),
             secret_env: "__UNSET_ENROLL_OWNER_KEY_VAR__".to_owned(),
@@ -680,5 +989,1024 @@ mod tests {
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
+        fixture.assert_refusal(
+            Some("validation.profile_not_found"),
+            &["the requested profile was not found"],
+        );
+    }
+    /// An enabled mainnet installation of profile `operator` under a fresh
+    /// data root: the owner `[31; 32]` enrolled, its signed v2 policy at
+    /// sequence 7 pinned, then the enablement nonce stored, in the order
+    /// `profile enable-mainnet` keeps. `var` holds the seed `[32; 32]` of the
+    /// candidate owner and `previous_var` the enrolled owner's seed.
+    struct Enabled {
+        _home: stellar_agent_test_support::StellarAgentHomeGuard,
+        _dir: stellar_agent_test_support::sandbox::StateSandbox,
+        profile: Profile,
+        owner_entry: KeyringEntry,
+        nonce_entry: KeyringEntry,
+        path: std::path::PathBuf,
+        window: std::path::PathBuf,
+        body: String,
+        old: ed25519_dalek::SigningKey,
+        new: ed25519_dalek::SigningKey,
+        old_value: String,
+        var: String,
+        previous_var: String,
+        _secrets: [EnvGuard; 2],
+    }
+    const NONCE: &str = "test-enablement-nonce";
+    impl Enabled {
+        fn new() -> Self {
+            use sha2::Digest as _;
+            use stellar_agent_core::profile::signer_identity::SignerIdentityRecord;
+            use stellar_agent_core::{
+                mainnet::enablement::{read_enablement_nonce, verify_enablement},
+                policy::v1::{
+                    PolicyStateStore,
+                    verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+                },
+                profile::{
+                    name::ProfileNameSource,
+                    schema::{
+                        default_policy_dir, default_policy_window_state_path_for,
+                        default_profile_dir, mainnet_enablement_entry_ref,
+                    },
+                },
+            };
+            keyring_mock::install().unwrap();
+            let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                dir.path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
+            let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+            let signer = stellar_strkey::ed25519::PublicKey([2; 32])
+                .to_string()
+                .to_string();
+            let mut profile = Profile::builder_mainnet_named(
+                "operator",
+                "https://rpc.example.invalid",
+                "stellar-agent-signer-operator",
+                &signer,
+                "stellar-agent-nonce-operator",
+                "default",
+            )
+            .primary_provider(
+                stellar_agent_core::profile::schema::PrimaryProviderRecord::new(
+                    "Primary operator",
+                    "rpc.example.invalid",
+                ),
+            )
+            .oracle_provider_url(url::Url::parse("https://oracle.example.invalid").unwrap())
+            .oracle_provider(stellar_agent_core::profile::schema::ProviderRecord::new(
+                "Oracle operator",
+                "oracle.example.invalid",
+                true,
+            ))
+            .build();
+            profile.wallet.mlock_required = stellar_agent_core::wallet::MlockRequired::Warn;
+            let identity = stellar_agent_core::profile::schema::signer_identity_entry_ref(
+                &profile.mcp_signer_default,
+            );
+            KeyringEntry::new(&identity.service, &identity.account)
+                .unwrap()
+                .set_password(
+                    &SignerIdentityRecord::signed_for_test(
+                        [2; 32],
+                        "operator",
+                        &profile,
+                        &ed25519_dalek::SigningKey::from_bytes(&[31; 32]),
+                    )
+                    .render()
+                    .unwrap(),
+                )
+                .unwrap();
+            let profiles = default_profile_dir().unwrap();
+            loader::save_to_dir("operator", &profile, &profiles).unwrap();
+            let path = default_policy_dir().unwrap().join("operator.toml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let window = default_policy_window_state_path_for("operator");
+            std::fs::create_dir_all(window.parent().unwrap()).unwrap();
+            let old = ed25519_dalek::SigningKey::from_bytes(&[31; 32]);
+            let new = ed25519_dalek::SigningKey::from_bytes(&[32; 32]);
+            let owner_coord = KeyringEntryRef::default_owner_key("operator");
+            let owner_entry =
+                KeyringEntry::new(&owner_coord.service, &owner_coord.account).unwrap();
+            let old_value = stellar_strkey::ed25519::PublicKey(old.verifying_key().to_bytes())
+                .to_string()
+                .to_string();
+            owner_entry.set_password(&old_value).unwrap();
+            let body = include_str!("../../../../stellar-agent-core/tests/fixtures/policy-v2.toml")
+                .replace(
+                    &"0".repeat(64),
+                    &stellar_agent_core::hex::encode(&sha2::Sha256::digest(NONCE.as_bytes())),
+                );
+            std::fs::write(&path, signed(&body, &old)).unwrap();
+            let verified = load_verified_policy(
+                &PolicyLoad {
+                    path: &path,
+                    profile: &profile,
+                    profile_name: "operator",
+                    owner_pubkey: &old.verifying_key().to_bytes(),
+                    owner_source: OwnerKeySource::Keyring,
+                    window_path: &window,
+                },
+                PolicyStateStore::new(),
+                PinMode::Advance,
+            )
+            .unwrap();
+            let coord = mainnet_enablement_entry_ref(&profile.policy_window_state_key_id);
+            let nonce_entry = KeyringEntry::new(&coord.service, &coord.account).unwrap();
+            nonce_entry.set_password(NONCE).unwrap();
+            verify_enablement(
+                &verified,
+                "operator",
+                ProfileNameSource::Flag,
+                &profile,
+                &profiles,
+                &read_enablement_nonce,
+            )
+            .unwrap();
+            let var = unique_var("ROTATION");
+            let previous_var = unique_var("PREVIOUS");
+            let secrets = [
+                EnvGuard::set(var.clone(), &seed_material([32; 32]).0),
+                EnvGuard::set(previous_var.clone(), &seed_material([31; 32]).0),
+            ];
+            Self {
+                _dir: dir,
+                _home: home,
+                profile,
+                owner_entry,
+                nonce_entry,
+                path,
+                window,
+                body,
+                old,
+                new,
+                old_value,
+                var,
+                previous_var,
+                _secrets: secrets,
+            }
+        }
+        /// The policy at `sequence` with a statement from the pinned owner
+        /// to the candidate owner, before its `[signature]`.
+        fn rotation(&self, sequence: i64) -> String {
+            let body = self
+                .body
+                .replace("sequence = 7", &format!("sequence = {sequence}"));
+            let mut doc = body.parse::<toml_edit::DocumentMut>().unwrap();
+            doc["owner_rotation"] = toml_edit::Item::Table(
+                stellar_agent_core::policy::v1::signature::build_owner_rotation(
+                    &body,
+                    &self.old,
+                    &self.new.verifying_key().to_bytes(),
+                )
+                .unwrap(),
+            );
+            doc.to_string()
+        }
+        fn pin(&self) -> stellar_agent_core::policy::pin::PinState {
+            stellar_agent_core::policy::v1::verified::read_pin_without_creating(
+                &self.window,
+                &self.profile,
+            )
+            .unwrap()
+        }
+        /// Runs the enrollment against the stored profile file.
+        async fn enroll(&self, var: &str, force: bool) -> (i32, Vec<serde_json::Value>) {
+            enroll_stored(var, force).await
+        }
+    }
+    /// Runs the enrollment of profile `operator` against its stored profile
+    /// file and returns the exit code and the rendered envelopes.
+    async fn enroll_stored(var: &str, force: bool) -> (i32, Vec<serde_json::Value>) {
+        render::take_rendered_for_test();
+        let code = run_with_dependencies(
+            &args("operator", var, None, force),
+            |name| {
+                loader::load_from_dir(
+                    name,
+                    &stellar_agent_core::profile::schema::default_profile_dir().unwrap(),
+                    None,
+                )
+            },
+            || Ok(()),
+        )
+        .await;
+        (code, render::take_rendered_for_test())
+    }
+    /// A testnet v2 policy body of profile `operator` at `sequence`, before
+    /// its `[signature]`.
+    fn testnet_body(sequence: i64) -> String {
+        format!(
+            "version = 2\nscope = \"profile:operator\"\nsequence = {sequence}\n\
+             [[rules]]\nmatch = {{tool = \"stellar_balances\", chain = \"*\"}}\n\
+             criteria = []\ndecision = \"allow\"\n"
+        )
+    }
+    /// The testnet profile `operator` with the window-state key `window`.
+    fn testnet_operator(window: Option<KeyringEntryRef>) -> Profile {
+        let signer = stellar_strkey::ed25519::PublicKey([2; 32])
+            .to_string()
+            .to_string();
+        let mut profile = Profile::builder_testnet_named(
+            "operator",
+            "stellar-agent-signer-operator",
+            &signer,
+            "stellar-agent-nonce-operator",
+            "default",
+        )
+        .build();
+        profile.wallet.mlock_required = stellar_agent_core::wallet::MlockRequired::Warn;
+        if let Some(window) = window {
+            profile.policy_window_state_key_id = window;
+        }
+        profile
+    }
+    /// Loads the policy at `path` for `profile` under `key` in
+    /// `PinMode::Advance`.
+    fn advance(
+        path: &std::path::Path,
+        window: &std::path::Path,
+        profile: &Profile,
+        key: &ed25519_dalek::SigningKey,
+    ) {
+        use stellar_agent_core::policy::v1::{
+            PolicyStateStore,
+            verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+        };
+        load_verified_policy(
+            &PolicyLoad {
+                path,
+                profile,
+                profile_name: "operator",
+                owner_pubkey: &key.verifying_key().to_bytes(),
+                owner_source: OwnerKeySource::Keyring,
+                window_path: window,
+            },
+            PolicyStateStore::new(),
+            PinMode::Advance,
+        )
+        .unwrap();
+    }
+    fn signed(raw: &str, key: &ed25519_dalek::SigningKey) -> String {
+        use stellar_agent_core::policy::v1::{
+            canonical::canonical_bytes,
+            signature::{digest, sign},
+        };
+        format!(
+            "{raw}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+            stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()),
+            stellar_agent_core::hex::encode(&sign(&digest(&canonical_bytes(raw).unwrap()), key))
+        )
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn enabled_owner_enrollment_requires_an_installed_valid_rotation() {
+        let f = Enabled::new();
+        let before = f.pin();
+        assert!(matches!(
+            before,
+            stellar_agent_core::policy::pin::PinState::Present(_)
+        ));
+        let valid = f.rotation(8);
+        for defect in [
+            "absent",
+            "forged",
+            "wrong_owner",
+            "changed_body",
+            "outer_signature",
+            "valid",
+        ] {
+            let mut doc = valid.parse::<toml_edit::DocumentMut>().unwrap();
+            match defect {
+                "absent" => {
+                    doc.remove("owner_rotation");
+                }
+                "forged" => doc["owner_rotation"]["sig"] = toml_edit::value("00".repeat(64)),
+                "wrong_owner" => {
+                    doc["owner_rotation"]["new_owner"] = toml_edit::value(f.old_value.clone())
+                }
+                "changed_body" => doc["sequence"] = toml_edit::value(9),
+                _ => {}
+            }
+            let key = if defect == "outer_signature" {
+                &f.old
+            } else {
+                &f.new
+            };
+            let installed = signed(&doc.to_string(), key);
+            std::fs::write(&f.path, &installed).unwrap();
+            let (code, output) = f.enroll(&f.var, true).await;
+            if defect == "valid" {
+                assert_eq!(code, 0, "{output:?}");
+                assert_eq!(
+                    f.owner_entry.get_password().unwrap(),
+                    stellar_strkey::ed25519::PublicKey(f.new.verifying_key().to_bytes())
+                        .to_string()
+                        .to_string()
+                );
+            } else {
+                assert_eq!(code, 1, "{defect}: {output:?}");
+                assert_eq!(
+                    output[0]["error"]["code"], "enroll_owner_key.rotation_statement_required",
+                    "{defect}"
+                );
+                assert_eq!(f.owner_entry.get_password().unwrap(), f.old_value);
+            }
+            assert_eq!(std::fs::read_to_string(&f.path).unwrap(), installed);
+            assert_eq!(f.pin(), before);
+            assert_eq!(f.nonce_entry.get_password().unwrap(), NONCE);
+        }
+    }
+
+    /// The pin authorizes its own owner: a lost owner entry of an enabled
+    /// installation is restored by enrolling the pinned key, with or without
+    /// `--force`, while another key without a statement stays refused.
+    #[tokio::test]
+    #[serial]
+    async fn enrolling_the_pinned_owner_restores_a_lost_owner_entry() {
+        let f = Enabled::new();
+        let before = f.pin();
+        f.owner_entry.delete_credential().unwrap();
+        let (code, output) = f.enroll(&f.var, false).await;
+        assert_eq!(code, 1, "{output:?}");
+        assert_eq!(
+            output[0]["error"]["code"],
+            "enroll_owner_key.rotation_statement_required"
+        );
+        assert!(matches!(
+            f.owner_entry.get_password(),
+            Err(keyring_core::Error::NoEntry)
+        ));
+        let (code, output) = f.enroll(&f.previous_var, false).await;
+        assert_eq!(code, 0, "{output:?}");
+        assert_eq!(f.owner_entry.get_password().unwrap(), f.old_value);
+        let (code, output) = f.enroll(&f.previous_var, true).await;
+        assert_eq!(code, 0, "{output:?}");
+        assert_eq!(output[0]["data"]["replaced"], true);
+        assert_eq!(f.owner_entry.get_password().unwrap(), f.old_value);
+        assert_eq!(f.pin(), before);
+        assert_eq!(f.nonce_entry.get_password().unwrap(), NONCE);
+    }
+
+    #[test]
+    #[serial]
+    fn owner_authorization_holds_every_selected_entry_lock() {
+        use stellar_agent_core::{
+            policy::{
+                pin::{self, PinScope, PinState},
+                state_lock::StateLockError,
+            },
+            profile::schema::mainnet_enablement_entry_ref,
+        };
+        for (configured, expected_guards) in [
+            (KeyringEntryRef::new("moved-window", "default"), 2),
+            (
+                KeyringEntryRef::default_policy_window_state_key("operator"),
+                1,
+            ),
+            (
+                KeyringEntryRef::new("STELLAR-AGENT-POLICY-WINDOW-OPERATOR", "DEFAULT"),
+                1,
+            ),
+        ] {
+            let f = Enabled::new();
+            let PinState::Present(pinned) = f.pin() else {
+                panic!("the enabled fixture holds a pin");
+            };
+            let mut profile = f.profile.clone();
+            profile.policy_window_state_key_id = configured.clone();
+            let default = KeyringEntryRef::default_policy_window_state_key("operator");
+            let lock = WindowStoreLock::acquire_for(&f.window, &configured).unwrap();
+            pin::write_for_test(&lock, &PinScope::for_profile(&f.window, &profile), &pinned)
+                .unwrap();
+            drop(lock);
+            let nonce = mainnet_enablement_entry_ref(&configured);
+            KeyringEntry::new(&nonce.service, &nonce.account)
+                .unwrap()
+                .set_password(NONCE)
+                .unwrap();
+
+            let held =
+                authorize_owner_write(&profile, "operator", &f.old.verifying_key().to_bytes())
+                    .unwrap();
+            for coordinate in [&configured, &default] {
+                assert!(
+                    matches!(
+                        WindowStoreLock::acquire_for(&f.window, coordinate),
+                        Err(StateLockError::WriterLocked)
+                    ),
+                    "every selected coordinate stays locked: {coordinate:?}"
+                );
+            }
+            assert_eq!(held.len(), expected_guards);
+            drop(held);
+            for coordinate in [&configured, &default] {
+                drop(WindowStoreLock::acquire_for(&f.window, coordinate).unwrap());
+            }
+        }
+    }
+
+    /// An enrollment whose two selected window-state entries both hold
+    /// records keeps both entry locks through the owner entry write and
+    /// releases them after it.
+    #[tokio::test]
+    #[serial]
+    async fn enrollment_holds_every_selected_entry_lock_across_the_owner_write() {
+        use stellar_agent_core::{
+            policy::{
+                pin::{self, PinScope, PinState},
+                state_lock::StateLockError,
+            },
+            profile::schema::default_profile_dir,
+        };
+        let f = Enabled::new();
+        let PinState::Present(pinned) = f.pin() else {
+            panic!("the enabled fixture holds a pin");
+        };
+        let moved_key = KeyringEntryRef::new("stellar-agent-policy-window-operator", "moved");
+        let moved = testnet_operator(Some(moved_key.clone()));
+        loader::save_to_dir("operator", &moved, &default_profile_dir().unwrap()).unwrap();
+        let lock = WindowStoreLock::acquire_for(&f.window, &moved_key).unwrap();
+        pin::write_for_test(&lock, &PinScope::for_profile(&f.window, &moved), &pinned).unwrap();
+        drop(lock);
+        f.owner_entry.delete_credential().unwrap();
+
+        let coordinates = [moved_key, f.profile.policy_window_state_key_id.clone()];
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let sink = observed.clone();
+        let window = f.window.clone();
+        let probed = coordinates.clone();
+        BEFORE_OWNER_WRITE.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                *sink.borrow_mut() = Some(probed.map(|coordinate| {
+                    matches!(
+                        WindowStoreLock::acquire_for(&window, &coordinate),
+                        Err(StateLockError::WriterLocked)
+                    )
+                }));
+            }));
+        });
+
+        let (code, output) = f.enroll(&f.previous_var, false).await;
+        assert_eq!(code, 0, "{output:?}");
+        assert_eq!(f.owner_entry.get_password().unwrap(), f.old_value);
+        assert_eq!(
+            observed.borrow_mut().take(),
+            Some([true, true]),
+            "both entry locks are held at the owner entry write"
+        );
+        for coordinate in &coordinates {
+            drop(WindowStoreLock::acquire_for(&f.window, coordinate).unwrap());
+        }
+    }
+
+    /// Each cause other than the statement keeps its own code, and none
+    /// writes the owner entry.
+    #[tokio::test]
+    #[serial]
+    async fn enrollment_refusals_keep_their_causes() {
+        use stellar_agent_core::policy::state_lock::{WindowStoreLock, window_lock_path};
+        let f = Enabled::new();
+        std::fs::write(&f.path, signed(&f.rotation(8), &f.new)).unwrap();
+        let lock_path = window_lock_path(&f.window, &f.profile.policy_window_state_key_id);
+        let pin_coord = stellar_agent_core::profile::schema::policy_pin_entry_ref(
+            &f.profile.policy_window_state_key_id,
+        );
+        let pin_entry = KeyringEntry::new(&pin_coord.service, &pin_coord.account).unwrap();
+        let stored_pin = pin_entry.get_password().unwrap();
+        let installed = std::fs::read_to_string(&f.path).unwrap();
+        for (cause, code, text) in [
+            (
+                "nonce_unreadable",
+                "profile.mainnet_enablement_invalid",
+                "nonce",
+            ),
+            ("lock_busy", "policy.state_lock_busy", ""),
+            ("lock_io", "policy.state_lock_io", ""),
+            ("lock_missing", "policy.pin_absent", "lock file"),
+            ("pin_missing", "policy.pin_absent", "stores no policy pin"),
+            ("pin_unusable", "policy.pin_unusable", ""),
+            ("pin_unreadable_without_nonce", "policy.pin_unusable", ""),
+            (
+                "policy_missing",
+                "policy.policy_file_load_failed",
+                "operator.toml",
+            ),
+            ("rollback", "policy.sequence_rollback", ""),
+        ] {
+            let mut held = None;
+            match cause {
+                "nonce_unreadable" => {
+                    let coord = stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
+                        &f.profile.policy_window_state_key_id,
+                    );
+                    keyring_mock::inject_error(
+                        &coord.service,
+                        &coord.account,
+                        keyring_core::Error::BadStoreFormat("injected read failure".into()),
+                    )
+                    .unwrap();
+                }
+                "lock_busy" => {
+                    held = Some(
+                        WindowStoreLock::acquire_for(
+                            &f.window,
+                            &f.profile.policy_window_state_key_id,
+                        )
+                        .unwrap(),
+                    );
+                }
+                "lock_io" => {
+                    std::fs::remove_file(&lock_path).unwrap();
+                    std::fs::create_dir(&lock_path).unwrap();
+                }
+                "lock_missing" => std::fs::remove_file(&lock_path).unwrap(),
+                "pin_missing" => pin_entry.delete_credential().unwrap(),
+                "pin_unusable" => pin_entry.set_password("not a pin").unwrap(),
+                "pin_unreadable_without_nonce" => {
+                    f.nonce_entry.delete_credential().unwrap();
+                    keyring_mock::inject_error(
+                        &pin_coord.service,
+                        &pin_coord.account,
+                        keyring_core::Error::BadStoreFormat("injected read failure".into()),
+                    )
+                    .unwrap();
+                }
+                "policy_missing" => std::fs::remove_file(&f.path).unwrap(),
+                _ => std::fs::write(&f.path, signed(&f.rotation(6), &f.new)).unwrap(),
+            }
+            let (status, output) = f.enroll(&f.var, true).await;
+            drop(held);
+            assert_eq!(status, 1, "{cause}: {output:?}");
+            assert_eq!(output[0]["error"]["code"], code, "{cause}: {output:?}");
+            let message = output[0]["error"]["message"].as_str().unwrap();
+            assert!(message.contains(text), "{cause}: {message}");
+            if cause == "lock_missing" {
+                assert_eq!(
+                    message,
+                    "the policy-state lock file of profile 'operator' is missing, so its \
+                     policy pin cannot be read; a command that builds the V1 policy engine \
+                     recreates the lock file of the configured window key; a pin under another \
+                     window key needs that key configured again; no entry was written"
+                );
+            }
+            assert_eq!(
+                f.owner_entry.get_password().unwrap(),
+                f.old_value,
+                "{cause}"
+            );
+            if cause == "pin_unreadable_without_nonce" {
+                assert_eq!(pin_entry.get_password().unwrap(), stored_pin, "{cause}");
+                assert!(matches!(
+                    f.nonce_entry.get_password(),
+                    Err(keyring_core::Error::NoEntry)
+                ));
+                f.nonce_entry.set_password(NONCE).unwrap();
+            }
+            assert_eq!(f.nonce_entry.get_password().unwrap(), NONCE, "{cause}");
+            // Restore the installation for the next cause.
+            if lock_path.is_dir() {
+                std::fs::remove_dir(&lock_path).unwrap();
+            }
+            drop(
+                WindowStoreLock::acquire_for(&f.window, &f.profile.policy_window_state_key_id)
+                    .unwrap(),
+            );
+            pin_entry.set_password(&stored_pin).unwrap();
+            std::fs::write(&f.path, &installed).unwrap();
+        }
+        let (status, output) = f.enroll(&f.var, true).await;
+        assert_eq!(status, 0, "{output:?}");
+    }
+
+    /// A window-state key moved in the profile file would select an empty pin
+    /// and nonce namespace. The mainnet key-scope check refuses that profile
+    /// before enrollment, both forms of the enablement ceremony, a mainnet
+    /// verb, and every other verb that reconciles it, so the owner cannot be
+    /// re-rooted without a statement.
+    #[tokio::test]
+    #[serial]
+    async fn a_moved_window_state_key_cannot_re_root_an_enabled_profile() {
+        use stellar_agent_core::profile::schema::{
+            default_profile_dir, mainnet_enablement_entry_ref, policy_pin_entry_ref,
+        };
+        let f = Enabled::new();
+        let mut moved = f.profile.clone();
+        moved.policy_window_state_key_id.account = "moved".to_owned();
+        let profiles = default_profile_dir().unwrap();
+        loader::save_to_dir("operator", &moved, &profiles).unwrap();
+        let loaded = loader::load_from_dir("operator", &profiles, None).unwrap();
+        assert_eq!(loaded.policy_window_state_key_id.account, "moved");
+        let moved_nonce = mainnet_enablement_entry_ref(&loaded.policy_window_state_key_id);
+        let moved_pin = policy_pin_entry_ref(&loaded.policy_window_state_key_id);
+        let absent = |coord: &KeyringEntryRef| {
+            matches!(
+                KeyringEntry::new(&coord.service, &coord.account)
+                    .unwrap()
+                    .get_password(),
+                Err(keyring_core::Error::NoEntry)
+            )
+        };
+
+        // A new owner without a statement.
+        let (code, output) = f.enroll(&f.var, true).await;
+        assert_eq!(code, 1, "{output:?}");
+        assert_eq!(output[0]["error"]["code"], "profile.key_scope_conflict");
+        assert!(
+            output[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("policy_window_state_key_id"),
+            "{output:?}"
+        );
+        assert_eq!(f.owner_entry.get_password().unwrap(), f.old_value);
+
+        // Both forms of the enablement ceremony in the moved namespace.
+        #[derive(clap::Parser)]
+        struct Command {
+            #[command(flatten)]
+            args: super::super::enable_mainnet::EnableMainnetArgs,
+        }
+        let policy = std::fs::read_to_string(&f.path).unwrap();
+        let pinned = f.pin();
+        for form in [&[][..], &["--rotate"][..]] {
+            let command = <Command as clap::Parser>::try_parse_from(
+                ["enable-mainnet", "--profile", "operator"]
+                    .iter()
+                    .chain(form),
+            )
+            .unwrap();
+            let mut audited = false;
+            let (refused, detail) = super::super::enable_mainnet::execute(
+                &command.args,
+                "operator",
+                &loaded,
+                &profiles,
+                &f.path,
+                &stellar_agent_network::policy_state::PersistedWindowStore::at_path(
+                    f.window.clone(),
+                ),
+                |_| {
+                    audited = true;
+                    Ok(())
+                },
+                |_, _| Ok(()),
+                &mut crate::common::spending_preview::SpendingPreview::new(&mut std::io::sink()),
+            )
+            .unwrap_err();
+            assert_eq!(refused, "profile.enable_mainnet_precondition", "{form:?}");
+            assert!(detail.contains("key_scope"), "{form:?}: {detail}");
+            assert!(
+                detail.contains("policy_window_state_key_id"),
+                "{form:?}: {detail}"
+            );
+            assert!(!audited, "{form:?}");
+            assert!(absent(&moved_nonce), "{form:?}");
+            assert!(absent(&moved_pin), "{form:?}");
+            assert_eq!(std::fs::read_to_string(&f.path).unwrap(), policy);
+            assert_eq!(f.pin(), pinned, "{form:?}");
+            assert_eq!(f.nonce_entry.get_password().unwrap(), NONCE, "{form:?}");
+        }
+
+        // A mainnet verb of the V1 engine.
+        #[derive(clap::Parser)]
+        struct Pay {
+            #[command(flatten)]
+            args: crate::commands::pay::PayArgs,
+        }
+        let destination = stellar_strkey::ed25519::PublicKey([9; 32])
+            .to_string()
+            .to_string();
+        let pay = <Pay as clap::Parser>::try_parse_from([
+            "pay",
+            "--profile",
+            "operator",
+            destination.as_str(),
+            "1",
+        ])
+        .unwrap();
+        render::take_rendered_for_test();
+        assert_eq!(crate::commands::pay::run(&pay.args).await, 1);
+        let output = render::take_rendered_for_test();
+        assert_eq!(
+            output[0]["error"]["code"], "profile.key_scope_conflict",
+            "{output:?}"
+        );
+        assert!(
+            output[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("policy_window_state_key_id"),
+            "{output:?}"
+        );
+        assert!(absent(&moved_nonce));
+        assert!(absent(&moved_pin));
+        assert_eq!(std::fs::read_to_string(&f.path).unwrap(), policy);
+        assert_eq!(f.pin(), pinned);
+
+        // Every CLI verb reconciles the loaded profile before it runs.
+        let refusal = crate::common::profile_access::reconcile_loaded_profile(
+            Ok(loaded),
+            &stellar_agent_core::profile::ResolvedProfileName::from_flag("operator"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &refusal,
+                crate::common::profile_access::ProfileAccessError::KeyScopeConflict(conflict)
+                    if conflict.kind == "window_state_key_override"
+            ),
+            "{refusal:?}"
+        );
+        assert_eq!(f.owner_entry.get_password().unwrap(), f.old_value);
+        assert_eq!(f.nonce_entry.get_password().unwrap(), NONCE);
+    }
+
+    /// An enabled installation whose profile file is edited to testnet with
+    /// a moved window-state entry: the edited profile loads, and enrollment
+    /// still finds the nonce and the pin at the default entry and applies
+    /// the enabled-installation rules. Without a pin it refuses with
+    /// `policy.pin_absent`; with one, a key without a statement refuses. The
+    /// owner entry, the nonce, and the pin stay unchanged, and nothing is
+    /// written at the moved entry.
+    #[tokio::test]
+    #[serial]
+    async fn a_testnet_detour_cannot_re_root_an_enabled_profile() {
+        use stellar_agent_core::profile::schema::{
+            default_profile_dir, mainnet_enablement_entry_ref, policy_pin_entry_ref,
+        };
+        for (pin, code) in [
+            (false, "policy.pin_absent"),
+            (true, "enroll_owner_key.rotation_statement_required"),
+        ] {
+            let f = Enabled::new();
+            if !pin {
+                let coord = policy_pin_entry_ref(&f.profile.policy_window_state_key_id);
+                KeyringEntry::new(&coord.service, &coord.account)
+                    .unwrap()
+                    .delete_credential()
+                    .unwrap();
+            }
+            let before = f.pin();
+            let signer = stellar_strkey::ed25519::PublicKey([2; 32])
+                .to_string()
+                .to_string();
+            let mut detour = Profile::builder_testnet_named(
+                "operator",
+                "stellar-agent-signer-operator",
+                &signer,
+                "stellar-agent-nonce-operator",
+                "default",
+            )
+            .build();
+            detour.wallet.mlock_required = stellar_agent_core::wallet::MlockRequired::Warn;
+            assert_eq!(
+                detour.policy_window_state_key_id,
+                KeyringEntryRef::default_policy_window_state_key("operator")
+            );
+            detour.policy_window_state_key_id.account = "moved".to_owned();
+            let profiles = default_profile_dir().unwrap();
+            loader::save_to_dir("operator", &detour, &profiles).unwrap();
+            let loaded = loader::load_from_dir("operator", &profiles, None).unwrap();
+            assert!(!loaded.chain_id.is_mainnet());
+            assert_eq!(loaded.policy_window_state_key_id.account, "moved");
+
+            let (status, output) = f.enroll(&f.var, true).await;
+            assert_eq!(status, 1, "{pin}: {output:?}");
+            assert_eq!(output[0]["error"]["code"], code, "{pin}: {output:?}");
+            assert_eq!(f.owner_entry.get_password().unwrap(), f.old_value, "{pin}");
+            assert_eq!(f.nonce_entry.get_password().unwrap(), NONCE, "{pin}");
+            assert_eq!(f.pin(), before, "{pin}");
+            for coord in [
+                mainnet_enablement_entry_ref(&loaded.policy_window_state_key_id),
+                policy_pin_entry_ref(&loaded.policy_window_state_key_id),
+            ] {
+                assert!(
+                    matches!(
+                        KeyringEntry::new(&coord.service, &coord.account)
+                            .unwrap()
+                            .get_password(),
+                        Err(keyring_core::Error::NoEntry)
+                    ),
+                    "{pin}: {coord:?}"
+                );
+            }
+        }
+    }
+
+    /// A policy pin without an enablement nonce at the configured
+    /// window-state entry is a continuity record too: on the mainnet profile,
+    /// on the same profile edited to testnet, and on a testnet profile whose
+    /// custom entry holds the pin while its default entry holds nothing, a
+    /// key without a statement refuses and the owner entry and the pin stay
+    /// unchanged.
+    #[tokio::test]
+    #[serial]
+    async fn a_pin_without_a_nonce_still_requires_the_statement() {
+        use stellar_agent_core::{
+            policy::{pin::PinState, v1::verified::read_pin_without_creating},
+            profile::schema::{default_profile_dir, policy_pin_entry_ref},
+        };
+        for case in ["mainnet", "testnet_default", "testnet_custom"] {
+            let f = Enabled::new();
+            f.nonce_entry.delete_credential().unwrap();
+            let profile = match case {
+                "mainnet" => f.profile.clone(),
+                "testnet_default" => {
+                    let testnet = testnet_operator(None);
+                    assert_eq!(
+                        testnet.policy_window_state_key_id,
+                        f.profile.policy_window_state_key_id
+                    );
+                    testnet
+                }
+                _ => {
+                    let default = policy_pin_entry_ref(&f.profile.policy_window_state_key_id);
+                    KeyringEntry::new(&default.service, &default.account)
+                        .unwrap()
+                        .delete_credential()
+                        .unwrap();
+                    let testnet = testnet_operator(Some(KeyringEntryRef::new(
+                        "stellar-agent-policy-window-operator",
+                        "custom",
+                    )));
+                    std::fs::write(&f.path, signed(&testnet_body(3), &f.old)).unwrap();
+                    advance(&f.path, &f.window, &testnet, &f.old);
+                    assert_eq!(f.pin(), PinState::Absent);
+                    testnet
+                }
+            };
+            if case != "mainnet" {
+                loader::save_to_dir("operator", &profile, &default_profile_dir().unwrap()).unwrap();
+            }
+            let before = read_pin_without_creating(&f.window, &profile).unwrap();
+            assert!(matches!(before, PinState::Present(_)), "{case}");
+            let (status, output) = f.enroll(&f.var, true).await;
+            assert_eq!(status, 1, "{case}: {output:?}");
+            assert_eq!(
+                output[0]["error"]["code"], "enroll_owner_key.rotation_statement_required",
+                "{case}: {output:?}"
+            );
+            assert_eq!(f.owner_entry.get_password().unwrap(), f.old_value, "{case}");
+            assert_eq!(
+                read_pin_without_creating(&f.window, &profile).unwrap(),
+                before,
+                "{case}"
+            );
+        }
+    }
+
+    /// Two successive owner rotations on a testnet profile whose window-state
+    /// entry moved after its policy loaded at the default entry: each
+    /// enrollment checks the configured pin, which the previous rotation's
+    /// load advanced, and the pin left at the default entry does not refuse
+    /// it.
+    #[tokio::test]
+    #[serial]
+    async fn successive_testnet_rotations_after_a_window_move_enroll() {
+        use stellar_agent_core::{
+            policy::{pin::PinState, v1::verified::read_pin_without_creating},
+            profile::schema::{
+                default_policy_dir, default_policy_window_state_path_for, default_profile_dir,
+            },
+        };
+        keyring_mock::install().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let keys = [41_u8, 42, 43].map(|seed| ed25519_dalek::SigningKey::from_bytes(&[seed; 32]));
+        let address = |key: &ed25519_dalek::SigningKey| {
+            stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes())
+                .to_string()
+                .to_string()
+        };
+        let vars = [unique_var("ROTATION_B"), unique_var("ROTATION_C")];
+        let _secrets = [
+            EnvGuard::set(vars[0].clone(), &seed_material([42; 32]).0),
+            EnvGuard::set(vars[1].clone(), &seed_material([43; 32]).0),
+        ];
+        let profiles = default_profile_dir().unwrap();
+        let path = default_policy_dir().unwrap().join("operator.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let window = default_policy_window_state_path_for("operator");
+        std::fs::create_dir_all(window.parent().unwrap()).unwrap();
+        let owner_coord = KeyringEntryRef::default_owner_key("operator");
+        let owner_entry = KeyringEntry::new(&owner_coord.service, &owner_coord.account).unwrap();
+        owner_entry.set_password(&address(&keys[0])).unwrap();
+
+        let original = testnet_operator(None);
+        loader::save_to_dir("operator", &original, &profiles).unwrap();
+        std::fs::write(&path, signed(&testnet_body(1), &keys[0])).unwrap();
+        advance(&path, &window, &original, &keys[0]);
+        let moved = testnet_operator(Some(KeyringEntryRef::new(
+            "stellar-agent-policy-window-operator",
+            "moved",
+        )));
+        loader::save_to_dir("operator", &moved, &profiles).unwrap();
+        advance(&path, &window, &moved, &keys[0]);
+        let default_pin = read_pin_without_creating(&window, &original).unwrap();
+
+        for (step, var) in vars.iter().enumerate() {
+            let (previous, next) = (&keys[step], &keys[step + 1]);
+            let sequence = i64::try_from(step).unwrap() + 2;
+            let body = testnet_body(sequence);
+            let mut doc = body.parse::<toml_edit::DocumentMut>().unwrap();
+            doc["owner_rotation"] = toml_edit::Item::Table(
+                stellar_agent_core::policy::v1::signature::build_owner_rotation(
+                    &body,
+                    previous,
+                    &next.verifying_key().to_bytes(),
+                )
+                .unwrap(),
+            );
+            std::fs::write(&path, signed(&doc.to_string(), next)).unwrap();
+            let (code, output) = enroll_stored(var, true).await;
+            assert_eq!(code, 0, "step {step}: {output:?}");
+            assert_eq!(owner_entry.get_password().unwrap(), address(next));
+            advance(&path, &window, &moved, next);
+            assert!(matches!(
+                read_pin_without_creating(&window, &moved).unwrap(),
+                PinState::Present(pin) if pin.sequence() == sequence
+                    && pin.owner() == next.verifying_key().to_bytes()
+            ));
+        }
+        assert_eq!(
+            read_pin_without_creating(&window, &original).unwrap(),
+            default_pin
+        );
+    }
+
+    /// A testnet profile with a custom window-state entry and no record at
+    /// its default entry or its configured one enrolls a new owner with
+    /// `--force`.
+    #[tokio::test]
+    #[serial]
+    async fn a_testnet_custom_window_key_without_records_enrolls() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock store");
+        let profile_name = "enroll-owner-custom-window";
+        let (s_strkey, derived_g, _) = seed_material([0x11u8; 32]);
+        let var = unique_var("CUSTOM_WINDOW");
+        let _guard = EnvGuard::set(var.clone(), &s_strkey);
+        let mut profile = profile_for(profile_name);
+        profile.policy_window_state_key_id =
+            KeyringEntryRef::new("stellar-agent-policy-window-custom", "custom");
+        let coord = KeyringEntryRef::default_owner_key(profile_name);
+        let (_, other_g, _) = seed_material([0x66u8; 32]);
+        KeyringEntry::new(&coord.service, &coord.account)
+            .unwrap()
+            .set_password(&other_g)
+            .unwrap();
+
+        let code = run_with_dependencies(
+            &args(profile_name, &var, None, true),
+            move |_n| Ok(profile.clone()),
+            || Ok(()),
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert_eq!(
+            KeyringEntry::new(&coord.service, &coord.account)
+                .unwrap()
+                .get_password()
+                .unwrap(),
+            derived_g
+        );
+    }
+
+    /// Profile-name reconciliation refuses an installation owner coordinate before keyring initialization.
+    #[tokio::test]
+    #[serial]
+    async fn installation_coordinate_refuses_without_writing() {
+        use crate::common::installation_key_fixture::InstallationKeyFixture;
+        let fixture = InstallationKeyFixture::new("stellar-agent-toolsets");
+        let name = "pin-coordinate-refusal";
+        let mut profile = profile_for(name);
+        profile.policy_owner_key_id = fixture.coordinate.clone();
+        let code = run_with_dependencies(
+            &args(name, "UNUSED_PIN_SEED", None, true),
+            |_| Ok(profile.clone()),
+            || fixture.init(),
+        )
+        .await;
+        fixture.assert_refused(code);
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0]["error"]["code"], "profile.name_mismatch");
     }
 }

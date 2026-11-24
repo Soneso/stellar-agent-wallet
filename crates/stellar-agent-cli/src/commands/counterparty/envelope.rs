@@ -26,7 +26,7 @@ pub(crate) fn to_counterparty_envelope(err: &CounterpartyError) -> Envelope<()> 
         CounterpartyError::HmacMismatch => "counterparty.hmac_mismatch",
         CounterpartyError::FetchFailed { .. } => "counterparty.fetch_failed",
         CounterpartyError::TomlInvalid { .. } => "counterparty.toml_invalid",
-        CounterpartyError::KindParseError(CounterpartyKindParseError::UnknownKind { .. }) => {
+        CounterpartyError::KindParseError(CounterpartyKindParseError::UnknownKind) => {
             "counterparty.kind_parse.unknown"
         }
         CounterpartyError::KindParseError(CounterpartyKindParseError::MissingField { .. }) => {
@@ -38,6 +38,7 @@ pub(crate) fn to_counterparty_envelope(err: &CounterpartyError) -> Envelope<()> 
         CounterpartyError::HomeDomainInvalid { .. } => "counterparty.home_domain_invalid",
         CounterpartyError::KeyringUnavailable { .. } => "counterparty.keyring_unavailable",
         CounterpartyError::KeyMatchesOwnerPublicKey => "validation.key_matches_owner_public_key",
+        CounterpartyError::InstallationKeyCoordinate => "validation.installation_key_coordinate",
         CounterpartyError::Io { .. } => "counterparty.io",
         // Non-exhaustive match — new variants map to the generic code.
         _ => "counterparty.unknown",
@@ -91,9 +92,7 @@ mod tests {
     fn counterparty_kind_parse_subvariant_wire_codes() {
         let cases = [
             (
-                CounterpartyError::KindParseError(CounterpartyKindParseError::UnknownKind {
-                    kind: "UNKNOWN".to_owned(),
-                }),
+                CounterpartyError::KindParseError(CounterpartyKindParseError::UnknownKind),
                 "counterparty.kind_parse.unknown",
             ),
             (
@@ -106,7 +105,6 @@ mod tests {
             (
                 CounterpartyError::KindParseError(CounterpartyKindParseError::InvalidValue {
                     field: "kind".to_owned(),
-                    value: "42".to_owned(),
                 }),
                 "counterparty.kind_parse.invalid_value",
             ),

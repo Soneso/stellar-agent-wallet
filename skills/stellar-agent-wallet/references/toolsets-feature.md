@@ -6,20 +6,28 @@ are reading right now.
 
 | | Knowledge skill (this package) | Wallet toolset (the feature) |
 |---|---|---|
-| Purpose | Teaches you how to use the wallet | Restricts what an agent may do |
+| Purpose | Teaches you how to use the wallet | Narrows what the toolset dispatcher routes |
 | Form | Documentation you read | A signed, installed package the wallet enforces |
 | Effect | Gives you context | Grants a narrow, wallet-enforced capability set |
 | Execution | You read and act on it | The wallet never executes its body; it is data |
 
-The feature exists to enforce least privilege. A wallet toolset grants an
-agent a narrow, declared capability set; the wallet treats the toolset as data
-(a manifest plus a capability declaration), never executes toolset-supplied code,
-and never lets a toolset reach a signing, key, or policy tool through its ungated
-capabilities. The only signing tools a toolset reaches are `stellar_pay_commit`
+A wallet toolset declares a narrow capability set that the toolset dispatcher
+(`stellar_toolset_invoke`) routes. The wallet treats the toolset as data: a
+manifest plus a capability declaration. It never executes toolset-supplied code.
+Its ungated capabilities never route a toolset to a signing, key, or policy
+tool. The only signing tools a toolset reaches are `stellar_pay_commit`
 and `stellar_rule_create_commit`, through the gated `sign-payment` and
-`sign-rule-create` capabilities, each behind a first-invoke grant and a
-per-action approval. This FEATURE restricts what an agent may do. It is NOT a way to
-teach an agent.
+`sign-rule-create` capabilities, each behind a first-invoke grant. Payment
+consent follows the composed policies; rule creation requires approval.
+
+What a toolset does not do: it does not narrow the native tools the same MCP
+server registers, which an agent connected to the server can call directly. The
+`toolset` argument of an invocation is chosen by the caller, and the server binds
+no session to a toolset. The operator policy and the approvals bound native and
+routed calls alike. The pin record a toolset's capabilities come from is
+authenticated by an HMAC under an installation key in the platform keyring and
+carries the `TOOLSET.md` digest that both resolver tiers check. This feature
+narrows the dispatcher's routes. It does not teach an agent.
 
 For the broader MCP tool surface used to invoke actions, see `./mcp-tools.md`
 (ships alongside this file).
@@ -49,11 +57,11 @@ Frontmatter fields read by the parser:
 
 | Field | Rule |
 |---|---|
-| `name` | Required. ASCII `[a-z0-9-]`, 1-64 chars; no leading/trailing hyphen; no `--`. Must equal the containing directory name (byte-exact, homoglyph-spoof defence). |
+| `name` | Required. ASCII `[a-z0-9-]`, 1-64 chars; no leading/trailing hyphen; no `--`. Must equal the containing directory name (byte-exact, homoglyph-spoof defense). |
 | `description` | Required. Non-empty after trim; <= 1024 Unicode scalar values. |
 | `license` | Optional. SPDX identifier or reference to a bundled license file. |
 | `compatibility` | Optional. <= 500 Unicode scalar values. |
-| `allowed-tools` | Optional. Whitespace-tokenised list of tool names; an intersective narrowing list. |
+| `allowed-tools` | Optional. Whitespace-tokenized list of tool names; an intersective narrowing list. |
 | `metadata` | Optional string->string map. May carry `stellar-agent-capabilities`. |
 
 The capability manifest is the space-separated value of
@@ -107,16 +115,16 @@ A separate table for the two signing-adjacent capabilities:
 
 | Capability | Tool | Admission |
 |---|---|---|
-| `sign-payment` | `stellar_pay_commit` | First-invoke gate plus unconditional per-action approval only |
+| `sign-payment` | `stellar_pay_commit` | First-invoke grant plus composed payment policy |
 | `sign-rule-create` | `stellar_rule_create_commit` | First-invoke gate plus unconditional per-proposal operator attestation only |
 
 ### Signing denylist
 
-A signing denylist names every signing, key, and policy-mutation tool by literal
-string, including `stellar_pay_commit`, the SEP-43 and SEP-53 signing tools, the
-`*_commit` tools, the x402 tools, and the toolset dispatcher's own tools
-`stellar_toolset_list` / `stellar_toolset_invoke` (the last two prevent a toolset from
-re-invoking the dispatcher to escalate). The denylist and the ungated matrix are
+A signing denylist names tools by literal string under one rule: every registry
+tool annotated destructive, every tool that reaches a signer (the SEP-43 and SEP-53
+signing tools return a signature without submitting), and the toolset dispatcher's
+own tools `stellar_toolset_list` / `stellar_toolset_invoke` (so a toolset cannot
+re-invoke the dispatcher to escalate). The denylist and the ungated matrix are
 disjoint by literal name, so the gated tools are unreachable from the ungated
 resolver.
 
@@ -128,7 +136,8 @@ A toolset action passes only this check:
    `&'static str` registry tool name `T`. The resolved name is a compile-time
    constant; a toolset-supplied string can never become the routed tool name.
 2. `T` is in the grant set of some capability `C` (implied by step 1).
-3. `C` is in the toolset's declared capability set, read from the pin record.
+3. `C` is in the toolset's declared capability set, read from the authenticated
+   pin record.
 4. `T` is in the toolset's `allowed_tools`. `allowed_tools` can only subtract from
    a capability grant, never add to it; an empty list applies no narrowing.
 
@@ -143,10 +152,10 @@ check:
 
 - 256 KiB file-size cap before parse; non-UTF-8 is rejected, never a panic.
 - YAML anchors and aliases are refused at the event level before any tree is
-  built (billion-laughs / alias-bomb defence).
+  built (billion-laughs / alias-bomb defense).
 - Nesting depth is bounded at 8 for both block and flow styles via an iterative
   event pull loop.
-- Duplicate mapping keys are refused (viewer-vs-parser confusion defence).
+- Duplicate mapping keys are refused (viewer-vs-parser confusion defense).
 - A `metadata` value that is a list or mapping rather than a string is refused.
 - Any other `metadata` key beginning with the reserved prefix `stellar-agent-`
   (other than `stellar-agent-capabilities`) is refused.
@@ -175,16 +184,28 @@ Install pipeline:
    failure.
 7. Cross-check that the parsed `name` equals the package name.
 8. Run the attestation gate for key-touching toolsets.
-9. Atomically rename staging into place and write the pin record.
+9. Atomically rename staging into place and write the pin record, authenticated
+   under the installation's pin key.
+
+Install, forced reinstall, and uninstall hold the toolsets directory lock
+(`.toolsets.lock`) exclusively. The gated resolver holds the same lock shared.
+It refuses without waiting while the exclusive lock is held.
+The first install mints the pin key in the platform keyring.
 
 Verification proves origin and integrity, not content safety. The extractor and
 parser are safe on adversarial input on their own merits; signature verification
-is defence-in-depth layered before them.
+is defense-in-depth layered before them.
+
+The publisher and auditor trust sets (`trust.txt`, `auditor-trust.txt`) default to
+plain operator-held files in the toolsets directory, read at install time only and
+not authenticated. A restored toolset directory with its authentic v3 record
+verifies again, and a saved grant for that install identity can match within its
+lifetime. The restored state is one the operator installed.
 
 ### The attestation gate
 
-A toolset that declares a key-touching capability (currently `sign-payment`)
-requires a `ToolsetAttestation` signed by an auditor key in a **separate** auditor
+`sign-payment` and `sign-rule-create` are key-touching capabilities.
+A toolset that declares either one requires a `ToolsetAttestation` signed by an auditor key in a **separate** auditor
 trust set (`auditor-trust.txt`), distinct from the publisher trust set
 (`trust.txt`). The gate fires after the `name == package` identity cross-check
 and before the atomic rename. It checks the attestation's `package`, `version`,
@@ -197,8 +218,10 @@ the publisher signature tag, so neither signature can be replayed as the other.
 An absent or empty auditor trust set fails closed for a key-touching toolset. The
 only sanctioned bypass is `--override-attestation`, which logs a structured
 warning and proceeds; no environment variable or config default skips the gate.
-Even under override the `sign-payment` capability is persisted inert, and the
-runtime first-invoke and per-action approval gates still fire at signing time.
+Under override, a key-touching capability (`sign-payment` or `sign-rule-create`)
+is persisted inert, and its runtime first-invoke grant still applies at signing
+time. A `sign-payment` commit still meets the payment policy gates. A
+`sign-rule-create` commit still requires the per-proposal operator attestation.
 
 The install records its result as one of `attested`, `overridden`, or
 `not-required`, reflecting what the gate actually did rather than what flags were
@@ -206,30 +229,46 @@ set: `--override-attestation` on a non-key-touching toolset reports `not-require
 
 ### The pin record and the capability-source invariant
 
+Every install, a forced reinstall included, mints a random 16-byte `install_id`,
+encoded as 32 lowercase hex characters and covered by the pin tag.
+
 A successful install writes a pin record holding `package`, `version`, `shasum`,
-`publisher`, `installed_at`, the verified `capabilities`, `allowed_tools`, and a
-SHA-256 digest of the installed `TOOLSET.md`.
+`publisher`, `installed_at`, `install_id`, the verified `capabilities`, `allowed_tools`, and the
+mandatory SHA-256 digest of the installed `TOOLSET.md`. The record is
+`{"v":3, <fields>, "tag":"<64 hex>"}`, the tag an HMAC-SHA256 over every field under
+the installation's pin key. A record that does not verify (edited, written under
+another key, or carrying no authentication tag) grants nothing and
+refuses with `toolset.pin_unverifiable`; the operator uninstalls the toolset and
+installs it again.
 
-The capability-source invariant: the install gate, the attestation preimage, and
-every runtime capability decision read capabilities from the signature-verified
-pin record, never from a re-parse of the on-disk `TOOLSET.md`. A toolset installed
-with no declared capability whose on-disk `TOOLSET.md` is later edited to add
-`sign-payment` is still refused at the signing path, because the runtime reads
-the pin, not the file. As additional tamper-evidence, dispatch re-reads the
-on-disk `TOOLSET.md`, recomputes its digest, and refuses dispatch on a mismatch
-against the pinned digest.
+The capability-source invariant: the install gate and the attestation preimage
+read capabilities from the parse of the signature-verified package. Every
+runtime capability decision reads them from the authenticated pin record, never
+from a re-parse of the on-disk `TOOLSET.md`. A toolset installed with no declared
+capability whose on-disk `TOOLSET.md` is later edited to add `sign-payment` is
+still refused at the signing path, because the runtime reads the pin, not the
+file. As additional tamper-evidence, both resolver tiers re-read the on-disk
+`TOOLSET.md` and recompute its digest. A mismatch or an unreadable file refuses
+dispatch. CLI `toolsets run` answers `toolset.content_digest_mismatch`. MCP
+`stellar_toolset_invoke` answers a JSON-RPC internal error whose message starts
+`toolset.enforcement_error: toolset.content_digest_mismatch:`.
 
-## First-invoke gate and per-action payment approval
+## First-invoke grants and payment policy
 
-`stellar_pay_commit` is reachable only through the gated resolver, never the
-ungated path. The gated resolver enforces, in order:
+Through the dispatcher, `stellar_pay_commit` is reachable only through the gated
+resolver, never the ungated path. The gated resolver enforces, in order:
 
-1. The caller's `asset` and its `amount` or `amount_in_stroops` are validated;
-   an invalid or missing value refuses before any approval is queued.
-2. The four-part check against the gated matrix: the toolset declares
+1. A call without `args.envelope_xdr` refuses with `toolset.gated_missing_envelope`.
+   The caller's `asset` and its `amount` or `amount_in_stroops` are then
+   validated; an invalid or missing value refuses before any approval is queued.
+2. The handler decodes `envelope_xdr` and requires one payment to a G or M
+   destination; another envelope refuses with `simulation.divergence`. It then
+   loads the profile's attestation key and the installation's pin key.
+3. The pin record verifies, and the on-disk `TOOLSET.md` matches its digest.
+4. The four-part check against the gated matrix: the toolset declares
    `sign-payment`, the action maps to the gated `stellar_pay_commit` constant,
    and the tool is within `allowed_tools`.
-3. The first-invoke gate: it looks for a current matching grant in the
+5. The first-invoke gate: it looks for a current matching grant in the
    per-profile grant store. Matching is computed from the authoritative
    destination, asset, and amount decoded from the transaction envelope, never
    from toolset-supplied arguments. A non-positive authoritative amount is refused
@@ -240,14 +279,51 @@ destination / asset / amount bucket), the gate queues a one-time
 `ToolsetFirstInvokeGate` pending approval and refuses, returning an approval
 nonce. The operator approves out of band with
 `stellar-agent approve --id <nonce> --profile <name>`, which records a time-boxed grant. The
-agent then re-invokes.
+agent then re-invokes. A `sign-payment` grant for a G account covers that account
+and its M addresses. A grant for an M address covers only that address.
 
-A matching grant suppresses only the first-invoke re-prompt. The per-action
-payment approval fires unconditionally on every toolset-routed payment: a
-policy-engine `Allow` is overridden to `RequireApproval`, and the approval binds
-the actual executed envelope. A forged or tampered grant can at most suppress
-the re-prompt; it cannot bypass the forced per-action approval, whose
-attestation key lives only in the keyring.
+A matching grant requires a version 3 HMAC that verifies under the profile's
+attestation key and profile/chain binding. It names the current install identity,
+package version and package shasum. It must be unexpired, with a lifetime
+of at most 30 days, and issued no later than the current time and at or after
+the second following the current installation. An invalid install time honors
+no grant. Consent issued in the install second re-prompts once. A forged or
+edited grant suppresses nothing. A request queued before any reinstall, in the
+same second included, yields no grant the new installation honors. Approval
+surfaces show the version, the first 12 shasum characters and the install identity.
+A pending request without these fields cannot be approved; invoke again to request
+fresh consent.
+
+A matching grant suppresses the first-invoke re-prompt. The routed payment and
+outer invocation policies compose: `Allow` submits unattended, while either
+policy's `RequireApproval` requires consent bound to the executed envelope,
+or on mainnet to the stored intent of a payment that `stellar_pay` prepared.
+Preparation requires `propose-transaction` without a signing grant. Commit
+checks its own grant, retains its lease through submission, and stops at the
+earliest policy or grant end. Limits from both policies account for one payment.
+On mainnet one payment has one record per business ID, and its first
+preparation decides its kind: `stellar_pay` stores the intent, a toolset
+preparation the exact envelope. Either route resumes that record, with its
+bound consent and original interval. Only a `stellar_pay` payment on mainnet,
+committed directly, commits after the prepared envelope's deadline. A toolset
+commit keeps the 120-second nonce lifetime, and on a `stellar_pay` record it
+signs only an envelope of that record's intent; any other refuses
+`operation.business_id_conflict`. A `stellar_pay` preparation stores an
+envelope whose deadline lies before its decision's end. When the authority
+a toolset commit adds ends at or before that deadline, the toolset commit of
+a direct-first payment refuses with `network.mainnet_authorization_refused`
+and sends nothing; commit the record directly instead. A payment rule shorter
+than 120 seconds already caps the stored deadline, so a short outer consent
+can still sign. A composed decision whose lifetime differs from the one the
+record's approval took refuses that approval with `policy.approval_required`;
+commit the record directly instead.
+Keep the same business ID for recovery; reconcile an uncertain send by its hash.
+
+A gated payment call that meets an install, uninstall, or grant write in
+progress answers the business code `toolset.coordination_busy`. A gated
+rule-creation call in that state answers an internal error. Its message starts
+`toolset.enforcement_error:` and holds the nested `toolset.coordination_busy`.
+Retry the call once that write ends.
 
 ## How an agent invokes a toolset action
 
@@ -267,13 +343,19 @@ reports `name`, `description` (always empty; the pin record stores no
 description), `capabilities`, `allowed_tools`, `version`, and `actions` (the tool
 names reachable through the ungated matrix; gated tools such as
 `stellar_pay_commit` are not listed here because they are reachable only through
-the gated path). Read-only and non-destructive.
+the gated path). A toolset whose record does not verify is left out. Read-only and
+non-destructive.
 
 ```json
 {}
 ```
 
 ### `stellar_toolset_invoke`
+
+Annotated destructive (`destructiveHint = true`, `readOnlyHint = false`): its
+signing actions route to the signing commit tools. Enabled mainnet setup admits
+only exact `stellar_pay` and `stellar_pay_commit` actions. The signed outer rule
+must meet payment minimums; incomplete setup and other actions refuse.
 
 | Field | Meaning |
 |---|---|
@@ -300,9 +382,16 @@ carry the `envelope_xdr` produced by a prior `stellar_pay` simulate call, and it
 are decoded authoritatively from that envelope.
 If the first-invoke gate fires, the call returns
 `toolset.first_invoke_approval_required` with the approval nonce; once a grant
-exists, the per-action payment approval is still forced on for the commit. For a
+exists, the composed payment policies determine whether consent is required. For a
 `sign-rule-create` toolset, `action: "stellar_rule_create_commit"` takes the same
 gated route, and the operator attestation over the proposal is always required.
+That route requires `args.approval_nonce` from `stellar_rule_create` and refuses
+with `toolset.gated_missing_approval_nonce` without it. A spent proposal answers
+`policy.approval_consumed`.
+
+The dispatcher compares `toolset` and `action` exactly as sent. A name with an
+escape sequence, a control character, or changed case answers
+`toolset.not_installed` or `toolset.unknown_action`.
 
 Wallet tool results use the envelope `{ok, data|error, request_id}`, except that
 `stellar_toolset_list` returns a bare array. The capability refusals and
@@ -316,7 +405,8 @@ stroop integer string as `amount_in_stroops`. Asset is
 
 The subcommand group is `stellar-agent toolsets` (plural). All four subcommands are
 local and offline (no network calls, no chain signing) and print a JSON
-envelope. Each prints its success and error envelopes on stdout. Exit code is `0` on success, `1` on any error. The toolsets root defaults
+envelope. `install`, `list`, and `run` read the installation's pin key from the
+platform keyring; `install` mints it on the first install. Each prints its success and error envelopes on stdout. Exit code is `0` on success, `1` on any error. The toolsets root defaults
 to the OS-conventional toolsets directory; `--toolsets-dir <PATH>` overrides it on
 every subcommand.
 
@@ -356,7 +446,8 @@ The success envelope reports `package`, `version`, and `attestation`
 
 Enumerates installed toolsets and their declared actions as JSON. This is the
 canonical scriptable enumeration; it is read from pin records, not parsed from
-help text. Each entry reports `name`, `description` (always empty; the pin record
+help text. A record that does not verify is skipped with a warning; before the
+first install the list is empty. Each entry reports `name`, `description` (always empty; the pin record
 stores no description), `capabilities`, `allowed_tools`, `version`, and `actions`
 (the tool names reachable through the ungated matrix; gated tools such as
 `stellar_pay_commit` are not listed here).
@@ -389,15 +480,21 @@ stellar-agent toolsets run balance-reporter stellar_balances
 ```
 
 On enforcement failure the error envelope carries a `code` such as
-`toolset.not_installed`, `toolset.unknown_action`, `toolset.capability_not_declared`,
-or `toolset.tool_not_allowed`.
+`toolset.not_installed`, `toolset.pin_unverifiable`,
+`toolset.content_digest_mismatch`, `toolset.unknown_action`,
+`toolset.capability_not_declared`, or `toolset.tool_not_allowed`.
 
 ### `toolsets uninstall <PACKAGE>`
 
 Removes an installed toolset's directory and pin record. Refuses if the toolset is
-not installed. Uninstall reads the pin, re-validates the stored package name,
-reconstructs the directory path from that validated name (never from a stored
-path), refuses a symlinked leaf, and removes the directory and pin.
+not installed. Uninstall reads no record: the toolset is installed when its pin
+file exists, and the directory removed is the one named by the validated
+requested package name (never a name or path read from the record). It refuses a
+symlinked leaf and removes the directory and pin, so a toolset whose record does
+not verify can be removed and installed again. Grants
+approved for the removed package do not apply to a later install, including a
+forced reinstall or an install after manual removal. Each install needs fresh
+consent for its new identity.
 
 Positional: `<PACKAGE>`: the package name (`[a-z0-9-]`).
 
@@ -414,7 +511,14 @@ stellar-agent toolsets uninstall balance-reporter
 | Code | Cause |
 |---|---|
 | `toolset.not_installed` | Named toolset has no pin record. |
+| `toolset.pin_unverifiable` | The pin record does not verify under the installation's pin key (edited, written under another key, or carrying no authentication tag), or no pin key exists. Uninstall the toolset and install it again. |
+| `toolset.content_digest_mismatch` | The on-disk `TOOLSET.md` differs from the digest in the pin record, or cannot be read. Through MCP it arrives inside a `toolset.enforcement_error:` internal error. Reinstall the toolset. |
 | `toolset.unknown_action` | Action does not resolve through the matrix (includes any signing tool named directly other than the two gated tools). |
 | `toolset.capability_not_declared` | Resolved tool's capability is not in the toolset's declared set. |
 | `toolset.tool_not_allowed` | Resolved tool is excluded by the toolset's `allowed_tools` narrowing. |
 | `toolset.first_invoke_approval_required` | Gated payment or rule-create commit has no current matching grant; returns an approval nonce for `stellar-agent approve --id <nonce> --profile <name>`. |
+| `toolset.coordination_busy` | An install, uninstall, or grant writer holds a lock. Retry once that write ends. |
+| `toolset.grant_invocation_mismatch` | The invocation differs from the one the grant was verified for. |
+| `toolset.grant_changed` | The installation changed, or the grant was revoked, replaced, or no longer verifies. |
+| `toolset.grant_expired` | The clock reads at or after the grant's stored expiry. |
+| `toolsets.install_failed` | CLI `toolsets install` refused; the detail is in `error.message`. |

@@ -1,0 +1,62 @@
+//! Version output reports build state separately from the MCP help header.
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "test assertions require a running binary"
+)]
+mod tests {
+    use crate::common::server_binary::server_command;
+
+    fn assert_version(flag: &str) {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("sandbox");
+        let output = server_command(home.path())
+            .arg(flag)
+            .output()
+            .expect("MCP binary runs");
+        assert!(output.status.success(), "{flag}: {:?}", output.status);
+        assert!(output.stderr.is_empty(), "{flag}: {:?}", output.stderr);
+        let stdout = String::from_utf8(output.stdout).expect("version output is UTF-8");
+        let suffix = if cfg!(feature = "mainnet-write") {
+            "on"
+        } else {
+            "off"
+        };
+        let expected = format!("{}{}{}", "STELLAR_AGENT_BUILD_", "MAINNET_WRITE=", suffix);
+        assert_eq!(
+            stdout,
+            format!(
+                "stellar-agent-mcp {}\n{expected}\n",
+                env!("CARGO_PKG_VERSION")
+            ),
+            "{flag}"
+        );
+    }
+
+    #[test]
+    fn long_version_reports_build_state() {
+        assert_version("--version");
+    }
+
+    #[test]
+    fn short_version_reports_build_state() {
+        assert_version("-V");
+    }
+
+    #[test]
+    fn help_keeps_package_version_without_marker() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("sandbox");
+        let output = server_command(home.path())
+            .arg("--help")
+            .output()
+            .expect("MCP binary runs");
+        assert!(output.status.success(), "{:?}", output.status);
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+        let stdout = String::from_utf8(output.stdout).expect("help output is UTF-8");
+        assert_eq!(
+            stdout.lines().next(),
+            Some(format!("stellar-agent-mcp {}", env!("CARGO_PKG_VERSION")).as_str())
+        );
+        assert!(!stdout.contains(concat!("STELLAR_AGENT_BUILD_", "MAINNET_WRITE=")));
+    }
+}

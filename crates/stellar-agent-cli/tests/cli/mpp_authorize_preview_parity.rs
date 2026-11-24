@@ -159,8 +159,8 @@ reason = "Operator review"
 
 /// A tagged MCP challenge whose realm, server identity, and target carry
 /// surrounding whitespace and mixed case, so a CLI path that trims or
-/// case-folds them prints a different preview. The explicit expiry fixes the
-/// effective expiry across both runs.
+/// case-folds them prints a different preview. The explicit expiry is the same
+/// across both runs.
 fn challenge_input() -> ChallengeInput {
     let now_seconds = now_unix_ms().expect("clock") / 1_000;
     ChallengeInput::Mcp {

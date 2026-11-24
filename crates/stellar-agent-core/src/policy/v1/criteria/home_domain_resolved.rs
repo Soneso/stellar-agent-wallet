@@ -262,7 +262,11 @@ mod tests {
 
     /// Criterion passes when the on-chain home_domain is in the cache.
     #[test]
+    #[serial_test::serial]
     fn passes_when_home_domain_resolved_in_cache() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = HomeDomainResolvedCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
@@ -273,7 +277,7 @@ mod tests {
         };
         let cache = MockCacheView::with_domains(&["circle.com"]);
 
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_identity_view(&identity)
             .with_counterparty_cache(&cache);
 
@@ -286,7 +290,11 @@ mod tests {
 
     /// Criterion denies when the on-chain home_domain is NOT in the cache.
     #[test]
+    #[serial_test::serial]
     fn denies_when_home_domain_not_in_cache() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = HomeDomainResolvedCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
@@ -297,7 +305,7 @@ mod tests {
         };
         let cache = MockCacheView::with_domains(&["circle.com"]);
 
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_identity_view(&identity)
             .with_counterparty_cache(&cache);
 
@@ -318,7 +326,11 @@ mod tests {
     /// An account without a home_domain cannot have a stellar.toml binding;
     /// the criterion must pass unconditionally rather than denying.
     #[test]
+    #[serial_test::serial]
     fn passes_when_no_home_domain_on_chain() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = HomeDomainResolvedCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
@@ -328,7 +340,7 @@ mod tests {
         // No cache needed because home_domain is absent.
         let cache = MockCacheView::with_domains(&[]);
 
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_identity_view(&identity)
             .with_counterparty_cache(&cache);
 
@@ -342,7 +354,11 @@ mod tests {
     /// Criterion returns CriterionEvaluationFailed (fail-closed) when
     /// counterparty_cache is absent but a home_domain is present.
     #[test]
+    #[serial_test::serial]
     fn fails_closed_when_cache_absent_with_home_domain() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = HomeDomainResolvedCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
@@ -353,8 +369,8 @@ mod tests {
         };
 
         // No .with_counterparty_cache() call — ctx.counterparty_cache is None.
-        let ctx =
-            EvalContext::new(&tool, &args, "alice", &profile, &store).with_identity_view(&identity);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
+            .with_identity_view(&identity);
 
         let result = criterion.evaluate(&ctx);
         match result {
@@ -375,7 +391,11 @@ mod tests {
     /// Criterion returns CriterionEvaluationFailed (fail-closed) when
     /// identity_view is absent.
     #[test]
+    #[serial_test::serial]
     fn fails_closed_when_identity_view_absent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let criterion = HomeDomainResolvedCriterion::new();
         let tool = make_tool();
         let profile = make_profile();
@@ -384,7 +404,7 @@ mod tests {
         let cache = MockCacheView::with_domains(&["circle.com"]);
 
         // No .with_identity_view() call — ctx.identity_view is None.
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_counterparty_cache(&cache);
 
         let result = criterion.evaluate(&ctx);

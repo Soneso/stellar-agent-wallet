@@ -62,13 +62,13 @@ pub struct Sep24InteractiveUrlArgs {
     /// The anchor domain to resolve `TRANSFER_SERVER_SEP0024` from (e.g.
     /// `"testanchor.stellar.org"`).
     ///
-    /// Mutually exclusive with `transfer_server_sep0024`.
+    /// Takes precedence if `transfer_server_sep0024` is also given.
     #[serde(default)]
     pub anchor_domain: Option<String>,
 
     /// A directly-supplied `TRANSFER_SERVER_SEP0024` URL (HTTPS required).
     ///
-    /// Mutually exclusive with `anchor_domain`.
+    /// Used when `anchor_domain` is omitted.
     #[serde(default)]
     pub transfer_server_sep0024: Option<String>,
 
@@ -183,10 +183,10 @@ impl WalletServer {
         let operation = match args.operation.as_str() {
             "deposit" => Sep24Operation::Deposit,
             "withdraw" => Sep24Operation::Withdraw,
-            other => {
+            _ => {
                 return Ok(crate::tools::common::business_error_result(
                     "sep24.invalid_operation",
-                    format!("operation must be 'deposit' or 'withdraw', got {other:?}"),
+                    "operation must be 'deposit' or 'withdraw'",
                 ));
             }
         };
@@ -346,6 +346,31 @@ mod tests {
     )]
 
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn operation_marker_is_not_echoed() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        let args: Sep24InteractiveUrlArgs = serde_json::from_value(serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "operation": "CREDMARKER7",
+            "asset_code": "USDC",
+            "jwt": "fixture-token"
+        }))
+        .unwrap();
+        let result = fixture
+            .server()
+            .stellar_sep24_interactive_url(Parameters(args))
+            .await
+            .unwrap();
+        crate::tools::message_signing_tests::assert_refusal(&result, "sep24.invalid_operation");
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains("CREDMARKER7"));
+        assert!(json.contains("operation must be 'deposit' or 'withdraw'"));
+    }
+
     use stellar_agent_core::amount::AnchorAmount;
 
     // ── AnchorAmount integration in Sep24InteractiveUrlArgs ──────────────────

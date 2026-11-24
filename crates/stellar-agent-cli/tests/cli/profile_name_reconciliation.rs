@@ -42,7 +42,6 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::Value;
 use stellar_agent_test_support::profile_fixtures::noop_profile_toml;
@@ -112,7 +111,11 @@ impl Run {
 }
 
 fn run_cli(home: &Path, args: &[&str]) -> Run {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    let mut command = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child");
     command
         .args(args)
         .env("STELLAR_AGENT_HOME", home)
@@ -140,15 +143,15 @@ fn write_profile(home: &Path, file_name: &str, owner_profile: &str) -> String {
 
 /// A home holding `i107-requested.toml` whose coordinates name `i107-other` —
 /// exactly what copying `i107-other.toml` to `i107-requested.toml` produces.
-fn mismatched_home() -> tempfile::TempDir {
-    let home = tempfile::tempdir().expect("temp home");
+fn mismatched_home() -> stellar_agent_test_support::sandbox::StateSandbox {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     write_profile(home.path(), REQUESTED, OWNED_BY);
     home
 }
 
 /// A home holding a self-consistent `i107-requested.toml`.
-fn consistent_home() -> tempfile::TempDir {
-    let home = tempfile::tempdir().expect("temp home");
+fn consistent_home() -> stellar_agent_test_support::sandbox::StateSandbox {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     write_profile(home.path(), REQUESTED, REQUESTED);
     home
 }
@@ -167,15 +170,15 @@ fn assert_mismatch_refusal(run: &Run, verb: &str) {
     );
     let message = run.message_field();
     assert!(
-        message.contains(REQUESTED) && message.contains(OWNED_BY),
-        "`{verb}`: the refusal must name both profiles; message={message}"
+        message.contains("policy_owner_key_id.service names a different profile"),
+        "`{verb}`: the refusal must name the offending field; message={message}"
     );
     assert!(
-        message.contains("stellar-agent-owner-i107-other"),
-        "`{verb}`: the refusal must quote the offending field; message={message}"
+        !message.contains(REQUESTED) && !message.contains(OWNED_BY),
+        "`{verb}`: the refusal must repeat neither profile name; message={message}"
     );
     assert!(
-        message.contains("profile init --profile i107-requested"),
+        message.contains("profile init --profile <name>"),
         "`{verb}`: the refusal must name the recovery command; message={message}"
     );
 }
@@ -298,7 +301,7 @@ fn a_self_consistent_profile_is_not_refused() {
 /// operate under any requested name while its authority points elsewhere.
 #[test]
 fn a_service_without_the_prefix_refuses_instead_of_resolving_to_default() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let profiles = home.path().join("profiles");
     std::fs::create_dir_all(&profiles).expect("create profiles dir");
     let toml = noop_profile_toml(REQUESTED, "stellar:testnet", FIXTURE_RPC).replace(
@@ -331,8 +334,8 @@ fn a_service_without_the_prefix_refuses_instead_of_resolving_to_default() {
     );
     let message = run.message_field();
     assert!(
-        message.contains("hand-written-owner-service"),
-        "the refusal must quote the offending field; message={message}"
+        !message.contains("hand-written-owner-service"),
+        "the refusal must not repeat the stored service; message={message}"
     );
     assert!(
         message.contains("does not carry the 'stellar-agent-owner-' prefix"),
@@ -350,7 +353,7 @@ fn a_service_without_the_prefix_refuses_instead_of_resolving_to_default() {
 /// gate they never chose.
 #[test]
 fn a_mismatched_default_profile_refuses_rather_than_synthesizing() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     write_profile(home.path(), "default", OWNED_BY);
 
     let run = run_cli(
@@ -381,7 +384,11 @@ fn a_mismatched_default_profile_refuses_rather_than_synthesizing() {
 #[test]
 fn the_environment_selected_profile_is_reconciled_as_well() {
     let home = mismatched_home();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    let mut command = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child");
     command
         .args([
             "pay",
@@ -730,7 +737,8 @@ fn add_passkey_refuses_before_the_bridge_starts() {
     for marker in [
         "bridge HTTP server started",
         "start_bridge_register_only",
-        "browser launch failed",
+        "if the browser does not show the registration page",
+        "could not open the browser",
     ] {
         assert!(
             !run.stderr.contains(marker),
@@ -810,12 +818,16 @@ fn mpp_surfaces_the_reconciliation_refusal_not_state_unavailable() {
 /// covers: this one for `stellar-agent`, the MCP integration test for the
 /// server.
 #[test]
+#[serial_test::serial]
 fn the_cli_and_the_mcp_server_agree_on_the_same_mismatched_file() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::profile::name::{
         OWNER_KEY_SERVICE_PREFIX, ProfileStateLayout, profile_name_mismatch_refusal,
     };
 
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     write_profile(home.path(), "alice", "default");
 
     // Loaded through the profile loader — the same path both binaries take —
@@ -847,8 +859,7 @@ fn the_cli_and_the_mcp_server_agree_on_the_same_mismatched_file() {
     );
     let refusal = profile_name_mismatch_refusal(&profile, "alice")
         .expect("the shared reconciliation must refuse this file");
-    assert_eq!(refusal.requested(), "alice");
-    assert_eq!(refusal.derived(), Some("default"));
+    assert!(refusal.names_another_profile());
 
     // The two surfaces state their own state layout and share the recovery.
     let cli_message = refusal.message(ProfileStateLayout::PolicyDerivedStateRequested);
@@ -859,10 +870,18 @@ fn the_cli_and_the_mcp_server_agree_on_the_same_mismatched_file() {
     );
     for message in [&cli_message, &mcp_message] {
         assert!(
-            message.contains("profile init --profile alice"),
+            message.contains("profile init --profile <name>"),
             "{message}"
         );
-        assert!(message.contains("stellar-agent-owner-default"), "{message}");
+        assert!(
+            message.contains("policy_owner_key_id.service names a different profile"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("stellar-agent-owner-default"),
+            "{message}"
+        );
+        assert!(!message.contains("'alice'"), "{message}");
     }
 
     // This surface's wiring: the same file, through the release binary.
@@ -945,7 +964,7 @@ fn an_unloadable_profile_is_not_reported_as_an_internal_defect() {
     ];
 
     for (label, argv) in commands {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
         let run = run_cli(home.path(), argv);
         assert_eq!(
             run.code_field(),
@@ -964,7 +983,7 @@ fn an_unloadable_profile_is_not_reported_as_an_internal_defect() {
 /// parse.
 #[test]
 fn a_malformed_profile_reports_a_validation_code_and_keeps_its_cause() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
     let profiles = home.path().join("profiles");
     std::fs::create_dir_all(&profiles).expect("create profiles dir");
     std::fs::write(
@@ -986,8 +1005,9 @@ fn a_malformed_profile_reports_a_validation_code_and_keeps_its_cause() {
         run.stderr
     );
     assert!(
-        run.message_field().contains("i109-malformed"),
-        "the refusal must name the profile; message={}",
+        run.message_field()
+            .contains("the requested profile failed to load"),
+        "the refusal must name the load failure; message={}",
         run.message_field()
     );
     assert!(
@@ -995,13 +1015,16 @@ fn a_malformed_profile_reports_a_validation_code_and_keeps_its_cause() {
         "a file that exists must not be reported as absent; message={}",
         run.message_field()
     );
+    assert!(run.message_field().contains("line 1, column 6"));
+    assert!(!run.stdout.contains("i109-malformed"));
+    assert!(!run.stderr.contains("i109-malformed"));
 }
 
 /// Both engines mint the audit key before signer enrollment, then the nonce key.
 #[test]
 fn init_next_steps_put_audit_key_before_signer_enrollment_on_both_engines() {
     for engine in ["v1", "noop"] {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let run = run_cli(
             home.path(),
             &[
@@ -1025,5 +1048,80 @@ fn init_next_steps_put_audit_key_before_signer_enrollment_on_both_engines() {
                 "{engine} requires {verb} at position {index}: {steps:?}"
             );
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A value typed as the profile name is never repeated
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A secret seed has the form of a valid profile name, so `--profile <seed>`
+/// reaches the profile lookup. The refusal for the absent file names neither
+/// the seed nor the path that ends in it, on stdout or stderr. A raw-code
+/// verb reports the absent file under `profile.load_failed`, the code it
+/// gives every load failure without a typed code of its own.
+#[test]
+fn a_seed_as_a_missing_profile_name_is_not_echoed_by_a_raw_code_verb() {
+    let marker = stellar_agent_test_support::rejected_value::seed_marker();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+    let run = run_cli(
+        home.path(),
+        &[
+            "pay",
+            "--source",
+            SOURCE_G,
+            DEST_G,
+            "1 XLM",
+            "--build-only",
+            "--rpc-url",
+            UNREACHABLE_RPC,
+            "--profile",
+            &marker,
+        ],
+    );
+
+    assert_eq!(
+        run.code_field(),
+        "profile.load_failed",
+        "stdout={} stderr={}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        run.message_field()
+            .contains("the requested profile was not found in the wallet configuration"),
+        "message={}",
+        run.message_field()
+    );
+    stellar_agent_test_support::rejected_value::assert_no_marker_in_text(&run.stdout, &marker);
+    stellar_agent_test_support::rejected_value::assert_no_marker_in_text(&run.stderr, &marker);
+}
+
+/// A profile name that is not a valid path component is refused by the rule
+/// it breaks, by every command family that validates the name itself; the
+/// refused name is repeated on neither stream.
+#[test]
+fn a_seed_in_a_refused_profile_name_is_not_echoed_by_any_command_family() {
+    let marker = stellar_agent_test_support::rejected_value::seed_marker();
+    let refused = format!("{marker}/x");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+    let families: [&[&str]; 4] = [
+        &["approve", "list", "--profile", &refused],
+        &["credentials", "list", "--profile", &refused],
+        &["profile", "init", "--profile", &refused],
+        &["profile", "halt", "--profile", &refused, "--reason", "test"],
+    ];
+    for argv in families {
+        let run = run_cli(home.path(), argv);
+        assert_ne!(run.code, 0, "{argv:?} must refuse; stdout={}", run.stdout);
+        assert!(
+            run.message_field()
+                .contains("the profile name is not a valid profile name"),
+            "{argv:?}: message={} stderr={}",
+            run.message_field(),
+            run.stderr
+        );
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(&run.stdout, &marker);
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(&run.stderr, &marker);
     }
 }

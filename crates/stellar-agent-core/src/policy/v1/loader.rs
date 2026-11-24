@@ -35,8 +35,8 @@
 //! The dispatch site is responsible for:
 //!
 //! 1. Fetching the owner public key from the keyring entry
-//!    `stellar-agent-owner-<profile_name>` (stored as base64-encoded 32 bytes).
-//! 2. Decoding it from base64 to `[u8; 32]`.
+//!    `stellar-agent-owner-<profile_name>` (stored as a G-strkey).
+//! 2. Decoding the G-strkey to `[u8; 32]`.
 //! 3. Passing it to `load_signed_policy`.
 //!
 //! If the keyring entry is absent, the dispatch site maps the absence to
@@ -55,7 +55,7 @@
 //! ## Version range
 //!
 //! Accepted policy file versions are `[MIN_POLICY_VERSION, MAX_POLICY_VERSION]`
-//! (currently `[1, 1]`).  Files with a version outside this range are rejected
+//! (currently `[1, 2]`).  Files with a version outside this range are rejected
 //! with [`crate::policy::PolicyError::PolicyFileParseFailed`] to prevent
 //! downgrade-replay attacks.
 
@@ -66,16 +66,24 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, Item, TableLike, Value};
 
 use crate::counterparty::is_valid_ldh_home_domain;
+use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::canonical::{OPTIONAL_RULE_KEYS, canonical_bytes};
 use crate::policy::v1::criteria::counterparty_allowlist::CounterpartyKind;
+use crate::policy::v1::criteria::counterparty_allowlist::{UnlistedBudget, UnlistedMode};
+use crate::policy::v1::criteria::memo_binding::{
+    MAX_MEMO_BINDINGS, MemoBinding, MemoBindingCriterion, MemoRequirement,
+};
 use crate::policy::v1::criteria::per_period_cap::Window;
 use crate::policy::v1::criteria::{
-    ApprovalAboveCriterion, BundleAggregateCapCriterion, BundlePerPeriodCapCriterion,
-    BundlePerTxCapCriterion, BundleRateLimitCriterion, CounterpartyAllowlistCriterion, Criterion,
-    InnerInvocationCountCapCriterion, MinimumReserveCriterion, PerPeriodCapCriterion,
-    PerTxCapCriterion, RateLimitCriterion, RestrictBundleToRecognisedKindsCriterion,
+    ApprovalAboveCriterion, BalanceFloorCriterion, BundleAggregateCapCriterion,
+    BundlePerPeriodCapCriterion, BundlePerTxCapCriterion, BundleRateLimitCriterion,
+    CounterpartyAllowlistCriterion, Criterion, InnerInvocationCountCapCriterion,
+    MinimumReserveCriterion, PerPeriodCapCriterion, PerTxCapCriterion, RateLimitCriterion,
+    RestrictBundleToRecognisedKindsCriterion, TotalBudgetCriterion,
 };
-use crate::policy::v1::schema::{criterion_keys, validate_policy_keys};
+use crate::policy::v1::schema::{
+    MEMO_BINDING_KEYS, UNLISTED_KEYS, criterion_keys, reject_unknown_keys, validate_policy_keys,
+};
 use crate::policy::v1::signature::{digest, verify};
 use crate::policy::{Decision, DenyReason, PolicyError};
 
@@ -93,7 +101,7 @@ const MIN_POLICY_VERSION: u32 = 1;
 ///
 /// Files with `version > MAX_POLICY_VERSION` are rejected by [`extract_version`].
 /// Bump this constant when a new policy schema version is introduced.
-const MAX_POLICY_VERSION: u32 = 1;
+const MAX_POLICY_VERSION: u32 = 2;
 
 /// Default approval time-to-live for `require_approval` policy decisions, in seconds.
 pub(super) const DEFAULT_APPROVAL_TTL_SECONDS: u32 =
@@ -304,6 +312,15 @@ pub struct PolicyRule {
 }
 
 impl PolicyRule {
+    /// The amount limits of this rule's criteria, in criterion order.
+    #[must_use]
+    pub fn descriptors(&self) -> Vec<crate::policy::v1::criteria::descriptor::BucketDescriptor> {
+        self.criteria
+            .iter()
+            .flat_map(|criterion| criterion.descriptors())
+            .collect()
+    }
+
     /// Returns `true` if this rule's [`RuleMatch`] clause matches `tool`.
     ///
     /// # Examples
@@ -416,6 +433,10 @@ impl RuleMatch {
 /// 6. Verify the ed25519 signature against the digest using `owner_pubkey`.
 /// 7. Parse `version`, `scope`, and `[[rules]]` into runtime form.
 ///
+/// `network_passphrase` is the passphrase of the profile the policy governs.
+/// Rule checks that compare assets use it to match a classic asset with its
+/// Stellar Asset Contract address, as evaluation does for that profile.
+///
 /// ## Owner-key contract
 ///
 /// This function does NOT fetch the owner public key from the keyring.
@@ -423,7 +444,7 @@ impl RuleMatch {
 /// dep).  The dispatch site is responsible for:
 ///
 /// 1. Fetching the keyring entry `stellar-agent-owner-<profile_name>`.
-/// 2. Decoding it from base64 to `[u8; 32]`.
+/// 2. Decoding the G-strkey to `[u8; 32]`.
 /// 3. Passing it to this function as `owner_pubkey`.
 ///
 /// If the keyring entry is absent, the dispatch site maps the absence to
@@ -456,15 +477,27 @@ impl RuleMatch {
 ///     Path::new("/home/user/.local/share/stellar-agent/policies/alice.toml"),
 ///     "alice",
 ///     &owner_pubkey,
+///     "Test SDF Network ; September 2015",
 /// );
 /// ```
 pub fn load_signed_policy(
     path: &Path,
     profile_name: &str,
     owner_pubkey: &[u8; 32],
+    network_passphrase: &str,
 ) -> Result<PolicyDocument, PolicyError> {
     // Step 1: read the file.
-    let raw = std::fs::read_to_string(path).map_err(|e| {
+    let raw = read_policy_file(path)?;
+
+    load_signed_policy_text(&raw, profile_name, owner_pubkey, network_passphrase)
+}
+
+/// Reads a policy file, naming its file name and the I/O cause on failure.
+///
+/// The detail carries the base name only, never the directory, so a refusal
+/// does not disclose the state-directory layout.
+pub(crate) fn read_policy_file(path: &Path) -> Result<String, PolicyError> {
+    std::fs::read_to_string(path).map_err(|e| {
         let basename = path
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
@@ -472,18 +505,31 @@ pub fn load_signed_policy(
         PolicyError::PolicyFileLoadFailed {
             detail: format!("{basename}: {e}"),
         }
-    })?;
+    })
+}
 
+/// Verifies and parses one in-memory policy using the file loader's checks.
+///
+/// Callers can apply further authorization checks to these same bytes.
+/// `network_passphrase` is the governed profile's passphrase, as for
+/// [`load_signed_policy`].
+///
+/// # Errors
+/// Returns the signature, scope, and schema errors of [`load_signed_policy`].
+pub fn load_signed_policy_text(
+    raw: &str,
+    profile_name: &str,
+    owner_pubkey: &[u8; 32],
+    network_passphrase: &str,
+) -> Result<PolicyDocument, PolicyError> {
     // Step 2: canonical bytes (excludes [signature] table).
-    let canon = canonical_bytes(&raw)?;
+    let canon = canonical_bytes(raw)?;
 
     // Step 3: BLAKE3 digest.
     let d = digest(&canon);
 
     // Parse the document to extract [signature].
-    let doc = DocumentMut::from_str(&raw).map_err(|e| PolicyError::PolicyFileParseFailed {
-        detail: e.to_string(),
-    })?;
+    let doc = DocumentMut::from_str(raw).map_err(|e| PolicyError::toml_syntax(raw, &e))?;
 
     // Step 4: extract and verify [signature].
     let sig_item = doc
@@ -497,8 +543,8 @@ pub fn load_signed_policy(
     let (owner_id, sig_hex) = extract_signature_fields(sig_item)?;
 
     // Step 5: the loader refuses keys outside the policy schema before it
-    // decodes and verifies the signature, so an unknown key is reported by
-    // name even when the signature also fails.
+    // decodes and verifies the signature, so an unknown key is reported with
+    // its location even when the signature also fails.
     validate_policy_keys(&doc)?;
 
     // Step 6: verify. A failed digest verification names the rules whose
@@ -517,7 +563,7 @@ pub fn load_signed_policy(
         version,
         scope,
         rules,
-    } = parse_policy_body(&doc, profile_name)?;
+    } = parse_policy_body(&doc, profile_name, network_passphrase)?;
 
     Ok(PolicyDocument {
         version,
@@ -546,8 +592,9 @@ pub fn load_signed_policy(
 /// signature never blocks re-signing.
 ///
 /// `profile_name` is the resolved profile name the loader compares the scope
-/// against. `stellar-agent profile sign-policy` calls this before it signs, so
-/// it never signs a body the loader refuses.
+/// against, and `network_passphrase` is that profile's passphrase.
+/// `stellar-agent profile sign-policy` calls this before it signs, so it never
+/// signs a body the loader refuses.
 ///
 /// # Errors
 ///
@@ -558,22 +605,25 @@ pub fn load_signed_policy(
 ///
 /// ```
 /// use stellar_agent_core::policy::v1::validate_unsigned_policy;
+/// use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 ///
 /// let body = "version = 1\nscope = \"profile:alice\"\n\n[[rules]]\n\
 ///             match = { tool = \"stellar_balances\", chain = \"*\" }\n\
 ///             criteria = []\ndecision = \"allow\"\n";
-/// assert!(validate_unsigned_policy(body, "alice").is_ok());
+/// assert!(validate_unsigned_policy(body, "alice", TESTNET_PASSPHRASE).is_ok());
 /// // The scope names another profile.
-/// assert!(validate_unsigned_policy(body, "bob").is_err());
+/// assert!(validate_unsigned_policy(body, "bob", TESTNET_PASSPHRASE).is_err());
 /// ```
-pub fn validate_unsigned_policy(raw: &str, profile_name: &str) -> Result<(), PolicyError> {
+pub fn validate_unsigned_policy(
+    raw: &str,
+    profile_name: &str,
+    network_passphrase: &str,
+) -> Result<(), PolicyError> {
     canonical_bytes(raw)?;
-    let mut doc = DocumentMut::from_str(raw).map_err(|e| PolicyError::PolicyFileParseFailed {
-        detail: e.to_string(),
-    })?;
+    let mut doc = DocumentMut::from_str(raw).map_err(|e| PolicyError::toml_syntax(raw, &e))?;
     doc.remove("signature");
     validate_policy_keys(&doc)?;
-    parse_policy_body(&doc, profile_name).map(|_| ())
+    parse_policy_body(&doc, profile_name, network_passphrase).map(|_| ())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -588,15 +638,28 @@ struct PolicyBody {
 }
 
 /// Parses `version`, `scope` (refusing a scope that names a profile other
-/// than `profile_name`), and the rules of `doc`.
+/// than `profile_name`), a present `[owner_rotation]` table, and the rules of
+/// `doc`.
 ///
 /// The one body parser of the signed and the unsigned path, so both refuse
 /// the same bodies.
-fn parse_policy_body(doc: &DocumentMut, profile_name: &str) -> Result<PolicyBody, PolicyError> {
+fn parse_policy_body(
+    doc: &DocumentMut,
+    profile_name: &str,
+    network_passphrase: &str,
+) -> Result<PolicyBody, PolicyError> {
     let version = extract_version(doc)?;
+    if version == 2 {
+        super::verified::sequence(doc)?;
+    }
+    super::schema::signed_engine(doc)?;
+    super::signature::parse_owner_rotation(doc)?;
+    if let Some(table) = doc.get("mainnet").and_then(Item::as_table_like) {
+        super::approval_origin::parse_fields(table)?;
+    }
     let scope = extract_scope(doc)?;
     reject_scope_profile_mismatch(&scope, profile_name)?;
-    let rules = extract_rules(doc)?;
+    let rules = extract_rules(doc, network_passphrase, version)?;
     Ok(PolicyBody {
         version,
         scope,
@@ -635,7 +698,7 @@ fn reject_scope_profile_mismatch(scope: &ScopeId, profile_name: &str) -> Result<
 
     if !matches_profile {
         return Err(PolicyError::PolicyFileParseFailed {
-            detail: format!("policy scope does not match profile `{profile_name}`"),
+            detail: "policy scope does not match the selected profile".into(),
         });
     }
 
@@ -717,13 +780,13 @@ fn extract_version(doc: &DocumentMut) -> Result<u32, PolicyError> {
         })?;
 
     let version = u32::try_from(v).map_err(|_| PolicyError::PolicyFileParseFailed {
-        detail: format!("`version` value {v} is out of range for u32"),
+        detail: "`version` must fit in u32".into(),
     })?;
 
     if version < MIN_POLICY_VERSION {
         return Err(PolicyError::PolicyFileParseFailed {
             detail: format!(
-                "`version` {version} is below the minimum supported version \
+                "`version` is below the minimum supported version \
                  {MIN_POLICY_VERSION}; policy files older than version \
                  {MIN_POLICY_VERSION} are not accepted (downgrade replay prevention)"
             ),
@@ -733,9 +796,9 @@ fn extract_version(doc: &DocumentMut) -> Result<u32, PolicyError> {
     if version > MAX_POLICY_VERSION {
         return Err(PolicyError::PolicyFileParseFailed {
             detail: format!(
-                "`version` {version} is above the maximum supported version \
+                "`version` is above the maximum supported version \
                  {MAX_POLICY_VERSION}; upgrade the agent to a version that \
-                 supports policy schema v{version}"
+                 supports the policy schema"
             ),
         });
     }
@@ -767,11 +830,13 @@ fn parse_scope_string(s: &str) -> Result<ScopeId, PolicyError> {
     let profile_part = parts[0].trim();
     let project_part = parts.get(1).map(|p| p.trim());
 
-    let profile_name = profile_part
-        .strip_prefix("profile:")
-        .ok_or_else(|| PolicyError::PolicyFileParseFailed {
-            detail: format!("invalid scope format: `{s}`; expected `profile:<name>` or `profile:<name>,project:<id>`"),
-        })?;
+    let profile_name = profile_part.strip_prefix("profile:").ok_or_else(|| {
+        PolicyError::PolicyFileParseFailed {
+            detail:
+                "invalid scope format; expected `profile:<name>` or `profile:<name>,project:<id>`"
+                    .into(),
+        }
+    })?;
 
     if profile_name == "*" && project_part.is_none() {
         return Ok(ScopeId::AllProfiles);
@@ -780,9 +845,7 @@ fn parse_scope_string(s: &str) -> Result<ScopeId, PolicyError> {
     if let Some(proj_str) = project_part {
         let project_name = proj_str.strip_prefix("project:").ok_or_else(|| {
             PolicyError::PolicyFileParseFailed {
-                detail: format!(
-                    "invalid scope project segment: `{proj_str}`; expected `project:<id>`"
-                ),
+                detail: "invalid scope project segment; expected `project:<id>`".into(),
             }
         })?;
         return Ok(ScopeId::ProfileProject {
@@ -796,8 +859,15 @@ fn parse_scope_string(s: &str) -> Result<ScopeId, PolicyError> {
 
 /// Extracts and parses the `[[rules]]` array.
 ///
-/// Returns an empty vec when no `rules` key is present.
-fn extract_rules(doc: &DocumentMut) -> Result<Vec<PolicyRule>, PolicyError> {
+/// Returns an empty vec when no `rules` key is present. `version` is the
+/// document's policy version; criteria and keys of version 2 refuse in a
+/// version 1 document. A rule carries at most one `unlisted` table, and
+/// every table of the policy equals the first.
+fn extract_rules(
+    doc: &DocumentMut,
+    network_passphrase: &str,
+    version: u32,
+) -> Result<Vec<PolicyRule>, PolicyError> {
     let rules_item = match doc.get("rules") {
         Some(item) => item,
         None => return Ok(vec![]),
@@ -814,9 +884,57 @@ fn extract_rules(doc: &DocumentMut) -> Result<Vec<PolicyRule>, PolicyError> {
 
     let mut rules = Vec::with_capacity(aot.len());
     for (i, table) in aot.iter().enumerate() {
-        rules.push(parse_rule(table, i)?);
+        rules.push(parse_rule(table, i, network_passphrase, version)?);
     }
+    reject_unequal_unlisted(&rules)?;
     Ok(rules)
+}
+
+/// Refuses a policy whose `unlisted` tables differ, or whose rule carries
+/// more than one table.
+///
+/// The tables are walked in document order. A rule carries at most one
+/// table. Every table equals the policy's first table as parsed: mode,
+/// asset after its default, both bounds, and window. Equal budget tables
+/// share one counter per asset across the rules that carry them. A rule
+/// without a table, its allow list, and its caps are unaffected.
+fn reject_unequal_unlisted(rules: &[PolicyRule]) -> Result<(), PolicyError> {
+    let mut first: Option<(usize, usize, &UnlistedMode)> = None;
+    for (rule_idx, rule) in rules.iter().enumerate() {
+        let mut rule_first: Option<usize> = None;
+        for (criterion_idx, criterion) in rule.criteria.iter().enumerate() {
+            let Some(mode) = (criterion.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<CounterpartyAllowlistCriterion>()
+                .and_then(CounterpartyAllowlistCriterion::unlisted)
+            else {
+                continue;
+            };
+            if let Some(rule_first_criterion) = rule_first {
+                return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "rule[{rule_idx}].criteria[{criterion_idx}]: a policy carries at most \
+                         one `unlisted` table; rule[{rule_idx}].criteria[{rule_first_criterion}] \
+                         carries the first"
+                    ),
+                });
+            }
+            rule_first = Some(criterion_idx);
+            match first {
+                Some((first_rule, first_criterion, first_mode)) if first_mode != mode => {
+                    return Err(PolicyError::PolicyFileParseFailed {
+                        detail: format!(
+                            "rule[{rule_idx}].criteria[{criterion_idx}]: every `unlisted` table \
+                             of a policy must equal the first; \
+                             rule[{first_rule}].criteria[{first_criterion}] carries the first"
+                        ),
+                    });
+                }
+                Some(_) => {}
+                None => first = Some((rule_idx, criterion_idx, mode)),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parses a single rule table.
@@ -826,7 +944,12 @@ fn extract_rules(doc: &DocumentMut) -> Result<Vec<PolicyRule>, PolicyError> {
 /// Returns [`PolicyError::PolicyFileParseFailed`] when the table is missing
 /// required keys, a criterion is unrecognised or malformed, or the decision
 /// value is unknown.
-fn parse_rule(table: &toml_edit::Table, idx: usize) -> Result<PolicyRule, PolicyError> {
+fn parse_rule(
+    table: &toml_edit::Table,
+    idx: usize,
+    network_passphrase: &str,
+    version: u32,
+) -> Result<PolicyRule, PolicyError> {
     // match clause
     let match_item = table
         .get("match")
@@ -836,7 +959,7 @@ fn parse_rule(table: &toml_edit::Table, idx: usize) -> Result<PolicyRule, Policy
     let rule_match = parse_rule_match(match_item, idx)?;
 
     // criteria (may be absent or empty)
-    let criteria = parse_criteria(table.get("criteria"), idx)?;
+    let criteria = parse_criteria(table.get("criteria"), idx, version)?;
 
     // decision
     let decision_str = table
@@ -849,7 +972,9 @@ fn parse_rule(table: &toml_edit::Table, idx: usize) -> Result<PolicyRule, Policy
     let reason = parse_optional_reason(table, idx)?;
     let ttl_secs = parse_optional_ttl_secs(table, idx)?;
     let decision = parse_decision(decision_str, idx, reason, ttl_secs)?;
-    validate_approval_above(&criteria, idx, &decision)?;
+    validate_approval_above(&criteria, idx, &decision, network_passphrase)?;
+    validate_unlisted(&criteria, idx, &decision, network_passphrase)?;
+    validate_total_budget(&criteria, idx, &decision)?;
 
     // Optional opaque-signing exemption (design §2.4). Absent → false; present
     // but not a boolean → parse error (fail-closed on a malformed exemption).
@@ -871,10 +996,16 @@ fn parse_rule(table: &toml_edit::Table, idx: usize) -> Result<PolicyRule, Policy
 }
 
 /// Validates approval thresholds against the decision and hard ceilings.
+///
+/// A threshold must be below every `per_tx_cap` of the same asset in its
+/// rule. Asset identity is the one evaluation applies on the governed
+/// profile's network: native aliases match, and a classic asset matches its
+/// Stellar Asset Contract address under `network_passphrase`.
 fn validate_approval_above(
     criteria: &[Box<dyn Criterion>],
     rule_idx: usize,
     decision: &Decision,
+    network_passphrase: &str,
 ) -> Result<(), PolicyError> {
     for (criterion_idx, criterion) in criteria.iter().enumerate() {
         let Some(threshold) =
@@ -894,18 +1025,109 @@ fn validate_approval_above(
             else {
                 continue;
             };
-            if super::value::asset_normalise(&threshold.asset)
-                == super::value::asset_normalise(cap.asset())
+            if assets_equivalent(&threshold.asset, cap.asset(), network_passphrase)
                 && threshold.max_stroops >= cap.max_stroops()
             {
                 return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!("{loc} threshold must be less than the `per_tx_cap` bound"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates an `unlisted` table against the decision and the hard caps of
+/// its rule.
+///
+/// `approval` and `budget` require `decision = "allow"`. A budget bound must be
+/// strictly below every matching hard cap of its rule. `per_tx_stroops` stays
+/// below each equivalent-asset `per_tx_cap`. `per_period_stroops` stays below
+/// each equivalent-asset `per_period_cap` of the same window. Both stay below
+/// each equivalent-asset `total_budget`. Asset identity is the one evaluation
+/// applies on the governed profile's network.
+fn validate_unlisted(
+    criteria: &[Box<dyn Criterion>],
+    rule_idx: usize,
+    decision: &Decision,
+    network_passphrase: &str,
+) -> Result<(), PolicyError> {
+    for (criterion_idx, criterion) in criteria.iter().enumerate() {
+        let Some(mode) = (criterion.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<CounterpartyAllowlistCriterion>()
+            .and_then(CounterpartyAllowlistCriterion::unlisted)
+        else {
+            continue;
+        };
+        let loc = format!("rule[{rule_idx}].criteria[{criterion_idx}].unlisted");
+        let budget = match mode {
+            UnlistedMode::Deny => continue,
+            UnlistedMode::Approval => None,
+            UnlistedMode::Budget(budget) => Some(budget),
+        };
+        if !matches!(decision, Decision::Allow) {
+            return Err(PolicyError::PolicyFileParseFailed {
+                detail: format!("{loc}: this mode requires decision = \"allow\""),
+            });
+        }
+        let Some(budget) = budget else {
+            continue;
+        };
+        let equivalent = |asset: &str| assets_equivalent(budget.asset(), asset, network_passphrase);
+        for cap in criteria.iter().map(|c| c.as_ref() as &dyn std::any::Any) {
+            if let Some(cap) = cap.downcast_ref::<PerTxCapCriterion>()
+                && equivalent(cap.asset())
+                && budget.per_tx_stroops() >= cap.max_stroops()
+            {
+                return Err(PolicyError::PolicyFileParseFailed {
                     detail: format!(
-                        "{loc} threshold {} must be less than `per_tx_cap` bound {}",
-                        threshold.max_stroops,
-                        cap.max_stroops()
+                        "{loc}: `per_tx_stroops` must be less than the `per_tx_cap` bound"
                     ),
                 });
             }
+            if let Some(cap) = cap.downcast_ref::<PerPeriodCapCriterion>()
+                && equivalent(cap.asset())
+                && cap.window() == budget.window()
+                && budget.per_period_stroops() >= cap.max_stroops()
+            {
+                return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "{loc}: `per_period_stroops` must be less than the `per_period_cap` \
+                         bound of the same window"
+                    ),
+                });
+            }
+            if let Some(total) = cap.downcast_ref::<TotalBudgetCriterion>()
+                && equivalent(total.asset())
+                && (budget.per_tx_stroops() >= total.max_stroops()
+                    || budget.per_period_stroops() >= total.max_stroops())
+            {
+                return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "{loc}: `per_tx_stroops` and `per_period_stroops` must be less than \
+                         the `total_budget` bound"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a `total_budget` criterion on a rule whose decision is not `allow`.
+fn validate_total_budget(
+    criteria: &[Box<dyn Criterion>],
+    rule_idx: usize,
+    decision: &Decision,
+) -> Result<(), PolicyError> {
+    for (criterion_idx, criterion) in criteria.iter().enumerate() {
+        if criterion.kind() == "total_budget" && !matches!(decision, Decision::Allow) {
+            return Err(PolicyError::PolicyFileParseFailed {
+                detail: format!(
+                    "rule[{rule_idx}].criteria[{criterion_idx}]: `total_budget` requires \
+                     decision = \"allow\""
+                ),
+            });
         }
     }
     Ok(())
@@ -925,6 +1147,7 @@ fn validate_approval_above(
 fn parse_criteria(
     item: Option<&Item>,
     rule_idx: usize,
+    version: u32,
 ) -> Result<Vec<Box<dyn Criterion>>, PolicyError> {
     let array = match item {
         None => return Ok(vec![]),
@@ -939,7 +1162,7 @@ fn parse_criteria(
     let mut criteria: Vec<Box<dyn Criterion>> = Vec::with_capacity(array.len());
     for (criterion_idx, elem) in array.iter().enumerate() {
         let item = Item::Value(elem.clone());
-        criteria.push(parse_criterion(&item, rule_idx, criterion_idx)?);
+        criteria.push(parse_criterion(&item, rule_idx, criterion_idx, version)?);
     }
     Ok(criteria)
 }
@@ -968,6 +1191,13 @@ fn parse_criteria(
 /// | `"quorum_satisfied"`       | [`QuorumSatisfiedCriterion`]         |
 /// | `"home_domain_resolved"`   | [`HomeDomainResolvedCriterion`]      |
 /// | `"sep10_session_active"`   | [`Sep10SessionActiveCriterion`]      |
+/// | `"total_budget"`           | [`TotalBudgetCriterion`]             |
+/// | `"balance_floor"`          | [`BalanceFloorCriterion`]            |
+/// | `"memo_binding"`           | [`MemoBindingCriterion`]             |
+///
+/// `total_budget`, `balance_floor`, `memo_binding`, and the `unlisted` table
+/// of `counterparty_allowlist` require policy version 2; `version` is the
+/// document's version.
 ///
 /// # Errors
 ///
@@ -987,6 +1217,7 @@ fn parse_criterion(
     item: &Item,
     rule_idx: usize,
     criterion_idx: usize,
+    version: u32,
 ) -> Result<Box<dyn Criterion>, PolicyError> {
     let loc = format!("rule[{rule_idx}].criteria[{criterion_idx}]");
 
@@ -1012,18 +1243,52 @@ fn parse_criterion(
     // A kind is supported only together with its closed key set, so every
     // parsed kind has its keys checked.
     if criterion_keys(kind).is_none() {
-        return Err(unknown_criterion_kind(&loc, kind));
+        return Err(unknown_criterion_kind(&loc));
+    }
+
+    let v2_only = match kind {
+        "total_budget" | "balance_floor" | "memo_binding" => Some(kind),
+        "counterparty_allowlist" if table.contains_key("unlisted") => {
+            Some("counterparty_allowlist.unlisted")
+        }
+        _ => None,
+    };
+    if let Some(feature) = v2_only
+        && version < 2
+    {
+        return Err(PolicyError::PolicyFileParseFailed {
+            detail: format!("{loc}: {feature} requires policy version 2"),
+        });
     }
 
     match kind {
+        "asset_allowlist" => {
+            let assets = table
+                .get("assets")
+                .and_then(Value::as_array)
+                .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                    detail: format!("{loc}: assets must be an array"),
+                })?;
+            let assets = assets
+                .iter()
+                .map(|asset| {
+                    asset.as_str().map(str::to_owned).ok_or_else(|| {
+                        PolicyError::PolicyFileParseFailed {
+                            detail: format!("{loc}: assets must contain strings"),
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Box::new(
+                super::criteria::asset_allowlist::AssetAllowlistCriterion::new(assets)?,
+            ))
+        }
         "approval_above" => {
             let asset = require_str(table, "asset", &loc)?;
             let max_stroops = require_i128(table, "max_stroops", &loc)?;
             if max_stroops <= 0 {
                 return Err(PolicyError::PolicyFileParseFailed {
-                    detail: format!(
-                        "{loc}: `approval_above` `max_stroops` must be positive, got {max_stroops}"
-                    ),
+                    detail: format!("{loc}: `approval_above` `max_stroops` must be positive"),
                 });
             }
             Ok(Box::new(ApprovalAboveCriterion::new(asset, max_stroops)))
@@ -1033,7 +1298,7 @@ fn parse_criterion(
             let max_stroops = require_i128(table, "max_stroops", &loc)?;
             if max_stroops < 0 {
                 return Err(PolicyError::PolicyFileParseFailed {
-                    detail: format!("{loc}: `max_stroops` must be non-negative, got {max_stroops}"),
+                    detail: format!("{loc}: `max_stroops` must be non-negative"),
                 });
             }
             Ok(Box::new(PerTxCapCriterion::new(asset, max_stroops)))
@@ -1044,14 +1309,14 @@ fn parse_criterion(
             let window =
                 Window::parse(&window_str).map_err(|_| PolicyError::PolicyFileParseFailed {
                     detail: format!(
-                        "{loc}: `window` value `{window_str}` is not accepted; \
+                        "{loc}: `window` is not accepted; \
                      valid values: 1m, 5m, 1h, 1d, 1w"
                     ),
                 })?;
             let max_stroops = require_i128(table, "max_stroops", &loc)?;
             if max_stroops < 0 {
                 return Err(PolicyError::PolicyFileParseFailed {
-                    detail: format!("{loc}: `max_stroops` must be non-negative, got {max_stroops}"),
+                    detail: format!("{loc}: `max_stroops` must be non-negative"),
                 });
             }
             Ok(Box::new(PerPeriodCapCriterion::new(
@@ -1065,16 +1330,14 @@ fn parse_criterion(
             let window =
                 Window::parse(&window_str).map_err(|_| PolicyError::PolicyFileParseFailed {
                     detail: format!(
-                        "{loc}: `window` value `{window_str}` is not accepted; \
+                        "{loc}: `window` is not accepted; \
                      valid values: 1m, 5m, 1h, 1d, 1w"
                     ),
                 })?;
             let max_calls_raw = require_i64(table, "max_calls", &loc)?;
             let max_calls =
                 u32::try_from(max_calls_raw).map_err(|_| PolicyError::PolicyFileParseFailed {
-                    detail: format!(
-                        "{loc}: `max_calls` value {max_calls_raw} is out of range for u32"
-                    ),
+                    detail: format!("{loc}: `max_calls` must fit in u32"),
                 })?;
             Ok(Box::new(RateLimitCriterion::new(window, max_calls)))
         }
@@ -1086,7 +1349,7 @@ fn parse_criterion(
                 let k =
                     CounterpartyKind::parse(s).map_err(|_| PolicyError::PolicyFileParseFailed {
                         detail: format!(
-                            "{loc}: unknown counterparty kind `{s}`; \
+                            "{loc}: unknown counterparty kind; \
                          accepted: G_ACCOUNT, C_ACCOUNT, KNOWN_ISSUER, \
                          SEP10_IDENTITY, HOME_DOMAIN, ONE_TIME_ADDRESS"
                         ),
@@ -1132,31 +1395,27 @@ fn parse_criterion(
                         detail: format!("{loc}: `gate_inflows` must be a boolean"),
                     })?,
             };
-            Ok(Box::new(
-                CounterpartyAllowlistCriterion::new(kinds, allowlist)
-                    .with_gate_inflows(gate_inflows),
-            ))
+            let criterion = CounterpartyAllowlistCriterion::new(kinds, allowlist)
+                .with_gate_inflows(gate_inflows);
+            Ok(Box::new(match table.get("unlisted") {
+                None => criterion,
+                Some(unlisted) => criterion.with_unlisted(parse_unlisted(unlisted, &loc)?),
+            }))
         }
         "minimum_reserve" => {
             let margin_stroops = require_i64(table, "margin_stroops", &loc)?;
             if margin_stroops < 0 {
                 return Err(PolicyError::PolicyFileParseFailed {
-                    detail: format!(
-                        "{loc}: `margin_stroops` must be non-negative, got {margin_stroops}"
-                    ),
+                    detail: format!("{loc}: `margin_stroops` must be non-negative"),
                 });
             }
             Ok(Box::new(MinimumReserveCriterion::new(margin_stroops)))
         }
-        // A future contract-invoke tool should get a descriptor-based resource
-        // criterion designed against `ContractInvoke` value legs.
         "inner_invocation_count_cap" => {
             let max_count_raw = require_i64(table, "max_count", &loc)?;
             let max_count =
                 u32::try_from(max_count_raw).map_err(|_| PolicyError::PolicyFileParseFailed {
-                    detail: format!(
-                        "{loc}: `max_count` value {max_count_raw} is out of range for u32"
-                    ),
+                    detail: format!("{loc}: `max_count` must fit in u32"),
                 })?;
             Ok(Box::new(InnerInvocationCountCapCriterion { max_count }))
         }
@@ -1165,16 +1424,15 @@ fn parse_criterion(
             // `max_amount` is string-encoded to allow values that exceed TOML's
             // i64 range (i128 can represent sums of many inner transfers).
             let max_amount_str = require_str(table, "max_amount", &loc)?;
-            let max_amount = max_amount_str.parse::<i128>().map_err(|_| {
-                PolicyError::PolicyFileParseFailed {
-                    detail: format!(
-                        "{loc}: `max_amount` value `{max_amount_str}` is not a valid i128 decimal"
-                    ),
-                }
-            })?;
+            let max_amount =
+                max_amount_str
+                    .parse::<i128>()
+                    .map_err(|_| PolicyError::PolicyFileParseFailed {
+                        detail: format!("{loc}: `max_amount` must be a valid i128 decimal"),
+                    })?;
             if max_amount < 0 {
                 return Err(PolicyError::PolicyFileParseFailed {
-                    detail: format!("{loc}: `max_amount` must be non-negative, got {max_amount}"),
+                    detail: format!("{loc}: `max_amount` must be non-negative"),
                 });
             }
             Ok(Box::new(BundleAggregateCapCriterion { asset, max_amount }))
@@ -1197,14 +1455,14 @@ fn parse_criterion(
             let window =
                 Window::parse(&window_str).map_err(|_| PolicyError::PolicyFileParseFailed {
                     detail: format!(
-                        "{loc}: `window` value `{window_str}` is not accepted; \
+                        "{loc}: `window` is not accepted; \
                          valid values: 1m, 5m, 1h, 1d, 1w"
                     ),
                 })?;
             let max_stroops = require_i128(table, "max_stroops", &loc)?;
             if max_stroops < 0 {
                 return Err(PolicyError::PolicyFileParseFailed {
-                    detail: format!("{loc}: `max_stroops` must be non-negative, got {max_stroops}"),
+                    detail: format!("{loc}: `max_stroops` must be non-negative"),
                 });
             }
             Ok(Box::new(BundlePerPeriodCapCriterion::new(
@@ -1218,7 +1476,7 @@ fn parse_criterion(
             let max_stroops = require_i128(table, "max_stroops", &loc)?;
             if max_stroops < 0 {
                 return Err(PolicyError::PolicyFileParseFailed {
-                    detail: format!("{loc}: `max_stroops` must be non-negative, got {max_stroops}"),
+                    detail: format!("{loc}: `max_stroops` must be non-negative"),
                 });
             }
             Ok(Box::new(BundlePerTxCapCriterion::new(asset, max_stroops)))
@@ -1228,16 +1486,14 @@ fn parse_criterion(
             let window =
                 Window::parse(&window_str).map_err(|_| PolicyError::PolicyFileParseFailed {
                     detail: format!(
-                        "{loc}: `window` value `{window_str}` is not accepted; \
+                        "{loc}: `window` is not accepted; \
                          valid values: 1m, 5m, 1h, 1d, 1w"
                     ),
                 })?;
             let max_calls_raw = require_i64(table, "max_calls", &loc)?;
             let max_calls =
                 u32::try_from(max_calls_raw).map_err(|_| PolicyError::PolicyFileParseFailed {
-                    detail: format!(
-                        "{loc}: `max_calls` value {max_calls_raw} is out of range for u32"
-                    ),
+                    detail: format!("{loc}: `max_calls` must fit in u32"),
                 })?;
             Ok(Box::new(BundleRateLimitCriterion::new(window, max_calls)))
         }
@@ -1253,21 +1509,166 @@ fn parse_criterion(
         "sep45_session_active" => Ok(Box::new(
             crate::policy::v1::criteria::sep45_session_active::Sep45SessionActiveCriterion::new(),
         )),
-        other => Err(unknown_criterion_kind(&loc, other)),
+        "total_budget" => {
+            let asset = require_str(table, "asset", &loc)?;
+            let max_stroops = require_nonnegative_i128(table, "max_stroops", &loc)?;
+            Ok(Box::new(TotalBudgetCriterion::new(asset, max_stroops)))
+        }
+        "balance_floor" => {
+            let min_stroops = require_nonnegative_i128(table, "min_stroops", &loc)?;
+            Ok(Box::new(BalanceFloorCriterion::new(min_stroops)))
+        }
+        "memo_binding" => Ok(Box::new(MemoBindingCriterion::new(parse_memo_bindings(
+            table, &loc,
+        )?))),
+        _ => Err(unknown_criterion_kind(&loc)),
     }
 }
 
+/// Parses the `unlisted` table of a `counterparty_allowlist` criterion at
+/// `loc`.
+///
+/// `mode` is `deny` (also when omitted), `approval`, or `budget`. `budget`
+/// requires `per_tx_stroops`, `per_period_stroops`, and `window`, and takes
+/// `asset`, `native` by default. Both bounds are nonnegative integers or
+/// decimal strings.
+fn parse_unlisted(item: &Value, loc: &str) -> Result<UnlistedMode, PolicyError> {
+    let loc = format!("{loc}.unlisted");
+    let table = item
+        .as_inline_table()
+        .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+            detail: format!("{loc}: must be an inline table"),
+        })?;
+    reject_unknown_keys(table, UNLISTED_KEYS, Some(&loc), "an `unlisted` table")?;
+    let mode = match table.get("mode") {
+        None => "deny",
+        Some(mode) => mode
+            .as_str()
+            .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                detail: format!("{loc}: `mode` must be a string"),
+            })?,
+    };
+    match mode {
+        "deny" | "approval" => {
+            if table.iter().any(|(key, _)| key != "mode") {
+                return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!("{loc}: mode `{mode}` accepts no key other than `mode`"),
+                });
+            }
+            Ok(if mode == "deny" {
+                UnlistedMode::Deny
+            } else {
+                UnlistedMode::Approval
+            })
+        }
+        "budget" => {
+            let per_tx_stroops = require_nonnegative_i128(table, "per_tx_stroops", &loc)?;
+            let per_period_stroops = require_nonnegative_i128(table, "per_period_stroops", &loc)?;
+            let window_str = require_str(table, "window", &loc)?;
+            let window =
+                Window::parse(&window_str).map_err(|_| PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "{loc}: `window` is not accepted; valid values: 1m, 5m, 1h, 1d, 1w"
+                    ),
+                })?;
+            let asset = match table.get("asset") {
+                None => "native".to_owned(),
+                Some(asset) => asset.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    PolicyError::PolicyFileParseFailed {
+                        detail: format!("{loc}: `asset` must be a string"),
+                    }
+                })?,
+            };
+            Ok(UnlistedMode::Budget(UnlistedBudget::new(
+                asset,
+                per_tx_stroops,
+                per_period_stroops,
+                window,
+            )))
+        }
+        _ => Err(PolicyError::PolicyFileParseFailed {
+            detail: format!("{loc}: `mode` must be deny, approval, or budget"),
+        }),
+    }
+}
+
+/// Parses the `bindings` array of a `memo_binding` criterion at `loc`.
+///
+/// Requires 1 to 64 inline tables with distinct G-strkey destinations; the
+/// kind and value rules are those of [`MemoRequirement::parse`].
+fn parse_memo_bindings(
+    table: &toml_edit::InlineTable,
+    loc: &str,
+) -> Result<Vec<MemoBinding>, PolicyError> {
+    let array = table
+        .get("bindings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+            detail: format!("{loc}: missing or non-array required field `bindings`"),
+        })?;
+    if array.is_empty() || array.len() > MAX_MEMO_BINDINGS {
+        return Err(PolicyError::PolicyFileParseFailed {
+            detail: format!("{loc}: `bindings` holds 1 to {MAX_MEMO_BINDINGS} bindings"),
+        });
+    }
+    let mut bindings: Vec<MemoBinding> = Vec::with_capacity(array.len());
+    for (idx, element) in array.iter().enumerate() {
+        let at = format!("{loc}.bindings[{idx}]");
+        let binding =
+            element
+                .as_inline_table()
+                .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                    detail: format!("{at}: must be an inline table"),
+                })?;
+        reject_unknown_keys(binding, MEMO_BINDING_KEYS, Some(&at), "a binding")?;
+        let destination = require_str(binding, "destination", &at)?;
+        let kind = require_str(binding, "kind", &at)?;
+        let value = match binding.get("value") {
+            None => None,
+            Some(value) => {
+                Some(
+                    value
+                        .as_str()
+                        .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                            detail: format!("{at}: `value` must be a string"),
+                        })?,
+                )
+            }
+        };
+        let requirement = MemoRequirement::parse(&kind, value).map_err(|detail| {
+            PolicyError::PolicyFileParseFailed {
+                detail: format!("{at}: {detail}"),
+            }
+        })?;
+        let parsed = MemoBinding::new(&destination, requirement).map_err(|detail| {
+            PolicyError::PolicyFileParseFailed {
+                detail: format!("{at}: {detail}"),
+            }
+        })?;
+        if bindings
+            .iter()
+            .any(|existing| existing.destination() == parsed.destination())
+        {
+            return Err(PolicyError::PolicyFileParseFailed {
+                detail: format!("{at}: `destination` repeats an earlier binding"),
+            });
+        }
+        bindings.push(parsed);
+    }
+    Ok(bindings)
+}
+
 /// The refusal of a criterion `kind` the loader does not support, at `loc`.
-fn unknown_criterion_kind(loc: &str, kind: &str) -> PolicyError {
+fn unknown_criterion_kind(loc: &str) -> PolicyError {
     PolicyError::PolicyFileParseFailed {
         detail: format!(
-            "{loc}: unknown criterion kind `{kind}`; accepted kinds: \
-             per_tx_cap, approval_above, per_period_cap, rate_limit, counterparty_allowlist, \
-             minimum_reserve, inner_invocation_count_cap, \
+            "{loc}: unknown criterion kind; accepted kinds: \
+             asset_allowlist, per_tx_cap, approval_above, per_period_cap, rate_limit, \
+             counterparty_allowlist, minimum_reserve, inner_invocation_count_cap, \
              bundle_aggregate_cap, restrict_bundle_to_recognised_kinds, \
              bundle_per_period_cap, bundle_per_tx_cap, bundle_rate_limit, \
              quorum_satisfied, home_domain_resolved, sep10_session_active, \
-             sep45_session_active"
+             sep45_session_active, total_budget, balance_floor, memo_binding"
         ),
     }
 }
@@ -1338,12 +1739,33 @@ fn require_i128(table: &toml_edit::InlineTable, key: &str, loc: &str) -> Result<
         return s
             .parse::<i128>()
             .map_err(|_| PolicyError::PolicyFileParseFailed {
-                detail: format!("{loc}: `{key}` value `{s}` is not a valid i128 decimal"),
+                detail: format!("{loc}: `{key}` must be a valid i128 decimal"),
             });
     }
     Err(PolicyError::PolicyFileParseFailed {
         detail: format!("{loc}: missing or non-integer required field `{key}`"),
     })
+}
+
+/// Extracts a required nonnegative amount field, as [`require_i128`] reads
+/// it. Zero is accepted.
+///
+/// # Errors
+///
+/// Returns [`PolicyError::PolicyFileParseFailed`] when the field is absent,
+/// unparseable, or negative.
+fn require_nonnegative_i128(
+    table: &toml_edit::InlineTable,
+    key: &str,
+    loc: &str,
+) -> Result<i128, PolicyError> {
+    let value = require_i128(table, key, loc)?;
+    if value < 0 {
+        return Err(PolicyError::PolicyFileParseFailed {
+            detail: format!("{loc}: `{key}` must be non-negative"),
+        });
+    }
+    Ok(value)
 }
 
 /// Extracts a required boolean field from a criterion inline table.
@@ -1527,9 +1949,9 @@ fn parse_decision(
             }
             Ok(Decision::RequireApproval(req))
         }
-        other => Err(PolicyError::PolicyFileParseFailed {
+        _ => Err(PolicyError::PolicyFileParseFailed {
             detail: format!(
-                "rule[{idx}] `decision` has unknown value `{other}`; \
+                "rule[{idx}] `decision` is not recognised; \
                  expected `allow`, `deny`, or `require_approval`"
             ),
         }),
@@ -1570,9 +1992,232 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn contract_fee_root_accepts_only_optional_u32_in_both_versions() {
+        let (key, public) = make_keypair();
+        let owner = stellar_strkey::ed25519::PublicKey(public).to_string();
+        for version in [1, 2] {
+            let sequence = if version == 2 { "sequence = 1\n" } else { "" };
+            let base = format!("version = {version}\nscope = \"profile:fee-test\"\n{sequence}");
+            for field in [
+                "",
+                "contract_transfer_max_fee_stroops = 0\n",
+                "contract_transfer_max_fee_stroops = 4294967295\n",
+            ] {
+                let body = format!("{field}{base}");
+                assert!(validate_unsigned_policy(&body, "fee-test", TESTNET_PASSPHRASE).is_ok());
+                let signed = make_signed_toml(&body, &key, &owner);
+                assert!(
+                    load_signed_policy_text(&signed, "fee-test", &public, TESTNET_PASSPHRASE)
+                        .is_ok()
+                );
+            }
+            let signed = make_signed_toml(&base, &key, &owner);
+            for value in ["-1", "4294967296", "\"100\"", "1.5", "true", "{}", "[]"] {
+                for body in [&base, &signed] {
+                    let invalid = format!("contract_transfer_max_fee_stroops = {value}\n{body}");
+                    let error = if body == &base {
+                        validate_unsigned_policy(&invalid, "fee-test", TESTNET_PASSPHRASE)
+                            .unwrap_err()
+                    } else {
+                        load_signed_policy_text(&invalid, "fee-test", &public, TESTNET_PASSPHRASE)
+                            .unwrap_err()
+                    };
+                    assert!(
+                        matches!(error, PolicyError::PolicyFileParseFailed { ref detail }
+                        if detail == "contract_transfer_max_fee_stroops must be an integer in the u32 range"),
+                        "{version}: {value}: {error:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn policy_semantic_numeric_inputs_are_not_echoed() {
+        use stellar_agent_test_support::rejected_value::assert_no_marker;
+        let mut cases = Vec::new();
+        for version in ["-987654321", "987654321", "9876543210"] {
+            cases.push((
+                format!("version = {version}\nscope = \"profile:alice\"\n"),
+                version,
+            ));
+        }
+        for criterion in [
+            r#"{kind = "per_tx_cap", asset = "native", max_stroops = -987654321}"#,
+            r#"{kind = "approval_above", asset = "native", max_stroops = -987654321}"#,
+            r#"{kind = "per_period_cap", asset = "native", window = "1d", max_stroops = -987654321}"#,
+            r#"{kind = "minimum_reserve", margin_stroops = -987654321}"#,
+            r#"{kind = "bundle_aggregate_cap", max_amount = "-987654321"}"#,
+            r#"{kind = "bundle_per_tx_cap", asset = "native", max_stroops = -987654321}"#,
+            r#"{kind = "bundle_per_period_cap", asset = "native", window = "1d", max_stroops = -987654321}"#,
+        ] {
+            cases.push((body_with_criterion(criterion), "-987654321"));
+        }
+        for criterion in [
+            r#"{kind = "rate_limit", window = "1d", max_calls = 9876543210}"#,
+            r#"{kind = "bundle_rate_limit", window = "1d", max_calls = 9876543210}"#,
+            r#"{kind = "inner_invocation_count_cap", max_count = 9876543210}"#,
+        ] {
+            cases.push((body_with_criterion(criterion), "9876543210"));
+        }
+        for (body, rejected) in cases {
+            let doc = DocumentMut::from_str(&body).unwrap();
+            let error = parse_policy_body(&doc, "alice", TESTNET_PASSPHRASE)
+                .err()
+                .expect("policy refuses");
+            assert_no_marker(&error, rejected);
+            assert!(matches!(error, PolicyError::PolicyFileParseFailed { .. }));
+        }
+    }
+
+    #[test]
+    fn policy_semantic_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+        for marker in ["CREDMARKER7".to_owned(), seed_marker()] {
+            assert_no_marker(&Window::parse(&marker).unwrap_err(), &marker);
+            assert_no_marker(&CounterpartyKind::parse(&marker).unwrap_err(), &marker);
+            let criteria = [
+                format!(r#"{{kind = "{marker}"}}"#),
+                format!(
+                    r#"{{kind = "per_period_cap", asset = "native", window = "{marker}", max_stroops = 1}}"#
+                ),
+                format!(r#"{{kind = "rate_limit", window = "{marker}", max_calls = 1}}"#),
+                format!(
+                    r#"{{kind = "counterparty_allowlist", kinds = ["{marker}"], allowlist = []}}"#
+                ),
+                format!(r#"{{kind = "bundle_aggregate_cap", max_amount = "{marker}"}}"#),
+                format!(r#"{{kind = "per_tx_cap", asset = "native", max_stroops = "{marker}"}}"#),
+                format!(r#"{{kind = "bundle_rate_limit", window = "{marker}", max_calls = 1}}"#),
+                format!(
+                    r#"{{kind = "bundle_per_period_cap", asset = "native", window = "{marker}", max_stroops = 1}}"#
+                ),
+            ];
+            let mut bodies: Vec<String> = criteria
+                .iter()
+                .map(|criterion| body_with_criterion(criterion))
+                .collect();
+            bodies.push(format!("version = 1\nscope = \"{marker}\"\n"));
+            bodies.push(format!(
+                "version = 1\nscope = \"profile:fixture,{marker}\"\n"
+            ));
+            bodies.push(format!("version = 1\nscope = \"profile:{marker}\"\n"));
+            bodies.push(
+                body_with_criterion("")
+                    .replace("decision = \"allow\"", &format!("decision = \"{marker}\"")),
+            );
+            for body in bodies {
+                let doc = DocumentMut::from_str(&body).unwrap();
+                let error = parse_policy_body(&doc, "alice", TESTNET_PASSPHRASE)
+                    .err()
+                    .expect("policy refuses");
+                assert_no_marker(&error, &marker);
+                let json = serde_json::to_string(&crate::envelope::Envelope::<()>::err_raw(
+                    error.wire_code(),
+                    error.to_string(),
+                ))
+                .unwrap();
+                assert!(!json.contains(&marker));
+                assert!(json.contains("policy.policy_file_parse_failed"));
+            }
+        }
+    }
+
+    /// A policy key the schema rejects is operator input: the refusal names
+    /// its location and the accepted keys, never the key. Each body reaches
+    /// the schema check through the unsigned validation entry point, and each
+    /// refusal carries the exact detail of its container.
+    #[test]
+    fn policy_key_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+        const RULE_ACCEPTS: &str =
+            "a rule accepts match, criteria, decision, reason, ttl_secs, allow_opaque_signing";
+        for marker in ["CREDMARKER7".to_owned(), seed_marker()] {
+            let rule = |extra: &str| {
+                format!(
+                    "version = 1\nscope = \"profile:alice\"\n\n[[rules]]\n\
+                     match = {{ tool = \"stellar_pay\", chain = \"*\" }}\n\
+                     criteria = [{{ kind = \"rate_limit\", window = \"1d\", max_calls = 1 }}]\n\
+                     decision = \"allow\"\n{extra}"
+                )
+            };
+            let v2_mainnet = |table: &str| {
+                format!(
+                    "version = 2\nscope = \"profile:alice\"\nsequence = 1\n\n{table}\n\
+                     \"{marker}\" = 1\n"
+                )
+            };
+            let cases = [
+                (
+                    format!("version = 1\nscope = \"profile:alice\"\n\"{marker}\" = 1\n"),
+                    "unknown key; the policy file accepts version, scope, contract_transfer_max_fee_stroops, rules, signature, \
+                     owner_rotation"
+                        .to_owned(),
+                ),
+                (
+                    rule(&format!("\"{marker}\" = 1\n")),
+                    format!("rule[0]: unknown key; {RULE_ACCEPTS}"),
+                ),
+                (
+                    rule("").replace(
+                        "chain = \"*\" }",
+                        &format!("chain = \"*\", \"{marker}\" = 1 }}"),
+                    ),
+                    "rule[0].match: unknown key; match accepts tool, chain".to_owned(),
+                ),
+                (
+                    rule("").replace(
+                        "max_calls = 1 }",
+                        &format!("max_calls = 1, \"{marker}\" = 1 }}"),
+                    ),
+                    "rule[0].criteria[0]: unknown key; a `rate_limit` criterion accepts kind, \
+                     window, max_calls"
+                        .to_owned(),
+                ),
+                (
+                    v2_mainnet("[mainnet]"),
+                    format!(
+                        "mainnet: unknown key; the mainnet table accepts {}",
+                        crate::policy::v1::schema::MAINNET_KEYS.join(", ")
+                    ),
+                ),
+                (
+                    v2_mainnet("[mainnet.cross_check_thresholds]"),
+                    "mainnet.cross_check_thresholds: unknown key; the thresholds table accepts \
+                     native and asset identities"
+                        .to_owned(),
+                ),
+                (
+                    format!(
+                        "version = 1\nscope = \"profile:alice\"\n\n[owner_rotation]\n\
+                         previous_owner = \"G\"\nnew_owner = \"G\"\nsig = \"00\"\n\
+                         \"{marker}\" = 1\n"
+                    ),
+                    "owner_rotation: unknown key; the owner rotation table accepts \
+                     previous_owner, new_owner, sig"
+                        .to_owned(),
+                ),
+            ];
+            for (body, expected) in cases {
+                let error = validate_unsigned_policy(&body, "alice", TESTNET_PASSPHRASE)
+                    .expect_err("an unknown key refuses");
+                assert!(
+                    matches!(
+                        &error,
+                        PolicyError::PolicyFileParseFailed { detail } if *detail == expected
+                    ),
+                    "expected detail {expected:?}, got {error:?}"
+                );
+                assert_no_marker(&error, &marker);
+            }
+        }
+    }
+
     use crate::policy::v1::criteria::PolicyStateStore;
     use crate::policy::v1::{AccountReserveLookupError, AccountReservesView, EvalContext};
     use crate::policy::{DenyReason, McpToolRegistration, ToolDescriptor};
+    use crate::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
     use crate::profile::schema::Profile;
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -1660,6 +2305,9 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: 1_700_000_000_000,
         };
         doc.rules[0].criteria[0]
             .evaluate(&ctx)
@@ -1686,7 +2334,7 @@ decision = "allow"
         let toml = make_signed_toml(BODY_WITH_RULES, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.version, 1);
         assert!(doc.signature.is_some());
         assert_eq!(doc.rules.len(), 1);
@@ -1704,7 +2352,7 @@ decision = "allow"
         let path = write_policy(&dir, "alice.toml", &toml);
 
         // Use the wrong public key — verification must fail.
-        let err = load_signed_policy(&path, "alice", &pk2).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk2, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1724,7 +2372,7 @@ decision = "allow"
         let path = write_policy(&dir, "alice.toml", MINIMAL_BODY);
 
         assert_parse_failure(
-            load_signed_policy(&path, "alice", &pk),
+            load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE),
             "policy file has no `[signature]` table; sign it with \
              `stellar-agent profile sign-policy --profile alice`",
         );
@@ -1738,11 +2386,44 @@ decision = "allow"
         let dir = TempDir::new().unwrap();
         let path = write_policy(&dir, "alice.toml", "not valid toml [[[");
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { .. }),
             "invalid TOML must produce PolicyFileParseFailed, got {err:?}"
         );
+    }
+
+    /// A policy file whose malformed line holds a credential is refused by the
+    /// position of the failure through every reader of the policy body; the
+    /// line is not repeated.
+    #[test]
+    fn a_malformed_policy_line_is_reported_by_position_only() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+
+        let (_sk, pk) = make_keypair();
+        let dir = TempDir::new().unwrap();
+        let body =
+            format!("version = 2\nscope = \"profile:alice\"\nsecret = {CREDENTIAL_MARKER} here\n");
+        let path = write_policy(&dir, "alice.toml", &body);
+
+        let refusals = [
+            load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err(),
+            validate_unsigned_policy(&body, "alice", TESTNET_PASSPHRASE).unwrap_err(),
+            crate::policy::v1::canonical::canonical_bytes(&body).unwrap_err(),
+            crate::policy::v1::canonical::owner_rotation_bytes(&body).unwrap_err(),
+            crate::policy::v1::signature::verify_owner_rotation(&body, &pk, &pk).unwrap_err(),
+        ];
+        for err in refusals {
+            assert_no_marker(&err, CREDENTIAL_MARKER);
+            assert!(
+                matches!(
+                    &err,
+                    PolicyError::PolicyFileParseFailed { detail }
+                        if detail.starts_with("not valid TOML: line 3, column ")
+                ),
+                "{err:?}"
+            );
+        }
     }
 
     // ── load_signed_policy_missing_file_rejected ──────────────────────────────
@@ -1753,7 +2434,7 @@ decision = "allow"
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("does_not_exist.toml");
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileLoadFailed { .. }),
             "missing file must produce PolicyFileLoadFailed, got {err:?}"
@@ -1767,7 +2448,7 @@ decision = "allow"
         let parent = dir.path().join("operator-pii-parent");
         let path = parent.join("alice.toml");
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         let detail = match err {
             PolicyError::PolicyFileLoadFailed { detail } => detail,
             other => return Err(format!("expected PolicyFileLoadFailed, got {other:?}")),
@@ -1793,7 +2474,7 @@ decision = "allow"
         let toml = make_signed_toml(MINIMAL_BODY, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert!(doc.rules.is_empty(), "zero-rule document must be accepted");
         assert_eq!(doc.version, 1);
     }
@@ -1893,12 +2574,12 @@ decision = "allow"
         let toml = make_signed_toml(body, &sk, "GABCDE");
         let path = write_policy(&dir, "bob.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(
                 err,
                 PolicyError::PolicyFileParseFailed { ref detail }
-                    if detail.contains("policy scope does not match profile `alice`")
+                    if detail == "policy scope does not match the selected profile"
             ),
             "cross-profile replay must fail at scope check, got {err:?}"
         );
@@ -1912,7 +2593,7 @@ decision = "allow"
         let toml = make_signed_toml(body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice-p1.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert!(
             matches!(
                 doc.scope,
@@ -2058,7 +2739,7 @@ decision = "allow"
         let toml = make_signed_toml(body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("minimum")),
             "version 0 should be rejected with PolicyFileParseFailed (minimum version), got {err:?}"
@@ -2069,14 +2750,14 @@ decision = "allow"
     fn version_above_max_rejected() {
         let (sk, pk) = make_keypair();
         let dir = TempDir::new().unwrap();
-        let body = "version = 2\nscope = \"profile:alice\"\n";
+        let body = "version = 3\nscope = \"profile:alice\"\n";
         let toml = make_signed_toml(body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("maximum")),
-            "version 2 should be rejected with PolicyFileParseFailed (maximum version), got {err:?}"
+            "version 3 should be rejected with PolicyFileParseFailed (maximum version), got {err:?}"
         );
     }
 
@@ -2118,14 +2799,18 @@ criteria = []
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules.len(), 1);
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "per_tx_cap");
     }
 
     #[test]
+    #[serial_test::serial]
     fn criterion_per_tx_cap_allows_zero_max_stroops() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (sk, pk) = make_keypair();
         let dir = TempDir::new().unwrap();
         let body =
@@ -2133,7 +2818,7 @@ criteria = []
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria[0].kind(), "per_tx_cap");
 
         let tool = test_tool("stellar_pay");
@@ -2162,7 +2847,7 @@ criteria = []
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria[0].kind(), "per_tx_cap");
     }
 
@@ -2200,13 +2885,17 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "per_period_cap");
     }
 
     #[test]
+    #[serial_test::serial]
     fn criterion_per_period_cap_allows_zero_max_stroops() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (sk, pk) = make_keypair();
         let dir = TempDir::new().unwrap();
         let body = body_with_criterion(
@@ -2215,7 +2904,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria[0].kind(), "per_period_cap");
 
         let tool = test_tool("stellar_pay");
@@ -2236,7 +2925,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "rate_limit");
     }
@@ -2252,7 +2941,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "counterparty_allowlist");
     }
@@ -2279,7 +2968,7 @@ garbage = "not-a-number"
             asset: Some(asset.to_owned()),
             destination: Some("CAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         doc.rules[0].criteria[0]
             .evaluate(&ctx)
@@ -2291,7 +2980,11 @@ garbage = "not-a-number"
     /// allowed, pinning that existing policy files (authored before this
     /// flag existed) parse and behave unchanged.
     #[test]
+    #[serial_test::serial]
     fn criterion_counterparty_allowlist_gate_inflows_absent_defaults_false() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (sk, pk) = make_keypair();
         let dir = TempDir::new().unwrap();
         let body = body_with_criterion(
@@ -2300,7 +2993,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         let result = eval_first_criterion_with_inflow_leg(
             &doc,
             "MYTOKEN:GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
@@ -2315,7 +3008,11 @@ garbage = "not-a-number"
     /// `gate_inflows = true` round-trips through the TOML parser: an inflow
     /// leg from an issuer not on the allowlist now denies.
     #[test]
+    #[serial_test::serial]
     fn criterion_counterparty_allowlist_gate_inflows_true_round_trips() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (sk, pk) = make_keypair();
         let dir = TempDir::new().unwrap();
         let body = body_with_criterion(
@@ -2324,7 +3021,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         let result = eval_first_criterion_with_inflow_leg(
             &doc,
             "MYTOKEN:GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
@@ -2347,7 +3044,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let result = load_signed_policy(&path, "alice", &pk);
+        let result = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE);
         assert!(
             matches!(result, Err(PolicyError::PolicyFileParseFailed { .. })),
             "a non-boolean gate_inflows must fail to load, got {result:?}"
@@ -2363,20 +3060,24 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "minimum_reserve");
     }
 
     #[test]
+    #[serial_test::serial]
     fn criterion_minimum_reserve_allows_zero_margin_stroops() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (sk, pk) = make_keypair();
         let dir = TempDir::new().unwrap();
         let body = body_with_criterion(r#"{ kind = "minimum_reserve", margin_stroops = 0 }"#);
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria[0].kind(), "minimum_reserve");
 
         let tool = test_tool("stellar_pay");
@@ -2474,9 +3175,9 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
-            matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("made_up_thing")),
+            matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("unknown criterion kind") && !detail.contains("made_up_thing")),
             "unknown criterion kind should produce PolicyFileParseFailed, got {err:?}"
         );
     }
@@ -2494,9 +3195,9 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
-            matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("soroban_resource_fee_cap")),
+            matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("unknown criterion kind") && !detail.contains("soroban_resource_fee_cap")),
             "a policy referencing soroban_resource_fee_cap must be rejected as an \
              unknown criterion, got {err:?}"
         );
@@ -2511,7 +3212,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("max_stroops")),
             "missing max_stroops should produce PolicyFileParseFailed mentioning the field, got {err:?}"
@@ -2527,7 +3228,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { .. }),
             "negative max_stroops should produce PolicyFileParseFailed, got {err:?}"
@@ -2543,9 +3244,9 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
-            matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("never")),
+            matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail == "rule[0].criteria[0]: `window` is not accepted; valid values: 1m, 5m, 1h, 1d, 1w" && !detail.contains("never")),
             "invalid window string should produce PolicyFileParseFailed, got {err:?}"
         );
     }
@@ -2560,7 +3261,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { .. }),
             "unknown counterparty kind should produce PolicyFileParseFailed, got {err:?}"
@@ -2584,7 +3285,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2610,7 +3311,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2635,7 +3336,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2660,7 +3361,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2682,7 +3383,7 @@ chain = "*"
             );
             let signed = make_signed_toml(&body, &sk, "GABCDE");
             let path = write_policy(&dir, "alice.toml", &signed);
-            let result = load_signed_policy(&path, "alice", &pk);
+            let result = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE);
             if accepted {
                 let doc = result.expect("bounded TTL must load");
                 assert!(matches!(
@@ -2715,7 +3416,7 @@ chain = "*"
             );
             let signed = make_signed_toml(&body, &sk, "GABCDE");
             let path = write_policy(&dir, "alice.toml", &signed);
-            let result = load_signed_policy(&path, "alice", &pk);
+            let result = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE);
             if count == 512 {
                 let doc = result.expect("512 characters must load");
                 assert!(matches!(
@@ -2746,7 +3447,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         let req = match &doc.rules[0].decision {
             Decision::RequireApproval(req) => req,
             other => return Err(format!("expected RequireApproval, got {other:?}")),
@@ -2766,7 +3467,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         let req = match &doc.rules[0].decision {
             Decision::RequireApproval(req) => req,
             other => return Err(format!("expected RequireApproval, got {other:?}")),
@@ -2785,7 +3486,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         let req = match &doc.rules[0].decision {
             Decision::RequireApproval(req) => req,
             other => return Err(format!("expected RequireApproval, got {other:?}")),
@@ -2804,7 +3505,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("only valid")),
             "allow rule with reason should produce PolicyFileParseFailed, got {err:?}"
@@ -2819,7 +3520,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("ttl_secs")),
             "invalid ttl_secs should produce PolicyFileParseFailed, got {err:?}"
@@ -2839,7 +3540,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(
             doc.rules[0].criteria[0].kind(),
@@ -2859,7 +3560,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("max_count")),
             "out-of-u32-range max_count must be rejected with PolicyFileParseFailed, got {err:?}"
@@ -2877,7 +3578,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "bundle_aggregate_cap");
     }
@@ -2892,7 +3593,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria[0].kind(), "bundle_aggregate_cap");
     }
 
@@ -2907,7 +3608,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("max_amount")),
             "non-parseable max_amount must be rejected, got {err:?}"
@@ -2923,7 +3624,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { .. }),
             "negative max_amount must be rejected, got {err:?}"
@@ -2941,7 +3642,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(
             doc.rules[0].criteria[0].kind(),
@@ -2958,7 +3659,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("enabled")),
             "missing enabled field must be rejected mentioning 'enabled', got {err:?}"
@@ -2978,7 +3679,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "bundle_per_period_cap");
     }
@@ -2994,7 +3695,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("max_stroops")),
             "negative max_stroops must be rejected, got {err:?}"
@@ -3012,7 +3713,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("window")),
             "unsupported window must be rejected mentioning 'window', got {err:?}"
@@ -3030,7 +3731,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "bundle_per_tx_cap");
     }
@@ -3046,7 +3747,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("max_stroops")),
             "negative max_stroops must be rejected, got {err:?}"
@@ -3063,7 +3764,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "bundle_rate_limit");
     }
@@ -3079,7 +3780,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("window")),
             "unsupported window must be rejected mentioning 'window', got {err:?}"
@@ -3103,7 +3804,7 @@ decision = "deny"
         let toml = make_signed_toml(body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules.len(), 1);
         assert!(
             matches!(
@@ -3132,19 +3833,20 @@ decision = "require_approval"
     #[test]
     fn unsigned_validator_checks_the_body_and_ignores_the_previous_signature() {
         let unknown_key = format!("foo = 1\n{APPROVAL_BODY}");
-        let err = validate_unsigned_policy(&unknown_key, "alice").unwrap_err();
+        let err = validate_unsigned_policy(&unknown_key, "alice", TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail }
-                if detail.contains("`foo`")),
-            "an unknown top-level key must be named: {err:?}"
+                if detail == "unknown key; the policy file accepts version, scope, contract_transfer_max_fee_stroops, rules, \
+                              signature, owner_rotation"),
+            "an unknown top-level key is refused with the accepted keys: {err:?}"
         );
 
         let missing_criteria = APPROVAL_BODY.replace("criteria = []\n", "");
         let doc = DocumentMut::from_str(&missing_criteria).unwrap();
-        assert!(parse_policy_body(&doc, "alice").is_ok());
+        assert!(parse_policy_body(&doc, "alice", TESTNET_PASSPHRASE).is_ok());
         assert!(
             matches!(
-                validate_unsigned_policy(&missing_criteria, "alice"),
+                validate_unsigned_policy(&missing_criteria, "alice", TESTNET_PASSPHRASE),
                 Err(PolicyError::PolicyFileParseFailed { ref detail })
                     if detail == "rule missing required `criteria` key"
             ),
@@ -3155,7 +3857,7 @@ decision = "require_approval"
             "{APPROVAL_BODY}\n[signature]\nowner_id = \"GOLD\"\n\
              sig = \"stale\"\nnote = \"replace this table\"\n"
         );
-        assert!(validate_unsigned_policy(&stale_signature, "alice").is_ok());
+        assert!(validate_unsigned_policy(&stale_signature, "alice", TESTNET_PASSPHRASE).is_ok());
     }
 
     /// One `require_approval` rule carrying all three signed optional keys.
@@ -3190,9 +3892,18 @@ decision = "deny"
 
     /// Writes `toml` and loads it for profile `alice` under `pk`.
     fn load_alice(toml: &str, pk: &[u8; 32]) -> Result<PolicyDocument, PolicyError> {
+        load_alice_on(toml, pk, TESTNET_PASSPHRASE)
+    }
+
+    /// Loads `toml` for `alice` on the network of `network_passphrase`.
+    fn load_alice_on(
+        toml: &str,
+        pk: &[u8; 32],
+        network_passphrase: &str,
+    ) -> Result<PolicyDocument, PolicyError> {
         let dir = TempDir::new().unwrap();
         let path = write_policy(&dir, "alice.toml", toml);
-        load_signed_policy(&path, "alice", pk)
+        load_signed_policy(&path, "alice", pk, network_passphrase)
     }
 
     /// Asserts that `result` is an owner-signature failure for `alice`.
@@ -3326,8 +4037,8 @@ decision = "deny"
         assert_ne!(body, BODY_WITH_RULES);
         assert_parse_failure(
             load_signed_body_after(&body, |signed| signed),
-            "unknown key `default_decision`; the policy file accepts version, scope, rules, \
-             signature",
+            "unknown key; the policy file accepts version, scope, contract_transfer_max_fee_stroops, rules, \
+             signature, owner_rotation",
         );
     }
 
@@ -3337,7 +4048,7 @@ decision = "deny"
             load_signed_body_after(BODY_WITH_RULES, |signed| {
                 format!("{signed}algorithm = \"ed25519\"\n")
             }),
-            "signature: unknown key `algorithm`; the signature table accepts owner_id, sig",
+            "signature: unknown key; the signature table accepts owner_id, sig",
         );
     }
 
@@ -3349,7 +4060,7 @@ decision = "deny"
         );
         assert_parse_failure(
             load_signed_body_after(&body, |signed| signed),
-            "rule[1]: unknown key `ttl`; a rule accepts match, criteria, decision, reason, \
+            "rule[1]: unknown key; a rule accepts match, criteria, decision, reason, \
              ttl_secs, allow_opaque_signing",
         );
     }
@@ -3368,7 +4079,7 @@ decision = "deny"
         for body in [inline_match.as_str(), table_match] {
             assert_parse_failure(
                 load_signed_body_after(body, |signed| signed),
-                "rule[0].match: unknown key `network`; match accepts tool, chain",
+                "rule[0].match: unknown key; match accepts tool, chain",
             );
         }
     }
@@ -3383,7 +4094,7 @@ decision = "deny"
         ));
         assert_parse_failure(
             load_signed_body_after(&body, |signed| signed),
-            "rule[0].criteria[1]: unknown key `window`; a `per_tx_cap` criterion accepts kind, \
+            "rule[0].criteria[1]: unknown key; a `per_tx_cap` criterion accepts kind, \
              asset, max_stroops",
         );
     }
@@ -3395,7 +4106,7 @@ decision = "deny"
         let body = body_with_criterion(r#"{ kind = "quorum_satisfied", max_calls = 1 }"#);
         assert_parse_failure(
             load_signed_body_after(&body, |signed| signed),
-            "rule[0].criteria[0]: unknown key `max_calls`; a `quorum_satisfied` criterion \
+            "rule[0].criteria[0]: unknown key; a `quorum_satisfied` criterion \
              accepts kind",
         );
     }
@@ -3408,7 +4119,7 @@ decision = "deny"
                     chain = \"*\" }, criteria = [], decision = \"allow\", note = \"x\" }]\n";
         assert_parse_failure(
             load_signed_body_after(body, |signed| signed),
-            "rule[0]: unknown key `note`; a rule accepts match, criteria, decision, reason, \
+            "rule[0]: unknown key; a rule accepts match, criteria, decision, reason, \
              ttl_secs, allow_opaque_signing",
         );
     }
@@ -3427,23 +4138,27 @@ decision = "deny"
                 assert_ne!(edited, signed, "the edit must apply");
                 edited
             }),
-            "rule[0].criteria[0]: unknown key `foo`; a `per_tx_cap` criterion accepts kind, \
+            "rule[0].criteria[0]: unknown key; a `per_tx_cap` criterion accepts kind, \
              asset, max_stroops",
         );
     }
 
     /// Every key of every criterion key set loads in a valid criterion, so the
-    /// closed sets refuse no key the loader parses.
+    /// closed sets refuse no key the loader parses. A criterion or key of
+    /// version 2 loads in a version 2 document.
     #[test]
     fn every_key_of_each_criterion_key_set_loads() {
         let criteria = [
+            r#"{ kind = "asset_allowlist", assets = ["native"] }"#,
             r#"{ kind = "per_tx_cap", asset = "native", max_stroops = 100 }"#,
             r#"{ kind = "approval_above", asset = "native", max_stroops = 100 }"#,
             r#"{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 100 }"#,
             r#"{ kind = "rate_limit", window = "1h", max_calls = 5 }"#,
             concat!(
                 r#"{ kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], "#,
-                r#"allowlist = ["GAAAA"], gate_inflows = true }"#,
+                r#"allowlist = ["GAAAA"], gate_inflows = true, unlisted = { mode = "budget", "#,
+                r#"per_tx_stroops = 10, per_period_stroops = 20, asset = "native", "#,
+                r#"window = "1d" } }"#,
             ),
             r#"{ kind = "minimum_reserve", margin_stroops = 0 }"#,
             r#"{ kind = "inner_invocation_count_cap", max_count = 3 }"#,
@@ -3459,6 +4174,13 @@ decision = "deny"
             r#"{ kind = "home_domain_resolved" }"#,
             r#"{ kind = "sep10_session_active" }"#,
             r#"{ kind = "sep45_session_active" }"#,
+            r#"{ kind = "total_budget", asset = "native", max_stroops = 100 }"#,
+            r#"{ kind = "balance_floor", min_stroops = 0 }"#,
+            concat!(
+                r#"{ kind = "memo_binding", bindings = [{ destination = ""#,
+                "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+                r#"", kind = "id", value = "7" }] }"#,
+            ),
         ];
         assert_eq!(
             criteria.len(),
@@ -3477,7 +4199,20 @@ decision = "deny"
                 *keys,
                 "{kind}: the criterion must carry every key of its set"
             );
-            let loaded = load_signed_body_after(&body_with_criterion(criterion), |signed| signed);
+            let v2_only = matches!(
+                *kind,
+                "counterparty_allowlist" | "total_budget" | "balance_floor" | "memo_binding"
+            );
+            let body = if v2_only {
+                body_with_criterion(criterion).replacen(
+                    "version = 1\n",
+                    "version = 2\nsequence = 1\n",
+                    1,
+                )
+            } else {
+                body_with_criterion(criterion)
+            };
+            let loaded = load_signed_body_after(&body, |signed| signed);
             assert!(
                 loaded.is_ok(),
                 "{kind}: a criterion with every key must load: {:?}",
@@ -3501,7 +4236,7 @@ decision = "deny"
                 "rule[0].criteria[0]: `approval_above` requires decision = \"allow\"",
             );
             assert!(matches!(
-                validate_unsigned_policy(&body, "alice"),
+                validate_unsigned_policy(&body, "alice", TESTNET_PASSPHRASE),
                 Err(PolicyError::PolicyFileParseFailed { .. })
             ));
         }
@@ -3515,9 +4250,7 @@ decision = "deny"
             ));
             assert_parse_failure(
                 load_signed_body_after(&body, |signed| signed),
-                &format!(
-                    "rule[0].criteria[0]: `approval_above` `max_stroops` must be positive, got {threshold}"
-                ),
+                "rule[0].criteria[0]: `approval_above` `max_stroops` must be positive",
             );
         }
     }
@@ -3545,11 +4278,40 @@ decision = "deny"
                     assert_parse_failure(
                         result,
                         &format!(
-                            "rule[0].criteria[{criterion_idx}]: `approval_above` threshold {threshold} must be less than `per_tx_cap` bound 100"
+                            "rule[0].criteria[{criterion_idx}]: `approval_above` threshold must be less than the `per_tx_cap` bound"
                         ),
                     );
                 }
             }
+        }
+
+        // A classic asset and its Stellar Asset Contract address on the
+        // profile's network are one asset, in either order. On another
+        // network the contract address names a different asset.
+        const NATIVE_SAC_TESTNET: &str = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        const USDC_TESTNET: &str = "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+        const USDC_SAC_TESTNET: &str = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
+        for (threshold_asset, cap_asset) in [
+            ("native", NATIVE_SAC_TESTNET),
+            (NATIVE_SAC_TESTNET, "native"),
+            (USDC_TESTNET, USDC_SAC_TESTNET),
+            (USDC_SAC_TESTNET, USDC_TESTNET),
+        ] {
+            let body = body_with_criterion(&format!(
+                "{{ kind = \"approval_above\", asset = \"{threshold_asset}\", max_stroops = 500 }}, \
+                 {{ kind = \"per_tx_cap\", asset = \"{cap_asset}\", max_stroops = 400 }}"
+            ));
+            let (sk, pk) = make_keypair();
+            let signed = make_signed_toml(&body, &sk, "GABCDE");
+            assert_parse_failure(
+                load_alice_on(&signed, &pk, TESTNET_PASSPHRASE),
+                "rule[0].criteria[0]: `approval_above` threshold must be less than the `per_tx_cap` bound",
+            );
+            let mainnet = load_alice_on(&signed, &pk, MAINNET_PASSPHRASE);
+            assert!(
+                mainnet.is_ok(),
+                "{threshold_asset} and {cap_asset} on mainnet: {mainnet:?}"
+            );
         }
     }
 
@@ -3568,7 +4330,7 @@ decision = "deny"
             } else {
                 assert_parse_failure(
                     result,
-                    "rule[0].criteria[1]: `approval_above` threshold 5000000000 must be less than `per_tx_cap` bound 4000000000",
+                    "rule[0].criteria[1]: `approval_above` threshold must be less than the `per_tx_cap` bound",
                 );
             }
         }
@@ -3598,7 +4360,7 @@ decision = "deny"
             load_signed_body_after(&body, |signed| {
                 signed.replace("max_stroops = 100", "max_stroops = 100, extra = 1")
             }),
-            "rule[0].criteria[0]: unknown key `extra`; a `approval_above` criterion accepts kind, asset, max_stroops",
+            "rule[0].criteria[0]: unknown key; a `approval_above` criterion accepts kind, asset, max_stroops",
         );
     }
 
@@ -3609,7 +4371,7 @@ decision = "deny"
         for (kind, _) in crate::policy::v1::schema::CRITERION_KEY_SETS {
             let doc = DocumentMut::from_str(&format!("c = {{ kind = \"{kind}\" }}")).unwrap();
             if let Err(PolicyError::PolicyFileParseFailed { detail }) =
-                parse_criterion(&doc["c"], 0, 0)
+                parse_criterion(&doc["c"], 0, 0, 2)
             {
                 assert!(
                     !detail.contains("unknown criterion kind"),

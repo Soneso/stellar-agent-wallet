@@ -16,12 +16,35 @@ pub struct RecorderFixture {
     audit: Arc<Mutex<AuditWriter>>,
 }
 
+/// Installs the in-memory keyring once per test binary.
+///
+/// The window store keeps its key and generation in the keyring. One store for
+/// every test of the binary means a test running in parallel never finds the
+/// store replaced under it.
+pub fn install_keyring() {
+    static KEYRING: std::sync::Once = std::sync::Once::new();
+    KEYRING.call_once(|| stellar_agent_test_support::keyring_mock::install().unwrap());
+}
+
 impl RecorderFixture {
     pub fn new() -> Self {
+        install_keyring();
         let dir = tempfile::tempdir().unwrap();
-        let profile = Profile::builder_testnet("pool-test", "source", "pool-test", "nonce")
+        let mut profile = Profile::builder_testnet("pool-test", "source", "pool-test", "nonce")
             .audit_log_path(dir.path().join("audit.log"))
             .build();
+        // Each fixture keeps its window key and generation apart, so fixtures
+        // in parallel tests never share a generation.
+        let window_key = profile.policy_window_state_key_id.clone();
+        profile.policy_window_state_key_id =
+            stellar_agent_core::profile::schema::KeyringEntryRef::new(
+                window_key.service,
+                format!(
+                    "{}-{}",
+                    window_key.account,
+                    dir.path().file_name().unwrap().to_string_lossy()
+                ),
+            );
         let receipts = ReceiptStore::open_at(dir.path(), "pool-test").unwrap();
         let audit = Arc::new(Mutex::new(
             AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),

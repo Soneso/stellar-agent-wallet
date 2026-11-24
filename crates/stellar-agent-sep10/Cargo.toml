@@ -24,13 +24,21 @@ base64 = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
+# The mainnet message authorization: the receipt, the challenge check, the
+# authorization errors and the mainnet clock of the authorized signing path.
+stellar-agent-network = { workspace = true }
+# The network passphrase constants and the mainnet signing refusal detail.
+stellar-agent-core = { workspace = true }
 
 [dev-dependencies]
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-helpers"] }
 tokio = { workspace = true }
 serial_test = { workspace = true }
 wiremock = { workspace = true }
 
 [features]
+# Enables mainnet-write in core and network and compiles the authorized completion.
+mainnet-write = ["stellar-agent-core/mainnet-write", "stellar-agent-network/mainnet-write"]
 # Live network round-trip tests against the SDF testnet anchor. Implies the
 # test-helpers feature.
 testnet-integration = ["test-helpers"]

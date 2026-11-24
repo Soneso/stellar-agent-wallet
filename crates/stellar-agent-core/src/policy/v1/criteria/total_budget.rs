@@ -1,0 +1,275 @@
+//! Non-renewing total budget criterion.
+//!
+//! [`TotalBudgetCriterion`] bounds the debits of one asset over the whole life
+//! of a signed policy:
+//!
+//! ```toml
+//! { kind = "total_budget", asset = "native", max_stroops = "200000000" }
+//! ```
+//!
+//! The allocation never renews with time. Its epoch is the digest of the
+//! signed policy ([`EvalContext::policy_digest`]): entries count against the
+//! policy that sized them, regardless of their age, and a policy with a
+//! different signed digest starts another allocation at zero. Every spelling
+//! of one asset on the profile's network keys one allocation
+//! ([`total_budget_identity`]). The criterion is accepted in version 2
+//! documents and on `allow` rules only.
+//!
+//! An engine built outside the verified loader carries an all-zero digest.
+//! Every evaluation, sizing, and recording under a rule with this criterion
+//! then fails with [`PolicyError::CriterionEvaluationFailed`], so no
+//! allocation accrues under an unidentified epoch.
+
+use crate::policy::v1::EvalContext;
+use crate::policy::v1::asset_equivalence::{assets_equivalent, total_budget_identity};
+use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
+use crate::policy::v1::criteria::Criterion;
+use crate::policy::v1::criteria::descriptor::{BucketDescriptor, BucketKind};
+use crate::policy::v1::criteria::per_tx_cap::{AssetDebitSum, checked_asset_debit_sum};
+use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
+use crate::policy::v1::value::{ValueClass, asset_normalise};
+use crate::policy::{DenyReason, PolicyError};
+
+/// The scope specificity of every total-budget bucket.
+pub const TOTAL_BUDGET_SCOPE_SPECIFICITY: u8 = 1;
+
+/// Refuses a call that would exceed the policy's total allocation of an asset.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::v1::criteria::Criterion;
+/// use stellar_agent_core::policy::v1::criteria::total_budget::TotalBudgetCriterion;
+///
+/// let criterion = TotalBudgetCriterion::new("native".into(), 200_000_000);
+/// assert_eq!(criterion.kind(), "total_budget");
+/// assert_eq!(criterion.max_stroops(), 200_000_000);
+/// ```
+#[derive(Debug, Clone)]
+pub struct TotalBudgetCriterion {
+    asset: String,
+    max_stroops: i128,
+}
+
+impl TotalBudgetCriterion {
+    /// Constructs a total allocation of `max_stroops` in `asset`.
+    #[must_use]
+    pub fn new(asset: String, max_stroops: i128) -> Self {
+        Self { asset, max_stroops }
+    }
+
+    /// Returns the configured asset identifier.
+    #[must_use]
+    pub fn asset(&self) -> &str {
+        &self.asset
+    }
+
+    /// Returns the total allocation in stroops.
+    #[must_use]
+    pub fn max_stroops(&self) -> i128 {
+        self.max_stroops
+    }
+
+    /// The bucket of this asset's allocation on the network of `ctx`. Every
+    /// spelling of one asset names the same bucket. Its window is zero: the
+    /// bucket never ages out.
+    fn state_key(&self, ctx: &EvalContext<'_>) -> StateKey {
+        StateKey::new(
+            ctx.profile_name,
+            TOTAL_BUDGET_SCOPE_SPECIFICITY,
+            &format!(
+                "total:{}",
+                total_budget_identity(&self.asset, &ctx.profile.network_passphrase)
+            ),
+            0,
+        )
+    }
+
+    fn window_limit(&self) -> WindowLimit {
+        WindowLimit::Total {
+            asset: self.asset.clone(),
+            max_stroops: self.max_stroops,
+        }
+    }
+}
+
+/// Returns the policy digest of `ctx`, refusing an all-zero digest.
+fn epoch(ctx: &EvalContext<'_>) -> Result<[u8; 32], PolicyError> {
+    if ctx.policy_digest == [0; 32] {
+        return Err(PolicyError::CriterionEvaluationFailed {
+            detail: "total_budget requires a verified policy digest".to_owned(),
+        });
+    }
+    Ok(ctx.policy_digest)
+}
+
+impl Criterion for TotalBudgetCriterion {
+    fn kind(&self) -> &'static str {
+        "total_budget"
+    }
+
+    fn descriptors(&self) -> Vec<BucketDescriptor> {
+        vec![BucketDescriptor::accumulating(
+            BucketKind::Total,
+            &self.asset,
+            self.max_stroops,
+            &StateKey::new(
+                "",
+                TOTAL_BUDGET_SCOPE_SPECIFICITY,
+                &format!("total:{}", self.asset),
+                0,
+            ),
+        )]
+    }
+
+    fn windowed(&self) -> bool {
+        true
+    }
+
+    fn records_bundle_inners(&self) -> bool {
+        true
+    }
+
+    /// Refuses with [`DenyReason::TotalBudgetExhausted`] when the call's debit
+    /// in the configured asset, added to the allocation already used in this
+    /// policy's epoch and to the earlier inners of a bundle, exceeds
+    /// `max_stroops`. Equality passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] for an all-zero
+    /// policy digest, whatever the call, an unresolvable debit, a
+    /// state-store failure other than an overflowing amount sum.
+    fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
+        let epoch = epoch(ctx)?;
+        let exhausted = || DenyReason::TotalBudgetExhausted {
+            asset: self.asset.clone(),
+            max_stroops: self.max_stroops,
+            remaining_stroops: 0,
+        };
+        let attempted = match checked_asset_debit_sum(ctx, &self.asset, self.kind(), &exhausted())?
+        {
+            AssetDebitSum::NotApplicable => return Ok(None),
+            // An overflowing attempt still reports the allocation left by existing use.
+            AssetDebitSum::Deny(DenyReason::TotalBudgetExhausted { .. }) => None,
+            AssetDebitSum::Deny(reason) => return Ok(Some(reason)),
+            AssetDebitSum::Amount(sum) => Some(sum),
+        };
+        let state_key = self.state_key(ctx);
+        let recorded = match ctx.state_store.query_epoch(&state_key, epoch) {
+            Ok((amount, _)) => amount,
+            Err(super::state_store::StateStoreError::SumOverflow) => return Ok(Some(exhausted())),
+            Err(e) => {
+                return Err(PolicyError::CriterionEvaluationFailed {
+                    detail: format!("total_budget: state store error: {e}"),
+                });
+            }
+        };
+        let Some(used) = ctx
+            .bundle
+            .map(|view| view.overlay.checked_get(&state_key))
+            .unwrap_or(Some(0))
+            .and_then(|overlay| recorded.checked_add(overlay))
+        else {
+            return Ok(Some(exhausted()));
+        };
+        if attempted
+            .and_then(|amount| used.checked_add(amount))
+            .is_none_or(|sum| sum > self.max_stroops)
+        {
+            return Ok(Some(DenyReason::TotalBudgetExhausted {
+                asset: self.asset.clone(),
+                max_stroops: self.max_stroops,
+                remaining_stroops: self.max_stroops.saturating_sub(used).max(0),
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Accumulates an inner transfer in the configured asset into the bundle
+    /// overlay, under the key the evaluation reads.
+    fn accumulate_overlay(
+        &self,
+        ctx: &EvalContext<'_>,
+        inner: &InnerOpDescriptor,
+        overlay: &mut BundleStateOverlay,
+    ) {
+        let InnerOpDescriptor::TokenTransfer { asset, amount, .. } = inner else {
+            return;
+        };
+        if !assets_equivalent(
+            &asset_normalise(asset),
+            &asset_normalise(&self.asset),
+            &ctx.profile.network_passphrase,
+        ) {
+            return;
+        }
+        overlay.accumulate(self.state_key(ctx), *amount);
+    }
+
+    /// Records the confirmed debit against this policy's epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] under an all-zero
+    /// policy digest, whatever the call, or on a state-store failure. The
+    /// debit is dated at the evaluation instant `ctx.now_ms`.
+    fn record_confirmed(&self, ctx: &EvalContext<'_>) -> Result<Vec<WindowEntry>, PolicyError> {
+        let epoch = epoch(ctx)?;
+        let now_ms = ctx.now_ms;
+        let entry = self.size(ctx, now_ms)?;
+        if let Some(entry) = &entry {
+            ctx.state_store
+                .append_epoch(entry.key(), entry.timestamp_ms(), entry.amount(), epoch)
+                .map_err(|error| PolicyError::CriterionEvaluationFailed {
+                    detail: format!("total_budget: record_confirmed state store error: {error}"),
+                })?;
+        }
+        Ok(entry.into_iter().collect())
+    }
+
+    /// Sizes the call's debit in the configured asset as an entry whose epoch
+    /// is the policy digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] under an all-zero
+    /// policy digest, whatever the call, and when the matching legs overflow
+    /// their sum.
+    fn size(&self, ctx: &EvalContext<'_>, now_ms: u64) -> Result<Option<WindowEntry>, PolicyError> {
+        let epoch = epoch(ctx)?;
+        let ValueClass::Value(effects) = &ctx.value else {
+            return Ok(None);
+        };
+        let criterion_asset = asset_normalise(&self.asset);
+        let mut matched = false;
+        let mut sum: i128 = 0;
+        for leg in effects.legs() {
+            if !leg.kind.carries_debit() {
+                continue;
+            }
+            let Some(leg_asset) = leg.asset.as_deref() else {
+                continue;
+            };
+            if !assets_equivalent(leg_asset, &criterion_asset, &ctx.profile.network_passphrase) {
+                continue;
+            }
+            let Some(amount) = leg.amount else {
+                continue;
+            };
+            matched = true;
+            sum =
+                sum.checked_add(amount)
+                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                        detail: "total_budget: sum overflows".to_owned(),
+                    })?;
+        }
+        if !matched {
+            return Ok(None);
+        }
+        Ok(Some(
+            WindowEntry::new(self.state_key(ctx), now_ms, sum, self.window_limit())
+                .with_epoch(Some(epoch)),
+        ))
+    }
+}

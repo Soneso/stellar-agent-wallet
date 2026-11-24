@@ -200,9 +200,9 @@ fn sep7_error_to_wire(err: &stellar_agent_sep7::Sep7Error) -> (&'static str, Str
     use stellar_agent_sep7::Sep7Error;
     match err {
         Sep7Error::MalformedUri { detail } => ("sep7.malformed_uri", detail.clone()),
-        Sep7Error::UnknownOperation { operation } => (
+        Sep7Error::UnknownOperation => (
             "sep7.unknown_operation",
-            format!("unknown operation: {operation:?}"),
+            "unknown operation; expected 'tx' or 'pay'".to_owned(),
         ),
         Sep7Error::MissingRequiredParam { param } => (
             "sep7.missing_required_param",
@@ -278,7 +278,12 @@ mod tests {
     use super::*;
     use stellar_agent_core::profile::schema::Profile;
 
+    /// A Noop-engine testnet server over a fresh mock keyring store.
+    ///
+    /// Construction reads the keyring and registers the platform store when
+    /// none is registered, so every caller holds the `keyring` serial key.
     fn make_server() -> crate::server::WalletServer {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         crate::server::WalletServer::new(
             Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
                 .with_noop_engine()
@@ -290,7 +295,12 @@ mod tests {
     /// A well-formed `pay` URI with no `origin_domain` parses successfully
     /// under the documented `{ ok: true, data: {...}, request_id }` envelope.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn valid_pay_uri_parses_under_normalised_envelope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_server();
         let args = Sep7ParseUriArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -326,7 +336,12 @@ mod tests {
     /// A malformed `web+stellar:` URI is a business refusal
     /// (`sep7.malformed_uri`), not a JSON-RPC protocol error.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn malformed_uri_is_business_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_server();
         let args = Sep7ParseUriArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -341,10 +356,45 @@ mod tests {
         assert_eq!(code, "sep7.malformed_uri");
     }
 
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn appended_parameter_after_signature_is_business_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let server = make_server();
+        let args = Sep7ParseUriArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            // `127.0.0.1` fails origin_domain validation, so this test never reaches the network.
+            uri: "web+stellar:pay?destination=\
+                  GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO\
+                  &origin_domain=127.0.0.1&signature=SIG&amount=5000"
+                .to_owned(),
+            verify_origin: true,
+        };
+        let result = server
+            .invoke_stellar_sep7_parse_uri(args)
+            .await
+            .expect("signature ordering must surface as a business-error envelope");
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "sep7.invalid_param_value");
+        assert_eq!(
+            message,
+            "invalid 'signature': signature must be the last parameter"
+        );
+        assert!(!text.contains("origin_verified"));
+    }
+
     /// An unsupported operation in the URI path is `sep7.unknown_operation`,
     /// not a JSON-RPC protocol error.
     #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn unknown_operation_is_business_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_server();
         let args = Sep7ParseUriArgs {
             chain_id: "stellar:testnet".to_owned(),
@@ -357,5 +407,81 @@ mod tests {
             .expect("an unknown operation must surface as a business-error envelope, not Err");
         let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
         assert_eq!(code, "sep7.unknown_operation");
+    }
+
+    /// The refusal of an unknown operation, a duplicate parameter name and an
+    /// unknown memo_type names the rule and the accepted values, and the
+    /// result repeats no text of the URI.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn sep7_parse_uri_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let server = make_server();
+        let destination = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let cases = [
+            (
+                format!(
+                    "web+stellar:pay?destination={destination}&origin_domain={CREDENTIAL_MARKER}"
+                ),
+                "sep7.invalid_origin_domain",
+                "must be a lowercase RFC 1035 LDH FQDN with at least two labels; IP addresses and numeric-only labels are not allowed",
+            ),
+            (
+                format!("web+stellar:{CREDENTIAL_MARKER}?foo=bar"),
+                "sep7.unknown_operation",
+                "unknown operation; expected 'tx' or 'pay'",
+            ),
+            (
+                format!(
+                    "web+stellar:pay?destination={destination}&{CREDENTIAL_MARKER}=1&\
+                     {CREDENTIAL_MARKER}=2"
+                ),
+                "sep7.invalid_param_value",
+                "invalid 'query': a parameter name appears more than once",
+            ),
+            (
+                format!(
+                    "web+stellar:pay?destination={destination}&memo=1&memo_type={CREDENTIAL_MARKER}"
+                ),
+                "sep7.invalid_param_value",
+                "invalid 'memo_type': must be one of MEMO_TEXT, MEMO_ID, MEMO_HASH, MEMO_RETURN",
+            ),
+        ];
+        for (uri, expected_code, expected_message) in cases {
+            let result = server
+                .invoke_stellar_sep7_parse_uri(Sep7ParseUriArgs {
+                    chain_id: "stellar:testnet".to_owned(),
+                    uri,
+                    verify_origin: false,
+                })
+                .await
+                .expect("a refused URI is a business-error envelope");
+            let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(code, expected_code);
+            assert_eq!(message, expected_message);
+            assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
+        }
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+            &capture.captured_str(),
+            "CREDMARKER7",
+        );
     }
 }

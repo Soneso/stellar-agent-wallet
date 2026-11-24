@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Offline regression checks for check-gate-tool-versions.sh. In the fixture,
-# coverage.yml holds the reference pin of cargo-llvm-cov, and ci.yml holds
-# those of cargo-machete and cargo-deny.
+# coverage.yml holds the two reference pins of cargo-llvm-cov, one for each
+# measurement job, and ci.yml holds those of cargo-machete and cargo-deny.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -29,7 +29,12 @@ jobs:
 EOF
   cat >"$dir/.github/workflows/coverage.yml" <<'EOF'
 jobs:
-  coverage:
+  coverage-off:
+    steps:
+      - uses: taiki-e/install-action@pinned
+        with:
+          tool: cargo-llvm-cov@0.8.7
+  coverage-on:
     steps:
       - uses: taiki-e/install-action@pinned
         with:
@@ -180,7 +185,7 @@ if grep -q "version mismatch" "$TMP/missing-ci.out"; then
   exit 1
 fi
 
-# The cargo-llvm-cov pin removed from coverage.yml fails the same way, naming
+# The cargo-llvm-cov pins removed from coverage.yml fail the same way, naming
 # coverage.yml as the reference workflow. The check still reads the other
 # files: it reports a stray line in release.yml and compares no version.
 make_fixture "$TMP/missing-coverage"
@@ -201,6 +206,43 @@ make_fixture "$TMP/duplicate-ci"
 printf '  extra:\n    steps:\n      - uses: taiki-e/install-action@pinned\n        with:\n          tool: cargo-deny@0.19.9\n' \
   >>"$TMP/duplicate-ci/.github/workflows/ci.yml"
 expect_fail "$TMP/duplicate-ci" "2 'tool: cargo-deny@<version>' pins found"
+
+# The second coverage.yml pin at another version fails with exactly one
+# mismatch that names both coverage.yml lines.
+REPEAT_MISMATCH="error: cargo-llvm-cov version mismatch:
+  .github/workflows/coverage.yml:6 pins 0.8.7
+  .github/workflows/coverage.yml:11 pins 0.8.6"
+make_fixture "$TMP/coverage-repeat-mismatch"
+sed -i.bak '11s/cargo-llvm-cov@0.8.7/cargo-llvm-cov@0.8.6/' \
+  "$TMP/coverage-repeat-mismatch/.github/workflows/coverage.yml"
+require_text "$TMP/coverage-repeat-mismatch/.github/workflows/coverage.yml" "tool: cargo-llvm-cov@0.8.6"
+expect_exact_fail "$TMP/coverage-repeat-mismatch" "$REPEAT_MISMATCH"
+
+# The mutation accept-any-repeated-pin skips the further reference pins. The
+# mutant passes the differing repeat, and the restored check fails it again.
+make_fixture "$TMP/accept-any-repeated-pin"
+sed -i.bak '11s/cargo-llvm-cov@0.8.7/cargo-llvm-cov@0.8.6/' \
+  "$TMP/accept-any-repeated-pin/.github/workflows/coverage.yml"
+# shellcheck disable=SC2016 # The sed program matches the literal $PINS of the script.
+sed -i.bak 's#^    done < <(printf '"'"'%s\\n'"'"' "\$PINS" | sed 1d)$#    done </dev/null#' \
+  "$TMP/accept-any-repeated-pin/$SCRIPT_REL"
+require_text "$TMP/accept-any-repeated-pin/$SCRIPT_REL" "    done </dev/null"
+bash -n "$TMP/accept-any-repeated-pin/$SCRIPT_REL"
+expect_pass "$TMP/accept-any-repeated-pin"
+cp "$ROOT/$SCRIPT_REL" "$TMP/accept-any-repeated-pin/$SCRIPT_REL"
+expect_exact_fail "$TMP/accept-any-repeated-pin" "$REPEAT_MISMATCH"
+
+# One coverage.yml pin fails, as coverage.yml pins once for each measurement job.
+make_fixture "$TMP/coverage-single-pin"
+sed -i.bak '7,$d' "$TMP/coverage-single-pin/.github/workflows/coverage.yml"
+expect_exact_fail "$TMP/coverage-single-pin" \
+  "error: 1 'tool: cargo-llvm-cov@<version>' pin found in .github/workflows/coverage.yml, expected two"
+
+# A third coverage.yml pin fails, even at the documented version.
+make_fixture "$TMP/coverage-third-pin"
+printf '  coverage-extra:\n    steps:\n      - uses: taiki-e/install-action@pinned\n        with:\n          tool: cargo-llvm-cov@0.8.7\n' \
+  >>"$TMP/coverage-third-pin/.github/workflows/coverage.yml"
+expect_fail "$TMP/coverage-third-pin" "3 'tool: cargo-llvm-cov@<version>' pins found"
 
 # A second install line for the same tool in building.md fails the same way.
 make_fixture "$TMP/duplicate-doc"

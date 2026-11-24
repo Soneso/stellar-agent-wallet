@@ -768,7 +768,7 @@ fn resolve_env_filter_from_invalid_stellar_agent_log_and_rust_log_errors() {
     // Both invalid: surface the primary error.
     let err = resolve_env_filter_from(Some(INVALID_FILTER), Some(INVALID_FILTER));
     assert!(
-        matches!(err, Err(InitError::Filter(_))),
+        matches!(err, Err(InitError::Filter)),
         "expected InitError::Filter, got {err:?}"
     );
 }
@@ -2146,7 +2146,7 @@ fn subscriber_config_with_filter_override_none_clears_it() {
 fn resolve_env_filter_from_invalid_stellar_agent_log_no_rust_log_errors() {
     let err = resolve_env_filter_from(Some("=INFO"), None);
     assert!(
-        matches!(err, Err(InitError::Filter(_))),
+        matches!(err, Err(InitError::Filter)),
         "must return InitError::Filter when primary is invalid and rust_log is None: {err:?}"
     );
 }
@@ -2326,4 +2326,87 @@ fn resolved_filter_keeps_raw_transport_logging_off() {
             );
         }
     }
+}
+
+/// The strict harness drops the raw transport prefix the wallet's subscriber keeps off.
+#[test]
+fn strict_harness_raw_transport_prefix_matches_wallet() {
+    assert_eq!(
+        RAW_TRANSPORT_LOG_TARGET,
+        stellar_agent_test_support::RAW_TRANSPORT_LOG_TARGET
+    );
+}
+
+/// A byte sink shared between a subscriber and the test that reads it.
+#[derive(Clone, Default)]
+struct SharedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The rmcp events that quote a client's message stay out of the log at the
+/// most verbose operator directive, and the other events of those targets and
+/// of rmcp's other targets stay in.
+#[test]
+fn held_rmcp_events_stay_out_at_the_most_verbose_directive() {
+    let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+    for directive in [
+        "trace",
+        "rmcp=trace",
+        "trace,rmcp::service::server=trace,rmcp::transport::async_rw=trace",
+    ] {
+        let log = SharedLog::default();
+        let sink = log.clone();
+        let subscriber = build_subscriber(
+            Some(EnvFilter::new(directive)),
+            Some(FormatChoice::Json),
+            Some(Box::new(move || Box::new(sink.clone()))),
+            false,
+        )
+        .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            tracing::warn!(target: "rmcp::service::server", client_requested = "credmarker7");
+            tracing::debug!(target: "rmcp::transport::async_rw", "frame credmarker7");
+            tracing::error!(target: "rmcp::service::server", "server error kept");
+            tracing::info!(target: "rmcp::transport::async_rw", "codec info kept");
+            tracing::warn!(target: "rmcp::service::client", "other target kept");
+            let frame = "credmarker7";
+            tracing::info!(target: "rmcp::service", peer_info = frame, "initialized");
+            tracing::trace!(target: "rmcp::service", evt = frame, "new event");
+            tracing::debug!(target: "rmcp::service", request = frame, "received request");
+            tracing::info!(target: "rmcp::service", notification = frame, "notification");
+            tracing::info!(target: "rmcp::service", "session event kept");
+        });
+        tracing::callsite::rebuild_interest_cache();
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(!text.contains("credmarker7"), "{directive}: {text}");
+        for kept in [
+            "server error kept",
+            "codec info kept",
+            "other target kept",
+            "session event kept",
+        ] {
+            assert!(text.contains(kept), "{directive}: {text}");
+        }
+    }
+}
+
+#[test]
+fn rejected_input_filter_helper_has_fixed_diagnostics() {
+    let error = resolve_env_filter_from(Some("=CREDMARKER7"), None).unwrap_err();
+    assert!(matches!(error, InitError::Filter));
+    assert_eq!(
+        error.to_string(),
+        "STELLAR_AGENT_LOG must be a valid log-filter expression"
+    );
+    assert_eq!(format!("{error:?}"), "Filter");
+    assert!(std::error::Error::source(&error).is_none());
 }

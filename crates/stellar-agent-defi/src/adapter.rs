@@ -134,23 +134,21 @@ impl DefiPreview {
 ///
 /// Carries the structural context required by protocol adapters: active profile
 /// name, the resolved `DefiContractPin` for the verb, primary RPC accessor, and
-/// the submit-time context (signer, network passphrase, chain ID, optional
-/// secondary RPC, timeout).
+/// the submission context, including its signer, network, witness endpoint,
+/// timeout, and checked recorder.
 ///
 /// `#[non_exhaustive]` so further fields grow additively without breaking
 /// the trait signature.
 ///
 /// # Submit context fields
 ///
-/// The `signer`, `network_passphrase`, `chain_id`, `secondary_rpc`, and
-/// `timeout` fields carry everything a concrete adapter's `submit` needs to
-/// call `submit_signed_invoke` without re-implementing that logic in the MCP
-/// tool or CLI.  The secondary RPC is threaded here rather than via a separate
-/// site because it is structurally part of the adapter's submit context.
+/// The signer, network passphrase, chain identifier, secondary endpoint,
+/// timeout, and submission recorder supply the shared signing flow.
+/// The recorder provides checked admission before any signature.
 ///
-/// Fields are `Option<...>` where the value is genuinely optional for
-/// preview-only calls (no signer needed for preview).  `submit` returns a
-/// `DefiAdapterError::InvalidArguments` when required fields are `None`.
+/// Preview calls can omit submission fields. A missing recorder refuses with
+/// [`DefiAdapterError::SigningRefusal`] before network access. Other missing
+/// required fields return [`DefiAdapterError::InvalidArguments`].
 ///
 /// # `auth_rule_ids`
 ///
@@ -190,9 +188,10 @@ pub struct DefiAdapterCtx<'a> {
     pub chain_id: Option<&'a str>,
     /// Optional secondary Stellar RPC for the two-RPC cross-check.
     ///
-    /// When `None`, the primary RPC is used for both sides of any two-RPC
-    /// check (degraded security).  Configuring a distinct secondary is
-    /// strongly recommended for mainnet operations.
+    /// A read with `None` uses the primary RPC for both sides of a two-RPC
+    /// check. A smart-account submit requires a secondary on a host other than
+    /// the primary's and refuses with [`DefiAdapterError::SigningRefusal`]
+    /// otherwise.
     pub secondary_rpc: Option<&'a StellarRpcClient>,
     /// Submit polling timeout.
     ///
@@ -209,20 +208,24 @@ pub struct DefiAdapterCtx<'a> {
     ///
     /// `None` delegates the default count decision to the concrete adapter.
     pub auth_rule_ids: Option<&'a [ContextRuleId]>,
-    /// Audit writer for the value-action row emitted after a confirmed submit.
+    /// Audit writer for the `sa_raw_invocation` row a failed submit writes.
     ///
-    /// `None` for preview-only calls and any caller that does not record value
-    /// rows. When `Some`, the adapter emits a `ValueActionSubmitted` row in the
-    /// submit Ok arm; the writer MUST have been opened with the profile's audit
-    /// chain-root HMAC key so `audit verify` covers the row.
+    /// `None` for preview-only calls and any caller that does not record
+    /// audit rows. A confirmed submit writes no row, because the recorder owns
+    /// the submission's rows. The writer MUST have been opened with the
+    /// profile's audit chain-root HMAC key so `audit verify` covers the row.
     pub audit_writer:
         Option<std::sync::Arc<std::sync::Mutex<stellar_agent_core::audit_log::AuditWriter>>>,
-    /// Gate-derived value legs recorded in the value-action row — the same
-    /// descriptor the policy gate sized (single-derivation invariant). Emission
-    /// is skipped when `None`.
+    /// Gate-derived value legs: the same descriptor the policy gate sized
+    /// (single-derivation invariant).
+    ///
+    /// No adapter reads this field. The submission recorder carries the legs
+    /// of the rows it writes.
     pub audit_legs: Option<&'a [stellar_agent_core::audit_log::ValueLegRecord]>,
-    /// MCP/CLI tool identity for the audit row's outer `tool` field (e.g.
-    /// `"stellar_blend_lend"`). Emission is skipped when `None`.
+    /// MCP/CLI tool identity of the action (e.g. `"stellar_blend_lend"`).
+    ///
+    /// No adapter reads this field. The submission recorder carries the tool
+    /// identity of the rows it writes.
     pub audit_tool: Option<&'a str>,
     /// Confirmed-sequence floor hook, threaded through to
     /// `SubmitInvokeArgs::sequence_floor` at the adapter's `submit_signed_invoke`
@@ -237,15 +240,11 @@ pub struct DefiAdapterCtx<'a> {
     /// `stellar_agent_mcp::sequence_floor`'s CLI-out-of-scope-by-design
     /// discipline for the classic commit verbs.
     pub sequence_floor: Option<&'a dyn stellar_agent_network::SequenceFloorHook>,
-    /// Durable-submission recorder, threaded through to
-    /// `SubmitInvokeArgs::submission_recorder` at the adapter's
-    /// `submit_signed_invoke` call site.
+    /// Checked admission and durable submission recorder for smart-account signing.
     ///
-    /// When `Some`, the recorder owns the value-action rows and the
-    /// spending-window reservation for this submission: it writes the pending
-    /// row before the send and the submitted or failed row after, so
-    /// [`Self::emit_value_action_submitted`] stands down. `None` leaves the
-    /// unrecorded behaviour, where the confirmed row is emitted here.
+    /// Adapters pass this recorder through `SubmitInvokeArgs::admission`.
+    /// A missing recorder refuses before signing with `submission.intent_record_unavailable`.
+    /// The recorder owns value-action rows and the retained intent charge.
     pub submission_recorder: Option<&'a dyn stellar_agent_network::SubmissionRecorder>,
 }
 
@@ -349,65 +348,6 @@ impl<'a> DefiAdapterCtx<'a> {
             audit_tool: None,
             sequence_floor: None,
             submission_recorder: None,
-        }
-    }
-
-    /// Emits a `ValueActionSubmitted` audit row for a confirmed DeFi submit.
-    ///
-    /// No-op unless an audit writer, gate-derived legs, tool identity, and
-    /// chain id were all threaded into this context. Non-fatal: the submit has
-    /// already confirmed, so a row-write failure logs a warning and does not
-    /// affect the caller. `tx_hash_redacted` MUST already be redacted.
-    pub fn emit_value_action_submitted(
-        &self,
-        tx_hash_redacted: &str,
-        ledger: u32,
-        request_id: &str,
-    ) {
-        // The recorder writes this row itself, from the same gate-sized legs,
-        // alongside the pending row it wrote before the send. One row, not
-        // two.
-        if self.submission_recorder.is_some() {
-            return;
-        }
-
-        let (Some(writer), Some(legs), Some(tool), Some(chain_id)) = (
-            self.audit_writer.as_ref(),
-            self.audit_legs,
-            self.audit_tool,
-            self.chain_id,
-        ) else {
-            return;
-        };
-
-        let entry = stellar_agent_core::audit_log::AuditEntry::new_value_action_submitted(
-            tool,
-            chain_id,
-            legs.to_vec(),
-            tx_hash_redacted,
-            ledger,
-            stellar_agent_core::audit_log::PolicyDecision::Allow,
-            None,
-            None,
-            None,
-            request_id,
-            None,
-        );
-
-        match writer.lock() {
-            Ok(mut guard) => {
-                if let Err(e) = guard.write_entry(entry) {
-                    tracing::warn!(
-                        error = %e,
-                        "defi value audit: write_entry failed; ValueActionSubmitted NOT emitted"
-                    );
-                }
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "defi value audit: writer mutex poisoned; ValueActionSubmitted NOT emitted"
-                );
-            }
         }
     }
 }
@@ -542,6 +482,17 @@ pub enum DefiAdapterError {
         /// The typed denial, as the governing criterion produced it.
         reason: Box<stellar_agent_core::policy::DenyReason>,
     },
+    /// The signing or binding path refuses without sending a transaction.
+    ///
+    /// The surface preserves its stable `wire_code`. An authorization signature
+    /// can already exist, so an exposed intent keeps its charge.
+    #[error("{message}")]
+    SigningRefusal {
+        /// The stable wire code of the refusal.
+        wire_code: &'static str,
+        /// Operator-facing message; it carries no endpoint input.
+        message: String,
+    },
     /// A write declared for mainnet, aimed at a mainnet-pattern endpoint, or
     /// sent to an endpoint that reports the mainnet passphrase was refused. No
     /// transaction was sent. The first two are refused before any signing call;
@@ -550,7 +501,7 @@ pub enum DefiAdapterError {
     /// Distinct from [`Self::Network`]: the refusal is structural, not a
     /// failure. The surface reports `network.mainnet_write_forbidden`, the one
     /// code every mainnet refusal carries.
-    #[error("mainnet writes are structurally refused in this alpha")]
+    #[error("this mainnet write is structurally refused")]
     MainnetWriteForbidden,
 }
 

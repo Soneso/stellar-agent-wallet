@@ -37,6 +37,7 @@ pub use stellar_agent_core::BASE_RESERVE_STROOPS;
 use stellar_agent_core::amount::StellarAmount;
 use stellar_agent_core::error::{NetworkError, ProtocolError, ValidationError, WalletError};
 pub(crate) use stellar_agent_core::observability::redact_strkey_first5_last5 as redact_account_id;
+use stellar_agent_core::policy::v1::ObservedAccount;
 use stellar_rpc_client::Error as RpcError;
 use stellar_xdr::{
     AccountEntry, AccountId, LedgerEntryData, LedgerKey, LedgerKeyAccount, LedgerKeyData,
@@ -142,6 +143,11 @@ pub struct AccountView {
     /// disclosure check; `auth_revocable` is informational only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_flags: Option<AccountFlagsView>,
+
+    /// The credit assets whose trustlines the read requested, listed or not.
+    /// An asset here without an entry in `balances` has no trustline.
+    #[serde(skip)]
+    pub(crate) requested_trustlines: Vec<AssetView>,
 }
 
 /// A typed projection of `AccountEntry.flags` into named boolean fields.
@@ -251,6 +257,7 @@ impl AccountView {
             signers,
             home_domain,
             account_flags,
+            requested_trustlines: Vec::new(),
         }
     }
 
@@ -432,27 +439,41 @@ impl BalanceView {
         // balance string).
         if stroops < 0 {
             return Err(WalletError::Validation(ValidationError::AmountOutOfRange {
-                amount: format!(
-                    "BalanceView::balance_stroops: negative stroop value ({stroops}) for '{}'",
-                    self.balance
-                ),
+                field: "the negative account balance the RPC reported".into(),
             }));
         }
         Ok(stroops)
     }
 }
 
+/// Stellar asset kind for a balance entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetType {
+    /// Native XLM.
+    Native,
+    /// Credit asset whose code has 1 to 4 characters.
+    CreditAlphanum4,
+    /// Credit asset whose code has 5 to 12 characters.
+    CreditAlphanum12,
+}
+
 /// Asset identifier for a balance entry.
 ///
-/// `"native"` for XLM. Non-native assets carry `code` and `issuer`.
+/// Native XLM uses [`AssetType::Native`] and omits `code` and `issuer`.
+/// Credit assets set `asset_type` by code length and carry `code` and `issuer`.
 #[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetView {
-    /// `"native"` for XLM; the alphanumeric asset code otherwise (e.g. `"USDC"`).
-    pub asset_type: String,
+    /// Asset kind: `native`, `credit_alphanum4`, or `credit_alphanum12`.
+    pub asset_type: AssetType,
+
+    /// `None` for native XLM; the alphanumeric asset code otherwise (e.g. `"USDC"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 
     /// `None` for native XLM; the issuer G-strkey otherwise.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issuer: Option<String>,
 }
 
@@ -461,20 +482,31 @@ impl AssetView {
     #[must_use]
     pub fn native() -> Self {
         Self {
-            asset_type: "native".to_owned(),
+            asset_type: AssetType::Native,
+            code: None,
             issuer: None,
         }
     }
 
     /// Constructs a non-native asset view.
     ///
+    /// Selects [`AssetType::CreditAlphanum4`] for codes up to 4 bytes and
+    /// [`AssetType::CreditAlphanum12`] for longer codes.
+    ///
     /// # Panics
     ///
     /// Never panics.
     #[must_use]
     pub fn credit(code: impl Into<String>, issuer: impl Into<String>) -> Self {
+        let code = code.into();
+        let asset_type = if code.len() <= 4 {
+            AssetType::CreditAlphanum4
+        } else {
+            AssetType::CreditAlphanum12
+        };
         Self {
-            asset_type: code.into(),
+            asset_type,
+            code: Some(code),
             issuer: Some(issuer.into()),
         }
     }
@@ -576,6 +608,8 @@ impl SignerView {
 ///   account does not exist on the network.
 /// - [`WalletError::Network`] wrapping [`NetworkError::RpcTimeout`] if the RPC
 ///   request times out.
+/// - [`WalletError::Network`] wrapping [`NetworkError::RpcCredentialRejected`]
+///   if the endpoint answers HTTP 401 or 403.
 /// - [`WalletError::Network`] wrapping [`NetworkError::RpcUnreachable`] if the
 ///   endpoint is unreachable.
 /// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`]
@@ -589,13 +623,13 @@ impl SignerView {
 /// # Examples
 ///
 /// ```no_run
-/// use stellar_agent_network::{StellarRpcClient, fetch_account};
+/// use stellar_agent_network::{AssetType, StellarRpcClient, fetch_account};
 ///
 /// # async fn run() -> Result<(), stellar_agent_core::WalletError> {
 /// let client = StellarRpcClient::new("https://soroban-testnet.stellar.org")?;
 /// // Native-only (no trustline assets requested):
 /// let account = fetch_account(&client, "GABC...XYZ", &[]).await?;
-/// assert_eq!(account.balances[0].asset.asset_type, "native");
+/// assert_eq!(account.balances[0].asset.asset_type, AssetType::Native);
 /// # Ok(()) }
 /// ```
 pub async fn fetch_account(
@@ -603,6 +637,89 @@ pub async fn fetch_account(
     account_id: &str,
     trustline_assets: &[Asset],
 ) -> Result<AccountView, WalletError> {
+    fetch_account_at(client, account_id, trustline_assets)
+        .await
+        .map(|(view, _latest_ledger)| view)
+}
+
+/// Reads `account_id` with one `getLedgerEntries` request and keeps the
+/// answer's coverage beside the view.
+///
+/// The observation carries the answer's latest ledger and the host time read
+/// after the answer returns. Its close-time floor is that of `report`, the
+/// same endpoint's readiness report before the read.
+///
+/// # Errors
+///
+/// - [`NetworkError::AccountLedgerRegressed`] when the answer's latest
+///   ledger is below `report.latest_ledger`.
+/// - [`NetworkError::RpcResponseMalformed`] when the answer's latest ledger
+///   is not a positive 32-bit ledger number.
+/// - `wallet.clock_error` when the host clock cannot time the answer.
+/// - Every error of [`fetch_account`].
+pub async fn fetch_account_observed(
+    client: &StellarRpcClient,
+    account_id: &str,
+    report: &crate::operational::OperationalReport,
+) -> Result<ObservedAccount<AccountView>, WalletError> {
+    fetch_account_observed_requesting(client, account_id, &[], report).await
+}
+
+/// [`fetch_account_observed`] with the trustlines of `trustline_assets` in
+/// the same request, as [`fetch_account`] reads them.
+pub(crate) async fn fetch_account_observed_requesting(
+    client: &StellarRpcClient,
+    account_id: &str,
+    trustline_assets: &[Asset],
+    report: &crate::operational::OperationalReport,
+) -> Result<ObservedAccount<AccountView>, WalletError> {
+    let (view, latest_ledger) = fetch_account_at(client, account_id, trustline_assets).await?;
+    let observed_at_ms = crate::mainnet::clock::now_ms()?;
+    let latest_ledger = account_coverage(latest_ledger, report.latest_ledger)?;
+    Ok(ObservedAccount::new(
+        view,
+        latest_ledger,
+        observed_at_ms,
+        report.close_time_unix.saturating_mul(1_000),
+    ))
+}
+
+fn account_malformed(detail: &str) -> WalletError {
+    WalletError::Network(NetworkError::RpcResponseMalformed {
+        method: "getLedgerEntries".to_owned(),
+        detail: detail.to_owned(),
+    })
+}
+
+/// Checks an account answer's latest ledger against the readiness ledger of
+/// the same endpoint: it is a positive `u32` at or above `readiness_ledger`.
+fn account_coverage(latest_ledger: i64, readiness_ledger: u32) -> Result<u32, WalletError> {
+    let latest = u32::try_from(latest_ledger)
+        .ok()
+        .filter(|ledger| *ledger > 0)
+        .ok_or_else(|| account_malformed("latestLedger is not a positive ledger number"))?;
+    if latest < readiness_ledger {
+        return Err(WalletError::Network(NetworkError::AccountLedgerRegressed {
+            latest_ledger: latest,
+            readiness_ledger,
+        }));
+    }
+    Ok(latest)
+}
+
+/// The body of [`fetch_account`], returning the answer's latest ledger too.
+async fn fetch_account_at(
+    client: &StellarRpcClient,
+    account_id: &str,
+    trustline_assets: &[Asset],
+) -> Result<(AccountView, i64), WalletError> {
+    // Parse the account_id into the XDR AccountId for key construction. The
+    // event below names only an account that passed this parse.
+    let pk_bytes = stellar_strkey::ed25519::PublicKey::from_string(account_id).map_err(|e| {
+        WalletError::Protocol(ProtocolError::XdrCodecFailed {
+            detail: format!("invalid account_id for fetch_account: {e}"),
+        })
+    })?;
     // Redact account ID at the log boundary.
     let redacted = redact_account_id(account_id);
     tracing::debug!(
@@ -610,13 +727,6 @@ pub async fn fetch_account(
         trustline_count = trustline_assets.len(),
         "fetch_account: querying RPC"
     );
-
-    // Parse the account_id into the XDR AccountId for key construction.
-    let pk_bytes = stellar_strkey::ed25519::PublicKey::from_string(account_id).map_err(|e| {
-        WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: format!("invalid account_id for fetch_account: {e}"),
-        })
-    })?;
     let xdr_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(pk_bytes.0)));
 
     // Build the ledger keys: 1 account key + N trustline keys.
@@ -642,6 +752,16 @@ pub async fn fetch_account(
         .await
         .map_err(|e| map_rpc_error_generic(&e, &client.url))?;
 
+    project_account_response(account_id, trustline_assets, &xdr_account_id, response)
+}
+
+fn project_account_response(
+    account_id: &str,
+    trustline_assets: &[Asset],
+    xdr_account_id: &AccountId,
+    response: stellar_rpc_client::GetLedgerEntriesResponse,
+) -> Result<(AccountView, i64), WalletError> {
+    let latest_ledger = response.latest_ledger;
     let entries = response.entries.unwrap_or_default();
 
     // Decode each response key XDR exactly once and classify entries (Account
@@ -702,9 +822,16 @@ pub async fn fetch_account(
         })
     })?;
 
-    tracing::debug!(account_id = %redacted, "fetch_account: account entry received");
+    tracing::debug!(account_id = %redact_account_id(account_id), "fetch_account: account entry received");
 
     let mut view = project_account_entry(account_id, &account_entry_data)?;
+    view.requested_trustlines = trustline_assets
+        .iter()
+        .filter_map(|asset| match asset {
+            Asset::Credit { code, issuer } => Some(AssetView::credit(code, issuer)),
+            Asset::Native => None,
+        })
+        .collect();
 
     // Append trustline entries in request order.
     //
@@ -750,7 +877,31 @@ pub async fn fetch_account(
         }
     }
 
-    Ok(view)
+    Ok((view, latest_ledger))
+}
+
+pub(crate) async fn fetch_account_recovery(
+    client: &StellarRpcClient,
+    account_id: &str,
+    report: &crate::operational::OperationalReport,
+) -> Result<ObservedAccount<AccountView>, crate::client::RecoveryReadError> {
+    let key = stellar_strkey::ed25519::PublicKey::from_string(account_id)
+        .map_err(|_| crate::client::RecoveryReadError::Shape)?;
+    let account = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(key.0)));
+    let response = client
+        .inner
+        .get_ledger_entries(&[LedgerKey::Account(LedgerKeyAccount {
+            account_id: account.clone(),
+        })])
+        .await?;
+    let (view, latest) = project_account_response(account_id, &[], &account, response)?;
+    let latest = account_coverage(latest, report.latest_ledger)?;
+    Ok(ObservedAccount::new(
+        view,
+        latest,
+        crate::mainnet::clock::now_ms()?,
+        report.close_time_unix.saturating_mul(1_000),
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -781,6 +932,10 @@ pub async fn fetch_account(
 /// response: it is the ledger a submission made straight after this read is
 /// recorded against.
 ///
+/// The SEP-43 transaction tools read the same sets to decide whose operations
+/// the wallet's signature authorizes: a source counts when its set holds the
+/// wallet key at any weight. An error is never an empty set.
+///
 /// # Errors
 ///
 /// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`] if an
@@ -790,7 +945,9 @@ pub async fn fetch_account(
 ///   exist has no signer set, so its signatures cannot be bound to a network.
 /// - [`WalletError::Network`] wrapping [`NetworkError::RpcUnreachable`] if the
 ///   query does not complete before `deadline`.
-pub(crate) async fn fetch_account_signers(
+/// - [`WalletError::Network`] wrapping [`NetworkError::RpcResponseMalformed`]
+///   if the response's `latestLedger` is 0 or does not fit a ledger sequence.
+pub async fn fetch_account_signers(
     client: &StellarRpcClient,
     account_ids: &[String],
     deadline: tokio::time::Instant,
@@ -868,8 +1025,22 @@ pub(crate) async fn fetch_account_signers(
     // The endpoint's view of the chain at the moment the signer sets were
     // read. The submission that follows is recorded against this ledger, so a
     // later reconciliation can tell "the endpoint never saw the transaction"
-    // apart from "the endpoint no longer remembers that far back".
-    let latest_ledger = u32::try_from(response.latest_ledger).unwrap_or(0);
+    // apart from "the endpoint no longer remembers that far back". A value
+    // that is 0 or not a ledger sequence gives reconciliation no retention
+    // boundary to compare, so the answer is refused before anything is
+    // recorded or sent.
+    let latest_ledger = u32::try_from(response.latest_ledger)
+        .ok()
+        .filter(|ledger| *ledger > 0)
+        .ok_or_else(|| {
+            WalletError::Network(NetworkError::RpcResponseMalformed {
+                method: "getLedgerEntries".to_owned(),
+                detail: format!(
+                    "latestLedger {} is not a ledger sequence",
+                    response.latest_ledger
+                ),
+            })
+        })?;
 
     Ok((signers_by_account, latest_ledger))
 }
@@ -1087,6 +1258,7 @@ pub(crate) fn project_account_entry(
         signers,
         home_domain,
         account_flags,
+        requested_trustlines: Vec::new(),
     })
 }
 
@@ -1177,8 +1349,10 @@ fn project_home_domain(bytes: &[u8]) -> Option<String> {
 ///
 /// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`] if
 ///   the key or returned XDR cannot be encoded / decoded.
+/// - [`WalletError::Network`] wrapping [`NetworkError::RpcCredentialRejected`]
+///   if the endpoint answers HTTP 401 or 403.
 /// - [`WalletError::Network`] wrapping [`NetworkError::RpcUnreachable`] or
-///   [`NetworkError::RpcTimeout`] on transport errors.
+///   [`NetworkError::RpcTimeout`] on other transport errors.
 ///
 /// # Panics
 ///
@@ -1202,14 +1376,8 @@ pub async fn fetch_data_entry(
 ) -> Result<Option<Vec<u8>>, WalletError> {
     use stellar_xdr::{AccountId, PublicKey, Uint256};
 
-    let redacted = redact_account_id(account_id);
-    tracing::debug!(
-        account_id = %redacted,
-        data_key = %data_key,
-        "fetch_data_entry: querying RPC"
-    );
-
-    // Parse the account_id into the XDR AccountId.
+    // Parse the account_id into the XDR AccountId. The event below names only
+    // an account and a key that passed their checks.
     let pk_bytes = stellar_strkey::ed25519::PublicKey::from_string(account_id).map_err(|e| {
         WalletError::Protocol(ProtocolError::XdrCodecFailed {
             detail: format!("invalid account_id for data-entry lookup: {e}"),
@@ -1222,10 +1390,16 @@ pub async fn fetch_data_entry(
     let key_bytes = data_key.as_bytes().to_vec();
     let string_m: stellar_xdr::StringM<64> = key_bytes.try_into().map_err(|_| {
         WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: format!("data_key '{data_key}' exceeds 64-byte limit for String64"),
+            detail: "data_key must contain at most 64 bytes".to_owned(),
         })
     })?;
     let data_name = stellar_xdr::String64::from(string_m);
+    let redacted = redact_account_id(account_id);
+    tracing::debug!(
+        account_id = %redacted,
+        data_key = %data_key,
+        "fetch_data_entry: querying RPC"
+    );
 
     let ledger_key = LedgerKey::Data(LedgerKeyData {
         account_id: xdr_account_id,
@@ -1293,11 +1467,8 @@ pub async fn fetch_trustline_entry(
     account_id: &str,
     asset: &stellar_xdr::TrustLineAsset,
 ) -> Result<Option<stellar_xdr::TrustLineEntry>, WalletError> {
-    let pk = stellar_strkey::ed25519::PublicKey::from_string(account_id).map_err(|_| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: account_id.to_owned(),
-        })
-    })?;
+    let pk = stellar_strkey::ed25519::PublicKey::from_string(account_id)
+        .map_err(|_| WalletError::Validation(ValidationError::address_argument("account_id")))?;
     let xdr_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(pk.0)));
     let key = LedgerKey::Trustline(LedgerKeyTrustLine {
         account_id: xdr_account_id.clone(),
@@ -1354,7 +1525,9 @@ pub async fn fetch_trustline_entry(
 /// (e.g. data-entry lookups that already validated the account separately).
 ///
 /// Every text field takes the error display scrubbed with
-/// [`RpcEndpoint::scrub`], because that display can carry server text.
+/// [`RpcEndpoint::scrub`], because that display can carry server text. An
+/// HTTP 401 or 403 answer is the endpoint refusing the credential, so it maps
+/// to [`NetworkError::RpcCredentialRejected`], as the identity request does.
 fn map_rpc_error_generic(e: &RpcError, endpoint: &RpcEndpoint) -> WalletError {
     match e {
         RpcError::TransactionSubmissionTimeout => WalletError::Network(NetworkError::RpcTimeout {
@@ -1364,14 +1537,30 @@ fn map_rpc_error_generic(e: &RpcError, endpoint: &RpcEndpoint) -> WalletError {
         RpcError::Xdr(_) => WalletError::Protocol(ProtocolError::XdrCodecFailed {
             detail: endpoint.scrub_display(e),
         }),
-        _ => WalletError::Network(rpc_unreachable(endpoint, "", e)),
+        _ => match crate::retry::rejected_status(e) {
+            Some(status @ (401 | 403)) => {
+                WalletError::Network(NetworkError::RpcCredentialRejected {
+                    url: endpoint.authority(),
+                    status,
+                })
+            }
+            _ => WalletError::Network(rpc_unreachable(endpoint, "", e)),
+        },
     }
 }
 
 /// Maps a failed signer-set `getLedgerEntries` read against `endpoint` to
-/// [`NetworkError::RpcUnreachable`], with the server text scrubbed.
+/// [`NetworkError::RpcUnreachable`], with the server text scrubbed. An HTTP
+/// 401 or 403 answer maps to [`NetworkError::RpcCredentialRejected`], as the
+/// other account reads do.
 fn map_signer_fetch_error(e: &RpcError, endpoint: &RpcEndpoint) -> WalletError {
-    WalletError::Network(rpc_unreachable(endpoint, GET_LEDGER_ENTRIES_FAILED, e))
+    match crate::retry::rejected_status(e) {
+        Some(status @ (401 | 403)) => WalletError::Network(NetworkError::RpcCredentialRejected {
+            url: endpoint.authority(),
+            status,
+        }),
+        _ => WalletError::Network(rpc_unreachable(endpoint, GET_LEDGER_ENTRIES_FAILED, e)),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1392,6 +1581,351 @@ mod tests {
     use crate::redact::rpc_error_fixtures::{
         ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_error, xdr_error,
     };
+
+    /// An account answer keeps an equal or later latest ledger, refuses a
+    /// regressed one with its own code, and refuses a missing or invalid
+    /// one as malformed. Each read sends exactly one request.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn account_coverage_missing_invalid_equal_and_regressed() {
+        use stellar_agent_core::policy::v1::AccountReservesView;
+        use stellar_agent_test_support::xdr_fixtures::{
+            account_entry_xdr_with_seq, account_ledger_key_xdr,
+        };
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        const OWNER: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let report = crate::operational::OperationalReport {
+            latest_ledger: 100,
+            close_time_unix: 1_700_000_000,
+            close_lag_seconds: 0,
+        };
+        let cases = [
+            (serde_json::json!(100), Ok(100)),
+            (serde_json::json!(101), Ok(101)),
+            (serde_json::json!(99), Err("account.ledger_regressed")),
+            (serde_json::json!(0), Err("network.rpc_response_malformed")),
+            (serde_json::json!(-1), Err("network.rpc_response_malformed")),
+            (
+                serde_json::json!(u64::from(u32::MAX) + 1),
+                Err("network.rpc_response_malformed"),
+            ),
+            (serde_json::Value::Null, Err("network.rpc_unreachable")),
+        ];
+        for (latest, expected) in cases {
+            let server = MockServer::start().await;
+            let mut body = serde_json::json!({
+                "entries": [{
+                    "key": account_ledger_key_xdr(OWNER),
+                    "xdr": account_entry_xdr_with_seq(OWNER, 50_000_000, 0, 41),
+                    "lastModifiedLedgerSeq": 6,
+                }],
+            });
+            if !latest.is_null() {
+                body["latestLedger"] = latest.clone();
+            }
+            Mock::given(method("POST"))
+                .respond_with(stellar_agent_test_support::EchoIdResponder::new(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = StellarRpcClient::new(&server.uri()).unwrap();
+            let before = crate::mainnet::clock::now_ms().unwrap();
+            let read = fetch_account_observed(&client, OWNER, &report).await;
+            match (read, expected) {
+                (Ok(observed), Ok(ledger)) => {
+                    let observation = observed.observation().unwrap();
+                    assert_eq!(observation.ledger_sequence, ledger, "{latest}");
+                    assert_eq!(observation.close_time_floor_ms, 1_700_000_000_000);
+                    assert!(observation.observed_at_ms >= before);
+                    assert_eq!(observed.view().sequence_number, 41);
+                }
+                (Err(error), Err(code)) => assert_eq!(error.code(), code, "{latest}"),
+                (read, expected) => panic!("{latest}: {read:?} against {expected:?}"),
+            }
+            server.verify().await;
+        }
+    }
+
+    /// A signer-set read answered with HTTP 401 refuses with the credential
+    /// code, and one answered with HTTP 500 keeps the unreachable code.
+    #[tokio::test]
+    async fn signer_set_read_refuses_a_rejected_credential() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        const OWNER: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        for (status, code) in [
+            (401, "network.rpc_credential_refused"),
+            (500, "network.rpc_unreachable"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let client = StellarRpcClient::new(&server.uri()).unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+            let error = fetch_account_signers(&client, &[OWNER.to_owned()], deadline)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), code, "HTTP {status}: {error}");
+        }
+    }
+
+    /// An account entry of `owner` that lists `signers` with their weights.
+    fn signed_account_entry(
+        owner: [u8; 32],
+        signers: Vec<(stellar_xdr::SignerKey, u32)>,
+    ) -> String {
+        use stellar_xdr::{AccountEntry, AccountEntryExt, SequenceNumber, Signer, Thresholds};
+        LedgerEntryData::Account(AccountEntry {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(owner))),
+            balance: 100,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: Default::default(),
+            thresholds: Thresholds([1, 5, 5, 5]),
+            signers: signers
+                .into_iter()
+                .map(|(key, weight)| Signer { key, weight })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+            ext: AccountEntryExt::V0,
+        })
+        .to_xdr_base64(stellar_xdr::Limits::none())
+        .unwrap()
+    }
+
+    /// A signer-set server answering one `getLedgerEntries` call with `entries`.
+    async fn signer_server(
+        entries: Vec<serde_json::Value>,
+        latest: serde_json::Value,
+    ) -> wiremock::MockServer {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                serde_json::json!({"entries": entries, "latestLedger": latest}),
+            ))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn entry_json(owner: [u8; 32], xdr: &str) -> serde_json::Value {
+        let id = stellar_strkey::ed25519::PublicKey(owner).to_string();
+        serde_json::json!({
+            "key": stellar_agent_test_support::xdr_fixtures::account_ledger_key_xdr(id.as_str()),
+            "xdr": xdr,
+            "lastModifiedLedgerSeq": 6,
+        })
+    }
+
+    /// A foreign source's payment counts when the read signer set lists the
+    /// wallet key, at weight 1 or 0 and below every threshold; it is
+    /// excluded when the key is absent or listed only as a hash-x,
+    /// pre-auth-tx or signed-payload signer.
+    #[tokio::test]
+    async fn foreign_source_membership_controls_attribution() {
+        use stellar_agent_core::policy::transaction_effects::{
+            transaction_effects_for_sources, transaction_source_candidates,
+        };
+        use stellar_xdr::{
+            Asset, MuxedAccount, MuxedAccountMed25519, Operation, OperationBody, PaymentOp,
+            SignerKey, SignerKeyEd25519SignedPayload, Transaction, TransactionEnvelope,
+            TransactionV1Envelope,
+        };
+        const WALLET: [u8; 32] = [1; 32];
+        const SOURCE: [u8; 32] = [2; 32];
+        const PEER: [u8; 32] = [3; 32];
+        let pay = |source| Operation {
+            source_account: Some(source),
+            body: OperationBody::Payment(PaymentOp {
+                destination: MuxedAccount::Ed25519(Uint256([4; 32])),
+                asset: Asset::Native,
+                amount: 5,
+            }),
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256(WALLET)),
+                operations: vec![
+                    pay(MuxedAccount::Ed25519(Uint256(SOURCE))),
+                    pay(MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+                        id: 9,
+                        ed25519: Uint256(SOURCE),
+                    })),
+                ]
+                .try_into()
+                .unwrap(),
+                ..Default::default()
+            },
+            signatures: Default::default(),
+        })
+        .to_xdr_base64(stellar_xdr::Limits::none())
+        .unwrap();
+        let candidates = transaction_source_candidates(&envelope, Some(&WALLET)).unwrap();
+        let ids = candidates.account_ids();
+        assert_eq!(ids.len(), 1, "G and M spellings share one request");
+        let ed = |key| SignerKey::Ed25519(Uint256(key));
+        let cases = [
+            ("weight 1", vec![(ed(WALLET), 1)], 2),
+            ("weight 0", vec![(ed(WALLET), 0)], 2),
+            (
+                "two subthreshold keys",
+                vec![(ed(PEER), 1), (ed(WALLET), 1)],
+                2,
+            ),
+            ("absent", vec![(ed(PEER), 5)], 0),
+            (
+                "other signer types",
+                vec![
+                    (SignerKey::HashX(Uint256(WALLET)), 5),
+                    (SignerKey::PreAuthTx(Uint256(WALLET)), 5),
+                    (
+                        SignerKey::Ed25519SignedPayload(SignerKeyEd25519SignedPayload {
+                            ed25519: Uint256(WALLET),
+                            payload: vec![1].try_into().unwrap(),
+                        }),
+                        5,
+                    ),
+                ],
+                0,
+            ),
+        ];
+        for (case, signers, legs) in cases {
+            let server = signer_server(
+                vec![entry_json(SOURCE, &signed_account_entry(SOURCE, signers))],
+                serde_json::json!(100),
+            )
+            .await;
+            let client = StellarRpcClient::new(&server.uri()).unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let (sets, ledger) = fetch_account_signers(&client, &ids, deadline)
+                .await
+                .unwrap();
+            assert_eq!(ledger, 100);
+            let membership = candidates
+                .observe(|key| {
+                    sets.get(
+                        stellar_strkey::ed25519::PublicKey(*key)
+                            .to_string()
+                            .as_str(),
+                    )
+                    .map(Vec::as_slice)
+                })
+                .unwrap();
+            let effects = transaction_effects_for_sources(&envelope, &membership, "").unwrap();
+            assert_eq!(effects.valued.len(), legs, "{case}");
+            assert_eq!(server.received_requests().await.unwrap().len(), 1, "{case}");
+        }
+    }
+
+    /// Every requested account needs an entry, and every read failure keeps
+    /// its own code: none of them is an empty signer set.
+    #[tokio::test]
+    async fn source_reader_requires_all_requested_accounts() {
+        const SOURCE: [u8; 32] = [2; 32];
+        const ABSENT: [u8; 32] = [5; 32];
+        let id = |key| {
+            stellar_strkey::ed25519::PublicKey(key)
+                .to_string()
+                .as_str()
+                .to_owned()
+        };
+        let valid = entry_json(SOURCE, &signed_account_entry(SOURCE, Vec::new()));
+        let mut bad_xdr = valid.clone();
+        bad_xdr["xdr"] = "AAAA".into();
+        let cases = [
+            (
+                vec![valid.clone()],
+                serde_json::json!(100),
+                vec![id(SOURCE), id(ABSENT)],
+                "network.account_not_found",
+            ),
+            (
+                vec![bad_xdr],
+                serde_json::json!(100),
+                vec![id(SOURCE)],
+                "protocol.xdr_codec_failed",
+            ),
+            (
+                vec![valid.clone()],
+                serde_json::json!(0),
+                vec![id(SOURCE)],
+                "network.rpc_response_malformed",
+            ),
+        ];
+        for (entries, latest, requested, code) in cases {
+            let server = signer_server(entries, latest).await;
+            let client = StellarRpcClient::new(&server.uri()).unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let error = fetch_account_signers(&client, &requested, deadline)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), code);
+        }
+        let server = signer_server(vec![valid], serde_json::json!(100)).await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (sets, _) = fetch_account_signers(&client, &[id(SOURCE), id(SOURCE)], deadline)
+            .await
+            .unwrap();
+        assert_eq!(sets[&id(SOURCE)], vec![SOURCE]);
+    }
+
+    /// A refused account or data key reaches no query event and no request;
+    /// a pair that passed its checks still gets the event.
+    #[test]
+    fn refused_accounts_stay_out_of_the_query_events() {
+        use stellar_agent_test_support::log_capture::with_captured_trace_logs;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+        for account in ["credmarker7", "credmarker7\u{e9}\u{e9}\u{e9}"] {
+            let logs = with_captured_trace_logs(|| {
+                runtime.block_on(async {
+                    for error in [
+                        fetch_account(&client, account, &[]).await.unwrap_err(),
+                        fetch_data_entry(&client, account, "key").await.unwrap_err(),
+                    ] {
+                        assert_eq!(error.code(), "protocol.xdr_codec_failed");
+                    }
+                });
+            });
+            assert!(!logs.contains("credmarker7"), "{logs}");
+            assert!(!logs.contains("querying RPC"), "{logs}");
+        }
+        let valid = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let long_key = format!("credmarker7{}", "k".repeat(65));
+        let logs = with_captured_trace_logs(|| {
+            let error = runtime
+                .block_on(fetch_data_entry(&client, valid, &long_key))
+                .unwrap_err();
+            assert_eq!(error.code(), "protocol.xdr_codec_failed");
+            assert!(
+                error
+                    .message()
+                    .ends_with("data_key must contain at most 64 bytes"),
+                "{error}"
+            );
+            stellar_agent_test_support::rejected_value::assert_no_marker(&error, "credmarker7");
+        });
+        assert!(!logs.contains("credmarker7"), "{logs}");
+        assert!(!logs.contains("querying RPC"), "{logs}");
+        let logs = with_captured_trace_logs(|| {
+            runtime
+                .block_on(fetch_data_entry(&client, valid, "key"))
+                .unwrap_err();
+        });
+        assert!(logs.contains("fetch_data_entry: querying RPC"), "{logs}");
+    }
 
     /// A JSON-RPC error object whose text holds a credential-bearing URL maps
     /// to a reason that keeps only that URL's host and port.
@@ -1825,15 +2359,49 @@ mod tests {
     #[test]
     fn asset_view_native() {
         let a = AssetView::native();
-        assert_eq!(a.asset_type, "native");
+        assert_eq!(a.asset_type, AssetType::Native);
+        assert!(a.code.is_none());
         assert!(a.issuer.is_none());
+        assert_eq!(
+            serde_json::to_value(&a).unwrap(),
+            serde_json::json!({ "asset_type": "native" })
+        );
     }
 
     #[test]
-    fn asset_view_credit() {
-        let a = AssetView::credit("USDC", "GA5Z...");
-        assert_eq!(a.asset_type, "USDC");
-        assert_eq!(a.issuer.as_deref(), Some("GA5Z..."));
+    fn asset_view_credit_alphanum4() {
+        for code in ["A", "EU", "USD", "USDC"] {
+            let a = AssetView::credit(code, "GA5Z...");
+            assert_eq!(a.asset_type, AssetType::CreditAlphanum4);
+            assert_eq!(a.code.as_deref(), Some(code));
+            assert_eq!(a.issuer.as_deref(), Some("GA5Z..."));
+            assert_eq!(
+                serde_json::to_value(&a).unwrap(),
+                serde_json::json!({
+                    "asset_type": "credit_alphanum4",
+                    "code": code,
+                    "issuer": "GA5Z...",
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn asset_view_credit_alphanum12() {
+        for code in ["ABCDE", "EURMTL", "ABCDEFGHIJKL"] {
+            let a = AssetView::credit(code, "GACK...");
+            assert_eq!(a.asset_type, AssetType::CreditAlphanum12);
+            assert_eq!(a.code.as_deref(), Some(code));
+            assert_eq!(a.issuer.as_deref(), Some("GACK..."));
+            assert_eq!(
+                serde_json::to_value(&a).unwrap(),
+                serde_json::json!({
+                    "asset_type": "credit_alphanum12",
+                    "code": code,
+                    "issuer": "GACK...",
+                })
+            );
+        }
     }
 
     // ─── trim_asset_code unit tests ───────────────────────────────────────────

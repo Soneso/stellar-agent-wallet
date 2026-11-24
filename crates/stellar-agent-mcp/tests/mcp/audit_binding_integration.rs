@@ -28,6 +28,8 @@ const RECIPIENT: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWH
 
 fn x402_args() -> X402CreatePaymentArgs {
     X402CreatePaymentArgs {
+        approval_nonce: None,
+        approval_attestation: None,
         chain_id: "stellar:testnet".into(),
         address: None,
         payment_required: serde_json::json!({
@@ -36,6 +38,7 @@ fn x402_args() -> X402CreatePaymentArgs {
             "extra": { "areFeesSponsored": true }
         })
         .to_string(),
+        business_id: None,
     }
 }
 
@@ -45,7 +48,13 @@ fn x402_args() -> X402CreatePaymentArgs {
 #[serial]
 async fn a_value_tool_refuses_a_changed_binding_and_sends_nothing() {
     const PROFILE: &str = "binding-x402";
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().unwrap();
     let seed = [0x6f; 32];
@@ -116,7 +125,13 @@ async fn unnamed_start_x402_code() -> String {
 #[tokio::test]
 #[serial]
 async fn an_unnamed_start_over_an_existing_default_toml_records_and_enforces_the_binding() {
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().unwrap();
     let profile_dir = stellar_agent_core::profile::schema::default_profile_dir().unwrap();

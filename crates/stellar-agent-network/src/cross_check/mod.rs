@@ -1,10 +1,12 @@
 //! Independent oracle witnesses for classic transaction decisions and for
 //! Soroban simulations.
 
+mod bound;
 mod classic;
 mod digest;
 pub mod inputs;
 mod soroban;
+pub use bound::{BoundSorobanInputs, obtain_classic_witness_bound, obtain_soroban_witness_bound};
 pub use inputs::*;
 
 use crate::{
@@ -37,19 +39,81 @@ const WITNESS_READ_ATTEMPTS: u32 = 3;
 const WITNESS_RETRY_BACKOFF: Duration = Duration::from_secs(7);
 
 /// Evidence of a completed comparison against an identified oracle.
+///
+/// Only this module's producers build one, and its fields are private:
+///
+/// ```compile_fail,E0451
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn forge(p: CrossCheckWitness) -> CrossCheckWitness { CrossCheckWitness { ..p } }
+/// ```
+///
+/// No test constructor exists:
+///
+/// ```compile_fail,E0599
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn main() { let _ = CrossCheckWitness::for_tests("https://oracle.example.invalid", 1, [0;32],
+/// vec![]); }
+/// ```
+///
+/// The import and the getters resolve:
+///
+/// ```
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn inspect(p: &CrossCheckWitness) -> (Option<[u8; 32]>, u32) { (p.subject(), p.oracle_ledger())
+/// }
+/// let _ = inspect;
+/// ```
+///
+/// The witness implements none of `Serialize`, `Deserialize`, or `Default`:
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn need<T: serde::Serialize>() {}
+/// need::<CrossCheckWitness>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn need<T: serde::de::DeserializeOwned>() {}
+/// need::<CrossCheckWitness>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn need<T: Default>() {}
+/// need::<CrossCheckWitness>();
+/// ```
+/// The `subject` field cannot be projected outside this crate.
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn inspect(p: &CrossCheckWitness) { let _ = &p.subject; }
+/// ```
+///
+/// ```
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn need(_: Option<CrossCheckWitness>) {}
+/// need(None);
+/// ```
+///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossCheckWitness {
     authority: String,
     oracle_ledger: u32,
     inputs_digest: [u8; 32],
     kinds: Vec<WitnessEntry>,
+    /// The transaction the comparison is bound to: the network transaction
+    /// hash of a classic envelope, or the Soroban intent digest of a payment.
+    /// `None` from the producers that take no envelope.
+    subject: Option<[u8; 32]>,
 }
 
 impl CrossCheckWitness {
-    /// Creates synthetic evidence for tests without making an oracle request.
-    #[cfg(feature = "test-helpers")]
+    /// Creates synthetic evidence for this crate's tests without an oracle
+    /// request.
+    #[cfg(test)]
     #[must_use]
-    pub fn for_tests(
+    pub(crate) fn for_crate_tests(
         authority: &str,
         oracle_ledger: u32,
         inputs_digest: [u8; 32],
@@ -63,7 +127,44 @@ impl CrossCheckWitness {
             oracle_ledger,
             inputs_digest,
             kinds,
+            subject: None,
         }
+    }
+
+    /// Attaches a checked envelope subject to a test witness.
+    #[cfg(all(test, feature = "mainnet-write"))]
+    pub(crate) fn bound_for_crate_tests(mut self, subject: [u8; 32]) -> Self {
+        self.subject = Some(subject);
+        self
+    }
+
+    /// The transaction the comparison is bound to, when its producer took
+    /// one: the network transaction hash of a classic envelope, or the
+    /// Soroban intent digest of a payment.
+    #[must_use]
+    pub fn subject(&self) -> Option<[u8; 32]> {
+        self.subject
+    }
+
+    /// The fact digest under `stellar-agent-authz-fact:witness:v1`.
+    ///
+    /// Fields, in order: `lp(authority)`, `u32be(oracle_ledger)`, the 32-byte
+    /// inputs digest, `u32be(count)` and the one-byte tag of each entry kind
+    /// in ascending order, and the optional 32-byte subject.
+    #[must_use]
+    pub fn fact_digest(&self) -> [u8; 32] {
+        use stellar_agent_core::mainnet::fact::{FACT_LABEL_WITNESS, FactDigest};
+        let mut digest = FactDigest::new(FACT_LABEL_WITNESS);
+        digest
+            .bytes(self.authority.as_bytes())
+            .u32(self.oracle_ledger)
+            .fixed(&self.inputs_digest)
+            .u32(u32::try_from(self.kinds.len()).unwrap_or(u32::MAX));
+        for kind in &self.kinds {
+            digest.tag(*kind as u8);
+        }
+        digest.opt_fixed32(self.subject.as_ref());
+        digest.finish()
     }
 
     /// Oracle endpoint authority.
@@ -221,6 +322,36 @@ impl OracleEndpoint {
             })?;
         Ok(Some(Self { client, authority }))
     }
+
+    /// Builds the oracle of `profile` as `context` builds its clients: a host
+    /// with a test transport route gets the routed client, and every other
+    /// oracle the client [`Self::from_profile`] builds.
+    ///
+    /// # Errors
+    /// The refusals of [`Self::from_profile`], and the routed client's
+    /// construction error.
+    pub(crate) fn from_context(
+        profile: &Profile,
+        context: &NetworkContext,
+    ) -> Result<Option<Self>, WalletError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(url) = &profile.oracle_provider_url
+            && let Some(client) = context.test_transport_routes().client(url.as_str())
+        {
+            return Ok(Some(Self {
+                client: client?,
+                authority: redact_url_authority(url.as_str()),
+            }));
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = context;
+        Self::from_profile(profile)
+    }
+
+    /// The oracle's client, for a caller that reads the oracle directly.
+    pub(crate) fn into_client(self) -> StellarRpcClient {
+        self.client
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -233,7 +364,7 @@ fn unavailable(reason: Reason) -> WalletError {
     NetworkError::WitnessUnavailable { reason }.into()
 }
 
-fn identity_error(error: WalletError, authority: &str, chain: Caip2) -> WalletError {
+pub(crate) fn identity_error(error: WalletError, authority: &str, chain: Caip2) -> WalletError {
     let authority = authority.to_owned();
     match error {
         WalletError::Network(NetworkError::EndpointNetworkMismatch { .. }) => {
@@ -258,11 +389,10 @@ enum ReadFailure {
     /// HTTP 401 or 403: the oracle refused the credential, and the same
     /// request gets the same answer.
     Credential(u16),
-    /// The request did not complete: a connection failure, a timeout, or an
-    /// HTTP 429 or 5xx answer. Another attempt can succeed.
+    /// A connection failure, timeout, HTTP 429 or 5xx, or full simulation queue permits another attempt.
     Transport,
     /// The oracle returns an unusable answer. Examples include a body that
-    /// is not JSON or exceeds the size limit, a JSON-RPC error object, a
+    /// is not JSON or exceeds the size limit, a JSON-RPC error other than a busy answer, a
     /// mismatched response id, or any other status. Repeating the request
     /// only spends the deadline on the same answer.
     InvalidAnswer,
@@ -289,6 +419,7 @@ fn classify_read(error: &stellar_rpc_client::Error) -> ReadFailure {
         };
     }
     match error {
+        error if crate::retry::is_preflight_busy(error) => ReadFailure::Transport,
         // The HTTP transport reads the whole body before the JSON-RPC layer
         // sees it. It reports a body that is not JSON as `Malformed` and an
         // oversized body as `TooLarge`. Both indicate unusable answers.
@@ -339,10 +470,40 @@ pub(crate) async fn obtain_classic_witness_with_timing(
     tool: &'static str,
     timing: WitnessTiming,
 ) -> Result<CrossCheckOutcome, WalletError> {
+    classic_witness(
+        profile,
+        context,
+        value,
+        &inputs,
+        &ThresholdSet::from_profile(profile),
+        None,
+        tool,
+        timing,
+    )
+    .await
+}
+
+/// Applies the requirement rule under `thresholds` and, when a comparison is
+/// required, compares the observations with the oracle; a passed witness
+/// carries `subject`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shared body of the bound and the unbound classic producers"
+)]
+async fn classic_witness(
+    profile: &Profile,
+    context: &NetworkContext,
+    value: CrossCheckValue<'_>,
+    inputs: &ClassicInputs,
+    thresholds: &ThresholdSet<'_>,
+    subject: Option<[u8; 32]>,
+    tool: &'static str,
+    timing: WitnessTiming,
+) -> Result<CrossCheckOutcome, WalletError> {
     match cross_check_requirement(
         context.chain_id,
         value,
-        &ThresholdSet::from_profile(profile),
+        thresholds,
         profile.oracle_provider_url.is_some(),
         inputs.memo_check(),
     )? {
@@ -358,10 +519,17 @@ pub(crate) async fn obtain_classic_witness_with_timing(
     let keys = classic::keys(&observations);
     let client = &oracle.client;
     let keys = keys.as_slice();
-    let answer = read_with_retries(&oracle, context, timing, tool, move || {
-        client.witness_ledger_entries(keys)
-    })
-    .await?;
+    let answer = if subject.is_some() && context.chain_id.is_mainnet() {
+        read_with_mainnet_identity(&oracle, context, timing, tool, || {
+            client.witness_ledger_entries(keys)
+        })
+        .await?
+    } else {
+        read_with_retries(&oracle, context, timing, tool, || {
+            client.witness_ledger_entries(keys)
+        })
+        .await?
+    };
     let ledger = classic::compare_answer(&observations, keys, answer, &oracle.authority)?;
     let mut kinds: Vec<_> = observations.iter().map(|o| o.kind).collect();
     kinds.dedup();
@@ -371,6 +539,7 @@ pub(crate) async fn obtain_classic_witness_with_timing(
         oracle_ledger: ledger,
         inputs_digest,
         kinds,
+        subject,
     }))
 }
 
@@ -388,14 +557,14 @@ fn warn_skipped(tool: &'static str, reason: CrossCheckSkip) {
 /// single-RPC verification.
 ///
 /// # Errors
-/// [`OracleEndpoint::from_profile`]'s refusal, or
+/// [`OracleEndpoint::from_context`]'s refusal, or
 /// `network.witness_unavailable` when the profile names no oracle.
 fn required_oracle(
     profile: &Profile,
     context: &NetworkContext,
     tool: &'static str,
 ) -> Result<OracleEndpoint, WalletError> {
-    let oracle = OracleEndpoint::from_profile(profile)?
+    let oracle = OracleEndpoint::from_context(profile, context)?
         .ok_or_else(|| unavailable(Reason::OracleNotConfigured))?;
     if same_provider_host(
         profile
@@ -438,6 +607,35 @@ async fn read_with_retries<T, F, Fut>(
     context: &NetworkContext,
     timing: WitnessTiming,
     tool: &'static str,
+    read: F,
+) -> Result<T, WalletError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, stellar_rpc_client::Error>>,
+{
+    read_with_identity(oracle, context, timing, tool, false, read).await
+}
+
+async fn read_with_mainnet_identity<T, F, Fut>(
+    oracle: &OracleEndpoint,
+    context: &NetworkContext,
+    timing: WitnessTiming,
+    tool: &'static str,
+    read: F,
+) -> Result<T, WalletError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, stellar_rpc_client::Error>>,
+{
+    read_with_identity(oracle, context, timing, tool, true, read).await
+}
+
+async fn read_with_identity<T, F, Fut>(
+    oracle: &OracleEndpoint,
+    context: &NetworkContext,
+    timing: WitnessTiming,
+    tool: &'static str,
+    mainnet: bool,
     mut read: F,
 ) -> Result<T, WalletError>
 where
@@ -445,11 +643,15 @@ where
     Fut: Future<Output = Result<T, stellar_rpc_client::Error>>,
 {
     let mut deadline = Instant::now() + timing.attempt_budget;
-    oracle
-        .client
-        .endpoint_identity(context.network_passphrase(), deadline)
-        .await
-        .map_err(|error| identity_error(error, &oracle.authority, context.chain_id))?;
+    let identity = if mainnet {
+        oracle.client.mainnet_endpoint_identity(deadline).await
+    } else {
+        oracle
+            .client
+            .endpoint_identity(context.network_passphrase(), deadline)
+            .await
+    };
+    identity.map_err(|error| identity_error(error, &oracle.authority, context.chain_id))?;
     let mut attempt = 1;
     loop {
         let response = timeout_at(deadline, read()).await.map_err(|_| {
@@ -491,6 +693,37 @@ where
         attempt += 1;
         deadline = Instant::now() + timing.attempt_budget;
     }
+}
+
+/// Reads the oracle's latest ledger on mainnet and bounds the primary's
+/// simulation ledger and the signature expiration with it, as checks 5 and 6
+/// of the Soroban comparison do.
+///
+/// The read runs under [`read_with_mainnet_identity`]: the oracle must answer
+/// the mainnet identity first, and the retry policy and refusals are the
+/// witness simulation's. No answer of the primary stands in for the oracle's.
+///
+/// # Errors
+/// `simulation.divergence` with `LedgerSkew` or `Expiration`;
+/// `network.witness_unavailable` and `network.rpc_credential_refused` as the
+/// witness read reports them; the identity check's mainnet refusal.
+async fn oracle_ledger_bound(
+    oracle: &OracleEndpoint,
+    context: &NetworkContext,
+    inputs: &SorobanWitnessInputs<'_>,
+    timing: WitnessTiming,
+    tool: &'static str,
+) -> Result<(), WalletError> {
+    let client = &oracle.client;
+    let answer = read_with_mainnet_identity(oracle, context, timing, tool, move || {
+        client.witness_latest_ledger()
+    })
+    .await?;
+    soroban::compare_ledger(
+        inputs.primary.latest_ledger,
+        answer.sequence,
+        inputs.expiration_ledger,
+    )
 }
 
 /// The witness requirement of one Soroban payment, prepared before the
@@ -602,6 +835,17 @@ impl SorobanCrossCheck {
         inputs: SorobanWitnessInputs<'_>,
         timing: WitnessTiming,
     ) -> Result<CrossCheckOutcome, WalletError> {
+        self.witness_with_subject(inputs, timing, None).await
+    }
+
+    /// The oracle comparison of [`Self::witness_with_timing`]; a passed
+    /// witness carries `subject`.
+    async fn witness_with_subject(
+        &self,
+        inputs: SorobanWitnessInputs<'_>,
+        timing: WitnessTiming,
+        subject: Option<[u8; 32]>,
+    ) -> Result<CrossCheckOutcome, WalletError> {
         let (oracle, context, tool) = match self {
             Self::NotRequired => return Ok(CrossCheckOutcome::NotRequired),
             Self::Skipped(reason) => return Ok(CrossCheckOutcome::Skipped(*reason)),
@@ -614,10 +858,17 @@ impl SorobanCrossCheck {
         let primary = soroban::Primary::decode(&inputs)?;
         let client = &oracle.client;
         let envelope = inputs.envelope;
-        let answer = read_with_retries(oracle, context, timing, tool, move || {
-            client.witness_simulate(envelope)
-        })
-        .await?;
+        let answer = if subject.is_some() && context.chain_id.is_mainnet() {
+            read_with_mainnet_identity(oracle, context, timing, tool, move || {
+                client.witness_simulate(envelope)
+            })
+            .await?
+        } else {
+            read_with_retries(oracle, context, timing, tool, move || {
+                client.witness_simulate(envelope)
+            })
+            .await?
+        };
         soroban::compare(&primary, &inputs, &answer, &oracle.authority)?;
         Ok(CrossCheckOutcome::Passed(CrossCheckWitness {
             authority: oracle.authority.clone(),
@@ -628,6 +879,7 @@ impl SorobanCrossCheck {
                 inputs.primary.latest_ledger,
             )?,
             kinds: vec![WitnessEntry::SorobanSimulation],
+            subject,
         }))
     }
 }
@@ -674,6 +926,231 @@ pub(super) mod log_capture {
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
     use super::*;
+
+    async fn busy_witness(
+        busy: u64,
+        divergent: bool,
+        refusal: bool,
+    ) -> (Result<CrossCheckOutcome, WalletError>, usize) {
+        use stellar_baselib::{
+            account::{Account, AccountBehavior},
+            transaction::TransactionBehavior,
+            transaction_builder::{TransactionBuilder, TransactionBuilderBehavior},
+        };
+        use stellar_xdr::{
+            AccountId, InvokeContractArgs, Limits, PublicKey, ScAddress, ScSymbol, ScVal,
+            SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
+            SorobanAuthorizedInvocation, SorobanCredentials, Uint256, VecM, WriteXdr,
+        };
+        let account = |byte| {
+            ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                [byte; 32],
+            ))))
+        };
+        let entry = SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                address: account(7),
+                nonce: 1,
+                signature_expiration_ledger: 0,
+                signature: ScVal::Void,
+            }),
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: account(9),
+                    function_name: ScSymbol::try_from("transfer").unwrap(),
+                    args: VecM::default(),
+                }),
+                sub_invocations: VecM::default(),
+            },
+        };
+        let response = |entry: &SorobanAuthorizationEntry| {
+            serde_json::json!({
+                "latestLedger": 100, "minResourceFee": "100",
+                "results": [{"auth": [entry.to_xdr_base64(Limits::none()).unwrap()], "xdr": "AAAAAQ=="}]
+            })
+        };
+        let primary = serde_json::from_value(response(&entry)).unwrap();
+        let mut oracle_entry = entry.clone();
+        if divergent && let SorobanCredentials::Address(credentials) = &mut oracle_entry.credentials
+        {
+            credentials.address = account(8);
+        }
+        let mut oracle_answer = response(&oracle_entry);
+        if refusal {
+            oracle_answer["error"] = serde_json::json!("preflight queue full");
+        }
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::body_partial_json(
+            serde_json::json!({"method": "getNetwork"}),
+        ))
+        .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+            stellar_agent_test_support::signed_envelope::get_network_result(
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            ),
+        ))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::body_partial_json(
+            serde_json::json!({"method": "simulateTransaction"}),
+        ))
+        .respond_with(stellar_agent_test_support::EchoIdResponder::new(response(
+            &entry,
+        )))
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::body_partial_json(
+            serde_json::json!({"method": "simulateTransaction"}),
+        ))
+        .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+            oracle_answer,
+        ))
+        .with_priority(2)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+        wiremock::Mock::given(wiremock::matchers::body_partial_json(
+            serde_json::json!({"method": "simulateTransaction"}),
+        ))
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": body["id"],
+                "error": {"code": -32004, "message": "preflight queue full"}
+            }))
+        })
+        .with_priority(1)
+        .up_to_n_times(busy)
+        .mount(&server)
+        .await;
+        let profile = Profile::builder_testnet("signer", "witness", "nonce", "witness")
+            .rpc_url(server.uri())
+            .oracle_provider_url(server.uri().parse::<url::Url>().unwrap())
+            .build();
+        let check = SorobanCrossCheck::prepare(
+            &profile,
+            &NetworkContext::from_profile(&profile),
+            CrossCheckValue::Unvalued,
+            "busy_witness",
+        )
+        .unwrap();
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let mut source = Account::new(&source, "0").unwrap();
+        let envelope = TransactionBuilder::new(
+            &mut source,
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            None,
+        )
+        .fee(100_u32)
+        .add_operation(stellar_xdr::Operation {
+            source_account: None,
+            body: stellar_xdr::OperationBody::Inflation,
+        })
+        .build_for_simulation()
+        .to_envelope()
+        .unwrap();
+        let result = check
+            .witness_with_timing(
+                SorobanWitnessInputs {
+                    envelope: &envelope,
+                    primary: &primary,
+                    expiration_ledger: 110,
+                    resource_fee_ceiling: 1000,
+                },
+                WitnessTiming {
+                    attempt_budget: Duration::from_secs(15),
+                    retry_backoff: Duration::ZERO,
+                },
+            )
+            .await;
+        (
+            result,
+            stellar_agent_test_support::rpc_request_count(&server, "simulateTransaction").await,
+        )
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn witness_retries_a_busy_oracle() {
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let error = stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Call(
+            serde_json::from_value(
+                serde_json::json!({"code": -32004, "message": "preflight queue full"}),
+            )
+            .unwrap(),
+        ));
+        assert_eq!(classify_read(&error), ReadFailure::Transport);
+        let (result, requests) = busy_witness(1, false, false).await;
+        assert!(
+            matches!(result, Ok(CrossCheckOutcome::Passed(_))),
+            "{result:?}"
+        );
+        assert_eq!(requests, 2);
+        let (result, requests) = busy_witness(3, false, false).await;
+        assert!(
+            matches!(
+                result,
+                Err(WalletError::Network(NetworkError::WitnessUnavailable {
+                    reason: Reason::Transport { attempts: 3, .. }
+                }))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(requests, 3);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn busy_never_turns_divergence_into_agreement() {
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let (result, requests) = busy_witness(1, true, false).await;
+        assert!(
+            matches!(
+                result,
+                Err(WalletError::Network(NetworkError::WitnessDivergence { .. }))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(requests, 2);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn witness_stops_on_a_simulation_refusal() {
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let (result, requests) = busy_witness(1, false, true).await;
+        assert!(
+            matches!(
+                result,
+                Err(WalletError::Network(NetworkError::WitnessDivergence { .. }))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(requests, 2);
+    }
     #[test]
     fn skipped_without_threshold_renders_its_own_line() {
         let view = CrossCheckOutcome::Skipped(CrossCheckSkip::NoThresholdForAsset).view();
@@ -698,6 +1175,7 @@ mod tests {
             oracle_ledger: 4_242,
             inputs_digest: [0; 32],
             kinds: vec![WitnessEntry::SourceAccount],
+            subject: None,
         });
         let cases = [
             (
@@ -765,7 +1243,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn skipped_outcome_warns_with_the_reason() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let text = "cross-check skipped; configure the oracle and asset threshold in the profile";
         let (outcome, logs) = skip_warnings(CrossCheckValue::Unvalued).await;
         assert!(matches!(
@@ -888,5 +1370,20 @@ mod tests {
             error,
             WalletError::Network(NetworkError::MainnetWriteForbidden)
         ));
+    }
+
+    #[test]
+    fn the_fact_digest_covers_a_bound_subject() {
+        let witness = CrossCheckWitness {
+            authority: "oracle.example".to_owned(),
+            oracle_ledger: 42,
+            inputs_digest: [3; 32],
+            kinds: vec![],
+            subject: Some([4; 32]),
+        };
+        assert_eq!(
+            stellar_agent_core::hex::encode(&witness.fact_digest()),
+            "0d0e52291f1d9645c008ed98f82e0febad912a6306d0b820e1b36cc27e967f18"
+        );
     }
 }

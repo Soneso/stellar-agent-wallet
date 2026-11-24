@@ -73,10 +73,11 @@ impl SponsoredRpc for StellarSponsoredRpc {
         &self,
         envelope: &TransactionEnvelope,
     ) -> Result<SimulateTransactionResponse, MppError> {
-        self.client
-            .simulate_transaction_envelope(envelope, None)
-            .await
-            .map_err(|_error| simulation_error())
+        stellar_agent_network::retry::retry_preflight_busy(None, || {
+            self.client.simulate_transaction_envelope(envelope, None)
+        })
+        .await
+        .map_err(|_error| simulation_error())
     }
 }
 
@@ -102,6 +103,16 @@ pub(crate) struct StoredPreparedCharge {
     latest_ledger: u32,
     simulated_fee_stroops: u32,
     artifact_hash: [u8; 32],
+}
+
+impl StoredPreparedCharge {
+    pub(crate) fn payer(&self) -> &str {
+        &self.payer
+    }
+
+    pub(crate) const fn selected(&self) -> &SelectedChallenge {
+        &self.selected
+    }
 }
 
 impl PreparedSponsoredCharge {
@@ -827,10 +838,67 @@ pub(crate) mod tests {
     use stellar_xdr::{SorobanAddressCredentials, SorobanAuthorizedInvocation};
 
     use super::*;
-    use crate::{ChallengeInput, HttpRequestContext, select_and_validate};
+    use crate::{
+        ChallengeInput, HttpRequestContext, limits::MAX_CHALLENGE_LIFETIME_SECS,
+        select_and_validate,
+    };
 
     const CONTRACT: &str = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
     const RECIPIENT: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+    #[tokio::test]
+    async fn sponsored_simulate_retries_busy() {
+        for busy in [1, 4] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                    serde_json::json!({
+                        "latestLedger": 123, "minResourceFee": "100",
+                        "results": [{"auth": [], "xdr": "AAAAAQ=="}]
+                    }),
+                ))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(|request: &wiremock::Request| {
+                    let body: serde_json::Value = request.body_json().expect("request");
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": body["id"],
+                        "error": {"code": -32004, "message": "preflight queue full"}
+                    }))
+                })
+                .with_priority(1)
+                .up_to_n_times(busy)
+                .mount(&server)
+                .await;
+            let mut account =
+                stellar_baselib::account::Account::new(RECIPIENT, "0").expect("account");
+            let envelope = TransactionBuilder::new(&mut account, TESTNET_PASSPHRASE, None)
+                .fee(100_u32)
+                .add_operation(Operation {
+                    source_account: None,
+                    body: OperationBody::Inflation,
+                })
+                .build_for_simulation()
+                .to_envelope()
+                .expect("envelope");
+            let rpc = StellarSponsoredRpc {
+                client: stellar_rpc_client::Client::new(&server.uri()).expect("client"),
+            };
+            let result = rpc.simulate(&envelope).await;
+            if busy == 1 {
+                assert_eq!(result.expect("simulation").latest_ledger, 123);
+            } else {
+                let error = result.expect_err("busy refusal");
+                assert_eq!(error.code(), simulation_error().code());
+                assert_eq!(error.message(), simulation_error().message());
+            }
+            assert_eq!(
+                server.received_requests().await.expect("requests").len(),
+                if busy == 1 { 2 } else { 4 }
+            );
+        }
+    }
     const TRANSACTION_DATA: &str = "AAAAAAAAAAIAAAAGAAAAAcwD/nT9D7Dc2LxRdab+2vEUF8B+XoN7mQW21oxPT8ALAAAAFAAAAAEAAAAHy8vNUZ8vyZ2ybPHW0XbSrRtP7gEWsJ6zDzcfY9P8z88AAAABAAAABgAAAAHMA/50/Q+w3Ni8UXWm/trxFBfAfl6De5kFttaMT0/ACwAAABAAAAABAAAAAgAAAA8AAAAHQ291bnRlcgAAAAASAAAAAAAAAAAg4dbAxsGAGICfBG3iT2cKGYQ6hK4sJWzZ6or1C5v6GAAAAAEAHfKyAAAFiAAAAIgAAAAAAAAAAw==";
 
     pub(crate) struct DeterministicRpc {
@@ -903,7 +971,21 @@ pub(crate) mod tests {
         selected_challenge_for_resource(now, "https://merchant.example/checkout")
     }
 
-    pub(crate) fn selected_challenge_for_resource(now: i64, resource: &str) -> SelectedChallenge {
+    /// Formats Unix seconds as the RFC 3339 `expires` value of a challenge.
+    pub(crate) fn rfc3339(unix_seconds: i64) -> String {
+        let seconds = u64::try_from(unix_seconds).expect("timestamp in range");
+        stellar_agent_core::timefmt::format_rfc3339_utc(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+        )
+    }
+
+    /// The HTTP charge challenge `id` for `resource`, carrying `expires` only
+    /// when `expires_unix` names one.
+    pub(crate) fn challenge_input(
+        id: &str,
+        resource: &str,
+        expires_unix: Option<i64>,
+    ) -> ChallengeInput {
         let request = serde_json::json!({
             "amount": "10000000",
             "currency": CONTRACT,
@@ -915,14 +997,29 @@ pub(crate) mod tests {
         let context =
             HttpRequestContext::new("https://merchant.example", "POST", resource, None, None)
                 .expect("valid request context");
+        let expires = expires_unix.map_or_else(String::new, |unix_seconds| {
+            format!(", expires=\"{}\"", rfc3339(unix_seconds))
+        });
+        ChallengeInput::Http {
+            www_authenticate: vec![format!(
+                "Payment id=\"{id}\", realm=\"merchant.example\", method=\"stellar\", intent=\"charge\", request={encoded}{expires}"
+            )],
+            selected_challenge_id: None,
+            context,
+        }
+    }
+
+    pub(crate) fn selected_challenge_for_resource(now: i64, resource: &str) -> SelectedChallenge {
+        selected_challenge_with_expiry(now, resource, now + MAX_CHALLENGE_LIFETIME_SECS)
+    }
+
+    fn selected_challenge_with_expiry(
+        now: i64,
+        resource: &str,
+        expires_unix: i64,
+    ) -> SelectedChallenge {
         select_and_validate(
-            &ChallengeInput::Http {
-                www_authenticate: vec![format!(
-                    "Payment id=\"challenge-1\", realm=\"merchant.example\", method=\"stellar\", intent=\"charge\", request={encoded}"
-                )],
-                selected_challenge_id: None,
-                context,
-            },
+            &challenge_input("challenge-1", resource, Some(expires_unix)),
             now,
         )
         .expect("valid selected challenge")
@@ -938,9 +1035,37 @@ pub(crate) mod tests {
         prepared_fixture_for_resource(now, "https://merchant.example/checkout").await
     }
 
+    /// A prepare at `now` of the one fixture challenge that expires at
+    /// `expires_unix`: repeating it at a later clock repeats the challenge.
+    pub(crate) async fn prepared_fixture_expiring(
+        now: i64,
+        expires_unix: i64,
+    ) -> (
+        PreparedSponsoredCharge,
+        SoftwareSigningKey,
+        DeterministicRpc,
+    ) {
+        prepared_fixture_for_selected(selected_challenge_with_expiry(
+            now,
+            "https://merchant.example/checkout",
+            expires_unix,
+        ))
+        .await
+    }
+
     pub(crate) async fn prepared_fixture_for_resource(
         now: i64,
         resource: &str,
+    ) -> (
+        PreparedSponsoredCharge,
+        SoftwareSigningKey,
+        DeterministicRpc,
+    ) {
+        prepared_fixture_for_selected(selected_challenge_for_resource(now, resource)).await
+    }
+
+    pub(crate) async fn prepared_fixture_for_selected(
+        selected: SelectedChallenge,
     ) -> (
         PreparedSponsoredCharge,
         SoftwareSigningKey,
@@ -952,14 +1077,9 @@ pub(crate) mod tests {
             calls: AtomicUsize::new(0),
             payer: payer_sc_address(&payer).expect("payer"),
         };
-        let prepared = prepare_sponsored(
-            selected_challenge_for_resource(now, resource),
-            &payer,
-            TESTNET_PASSPHRASE,
-            &rpc,
-        )
-        .await
-        .expect("prepare fixture");
+        let prepared = prepare_sponsored(selected, &payer, TESTNET_PASSPHRASE, &rpc)
+            .await
+            .expect("prepare fixture");
         (prepared, signer, rpc)
     }
 

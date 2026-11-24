@@ -19,6 +19,7 @@
 
 use crate::cross_check::MemoObservation;
 use stellar_agent_core::error::{ValidationError, WalletError};
+use stellar_agent_core::payment_accounts::PaymentAccount;
 
 use crate::account::fetch_data_entry;
 use crate::client::StellarRpcClient;
@@ -33,8 +34,9 @@ pub(crate) fn normalise_memo_required(value: &Option<Vec<u8>>) -> bool {
 
 /// Checks whether the destination account requires a memo per SEP-29.
 ///
-/// Reads the flag on the primary when the envelope carries no memo.
-/// The returned observation lets a commit witness compare the same decision.
+/// Reads the flag on the primary when the envelope carries no memo and the
+/// destination is a plain `G...` account. A muxed `M...` destination returns
+/// [`MemoObservation::NotRead`] without a read. The returned observation lets a commit witness compare the same decision.
 ///
 /// # Errors
 /// Refuses a required missing memo and propagates primary read or decode failures.
@@ -57,6 +59,14 @@ pub async fn check_memo_required(
     // Fast-path: if a memo is already supplied, no check is needed regardless
     // of the data entry value.
     if memo_present {
+        return Ok(MemoObservation::NotRead);
+    }
+
+    // The payment carries the mux ID of a muxed destination, including ID
+    // zero, and the recipient interprets it. SEP-29 lookup is skipped for M
+    // destinations, so no data entry is read. Signed memo bindings still
+    // apply in policy evaluation.
+    if PaymentAccount::parse(destination).is_ok_and(|account| account.muxed_id().is_some()) {
         return Ok(MemoObservation::NotRead);
     }
 

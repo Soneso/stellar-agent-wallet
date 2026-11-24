@@ -35,7 +35,11 @@ use super::rpc_mock_helpers::{
 /// disagreement and returns `NetworkRpcDivergence` before performing any signer-set
 /// comparison.
 #[tokio::test]
+#[serial_test::serial]
 async fn policy_hash_rpc_disagreement_returns_rpc_divergence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     // Write a valid baseline so Step 1 passes.

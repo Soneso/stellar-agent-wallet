@@ -1,14 +1,19 @@
 //! `stellar-agent tx receipt clear` and `tx status` against a mocked
 //! endpoint.
 //!
-//! Clearing a submission record states that the transaction did not move
-//! value, and the wallet cannot establish that on its own. The endpoint can,
-//! so the verb asks it first and reconciles before it decides: a transaction
-//! the chain has answered for is settled by reconciliation, not by an
-//! operator; one released on chain evidence gets its settled row before the
-//! clear; one that can still apply is refused; and an endpoint that cannot
-//! answer is not a licence to clear either. No path sends the transaction
-//! again, which every responder here counts.
+//! `--acknowledge` records the operator's decision; clearing establishes no
+//! chain outcome. The verb asks the endpoint first and reconciles before it
+//! decides. A reported success for a bounded transaction is not the
+//! operator's to clear. A reported failure is not either, except for a
+//! submission without a held reservation or on a mainnet profile without an
+//! oracle. A bounded hold or submitted receipt waits for its time bound. An
+//! unsent receipt without a hold can clear earlier. One that can still apply
+//! is refused. An endpoint that cannot answer is not a license to
+//! clear either. A
+//! reported failure or missing transaction does not release possible
+//! spending. An authenticated hold without a time bound is cleared only with
+//! `--acknowledge-unbounded` as well, whatever the endpoint reports. No path
+//! sends the transaction again, which every responder here counts.
 //!
 //! Driven as subprocesses of the real binary so the printed envelope is the
 //! one an operator sees. The CLI crate has no `[lib]` target.
@@ -21,22 +26,22 @@
 )]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
-use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore, ReleaseEvidence};
+use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// A throwaway 32-byte URL-safe base64 key for the headless keyring backend,
 /// so no child process can reach the login keychain.
-const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+pub(super) const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
-const PROFILE: &str = "clear-guard";
-const ENVELOPE_HASH: &str = "11111111111111111111111111111111111111111111111111111111111111aa";
-const TX_HASH: &str = "22222222222222222222222222222222222222222222222222222222222222bb";
+pub(super) const PROFILE: &str = "clear-guard";
+pub(super) const ENVELOPE_HASH: &str =
+    "11111111111111111111111111111111111111111111111111111111111111aa";
+pub(super) const TX_HASH: &str = "22222222222222222222222222222222222222222222222222222222222222bb";
 const SOURCE: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
 
 /// The current time in unix seconds.
@@ -210,14 +215,18 @@ async fn endpoint(rpc: &FixedStatusRpc) -> MockServer {
 }
 
 fn run_cli(home: &Path, args: &[&str]) -> (i32, Value) {
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(args)
-        .env("STELLAR_AGENT_HOME", home)
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-        .output()
-        .expect("stellar-agent binary must run");
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child")
+    .args(args)
+    .env("STELLAR_AGENT_HOME", home)
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .output()
+    .expect("stellar-agent binary must run");
 
     let code = output.status.code().expect("process must exit with a code");
     let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
@@ -240,7 +249,7 @@ fn fixture(home: &Path, rpc_url: &str) {
 
 /// Writes the profile and seeds a sent receipt for `ENVELOPE_HASH` at
 /// `sequence` with time bound `max_time`.
-fn fixture_with(home: &Path, rpc_url: &str, sequence: i64, max_time: u64) {
+pub(super) fn fixture_with(home: &Path, rpc_url: &str, sequence: i64, max_time: u64) {
     write_profile(home, rpc_url);
     let receipts = ReceiptStore::open_at(&home.join("receipts"), PROFILE).unwrap();
     receipts
@@ -292,6 +301,9 @@ fn write_profile(home: &Path, rpc_url: &str) {
     )
     .unwrap();
 
+    let (code, listed) = run_cli(home, &["profile", "list"]);
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(listed["data"], serde_json::json!([PROFILE]));
     let (code, envelope) = run_cli(home, &["profile", "rotate-audit-key", PROFILE]);
     assert_eq!(code, 0, "rotate-audit-key must succeed: {envelope}");
 }
@@ -301,7 +313,7 @@ async fn tx_status_completes_owed_approval_consumption_once() {
     use stellar_agent_core::approval::{
         ApprovalKind, ConsumedOutcome, PendingApproval, PendingApprovalStore,
     };
-    let home = tempfile::TempDir::new().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = FixedStatusRpc::new("SUCCESS");
     let server = endpoint(&rpc).await;
     let entry = PendingApproval::new_payment_pending(
@@ -388,6 +400,24 @@ fn rows_of_kind(home: &Path, kind: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Runs `tx receipt clear` for `ENVELOPE_HASH` with both acknowledgements,
+/// the form an untimed authenticated hold needs.
+fn clear_unbounded(home: &Path) -> (i32, Value) {
+    run_cli(
+        home,
+        &[
+            "tx",
+            "receipt",
+            "clear",
+            ENVELOPE_HASH,
+            "--acknowledge",
+            "--acknowledge-unbounded",
+            "--profile",
+            PROFILE,
+        ],
+    )
+}
+
 /// Runs `tx receipt clear` for `ENVELOPE_HASH`, with or without the
 /// acknowledgement.
 fn clear(home: &Path, acknowledge: bool) -> (i32, Value) {
@@ -418,7 +448,7 @@ fn receipt(home: &Path) -> stellar_agent_core::profile::receipt::SubmissionRecei
 /// not get to declare it never moved value.
 #[tokio::test]
 async fn a_submission_the_chain_answered_for_is_not_cleared_by_an_operator() {
-    let home = tempfile::TempDir::new().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = FixedStatusRpc::new("SUCCESS");
     let server = endpoint(&rpc).await;
     fixture(home.path(), &server.uri());
@@ -464,7 +494,7 @@ async fn a_submission_the_chain_answered_for_is_not_cleared_by_an_operator() {
 /// operator verb exists for.
 #[tokio::test]
 async fn a_submission_the_endpoint_cannot_account_for_is_cleared() {
-    let home = tempfile::TempDir::new().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
     fixture(home.path(), &server.uri());
@@ -518,7 +548,7 @@ async fn a_submission_the_endpoint_cannot_account_for_is_cleared() {
 /// Without `--acknowledge` the verb refuses whatever the chain says.
 #[tokio::test]
 async fn a_clear_without_the_acknowledgement_is_refused() {
-    let home = tempfile::TempDir::new().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
     fixture(home.path(), &server.uri());
@@ -551,7 +581,7 @@ async fn a_clear_without_the_acknowledgement_is_refused() {
 /// the receipt's own state stops the second.
 #[tokio::test]
 async fn a_re_run_on_a_cleared_receipt_writes_no_row() {
-    let home = tempfile::TempDir::new().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
     fixture(home.path(), &server.uri());
@@ -595,7 +625,7 @@ async fn a_re_run_on_a_cleared_receipt_writes_no_row() {
 /// chain answer, and it is stopped before anything is released or written.
 #[tokio::test]
 async fn a_pending_receipt_the_chain_confirmed_writes_no_row() {
-    let home = tempfile::TempDir::new().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = FixedStatusRpc::new("SUCCESS");
     let server = endpoint(&rpc).await;
     fixture(home.path(), &server.uri());
@@ -626,23 +656,25 @@ async fn a_pending_receipt_the_chain_confirmed_writes_no_row() {
     assert_eq!(rpc.log.sends(), 0, "the verb never sends");
 }
 
-/// A submission the wallet recorded and never sent is clearable, and clearing
-/// it frees the pair.
+/// A receipt that records its submission as never sent does not clear the
+/// authenticated hold of a transaction whose time bound is still open.
 ///
-/// A process killed between the record and the send leaves exactly this shape.
-/// It holds its source account's sequence, and the sequence never advances
-/// because nothing applied, so every rebuild at that number is refused.
+/// A process killed between the record and the send leaves this shape. The
+/// receipt's unsent state is unauthenticated, so only the bound ends the
+/// exposure: the clear is refused and the hold, the receipt and the log stay
+/// as they were. A receipt without a hold is cleared on its unsent state; see
+/// `untimed_and_unsent_clears_do_not_need_a_ledger_time`.
 #[tokio::test]
 #[serial_test::serial]
-async fn a_submission_that_was_never_sent_is_cleared() {
-    let home = tempfile::TempDir::new().unwrap();
+async fn an_unsent_receipt_does_not_clear_its_open_bounded_hold() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
     fixture(home.path(), &server.uri());
 
-    // A receipt recorded and never sent, with a time bound that is still open
-    // and a sequence the account has not consumed: only its unsent state
-    // makes it clearable.
     let receipts_dir = home.path().join("receipts");
     let unsent = "3333333333333333333333333333333333333333333333333333333333333333";
     {
@@ -654,6 +686,7 @@ async fn a_submission_that_was_never_sent_is_cleared() {
     }
 
     let (window, profile) = seed_window(home.path(), unsent, 9, now_secs() + 86_400);
+    let before = audit_rows(home.path());
     let (refused, _) = run_cli(
         home.path(),
         &["tx", "receipt", "clear", unsent, "--profile", PROFILE],
@@ -674,35 +707,22 @@ async fn a_submission_that_was_never_sent_is_cleared() {
         ],
     );
 
-    assert_eq!(code, 0, "an unsent submission is clearable: {envelope}");
-    assert!(!window.holds_reservation(&profile, unsent).unwrap());
-    let receipts = ReceiptStore::open_at(&receipts_dir, PROFILE).unwrap();
-    assert_eq!(
-        receipts.get(unsent).unwrap().unwrap().status,
-        stellar_agent_core::profile::receipt::ReceiptStatus::ClearedByOperator
-    );
-    let outcome = receipts
-        .begin_submission(
-            "4444444444444444444444444444444444444444444444444444444444444444",
-            TX_HASH,
-            SOURCE,
-            9,
-            0,
-            1_000,
-        )
+    assert_eq!(code, 1, "{envelope}");
+    assert_eq!(envelope["error"]["code"], "submission.still_pending");
+    assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
+    let receipt = ReceiptStore::open_at(&receipts_dir, PROFILE)
+        .unwrap()
+        .get(unsent)
+        .unwrap()
         .unwrap();
-    assert!(
-        matches!(
-            outcome,
-            stellar_agent_core::profile::receipt::BeginSubmissionOutcome::Recorded
-        ),
-        "clearing frees the pair the unsent receipt held; got {outcome:?}"
-    );
+    assert_eq!(receipt.status, ReceiptStatus::Pending);
+    assert!(!receipt.submitted);
+    assert_eq!(audit_rows(home.path()), before);
     assert_eq!(rpc.log.sends(), 0, "the verb never sends");
 }
 
-/// A settled record whose transaction the endpoint no longer reports is
-/// refused, and writes no row.
+/// A record settled as a success whose transaction has left the endpoint's
+/// retention is refused, and writes no row.
 ///
 /// This is the state that makes the ordering load-bearing. The endpoint has
 /// forgotten the transaction, so the chain check passes; only the record's own
@@ -711,7 +731,7 @@ async fn a_submission_that_was_never_sent_is_cleared() {
 /// record a clear it then refuses.
 #[tokio::test]
 async fn a_settled_record_the_endpoint_forgot_is_refused_and_writes_no_row() {
-    let home = tempfile::TempDir::new().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
     fixture(home.path(), &server.uri());
@@ -728,9 +748,7 @@ async fn a_settled_record_the_endpoint_forgot_is_refused_and_writes_no_row() {
         receipts
             .finalize(
                 settled,
-                stellar_agent_core::profile::receipt::ReceiptStatus::Failed {
-                    code: "submission.on_chain_failed".to_owned(),
-                },
+                stellar_agent_core::profile::receipt::ReceiptStatus::Success,
                 None,
             )
             .unwrap();
@@ -766,7 +784,7 @@ async fn a_settled_record_the_endpoint_forgot_is_refused_and_writes_no_row() {
     assert!(
         matches!(
             receipts.get(settled).unwrap().unwrap().status,
-            stellar_agent_core::profile::receipt::ReceiptStatus::Failed { .. }
+            stellar_agent_core::profile::receipt::ReceiptStatus::Success
         ),
         "the record is untouched"
     );
@@ -812,6 +830,22 @@ impl Respond for OrphanRpc {
     }
 }
 
+/// Seeds an orphaned reservation whose execution bound passed an hour ago on
+/// the host clock and at the endpoint's latest ledger close time.
+fn bounded_orphan_fixture(
+    home: &Path,
+    rpc_url: &str,
+) -> (
+    stellar_agent_network::policy_state::PersistedWindowStore,
+    stellar_agent_core::profile::schema::Profile,
+) {
+    let bound = now_secs() - 3_600;
+    fixture_with(home, rpc_url, 7, bound);
+    let seeded = seed_window(home, ENVELOPE_HASH, 7, bound);
+    std::fs::remove_file(home.join(format!("receipts/{PROFILE}.json"))).unwrap();
+    seeded
+}
+
 /// Seeds a real authenticated window using the subprocesses' encrypted
 /// keyring, then removes the receipt, leaving an orphaned reservation.
 fn orphan_fixture(
@@ -841,7 +875,7 @@ fn windowed_fixture(
     seed_window(home, ENVELOPE_HASH, sequence, 0)
 }
 
-fn seed_window(
+pub(super) fn seed_window(
     home: &Path,
     id: &str,
     sequence: i64,
@@ -850,11 +884,41 @@ fn seed_window(
     stellar_agent_network::policy_state::PersistedWindowStore,
     stellar_agent_core::profile::schema::Profile,
 ) {
+    seed_window_for(home, id, TX_HASH, sequence, max_time)
+}
+
+/// Takes a due reservation for the submission `id` with transaction hash
+/// `tx_hash` in a real authenticated window, written through the
+/// subprocesses' encrypted keyring.
+fn seed_window_for(
+    home: &Path,
+    id: &str,
+    tx_hash: &str,
+    sequence: i64,
+    max_time: u64,
+) -> (
+    stellar_agent_network::policy_state::PersistedWindowStore,
+    stellar_agent_core::profile::schema::Profile,
+) {
+    seed_window_for_to(home, id, tx_hash, sequence, max_time, Default::default())
+}
+
+fn seed_window_for_to(
+    home: &Path,
+    id: &str,
+    tx_hash: &str,
+    sequence: i64,
+    max_time: u64,
+    destinations: stellar_agent_core::profile::receipt::PaymentDestinations,
+) -> (
+    stellar_agent_network::policy_state::PersistedWindowStore,
+    stellar_agent_core::profile::schema::Profile,
+) {
     use stellar_agent_core::policy::v1::criteria::state_store::{
         StateKey, WindowEntry, WindowLimit,
     };
     use stellar_agent_headless_keyring::{crypto::ProtectionMode, store::HeadlessStore};
-    use stellar_agent_network::policy_state::{PersistedWindowStore, WindowReservation};
+    use stellar_agent_network::policy_state::{PersistedWindowStore, SubmissionHold};
     keyring_core::set_default_store(Arc::new(HeadlessStore::new(
         home.join("headless-keyring/store.keyring"),
         ProtectionMode::EnvKey(Arc::new(zeroize::Zeroizing::new(std::array::from_fn(
@@ -869,14 +933,17 @@ fn seed_window(
     .unwrap();
     let window = PersistedWindowStore::at_path(home.join(format!("policy/{PROFILE}.window")));
     let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
-    let res = WindowReservation {
+    let res = SubmissionHold {
+        destinations,
+        chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(profile.chain_id),
         id: id.to_owned(),
-        tx_hash: TX_HASH.to_owned(),
+        tx_hash: tx_hash.to_owned(),
         source: SOURCE.to_owned(),
         sequence,
         max_time,
         pending_since_ms: now - 400_000,
         submission_ledger: 1000,
+        submission_anchor: None,
         operator_required: false,
     };
     window
@@ -898,19 +965,57 @@ fn seed_window(
     (window, profile)
 }
 
+/// Asks the window for a second reservation of `amount` stroops under the
+/// one-day cap the fixtures hold. Returns whether it was admitted; a refusal
+/// must be the cap's.
+fn admits(
+    window: &stellar_agent_network::policy_state::PersistedWindowStore,
+    profile: &stellar_agent_core::profile::schema::Profile,
+    amount: i128,
+) -> bool {
+    use stellar_agent_core::policy::v1::criteria::state_store::{
+        StateKey, WindowEntry, WindowLimit,
+    };
+    use stellar_agent_network::policy_state::{ChainScope, SubmissionHold, WindowStoreError};
+    let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+    let outcome = window.record_pending(
+        profile,
+        &[WindowEntry::new(
+            StateKey::new(PROFILE, 1, "native", 86_400),
+            now,
+            amount,
+            WindowLimit::Amount {
+                asset: "native".to_owned(),
+                window: "1d".to_owned(),
+                max_stroops: 1_000_000,
+            },
+        )],
+        &SubmissionHold {
+            destinations: Default::default(),
+            chain_scope: ChainScope::for_chain(profile.chain_id),
+            id: "5555555555555555555555555555555555555555555555555555555555555555".to_owned(),
+            tx_hash: "6666666666666666666666666666666666666666666666666666666666666666".to_owned(),
+            source: SOURCE.to_owned(),
+            sequence: 99,
+            max_time: 0,
+            pending_since_ms: now,
+            submission_ledger: 1000,
+            submission_anchor: None,
+            operator_required: false,
+        },
+    );
+    match outcome {
+        Ok(_) => true,
+        Err(WindowStoreError::PolicyDenied { .. }) => false,
+        Err(other) => panic!("the admission must succeed or meet the cap: {other}"),
+    }
+}
+
+/// Clears the orphan for `ENVELOPE_HASH` with both acknowledgements: an
+/// untimed orphan needs `--acknowledge-unbounded`, and a bounded one ignores
+/// it.
 fn orphan_clear(home: &Path) -> (i32, Value) {
-    run_cli(
-        home,
-        &[
-            "tx",
-            "receipt",
-            "clear",
-            ENVELOPE_HASH,
-            "--acknowledge",
-            "--profile",
-            PROFILE,
-        ],
-    )
+    clear_unbounded(home)
 }
 
 /// Orphan recovery preserves authenticated identity and provenance, writes one
@@ -918,7 +1023,10 @@ fn orphan_clear(home: &Path) -> (i32, Value) {
 #[tokio::test]
 #[serial_test::serial]
 async fn orphan_clear_recovers_identity_and_releases_headroom() {
-    let home = tempfile::TempDir::new().unwrap();
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = OrphanRpc::new("NOT_FOUND", 1200);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -946,24 +1054,84 @@ async fn orphan_clear_recovers_identity_and_releases_headroom() {
     assert_eq!(rpc.log.sends(), 0, "the verb never sends");
 }
 
-/// Only an absent transaction beyond retention permits orphan reconstruction.
 #[tokio::test]
 #[serial_test::serial]
-async fn answerable_or_in_retention_orphans_are_not_cleared() {
+async fn a_cleared_orphan_restores_its_destination() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::profile::receipt::{OperationDestination, PaymentDestinations};
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let rpc = OrphanRpc::new("NOT_FOUND", 1200);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(rpc.clone())
+        .mount(&server)
+        .await;
+    fixture(home.path(), &server.uri());
+    let m = format!(
+        "{}",
+        stellar_strkey::ed25519::MuxedAccount {
+            ed25519: [7; 32],
+            id: u64::MAX
+        }
+    );
+    let destinations = PaymentDestinations::PerOperation(vec![
+        OperationDestination {
+            operation: 0,
+            destination: SOURCE.to_owned(),
+        },
+        OperationDestination {
+            operation: 2,
+            destination: m,
+        },
+    ]);
+    let (window, profile) = seed_window_for_to(
+        home.path(),
+        ENVELOPE_HASH,
+        TX_HASH,
+        7,
+        0,
+        destinations.clone(),
+    );
+    let receipts = ReceiptStore::open_at(&home.path().join("receipts"), PROFILE).unwrap();
+    std::fs::write(receipts.file_path().unwrap(), b"{}").unwrap();
+    let (code, data) = orphan_clear(home.path());
+    assert_eq!(code, 0, "{data}");
+    assert_eq!(
+        receipts.get(ENVELOPE_HASH).unwrap().unwrap().destinations,
+        destinations
+    );
+    assert_eq!(
+        data["data"]["destinations"],
+        destinations.to_stored().unwrap()
+    );
+    assert!(window.pending_reservations(&profile).unwrap().is_empty());
+    assert_eq!(rpc.log.sends(), 0);
+}
+
+/// Only an absent transaction beyond retention permits reconstruction of an
+/// orphan with an execution bound, even once that bound has passed.
+#[tokio::test]
+#[serial_test::serial]
+async fn answerable_or_in_retention_bounded_orphans_are_not_cleared() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for (status, floor) in [
         ("SUCCESS", 1200),
         ("FAILED", 1200),
         ("NOT_FOUND", 1000),
         ("PENDING", 1200),
     ] {
-        let home = tempfile::TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let rpc = OrphanRpc::new(status, floor);
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(rpc.clone())
             .mount(&server)
             .await;
-        let (window, profile) = orphan_fixture(home.path(), &server.uri());
+        let (window, profile) = bounded_orphan_fixture(home.path(), &server.uri());
         let (code, data) = orphan_clear(home.path());
         assert_eq!(code, 1, "{status} {floor}: {data}");
         assert_eq!(data["error"]["code"], "submission.not_clearable");
@@ -980,13 +1148,62 @@ async fn answerable_or_in_retention_orphans_are_not_cleared() {
     }
 }
 
+/// An untimed orphan is cleared on its authenticated hold with both
+/// acknowledgements whatever the endpoint reports. With `--acknowledge` alone,
+/// recovery and reconciliation may run, but the clear is refused and the hold
+/// remains.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_untimed_orphan_is_cleared_with_both_acknowledgements_whatever_the_endpoint_reports() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    for (status, floor) in [
+        ("SUCCESS", 1200),
+        ("FAILED", 1200),
+        ("NOT_FOUND", 1000),
+        ("PENDING", 1200),
+    ] {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let rpc = OrphanRpc::new(status, floor);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(rpc.clone())
+            .mount(&server)
+            .await;
+        let (window, profile) = orphan_fixture(home.path(), &server.uri());
+
+        let (code, data) = clear(home.path(), true);
+        assert_eq!(code, 1, "{status} {floor}: {data}");
+        assert_eq!(data["error"]["code"], "submission.unbounded_exposure");
+        assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
+        assert_eq!(cleared_rows(home.path()), 0);
+
+        let (code, data) = orphan_clear(home.path());
+        assert_eq!(code, 0, "{status} {floor}: {data}");
+        assert_eq!(data["data"]["reservation_released"], true);
+        assert!(window.pending_reservations(&profile).unwrap().is_empty());
+        let receipt = receipt(home.path());
+        assert_eq!(receipt.status, ReceiptStatus::ClearedByOperator);
+        assert!(receipt.recovered_from_reservation);
+        let rows = rows_of_kind(home.path(), "submission_receipt_cleared");
+        assert_eq!(rows.len(), 1, "{status} {floor}: {rows:?}");
+        assert_eq!(rows[0]["reservation_released"], true);
+        assert_eq!(rows[0]["unbounded_exposure"], true);
+        assert_eq!(rpc.log.sends(), 0, "{status} {floor}: the verb never sends");
+    }
+}
+
 /// The durable recovery receipt is the crash checkpoint before reservation
 /// release. A new process finishes from either side of release and records one clear.
 #[tokio::test]
 #[serial_test::serial]
 async fn clear_resumes_after_recovered_receipt_write_before_release() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for released_before_retry in [false, true] {
-        let home = tempfile::TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let rpc = OrphanRpc::new("NOT_FOUND", 1200);
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -996,7 +1213,10 @@ async fn clear_resumes_after_recovered_receipt_write_before_release() {
         let (window, profile) = orphan_fixture(home.path(), &server.uri());
         let lock = std::fs::OpenOptions::new()
             .write(true)
-            .open(home.path().join(format!("policy/{PROFILE}.window.lock")))
+            .open(stellar_agent_core::policy::state_lock::window_lock_path(
+                &home.path().join(format!("policy/{PROFILE}.window")),
+                &profile.policy_window_state_key_id,
+            ))
             .unwrap();
         lock.try_lock().unwrap();
         let (interrupted, error) = orphan_clear(home.path());
@@ -1014,7 +1234,14 @@ async fn clear_resumes_after_recovered_receipt_write_before_release() {
         drop(lock);
         assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
         if released_before_retry {
-            window.release(&profile, ENVELOPE_HASH).unwrap();
+            window
+                .apply_accounting_decision(
+                    &profile,
+                    window
+                        .operator_clear_decision(&profile, ENVELOPE_HASH, true, true)
+                        .unwrap(),
+                )
+                .unwrap();
         }
         let (code, data) = orphan_clear(home.path());
         assert_eq!(code, 0, "{data}");
@@ -1035,7 +1262,10 @@ async fn clear_resumes_after_recovered_receipt_write_before_release() {
 #[tokio::test]
 #[serial_test::serial]
 async fn tx_status_reports_an_orphan_requiring_operator_recovery() {
-    let home = tempfile::TempDir::new().unwrap();
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = OrphanRpc::new("NOT_FOUND", 1200);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1061,8 +1291,11 @@ async fn tx_status_reports_an_orphan_requiring_operator_recovery() {
 #[tokio::test]
 #[serial_test::serial]
 async fn orphan_recovery_preconditions_leave_state_untouched() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for condition in ["unreadable_receipt", "bad_hmac", "no_acknowledgement"] {
-        let home = tempfile::TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let rpc = OrphanRpc::new("NOT_FOUND", 1200);
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1113,12 +1346,15 @@ async fn orphan_recovery_preconditions_leave_state_untouched() {
     }
 }
 
-/// A definitive answer can restore an orphan's receipt during status lookup;
-/// the resulting receipt and its one settlement audit row must be visible.
+/// A success report restores an orphan receipt while retaining exposure and
+/// leaving authenticated outcome audit rows absent.
 #[tokio::test]
 #[serial_test::serial]
-async fn tx_status_surfaces_a_restored_orphan_receipt_and_settlement_row() {
-    let home = tempfile::TempDir::new().unwrap();
+async fn tx_status_surfaces_a_restored_orphan_receipt_without_settlement() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = OrphanRpc::new("SUCCESS", 1200);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1130,14 +1366,14 @@ async fn tx_status_surfaces_a_restored_orphan_receipt_and_settlement_row() {
     let (code, data) = run_cli(home.path(), &args);
     assert_eq!(code, 0, "{data}");
     assert_eq!(data["data"]["record"]["status"], "success");
-    assert_eq!(data["data"]["record"]["reservation_open"], false);
-    assert!(window.pending_reservations(&profile).unwrap().is_empty());
+    assert_eq!(data["data"]["record"]["reservation_open"], true);
+    assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
     assert_eq!(
         audit_rows(home.path())
             .iter()
             .filter(|row| row.contains("value_action_submitted"))
             .count(),
-        1
+        0
     );
     let (code, data) = run_cli(home.path(), &args);
     assert_eq!(code, 0, "{data}");
@@ -1146,7 +1382,7 @@ async fn tx_status_surfaces_a_restored_orphan_receipt_and_settlement_row() {
             .iter()
             .filter(|row| row.contains("value_action_submitted"))
             .count(),
-        1
+        0
     );
     assert_eq!(rpc.log.sends(), 0, "the verb never sends");
 }
@@ -1155,11 +1391,11 @@ async fn tx_status_surfaces_a_restored_orphan_receipt_and_settlement_row() {
 // The decision after reconciliation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A reservation the clear's reconciliation releases on chain evidence gets
-/// its settled row before the clear, and the clear row names the evidence.
+/// A consumed sequence leaves the outcome unknown; clear records only the
+/// operator acknowledgement.
 #[tokio::test]
-async fn an_evidence_release_writes_the_settled_row_before_the_clear() {
-    let home = tempfile::TempDir::new().unwrap();
+async fn a_negative_observation_writes_only_the_clear_acknowledgement() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
     // Sequence 1 is the one the account reports: another transaction used it.
@@ -1168,13 +1404,12 @@ async fn an_evidence_release_writes_the_settled_row_before_the_clear() {
     let (code, envelope) = clear(home.path(), true);
 
     assert_eq!(code, 0, "{envelope}");
-    assert_eq!(envelope["data"]["cleared_from"], "ambiguous");
+    assert_eq!(envelope["data"]["cleared_from"], "pending");
     let cleared = receipt(home.path());
     assert_eq!(cleared.status, ReceiptStatus::ClearedByOperator);
     assert_eq!(
-        cleared.release_code,
-        Some(ReleaseEvidence::SequenceConsumed),
-        "the cleared receipt keeps the reason its reservation was released"
+        cleared.release_code, None,
+        "absence does not create a release reason"
     );
     let rows: Vec<Value> = audit_rows(home.path())
         .iter()
@@ -1184,19 +1419,17 @@ async fn an_evidence_release_writes_the_settled_row_before_the_clear() {
     let kinds: Vec<&str> = rows.iter().map(|r| r["kind"].as_str().unwrap()).collect();
     assert_eq!(
         kinds,
-        ["value_action_failed", "submission_receipt_cleared"],
-        "the settled row precedes the clear: {rows:?}"
+        ["submission_receipt_cleared"],
+        "only the operator acknowledgement is recorded: {rows:?}"
     );
-    assert_eq!(rows[0]["code"], "submission.sequence_consumed");
-    assert_eq!(rows[1]["evidence"], "submission.sequence_consumed");
+    assert!(rows[0].get("evidence").is_none());
     assert_eq!(rpc.log.sends(), 0, "the verb never sends");
 }
 
-/// An ambiguous receipt whose retention window closed is cleared with an
-/// unknown outcome, whatever its time bound.
+/// A retention gap does not clear a bounded transaction that can still apply.
 #[tokio::test]
-async fn a_receipt_beyond_retention_is_cleared_with_an_unknown_outcome() {
-    let home = tempfile::TempDir::new().unwrap();
+async fn a_receipt_beyond_retention_keeps_its_open_execution_bound() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let mut rpc = FixedStatusRpc::new("NOT_FOUND");
     rpc.floor = 1_200;
     let server = endpoint(&rpc).await;
@@ -1206,14 +1439,13 @@ async fn a_receipt_beyond_retention_is_cleared_with_an_unknown_outcome() {
 
     let (code, envelope) = clear(home.path(), true);
 
-    assert_eq!(code, 0, "{envelope}");
-    assert_eq!(envelope["data"]["cleared_from"], "ambiguous");
+    assert_eq!(code, 1, "{envelope}");
+    assert_eq!(envelope["error"]["code"], "submission.still_pending");
     let cleared = receipt(home.path());
-    assert_eq!(cleared.status, ReceiptStatus::ClearedByOperator);
+    assert_eq!(cleared.status, ReceiptStatus::Ambiguous);
     assert_eq!(cleared.release_code, None);
     let rows = rows_of_kind(home.path(), "submission_receipt_cleared");
-    assert_eq!(rows.len(), 1);
-    assert!(rows[0].get("evidence").is_none(), "{}", rows[0]);
+    assert!(rows.is_empty());
     assert!(rows_of_kind(home.path(), "value_action_failed").is_empty());
     assert_eq!(rpc.log.sends(), 0, "the verb never sends");
 }
@@ -1223,7 +1455,10 @@ async fn a_receipt_beyond_retention_is_cleared_with_an_unknown_outcome() {
 #[tokio::test]
 #[serial_test::serial]
 async fn a_sent_receipt_whose_time_bound_is_open_is_still_pending() {
-    let home = tempfile::TempDir::new().unwrap();
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
     let max_time = now_secs() + 86_400;
@@ -1256,7 +1491,7 @@ async fn without_the_acknowledgement_the_next_step_comes_from_the_record() {
         (now_secs() + 86_400, "run 'stellar-agent tx status"),
         (0, "pass --acknowledge"),
     ] {
-        let home = tempfile::TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let rpc = FixedStatusRpc::new("NOT_FOUND");
         let server = endpoint(&rpc).await;
         fixture_with(home.path(), &server.uri(), 7, max_time);
@@ -1285,7 +1520,10 @@ async fn without_the_acknowledgement_the_next_step_comes_from_the_record() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_audit_refusal_reconciles_nothing_and_changes_nothing() {
-    let home = tempfile::TempDir::new().unwrap();
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
     fixture_with(home.path(), &server.uri(), 1, 0);
@@ -1315,7 +1553,7 @@ async fn an_audit_refusal_reconciles_nothing_and_changes_nothing() {
 /// apply.
 #[tokio::test]
 async fn a_reconciliation_endpoint_failure_refuses_the_clear() {
-    let home = tempfile::TempDir::new().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let mut rpc = FixedStatusRpc::new("NOT_FOUND");
     rpc.fail_ledgers = true;
     let server = endpoint(&rpc).await;
@@ -1346,11 +1584,11 @@ async fn a_reconciliation_endpoint_failure_refuses_the_clear() {
     assert_eq!(rpc.log.sends(), 0, "the verb never sends");
 }
 
-/// A settled row that cannot be appended refuses the clear and leaves the
-/// receipt clearable; the retry writes one settled row and one clear row.
+/// A clear acknowledgement that cannot be appended leaves the receipt
+/// clearable; retry records one clear and no endpoint-derived failure.
 #[tokio::test]
-async fn a_failed_settlement_append_is_retried_without_a_second_row() {
-    let home = tempfile::TempDir::new().unwrap();
+async fn a_failed_clear_append_is_retried_without_a_failure_row() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let mut rpc = FixedStatusRpc::new("NOT_FOUND");
     rpc.break_audit = Some(home.path().to_path_buf());
     let server = endpoint(&rpc).await;
@@ -1367,11 +1605,10 @@ async fn a_failed_settlement_append_is_retried_without_a_second_row() {
         "the refusal is the audit error: {envelope}"
     );
     let released = receipt(home.path());
-    assert_eq!(released.status, ReceiptStatus::Ambiguous);
+    assert_eq!(released.status, ReceiptStatus::Pending);
     assert_eq!(
-        released.release_code,
-        Some(ReleaseEvidence::SequenceConsumed),
-        "the receipt keeps its evidence and stays clearable"
+        released.release_code, None,
+        "the receipt stays clearable with an unknown outcome"
     );
 
     std::fs::remove_file(home.path().join("audit")).unwrap();
@@ -1383,11 +1620,10 @@ async fn a_failed_settlement_append_is_retried_without_a_second_row() {
 
     assert_eq!(code, 0, "{envelope}");
     let settled = rows_of_kind(home.path(), "value_action_failed");
-    assert_eq!(settled.len(), 1, "one settled row: {settled:?}");
-    assert_eq!(settled[0]["code"], "submission.sequence_consumed");
+    assert!(settled.is_empty(), "{settled:?}");
     let cleared = rows_of_kind(home.path(), "submission_receipt_cleared");
     assert_eq!(cleared.len(), 1, "one clear row: {cleared:?}");
-    assert_eq!(cleared[0]["evidence"], "submission.sequence_consumed");
+    assert!(cleared[0].get("evidence").is_none());
     assert_eq!(
         receipt(home.path()).status,
         ReceiptStatus::ClearedByOperator
@@ -1399,10 +1635,10 @@ async fn a_failed_settlement_append_is_retried_without_a_second_row() {
 // Release evidence through tx status and the gate pass
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `tx status` writes the settled row under each release code, reports it on
-/// the record, and a rerun writes no second row.
+/// Sequence and time observations leave the outcome pending and produce no
+/// failure row, including on repeated status calls.
 #[tokio::test]
-async fn tx_status_writes_the_settled_row_under_each_release_code() {
+async fn tx_status_does_not_promote_negative_observations_to_failure() {
     let now = now_secs();
     for (sequence, max_time, code) in [
         (1, 0, "submission.sequence_consumed"),
@@ -1410,7 +1646,7 @@ async fn tx_status_writes_the_settled_row_under_each_release_code() {
         // is unconsumed.
         (7, now - 100, "submission.time_bound_passed"),
     ] {
-        let home = tempfile::TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let rpc = FixedStatusRpc::new("NOT_FOUND");
         let server = endpoint(&rpc).await;
         fixture_with(home.path(), &server.uri(), sequence, max_time);
@@ -1419,19 +1655,17 @@ async fn tx_status_writes_the_settled_row_under_each_release_code() {
         let (exit, envelope) = run_cli(home.path(), &status);
 
         assert_eq!(exit, 0, "{code}: {envelope}");
-        assert_eq!(envelope["data"]["record"]["status"], "ambiguous");
-        assert_eq!(envelope["data"]["record"]["release_code"], code);
+        assert_eq!(envelope["data"]["record"]["status"], "pending");
+        assert!(envelope["data"]["record"]["release_code"].is_null());
         let failed = rows_of_kind(home.path(), "value_action_failed");
-        assert_eq!(failed.len(), 1, "{code}: {failed:?}");
-        assert_eq!(failed[0]["code"], code);
-        assert_eq!(failed[0]["envelope_hash"], ENVELOPE_HASH);
+        assert!(failed.is_empty(), "{code}: {failed:?}");
 
         let (exit, envelope) = run_cli(home.path(), &status);
         assert_eq!(exit, 0, "{code}: {envelope}");
         assert_eq!(
             rows_of_kind(home.path(), "value_action_failed").len(),
-            1,
-            "{code}: a rerun writes no second row"
+            0,
+            "{code}: a rerun writes no failure row"
         );
         assert_eq!(rpc.log.sends(), 0, "{code}: the verb never sends");
     }
@@ -1466,16 +1700,21 @@ fn assert_refused_on_the_fee(code: i32, envelope: &Value) {
         "the run refuses on the fee: {envelope}"
     );
     let message = envelope["error"]["message"].as_str().unwrap();
-    assert!(message.contains("not-a-fee"), "{message}");
+    assert!(message.contains("--fee"), "{message}");
+    assert!(
+        !message.contains("not-a-fee"),
+        "the refusal names the argument, never the rejected value: {message}"
+    );
 }
 
-/// The gate pass a value verb runs releases a due reservation on chain
-/// evidence, writes its settled row under the evidence's code, and never
-/// sends.
+/// The gate pass retains untimed exposure on a consumed sequence and never sends.
 #[tokio::test]
 #[serial_test::serial]
-async fn the_gate_pass_settles_on_evidence_and_never_sends() {
-    let home = tempfile::TempDir::new().unwrap();
+async fn the_gate_pass_retains_negative_exposure_and_never_sends() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
     let (window, profile) = windowed_fixture(home.path(), &server.uri(), 1);
@@ -1484,25 +1723,59 @@ async fn the_gate_pass_settles_on_evidence_and_never_sends() {
 
     assert_refused_on_the_fee(code, &envelope);
     assert!(
-        window.pending_reservations(&profile).unwrap().is_empty(),
-        "the pass released the reservation"
+        window.pending_reservations(&profile).unwrap().len() == 1,
+        "the pass retains the reservation"
     );
-    assert_eq!(
-        receipt(home.path()).release_code,
-        Some(ReleaseEvidence::SequenceConsumed)
-    );
+    assert_eq!(receipt(home.path()).release_code, None);
     let failed = rows_of_kind(home.path(), "value_action_failed");
-    assert_eq!(failed.len(), 1, "{failed:?}");
-    assert_eq!(failed[0]["code"], "submission.sequence_consumed");
+    assert!(failed.is_empty(), "{failed:?}");
     assert_eq!(rpc.log.sends(), 0, "the gate pass never sends");
 }
 
-/// A gate pass that cannot write the settled row leaves the reason on the
-/// receipt, and the next `tx status` writes the row under it.
+/// The gate pass delivers the accounting expiry it commits before the fee
+/// refuses the run.
 #[tokio::test]
 #[serial_test::serial]
-async fn a_release_reason_left_by_a_gate_pass_is_written_by_tx_status() {
-    let home = tempfile::TempDir::new().unwrap();
+async fn the_gate_pass_drains_accounting_obligations_before_the_refusal() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let rpc = FixedStatusRpc::new("NOT_FOUND");
+    let server = endpoint(&rpc).await;
+    fixture_with(home.path(), &server.uri(), 7, 1);
+    let (window, profile) = seed_window(home.path(), ENVELOPE_HASH, 7, 1);
+
+    let (code, envelope) = pay_refused_after_the_reconcile_pass(home.path());
+
+    assert_refused_on_the_fee(code, &envelope);
+    assert!(
+        window.pending_reservations(&profile).unwrap().is_empty(),
+        "the expired reservation ends"
+    );
+    assert!(
+        window
+            .owed_accounting_expiries(&profile)
+            .unwrap()
+            .is_empty(),
+        "no accounting expiry stays owed"
+    );
+    assert_eq!(
+        rows_of_kind(home.path(), "submission_accounting_expired").len(),
+        1
+    );
+    assert_eq!(rpc.log.sends(), 0, "the gate pass never sends");
+}
+
+/// An unavailable audit log does not turn a negative observation into an
+/// owed failure row; status retains the debit when the log becomes available.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_negative_gate_observation_does_not_owe_an_audit_failure() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let rpc = FixedStatusRpc::new("NOT_FOUND");
     let server = endpoint(&rpc).await;
     let (window, profile) = windowed_fixture(home.path(), &server.uri(), 1);
@@ -1512,11 +1785,11 @@ async fn a_release_reason_left_by_a_gate_pass_is_written_by_tx_status() {
     let (code, envelope) = pay_refused_after_the_reconcile_pass(home.path());
 
     assert_refused_on_the_fee(code, &envelope);
-    assert!(window.pending_reservations(&profile).unwrap().is_empty());
+    assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
     assert_eq!(
         receipt(home.path()).release_code,
-        Some(ReleaseEvidence::SequenceConsumed),
-        "the receipt keeps the reason the row is owed"
+        None,
+        "the receipt has no definitive failure evidence"
     );
     std::fs::remove_file(home.path().join("audit")).unwrap();
     std::fs::rename(home.path().join("audit-held"), home.path().join("audit")).unwrap();
@@ -1528,13 +1801,9 @@ async fn a_release_reason_left_by_a_gate_pass_is_written_by_tx_status() {
     );
 
     assert_eq!(code, 0, "{envelope}");
-    assert_eq!(
-        envelope["data"]["record"]["release_code"],
-        "submission.sequence_consumed"
-    );
+    assert!(envelope["data"]["record"]["release_code"].is_null());
     let failed = rows_of_kind(home.path(), "value_action_failed");
-    assert_eq!(failed.len(), 1, "{failed:?}");
-    assert_eq!(failed[0]["code"], "submission.sequence_consumed");
+    assert!(failed.is_empty(), "{failed:?}");
     assert_eq!(rpc.log.sends(), 0, "neither run sends");
 }
 
@@ -1542,7 +1811,7 @@ async fn a_release_reason_left_by_a_gate_pass_is_written_by_tx_status() {
 #[tokio::test]
 async fn untimed_and_unsent_clears_do_not_need_a_ledger_time() {
     for sent in [true, false] {
-        let home = tempfile::TempDir::new().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let mut rpc = FixedStatusRpc::new("NOT_FOUND");
         rpc.fail_ledgers = true;
         let server = endpoint(&rpc).await;
@@ -1580,7 +1849,7 @@ async fn untimed_and_unsent_clears_do_not_need_a_ledger_time() {
 /// An absent account leaves the sequence unknown and permits the untimed clear.
 #[tokio::test]
 async fn an_absent_source_account_leaves_an_untimed_outcome_unknown() {
-    let home = tempfile::TempDir::new().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let mut rpc = FixedStatusRpc::new("NOT_FOUND");
     rpc.source_absent = true;
     let server = endpoint(&rpc).await;
@@ -1600,11 +1869,16 @@ async fn an_absent_source_account_leaves_an_untimed_outcome_unknown() {
     assert_eq!(rpc.log.sends(), 0);
 }
 
-/// A clear waits for the receipt checkpoint and recognizes success on retry.
+/// A clear waits for the receipt checkpoint, and a retry records the reported
+/// success: the untimed hold then needs both acknowledgements, with which it
+/// is cleared.
 #[tokio::test]
 #[serial_test::serial]
 async fn a_clear_refuses_a_success_whose_receipt_write_failed_and_retries() {
-    let home = tempfile::TempDir::new().unwrap();
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let mut rpc = FixedStatusRpc::new("NOT_FOUND");
     rpc.reconcile_success = true;
     let server = endpoint(&rpc).await;
@@ -1629,17 +1903,73 @@ async fn a_clear_refuses_a_success_whose_receipt_write_failed_and_retries() {
 
     let (code, envelope) = clear(home.path(), true);
     assert_eq!(code, 1, "{envelope}");
-    assert_eq!(envelope["error"]["code"], "submission.not_clearable");
-    assert!(
-        envelope["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("settled by reconciliation")
-    );
+    assert_eq!(envelope["error"]["code"], "submission.unbounded_exposure");
     assert_eq!(receipt(home.path()).status, ReceiptStatus::Success);
-    assert!(window.pending_reservations(&profile).unwrap().is_empty());
+    assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
     assert_eq!(audit_rows(home.path()), before);
+
+    let (code, envelope) = clear_unbounded(home.path());
+    assert_eq!(code, 0, "{envelope}");
+    assert_eq!(envelope["data"]["cleared_from"], "success");
+    assert_eq!(envelope["data"]["reservation_released"], true);
+    assert_eq!(
+        receipt(home.path()).status,
+        ReceiptStatus::ClearedByOperator
+    );
+    assert!(window.pending_reservations(&profile).unwrap().is_empty());
+    assert_eq!(cleared_rows(home.path()), 1);
     assert_eq!(rpc.log.sends(), 0);
+}
+
+/// An untimed transaction the endpoint reports as successful keeps its hold
+/// on testnet as on mainnet. `--acknowledge` alone is refused; with
+/// `--acknowledge-unbounded` as well the clear releases the hold, records
+/// that release, and the window admits again.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_testnet_untimed_success_is_cleared_only_with_both_acknowledgements() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let rpc = FixedStatusRpc::new("SUCCESS");
+    let server = endpoint(&rpc).await;
+    let (window, profile) = windowed_fixture(home.path(), &server.uri(), 7);
+    assert!(
+        !admits(&window, &profile, 999_950),
+        "the hold occupies the cap"
+    );
+
+    let (code, envelope) = clear(home.path(), true);
+    assert_eq!(code, 1, "{envelope}");
+    assert_eq!(envelope["error"]["code"], "submission.unbounded_exposure");
+    assert_eq!(receipt(home.path()).status, ReceiptStatus::Success);
+    assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
+    assert_eq!(cleared_rows(home.path()), 0);
+    assert!(
+        !admits(&window, &profile, 999_950),
+        "a refused clear leaves the hold counted"
+    );
+
+    let (code, envelope) = clear_unbounded(home.path());
+    assert_eq!(code, 0, "{envelope}");
+    assert_eq!(envelope["data"]["cleared_from"], "success");
+    assert_eq!(envelope["data"]["reservation_released"], true);
+    assert_eq!(
+        receipt(home.path()).status,
+        ReceiptStatus::ClearedByOperator
+    );
+    assert!(window.pending_reservations(&profile).unwrap().is_empty());
+    let rows = rows_of_kind(home.path(), "submission_receipt_cleared");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["envelope_hash"], ENVELOPE_HASH);
+    assert_eq!(rows[0]["reservation_released"], true);
+    assert_eq!(rows[0]["unbounded_exposure"], true);
+    assert!(
+        admits(&window, &profile, 999_950),
+        "the cleared hold stops counting"
+    );
+    assert_eq!(rpc.log.sends(), 0, "the verb never sends");
 }
 
 /// Fails only the post-send receipt write while the real recorder confirms spend.
@@ -1673,11 +2003,14 @@ impl stellar_agent_network::SubmissionRecorder for ReceiptWriteFailure<'_> {
     }
 }
 
-/// Status repairs a post-send receipt failure and writes the missing settlement
-/// once, keeping the recorder's confirmed window spend unchanged across retries.
+/// Status repairs a post-send receipt failure without an authenticated outcome
+/// row, keeping exposure unchanged across retries.
 #[tokio::test]
 #[serial_test::serial]
 async fn tx_status_repairs_a_post_send_receipt_failure_without_counting_twice() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use stellar_agent_core::audit_log::PolicyDecision;
     use stellar_agent_core::policy::v1::criteria::state_store::{
         PolicyStateStore, StateKey, WindowEntry, WindowLimit,
@@ -1689,7 +2022,7 @@ async fn tx_status_repairs_a_post_send_receipt_failure_without_counting_twice() 
     };
     use wiremock::matchers::body_partial_json;
 
-    let home = tempfile::TempDir::new().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let server = MockServer::start().await;
     let signed = SignedTestEnvelope::for_source([0x38; 32]);
     let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
@@ -1718,11 +2051,18 @@ async fn tx_status_repairs_a_post_send_receipt_failure_without_counting_twice() 
             .await;
     }
     let (window, profile) = windowed_fixture(home.path(), &server.uri(), 7);
-    window.release(&profile, ENVELOPE_HASH).unwrap();
+    window
+        .apply_accounting_decision(
+            &profile,
+            window
+                .operator_clear_decision(&profile, ENVELOPE_HASH, true, true)
+                .unwrap(),
+        )
+        .unwrap();
     std::fs::remove_file(home.path().join(format!("receipts/{PROFILE}.json"))).unwrap();
     let receipts = ReceiptStore::open_at(&home.path().join("receipts"), PROFILE).unwrap();
     let key = StateKey::new(PROFILE, 1, "native", 86_400);
-    // No post-send audit writer: status owes the outcome row as well as the receipt.
+    // No post-send audit writer: status repairs the receipt without an outcome fact.
     let recorder = ReceiptWriteFailure {
         recorder: WalletSubmissionRecorder::new(
             &profile,
@@ -1766,7 +2106,7 @@ async fn tx_status_repairs_a_post_send_receipt_failure_without_counting_twice() 
         .unwrap()
         .unwrap();
     assert_eq!(checkpoint.status, ReceiptStatus::Pending);
-    assert!(window.pending_reservations(&profile).unwrap().is_empty());
+    assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
     assert!(rows_of_kind(home.path(), "value_action_submitted").is_empty());
     let confirmed_window =
         std::fs::read(home.path().join(format!("policy/{PROFILE}.window"))).unwrap();
@@ -1777,7 +2117,7 @@ async fn tx_status_repairs_a_post_send_receipt_failure_without_counting_twice() 
         );
         assert_eq!(code, 0, "{data}");
         assert_eq!(data["data"]["record"]["status"], "success");
-        assert_eq!(data["data"]["record"]["reservation_open"], false);
+        assert_eq!(data["data"]["record"]["reservation_open"], true);
         assert_eq!(
             receipts
                 .get(&checkpoint.envelope_hash)
@@ -1787,8 +2127,7 @@ async fn tx_status_repairs_a_post_send_receipt_failure_without_counting_twice() 
             ReceiptStatus::Success
         );
         let rows = rows_of_kind(home.path(), "value_action_submitted");
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert_eq!(rows[0]["envelope_hash"], checkpoint.envelope_hash);
+        assert!(rows.is_empty(), "{rows:?}");
         let state = PolicyStateStore::new();
         window.load_into(PROFILE, &profile, &state).unwrap();
         assert_eq!(state.query_window(&key, now + 1_000).unwrap(), (500, 1));
@@ -1801,4 +2140,370 @@ async fn tx_status_repairs_a_post_send_receipt_failure_without_counting_twice() 
         stellar_agent_test_support::rpc_request_count(&server, "sendTransaction").await,
         1
     );
+}
+
+/// Status and acknowledged clear refuse an edited network before any RPC or final row.
+#[tokio::test]
+#[serial_test::serial]
+async fn chain_flip_cannot_clear_original_hold() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let primary = MockServer::start().await;
+    let oracle = MockServer::start().await;
+    let rpc = FixedStatusRpc::new("FAILED");
+    rpc.mount(&primary).await;
+    rpc.mount(&oracle).await;
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    fixture(home.path(), &primary.uri());
+    let path = home.path().join(format!("profiles/{PROFILE}.toml"));
+    let testnet = std::fs::read_to_string(&path).unwrap();
+    let mainnet = testnet
+        .replace("stellar:testnet", "stellar:mainnet")
+        .replace(&primary.uri(), "https://primary.example");
+    std::fs::write(&path, mainnet).unwrap();
+    let (window, original) = seed_window(home.path(), ENVELOPE_HASH, 7, 0);
+    std::fs::write(&path, testnet).unwrap();
+    let window_path = home.path().join(format!("policy/{PROFILE}.window"));
+    let before = std::fs::read(&window_path).unwrap();
+    let receipt_path = home.path().join(format!("receipts/{PROFILE}.json"));
+    let receipt_before = std::fs::read(&receipt_path).unwrap();
+    let audit_before = audit_rows(home.path());
+    for receipt_bytes in [receipt_before.as_slice(), b"unreadable receipt"] {
+        std::fs::write(&receipt_path, receipt_bytes).unwrap();
+        for arguments in [
+            vec!["tx", "status", TX_HASH],
+            vec!["tx", "receipt", "clear", ENVELOPE_HASH, "--acknowledge"],
+            vec![
+                "tx",
+                "receipt",
+                "clear",
+                ENVELOPE_HASH,
+                "--acknowledge",
+                "--acknowledge-unbounded",
+            ],
+        ] {
+            let mut arguments = arguments;
+            arguments.extend(["--profile", PROFILE]);
+            let (code, body) = run_cli(home.path(), &arguments);
+            assert_ne!(code, 0, "{body}");
+            assert_eq!(
+                body["error"]["code"], "policy.window_chain_mismatch",
+                "{body}"
+            );
+            assert_eq!(std::fs::read(&window_path).unwrap(), before);
+            assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_bytes);
+            assert_eq!(audit_rows(home.path()), audit_before);
+        }
+    }
+    assert_eq!(window.pending_reservations(&original).unwrap().len(), 1);
+    assert!(primary.received_requests().await.unwrap().is_empty());
+    assert!(oracle.received_requests().await.unwrap().is_empty());
+}
+
+/// The spending the window counts for the fixtures' bucket.
+fn counted(
+    window: &stellar_agent_network::policy_state::PersistedWindowStore,
+    profile: &stellar_agent_core::profile::schema::Profile,
+) -> (i128, u32) {
+    use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+    let state = PolicyStateStore::new();
+    window.load_into(PROFILE, profile, &state).unwrap();
+    state
+        .query_window(
+            &StateKey::new(PROFILE, 1, "native", 86_400),
+            stellar_agent_core::timefmt::now_unix_ms().unwrap() + 1_000,
+        )
+        .unwrap()
+}
+
+/// Forged receipts create no settlement rows through `tx status`. Two status
+/// calls preserve authentic holds and counted amounts. The forged cases are a
+/// receipt edited to `Failed` over an authentic untimed hold and a fabricated
+/// `Failed` receipt with no hold. An ambiguous receipt with a release code and
+/// a success report are the controls.
+#[tokio::test]
+#[serial_test::serial]
+async fn tx_status_forged_receipts_create_no_settlement_rows() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    for (label, endpoint_status, held) in [
+        ("edited-failed", "FAILED", true),
+        ("fabricated-failed", "FAILED", false),
+        ("ambiguous-released", "NOT_FOUND", true),
+        ("success", "SUCCESS", true),
+    ] {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let rpc = FixedStatusRpc::new(endpoint_status);
+        let server = endpoint(&rpc).await;
+        fixture_with(home.path(), &server.uri(), 7, 0);
+        let window = held.then(|| seed_window(home.path(), ENVELOPE_HASH, 7, 0));
+        let receipts = ReceiptStore::open_at(&home.path().join("receipts"), PROFILE).unwrap();
+        match label {
+            "edited-failed" | "fabricated-failed" => receipts
+                .finalize(
+                    ENVELOPE_HASH,
+                    ReceiptStatus::Failed {
+                        code: "ledger.op_failed".to_owned(),
+                    },
+                    Some(1_001),
+                )
+                .unwrap(),
+            "ambiguous-released" => receipts
+                .finalize_released(
+                    ENVELOPE_HASH,
+                    stellar_agent_core::profile::receipt::ReleaseEvidence::SequenceConsumed,
+                )
+                .unwrap(),
+            _ => {}
+        }
+        let before = window.as_ref().map(|(window, profile)| {
+            (
+                window.pending_reservations(profile).unwrap(),
+                counted(window, profile),
+            )
+        });
+
+        for _ in 0..2 {
+            let (code, envelope) = run_cli(
+                home.path(),
+                &["tx", "status", TX_HASH, "--profile", PROFILE],
+            );
+            assert_eq!(code, 0, "{label}: {envelope}");
+            let record = &envelope["data"]["record"];
+            assert_eq!(
+                record["settlement_evidence"], "unavailable",
+                "{label}: {envelope}"
+            );
+            assert!(
+                record["settlement_decision_id"].is_null(),
+                "{label}: {envelope}"
+            );
+        }
+
+        for kind in [
+            "value_action_failed",
+            "value_action_submitted",
+            "submission_accounting_expired",
+        ] {
+            let rows = rows_of_kind(home.path(), kind);
+            assert!(rows.is_empty(), "{label}: {kind}: {rows:?}");
+        }
+        match (&window, before) {
+            (Some((window, profile)), Some((holds, counted_before))) => {
+                assert_eq!(
+                    window.pending_reservations(profile).unwrap(),
+                    holds,
+                    "{label}: the hold stands"
+                );
+                assert_eq!(holds.len(), 1, "{label}");
+                assert_eq!(counted(window, profile), counted_before, "{label}");
+                assert_eq!(counted_before, (75, 1), "{label}");
+                assert!(
+                    window.owed_accounting_expiries(profile).unwrap().is_empty(),
+                    "{label}: no accounting decision"
+                );
+            }
+            _ => assert!(
+                !home
+                    .path()
+                    .join(format!("policy/{PROFILE}.window"))
+                    .exists(),
+                "{label}: no reservation or decision is created"
+            ),
+        }
+        assert_eq!(rpc.log.sends(), 0, "{label}: the verb never sends");
+    }
+}
+
+/// Commits the accounting expiry of every due hold in `window` through an
+/// ordinary pass without the receipt store, and returns the one committed
+/// decision identifier. Delivery and projection stay owed.
+async fn commit_expiry(
+    window: &stellar_agent_network::policy_state::PersistedWindowStore,
+    profile: &stellar_agent_core::profile::schema::Profile,
+    rpc_url: &str,
+) -> String {
+    let client = stellar_agent_network::StellarRpcClient::new(rpc_url).unwrap();
+    let report = window
+        .reconcile_due(
+            profile,
+            &client,
+            None,
+            None,
+            stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+            stellar_agent_network::policy_state::RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+    let [settled] = report.settled.as_slice() else {
+        panic!("one committed expiry: {report:?}");
+    };
+    settled.decision_id.clone()
+}
+
+/// The `submission_accounting_expired` rows naming `decision_id`.
+fn expiry_rows(home: &Path, decision_id: &str) -> usize {
+    rows_of_kind(home, "submission_accounting_expired")
+        .iter()
+        .filter(|row| row["decision_id"] == decision_id)
+        .count()
+}
+
+/// A delivered accounting event whose receipt projection is still owed
+/// completes on a `tx status` run that cannot acquire the audit writer. The
+/// output carries the projected record and the run appends no row.
+#[tokio::test]
+#[serial_test::serial]
+async fn tx_status_completes_a_projection_without_the_audit_writer() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::audit_log::{AuditWriter, BindingCheck};
+
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let rpc = FixedStatusRpc::new("NOT_FOUND");
+    let server = endpoint(&rpc).await;
+    let max_time = now_secs() - 86_401;
+    fixture_with(home.path(), &server.uri(), 7, max_time);
+    let (window, mut profile) = seed_window(home.path(), ENVELOPE_HASH, 7, max_time);
+    profile.audit_log_path = home.path().join("audit").join(format!("{PROFILE}.jsonl"));
+    let decision_id = commit_expiry(&window, &profile, &server.uri()).await;
+
+    // The event is delivered and acknowledged without the receipt store, so
+    // only the projection stays owed.
+    {
+        let access = stellar_agent_network::keyring::keyed_audit_access(
+            &profile,
+            PROFILE,
+            BindingCheck::Enforce,
+        )
+        .unwrap();
+        let mut writer = AuditWriter::open(profile.audit_log_path.clone(), Some(access)).unwrap();
+        let delivered = stellar_agent_network::policy_state::deliver_accounting_expiries(
+            &mut writer,
+            &window,
+            &profile,
+            PROFILE,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                delivered.appended,
+                delivered.acknowledged,
+                delivered.projected
+            ),
+            (1, 1, 0),
+            "{delivered:?}"
+        );
+    }
+    let owed = window.owed_accounting_expiries(&profile).unwrap();
+    assert!(owed.unacknowledged.is_empty(), "{owed:?}");
+    assert_eq!(owed.unprojected, vec![decision_id.clone()]);
+
+    // The audit chain key is absent, so no audit writer can be acquired.
+    let coordinate = profile.audit_log_hash_chain_key_id.clone();
+    keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+        .unwrap()
+        .delete_credential()
+        .unwrap();
+    let rows_before = audit_rows(home.path());
+
+    let (code, envelope) = run_cli(
+        home.path(),
+        &["tx", "status", TX_HASH, "--profile", PROFILE],
+    );
+
+    assert_eq!(code, 0, "{envelope}");
+    let record = &envelope["data"]["record"];
+    assert_eq!(record["settlement_evidence"], "unavailable", "{envelope}");
+    assert_eq!(
+        record["settlement_decision_id"],
+        decision_id.as_str(),
+        "{envelope}"
+    );
+    assert_eq!(
+        record["release_code"], "submission.accounting_expired",
+        "{envelope}"
+    );
+    assert_eq!(record["status"], "ambiguous", "{envelope}");
+    assert!(
+        window
+            .owed_accounting_expiries(&profile)
+            .unwrap()
+            .is_empty(),
+        "the projection completes"
+    );
+    assert_eq!(
+        audit_rows(home.path()),
+        rows_before,
+        "the run appends no row"
+    );
+    assert_eq!(expiry_rows(home.path(), &decision_id), 1);
+    assert_eq!(rpc.log.sends(), 0, "the verb never sends");
+}
+
+/// A `tx status` run whose own reconciliation refuses still delivers the
+/// obligations of earlier runs before it renders the refusal.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_refused_tx_status_delivers_old_obligations() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    const OLD_ENVELOPE_HASH: &str =
+        "33333333333333333333333333333333333333333333333333333333333333cc";
+    const OLD_TX_HASH: &str = "44444444444444444444444444444444444444444444444444444444444444dd";
+
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let rpc = FixedStatusRpc::new("NOT_FOUND");
+    let server = endpoint(&rpc).await;
+    let max_time = now_secs() - 86_401;
+    fixture_with(home.path(), &server.uri(), 7, max_time);
+    let (window, profile) =
+        seed_window_for(home.path(), OLD_ENVELOPE_HASH, OLD_TX_HASH, 5, max_time);
+    let old = commit_expiry(&window, &profile, &server.uri()).await;
+    seed_window(home.path(), ENVELOPE_HASH, 7, max_time);
+
+    let lock = stellar_agent_core::policy::state_lock::WindowStoreLock::acquire_for(
+        window.path(),
+        &profile.policy_window_state_key_id,
+    )
+    .unwrap();
+    let status = ["tx", "status", TX_HASH, "--profile", PROFILE];
+    let (code, refused) = run_cli(home.path(), &status);
+    assert_ne!(code, 0, "{refused}");
+    assert_eq!(
+        refused["error"]["code"], "submission.record_unavailable",
+        "{refused}"
+    );
+    assert_eq!(
+        expiry_rows(home.path(), &old),
+        1,
+        "the old event is appended before the refusal renders"
+    );
+    drop(lock);
+
+    let (code, envelope) = run_cli(home.path(), &status);
+    assert_eq!(code, 0, "{envelope}");
+    assert_eq!(
+        envelope["data"]["record"]["release_code"], "submission.accounting_expired",
+        "{envelope}"
+    );
+    assert_eq!(expiry_rows(home.path(), &old), 1, "no second row");
+    assert_eq!(
+        rows_of_kind(home.path(), "submission_accounting_expired").len(),
+        2,
+        "each decision has one row"
+    );
+    assert!(
+        window
+            .owed_accounting_expiries(&profile)
+            .unwrap()
+            .unacknowledged
+            .is_empty()
+    );
+    assert_eq!(rpc.log.sends(), 0, "the verb never sends");
 }

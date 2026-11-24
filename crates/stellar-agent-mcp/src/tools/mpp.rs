@@ -127,7 +127,7 @@ impl WalletServer {
         let effects = mpp_value_effects(prepared.selected());
         let args_value = serde_json::to_value(&args)
             .map_err(|_| rmcp::ErrorData::invalid_params("invalid MPP arguments", None))?;
-        let mut disposition = match self
+        let gate = match self
             .dispatch_gate_with_value(
                 "stellar_mpp_charge_prepare",
                 &args_value,
@@ -138,9 +138,12 @@ impl WalletServer {
             )
             .await
         {
-            Ok(DispatchOutcome::Allow(_)) => ApprovalDisposition::Allow,
-            Ok(DispatchOutcome::RequireApproval(_)) => ApprovalDisposition::RequireApproval,
+            Ok(outcome) => outcome,
             Err(error) => return error.into_result(),
+        };
+        let mut disposition = match &gate {
+            DispatchOutcome::Allow(_) => ApprovalDisposition::Allow,
+            DispatchOutcome::RequireApproval(_) => ApprovalDisposition::RequireApproval,
         };
 
         // As in `paired_commit_outcome`, only a commit RequireApproval parks a request.
@@ -151,29 +154,37 @@ impl WalletServer {
                 &prepared,
                 now_unix,
             ) {
-                Ok(record) => match self
-                    .evaluate_policy_only(
-                        "stellar_mpp_charge_commit",
-                        &json!({"authorization_id": record.authorization_id()}),
-                        "stellar:testnet",
-                        Some(ValueClass::Value(effects)),
-                        None,
-                        None,
-                    )
-                    .await
-                {
-                    Ok(evaluation) => {
-                        if matches!(
-                            evaluation.decision,
-                            stellar_agent_core::policy::Decision::RequireApproval(_)
-                        ) {
-                            disposition = ApprovalDisposition::RequireApproval;
+                Ok(record) => match gate.snapshot() {
+                    Ok(snapshot) => match self
+                        .evaluate_policy_in_snapshot(
+                            "stellar_mpp_charge_commit",
+                            &json!({"authorization_id": record.authorization_id()}),
+                            "stellar:testnet",
+                            Some(ValueClass::Value(effects)),
+                            None,
+                            None,
+                            snapshot,
+                        )
+                        .await
+                    {
+                        Ok(evaluation) => {
+                            if matches!(
+                                evaluation.decision,
+                                stellar_agent_core::policy::Decision::RequireApproval(_)
+                            ) {
+                                disposition = ApprovalDisposition::RequireApproval;
+                            }
                         }
-                    }
+                        Err(error) => tracing::debug!(
+                            tool = "stellar_mpp_charge_commit",
+                            error_code = %error.code(),
+                            "stellar_mpp_charge_prepare: commit policy evaluation failed; disposition unchanged"
+                        ),
+                    },
                     Err(error) => tracing::debug!(
                         tool = "stellar_mpp_charge_commit",
                         error_code = %error.code(),
-                        "stellar_mpp_charge_prepare: commit policy evaluation failed; disposition unchanged"
+                        "stellar_mpp_charge_prepare: policy frame unavailable; disposition unchanged"
                     ),
                 },
                 Err(error) => tracing::debug!(
@@ -286,6 +297,7 @@ impl WalletServer {
             "stellar:testnet",
             "stellar_mpp_charge_commit",
             now_ms,
+            None,
         )
         .await
         {
@@ -351,7 +363,7 @@ impl WalletServer {
         if let Err(error) = verify_pending_approval(
             &state,
             approval_store.as_ref(),
-            approval_key.as_ref(),
+            approval_key.as_deref(),
             &stellar_agent_core::approval::AttestationBinding::new(
                 &self.profile_name_for_approval(),
                 self.context.chain_id.caip2_str(),
@@ -371,6 +383,15 @@ impl WalletServer {
             &self.profile,
             &profile_name,
             self.audit_binding,
+        ) {
+            return Ok(business_error_result(error.code(), error.to_string()));
+        }
+        // The identity record must serve this profile before the lazy handle
+        // can read the seed at the signing call.
+        if let Err(error) = stellar_agent_network::keyring::read_and_check_signer_binding(
+            &profile_name,
+            &self.profile,
+            self.established_owner().as_ref(),
         ) {
             return Ok(business_error_result(error.code(), error.to_string()));
         }
@@ -405,7 +426,7 @@ impl WalletServer {
         let credential = commit_authorization(
             &state,
             approval_store.as_ref(),
-            approval_key.as_ref(),
+            approval_key.as_deref(),
             &stellar_agent_core::approval::AttestationBinding::new(
                 &self.profile_name_for_approval(),
                 self.context.chain_id.caip2_str(),
@@ -773,14 +794,21 @@ fn mpp_signing_error() -> CallToolResult {
     ))
 }
 
-/// Retains a typed policy refusal across the service's MPP error boundary.
+/// Retains a typed policy refusal, a denial or a total-budget epoch refusal,
+/// across the service's MPP error boundary.
 fn accounting_error(
     error: stellar_agent_network::policy_state::WindowStoreError,
     refusal: &Mutex<Option<WalletError>>,
 ) -> stellar_agent_mpp::BeforeSignError {
-    if let stellar_agent_network::policy_state::WindowStoreError::PolicyDenied { reason } = error {
+    let typed = match error {
+        stellar_agent_network::policy_state::WindowStoreError::PolicyDenied { reason } => {
+            Some(WalletError::PolicyDenied { reason })
+        }
+        other => other.total_epoch_error().map(WalletError::Validation),
+    };
+    if let Some(typed) = typed {
         if let Ok(mut slot) = refusal.lock() {
-            *slot = Some(WalletError::PolicyDenied { reason });
+            *slot = Some(typed);
         }
         stellar_agent_mpp::BeforeSignError::PolicyRefused(state_error())
     } else {
@@ -819,6 +847,77 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn muxed_contract_challenge_refuses_before_state() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().expect("keyring");
+        let input = stellar_agent_mpp::ChallengeInput::Mcp {
+            challenges: vec![serde_json::json!({
+                "id": "challenge", "realm": "merchant", "method": "stellar", "intent": "charge",
+                "expires": stellar_agent_core::timefmt::format_rfc3339_utc(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(300)),
+                "request": {
+                    "amount": "10", "currency": stellar_strkey::Contract([8; 32]).to_string().as_str(),
+                    "recipient": stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string(),
+                    "methodDetails": {"network": "stellar:testnet", "feePayer": true}
+                }
+            })],
+            selected_challenge_id: None,
+            context: stellar_agent_mpp::McpRequestContext::from_params(
+                "merchant",
+                stellar_agent_mpp::McpOperationKind::Tool,
+                "charge",
+                None,
+            )
+            .expect("context"),
+        };
+        let mut ordinary = input.clone();
+        if let stellar_agent_mpp::ChallengeInput::Mcp { challenges, .. } = &mut ordinary {
+            challenges[0]["request"]["recipient"] = serde_json::json!(
+                stellar_strkey::ed25519::PublicKey([1; 32])
+                    .to_string()
+                    .as_str()
+            );
+        }
+        let now = i64::try_from(stellar_agent_core::timefmt::now_unix_ms().expect("clock") / 1000)
+            .expect("time");
+        stellar_agent_mpp::select_and_validate(&ordinary, now).expect("valid ordinary challenge");
+        let payer = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+        let server = WalletServer::new(
+            Profile::builder_testnet_named(
+                FIRST_RUN_PROFILE,
+                "svc",
+                payer.as_str(),
+                "nonce-svc",
+                "nonce-acct",
+            )
+            .with_noop_engine()
+            .build(),
+        )
+        .expect("server");
+        let result = server
+            .stellar_mpp_charge_prepare(Parameters(MppPrepareArgs {
+                profile: server.profile_name_for_approval(),
+                challenge: input,
+            }))
+            .await
+            .expect("business error");
+        assert_eq!(
+            crate::tools::common::assert_business_envelope(&result).0,
+            "mpp.challenge_invalid"
+        );
+        assert!(!state_path(home.path()).exists());
+    }
+
     #[test]
     fn accounting_denial_preserves_the_policy_code() {
         let reason = stellar_agent_core::policy::DenyReason::RateLimitExceeded {
@@ -856,6 +955,40 @@ mod tests {
         assert!(refusal.lock().expect("refusal lock").is_none());
     }
 
+    #[test]
+    fn accounting_epoch_refusal_preserves_its_code() {
+        use stellar_agent_network::policy_state::WindowStoreError;
+        for (error, code) in [
+            (
+                WindowStoreError::TotalEpochUnavailable {
+                    detail: "pin unreadable".to_owned(),
+                },
+                "policy.total_epoch_unavailable",
+            ),
+            (
+                WindowStoreError::TotalEpochStale,
+                "policy.total_epoch_stale",
+            ),
+            (
+                WindowStoreError::TotalEpochRetired,
+                "policy.total_epoch_retired",
+            ),
+        ] {
+            let refusal = Mutex::new(None);
+            let classified = accounting_error(error, &refusal);
+            assert!(matches!(
+                classified,
+                stellar_agent_mpp::BeforeSignError::PolicyRefused(_)
+            ));
+            let error = refusal
+                .lock()
+                .expect("refusal lock")
+                .take()
+                .expect("typed epoch refusal");
+            assert_eq!(error.code(), code);
+        }
+    }
+
     const MPP_TOOLS: [&str; 5] = [
         "stellar_mpp_charge_prepare",
         "stellar_mpp_charge_commit",
@@ -865,7 +998,14 @@ mod tests {
     ];
 
     #[test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn registry_and_router_expose_closed_mpp_surface() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         let server = WalletServer::new(
             Profile::builder_testnet("svc", "acct", "nonce-svc", "nonce-acct")
                 .with_noop_engine()
@@ -952,7 +1092,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn every_mpp_tool_refuses_mainnet_before_state_or_keyring_access() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         let server = WalletServer::new(
             Profile::builder_mainnet(
                 "https://rpc.example.invalid",
@@ -1093,8 +1240,15 @@ mod tests {
     /// the two surfaces answer this case identically by construction.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn every_id_lookup_reports_not_found_on_a_profile_with_no_mpp_state() {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().expect("mock keyring store");
         let server = first_run_server();
@@ -1162,8 +1316,15 @@ mod tests {
     /// see.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn an_unknown_id_on_a_minted_empty_store_reports_not_found() {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().expect("mock keyring store");
         stellar_agent_mpp::MppAuthorizationStore::open_for_prepare(
@@ -1227,8 +1388,15 @@ mod tests {
     /// under an existing store cannot be answered as "nothing was ever here".
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn a_state_file_without_its_key_still_refuses() {
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().expect("mock keyring store");
         let path = state_path(home.path());

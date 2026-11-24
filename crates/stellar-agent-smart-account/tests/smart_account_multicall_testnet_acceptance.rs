@@ -28,10 +28,10 @@
 //! testnet RPC and Friendbot. Each deploys the vendored router
 //! ([`MULTICALL_WASM`]) from a funded ephemeral deployer with a fresh salt,
 //! unless `STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS` names a deployed
-//! router C-strkey. `STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL` optionally names
-//! a second Soroban RPC endpoint for the cross-RPC trust-anchor check; without
-//! it the primary endpoint stands in as the secondary, so the check compares
-//! one provider with itself. An empty variable counts as unset. An override
+//! router C-strkey. `STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL` names the second
+//! Soroban RPC endpoint of the ledger witness and the cross-RPC trust-anchor
+//! check, on a host other than the primary's; the suite fails without it. An
+//! empty variable counts as unset. An override
 //! that does not parse, and a router deployment that fails, fail the test.
 //! `h2_per_period_cap_deny_at_inner_3` and `h3_bundle_aggregate_cap_deny` are
 //! host-side and require no network access.
@@ -39,12 +39,16 @@
 //! The CLI's on-chain multicall coverage lives in the `stellar-agent-cli`
 //! suite `smart_account_multicall_cli_testnet_acceptance`.
 //!
+//! Each test installs the in-memory keyring store first. The policy gate and
+//! the signing admission read their keyring entries there. The test's data
+//! root and its keyring start empty together.
+//!
 //! # Reference cross-check
 //!
 //! - Router contract `exec(caller, invocations: Vec<(Address, Symbol, Vec<Val>)>)`:
 //!   the in-tree router contract `contracts/multicall-router/src/lib.rs`.
-//! - SAC `transfer(from, to, amount)` ABI: soroban-sdk SAC derive macro; three-arg
-//!   shape required by `decompose_bundle` recognition criteria (bundle.rs:288-325).
+//! - Typed `transfer(Address from, Address to, I128 amount)` calls count when
+//!   `from` is the wallet and the amount is nonnegative. Addresses use `scval`.
 //! - `PerPeriodCapCriterion` evaluation (per_period_cap.rs:231-): denies when
 //!   `persistent_store + overlay_accumulated + attempted > max_stroops`.
 //! - `BundleAggregateCapCriterion` evaluation (bundle_aggregate_cap.rs:76-):
@@ -113,9 +117,6 @@ const TIMEOUT_SECS: u64 = 120;
 /// deployment.
 const ROUTER_ADDRESS_ENV: &str = "STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS";
 
-/// Names a second Soroban RPC endpoint for the cross-RPC trust-anchor check.
-const SECONDARY_RPC_URL_ENV: &str = "STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL";
-
 /// The symbol the native asset's SAC returns from `symbol`.
 const NATIVE_ASSET_SYMBOL: &str = "native";
 
@@ -130,15 +131,13 @@ const LIVE_INNER_COUNT: usize = 3;
 /// address (verified via `stellar_strkey::Contract` encode of `[0u8; 32]`).
 const DUMMY_C_STRKEY: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
-/// A valid all-zero G-strkey used as dummy sender/receiver in policy tests.
-///
-/// The strkey encodes a 32-byte ed25519 public key of all zeros. Used only in
-/// `decompose_bundle` token-transfer recognition (requires valid G-strkeys in
-/// args[0] and args[1] of a `transfer` call).
-const DUMMY_G_STRKEY_FROM: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-
 /// A different valid all-zero G-strkey used as dummy receiver.
 const DUMMY_G_STRKEY_TO: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+/// The secondary endpoint of the host-side cap cases. They refuse before any
+/// request, at the policy gate or the router registry lookup, so the name
+/// never resolves.
+const HOST_SIDE_SECONDARY_RPC_URL: &str = "https://host-side-secondary-never-dialed.invalid";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -248,29 +247,6 @@ async fn multicall_router() -> String {
     .contract
 }
 
-/// The secondary endpoint of the cross-RPC trust-anchor check: the URL named
-/// by [`SECONDARY_RPC_URL_ENV`], or the primary endpoint. The primary
-/// standing in as the secondary does not demonstrate verification against an
-/// independent provider.
-///
-/// # Panics
-///
-/// Panics when the override is not an `http` or `https` URL.
-fn secondary_rpc_url() -> String {
-    match env_override(SECONDARY_RPC_URL_ENV) {
-        Some(url) => {
-            let parsed = reqwest::Url::parse(&url)
-                .unwrap_or_else(|e| panic!("{SECONDARY_RPC_URL_ENV} must be a URL: {e}"));
-            assert!(
-                matches!(parsed.scheme(), "http" | "https"),
-                "{SECONDARY_RPC_URL_ENV} must be an http or https URL"
-            );
-            url
-        }
-        None => TESTNET_RPC_URL.to_owned(),
-    }
-}
-
 /// [`LIVE_INNER_COUNT`] calls of the native asset SAC's `symbol`.
 fn native_symbol_bundle() -> Vec<MulticallInvocation> {
     (0..LIVE_INNER_COUNT)
@@ -365,20 +341,14 @@ fn testnet_profile() -> Profile {
 /// not deployed on testnet — they are only used for host-side decomposition
 /// in the policy gate tests where no RPC calls are made.
 fn dummy_transfer_invocation(amount_usdc_units: i128) -> MulticallInvocation {
+    use stellar_xdr::WriteXdr as _;
     MulticallInvocation {
         target_contract: DUMMY_C_STRKEY.to_owned(),
         fn_name: "transfer".to_owned(),
-        // SAC `transfer(from: Address, to: Address, amount: i128)` — three args.
-        // `decompose_bundle` recognises this as `TokenTransfer` when:
-        // - target is valid C-strkey
-        // - fn_name == "transfer"
-        // - args[0] and args[1] are valid G-strkey strings
-        // - args[2] is a parseable i128 (as decimal string)
-        // (bundle.rs:288-325)
         args_json: serde_json::json!([
-            DUMMY_G_STRKEY_FROM,
-            DUMMY_G_STRKEY_TO,
-            amount_usdc_units.to_string(),
+            {"scval": ScVal::Address(parse_c_strkey_to_smart_account(DUMMY_C_STRKEY).unwrap()).to_xdr_base64(Limits::none()).unwrap()},
+            {"scval": ScVal::Address(parse_g_strkey_to_signer_address(DUMMY_G_STRKEY_TO).unwrap()).to_xdr_base64(Limits::none()).unwrap()},
+            i64::try_from(amount_usdc_units).unwrap(),
         ]),
     }
 }
@@ -411,13 +381,23 @@ fn registry_with_entry(router_address: &str) -> MulticallRegistry {
 /// - Each inner's return value decodes to the native asset's symbol
 ///
 /// The router is [`multicall_router`]'s and the secondary endpoint
-/// [`secondary_rpc_url`]'s; see the module's gating section.
+/// [`stellar_agent_test_support::testnet_secondary_rpc_url`]'s; see the
+/// module's gating section.
 #[tokio::test]
 #[serial_test::serial]
 async fn h1_three_native_sac_symbol_calls_confirm() {
-    let data_root = tempfile::tempdir().expect("temporary wallet data root");
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
+    let data_root = stellar_agent_test_support::sandbox::StateSandbox::new()
+        .expect("temporary wallet data root");
+    assert!(
+        data_root
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
-    let secondary_rpc_url = secondary_rpc_url();
+    let secondary_rpc_url = stellar_agent_test_support::testnet_secondary_rpc_url();
 
     // ── Step 1: Fresh signer + fund ───────────────────────────────────────────
     let (signer_g, signer_box) = fresh_signer();
@@ -440,7 +420,7 @@ async fn h1_three_native_sac_symbol_calls_confirm() {
     // ── Step 4: Submit the multicall bundle ───────────────────────────────────
     let signers_manager = pin_check_manager::pin_check_manager(
         TESTNET_RPC_URL,
-        &secondary_rpc_url,
+        secondary_rpc_url,
         "multicall-acceptance",
         data_root.path(),
     );
@@ -451,7 +431,7 @@ async fn h1_three_native_sac_symbol_calls_confirm() {
             bundle: native_symbol_bundle(),
             signer: signer_box.as_ref(),
             primary_rpc_url: TESTNET_RPC_URL,
-            secondary_rpc_url: &secondary_rpc_url,
+            secondary_rpc_url,
             network_passphrase: TESTNET_PASSPHRASE,
             policy_engine,
             profile: &profile,
@@ -497,233 +477,118 @@ async fn h1_three_native_sac_symbol_calls_confirm() {
     );
 }
 
-// ── h2_per_period_cap_deny_at_inner_3 ────────────────────────────────────────
-
-/// Submit a 5-transfer bundle of 30 USDC each under a policy with
-/// `bundle_per_period_cap` of 100 USDC.
-///
-/// The policy gate fires at inner-3 (0-based inner index 3 = 4th inner):
-/// - Inners 0-2: 30+30+30 = 90 USDC accumulated in running sum.
-/// - Inner 3: 90 + 30 = 120 USDC > 100 USDC cap → `DenyReason::BundleDenied`
-///   wrapping `DenyReason::PerPeriodCapExceeded`.
-///
-/// Asserts:
-/// - `Err(SaError::MulticallFailed { phase: "policy_gate" })`
-/// - No RPC call is made (pure host-side evaluation).
-///
-/// # Design (host-side only)
-///
-/// Uses a dummy C-strkey as the fake USDC SAC address (valid structure; not
-/// deployed). The `decompose_bundle` function recognises these as `TokenTransfer`
-/// inners because the target is a valid C-strkey, fn_name == "transfer", and
-/// args match the SAC ABI shape (bundle.rs:288-325).
-///
-/// The `smart_account` field uses `DUMMY_C_STRKEY` — no deployed SA is required
-/// because the policy gate fires before any RPC call (Step 2 precedes Step 3).
-///
-/// # Design note
-///
-/// `PerPeriodCapCriterion` short-circuits for tool names outside the
-/// `{stellar_pay, …}` set — the multicall tool name is not in that set.
-/// `BundlePerPeriodCapCriterion` is used instead: it iterates
-/// `BundleView.inners` and applies the per-period cap per-inner-transfer
-/// at evaluation time. `is_bundle_level() = true` ensures it fires correctly
-/// under `evaluate_bundle` (bundle_per_period_cap.rs).
+/// The per-period bundle cap identifies the fourth transfer as the excess.
 #[tokio::test]
 #[serial_test::serial]
 async fn h2_per_period_cap_deny_at_inner_3() {
-    let data_root = tempfile::tempdir().expect("temporary wallet data root");
-    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
-    // 30 USDC per inner in 7-decimal SAC units = 30 * 10_000_000 = 300_000_000.
-    // cap = 100 USDC = 1_000_000_000 units.
-    // Per-period window: 1 hour.
-    let usdc_per_inner: i128 = 300_000_000; // 30 USDC in SAC units
-    let cap_usdc: i128 = 1_000_000_000; // 100 USDC in SAC units
-
-    let window = Window::parse("1h").expect("Window::parse('1h') must succeed");
-    let bundle_per_period_cap = BundlePerPeriodCapCriterion::new(
-        DUMMY_C_STRKEY.to_owned(), // asset = fake USDC SAC address (dummy C-strkey)
-        window,
-        cap_usdc,
+    let criterion = BundlePerPeriodCapCriterion::new(
+        DUMMY_C_STRKEY.to_owned(),
+        Window::parse("1h").unwrap(),
+        1_000_000_000,
     );
-
-    let policy_engine = policy_engine_with_criteria(vec![Box::new(bundle_per_period_cap)]);
-    let profile = testnet_profile();
-
-    // 5 inners × 30 USDC each. Inner 3 (0-based) tips the cap: 90+30=120 > 100.
-    let bundle = (0..5)
-        .map(|_| dummy_transfer_invocation(usdc_per_inner))
-        .collect::<Vec<_>>();
-
-    // Empty registry (no router registered for testnet). The policy gate fires
-    // before the registry lookup at Step 3, so `MulticallRegistryEntryNotFound`
-    // never surfaces — the test asserts `MulticallFailed { phase: "policy_gate" }`.
-    let empty_registry = {
-        let config_path = std::path::PathBuf::from("/dev/null");
-        MulticallRegistry::load(&config_path).expect("empty registry load must succeed")
-    };
-
-    let result = submit_multicall_bundle(
-        MulticallSubmitArgs {
-            smart_account: DUMMY_C_STRKEY,
-            rule_id: 0,
-            bundle,
-            // Signer is unused before policy gate fires. Use a fresh key.
-            signer: {
-                static STUB_SIGNER: std::sync::OnceLock<
-                    Box<dyn stellar_agent_network::Signer + Send + Sync>,
-                > = std::sync::OnceLock::new();
-                STUB_SIGNER.get_or_init(|| {
-                    let (_, signer) = fresh_signer();
-                    signer
-                })
-            }
-            .as_ref(),
-            primary_rpc_url: TESTNET_RPC_URL,
-            secondary_rpc_url: TESTNET_RPC_URL, // unused; policy gate fires first
-            network_passphrase: TESTNET_PASSPHRASE,
-            policy_engine,
-            profile: &profile,
-            audit_writer: None,
-            timeout: Duration::from_secs(TIMEOUT_SECS),
-            fee: ResolvedFeePerOp::default(),
-            chain_id: CHAIN_ID,
-            request_id: "h2-per-period-cap-deny",
-            signers_manager: &pin_check_manager::pin_check_manager(
-                TESTNET_RPC_URL,
-                TESTNET_RPC_URL,
-                "multicall-acceptance",
-                data_root.path(),
-            ),
-        },
-        &empty_registry,
+    check_host_cap(
+        policy_engine_with_criteria(vec![Box::new(criterion)]),
+        5,
+        "multicall.per_period_cap_exceeded",
+        Some(3),
     )
     .await;
-
-    let err = result.expect_err("[h2] submit_multicall_bundle must return Err when policy denies");
-
-    assert_eq!(
-        err.wire_code(),
-        "sa.multicall_failed",
-        "[h2] wire_code must be 'sa.multicall_failed'; got {:?}",
-        err.wire_code()
-    );
-
-    // Confirm the phase is policy_gate (not build, not rpc_divergence).
-    let err_str = format!("{err}");
-    assert!(
-        err_str.contains("policy_gate"),
-        "[h2] error message must contain 'policy_gate'; got: {err_str}"
-    );
-
-    eprintln!(
-        "[h2] PASS: bundle_per_period_cap denied 5x30 USDC bundle at policy gate \
-         (100 USDC cap, inner 3 tips the sum)"
-    );
 }
 
-// ── h3_bundle_aggregate_cap_deny ─────────────────────────────────────────────
-
-/// Submit a 6-transfer bundle of 30 USDC each under a policy with
-/// `bundle_aggregate_cap` of 150 USDC.
-///
-/// Total: 6 × 30 = 180 USDC > 150 USDC cap → `DenyReason::BundleAggregateCapExceeded`.
-///
-/// Asserts:
-/// - `Err(SaError::MulticallFailed { phase: "policy_gate" })`
-/// - No RPC call is made (pure host-side evaluation).
-///
-/// # Design (host-side only)
-///
-/// Same dummy-strkey approach as `h2_per_period_cap_deny_at_inner_3`.
-/// `BundleAggregateCapCriterion` sums all `TokenTransfer.amount` values across
-/// the bundle view and fires before any per-inner evaluation because
-/// `is_bundle_level()` returns `true` (bundle_aggregate_cap.rs:76-).
+/// The aggregate bundle cap refuses the sum of six wallet transfers.
 #[tokio::test]
 #[serial_test::serial]
 async fn h3_bundle_aggregate_cap_deny() {
-    let data_root = tempfile::tempdir().expect("temporary wallet data root");
-    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
-    // 30 USDC per inner in 7-decimal SAC units.
-    let usdc_per_inner: i128 = 300_000_000; // 30 USDC
-    let cap_usdc: i128 = 1_500_000_000; // 150 USDC cap
-
-    let bundle_cap = BundleAggregateCapCriterion {
-        asset: Some(DUMMY_C_STRKEY.to_owned()), // asset filter = fake USDC SAC
-        max_amount: cap_usdc,
+    let criterion = BundleAggregateCapCriterion {
+        asset: Some(DUMMY_C_STRKEY.to_owned()),
+        max_amount: 1_500_000_000,
     };
-
-    let policy_engine = policy_engine_with_criteria(vec![Box::new(bundle_cap)]);
-    let profile = testnet_profile();
-
-    // 6 inners × 30 USDC = 180 USDC > 150 USDC cap.
-    let bundle = (0..6)
-        .map(|_| dummy_transfer_invocation(usdc_per_inner))
-        .collect::<Vec<_>>();
-
-    let empty_registry = {
-        let config_path = std::path::PathBuf::from("/dev/null");
-        MulticallRegistry::load(&config_path).expect("empty registry load must succeed")
-    };
-
-    let result = submit_multicall_bundle(
-        MulticallSubmitArgs {
-            smart_account: DUMMY_C_STRKEY,
-            rule_id: 0,
-            bundle,
-            signer: {
-                static STUB_SIGNER: std::sync::OnceLock<
-                    Box<dyn stellar_agent_network::Signer + Send + Sync>,
-                > = std::sync::OnceLock::new();
-                STUB_SIGNER.get_or_init(|| {
-                    let (_, signer) = fresh_signer();
-                    signer
-                })
-            }
-            .as_ref(),
-            primary_rpc_url: TESTNET_RPC_URL,
-            secondary_rpc_url: TESTNET_RPC_URL, // unused; policy gate fires first
-            network_passphrase: TESTNET_PASSPHRASE,
-            policy_engine,
-            profile: &profile,
-            audit_writer: None,
-            timeout: Duration::from_secs(TIMEOUT_SECS),
-            fee: ResolvedFeePerOp::default(),
-            chain_id: CHAIN_ID,
-            request_id: "h3-bundle-aggregate-cap-deny",
-            signers_manager: &pin_check_manager::pin_check_manager(
-                TESTNET_RPC_URL,
-                TESTNET_RPC_URL,
-                "multicall-acceptance",
-                data_root.path(),
-            ),
-        },
-        &empty_registry,
+    check_host_cap(
+        policy_engine_with_criteria(vec![Box::new(criterion)]),
+        6,
+        "multicall.bundle_aggregate_cap_exceeded",
+        None,
     )
     .await;
-
-    let err = result.expect_err("[h3] submit_multicall_bundle must return Err when policy denies");
-
-    assert_eq!(
-        err.wire_code(),
-        "sa.multicall_failed",
-        "[h3] wire_code must be 'sa.multicall_failed'; got {:?}",
-        err.wire_code()
-    );
-
-    let err_str = format!("{err}");
-    assert!(
-        err_str.contains("policy_gate"),
-        "[h3] error message must contain 'policy_gate'; got: {err_str}"
-    );
-
-    eprintln!(
-        "[h3] PASS: bundle aggregate cap denied 6×30 USDC bundle at policy gate \
-         (150 USDC cap, 180 USDC total)"
-    );
 }
 
-// ── h5_bundle_under_a_rule_other_than_0_checks_its_signer_set ────────────────
+async fn check_host_cap(
+    engine: Arc<PolicyEngineV1>,
+    count: usize,
+    expected_code: &str,
+    expected_index: Option<u32>,
+) {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        dir.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+    let (audit, _) = audit_writer_in(dir.path());
+    let empty_registry = MulticallRegistry::load(&dir.path().join("empty.json")).unwrap();
+    let profile = testnet_profile();
+    let (_, signer) = fresh_signer();
+    let manager = pin_check_manager::pin_check_manager(
+        TESTNET_RPC_URL,
+        HOST_SIDE_SECONDARY_RPC_URL,
+        "multicall-acceptance",
+        dir.path(),
+    );
+    for inner_count in [count, 1] {
+        let error = submit_multicall_bundle(
+            MulticallSubmitArgs {
+                smart_account: DUMMY_C_STRKEY,
+                rule_id: 0,
+                bundle: (0..inner_count)
+                    .map(|_| dummy_transfer_invocation(300_000_000))
+                    .collect(),
+                signer: signer.as_ref(),
+                primary_rpc_url: TESTNET_RPC_URL,
+                secondary_rpc_url: HOST_SIDE_SECONDARY_RPC_URL,
+                network_passphrase: TESTNET_PASSPHRASE,
+                policy_engine: Arc::clone(&engine),
+                profile: &profile,
+                audit_writer: Some(Arc::clone(&audit)),
+                timeout: Duration::from_secs(TIMEOUT_SECS),
+                fee: ResolvedFeePerOp::default(),
+                chain_id: CHAIN_ID,
+                request_id: "host-cap",
+                signers_manager: &manager,
+            },
+            &empty_registry,
+        )
+        .await
+        .unwrap_err();
+        if inner_count == 1 {
+            assert!(
+                matches!(error, SaError::MulticallRegistryEntryNotFound { .. }),
+                "{error:?}"
+            );
+        } else {
+            match &error {
+                SaError::MulticallFailed {
+                    phase,
+                    redacted_reason,
+                    ..
+                } => {
+                    assert_eq!(*phase, "policy_gate", "{error:?}");
+                    assert_eq!(
+                        redacted_reason, "policy denied the multicall bundle",
+                        "the policy gate denies the bundle: {error:?}"
+                    );
+                }
+                other => panic!("expected MulticallFailed at policy_gate; got {other:?}"),
+            }
+            let entries = verified_audit_entries(&audit);
+            assert!(entries.iter().any(|entry| matches!(&entry.event_kind,
+                EventKind::SaMulticallBundleDenied { deny_wire_code, denied_inner_index, .. }
+                if deny_wire_code == expected_code && *denied_inner_index == expected_index)));
+        }
+    }
+}
 
 /// A fresh audit writer over `audit.jsonl` in `dir`, with the log's path.
 fn audit_writer_in(dir: &std::path::Path) -> (Arc<Mutex<AuditWriter>>, std::path::PathBuf) {
@@ -749,14 +614,24 @@ fn audit_writer_in(dir: &std::path::Path) -> (Arc<Mutex<AuditWriter>>, std::path
 /// and the denied-bundle row into the first log.
 ///
 /// Each bundle is three native-SAC `symbol` calls. The router is
-/// [`multicall_router`]'s and the secondary endpoint [`secondary_rpc_url`]'s;
+/// [`multicall_router`]'s and the secondary endpoint
+/// [`stellar_agent_test_support::testnet_secondary_rpc_url`]'s;
 /// see the module's gating section.
 #[tokio::test]
 #[serial_test::serial]
 async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
-    let data_root = tempfile::tempdir().expect("temporary wallet data root");
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
+    let data_root = stellar_agent_test_support::sandbox::StateSandbox::new()
+        .expect("temporary wallet data root");
+    assert!(
+        data_root
+            .path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
-    let secondary_rpc_url = secondary_rpc_url();
+    let secondary_rpc_url = stellar_agent_test_support::testnet_secondary_rpc_url();
     let timeout = Duration::from_secs(TIMEOUT_SECS);
     let rid = || uuid::Uuid::new_v4().to_string();
 
@@ -774,14 +649,14 @@ async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
     let (writer, log_path) = audit_writer_in(log_dir.path());
     let signers_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
-        &secondary_rpc_url,
+        secondary_rpc_url,
         Arc::clone(&writer),
         log_path,
         timeout,
     );
     let rule_manager = rule_manager_for_tests(
         TESTNET_RPC_URL,
-        None,
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
         Arc::clone(&signers_manager),
         Arc::clone(&writer),
         timeout,
@@ -826,7 +701,7 @@ async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
                 bundle: native_symbol_bundle(),
                 signer: signer_box.as_ref(),
                 primary_rpc_url: TESTNET_RPC_URL,
-                secondary_rpc_url: &secondary_rpc_url,
+                secondary_rpc_url,
                 network_passphrase: TESTNET_PASSPHRASE,
                 policy_engine: policy_engine_allow_all(),
                 profile: &profile,
@@ -863,7 +738,7 @@ async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
     let (other_writer, other_log_path) = audit_writer_in(other_dir.path());
     let other_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
-        &secondary_rpc_url,
+        secondary_rpc_url,
         other_writer,
         other_log_path,
         timeout,

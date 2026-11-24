@@ -21,7 +21,7 @@ hex = { version = "=0.4.3", default-features = false, features = ["std"] }
 hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
 secrecy = { version = "0.10.3", default-features = false }
 sha2 = { version = "0.11.0", features = ["zeroize"] }
-stellar-strkey = { version = "0.0.18", default-features = false }
+stellar-strkey = { version = "1.0.0", default-features = false }
 serde = { version = "1", default-features = false, features = ["std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 serde_json_canonicalizer = "=0.3.2"
@@ -30,7 +30,7 @@ thiserror = "2.0.21"
 yaml-rust2 = { version = "=0.11.0", default-features = false }
 zeroize = { version = "=1.9.0", default-features = false }
 chacha20poly1305 = "=0.11.0"
-stellar-xdr = { version = "28.0.0", features = ["base64"] }
+stellar-xdr = { version = "30.0.0", features = ["base64"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
 rand_core = { version = "=0.6.4", default-features = false, features = ["getrandom"] }
@@ -48,7 +48,7 @@ tracing-log = "0.2.0"
 uuid = { version = "1.23.3", default-features = false, features = ["std", "v4"] }
 figment = { version = "=0.10.19", features = ["toml", "env"] }
 toml = { version = "=1.1.2", default-features = false, features = ["display", "parse", "serde"] }
-url = { version = "=2.5.8", default-features = false, features = ["serde"] }
+url = { version = "=2.5.9", default-features = false, features = ["serde"] }
 time = { version = "=0.3.49", default-features = false, features = ["formatting", "parsing"] }
 directories = "=6.0.0"
 subtle = { version = "=2.6.1", default-features = false }
@@ -76,12 +76,13 @@ stellar-agent-sep53 = { path = "crates/stellar-agent-sep53", version = "0.1.0-al
 stellar-agent-sep43 = { path = "crates/stellar-agent-sep43", version = "0.1.0-alpha.13" }
 stellar-agent-xdr-limits = { path = "crates/stellar-agent-xdr-limits", version = "0.1.0-alpha.13" }
 stellar-agent-soroban-auth = { path = "crates/stellar-agent-soroban-auth", version = "0.1.0-alpha.13" }
-soroban-spec-tools = { version = "=28.0.0", default-features = false }
+soroban-spec-tools = { version = "=30.0.1", default-features = false }
 wasmparser = { version = "=0.116.1", default-features = false }
-stellar-rpc-client = "=28.0.0"
-stellar-baselib = "=0.6.0"
-stellar-ledger = { version = "=28.0.0", default-features = false }
+stellar-rpc-client = "=30.0.0"
+stellar-baselib = "=0.7.1"
+stellar-ledger = { version = "=30.0.1", default-features = false }
 apple-native-keyring-store = { version = "=1.0.0", default-features = false }
+security-framework = { version = "=3.7.0", default-features = false }
 dbus-secret-service-keyring-store = { version = "=1.0.0", default-features = false }
 windows-native-keyring-store = { version = "=1.1.0", default-features = false }
 # Toolset-package extraction.
@@ -143,23 +144,28 @@ futures = { version = "=0.3.32", default-features = false, features = ["std"] }
 rmcp = { version = "=1.8.0", default-features = false, features = ["server", "macros", "transport-io", "schemars"] }
 # tokio-util: codec framing for the bounded-line transport (FramedRead / FramedWrite).
 tokio-util = { version = "=0.7.18", default-features = false, features = ["codec"] }
-# libc: raw prctl(2) on Linux for process isolation; #[cfg(target_os = "linux")]
-# only, a zero-dep no-op on macOS/Windows.
+# libc: raw prctl(2) on Linux for process isolation in the MCP and CLI crates,
+# and the Unix open flags of the core crate's audit-log regular-file open.
 libc = { version = "=0.2.186", default-features = false }
+# rustix: the exclusive rename of the core crate's retired outbox file, through
+# the safe `renameat_with` API.
+rustix = { version = "=1.1.6", default-features = false, features = ["fs", "std"] }
 stellar-agent-stablecoin = { path = "crates/stellar-agent-stablecoin", version = "0.1.0-alpha.13" }
 stellar-agent-sep48 = { path = "crates/stellar-agent-sep48", version = "0.1.0-alpha.13" }
 stellar-agent-sep7 = { path = "crates/stellar-agent-sep7", version = "0.1.0-alpha.13" }
 stellar-agent-anchor = { path = "crates/stellar-agent-anchor", version = "0.1.0-alpha.13" }
 stellar-agent-mcp-macros = { path = "crates/stellar-agent-mcp-macros", version = "0.1.0-alpha.13" }
-stellar-agent-mcp = { path = "crates/stellar-agent-mcp", version = "0.1.0-alpha.13" }
+stellar-agent-mcp = { path = "crates/stellar-agent-mcp", version = "0.1.0-alpha.13", default-features = false }
 # CLI binary (stellar-agent) deps.
-clap = { version = "=4.6.1", default-features = false, features = ["std", "derive", "help", "usage"] }
-# webbrowser: launches the system browser for the passkey-registration handoff.
-# `hardened` restricts launchable URLs to http(s) — the loopback handoff URL is
-# the only thing this workspace ever opens, and it closes the whole class the
-# GHSA-2ph8-5cr8-hr33 argument-injection advisory belongs to, beyond the >=1.2.2
-# tokenization fix itself.
-webbrowser = { version = "=1.2.4", default-features = false, features = ["hardened"] }
+clap = { version = "=4.6.1", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+# webbrowser: launches the system browser for the loopback handoffs. The only
+# URL it ever receives is the file:// URL of the private redirect file that the
+# CLI's `common::private_open` builds after accepting only a wallet loopback
+# destination, so the bearer URL never reaches a launcher's arguments. The
+# `hardened` feature refuses every file:// URL and is therefore off; versions
+# >= 1.2.2 carry the tokenization fix for the GHSA-2ph8-5cr8-hr33
+# argument-injection advisory.
+webbrowser = { version = "=1.2.4", default-features = false }
 # rpassword: terminal input without echo for `profile enroll-rpc-credential`.
 rpassword = { version = "=7.5.4", default-features = false }
 stellar-agent-pool = { path = "crates/stellar-agent-pool", version = "0.1.0-alpha.13" }

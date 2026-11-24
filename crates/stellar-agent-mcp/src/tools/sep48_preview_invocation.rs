@@ -64,7 +64,7 @@ pub struct Sep48PreviewInvocationArgs {
 
     /// CAIP-2 chain identifier (e.g. `"stellar:testnet"`).
     ///
-    /// Required to resolve the active RPC endpoint from the profile.
+    /// Must match the loaded profile's `chain_id`. The endpoint comes from the profile.
     pub chain_id: String,
 }
 
@@ -251,7 +251,10 @@ mod tests {
     use super::*;
     use stellar_agent_core::profile::schema::Profile;
 
+    /// A Noop-engine testnet server over a fresh mock keyring store; callers
+    /// hold the `keyring` serial key.
     fn make_testnet_server() -> crate::server::WalletServer {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         crate::server::WalletServer::new(
             Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
                 .with_noop_engine()
@@ -266,7 +269,11 @@ mod tests {
     /// top-level shape).
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn missing_required_args_returns_business_envelope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_testnet_server();
         let args = Sep48PreviewInvocationArgs {
             transaction_xdr: None,
@@ -286,7 +293,11 @@ mod tests {
     /// business-error envelope with wire code `sep48.invoke_decode_failed`.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn malformed_transaction_xdr_returns_invoke_decode_failed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = make_testnet_server();
         let args = Sep48PreviewInvocationArgs {
             transaction_xdr: Some("!!! not valid xdr !!!".to_owned()),

@@ -27,11 +27,10 @@
 //! # TOCTOU accepted limitation
 //!
 //! The migration path contains a time-of-check / time-of-use window: the
-//! profile file is read at step 1 (peek version) and again at step 2 (load
-//! v1), then written at step 3 (save).  A concurrent writer replacing the
-//! file between steps 1 and 3 would result in the migrated output being
-//! derived from the file state at step 2, not from whatever the concurrent
-//! writer produced.
+//! profile file is read once at step 1, its version and v1 fields are taken
+//! from that one body at step 2, and the result is written at step 3 (save).
+//! A concurrent writer replacing the file between steps 1 and 3 is
+//! overwritten by a migration derived from the body read at step 1.
 //!
 //! **Accepted limitation:** `stellar-agent profile migrate` is an
 //! operator-driven CLI command, invoked interactively or in a maintenance
@@ -82,7 +81,8 @@ struct PartialV1Profile {
     mcp_disabled: bool,
 }
 
-/// Loads a v1 profile from an explicit path, bypassing the v2 version check.
+/// Extracts a v1 profile from the profile body, bypassing the v2 version
+/// check.
 ///
 /// This is the ONLY call site that should accept version `1`; the production
 /// loader requires version `2`.
@@ -90,21 +90,16 @@ struct PartialV1Profile {
 /// # Errors
 ///
 /// Returns [`ProfileLoadError`] on figment extraction failure.
-fn load_v1_from_path(name: &str, path: &Path) -> Result<PartialV1Profile, ProfileLoadError> {
+fn load_v1(body: &str) -> Result<PartialV1Profile, ProfileLoadError> {
     use figment::{
         Figment,
         providers::{Format, Toml},
     };
 
-    let raw: PartialV1Profile = Figment::new()
-        .merge(Toml::file(path))
+    Figment::new()
+        .merge(Toml::string(body))
         .extract()
-        .map_err(|e| ProfileLoadError::Figment {
-            name: name.to_owned(),
-            source: Box::new(e),
-        })?;
-
-    Ok(raw)
+        .map_err(super::loader::extraction_error)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,20 +112,19 @@ fn load_v1_from_path(name: &str, path: &Path) -> Result<PartialV1Profile, Profil
 pub enum MigrateError {
     /// The profile could not be loaded, or the migrated profile breaks a load
     /// rule.
-    #[error("migration failed to load profile '{name}': {source}")]
+    ///
+    /// The message names no profile: the caller supplied the name and the
+    /// source error states the refusal.
+    #[error("migration failed to load the profile: {source}")]
     Load {
-        /// Profile name supplied by the caller.
-        name: String,
         /// The underlying load error (boxed to keep the enum variant small).
         #[source]
         source: Box<ProfileLoadError>,
     },
 
     /// The profile could not be saved after migration.
-    #[error("migration failed to save profile '{name}': {source}")]
+    #[error("migration failed to save the profile: {source}")]
     Save {
-        /// Profile name supplied by the caller.
-        name: String,
         /// The underlying save error.
         #[source]
         source: ProfileSaveError,
@@ -140,16 +134,13 @@ pub enum MigrateError {
     ///
     /// The production loader's version guard fires first in normal operation;
     /// this variant is a safety net for versions the migration chain cannot
-    /// handle (e.g. a future v3 profile opened by a v2 wallet).
+    /// handle (e.g. a future v3 profile opened by a v2 wallet).  The message
+    /// states the supported version and never the one the file holds.
     #[error(
-        "profile '{name}' has version {found} which has no migration path \
-         in this wallet version (supports up to {supported})"
+        "the profile version has no migration path in this wallet version \
+         (supports up to {supported})"
     )]
     UnknownVersion {
-        /// Profile name supplied by the caller.
-        name: String,
-        /// The version found in the TOML file.
-        found: u32,
         /// The highest version this wallet can migrate.
         supported: u32,
     },
@@ -208,20 +199,17 @@ const CURRENT_VERSION: u32 = 2;
 pub fn migrate(name: &str, profile_dir: &Path) -> Result<MigrateOutcome, MigrateError> {
     let path = profile_dir.join(format!("{name}.toml"));
 
-    // The version peek reads through figment, which yields no data for an
-    // absent path, so a missing file is detected here first.
+    // A missing file is a NotFound refusal, distinct from an unreadable one.
     if !path.exists() {
-        return Err(load_refusal(
-            name,
-            ProfileLoadError::NotFound {
-                name: name.to_owned(),
-                path,
-            },
-        ));
+        return Err(load_refusal(ProfileLoadError::NotFound));
     }
 
+    // The file is read once; the version peek and the v1 extraction both
+    // work on this body, so they cannot observe two different files.
+    let body = super::loader::read_profile_toml(&path).map_err(load_refusal)?;
+
     // Peek at the version field without requiring v2-specific fields.
-    let raw_version = peek_version(name, &path)?;
+    let raw_version = peek_version(&body)?;
 
     if raw_version == CURRENT_VERSION {
         return Ok(MigrateOutcome::NoOp {
@@ -232,12 +220,10 @@ pub fn migrate(name: &str, profile_dir: &Path) -> Result<MigrateOutcome, Migrate
     let from_version = raw_version;
 
     // Dispatch on the from-version.
-    let migrated = apply_migrations(name, &path, from_version)?;
+    let migrated = apply_migrations(name, &body, from_version)?;
 
-    let dest = save_to_dir(name, &migrated, profile_dir).map_err(|e| MigrateError::Save {
-        name: name.to_owned(),
-        source: e,
-    })?;
+    let dest = save_to_dir(name, &migrated, profile_dir)
+        .map_err(|source| MigrateError::Save { source })?;
 
     Ok(MigrateOutcome::Migrated {
         from_version,
@@ -250,17 +236,16 @@ pub fn migrate(name: &str, profile_dir: &Path) -> Result<MigrateOutcome, Migrate
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Wraps a load refusal of the profile `name` as [`MigrateError::Load`].
-fn load_refusal(name: &str, source: ProfileLoadError) -> MigrateError {
+/// Wraps a load refusal as [`MigrateError::Load`].
+fn load_refusal(source: ProfileLoadError) -> MigrateError {
     MigrateError::Load {
-        name: name.to_owned(),
         source: Box::new(source),
     }
 }
 
-/// Reads only the `version` field from the TOML at `path` without requiring
+/// Reads only the `version` field from the profile body without requiring
 /// any other fields to be present.
-fn peek_version(name: &str, path: &Path) -> Result<u32, MigrateError> {
+fn peek_version(body: &str) -> Result<u32, MigrateError> {
     use figment::{
         Figment,
         providers::{Format, Toml},
@@ -272,31 +257,21 @@ fn peek_version(name: &str, path: &Path) -> Result<u32, MigrateError> {
     }
 
     Figment::new()
-        .merge(Toml::file(path))
+        .merge(Toml::string(body))
         .extract::<VersionOnly>()
         .map(|v| v.version)
-        .map_err(|e| {
-            load_refusal(
-                name,
-                ProfileLoadError::Figment {
-                    name: name.to_owned(),
-                    source: Box::new(e),
-                },
-            )
-        })
+        .map_err(|e| load_refusal(super::loader::extraction_error(e)))
 }
 
 /// Applies the chain of migration functions from `from_version` to
-/// [`CURRENT_VERSION`].
-fn apply_migrations(name: &str, path: &Path, from_version: u32) -> Result<Profile, MigrateError> {
+/// [`CURRENT_VERSION`], taking the v1 fields from the profile `body`.
+fn apply_migrations(name: &str, body: &str, from_version: u32) -> Result<Profile, MigrateError> {
     match from_version {
         1 => {
-            let v1 = load_v1_from_path(name, path).map_err(|e| load_refusal(name, e))?;
+            let v1 = load_v1(body).map_err(load_refusal)?;
             migrate_v1_to_v2(name, v1)
         }
         _ => Err(MigrateError::UnknownVersion {
-            name: name.to_owned(),
-            found: from_version,
             supported: CURRENT_VERSION,
         }),
     }
@@ -355,17 +330,15 @@ fn migrate_v1_to_v2(profile_name: &str, v1: PartialV1Profile) -> Result<Profile,
         (Some(explicit), _) => explicit,
         (None, Some(default)) => default.to_owned(),
         (None, None) => {
-            return Err(load_refusal(
-                profile_name,
-                ProfileLoadError::MainnetRpcUrlRequired {
-                    name: profile_name.to_owned(),
-                },
-            ));
+            return Err(load_refusal(ProfileLoadError::MainnetRpcUrlRequired {
+                name: profile_name.to_owned(),
+            }));
         }
     };
     let network_passphrase = chain_id.network_passphrase().to_owned();
 
     let profile = Profile {
+        overlaid_fields: Vec::new(),
         version: 2,
         chain_id,
         rpc_url,
@@ -405,13 +378,10 @@ fn migrate_v1_to_v2(profile_name: &str, v1: PartialV1Profile) -> Result<Profile,
     };
 
     profile.validate_endpoint_urls().map_err(|source| {
-        load_refusal(
-            profile_name,
-            ProfileLoadError::InvalidEndpointUrl {
-                name: profile_name.to_owned(),
-                source,
-            },
-        )
+        load_refusal(ProfileLoadError::InvalidEndpointUrl {
+            name: profile_name.to_owned(),
+            source,
+        })
     })?;
     Ok(profile)
 }
@@ -432,6 +402,7 @@ mod tests {
     use super::*;
     use crate::profile::loader::{load_from_dir, save_to_dir};
     use crate::profile::schema::{MINIMUM_FLOOR, Profile};
+    use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -496,7 +467,11 @@ account = "{name}"
 
     /// A v1 TOML migrates to v2; all new fields are present at expected defaults.
     #[test]
+    #[serial_test::serial]
     fn migrate_v1_to_v2_round_trip() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let name = write_v1_toml(dir.path(), "round-trip");
 
@@ -556,7 +531,11 @@ account = "{name}"
     /// Running migrate twice on a v1 profile: first run migrates (1→2), second
     /// run returns NoOp (already at v2).
     #[test]
+    #[serial_test::serial]
     fn migrate_v1_to_v2_idempotent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let name = write_v1_toml(dir.path(), "idempotent");
 
@@ -584,7 +563,11 @@ account = "{name}"
 
     /// All v1 fields are unchanged after migration.
     #[test]
+    #[serial_test::serial]
     fn migrate_v1_to_v2_preserves_existing_fields() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let name = write_v1_toml(dir.path(), "preserve-fields");
 
@@ -611,7 +594,11 @@ account = "{name}"
     /// `cross_check_threshold_stroops`, and the migrated file on disk is
     /// written with the current key only (never the v1 wire key).
     #[test]
+    #[serial_test::serial]
     fn migrate_v1_carries_explicit_usd_threshold_value() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let name = "carry-threshold";
         let above_floor = crate::profile::schema::MINIMUM_FLOOR + 11;
@@ -660,11 +647,33 @@ account = "{name}"
         assert!(
             matches!(
                 &err,
-                MigrateError::Load { source, .. }
-                    if matches!(source.as_ref(), ProfileLoadError::NotFound { name, .. } if name == "nonexistent")
+                MigrateError::Load { source }
+                    if matches!(source.as_ref(), ProfileLoadError::NotFound)
             ),
             "expected a NotFound load error, got {err:?}"
         );
+    }
+
+    /// A profile name that holds a secret seed reaches the migration only as
+    /// a file name; no migration error repeats it.
+    #[test]
+    fn a_seed_as_the_profile_name_is_not_echoed() {
+        let seed = stellar_agent_test_support::rejected_value::seed_marker();
+        let dir = tempfile::tempdir().unwrap();
+        let err = migrate(&seed, dir.path()).unwrap_err();
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, &seed);
+
+        std::fs::write(
+            dir.path().join(format!("{seed}.toml")),
+            "version = 99\nchain_id = \"stellar:testnet\"\n",
+        )
+        .unwrap();
+        let err = migrate(&seed, dir.path()).unwrap_err();
+        assert!(
+            matches!(err, MigrateError::UnknownVersion { supported: 2 }),
+            "expected UnknownVersion, got {err:?}"
+        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, &seed);
     }
 
     // ── Endpoint rule ────────────────────────────────────────────────────────
@@ -700,7 +709,11 @@ account = "{name}"
     /// userinfo refuses with the typed load error, and the file stays
     /// byte-identical. The error names no part of the URL.
     #[test]
+    #[serial_test::serial]
     fn migrate_v1_mainnet_endpoint_refusals_leave_the_file_unchanged() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::profile::schema::sentinel::{self, assert_no_sentinel};
         use crate::profile::schema::{EndpointUrlError, EndpointUrlRejection};
 
@@ -752,7 +765,11 @@ account = "{name}"
 
     /// A v1 testnet file without `rpc_url` migrates to the testnet default.
     #[test]
+    #[serial_test::serial]
     fn migrate_v1_testnet_without_rpc_url_takes_the_testnet_default() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         write_v1_endpoint_toml(dir.path(), "testnet-v1", "stellar:testnet", None);
 
@@ -764,7 +781,11 @@ account = "{name}"
 
     /// A v1 mainnet file with an HTTPS endpoint migrates and keeps it.
     #[test]
+    #[serial_test::serial]
     fn migrate_v1_mainnet_with_https_rpc_url_migrates() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         write_v1_endpoint_toml(
             dir.path(),
@@ -789,7 +810,11 @@ account = "{name}"
     /// A migrated profile must retain the mainnet gate until the operator
     /// explicitly opts in to V1.
     #[test]
+    #[serial_test::serial]
     fn migrate_v1_to_v2_produces_noop_engine() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = tempfile::tempdir().unwrap();
         let name = write_v1_toml(dir.path(), "noop-engine-asymmetry");
 
@@ -823,13 +848,17 @@ account = "a"
         std::fs::write(dir.path().join("future.toml"), toml).unwrap();
         let err = migrate("future", dir.path()).unwrap_err();
         assert!(
-            matches!(err, MigrateError::UnknownVersion { found: 99, .. }),
+            matches!(err, MigrateError::UnknownVersion { supported: 2 }),
             "expected UnknownVersion, got {err:?}"
         );
     }
 
     #[test]
+    #[serial_test::serial]
     fn migration_leaves_provider_records_absent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             let dir = tempfile::tempdir().unwrap();
             let name = write_v1_toml(dir.path(), "provider-migration");
@@ -852,5 +881,18 @@ account = "a"
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn a_migration_read_reports_position_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("position.toml");
+        std::fs::write(&path, format!("version = 1\nchain_id = \"stellar:testnet\"\n\nrpc_url = \"https://user:{CREDENTIAL_MARKER}@rpc.example")).unwrap();
+        let err = migrate("position", dir.path()).unwrap_err();
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        assert!(err.to_string().contains("line 4, column"), "{err}");
+        let body = std::fs::read_to_string(&path).unwrap();
+        let err = load_v1(&body).err().unwrap();
+        assert_no_marker(&err, CREDENTIAL_MARKER);
     }
 }

@@ -5,18 +5,15 @@
 //!
 //! [`AuthorizationInfo`] declares groups of ed25519 signers, each with a
 //! threshold M-of-N, plus a cross-group [`Combinator`] (AND / OR).
-//! [`collect_quorum_signatures`] is the off-chain orchestrator: it iterates
-//! over each group, finds the qualifying signers from the supplied slice,
-//! produces one `SorobanAuthorizationEntry` per signer (via the existing
-//! [`crate::managers::auth_entry`] substrate), and returns the flat entry
-//! vector that [`crate::submit::submit_signed_invoke`] passes to the
-//! contract.
+//! [`plan_quorum_signatures`] selects qualifying signers and fixes every nonce.
+//! Admission certifies that plan before [`sign_quorum_plan`] signs its entries.
+//! The submission flow passes those entries to the contract.
 //!
 //! # Design decisions
 //!
 //! - `SubmitInvokeArgs` owns the quorum loop: when
 //!   `args.authorization` is `Some`, `submit_signed_invoke` calls
-//!   `collect_quorum_signatures` internally instead of a single-signer path.
+//!   `plan_quorum_signatures` internally instead of a single-signer path.
 //! - Current implementation supports homogeneous signer groups only:
 //!   all members are Ed25519 software signers via the `Signer` trait.
 //!   Heterogeneous groups (Ed25519 + WebAuthn passkey within one group) are
@@ -29,6 +26,7 @@
 //! an empty auth-entry set that would pass through to on-chain submission as a
 //! no-auth transaction.
 
+use crate::submit::CheckedSigningRules;
 use serde::{Deserialize, Serialize};
 use stellar_agent_network::signing::Signer;
 use stellar_xdr::{ScAddress, ScSymbol, ScVal, SorobanAuthorizationEntry};
@@ -36,10 +34,12 @@ use thiserror::Error;
 
 use crate::SaError;
 use crate::managers::auth_entry::{
-    AuthorizationSimulation, PartialSorobanAuthorizationEntry, build_authorization_entry,
-    complete_authorization_entry_multi_signer,
+    AuthorizationSimulation, PartialSorobanAuthorizationEntry, PreSubmitBudget,
+    SIGN_AUTH_DIGEST_STAGE, build_authorization_entry,
+    complete_authorization_entry_multi_signer_within_budget, network_id_of, sign_within_budget,
 };
 use crate::managers::rules::build_and_sign_delegated_g_key_entry;
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -102,20 +102,17 @@ impl SignerGroup {
     /// ```
     pub fn new(name: String, members: Vec<[u8; 32]>, threshold: u32) -> Result<Self, String> {
         if members.is_empty() {
-            return Err(format!("SignerGroup '{name}': members must not be empty"));
+            return Err("SignerGroup members must not be empty".to_owned());
         }
         if threshold == 0 {
-            return Err(format!("SignerGroup '{name}': threshold must be ≥ 1"));
+            return Err("SignerGroup threshold must be at least 1".to_owned());
         }
         #[allow(
             clippy::cast_possible_truncation,
             reason = "members.len() is bounded by u32 max in practice"
         )]
         if threshold > members.len() as u32 {
-            return Err(format!(
-                "SignerGroup '{name}': threshold {threshold} > members.len() {}",
-                members.len()
-            ));
+            return Err("SignerGroup threshold must not exceed the member count".to_owned());
         }
         Ok(Self {
             name,
@@ -180,7 +177,7 @@ pub enum Combinator {
 ///
 /// Declares one or more signer groups, each with its own M-of-N threshold,
 /// and a cross-group combinator.  Used by
-/// [`collect_quorum_signatures`] to orchestrate signature collection and by
+/// [`plan_quorum_signatures`] to select signing authority and by
 /// the [`crate::managers::policies`]-side `quorum_satisfied` criterion to validate
 /// adequacy before submission.
 ///
@@ -234,7 +231,7 @@ impl AuthorizationInfo {
 // QuorumError
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Typed error from [`collect_quorum_signatures`].
+/// Typed error from [`plan_quorum_signatures`].
 ///
 /// Every variant carries a stable `wire_code()` consumed by audit-log emission
 /// and the CLI JSON envelope.
@@ -304,6 +301,22 @@ pub enum QuorumError {
     /// Wire code: `sa.quorum.empty_authorization_info`.
     #[error("AuthorizationInfo has no groups (fail-closed)")]
     EmptyAuthorizationInfo,
+
+    /// Quorum signing was refused before any signer key access: the
+    /// passphrase names mainnet, or the passphrase and the simulation name
+    /// different networks.
+    ///
+    /// A mismatch shares the mainnet code because the delegated G-key entries
+    /// are signed for the passphrase and the smart-account entry for the
+    /// simulation's network ID: with the two apart, the declared network does
+    /// not establish which network a signature commits to.
+    ///
+    /// Wire code: `sa.quorum.mainnet_write_forbidden`.
+    #[error(
+        "quorum signing refused: the network is mainnet, or the passphrase and the simulation \
+         name different networks"
+    )]
+    MainnetWriteForbidden,
 }
 
 impl QuorumError {
@@ -340,92 +353,46 @@ impl QuorumError {
             }
             Self::SignatureProductionFailed { .. } => "sa.quorum.signature_production_failed",
             Self::EmptyAuthorizationInfo => "sa.quorum.empty_authorization_info",
+            Self::MainnetWriteForbidden => "sa.quorum.mainnet_write_forbidden",
         }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// collect_quorum_signatures
+// plan_quorum_signatures
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Collects per-signer `SorobanAuthorizationEntry` values for a quorum invoke.
-///
-/// This is the wallet-side **off-chain** orchestrator that produces the entry
-/// set the on-chain OpenZeppelin contract's `__check_auth` validates.  The auth-entry XDR per
-/// signer is identical to the N=1 single-signer case; this function calls
-/// [`build_authorization_entry`]
-/// + [`complete_authorization_entry`][crate::managers::auth_entry::complete_authorization_entry]
-///   once per qualifying signer and returns the flat vector.
-///
-/// # On-chain threshold note
-///
-/// On-chain threshold enforcement happens at `__check_auth` time per the
-/// OpenZeppelin smart-account contract.
-/// The wallet-side helper is complementary — it ensures the correct number of
-/// signers are represented before submission.
-///
-/// # Auth-entry XDR canonical reference
-///
-/// Per-signer auth-entry construction follows the existing
-/// [`build_authorization_entry`]
-/// + [`complete_authorization_entry`][crate::managers::auth_entry::complete_authorization_entry]
-///   substrate.
-///   The XDR preimage is `HashIdPreimage::SorobanAuthorization`
-///   (`HashIdPreimageSorobanAuthorization`) in `Stellar-transaction.x`.
-///
-/// # Signer matching
-///
-/// Signers are matched by comparing `signer.public_key().await` bytes against
-/// each group's `members` list.  Matching signers within a group are sorted by
-/// public-key bytes (deterministic order) before signing to ensure identical
-/// auth-entry ordering on repeated calls with the same signer set.
-///
-/// # Parameters
-///
-/// - `authz`: the quorum declaration.
-/// - `signers`: all candidate signers for this invocation.
-/// - `auth_scaddr`: the `ScAddress` of the smart-account contract being authorised.
-/// - `function_name`: the Soroban function name being invoked.
-/// - `args`: the function arguments.
-/// - `auth_rule_ids`: context-rule IDs used for the auth-digest binding.
-/// - `simulation`: the `AuthorizationSimulation` from the simulate step.
-/// - `envelope`: the `EnvelopeContext` from the simulate step.
-/// - `network_passphrase`: Stellar network passphrase.
-/// - `signature_expiration_ledger`: ledger number at which auth entries expire.
-///
-/// # Returns
-///
-/// A flat `Vec<SorobanAuthorizationEntry>` suitable for passing to
-/// [`crate::submit::submit_signed_invoke`] for on-chain submission.
-///
-/// When `authz.combinator == Combinator::Or`, only the entries from the first
-/// satisfied group are returned.
+/// The selected authority and nonces fixed before signing admission.
+#[derive(Debug)]
+pub struct QuorumPlan {
+    groups: Vec<PlannedGroup>,
+    subjects: Vec<stellar_agent_network::IntentSubject>,
+    network_passphrase: String,
+}
+
+#[derive(Debug)]
+struct PlannedGroup {
+    partial: PartialSorobanAuthorizationEntry,
+    checked: CheckedSigningRules,
+    keys: Vec<[u8; 32]>,
+    nonces: Vec<i64>,
+}
+
+impl QuorumPlan {
+    /// Returns every smart account and delegated authorization subject.
+    #[must_use]
+    pub fn intent_subjects(&self) -> Vec<stellar_agent_network::IntentSubject> {
+        self.subjects.clone()
+    }
+}
+
+/// Plans the selected quorum without producing any signature.
 ///
 /// # Errors
-///
-/// - [`QuorumError::EmptyAuthorizationInfo`] — `authz.groups` is empty.
-/// - [`QuorumError::InsufficientSignersInGroup`] — a group does not have
-///   enough qualifying signers (AND path: first such group; OR path: reported
-///   when NO group is satisfied).
-/// - [`QuorumError::GroupNotSatisfiedInAndCombinator`] — AND combinator and
-///   one or more groups could not reach threshold.
-/// - [`QuorumError::NoGroupSatisfiedInOrCombinator`] — OR combinator and no
-///   group reached threshold.
-/// - [`QuorumError::SignatureProductionFailed`] — an underlying
-///   [`build_authorization_entry`]
-///   or [`complete_authorization_entry`][crate::managers::auth_entry::complete_authorization_entry]
-///   call returned an error.
-///
-/// # Examples
-///
-/// See `crates/stellar-agent-smart-account/tests/quorum_authorization_info_testnet_acceptance.rs`
-/// for end-to-end testnet exercises.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "quorum orchestration requires the full auth-entry construction context; \
-              splitting would require a context struct (deferred to a future ergonomics pass)"
-)]
-pub async fn collect_quorum_signatures(
+/// Refuses invalid authority, an unsatisfied quorum, or an unreadable public key.
+#[allow(clippy::too_many_arguments)]
+pub async fn plan_quorum_signatures(
+    checked_rules: CheckedSigningRules,
     authz: &AuthorizationInfo,
     signers: &[&(dyn Signer + Send + Sync)],
     auth_scaddr: ScAddress,
@@ -436,71 +403,92 @@ pub async fn collect_quorum_signatures(
     envelope: &crate::signing::divergence::EnvelopeContext,
     network_passphrase: &str,
     signature_expiration_ledger: u32,
-) -> Result<Vec<SorobanAuthorizationEntry>, QuorumError> {
-    if authz.groups.is_empty() {
-        return Err(QuorumError::EmptyAuthorizationInfo);
-    }
+) -> Result<QuorumPlan, QuorumError> {
+    plan_quorum_signatures_within_budget(
+        checked_rules,
+        authz,
+        signers,
+        auth_scaddr,
+        function_name,
+        args,
+        auth_rule_ids,
+        simulation,
+        envelope,
+        network_passphrase,
+        signature_expiration_ledger,
+        None,
+    )
+    .await
+    .map_err(QuorumFailure::into_quorum_error)
+}
 
-    // Resolve each signer's public key once upfront to avoid repeated async
-    // calls and to enable deterministic sorting within groups.
-    let mut resolved: Vec<([u8; 32], &(dyn Signer + Send + Sync))> =
-        Vec::with_capacity(signers.len());
-    for &s in signers {
-        let pk = s
-            .public_key()
-            .await
-            .map_err(|e| QuorumError::SignatureProductionFailed {
-                detail: format!("public_key fetch failed: {e}"),
-            })?;
-        resolved.push((pk.0, s));
-    }
+/// Why quorum planning or signing refuses.
+#[derive(Debug)]
+pub(crate) enum QuorumFailure {
+    Quorum(QuorumError),
+    Deadline(SaError),
+    Intent(SaError),
+}
 
-    match authz.combinator {
-        Combinator::And => {
-            collect_and(
-                authz,
-                &resolved,
-                auth_scaddr,
-                function_name,
-                args,
-                auth_rule_ids,
-                simulation,
-                envelope,
-                network_passphrase,
-                signature_expiration_ledger,
-            )
-            .await
+impl From<QuorumError> for QuorumFailure {
+    fn from(error: QuorumError) -> Self {
+        Self::Quorum(error)
+    }
+}
+
+impl QuorumFailure {
+    fn into_quorum_error(self) -> QuorumError {
+        match self {
+            Self::Quorum(error) => error,
+            Self::Deadline(error) | Self::Intent(error) => QuorumError::SignatureProductionFailed {
+                detail: error.to_string(),
+            },
         }
-        Combinator::Or => {
-            collect_or(
-                authz,
-                &resolved,
-                auth_scaddr,
-                function_name,
-                args,
-                auth_rule_ids,
-                simulation,
-                envelope,
-                network_passphrase,
-                signature_expiration_ledger,
-            )
-            .await
+    }
+    fn of_signing(budget: Option<PreSubmitBudget>, context: &str, error: SaError) -> Self {
+        if matches!(
+            error,
+            SaError::IntentBindingMismatch { .. } | SaError::IntentRecordUnavailable { .. }
+        ) {
+            Self::Intent(error)
+        } else if budget.is_some_and(|budget| tokio::time::Instant::now() >= budget.deadline) {
+            Self::Deadline(error)
+        } else {
+            Self::Quorum(QuorumError::SignatureProductionFailed {
+                detail: format!("{context}{error}"),
+            })
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Private: AND / OR collection helpers
-// ─────────────────────────────────────────────────────────────────────────────
+/// A quorum refusal or a typed intent refusal during signing.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum QuorumSigningError {
+    /// The selected quorum cannot produce its signatures.
+    #[error(transparent)]
+    Quorum(QuorumError),
+    /// The signing request differs from its admitted intent.
+    #[error(transparent)]
+    Intent(SaError),
+}
+impl QuorumSigningError {
+    /// Returns the underlying stable refusal code.
+    #[must_use]
+    pub fn wire_code(&self) -> &'static str {
+        match self {
+            Self::Quorum(error) => error.wire_code(),
+            Self::Intent(error) => error.wire_code(),
+        }
+    }
+}
 
-/// AND combinator: collect entries from ALL groups; fail on first unsatisfied.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "mirrors collect_quorum_signatures parameter set"
-)]
-async fn collect_and(
+/// Plans all selected groups before any signer runs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn plan_quorum_signatures_within_budget(
+    checked_rules: CheckedSigningRules,
     authz: &AuthorizationInfo,
-    resolved: &[([u8; 32], &(dyn Signer + Send + Sync))],
+    signers: &[&(dyn Signer + Send + Sync)],
     auth_scaddr: ScAddress,
     function_name: ScSymbol,
     args: Vec<ScVal>,
@@ -509,225 +497,230 @@ async fn collect_and(
     envelope: &crate::signing::divergence::EnvelopeContext,
     network_passphrase: &str,
     signature_expiration_ledger: u32,
-) -> Result<Vec<SorobanAuthorizationEntry>, QuorumError> {
-    let mut all_entries: Vec<SorobanAuthorizationEntry> = Vec::new();
-    let mut unsatisfied: Vec<String> = Vec::new();
-
-    for group in &authz.groups {
-        match collect_group_entries(
-            group,
-            resolved,
-            auth_scaddr.clone(),
-            function_name.clone(),
-            args.clone(),
-            auth_rule_ids.clone(),
-            simulation,
-            envelope,
-            network_passphrase,
-            signature_expiration_ledger,
-        )
-        .await
-        {
-            Ok(entries) => all_entries.extend(entries),
-            Err(QuorumError::InsufficientSignersInGroup { .. }) => {
-                unsatisfied.push(group.name.clone());
-            }
-            Err(e) => return Err(e),
+    budget: Option<PreSubmitBudget>,
+) -> Result<QuorumPlan, QuorumFailure> {
+    use stellar_agent_network::{IntentSubject, SignerDescriptor};
+    if network_passphrase == MAINNET_PASSPHRASE
+        || network_id_of(network_passphrase) != simulation.network_id
+    {
+        return Err(QuorumError::MainnetWriteForbidden.into());
+    }
+    if authz.groups.is_empty() {
+        return Err(QuorumError::EmptyAuthorizationInfo.into());
+    }
+    checked_rules
+        .check_binding(&auth_scaddr, simulation.network_id, &auth_rule_ids)
+        .map_err(|error| QuorumError::SignatureProductionFailed {
+            detail: error.to_string(),
+        })?;
+    let mut keys = Vec::new();
+    for signer in signers {
+        keys.push(
+            sign_within_budget(budget, SIGN_AUTH_DIGEST_STAGE, signer.public_key())
+                .await
+                .map_err(QuorumFailure::Deadline)?
+                .map_err(|error| QuorumError::SignatureProductionFailed {
+                    detail: error.to_string(),
+                })?
+                .0,
+        );
+    }
+    let mut selected = Vec::new();
+    let mut unsatisfied = Vec::new();
+    for (group, checked) in authz
+        .groups
+        .iter()
+        .zip(checked_rules.into_groups(authz.groups.len()))
+    {
+        let mut qualifying: Vec<_> = keys
+            .iter()
+            .filter(|key| group.members.contains(key))
+            .copied()
+            .collect();
+        qualifying.sort();
+        if qualifying.len() < group.threshold as usize {
+            unsatisfied.push(group.name.clone());
+            continue;
+        }
+        qualifying.truncate(group.threshold as usize);
+        selected.push((qualifying, checked));
+        if matches!(authz.combinator, Combinator::Or) {
+            break;
         }
     }
-
-    if !unsatisfied.is_empty() {
+    if matches!(authz.combinator, Combinator::And) && !unsatisfied.is_empty() {
         return Err(QuorumError::GroupNotSatisfiedInAndCombinator {
             unsatisfied_groups: unsatisfied,
-        });
+        }
+        .into());
     }
-
-    Ok(all_entries)
-}
-
-/// OR combinator: return entries from the FIRST satisfied group.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "mirrors collect_quorum_signatures parameter set"
-)]
-async fn collect_or(
-    authz: &AuthorizationInfo,
-    resolved: &[([u8; 32], &(dyn Signer + Send + Sync))],
-    auth_scaddr: ScAddress,
-    function_name: ScSymbol,
-    args: Vec<ScVal>,
-    auth_rule_ids: Vec<ContextRuleId>,
-    simulation: &AuthorizationSimulation,
-    envelope: &crate::signing::divergence::EnvelopeContext,
-    network_passphrase: &str,
-    signature_expiration_ledger: u32,
-) -> Result<Vec<SorobanAuthorizationEntry>, QuorumError> {
-    let group_names: Vec<String> = authz.groups.iter().map(|g| g.name.clone()).collect();
-
-    for group in &authz.groups {
-        match collect_group_entries(
-            group,
-            resolved,
+    if selected.is_empty() {
+        return Err(QuorumError::NoGroupSatisfiedInOrCombinator {
+            groups: authz
+                .groups
+                .iter()
+                .map(|group| group.name.clone())
+                .collect(),
+        }
+        .into());
+    }
+    let mut groups = Vec::new();
+    let mut subjects = Vec::new();
+    let failure = |error: SaError| QuorumError::SignatureProductionFailed {
+        detail: error.to_string(),
+    };
+    for (keys, checked) in selected {
+        let partial = build_authorization_entry(
             auth_scaddr.clone(),
             function_name.clone(),
             args.clone(),
             auth_rule_ids.clone(),
             simulation,
             envelope,
-            network_passphrase,
-            signature_expiration_ledger,
         )
         .await
-        {
-            Ok(entries) => return Ok(entries),
-            Err(QuorumError::InsufficientSignersInGroup { .. }) => {
-                // Try next group.
-            }
-            Err(e) => return Err(e),
+        .map_err(failure)?;
+        let rule_ids = partial
+            .context_rule_ids
+            .iter()
+            .map(ContextRuleId::as_u32)
+            .collect();
+        subjects.push(
+            IntentSubject::smart_account(
+                &auth_scaddr,
+                partial.nonce,
+                signature_expiration_ledger,
+                &partial.root_invocation,
+                rule_ids,
+                keys.iter()
+                    .map(|key| SignerDescriptor::Delegated { account: *key })
+                    .collect(),
+            )
+            .map_err(|field| QuorumFailure::Intent(SaError::IntentBindingMismatch { field }))?,
+        );
+        let invocation = crate::managers::auth_entry::delegated_g_key_invocation(
+            &auth_scaddr,
+            &partial.auth_digest,
+        )
+        .map_err(failure)?;
+        let mut nonces = Vec::new();
+        for key in &keys {
+            use rand_core::RngCore as _;
+            let nonce = i64::from_ne_bytes(rand_core::OsRng.next_u64().to_ne_bytes());
+            let address = stellar_xdr::ScAddress::Account(stellar_xdr::AccountId(
+                stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(*key)),
+            ));
+            subjects.push(
+                IntentSubject::account_key(
+                    &address,
+                    nonce,
+                    signature_expiration_ledger,
+                    &invocation,
+                )
+                .map_err(|field| QuorumFailure::Intent(SaError::IntentBindingMismatch { field }))?,
+            );
+            nonces.push(nonce);
         }
+        groups.push(PlannedGroup {
+            partial,
+            checked,
+            keys,
+            nonces,
+        });
     }
-
-    Err(QuorumError::NoGroupSatisfiedInOrCombinator {
-        groups: group_names,
+    Ok(QuorumPlan {
+        groups,
+        subjects,
+        network_passphrase: network_passphrase.into(),
     })
 }
 
-/// Collects auth entries for the qualifying members of a single group.
+/// Signs exactly the quorum selected before admission.
 ///
-/// Finds signers whose public key is in `group.members`, sorts them by public
-/// key bytes (deterministic), takes the first `group.threshold` qualifying
-/// signers, and produces one entry per signer.
-///
-/// Returns [`QuorumError::InsufficientSignersInGroup`] when fewer than
-/// `threshold` qualifying signers are found.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "mirrors collect_quorum_signatures parameter set"
-)]
-async fn collect_group_entries(
-    group: &SignerGroup,
-    resolved: &[([u8; 32], &(dyn Signer + Send + Sync))],
-    auth_scaddr: ScAddress,
-    function_name: ScSymbol,
-    args: Vec<ScVal>,
-    auth_rule_ids: Vec<ContextRuleId>,
-    simulation: &AuthorizationSimulation,
-    envelope: &crate::signing::divergence::EnvelopeContext,
-    network_passphrase: &str,
-    signature_expiration_ledger: u32,
-) -> Result<Vec<SorobanAuthorizationEntry>, QuorumError> {
-    // Find qualifying signers: public key must be in group.members.
-    let mut qualifying: Vec<([u8; 32], &(dyn Signer + Send + Sync))> = resolved
+/// # Errors
+/// Refuses missing planned keys, unplanned signatures, or a signer failure.
+pub async fn sign_quorum_plan(
+    plan: &QuorumPlan,
+    signers: &[&(dyn Signer + Send + Sync)],
+    gate: &crate::signing::gate::SigningGate,
+) -> Result<Vec<SorobanAuthorizationEntry>, QuorumSigningError> {
+    sign_quorum_plan_within_budget(plan, signers, gate, None)
+        .await
+        .map_err(|error| match error {
+            QuorumFailure::Quorum(error) => QuorumSigningError::Quorum(error),
+            QuorumFailure::Intent(error) | QuorumFailure::Deadline(error) => {
+                QuorumSigningError::Intent(error)
+            }
+        })
+}
+
+pub(crate) async fn sign_quorum_plan_within_budget(
+    plan: &QuorumPlan,
+    signers: &[&(dyn Signer + Send + Sync)],
+    gate: &crate::signing::gate::SigningGate,
+    budget: Option<PreSubmitBudget>,
+) -> Result<Vec<SorobanAuthorizationEntry>, QuorumFailure> {
+    let mut resolved = Vec::new();
+    for &signer in signers {
+        let key = sign_within_budget(budget, SIGN_AUTH_DIGEST_STAGE, signer.public_key())
+            .await
+            .map_err(QuorumFailure::Deadline)?
+            .map_err(|error| QuorumError::SignatureProductionFailed {
+                detail: error.to_string(),
+            })?;
+        resolved.push((key.0, signer));
+    }
+    if plan
+        .groups
         .iter()
-        .filter(|(pk, _)| group.members.contains(pk))
-        .map(|(pk, s)| (*pk, *s))
-        .collect();
-
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "qualifying.len() bounded by group.members.len() ≤ u32::MAX"
-    )]
-    let provided = qualifying.len() as u32;
-    if provided < group.threshold {
-        return Err(QuorumError::InsufficientSignersInGroup {
-            group_name: group.name.clone(),
-            required: group.threshold,
-            provided,
-        });
+        .flat_map(|group| &group.keys)
+        .any(|key| !resolved.iter().any(|(actual, _)| actual == key))
+    {
+        return Err(QuorumError::SignatureProductionFailed {
+            detail: "a planned signing key is unavailable".into(),
+        }
+        .into());
     }
-
-    // Sort by public-key bytes for deterministic ordering.
-    //
-    // A `SignerGroup` is a homogeneous Delegated-only quorum group, so all
-    // AuthPayload keys share the `Symbol("Delegated")` tag and differ only in
-    // the Account-address suffix; sorting by pubkey bytes is therefore
-    // equivalent to sorting by the full canonical `ScVal` key order. A
-    // heterogeneous Delegated + External-Ed25519 set is signed through
-    // `auth_entry::collect_mixed_signer_entries`, which sorts the signers map
-    // by the full key `ScVal` `Ord` and skips the G-key sub-entry for External
-    // signers.
-    qualifying.sort_by_key(|(pk, _)| *pk);
-
-    // Take exactly `threshold` signers.
-    qualifying.truncate(group.threshold as usize);
-
-    // Build the shared partial auth entry (ONE per invocation, shared by all signers).
-    //
-    // All qualifying signers sign the SAME auth_digest because they are all
-    // authorising the same invocation root. Producing a separate partial per
-    // signer would change nothing — the preimage inputs (contract, fn_name,
-    // args, rule_ids, simulation nonce, expiry) are identical for all signers
-    // in this group.
-    //
-    // Canonical byte-layout source: `HashIdPreimage::SorobanAuthorization`
-    // (`HashIdPreimageSorobanAuthorization`) in `Stellar-transaction.x`.
-    let partial: PartialSorobanAuthorizationEntry = build_authorization_entry(
-        auth_scaddr.clone(),
-        function_name.clone(),
-        args.clone(),
-        auth_rule_ids.clone(),
-        simulation,
-        envelope,
-    )
-    .await
-    .map_err(|e: SaError| QuorumError::SignatureProductionFailed {
-        detail: format!("{e}"),
-    })?;
-
-    // Capture auth_digest before partial is consumed by the multi-signer completer.
-    let auth_digest: [u8; 32] = partial.auth_digest;
-
-    // Collect the signer references for the multi-signer completer.
-    let signer_refs: Vec<&(dyn Signer + Send + Sync)> =
-        qualifying.iter().map(|(_, s)| *s).collect();
-
-    // Build ONE SorobanAuthorizationEntry for the smart-account C-address whose
-    // AuthPayload.signers map contains ALL qualifying signers' signatures.
-    //
-    // Per the OpenZeppelin smart-account contract, the on-chain
-    // `AuthPayload { signers: Map<Signer, Bytes>, context_rule_ids }` is consumed
-    // by `do_check_auth`, which iterates the signers map and authenticates each
-    // entry; the policy's `enforce(authenticated_signers)` then counts all
-    // authenticated entries.
-    // Producing separate entries per signer would have the host process only ONE
-    // entry for the smart-account C-address.
-    let smart_account_entry = complete_authorization_entry_multi_signer(partial, &signer_refs)
-        .await
-        .map_err(|e: SaError| QuorumError::SignatureProductionFailed {
-            detail: format!("{e}"),
-        })?;
-
-    // Build one delegated G-key sub-auth entry PER signer (required by __check_auth).
-    //
-    // The contract's `authenticate(Delegated)` calls
-    // `addr.require_auth_for_args((auth_digest,))` from inside `__check_auth`.
-    // Each G-key must have a separate delegated entry since each entry carries a
-    // unique G-key address and a fresh CSPRNG nonce.
-    //
-    // The canonical single-signer pattern extends to the quorum: each signer in
-    // the quorum needs their own delegated entry by the same logic.
-    // XDR shape: SorobanAuthorizationEntry with SorobanCredentials::Address whose
-    // address is the signer's G-key; signature over the standard Soroban
-    // HashIdPreimage::SorobanAuthorization preimage
-    // (`HashIdPreimageSorobanAuthorization` in `Stellar-transaction.x`).
-    let mut entries: Vec<SorobanAuthorizationEntry> = Vec::with_capacity(1 + qualifying.len());
-    entries.push(smart_account_entry);
-
-    for (_pk, signer) in &qualifying {
-        let delegated = build_and_sign_delegated_g_key_entry(
-            &auth_scaddr,
-            &auth_digest,
-            signature_expiration_ledger,
-            *signer,
-            network_passphrase,
-        )
-        .await
-        .map_err(|e: SaError| QuorumError::SignatureProductionFailed {
-            detail: format!("delegated G-key entry: {e}"),
-        })?;
-        entries.push(delegated);
+    let mut entries = Vec::new();
+    for group in &plan.groups {
+        let signers: Vec<_> = group
+            .keys
+            .iter()
+            .filter_map(|key| {
+                resolved
+                    .iter()
+                    .find(|(actual, _)| actual == key)
+                    .map(|(_, signer)| *signer)
+            })
+            .collect();
+        entries.push(
+            complete_authorization_entry_multi_signer_within_budget(
+                gate,
+                group.checked.for_planned_signing(),
+                group.partial.clone(),
+                &signers,
+                budget,
+            )
+            .await
+            .map_err(|error| QuorumFailure::of_signing(budget, "", error))?,
+        );
+        for (signer, nonce) in signers.iter().zip(&group.nonces) {
+            entries.push(
+                build_and_sign_delegated_g_key_entry(
+                    gate,
+                    *nonce,
+                    &group.partial.smart_account,
+                    &group.partial.auth_digest,
+                    group.partial.signature_expiration_ledger,
+                    *signer,
+                    &plan.network_passphrase,
+                    budget,
+                )
+                .await
+                .map_err(|error| QuorumFailure::of_signing(budget, "delegated entry: ", error))?,
+            );
+        }
     }
-
     Ok(entries)
 }
 
@@ -825,19 +818,19 @@ mod tests {
     #[test]
     fn signer_group_empty_members_rejected() {
         let e = SignerGroup::new("ops".into(), vec![], 1).unwrap_err();
-        assert!(e.contains("members must not be empty"), "got: {e}");
+        assert_eq!(e, "SignerGroup members must not be empty");
     }
 
     #[test]
     fn signer_group_zero_threshold_rejected() {
         let e = SignerGroup::new("ops".into(), vec![[0u8; 32]], 0).unwrap_err();
-        assert!(e.contains("threshold must be ≥ 1"), "got: {e}");
+        assert_eq!(e, "SignerGroup threshold must be at least 1");
     }
 
     #[test]
     fn signer_group_threshold_exceeds_members_rejected() {
         let e = SignerGroup::new("ops".into(), vec![[0u8; 32]], 2).unwrap_err();
-        assert!(e.contains("threshold 2 > members.len() 1"), "got: {e}");
+        assert_eq!(e, "SignerGroup threshold must not exceed the member count");
     }
 
     // ── QuorumError wire codes ─────────────────────────────────────────────────
@@ -871,6 +864,10 @@ mod tests {
         assert_eq!(
             QuorumError::SignatureProductionFailed { detail: "x".into() }.wire_code(),
             "sa.quorum.signature_production_failed"
+        );
+        assert_eq!(
+            QuorumError::MainnetWriteForbidden.wire_code(),
+            "sa.quorum.mainnet_write_forbidden"
         );
     }
 
@@ -923,7 +920,7 @@ mod tests {
         assert_eq!(a.groups.len(), 2);
     }
 
-    // ── collect_quorum_signatures unit tests (offline, pure logic) ────────────
+    // ── plan_quorum_signatures unit tests (offline, pure logic) ────────────
     //
     // These tests exercise the quorum orchestrator using StubSigner doubles that
     // never touch the network; they validate fail-closed logic and group
@@ -939,11 +936,17 @@ mod tests {
 
     #[async_trait]
     impl Signer for StubSigner {
-        async fn sign_tx_payload(&self, _: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        async fn sign_tx_payload(
+            &self,
+            _: &stellar_agent_network::signing::TxSigningPayload,
+        ) -> Result<[u8; 64], WalletError> {
             unimplemented!("stub")
         }
 
-        async fn sign_auth_digest(&self, _: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        async fn sign_auth_digest(
+            &self,
+            _: &stellar_agent_network::signing::SmartAccountAuthDigest,
+        ) -> Result<[u8; 64], WalletError> {
             // Return a deterministic fake 64-byte signature; sufficient for
             // offline unit tests that only exercise the quorum logic path.
             Ok([self.pubkey_bytes[0]; 64])
@@ -951,14 +954,21 @@ mod tests {
 
         async fn sign_soroban_address_auth_payload(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SorobanAuthPayload,
         ) -> Result<[u8; 64], WalletError> {
             Ok([self.pubkey_bytes[0]; 64])
         }
 
+        async fn sign_message(
+            &self,
+            _: &stellar_agent_network::signing::MessagePayload,
+        ) -> Result<[u8; 64], WalletError> {
+            unimplemented!("stub")
+        }
+
         async fn sign_webauthn_assertion(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SmartAccountAuthDigest,
             _: &[u8],
         ) -> Result<WebAuthnAssertion, WalletError> {
             unimplemented!("stub")
@@ -969,7 +979,7 @@ mod tests {
         }
     }
 
-    /// `collect_quorum_signatures` returns `EmptyAuthorizationInfo` when
+    /// `plan_quorum_signatures` returns `EmptyAuthorizationInfo` when
     /// `authz.groups` is empty.
     #[tokio::test]
     async fn empty_authorization_info_fails_closed() {
@@ -1012,7 +1022,7 @@ mod tests {
                     resource_fee: 1000,
                 },
             },
-            network_id: [9u8; 32],
+            network_id: network_id_of("Test SDF Network ; September 2015"),
             nonce: 42,
             signature_expiration_ledger: 100,
         };
@@ -1024,7 +1034,12 @@ mod tests {
             fee_envelope: simulation.context.fee_envelope.clone(),
         };
 
-        let result = collect_quorum_signatures(
+        let result = plan_quorum_signatures(
+            crate::submit::checked_context_for_test(
+                &auth_scaddr,
+                simulation.network_id,
+                &simulation.context.context_rule_ids,
+            ),
             &authz,
             &signers,
             auth_scaddr,
@@ -1089,7 +1104,7 @@ mod tests {
                     resource_fee: 1000,
                 },
             },
-            network_id: [9u8; 32],
+            network_id: network_id_of("Test SDF Network ; September 2015"),
             nonce: 42,
             signature_expiration_ledger: 100,
         };
@@ -1101,7 +1116,12 @@ mod tests {
             fee_envelope: simulation.context.fee_envelope.clone(),
         };
 
-        let result = collect_quorum_signatures(
+        let result = plan_quorum_signatures(
+            crate::submit::checked_context_for_test(
+                &auth_scaddr,
+                simulation.network_id,
+                &simulation.context.context_rule_ids,
+            ),
             &authz,
             &signers,
             auth_scaddr,
@@ -1170,7 +1190,7 @@ mod tests {
                     resource_fee: 1000,
                 },
             },
-            network_id: [9u8; 32],
+            network_id: network_id_of("Test SDF Network ; September 2015"),
             nonce: 42,
             signature_expiration_ledger: 100,
         };
@@ -1182,7 +1202,12 @@ mod tests {
             fee_envelope: simulation.context.fee_envelope.clone(),
         };
 
-        let result = collect_quorum_signatures(
+        let result = plan_quorum_signatures(
+            crate::submit::checked_context_for_test(
+                &auth_scaddr,
+                simulation.network_id,
+                &simulation.context.context_rule_ids,
+            ),
             &authz,
             &signers,
             auth_scaddr,
@@ -1249,7 +1274,7 @@ mod tests {
                     resource_fee: 1000,
                 },
             },
-            network_id: [9u8; 32],
+            network_id: network_id_of("Test SDF Network ; September 2015"),
             nonce: 42,
             signature_expiration_ledger: 100,
         };
@@ -1262,7 +1287,12 @@ mod tests {
         };
 
         // We expect success (g1 satisfied by s1).
-        let result = collect_quorum_signatures(
+        let result = plan_quorum_signatures(
+            crate::submit::checked_context_for_test(
+                &auth_scaddr,
+                simulation.network_id,
+                &simulation.context.context_rule_ids,
+            ),
             &authz,
             &signers,
             auth_scaddr,
@@ -1286,5 +1316,333 @@ mod tests {
         }
         // Any other error (auth-entry construction fails without live RPC) is acceptable
         // in this offline unit test.
+    }
+
+    // ── Mainnet refusal and network binding before any key access ───────────
+
+    /// A non-mainnet network other than testnet.
+    const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
+
+    /// Runs a 1-of-1 quorum over one counting signer, declaring
+    /// `network_passphrase` with a simulation of the network of
+    /// `simulation_passphrase`. Returns the result and the signer's key
+    /// accesses. The quorum takes no RPC client, so it makes no request.
+    async fn quorum_over(
+        network_passphrase: &str,
+        simulation_passphrase: &str,
+    ) -> (Result<Vec<SorobanAuthorizationEntry>, QuorumError>, usize) {
+        use crate::managers::auth_entry::test_helpers::{
+            baseline_authorization_simulation, matching_envelope_context,
+        };
+        use stellar_agent_network::signing::test_doubles::CountingSigner;
+        use stellar_xdr::{ContractId, Hash};
+
+        let seed = [0x21u8; 32];
+        let member = stellar_agent_network::SoftwareSigningKey::new_from_bytes(seed)
+            .public_key()
+            .await
+            .unwrap()
+            .0;
+        let authz = AuthorizationInfo::new(
+            vec![SignerGroup::new("ops".into(), vec![member], 1).unwrap()],
+            Combinator::And,
+        );
+        let signer = CountingSigner::new(seed);
+        let rule_id = ContextRuleId::new(1);
+        let simulation = baseline_authorization_simulation(
+            simulation_passphrase,
+            "stellar:fixture",
+            vec![rule_id],
+        );
+        let envelope = matching_envelope_context(&simulation);
+
+        let result = plan_quorum_signatures(
+            crate::submit::checked_context_for_test(
+                &ScAddress::Contract(ContractId(Hash([0x31; 32]))),
+                simulation.network_id,
+                &simulation.context.context_rule_ids,
+            ),
+            &authz,
+            &[&signer],
+            ScAddress::Contract(ContractId(Hash([0x31; 32]))),
+            ScSymbol::try_from("execute").unwrap(),
+            vec![],
+            vec![rule_id],
+            &simulation,
+            &envelope,
+            network_passphrase,
+            9999,
+        )
+        .await;
+        let result = match result {
+            Ok(plan) => {
+                let gate = crate::signing::intent_test_helpers::gate(plan.intent_subjects());
+                sign_quorum_plan(&plan, &[&signer], &gate)
+                    .await
+                    .map_err(|error| match error {
+                        QuorumSigningError::Quorum(error) => error,
+                        QuorumSigningError::Intent(error) => {
+                            panic!("fixture admission refuses: {error}")
+                        }
+                    })
+            }
+            Err(error) => Err(error),
+        };
+        (result, signer.key_accesses())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plan_quorum_signatures_signs_a_testnet_quorum() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let (result, key_accesses) = quorum_over(
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap().len(),
+            2,
+            "the smart-account entry and one G-key entry"
+        );
+        assert!(key_accesses > 0);
+    }
+
+    #[tokio::test]
+    async fn plan_quorum_signatures_refuses_the_mainnet_passphrase_before_any_key_access() {
+        let (result, key_accesses) = quorum_over(MAINNET_PASSPHRASE, MAINNET_PASSPHRASE).await;
+
+        assert!(
+            matches!(result, Err(QuorumError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(key_accesses, 0);
+    }
+
+    #[tokio::test]
+    async fn plan_quorum_signatures_refuses_a_mainnet_simulation_before_any_key_access() {
+        let (result, key_accesses) = quorum_over(
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            MAINNET_PASSPHRASE,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(QuorumError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(key_accesses, 0);
+    }
+
+    #[tokio::test]
+    async fn plan_quorum_signatures_refuses_a_passphrase_of_another_network_before_any_key_access()
+    {
+        let (result, key_accesses) = quorum_over(
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            FUTURENET_PASSPHRASE,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(QuorumError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(key_accesses, 0);
+    }
+    #[tokio::test]
+    async fn quorum_collection_refuses_a_different_checked_rule() {
+        use crate::managers::auth_entry::test_helpers::{
+            baseline_authorization_simulation, matching_envelope_context,
+        };
+        use stellar_agent_network::signing::test_doubles::CountingSigner;
+        use stellar_xdr::{ContractId, Hash};
+        let address = ScAddress::Contract(ContractId(Hash([0x31; 32])));
+        let rule = ContextRuleId::new(1);
+        let simulation = baseline_authorization_simulation(
+            "Test SDF Network ; September 2015",
+            "stellar:testnet",
+            vec![rule],
+        );
+        let envelope = matching_envelope_context(&simulation);
+        let checked = crate::submit::checked_context_for_test(
+            &address,
+            simulation.network_id,
+            &[ContextRuleId::new(0)],
+        );
+        let signer = CountingSigner::new([0x46; 32]);
+        let authz = AuthorizationInfo::new(
+            vec![SignerGroup::new("one".to_owned(), vec![[0x46; 32]], 1).unwrap()],
+            Combinator::And,
+        );
+        let error = plan_quorum_signatures(
+            checked,
+            &authz,
+            &[&signer],
+            address,
+            "execute".try_into().unwrap(),
+            vec![],
+            vec![rule],
+            &simulation,
+            &envelope,
+            "Test SDF Network ; September 2015",
+            9999,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, QuorumError::SignatureProductionFailed { ref detail } if detail.contains("checked_signing_rules")),
+            "{error:?}"
+        );
+        assert_eq!(signer.key_accesses(), 0);
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn quorum_signing_signs_the_admitted_plan() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        use crate::managers::auth_entry::test_helpers::{
+            baseline_authorization_simulation, matching_envelope_context,
+        };
+        use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+        use stellar_agent_network::signing::test_doubles::CountingSigner;
+        let seeds = [[0x21; 32], [0x22; 32]];
+        let keys = seeds.map(|seed| {
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes()
+        });
+        let authz = AuthorizationInfo::new(
+            vec![
+                SignerGroup::new("first".into(), vec![keys[0]], 1).unwrap(),
+                SignerGroup::new("second".into(), vec![keys[1]], 1).unwrap(),
+            ],
+            Combinator::And,
+        );
+        let account = stellar_xdr::ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash(
+            [0x31; 32],
+        )));
+        let a = CountingSigner::new(seeds[0]);
+        let b = CountingSigner::new(seeds[1]);
+        let signers: Vec<&(dyn Signer + Send + Sync)> = vec![&a, &b];
+        let make_plan = |expiration| {
+            let authz = &authz;
+            let signers = &signers;
+            let account = account.clone();
+            async move {
+                let mut simulation = baseline_authorization_simulation(
+                    TESTNET_PASSPHRASE,
+                    "stellar:testnet",
+                    vec![ContextRuleId::new(1)],
+                );
+                simulation.signature_expiration_ledger = expiration;
+                let envelope = matching_envelope_context(&simulation);
+                plan_quorum_signatures(
+                    crate::submit::checked_context_for_test(
+                        &account,
+                        simulation.network_id,
+                        &simulation.context.context_rule_ids,
+                    ),
+                    authz,
+                    signers,
+                    account,
+                    ScSymbol::try_from("execute").unwrap(),
+                    vec![],
+                    simulation.context.context_rule_ids.clone(),
+                    &simulation,
+                    &envelope,
+                    TESTNET_PASSPHRASE,
+                    expiration,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let plan = make_plan(9999).await;
+        let source = stellar_strkey::ed25519::PublicKey([0; 32])
+            .to_string()
+            .as_str()
+            .to_owned();
+        let intent = |subjects| {
+            stellar_agent_network::SignedIntentPlan::new(
+                TESTNET_PASSPHRASE,
+                "fixture",
+                &source,
+                1,
+                [7; 32],
+                subjects,
+                Some(9999),
+            )
+            .unwrap()
+        };
+        let admitted_plan = intent(plan.intent_subjects());
+        let proof = stellar_agent_network::SubmissionRecorder::admit_signed_intent(
+            &crate::signing::intent_test_helpers::NoLimitRecorder,
+            &admitted_plan,
+        )
+        .await
+        .unwrap();
+        let gate = crate::signing::gate::SigningGate::new(proof);
+        let entries = sign_quorum_plan(&plan, &signers, &gate).await.unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!((a.sign_calls(), b.sign_calls()), (2, 2));
+
+        let actual: Vec<_> = entries
+            .iter()
+            .map(|entry| stellar_agent_network::IntentSubject::of_entry(entry, &source).unwrap())
+            .collect();
+        for (actual, planned) in actual.iter().zip(plan.intent_subjects()) {
+            assert_eq!(actual.auth_subject(), planned.auth_subject());
+            assert_eq!(actual.nonce(), planned.nonce());
+            assert_eq!(actual.expiration(), planned.expiration());
+            assert_eq!(actual.root_invocation(), planned.root_invocation());
+        }
+        assert_eq!(intent(actual).subjects(), admitted_plan.subjects());
+        assert!(gate.exposure().is_some());
+        let changed = make_plan(10000).await;
+        let gate = crate::signing::intent_test_helpers::gate(plan.intent_subjects());
+        let before = a.sign_calls() + b.sign_calls();
+        let error = sign_quorum_plan(&changed, &signers, &gate)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            QuorumSigningError::Intent(SaError::IntentBindingMismatch {
+                field: "signing_request"
+            })
+        ));
+        assert_eq!(a.sign_calls() + b.sign_calls(), before);
+        assert!(gate.take_unexposed().is_some());
+        let replanned = make_plan(9999).await;
+        let gate = crate::signing::intent_test_helpers::gate(plan.intent_subjects());
+        let error = sign_quorum_plan(&replanned, &signers, &gate)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            QuorumSigningError::Intent(SaError::IntentBindingMismatch {
+                field: "signing_request"
+            })
+        ));
+        assert_eq!(a.sign_calls() + b.sign_calls(), before + 1);
+        assert!(gate.exposure().is_some());
+        for error in [
+            SaError::IntentBindingMismatch { field: "signers" },
+            SaError::IntentRecordUnavailable {
+                class: "window_unavailable",
+            },
+        ] {
+            let code = error.wire_code();
+            let QuorumFailure::Intent(error) = QuorumFailure::of_signing(None, "fixture", error)
+            else {
+                panic!("intent error must stay typed");
+            };
+            assert_eq!(error.wire_code(), code);
+        }
     }
 }

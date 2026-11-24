@@ -26,14 +26,16 @@
 //!
 //! 1. `profile.secondary_rpc_url` from the loaded profile TOML.
 //! 2. `--secondary-rpc-url` CLI flag (overrides the profile field).
-//! 3. If neither is set: error with `WalletError::Auth` typed error.
+//! 3. If neither is set, or the URL is on the primary's host: the command
+//!    refuses with `smart_account.ledger_witness_unavailable`.
 //!
 //! # Invocation format
 //!
 //! Each `--invocation` value MUST have the form `<target>:<fn>:<json-args>`:
 //! - `<target>` — C-strkey of the target contract.
 //! - `<fn>` — Soroban function name (≤32 bytes, no special characters).
-//! - `<json-args>` — JSON array of arguments.
+//! - `<json-args>`: JSON array of integers, strings, null, or exact objects
+//!   `{"scval": "<base64 XDR ScVal>"}`. Use the object form for addresses.
 //!
 //! Parse errors at the CLI layer surface as `MulticallInvocation` candidates
 //! with sentinel error fields; `submit_multicall_bundle` Step 1 (build) validates
@@ -45,12 +47,16 @@
 //! pin record too. A deadline that elapses during the baseline read or the
 //! comparison refuses with `sa.auth_entry_construction_failed` at stage
 //! `baseline_read` or `signer_set_compare`; during the pin check, with
-//! `sa.pin_check_unavailable`. Refusals render as `sa.multicall_failed`. Most
+//! `sa.pin_check_unavailable`; a rule whose pin record holds eight-byte hash
+//! prefixes refuses with `sa.wasm_pin_incomplete`. Refusals render as
+//! `sa.multicall_failed`. Most
 //! refusals render at phase `policy_gate`; a `sa.deployment_failed` keeps its
 //! `simulate` or `submit` phase. A version 1 authorizing rule with a contract
 //! delegate cannot form its projection and refuses at phase `simulate`. A
 //! signer-set read that refuses with `sa.contract_instance_unsupported`
-//! renders at phase `submit`.
+//! renders at phase `submit`. A refused simulated authorization tree
+//! (`simulation.divergence.*`) renders at phase `sign`, before anything is
+//! signed.
 //!
 //! # Policy
 //!
@@ -97,6 +103,7 @@ use crate::commands::policy_engine::load_v1_policy_engine;
 use crate::commands::smart_account::common::{
     SignerSourceFlags, construct_signers_manager_from_fields, emit_multicall_registry_error,
     emit_sa_error, load_command_profile, map_access_error, open_audit_writer, resolve_signer,
+    signing_secondary_rpc_url,
 };
 use crate::common::network::{
     EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
@@ -111,6 +118,11 @@ use crate::common::signer_ceremony::record_mlock_degradation;
 
 /// Default submission timeout in seconds.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
+
+/// `target_contract` of an invocation string with fewer than three fields.
+/// The bundle check refuses it as an invalid C-strkey; it holds none of the
+/// invocation string because the refusal is for that string.
+const MISSING_FIELDS_SENTINEL: &str = "<parse_error: missing fields>";
 
 /// Default per-op base fee in stroops.
 const DEFAULT_FEE_STROOPS: u32 = 100;
@@ -144,11 +156,15 @@ pub struct MulticallArgs {
 
     /// Invocation descriptor: `<target_c_strkey>:<fn_name>:<json_args_array>`.
     ///
-    /// Repeatable (1–50 invocations). Each value MUST have the form:
+    /// Repeatable (1 to 50 invocations). Each value has the form:
     /// `<target>:<fn>:<json-args>` where `<json-args>` is a JSON array.
     ///
     /// Examples:
-    /// - `CABC...WXYZ:transfer:["GABC...","GWXYZ...","1000000"]`
+    /// - `CTOKEN:transfer:[{"scval":"<wallet Address XDR>"},{"scval":"<recipient Address XDR>"},1000000]`
+    ///
+    /// Elements are integers, strings, null, or exact `scval` objects.
+    /// Address placeholders contain standard-base64 XDR `ScVal::Address` values.
+    /// The wallet address is the transfer sender.
     ///
     /// Parse errors surface at Step 1 (build validation) of `submit_multicall_bundle`.
     #[arg(
@@ -284,10 +300,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved_profile) {
         Ok(loaded) => loaded,
         Err(error) => {
-            render_json(&Envelope::<()>::err(&map_access_error(
-                &error,
-                &profile_name,
-            )));
+            render_json(&Envelope::<()>::err(&map_access_error(&error)));
             return 1;
         }
     };
@@ -314,13 +327,6 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     if context.chain_id.is_mainnet() {
         let e =
             WalletError::Network(stellar_agent_core::error::NetworkError::MainnetWriteForbidden);
-        render_json(&Envelope::<()>::err(&e));
-        return 1;
-    }
-    if context.secondary_rpc_url.is_none() {
-        let e = WalletError::Validation(ValidationError::AddressInvalid {
-            input: "secondary_rpc_url is required for multicall: set it in the profile TOML (secondary_rpc_url = \"https://...\") or pass --secondary-rpc-url".to_owned(),
-        });
         render_json(&Envelope::<()>::err(&e));
         return 1;
     }
@@ -386,6 +392,13 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         };
     let audit_writer = Some(Arc::clone(&profile_audit_writer));
 
+    // The signature rests on a second endpoint's ledger observation, and the
+    // trust anchor compares the same two endpoints.
+    let secondary_rpc_url = match signing_secondary_rpc_url(&context) {
+        Ok(url) => url.to_owned(),
+        Err(e) => return emit_sa_error(&e),
+    };
+
     let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
         Ok(v) => v,
         Err(e) => {
@@ -406,17 +419,19 @@ pub async fn run(args: &MulticallArgs) -> i32 {
             &profile_name,
             origin,
             &reconcile_client,
+            crate::commands::submission_record::settlement_oracle(&profile).as_ref(),
             now_ms,
+            None,
         )
         .await;
     }
 
-    // Load and verify the signed policy, then hydrate its persisted window
-    // state. A load failure refuses; there is no permissive fallback.
+    // Hydrate persisted window state, then load and verify the signed policy.
+    // A load failure refuses; there is no permissive fallback.
     let policy_engine = match load_v1_policy_engine("multicall", &profile, &profile_name) {
-        Ok(engine) => Arc::new(engine),
+        Ok(engine) => engine,
         Err(msg) => {
-            render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
+            render_json(&Envelope::<()>::err_raw(msg.code(), msg.to_string()));
             return 1;
         }
     };
@@ -446,6 +461,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         Duration::from_secs(args.timeout_seconds),
         profile_audit_writer,
         &audit_log_path,
+        None,
     ) {
         Ok(manager) => manager,
         Err(e) => {
@@ -471,10 +487,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         bundle,
         signer: signer.as_ref(),
         primary_rpc_url: &context.rpc_url,
-        secondary_rpc_url: context
-            .secondary_rpc_url
-            .as_deref()
-            .unwrap_or(&context.rpc_url),
+        secondary_rpc_url: &secondary_rpc_url,
         network_passphrase: &network_passphrase,
         policy_engine,
         profile: &profile,
@@ -569,7 +582,7 @@ fn parse_single_invocation(raw: &str) -> MulticallInvocation {
     let parts: Vec<&str> = raw.splitn(3, ':').collect();
     if parts.len() != 3 {
         return MulticallInvocation {
-            target_contract: format!("<parse_error: missing fields in {raw:?}>"),
+            target_contract: MISSING_FIELDS_SENTINEL.to_owned(),
             fn_name: String::new(),
             args_json: serde_json::Value::Null,
         };
@@ -647,14 +660,14 @@ mod tests {
 
     #[test]
     fn parse_invocation_missing_fields() {
-        let raw = "CABC123:transfer";
+        let raw = "credmarker7:transfer";
         let inv = parse_single_invocation(raw);
-        // Target contract gets the error sentinel.
-        assert!(
-            inv.target_contract.starts_with("<parse_error:"),
-            "expected sentinel: got {:?}",
-            inv.target_contract
-        );
+        // Target contract gets the error sentinel, and the invocation holds
+        // none of the refused input.
+        assert_eq!(inv.target_contract, "<parse_error: missing fields>");
+        assert_eq!(inv.fn_name, "");
+        assert_eq!(inv.args_json, serde_json::Value::Null);
+        assert!(!format!("{inv:?}").contains("credmarker7"), "{inv:?}");
     }
 
     #[test]

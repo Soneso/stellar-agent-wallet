@@ -7,23 +7,36 @@
 //!
 //! # Signing discipline
 //!
-//! The helper decodes the base64 envelope, constructs the SEP-23
-//! `TransactionSignaturePayload`, SHA-256 hashes it, calls
-//! `signer.sign_tx_payload` exactly once, attaches the resulting
+//! The helper decodes the base64 envelope, builds its SEP-23 payload with
+//! [`TxSigningPayload::for_envelope`], calls `signer.sign_tx_payload` exactly
+//! once, attaches the resulting
 //! `DecoratedSignature`, and re-encodes the signed envelope as base64.
 //! Signing is fully off-chain.
 //!
 //! Retries in the submit layer operate on the already-signed bytes;
 //! this function is never called again after initial signing.
+//!
+//! # Mainnet
+//!
+//! `attach_signature` refuses the mainnet passphrase before any key access.
+//! A mainnet signature is produced only by [`attach_signature_authorized`],
+//! which checks a transaction authorization before it touches the signer and
+//! verifies the signature before it attaches it.
 
-use sha2::{Digest, Sha256};
-use stellar_agent_core::error::{ProtocolError, WalletError};
+use stellar_agent_core::envelope_decode::TRANSACTION_ENVELOPE_XDR_FORM;
+use stellar_agent_core::error::{NetworkError, ProtocolError, WalletError};
+use stellar_agent_core::profile::caip2::Caip2;
 use stellar_xdr::{
-    DecoratedSignature, Hash, Limits, ReadXdr, Signature, SignatureHint, TransactionEnvelope,
-    TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction, WriteXdr,
+    DecoratedSignature, Limits, ReadXdr, Signature, SignatureHint, TransactionEnvelope, WriteXdr,
 };
 
-use crate::signing::Signer;
+use crate::mainnet::authorization::MainnetTxSignAuthorization;
+use crate::mainnet::digest::approval_subject_classic;
+use crate::mainnet::refusal::{AuthorizedPathError, require};
+use crate::mainnet::{MainnetConsumer, MainnetPrecondition, SignerRole};
+use crate::signing::verify_binding::signature_verifies;
+use crate::signing::{Signer, TxSigningPayload};
+use crate::submit::{MAINNET_PASSPHRASE, replay_identity};
 
 /// Decodes a base64 `TransactionEnvelope`, attaches an ed25519 signature
 /// constructed via `signer`, and returns the re-encoded signed envelope.
@@ -32,8 +45,14 @@ use crate::signing::Signer;
 /// `TxFeeBump` envelopes (the SEP-23 tagged-transaction variants); legacy `TxV0`
 /// envelopes are rejected.
 ///
+/// The mainnet passphrase is refused before the envelope is decoded and
+/// before any call on `signer`, for every envelope kind;
+/// [`attach_signature_authorized`] is the mainnet signing path.
+///
 /// # Errors
 ///
+/// - [`WalletError::Network`] wrapping [`NetworkError::MainnetWriteForbidden`]
+///   if `network_passphrase` is the mainnet passphrase.
 /// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`] if
 ///   the envelope cannot be decoded or re-encoded, or is a legacy `TxV0`
 ///   envelope.
@@ -59,59 +78,170 @@ pub async fn attach_signature(
     signer: &dyn Signer,
     network_passphrase: &str,
 ) -> Result<String, WalletError> {
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
+    }
+    let envelope = decode_envelope(unsigned_envelope_xdr)?;
+    let payload = TxSigningPayload::for_envelope(&envelope, network_passphrase)?;
+
+    // Invoke the signer exactly once, then read the key for the hint.
+    let sig_bytes = signer.sign_tx_payload(&payload).await?;
+    let public_key = signer.public_key().await?;
+    append_signature(envelope, &public_key.0, &sig_bytes)
+}
+
+/// Signs a classic `Tx` envelope for mainnet under a transaction
+/// authorization, and returns the re-encoded signed envelope.
+///
+/// A fee-bump envelope is refused first, after decoding and before reading the
+/// clock. Before any signer call, checks start with the chain: both the passphrase
+/// and bound chain must name mainnet. The consumer must then match the bound verb.
+/// Next comes expiry on [`crate::mainnet::clock::now_ms`], followed by the digest of
+/// the unsigned envelope text. Finally, checks compare the transaction hash under
+/// the passphrase, the source account, and the sequence. Only a `Tx` is signed.
+/// The signer's reported public key must be the bound agent signer's; that is the
+/// first call on `signer`. The window store durably claims the authorization
+/// after that key check and before the signing call. A late signature is
+/// discarded; a refusal after the claim keeps its spend counted. After signing,
+/// the signature must verify under the transaction's mainnet payload against
+/// that key before it is attached.
+///
+/// Compiled in every build; without mainnet writes no authorization value
+/// exists, so the function cannot be called.
+///
+/// # Errors
+///
+/// - [`WalletError::Network`] wrapping
+///   [`NetworkError::MainnetAuthorizationRefused`] if a check fails, the
+///   passphrase is not mainnet's, the envelope is a fee bump, or the
+///   signature does not verify. The broken precondition is logged.
+/// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`] if
+///   the envelope cannot be decoded or re-encoded, or is a legacy `TxV0`
+///   envelope.
+/// - `wallet.clock_error` if the clock cannot be read.
+/// - [`WalletError::Auth`] or [`WalletError::WalletState`] from the signer.
+///
+/// # Panics
+///
+/// Never panics.
+pub async fn attach_signature_authorized(
+    unsigned_envelope_xdr: &str,
+    signer: &dyn Signer,
+    network_passphrase: &str,
+    consumer: MainnetConsumer,
+    authorization: &MainnetTxSignAuthorization,
+) -> Result<String, WalletError> {
+    authorized_signature(
+        unsigned_envelope_xdr,
+        signer,
+        network_passphrase,
+        consumer,
+        authorization,
+    )
+    .await
+    .map_err(|error| error.report("attach_signature_authorized"))
+}
+
+/// [`attach_signature_authorized`] with the broken precondition kept for the
+/// caller.
+pub(crate) async fn authorized_signature(
+    unsigned_envelope_xdr: &str,
+    signer: &dyn Signer,
+    network_passphrase: &str,
+    consumer: MainnetConsumer,
+    authorization: &MainnetTxSignAuthorization,
+) -> Result<String, AuthorizedPathError> {
+    let envelope = decode_envelope(unsigned_envelope_xdr)?;
+    // A transaction authorization covers a transaction envelope; a fee bump
+    // is a domain of its own.
+    if matches!(envelope, TransactionEnvelope::TxFeeBump(_)) {
+        return Err(AuthorizedPathError::Refused(
+            MainnetPrecondition::BindingMismatch,
+        ));
+    }
+
+    let chain = Caip2::from_passphrase(network_passphrase).ok_or(AuthorizedPathError::Refused(
+        MainnetPrecondition::ChainNotMainnet,
+    ))?;
+    authorization.check_chain(chain)?;
+    authorization.check_consumer(consumer)?;
+    authorization.check_not_expired(crate::mainnet::clock::now_ms()?)?;
+
+    authorization.check_unsigned_envelope(&approval_subject_classic(unsigned_envelope_xdr))?;
+    let payload = TxSigningPayload::authorized(&envelope, authorization)?;
+    let (source, sequence) = replay_identity(&envelope)?;
+    authorization.check_source_sequence(&source, sequence)?;
+
+    let public_key = signer.public_key().await?;
+    authorization.check_signer(&public_key.0, SignerRole::AgentSigner)?;
+    authorization.claim()?;
+    let sig_bytes = signer.sign_tx_payload(&payload).await?;
+    authorization.check_not_expired(crate::mainnet::clock::now_ms()?)?;
+    require(
+        signature_verifies(&public_key.0, payload.as_bytes(), &sig_bytes),
+        MainnetPrecondition::SignatureInvalid,
+    )?;
+    Ok(append_signature(envelope, &public_key.0, &sig_bytes)?)
+}
+
+/// Refuses a decoded W address before an intake persists or accesses a key.
+/// Malformed XDR remains subject to the caller's existing validation order.
+///
+/// # Errors
+///
+/// Returns `protocol.xdr_codec_failed` for a CAP-84 muxed contract address.
+pub fn check_envelope_address_forms(envelope_xdr: &str) -> Result<(), WalletError> {
+    if let Ok(envelope) = TransactionEnvelope::from_xdr_base64(
+        envelope_xdr,
+        stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr.len()),
+    ) {
+        refuse_muxed_contract(&envelope)?;
+    }
+    Ok(())
+}
+
+/// Refuses a decoded envelope that carries a muxed contract address.
+pub(crate) fn refuse_muxed_contract(envelope: &TransactionEnvelope) -> Result<(), WalletError> {
+    if stellar_agent_core::sc_address::envelope_has_muxed_contract(envelope) {
+        return Err(WalletError::Protocol(ProtocolError::XdrCodecFailed {
+            detail: stellar_agent_core::sc_address::MUXED_CONTRACT_REFUSAL.to_owned(),
+        }));
+    }
+    Ok(())
+}
+
+/// Decodes a caller-supplied envelope under the untrusted-input limits.
+fn decode_envelope(envelope_xdr: &str) -> Result<TransactionEnvelope, WalletError> {
     // The unsigned envelope is caller-supplied and untrusted; bounded limits
     // prevent a deeply nested auth-invocation tree from exhausting the stack.
-    let mut envelope = TransactionEnvelope::from_xdr_base64(
-        unsigned_envelope_xdr,
-        stellar_agent_xdr_limits::untrusted_decode_limits(unsigned_envelope_xdr.len()),
+    let envelope = TransactionEnvelope::from_xdr_base64(
+        envelope_xdr,
+        stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr.len()),
     )
-    .map_err(|e| {
+    .map_err(|_| {
         WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: format!("failed to decode TransactionEnvelope: {e}"),
+            detail: format!(
+                "failed to decode TransactionEnvelope: {TRANSACTION_ENVELOPE_XDR_FORM}"
+            ),
         })
     })?;
+    refuse_muxed_contract(&envelope)?;
+    Ok(envelope)
+}
 
-    // SEP-23 covers V1 `Tx` and `TxFeeBump` envelopes. The tagged transaction
-    // selects the matching payload variant; legacy V0 envelopes are rejected.
-    let network_id_hash = Hash(Sha256::digest(network_passphrase.as_bytes()).into());
-    let tagged_tx = match &envelope {
-        TransactionEnvelope::Tx(v1) => {
-            TransactionSignaturePayloadTaggedTransaction::Tx(v1.tx.clone())
-        }
-        TransactionEnvelope::TxFeeBump(fb) => {
-            TransactionSignaturePayloadTaggedTransaction::TxFeeBump(fb.tx.clone())
-        }
-        TransactionEnvelope::TxV0(_) => {
-            return Err(WalletError::Protocol(ProtocolError::XdrCodecFailed {
-                detail: "legacy V0 transaction envelopes are not supported; \
-                         use a V1 Tx or TxFeeBump envelope"
-                    .to_owned(),
-            }));
-        }
-    };
-
-    let sig_payload = TransactionSignaturePayload {
-        network_id: network_id_hash,
-        tagged_transaction: tagged_tx,
-    };
-
-    let payload_bytes = sig_payload.to_xdr(Limits::none()).map_err(|e| {
-        WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: format!("TransactionSignaturePayload XDR encode failed: {e}"),
-        })
-    })?;
-
-    // SHA-256 the payload and invoke the signer exactly once.
-    let tx_hash: [u8; 32] = Sha256::digest(&payload_bytes).into();
-    let sig_bytes = signer.sign_tx_payload(&tx_hash).await?;
-
+/// Appends the signature by `public_key` to the envelope's signature list and
+/// re-encodes the envelope.
+fn append_signature(
+    mut envelope: TransactionEnvelope,
+    public_key: &[u8; 32],
+    sig_bytes: &[u8; 64],
+) -> Result<String, WalletError> {
     // The hint is the last 4 bytes of the 32-byte public key.
-    let public_key = signer.public_key().await?;
     let hint_bytes: [u8; 4] = [
-        public_key.0[28],
-        public_key.0[29],
-        public_key.0[30],
-        public_key.0[31],
+        public_key[28],
+        public_key[29],
+        public_key[30],
+        public_key[31],
     ];
 
     let decorated = DecoratedSignature {
@@ -170,6 +300,7 @@ pub async fn attach_signature(
 mod tests {
     use super::*;
     use crate::signing::SoftwareSigningKey;
+    use crate::signing::test_doubles::CountingSigner;
     use ed25519_dalek::{Signature as DalekSignature, Verifier, VerifyingKey};
     use sha2::{Digest, Sha256};
     use stellar_agent_core::error::{ProtocolError, WalletError};
@@ -185,6 +316,8 @@ mod tests {
 
     const TESTNET: &str = "Test SDF Network ; September 2015";
     const MAINNET: &str = "Public Global Stellar Network ; September 2015";
+    /// A third network, for properties that compare two non-mainnet ones.
+    const FUTURENET: &str = "Test SDF Future Network ; October 2022";
 
     /// Builds a minimal, unsigned `TransactionEnvelope::Tx` (V1) containing a
     /// single Payment operation and returns its base64 XDR.
@@ -208,6 +341,47 @@ mod tests {
             )
             .expect("payment op");
         builder.build().expect("build unsigned envelope")
+    }
+
+    #[tokio::test]
+    async fn muxed_contract_envelope_refuses_before_signature() {
+        let signer = CountingSigner::new([5; 32]);
+        let mut tx = stellar_xdr::TransactionV1Envelope::default();
+        tx.tx.operations = vec![stellar_xdr::Operation {
+            source_account: None,
+            body: stellar_xdr::OperationBody::InvokeHostFunction(
+                stellar_xdr::InvokeHostFunctionOp {
+                    host_function: stellar_xdr::HostFunction::InvokeContract(
+                        stellar_xdr::InvokeContractArgs {
+                            contract_address: stellar_xdr::ScAddress::MuxedContract(
+                                stellar_xdr::MuxedContract {
+                                    id: 7,
+                                    contract_id: stellar_xdr::ContractId(stellar_xdr::Hash(
+                                        [3; 32],
+                                    )),
+                                },
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                    auth: Default::default(),
+                },
+            ),
+        }]
+        .try_into()
+        .unwrap();
+        let encoded = TransactionEnvelope::Tx(tx)
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        let result = attach_signature(&encoded, &signer, TESTNET).await;
+        assert_eq!(signer.sign_calls(), 0);
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), "protocol.xdr_codec_failed");
+        assert!(
+            error
+                .to_string()
+                .ends_with("a muxed contract address (W) is not accepted on this path")
+        );
     }
 
     /// Builds a `TransactionEnvelope::TxV0` and returns its base64 XDR.
@@ -404,15 +578,43 @@ mod tests {
         let signed_testnet = attach_signature(&unsigned, &key, TESTNET)
             .await
             .expect("testnet sign");
-        let signed_mainnet = attach_signature(&unsigned, &key, MAINNET)
+        let signed_futurenet = attach_signature(&unsigned, &key, FUTURENET)
             .await
-            .expect("mainnet sign");
+            .expect("futurenet sign");
 
         // Different network_id hash → different SEP-23 payload hash → different signature.
         assert_ne!(
-            signed_testnet, signed_mainnet,
+            signed_testnet, signed_futurenet,
             "different passphrases must produce different signatures"
         );
+    }
+
+    /// The mainnet passphrase is refused before the signer is asked for its
+    /// key or a signature.
+    #[tokio::test]
+    async fn a_mainnet_passphrase_is_refused_before_any_key_access() {
+        let signer = CountingSigner::new([5u8; 32]);
+
+        let err = attach_signature(&unsigned_v1_envelope_b64(), &signer, MAINNET)
+            .await
+            .expect_err("mainnet must be refused");
+
+        assert_eq!(err.code(), "network.mainnet_write_forbidden");
+        assert_eq!(signer.key_accesses(), 0, "no key access before the refusal");
+    }
+
+    /// A fee-bump envelope on mainnet is refused before any key access, as a
+    /// transaction envelope is.
+    #[tokio::test]
+    async fn a_mainnet_fee_bump_is_refused_before_any_key_access() {
+        let signer = CountingSigner::new([5u8; 32]);
+
+        let err = attach_signature(&fee_bump_envelope_b64(), &signer, MAINNET)
+            .await
+            .expect_err("mainnet must be refused");
+
+        assert_eq!(err.code(), "network.mainnet_write_forbidden");
+        assert_eq!(signer.key_accesses(), 0, "no key access before the refusal");
     }
 
     /// Two sequential calls to `attach_signature` accumulate two signatures.
@@ -505,14 +707,19 @@ mod tests {
             matches!(
                 &err,
                 WalletError::Protocol(ProtocolError::XdrCodecFailed { detail })
-                    if detail.contains("failed to decode TransactionEnvelope")
+                    if detail == DECODE_REFUSAL
             ),
             "expected XdrCodecFailed with decode message, got: {err:?}"
         );
     }
 
+    /// The decode refusal of both failure classes: it states the accepted form
+    /// and no decoder diagnostic.
+    const DECODE_REFUSAL: &str =
+        "failed to decode TransactionEnvelope: must be base64-encoded TransactionEnvelope XDR";
+
     /// Valid base64 that does not decode to any recognized XDR type returns
-    /// `XdrCodecFailed` with "failed to decode TransactionEnvelope".
+    /// `XdrCodecFailed` with [`DECODE_REFUSAL`].
     #[tokio::test]
     async fn random_base64_not_xdr_returns_xdr_codec_failed() {
         use base64::Engine as _;
@@ -528,7 +735,7 @@ mod tests {
             matches!(
                 &err,
                 WalletError::Protocol(ProtocolError::XdrCodecFailed { detail })
-                    if detail.contains("failed to decode TransactionEnvelope")
+                    if detail == DECODE_REFUSAL
             ),
             "expected XdrCodecFailed for garbage XDR bytes, got: {err:?}"
         );
@@ -767,5 +974,759 @@ mod tests {
             ),
             "expected XdrCodecFailed from depth-exceeded decode, got: {err:?}"
         );
+    }
+
+    // ── The authorized sibling ────────────────────────────────────────────────
+
+    #[cfg(feature = "mainnet-write")]
+    mod authorized {
+        use std::sync::{Arc, Mutex};
+
+        use serial_test::serial;
+        use stellar_agent_core::audit_log::AuditWriter;
+        use stellar_agent_core::audit_log::writer::VerifiedTipFacts;
+        use stellar_agent_core::profile::caip2::Caip2;
+        use stellar_agent_test_support::signed_envelope::SignedTestEnvelope;
+        use tempfile::TempDir;
+
+        use super::*;
+        use crate::mainnet::authorization::Header;
+        use crate::mainnet::clock::set_now_ms_for_test;
+        use crate::mainnet::fixtures::{self, SEQUENCE, SIGNER_SEED, TTL_MS};
+        use crate::mainnet::{MainnetConsumer, MainnetPrecondition as P};
+        use crate::policy_state::DomainBinding;
+        use crate::submission_record::AuditWriterHandle;
+
+        const NOW: u64 = 1_800_000_000_000;
+        const OTHER_SEED: [u8; 32] = [0x3b; 32];
+
+        /// An unsigned mainnet envelope and an audit writer the authorization's
+        /// proof holds. Its Approval headers carry the store access their
+        /// expiry check reads under the enforcement.
+        struct Case {
+            _dir: TempDir,
+            writer: AuditWriterHandle,
+            unsigned: SignedTestEnvelope,
+            /// The store access of the first header built; a later header's
+            /// guard drops at once and restores this store.
+            store: std::cell::RefCell<
+                Option<stellar_agent_test_support::keyring_mock::DefaultStoreGuard>,
+            >,
+        }
+
+        impl Case {
+            fn new() -> Self {
+                let dir = TempDir::new().unwrap();
+                let writer = Arc::new(Mutex::new(
+                    AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap(),
+                ));
+                Self {
+                    _dir: dir,
+                    writer,
+                    unsigned: fixtures::unsigned_envelope(),
+                    store: std::cell::RefCell::new(None),
+                }
+            }
+
+            /// An authorization over the unsigned envelope with every fact
+            /// valid, after `edit`.
+            fn authorization(
+                &self,
+                edit: impl FnOnce(&mut Header, &mut DomainBinding),
+            ) -> MainnetTxSignAuthorization {
+                self.authorization_over(&self.unsigned, edit)
+            }
+
+            fn minted_authorization(&self) -> MainnetTxSignAuthorization {
+                stellar_agent_test_support::keyring_mock::install().unwrap();
+                let mut auth = self.authorization(|_, _| {});
+                fixtures::mint_header(&mut auth.0.header, &auth.0.binding, &[]);
+                auth
+            }
+
+            fn authorization_over(
+                &self,
+                envelope: &SignedTestEnvelope,
+                edit: impl FnOnce(&mut Header, &mut DomainBinding),
+            ) -> MainnetTxSignAuthorization {
+                let facts = VerifiedTipFacts {
+                    segment_start_hash: [0; 32],
+                    entry_count: 0,
+                    tip_hash: [0; 32],
+                    log_path_sha256: [5; 32],
+                    anchor_covers_tip: true,
+                    entry_tags_in_force: true,
+                };
+                let (mut header, access) = fixtures::approval_header(
+                    fixtures::claim_target(self._dir.path(), "fixture"),
+                    "fixture",
+                    None,
+                    &self.writer,
+                    facts,
+                    NOW,
+                );
+                let _ = self.store.borrow_mut().get_or_insert(access);
+                let mut binding =
+                    fixtures::tx_binding(envelope.envelope_xdr(), envelope.tx_hash_hex());
+                edit(&mut header, &mut binding);
+                fixtures::tx_authorization(header, binding)
+            }
+        }
+
+        /// Signs `xdr` under `authorization` and returns the precondition of
+        /// its refusal, after asserting that the signer was never asked for a
+        /// signature.
+        async fn refusal(
+            xdr: &str,
+            signer: &CountingSigner,
+            passphrase: &str,
+            consumer: MainnetConsumer,
+            authorization: &MainnetTxSignAuthorization,
+        ) -> P {
+            let result =
+                authorized_signature(xdr, signer, passphrase, consumer, authorization).await;
+            assert_eq!(signer.sign_calls(), 0, "no signature before the refusal");
+            match result {
+                Err(AuthorizedPathError::Refused(precondition)) => precondition,
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+
+        fn ledger_authorization(
+            f: &fixtures::LedgerFixture,
+        ) -> (SignedTestEnvelope, MainnetTxSignAuthorization) {
+            let envelope = fixtures::unsigned_envelope();
+            let auth = f.mint(
+                fixtures::tx_binding(envelope.envelope_xdr(), envelope.tx_hash_hex()),
+                &[fixtures::hold(&f.name, f.now, 70)],
+                None,
+                "signing-claim",
+            );
+            (envelope, auth)
+        }
+
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn an_invalidated_classic_authorization_never_reaches_the_signer() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let f = fixtures::LedgerFixture::new("invalidated-classic", NOW);
+            let (envelope, auth) = ledger_authorization(&f);
+            crate::mainnet::resolve::invalidate_unconsumed(
+                &f.window,
+                &f.context(),
+                auth.id(),
+                crate::mainnet::resolve::InvalidationStage::SignRefused,
+            )
+            .unwrap();
+            let signer = CountingSigner::new(SIGNER_SEED);
+            assert_eq!(
+                refusal(
+                    envelope.envelope_xdr(),
+                    &signer,
+                    MAINNET,
+                    MainnetConsumer::CliPay,
+                    &auth
+                )
+                .await,
+                P::NotOpen
+            );
+            assert_eq!(signer.sign_calls(), 0);
+            assert!(
+                attach_signature_authorized(
+                    envelope.envelope_xdr(),
+                    &signer,
+                    MAINNET,
+                    MainnetConsumer::CliPay,
+                    &auth
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(signer.sign_calls(), 0);
+        }
+
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn a_classic_claim_that_fails_to_persist_never_reaches_the_signer() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let f = fixtures::LedgerFixture::new("unpersisted-classic", NOW);
+            let (envelope, auth) = ledger_authorization(&f);
+            let signer = CountingSigner::new(SIGNER_SEED);
+            let armed = crate::policy_state::store::fail_store_writes();
+            assert_eq!(
+                refusal(
+                    envelope.envelope_xdr(),
+                    &signer,
+                    MAINNET,
+                    MainnetConsumer::CliPay,
+                    &auth
+                )
+                .await,
+                P::StoreUnavailable
+            );
+            drop(armed);
+            assert!(f.is_open(auth.id()));
+        }
+
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn a_changed_policy_pin_at_the_classic_claim_never_reaches_the_signer() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let f = fixtures::LedgerFixture::new("repinned-classic", NOW);
+            let (envelope, auth) = ledger_authorization(&f);
+            f.repin([0x5a; 32]);
+            let signer = CountingSigner::new(SIGNER_SEED);
+            assert_eq!(
+                refusal(
+                    envelope.envelope_xdr(),
+                    &signer,
+                    MAINNET,
+                    MainnetConsumer::CliPay,
+                    &auth
+                )
+                .await,
+                P::PolicyPinMismatch
+            );
+            assert!(f.is_open(auth.id()));
+        }
+
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn muxed_contract_authorized_signature_refuses_without_consuming() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let f = fixtures::LedgerFixture::new("muxed", NOW);
+            let signer = CountingSigner::new(SIGNER_SEED);
+            let TransactionEnvelope::Tx(mut v1) = TransactionEnvelope::from_xdr_base64(
+                stellar_agent_test_support::xdr_fixtures::muxed_contract_envelope(),
+                Limits::none(),
+            )
+            .unwrap() else {
+                panic!("transaction")
+            };
+            v1.tx.source_account = MuxedAccount::Ed25519(Uint256(signer.key_bytes()));
+            v1.tx.seq_num = SequenceNumber(SEQUENCE);
+            let payload = TransactionSignaturePayload {
+                network_id: Hash(Sha256::digest(MAINNET.as_bytes()).into()),
+                tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(v1.tx.clone()),
+            };
+            let hash = stellar_agent_core::hex::encode(&Sha256::digest(
+                payload.to_xdr(Limits::none()).unwrap(),
+            ));
+            let encoded = TransactionEnvelope::Tx(v1)
+                .to_xdr_base64(Limits::none())
+                .unwrap();
+            let auth = f.mint(fixtures::tx_binding(&encoded, &hash), &[], None, "nonce");
+            let result = attach_signature_authorized(
+                &encoded,
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &auth,
+            )
+            .await;
+            assert_eq!(signer.sign_calls(), 0);
+            assert!(f.is_open(auth.id()));
+            assert_eq!(result.unwrap_err().code(), "protocol.xdr_codec_failed");
+        }
+
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn a_classic_authorization_signs_once() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let f = fixtures::LedgerFixture::new("classic-once", NOW);
+            let (envelope, auth) = ledger_authorization(&f);
+            let signer = CountingSigner::new(SIGNER_SEED);
+            attach_signature_authorized(
+                envelope.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &auth,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                authorized_signature(
+                    envelope.envelope_xdr(),
+                    &signer,
+                    MAINNET,
+                    MainnetConsumer::CliPay,
+                    &auth
+                )
+                .await,
+                Err(AuthorizedPathError::Refused(P::NotOpen))
+            ));
+            assert!(
+                attach_signature_authorized(
+                    envelope.envelope_xdr(),
+                    &signer,
+                    MAINNET,
+                    MainnetConsumer::CliPay,
+                    &auth
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(signer.sign_calls(), 1);
+            f.assert_claimed_holds(auth.id(), 70);
+        }
+
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn a_late_classic_signature_is_discarded() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let f = fixtures::LedgerFixture::new("late-classic", NOW);
+            let (envelope, auth) = ledger_authorization(&f);
+            let signer = CountingSigner::advancing_clock_to(SIGNER_SEED, auth.expires_at_ms());
+            assert!(matches!(
+                authorized_signature(
+                    envelope.envelope_xdr(),
+                    &signer,
+                    MAINNET,
+                    MainnetConsumer::CliPay,
+                    &auth
+                )
+                .await,
+                Err(AuthorizedPathError::Refused(P::Expired))
+            ));
+            assert_eq!(signer.sign_calls(), 1);
+            f.assert_claimed_holds(auth.id(), 70);
+        }
+
+        /// The authorization's end reached after the claim and before the key
+        /// signs refuses at the signer: the payload carries the authorization's
+        /// interval, the key checks it immediately before signing, and the
+        /// claim keeps its spend counted.
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn a_classic_authorization_expiring_before_the_signature_signs_nothing() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let f = fixtures::LedgerFixture::new("expiring-classic", NOW);
+            let (envelope, auth) = ledger_authorization(&f);
+            let signer = CountingSigner::advancing_clock_before_signing_to(
+                SIGNER_SEED,
+                auth.expires_at_ms(),
+            );
+            let (warnings, _guard) =
+                stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent_network"));
+            let result = authorized_signature(
+                envelope.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &auth,
+            )
+            .await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(AuthorizedPathError::Wallet(error))
+                        if error.code() == "network.mainnet_authorization_refused"
+                ),
+                "{result:?}"
+            );
+            assert_eq!(
+                crate::signing::test_doubles::refused_preconditions(&warnings),
+                ["expired"]
+            );
+            assert_eq!(signer.sign_calls(), 1);
+            f.assert_claimed_holds(auth.id(), 70);
+        }
+
+        /// The valid case signs once, and the attached signature verifies
+        /// under the transaction's mainnet payload.
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn the_authorized_sibling_signs_once_under_the_mainnet_payload() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let _clock = set_now_ms_for_test(NOW);
+            let case = Case::new();
+            let signer = CountingSigner::new(SIGNER_SEED);
+
+            let signed = attach_signature_authorized(
+                case.unsigned.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &case.minted_authorization(),
+            )
+            .await
+            .expect("a valid authorization signs");
+
+            assert_eq!(signer.sign_calls(), 1);
+            let TransactionEnvelope::Tx(v1) =
+                TransactionEnvelope::from_xdr_base64(&signed, Limits::none()).unwrap()
+            else {
+                panic!("expected Tx");
+            };
+            assert_eq!(v1.signatures.len(), 1);
+            let payload = TransactionSignaturePayload {
+                network_id: Hash(Sha256::digest(MAINNET.as_bytes()).into()),
+                tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(v1.tx.clone()),
+            };
+            let hash: [u8; 32] = Sha256::digest(payload.to_xdr(Limits::none()).unwrap()).into();
+            let key = VerifyingKey::from_bytes(&signer.key_bytes()).unwrap();
+            let sig: [u8; 64] = v1.signatures[0].signature.0.as_slice().try_into().unwrap();
+            key.verify(&hash, &DalekSignature::from_bytes(&sig))
+                .expect("the signature verifies under the mainnet payload");
+        }
+
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn another_consumer_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let _clock = set_now_ms_for_test(NOW);
+            let case = Case::new();
+            let signer = CountingSigner::new(SIGNER_SEED);
+            let precondition = refusal(
+                case.unsigned.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::McpPay,
+                &case.authorization(|_, _| {}),
+            )
+            .await;
+            assert_eq!(precondition, P::ConsumerMismatch);
+            assert_eq!(signer.key_accesses(), 0);
+        }
+
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn another_transaction_hash_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let _clock = set_now_ms_for_test(NOW);
+            let case = Case::new();
+            let signer = CountingSigner::new(SIGNER_SEED);
+            let authorization = case.authorization(|_, binding| {
+                if let DomainBinding::Transaction { tx_hash, .. } = binding {
+                    *tx_hash = [0x22; 32];
+                }
+            });
+            let precondition = refusal(
+                case.unsigned.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &authorization,
+            )
+            .await;
+            assert_eq!(precondition, P::TxHash);
+            assert_eq!(signer.key_accesses(), 0);
+        }
+
+        /// A pre-signed copy of the approved envelope carries the same
+        /// transaction under another text, so only its digest differs.
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn a_pre_signed_envelope_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let _clock = set_now_ms_for_test(NOW);
+            let case = Case::new();
+            let signer = CountingSigner::new(SIGNER_SEED);
+            let presigned = fixtures::signed_envelope();
+            assert_eq!(presigned.tx_hash_hex(), case.unsigned.tx_hash_hex());
+            let precondition = refusal(
+                presigned.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &case.authorization(|_, _| {}),
+            )
+            .await;
+            assert_eq!(precondition, P::UnsignedEnvelope);
+            assert_eq!(signer.key_accesses(), 0);
+        }
+
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn another_source_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let _clock = set_now_ms_for_test(NOW);
+            let case = Case::new();
+            let signer = CountingSigner::new(SIGNER_SEED);
+            let authorization = case.authorization(|_, binding| {
+                if let DomainBinding::Transaction { source, .. } = binding {
+                    *source = fixtures::account(OTHER_SEED);
+                }
+            });
+            let precondition = refusal(
+                case.unsigned.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &authorization,
+            )
+            .await;
+            assert_eq!(precondition, P::SourceAccount);
+            assert_eq!(signer.key_accesses(), 0);
+        }
+
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn another_sequence_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let _clock = set_now_ms_for_test(NOW);
+            let case = Case::new();
+            let signer = CountingSigner::new(SIGNER_SEED);
+            let authorization = case.authorization(|_, binding| {
+                if let DomainBinding::Transaction { sequence, .. } = binding {
+                    *sequence = SEQUENCE + 1;
+                }
+            });
+            let precondition = refusal(
+                case.unsigned.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &authorization,
+            )
+            .await;
+            assert_eq!(precondition, P::Sequence);
+            assert_eq!(signer.key_accesses(), 0);
+        }
+
+        /// A signer whose key is not the bound one is refused after its key
+        /// is read and before it signs.
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn another_signer_key_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let _clock = set_now_ms_for_test(NOW);
+            let case = Case::new();
+            let signer = CountingSigner::new(OTHER_SEED);
+            let precondition = refusal(
+                case.unsigned.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &case.authorization(|_, _| {}),
+            )
+            .await;
+            assert_eq!(precondition, P::SignerKeyMismatch);
+            assert_eq!(signer.public_key_calls(), 1);
+        }
+
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn an_expired_authorization_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let _clock = set_now_ms_for_test(NOW + TTL_MS);
+            let case = Case::new();
+            let signer = CountingSigner::new(SIGNER_SEED);
+            let precondition = refusal(
+                case.unsigned.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &case.authorization(|_, _| {}),
+            )
+            .await;
+            assert_eq!(precondition, P::Expired);
+            assert_eq!(signer.key_accesses(), 0);
+        }
+
+        /// An authorization presented with the testnet passphrase is refused.
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn an_authorization_on_testnet_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let _clock = set_now_ms_for_test(NOW);
+            let case = Case::new();
+            let signer = CountingSigner::new(SIGNER_SEED);
+            let precondition = refusal(
+                case.unsigned.envelope_xdr(),
+                &signer,
+                TESTNET,
+                MainnetConsumer::CliPay,
+                &case.authorization(|_, _| {}),
+            )
+            .await;
+            assert_eq!(precondition, P::ChainNotMainnet);
+            assert_eq!(signer.key_accesses(), 0);
+        }
+
+        /// The chain check compares the bound chain too: an authorization
+        /// bound to testnet is refused under the mainnet passphrase.
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn an_authorization_bound_to_another_chain_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let _clock = set_now_ms_for_test(NOW);
+            let case = Case::new();
+            let signer = CountingSigner::new(SIGNER_SEED);
+            let authorization = case.authorization(|header, _| header.chain = Caip2::Testnet);
+            let precondition = refusal(
+                case.unsigned.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &authorization,
+            )
+            .await;
+            assert_eq!(precondition, P::ChainNotMainnet);
+            assert_eq!(signer.key_accesses(), 0);
+        }
+
+        /// A fee-bump envelope whose every bound fact matches is refused: a
+        /// transaction authorization covers a transaction envelope only.
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn a_fee_bump_envelope_is_refused() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let _clock = set_now_ms_for_test(NOW);
+            let case = Case::new();
+            let signer = CountingSigner::new(SIGNER_SEED);
+            let fee_bump = SignedTestEnvelope::builder(SIGNER_SEED)
+                .network_passphrase(MAINNET)
+                .sequence(SEQUENCE)
+                .fee_bump(SIGNER_SEED)
+                .build();
+            let authorization = case.authorization_over(&fee_bump, |_, _| {});
+            let precondition = refusal(
+                fee_bump.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &authorization,
+            )
+            .await;
+            assert_eq!(precondition, P::BindingMismatch);
+            assert_eq!(signer.key_accesses(), 0);
+        }
+
+        /// A decoded fee bump refuses before chain, consumer, expiry, or key access.
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn a_fee_bump_refuses_before_chain_consumer_and_expiry_checks() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let _clock = set_now_ms_for_test(NOW + TTL_MS);
+            let case = Case::new();
+            let signer = CountingSigner::new(SIGNER_SEED);
+            let fee_bump = SignedTestEnvelope::builder(SIGNER_SEED)
+                .network_passphrase(MAINNET)
+                .sequence(SEQUENCE)
+                .fee_bump(SIGNER_SEED)
+                .build();
+            let authorization = case.authorization_over(&fee_bump, |_, _| {});
+            for (passphrase, consumer) in [
+                (MAINNET, MainnetConsumer::CliPay),
+                ("unknown", MainnetConsumer::CliPay),
+                (MAINNET, MainnetConsumer::CliClaim),
+            ] {
+                assert_eq!(
+                    refusal(
+                        fee_bump.envelope_xdr(),
+                        &signer,
+                        passphrase,
+                        consumer,
+                        &authorization
+                    )
+                    .await,
+                    P::BindingMismatch
+                );
+            }
+            assert_eq!(signer.key_accesses(), 0);
+        }
+
+        /// A signer that returns a signature that does not verify is refused
+        /// after it signed, and nothing is attached. Each path signs under
+        /// its own freshly claimed authorization.
+        #[tokio::test]
+        #[serial(mainnet_clock)]
+        #[serial]
+        async fn a_bad_signature_is_refused_after_signing() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let _clock = set_now_ms_for_test(NOW);
+            let case = Case::new();
+            let signer = CountingSigner::corrupting(SIGNER_SEED);
+            let authorization = case.minted_authorization();
+
+            let result = authorized_signature(
+                case.unsigned.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &authorization,
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(AuthorizedPathError::Refused(P::SignatureInvalid))
+            ));
+            assert_eq!(signer.sign_calls(), 1);
+
+            let public = Case::new();
+            let public_authorization = public.minted_authorization();
+            let err = attach_signature_authorized(
+                public.unsigned.envelope_xdr(),
+                &signer,
+                MAINNET,
+                MainnetConsumer::CliPay,
+                &public_authorization,
+            )
+            .await
+            .expect_err("a bad signature is refused");
+            assert_eq!(err.code(), "network.mainnet_authorization_refused");
+            assert_eq!(signer.sign_calls(), 2);
+        }
     }
 }

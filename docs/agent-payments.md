@@ -1,5 +1,8 @@
 # Agent payments with MPP
 
+See [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 The wallet implements a narrow Machine Payments Protocol (MPP) payer flow for
 sponsored Stellar charges. This feature is testnet-only and credential-only:
 the wallet validates a challenge, prepares and signs the payer authorization,
@@ -29,6 +32,12 @@ MPP is separate from the wallet's x402 v2 support. x402 accepts an x402
 Payment challenge bound to the request context and returns an HTTP or native MCP
 Payment credential. Neither path sends the merchant request.
 
+The classic payment tools are separate from both. CLI `pay`, the MCP payment
+tools, and the toolset payment actions refuse a C contract or W muxed
+contract recipient. The refusal codes are in
+[CLI reference: pay](cli-reference/stellar-ops.md#stellar-agent-pay-destination-amount-asset-flags)
+and [MCP: payments and accounts](mcp.md#payments-and-accounts).
+
 ## Request binding
 
 The host must give the wallet both the challenge and the exact request context.
@@ -43,7 +52,7 @@ An HTTP CLI input has this shape:
 {
   "transport": "http",
   "www_authenticate": [
-    "Payment id=\"order-7\", realm=\"merchant.example\", method=\"stellar\", intent=\"charge\", request=<base64url-json>"
+    "Payment id=\"order-7\", realm=\"merchant.example\", method=\"stellar\", intent=\"charge\", request=<base64url-json>, expires=\"<rfc3339-time>\""
   ],
   "selected_challenge_id": "order-7",
   "context": {
@@ -58,9 +67,13 @@ An HTTP CLI input has this shape:
 
 Input is strict and bounded. Unknown members, duplicate JSON members or auth
 parameters, ambiguous supported challenges, non-canonical amounts, invalid
-addresses, cross-origin resources, unsupported modes, and expired or near-expiry
-challenges fail before signing. Examples use synthetic account values; obtain
-real testnet terms from the server challenge.
+addresses, cross-origin resources, unsupported modes, challenges without an
+`expires`, challenges that expire more than six minutes ahead, and expired or
+near-expiry challenges fail before signing. A challenge without `expires`, or
+expiring more than six minutes ahead, refuses with `mpp.challenge_invalid`. A
+challenge with under 30 seconds left refuses with `mpp.challenge_expired`.
+Examples use synthetic account
+values; obtain real testnet terms from the server challenge.
 
 ## CLI workflow
 
@@ -76,6 +89,10 @@ audits, and returns one credential. If the prepare policy requires consent, it
 creates pending approval and returns `mpp.approval_required`, an authorization
 ID, and an approval ID. When only the commit rule requires approval, CLI MPP
 refuses with `mpp.approval_invalid` and creates no pending approval entry.
+When the policy decision denies the charge, CLI MPP also refuses with
+`mpp.approval_invalid`. Its message says operator policy denied the
+authorization. A spending-window or total-budget refusal at commit keeps its
+own `policy.deny.*` or `policy.total_epoch_*` code.
 
 The operator reviews and approves a pending request through the normal
 `approve` command or approval inbox; then resume only the stored authorization:
@@ -107,9 +124,12 @@ printf '%s' 'scheduled retention cleanup' | \
   stellar-agent mpp state prune --profile default --reason-stdin
 ```
 
+`mpp state prune` requires `--profile <NAME>`; it has no environment or
+`default` fallback.
 Select exactly one reason source: `--reason-stdin` or `--reason-file <PATH>`.
 The reason must contain 1 to 4096 bytes. A reason file must be a regular file;
-the command refuses a symlink. For a file-based reason:
+the command refuses a symlink. An empty or oversize reason, or a reason file
+that is not a regular file, refuses with `mpp.state_unavailable`. For a file-based reason:
 
 ```bash
 stellar-agent mpp state prune --profile default --reason-file reason.txt
@@ -127,7 +147,7 @@ server, never through installed toolsets.
 | Tool | Arguments | Result and role |
 |---|---|---|
 | `stellar_mpp_charge_prepare` | `profile`, tagged `challenge` | Validates, simulates, evaluates policy, persists exact terms, and returns a preview plus commit nonce. Never signs. |
-| `stellar_mpp_charge_commit` | `authorization_id`, `nonce`, `expires_at_unix_ms` | Reloads stored terms, verifies approval and policy, signs once, re-simulates, audits, and returns one credential. |
+| `stellar_mpp_charge_commit` | `authorization_id`, `nonce`, `expires_at_unix_ms` (prepare's `nonce_expires_at_unix_ms`) | Reloads stored terms, verifies approval and policy, signs once, re-simulates, audits, and returns one credential. |
 | `stellar_mpp_record_receipt` | `authorization_id`, tagged `receipt` | Records a trusted-host observation. It does not prove settlement. |
 | `stellar_mpp_reconcile_transaction` | `authorization_id`, `transaction_hash` | Queries RPC and independently verifies the exact final direct or fee-bump transaction and payer signature. |
 | `stellar_mpp_authorization_status` | `authorization_id` | Returns redacted lifecycle, policy-accounting, receipt-observation, and ledger-outcome state. |
@@ -139,9 +159,11 @@ the durable state retains only their digests.
 
 ## Credential delivery
 
-An HTTP result contains an `authorization` value beginning with `Payment`; use
-it as the exact `Authorization` field value on the request that was bound during
-prepare. A native MCP result contains the `org.paymentauth/credential` object for
+The CLI and MCP results carry the credential in a `credential` member, tagged
+by `transport`. With `"transport": "http"`, its `authorization` member holds a
+value beginning with `Payment`. Use it as the exact `Authorization` field value
+on the request that was bound during prepare. With `"transport": "mcp"`, its
+nested `credential` member holds the `org.paymentauth/credential` object for
 the bound operation. Do not translate a credential between transports.
 
 The trusted host is responsible for all transport behavior:
@@ -181,16 +203,20 @@ transaction. Never sign again for the same charge.
 Stable errors use the `mpp.*` namespace, including `mpp.challenge_invalid`,
 `mpp.challenge_ambiguous`, `mpp.challenge_mismatch`, `mpp.challenge_expired`,
 `mpp.unsupported_method`, `mpp.unsupported_intent`, `mpp.unsupported_mode`,
-`mpp.input_too_large`, `mpp.approval_invalid`, `mpp.network_forbidden`,
-`mpp.authorization_not_found`, `mpp.authorization_replayed`,
+`mpp.input_too_large`, `mpp.approval_required`, `mpp.approval_invalid`,
+`mpp.network_forbidden`, `mpp.authorization_not_found`,
+`mpp.authorization_replayed`, `mpp.authorization_indeterminate`,
 `mpp.state_unavailable`, `mpp.simulation_failed`, `mpp.signing_failed`,
 `mpp.credential_too_large`, `mpp.receipt_invalid`, `mpp.receipt_conflict`, and
-`mpp.reconciliation_unavailable`.
+`mpp.reconciliation_unavailable`. A charge commit whose pending approval shows
+another transport, authority, or target than the prepared request refuses
+with `approval.entry_inconsistent`, the approval code every approval surface
+uses for such a request, and commits nothing.
 
 The verbs that record an audit row before they return (charge commit, record
-receipt, reconcile, prune) answer a problem with the audit LOG under its own
+receipt, reconcile, prune) answer a problem with the audit log under its own
 `audit.*` code instead. They answer with `audit.chain_key_unavailable` when the profile's
-chain-root key is not acquirable. They answer with `audit.tip_anchor_mismatch` when the log no longer holds the chain tip its keyring-held anchor names. They answer with `audit.log_binding_changed` when the profile names a log path or audit key other than its recorded audit binding. Those name a different
+chain-root key is not acquirable. They answer with `audit.tip_anchor_mismatch` when the log no longer holds the chain tip its keyring-held anchor names, and with `audit.tip_anchor_missing` when the anchor is gone from a log that shows it was anchored. They answer with `audit.log_binding_changed` when the profile names a log path or audit key other than its recorded audit binding. Those name a different
 thing to fix from the MPP state file, and each has its own recovery in
 [Audit-log recovery](maintainers/audit-log-recovery.md).
 
@@ -213,16 +239,19 @@ every store state, including a profile with no MPP state, so the answer never
 reveals whether a profile has one.
 
 Verified version 1 MPP history, which carries no generation, is adopted once on
-open, with an audit row naming the profile and generation. A version 2 file
-without its keyring counter, an invalid file, or a keyring access failure
-refuses. After adoption, deletion and stale snapshots are detected against the
-trusted counter. A profile whose state key exists with neither a counter nor a
-state file holds no replay history; it refuses with a missing anchor, and a
-reset recovers it without discarding any record.
+open, with an audit row naming the profile and generation. An invalid file or a
+keyring access failure refuses. After adoption, deletion and stale snapshots
+are detected against the trusted counter. An adoption interrupted at intent
+one resumes at generation two. A publication under an absent committed counter
+completes on open only when its intent names the authenticated snapshot.
+A profile whose state key exists with neither a counter nor a state file
+refuses with a missing anchor, and a discarding reset recovers it. Reset never
+infers a counter from a state file.
 
-With the headless keyring backend the counter is kept in a file on the same
-host. Anyone who can replace both that keyring file and the MPP state file can
-restore older history, so protect the headless keyring directory separately.
+With the headless keyring backend the committed and intent counters are kept
+in a file on the same host. Anyone who can replace both that keyring file and
+the MPP state file can restore older history, so protect the headless keyring
+directory separately.
 The same file holds the audit log's tip anchor, its re-anchor counter, the
 audit binding, and the policy window state's key and generation counter.
 Anyone who can write that file can restore older entries or delete one, which
@@ -236,13 +265,54 @@ recovery command is:
 stellar-agent profile reset-mpp-state default --acknowledge --reason "state recovery"
 ```
 
-This command discards all replay markers for prepared, authorized, indeterminate
-and settled charges. A charge settled before reset is no longer recognized as
-settled. Reset records the discarded generation in the audit log, rotates the
-state key, removes the state file, and resets the counter to zero. A newly
-minted key with counter zero and no file is a valid empty store. The next prepare
-can proceed. Reset requires a usable audit log and its key; it is never an
-automatic response to a state failure.
+Reset audits the request and keeps every record of the state file on disk when
+that file authenticates. It closes charges not yet committed as
+`expired_unresolved`; authorized, indeterminate, and settled statuses survive.
+It keeps the state key and publishes the carried history above both counters.
+The result includes `carried_records` and `carried_generation`.
+
+The carried snapshot is the one on disk. If the state file was rolled back to
+an older copy before the reset, the records written after that copy are lost.
+When the generation counter proves such a rollback, the result sets
+`stale_carry` and names it in `warnings`. Challenges those lost records answered
+are refused while they can still be live: for six minutes after the reset, a
+challenge expiring within that window returns `mpp.challenge_expired`. The
+window holds for every challenge, because every admitted challenge expires
+within six minutes of its prepare. A fresh challenge prepares once its expiry
+lies past the window, so a payee's five-minute challenge prepares from about one
+minute after the reset.
+
+When no snapshot authenticates, reset discards every replay marker, rotates the
+state key, and starts an empty store above both trusted generation counters,
+with the same six-minute refusal window.
+A charge settled before that reset loses its settled status. A keyring or file
+access error refuses the reset and changes nothing; retry once the error
+clears. A state file that authenticates while the committed counter is missing
+or malformed, or the intent counter is malformed, cannot be carried: the reset
+refuses and names the discarding reset. Move the state file out of the MPP
+state directory under the data root and run the reset again; it then discards
+every replay marker as above.
+Reset requires a usable audit log and its key; it is never automatic.
+Ordinary writes keep the committed snapshot readable before publication, or
+complete on read when the published snapshot matches the intent counter.
+Discarding resets and resumed adoptions have these recovery cases:
+
+- A discard interrupted after key rotation and before publication leaves no
+  snapshot that authenticates under the new key. Opening refuses; rerun the
+  reset to discard.
+- A discard under a malformed committed counter interrupted after publication
+  refuses on open with the anchor error. Reset refuses the carry. Move the
+  state file out of the MPP state directory and rerun the reset to discard.
+- An adoption at generation two interrupted before publication refuses on
+  open, because its intent cannot be told apart from anchor removal. Move the
+  state file out of the MPP state directory and run the reset to discard.
+
+Repeated prepare matches the exact challenge, payer, and request context,
+independently of preparation time. Prune keeps the largest expiry it removes and
+refuses a challenge expiring at or below it with `mpp.challenge_expired`. The
+refusal names the replay horizon and asks for a fresh challenge. A challenge's
+expiry never moves, so a pruned challenge stays refused; a payee can issue a
+fresh challenge at any time.
 
 `mpp state prune` on a profile with no MPP history succeeds with `pruned: 0`
 and records the maintenance request in the audit log, the same as pruning a

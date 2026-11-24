@@ -6,8 +6,13 @@
 //! between calls. It answers `getLedgerEntries` for the accounts and the
 //! extra ledger entries it was given, quotes fixed fee statistics, accepts
 //! every send with the hash of the transaction it was handed, and confirms
-//! every transaction. `getHealth` and `getLedgers` describe a ledger range
-//! that covers every submission the tests make.
+//! every transaction in a ledger that closed at the time of the request, so a
+//! confirmed spend counts in the current policy window. Every send it accepts
+//! advances the sequence number of the accounts it funds, as the network does
+//! for the source account. `getHealth` and `getLedgers` describe a ledger
+//! range that covers every submission the tests make; the latest ledger
+//! closed at the time of the request unless a test makes the endpoint stale
+//! or unhealthy.
 
 #![allow(
     clippy::unwrap_used,
@@ -38,20 +43,75 @@ const ACCOUNT_BALANCE_STROOPS: i64 = 100_000_000_000;
 /// with [`account_xdr`] at this sequence.
 pub(crate) const ACCOUNT_SEQUENCE: i64 = 100;
 
+/// Answers one request in place of the endpoint's own answer: called with
+/// the JSON-RPC method, how many earlier requests of that method the endpoint
+/// received, and the request body. `Some(result)` is the `result` member
+/// returned; `None` keeps the endpoint's answer.
+pub(crate) type Script = Arc<dyn Fn(&str, usize, &Value) -> Option<Value> + Send + Sync>;
+
 /// A mocked endpoint for the classic value verbs.
 #[derive(Clone)]
 pub(crate) struct ClassicRpc {
     network: Arc<Mutex<String>>,
+    /// The passphrase a sent transaction's hash is computed under.
+    send_passphrase: &'static str,
     /// `(ledger key XDR, entry XDR)` per answerable ledger entry.
     entries: Arc<Vec<(String, String)>>,
+    /// The accounts the endpoint funds.
+    accounts: Arc<Vec<String>>,
+    /// Per funded account, the sends from it the endpoint accepted with its
+    /// own answer; each advances the account's sequence number.
+    accepted_sends: Arc<Mutex<std::collections::HashMap<String, i64>>>,
+    /// The answers that replace the endpoint's own.
+    script: Option<Script>,
+    /// Requests received per method.
+    counts: Arc<Mutex<std::collections::HashMap<String, usize>>>,
+    /// `(method, first delayed index, delay)`: the answers to that method
+    /// from that request on arrive after the delay.
+    stall: Arc<Mutex<Option<(String, usize, std::time::Duration)>>>,
+    /// How many seconds before the request the latest ledger closed.
+    close_age_secs: Arc<Mutex<u64>>,
+    close_clock: fn() -> u64,
+    /// How many seconds after the request the latest ledger closed in the
+    /// `getHealth` answers; `getLedgers` keeps the unshifted clock.
+    health_lead_secs: Arc<Mutex<u64>>,
+    /// The status `getHealth` reports.
+    health_status: Arc<Mutex<String>>,
+    /// The latest ledger `getLedgerEntries` reports.
+    entries_ledger: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl ClassicRpc {
     /// An endpoint reporting testnet and answering for each of `accounts`,
     /// funded and signed by its own master key.
     pub(crate) fn testnet(accounts: &[&str]) -> Self {
+        Self::on_network(TESTNET_PASSPHRASE, accounts)
+    }
+
+    /// An endpoint reporting mainnet and answering for each of `accounts`,
+    /// funded and signed by its own master key.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn mainnet(accounts: &[&str]) -> Self {
+        Self::on_network(
+            stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            accounts,
+        )
+    }
+
+    fn on_network(passphrase: &'static str, accounts: &[&str]) -> Self {
         Self {
-            network: Arc::new(Mutex::new(TESTNET_PASSPHRASE.to_owned())),
+            network: Arc::new(Mutex::new(passphrase.to_owned())),
+            send_passphrase: passphrase,
+            script: None,
+            counts: Arc::default(),
+            stall: Arc::default(),
+            close_age_secs: Arc::default(),
+            close_clock: now_secs,
+            health_lead_secs: Arc::default(),
+            health_status: Arc::new(Mutex::new("healthy".to_owned())),
+            entries_ledger: Arc::new(std::sync::atomic::AtomicU32::new(1001)),
+            accounts: Arc::new(accounts.iter().map(|a| (*a).to_owned()).collect()),
+            accepted_sends: Arc::default(),
             entries: Arc::new(
                 accounts
                     .iter()
@@ -71,15 +131,92 @@ impl ClassicRpc {
         }
     }
 
+    /// Answers for the funded `account` with `balance_stroops` and
+    /// `subentries` until it sends.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn with_account(
+        mut self,
+        account: &str,
+        balance_stroops: i64,
+        subentries: u32,
+    ) -> Self {
+        let key = account_ledger_key_xdr(account);
+        for (entry_key, entry) in Arc::make_mut(&mut self.entries) {
+            if *entry_key == key {
+                *entry = account_entry_xdr_with_seq(
+                    account,
+                    balance_stroops,
+                    subentries,
+                    ACCOUNT_SEQUENCE,
+                );
+            }
+        }
+        self
+    }
+
     /// Answers `getLedgerEntries` for `key` with `entry` as well.
     pub(crate) fn with_entry(mut self, key: String, entry: String) -> Self {
         Arc::make_mut(&mut self.entries).push((key, entry));
         self
     }
 
+    /// Answers through `script` before the endpoint's own answers.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn with_script(
+        mut self,
+        script: impl Fn(&str, usize, &Value) -> Option<Value> + Send + Sync + 'static,
+    ) -> Self {
+        self.script = Some(Arc::new(script));
+        self
+    }
+
+    /// Answers the next `prompt` requests of `rpc_method` at once and every
+    /// later one after `delay`.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn stall_after(&self, rpc_method: &str, prompt: usize, delay: std::time::Duration) {
+        let asked = self
+            .counts
+            .lock()
+            .unwrap()
+            .get(rpc_method)
+            .copied()
+            .unwrap_or(0);
+        *self.stall.lock().unwrap() = Some((rpc_method.to_owned(), asked + prompt, delay));
+    }
+
+    /// Reports `account`'s sequence `sends` higher from now on, as accepted
+    /// sends from another wallet would.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn advance_sequence(&self, account: &str, sends: i64) {
+        *self
+            .accepted_sends
+            .lock()
+            .unwrap()
+            .entry(account.to_owned())
+            .or_insert(0) += sends;
+    }
+
     /// Reports `passphrase` from every later `getNetwork`.
     pub(crate) fn report(&self, passphrase: &str) {
         *self.network.lock().unwrap() = passphrase.to_owned();
+    }
+
+    /// Reports from every later `getLedgers` a latest ledger that closed
+    /// `seconds` before the request.
+    pub(crate) fn close_ledgers_ago(&self, seconds: u64) {
+        *self.close_age_secs.lock().unwrap() = seconds;
+    }
+
+    /// Reports from every later `getHealth` a latest ledger that closed
+    /// `seconds` after the request.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn close_health_ahead(&self, seconds: u64) {
+        *self.health_lead_secs.lock().unwrap() = seconds;
+    }
+
+    /// Reports `status` from every later `getHealth`.
+    pub(crate) fn report_health(&self, status: &str) {
+        *self.health_status.lock().unwrap() = status.to_owned();
     }
 
     /// Starts a server answering every `POST` with this endpoint.
@@ -92,18 +229,69 @@ impl ClassicRpc {
         server
     }
 
+    /// Answers `getLedgerEntries` at the readiness ledger 2000, as an
+    /// endpoint whose account reads cover its readiness report does.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn entries_at_readiness_ledger(self) -> Self {
+        self.report_entries_ledger(2000);
+        self
+    }
+
+    /// Answers every later `getLedgerEntries` at `ledger`.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn report_entries_ledger(&self, ledger: u32) {
+        self.entries_ledger
+            .store(ledger, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Uses the test's clock for readiness ledger close times.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn with_close_clock(mut self, clock: fn() -> u64) -> Self {
+        self.close_clock = clock;
+        self
+    }
+
+    /// The close time of the latest ledger this endpoint reports now.
+    fn close_secs(&self) -> u64 {
+        (self.close_clock)() - *self.close_age_secs.lock().unwrap()
+    }
+
     fn ledger_entries(&self, body: &Value) -> Value {
         let requested: Vec<&str> = body["params"]["keys"]
             .as_array()
             .map(|keys| keys.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
+        let accepted = self.accepted_sends.lock().unwrap().clone();
         let entries: Vec<Value> = self
             .entries
             .iter()
             .filter(|(key, _)| requested.contains(&key.as_str()))
-            .map(|(key, entry)| json!({ "key": key, "xdr": entry, "lastModifiedLedgerSeq": 1000 }))
+            .map(|(key, entry)| {
+                let entry = self
+                    .accounts
+                    .iter()
+                    .find(|account| account_ledger_key_xdr(account) == *key)
+                    .and_then(|account| accepted.get(account).map(|sends| (account, *sends)))
+                    .map_or_else(
+                        || entry.clone(),
+                        |(account, sends)| {
+                            account_entry_xdr_with_seq(
+                                account,
+                                ACCOUNT_BALANCE_STROOPS,
+                                0,
+                                ACCOUNT_SEQUENCE + sends,
+                            )
+                        },
+                    );
+                json!({ "key": key, "xdr": entry, "lastModifiedLedgerSeq": 1000 })
+            })
             .collect();
-        json!({ "entries": entries, "latestLedger": 1001 })
+        json!({
+            "entries": entries,
+            "latestLedger": self
+                .entries_ledger
+                .load(std::sync::atomic::Ordering::SeqCst)
+        })
     }
 }
 
@@ -116,45 +304,149 @@ impl Respond for ClassicRpc {
             "p80": "100", "p90": "100", "p95": "100", "p99": "100",
             "transactionCount": "10", "ledgerCount": 5
         });
-        let result = match body["method"].as_str().unwrap_or_default() {
+        let method_name = body["method"].as_str().unwrap_or_default();
+        let index = {
+            let mut counts = self.counts.lock().unwrap();
+            let count = counts.entry(method_name.to_owned()).or_insert(0);
+            let index = *count;
+            *count += 1;
+            index
+        };
+        let delay = self
+            .stall
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(stalled, from, _)| stalled == method_name && index >= *from)
+            .map_or(std::time::Duration::ZERO, |(_, _, delay)| *delay);
+        if let Some(result) = self
+            .script
+            .as_ref()
+            .and_then(|script| script(method_name, index, &body))
+        {
+            return ResponseTemplate::new(200)
+                .set_body_json(json!({ "jsonrpc": "2.0", "id": body["id"], "result": result }))
+                .set_delay(delay);
+        }
+        let result = match method_name {
             "getNetwork" => get_network_result(&self.network.lock().unwrap()),
             "getLedgerEntries" => self.ledger_entries(&body),
             "getFeeStats" => json!({
                 "sorobanInclusionFee": fees, "inclusionFee": fees, "latestLedger": 1001
             }),
-            "sendTransaction" => json!({
-                "hash": send_transaction_hash_hex(&body, TESTNET_PASSPHRASE),
+            "sendTransaction" => {
+                *self
+                    .accepted_sends
+                    .lock()
+                    .unwrap()
+                    .entry(sent_source(&body))
+                    .or_insert(0) += 1;
+                json!({
+                "hash": send_transaction_hash_hex(&body, self.send_passphrase),
                 "status": "PENDING",
                 "latestLedger": 1001,
                 "latestLedgerCloseTime": "1700000000"
-            }),
+                })
+            }
             "getTransaction" => json!({
                 "status": "SUCCESS",
                 "txHash": body["params"]["hash"],
                 "ledger": 1005,
-                "createdAt": "1700000005",
+                "createdAt": ledger_close_now(),
                 "latestLedger": 1006,
                 "oldestLedger": 1
             }),
-            "getHealth" => json!({
-                "status": "healthy",
-                "latestLedger": 2000,
-                "oldestLedger": 1,
-                "ledgerRetentionWindow": 1999
-            }),
-            "getLedgers" => json!({
-                "latestLedger": 2000,
-                "oldestLedger": 1,
-                "latestLedgerCloseTime": "1700000100",
-                "oldestLedgerCloseTime": 1,
-                "cursor": "2000",
-                "ledgers": []
+            "getHealth" => health_result(
+                &self.health_status.lock().unwrap(),
+                self.close_secs() + *self.health_lead_secs.lock().unwrap(),
+            ),
+            "getLedgers" => ledgers_result(self.close_secs()),
+            "getLatestLedger" => json!({
+                "id": "00".repeat(32),
+                "protocolVersion": 23,
+                "sequence": 2000
             }),
             other => panic!("unexpected RPC method {other}"),
         };
         ResponseTemplate::new(200)
             .set_body_json(json!({ "jsonrpc": "2.0", "id": body["id"], "result": result }))
+            .set_delay(delay)
     }
+}
+
+/// The answer of a healthy endpoint whose latest ledger closed at the time
+/// of the request, to the `getHealth` or `getLedgers` request of the
+/// operational check; `None` for every other method. The command tests' own
+/// mocks answer those two methods with it.
+pub(crate) fn operational_result(rpc_method: &str) -> Option<Value> {
+    match rpc_method {
+        "getHealth" => Some(health_result("healthy", now_secs())),
+        "getLedgers" => Some(ledgers_result(now_secs())),
+        _ => None,
+    }
+}
+
+/// A `getHealth` answer reporting `status` with latest ledger 2000.
+fn health_result(status: &str, close_secs: u64) -> Value {
+    json!({
+        "status": status,
+        "latestLedger": 2000,
+        "oldestLedger": 1,
+        "ledgerRetentionWindow": 1999,
+        "oldestLedgerCloseTime": 1,
+        "latestLedgerCloseTime": close_secs
+    })
+}
+
+/// A `getLedgers` answer whose latest ledger 2000 closed at `close_secs`.
+fn ledgers_result(close_secs: u64) -> Value {
+    json!({
+        "latestLedger": 2000,
+        "oldestLedger": 1,
+        "latestLedgerCloseTime": close_secs.to_string(),
+        "oldestLedgerCloseTime": 1,
+        "cursor": "2000",
+        "ledgers": []
+    })
+}
+
+/// The current Unix time in seconds as the decimal string `getTransaction`
+/// reports a ledger close time in.
+fn ledger_close_now() -> String {
+    now_secs().to_string()
+}
+
+/// The current Unix time in seconds.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// The G-strkey of the source account of the transaction a
+/// `sendTransaction` request carries.
+fn sent_source(body: &Value) -> String {
+    use stellar_xdr::{Limits, MuxedAccount, ReadXdr as _, TransactionEnvelope};
+    let envelope = TransactionEnvelope::from_xdr_base64(
+        body["params"]["transaction"].as_str().unwrap(),
+        Limits::none(),
+    )
+    .unwrap();
+    let source = match envelope {
+        TransactionEnvelope::Tx(v1) => v1.tx.source_account,
+        TransactionEnvelope::TxFeeBump(bump) => match bump.tx.inner_tx {
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.source_account,
+        },
+        TransactionEnvelope::TxV0(v0) => MuxedAccount::Ed25519(v0.tx.source_account_ed25519),
+    };
+    let key = match source {
+        MuxedAccount::Ed25519(key) => key.0,
+        MuxedAccount::MuxedEd25519(muxed) => muxed.ed25519.0,
+    };
+    stellar_strkey::ed25519::PublicKey(key)
+        .to_string()
+        .to_string()
 }
 
 /// The JSON-RPC methods `server` received, in order.
@@ -209,12 +501,18 @@ pub(crate) async fn clients_built_by<F: Future>(call: F) -> (F::Output, usize) {
 pub(crate) struct ZeroConfig {
     _home: stellar_agent_test_support::StellarAgentHomeGuard,
     _profile_var: stellar_agent_test_support::ProfileEnvVarGuard,
-    _dir: tempfile::TempDir,
+    _dir: stellar_agent_test_support::sandbox::StateSandbox,
 }
 
 /// Sets up the isolation of [`ZeroConfig`] for the lifetime of the value.
 pub(crate) fn zero_config() -> ZeroConfig {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+    assert!(
+        dir.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
     let profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
     stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
@@ -229,11 +527,8 @@ pub(crate) fn zero_config() -> ZeroConfig {
 ///
 /// Whether that becomes a synthesized profile or a refusal is decided by the
 /// caller of the injected closure, keyed on the resolved name's provenance.
-pub(crate) fn absent_profile_file(name: &str) -> Result<Profile, ProfileLoadError> {
-    Err(ProfileLoadError::NotFound {
-        name: name.to_owned(),
-        path: std::path::PathBuf::from("/nonexistent"),
-    })
+pub(crate) fn absent_profile_file(_: &str) -> Result<Profile, ProfileLoadError> {
+    Err(ProfileLoadError::NotFound)
 }
 
 /// The signer of a zero-config run: the account of `seed`, whose secret sits
@@ -288,7 +583,7 @@ impl Drop for EnvSigner {
 ///
 /// The audit log lives in `audit_dir`, and the profile's audit chain-root key
 /// is minted in the mock keyring [`zero_config`] installed, so a stage
-/// acquires its audit writer and records its pending and submitted rows. The
+/// acquires its audit writer and records its pending rows. The
 /// audit writer registry is process-wide and keyed by profile name, so each
 /// test names its own profile.
 pub(crate) fn witness_profile(
@@ -333,19 +628,18 @@ pub(crate) fn audit_rows(profile: &Profile, kind: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Asserts that the pending and submitted rows each carry the witness of
-/// `oracle` at the fixture ledger.
-pub(crate) fn assert_rows_carry_witness(profile: &Profile, oracle: &str) {
+/// Asserts that the pending row carries the witness of `oracle` at the
+/// fixture ledger, and that the reported success wrote no submitted row: the
+/// pending row stays open.
+pub(crate) fn assert_pending_row_carries_witness(profile: &Profile, oracle: &str) {
     let pending = audit_rows(profile, "value_action_pending");
     let submitted = audit_rows(profile, "value_action_submitted");
     assert_eq!(pending.len(), 1, "{pending:?}");
-    assert_eq!(submitted.len(), 1, "{submitted:?}");
-    for row in [&pending[0], &submitted[0]] {
-        assert_eq!(row["witness"]["provider"], oracle, "{row}");
-        assert_eq!(row["witness"]["ledger"], 1001, "{row}");
-        assert_eq!(row["witness"]["inputs_digest"].as_str().unwrap().len(), 64);
-    }
-    assert_eq!(pending[0]["witness"], submitted[0]["witness"]);
+    assert!(submitted.is_empty(), "{submitted:?}");
+    let row = &pending[0];
+    assert_eq!(row["witness"]["provider"], oracle, "{row}");
+    assert_eq!(row["witness"]["ledger"], 1001, "{row}");
+    assert_eq!(row["witness"]["inputs_digest"].as_str().unwrap().len(), 64);
 }
 
 /// The envelope a command printed last on this thread.
@@ -565,4 +859,86 @@ pub(crate) async fn signers_resolved_by<F: Future>(call: F) -> (F::Output, usize
 /// Whether `server` received a `sendTransaction`.
 pub(crate) async fn sent(server: &MockServer) -> bool {
     methods(server).await.iter().any(|m| m == "sendTransaction")
+}
+
+/// How a test names a mainnet profile without `--profile`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ImplicitSource {
+    /// `STELLAR_AGENT_PROFILE` names the profile.
+    Env,
+    /// Neither the flag nor the variable names a profile, so the name is
+    /// `default`.
+    Default,
+}
+
+/// The isolation of an implicit mainnet selection: a temporary home and a
+/// cleared `STELLAR_AGENT_PROFILE`, which the `Env` case sets to the
+/// profile's name. Callers are `#[serial]`.
+pub(crate) struct ImplicitSelection {
+    /// The name the resolver selects.
+    pub(crate) name: &'static str,
+    _profile_var: stellar_agent_test_support::ProfileEnvVarGuard,
+    _home: stellar_agent_test_support::StellarAgentHomeGuard,
+    _dir: stellar_agent_test_support::sandbox::StateSandbox,
+}
+
+impl ImplicitSelection {
+    /// Sets up the selection of `source`.
+    #[allow(
+        unsafe_code,
+        reason = "test-only process environment mutation; serialised by #[serial]"
+    )]
+    pub(crate) fn new(source: ImplicitSource) -> Self {
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let name = match source {
+            ImplicitSource::Env => {
+                // SAFETY: serialised by #[serial]; the guard restores the
+                // variable when it drops.
+                unsafe {
+                    std::env::set_var("STELLAR_AGENT_PROFILE", "implicit-mainnet");
+                }
+                "implicit-mainnet"
+            }
+            ImplicitSource::Default => "default",
+        };
+        Self {
+            name,
+            _profile_var: profile_var,
+            _home: home,
+            _dir: dir,
+        }
+    }
+
+    /// A loader answering every name with a mainnet profile of that name
+    /// whose endpoint is `rpc_url`.
+    pub(crate) fn loader(
+        rpc_url: &str,
+    ) -> impl Fn(&str) -> Result<Profile, ProfileLoadError> + use<> {
+        let rpc_url = rpc_url.to_owned();
+        move |name| {
+            Ok(
+                Profile::builder_mainnet_named(name, rpc_url.clone(), "s", "default", "n", "a")
+                    .build(),
+            )
+        }
+    }
+}
+
+/// A keyring initializer that succeeds and counts its calls in `calls`.
+pub(crate) fn counting_initializer(
+    calls: &std::rc::Rc<std::cell::Cell<usize>>,
+) -> impl Fn() -> Result<(), stellar_agent_core::error::WalletError> + use<> {
+    let calls = std::rc::Rc::clone(calls);
+    move || {
+        calls.set(calls.get() + 1);
+        Ok(())
+    }
 }

@@ -9,7 +9,7 @@ others).
 ## What it does
 
 When installed, the skill gives your AI agent working knowledge of the wallet. This covers how to create a profile and custody keys, read account state, send payments
-through the two-phase build-then-commit flow, satisfy the operator-approval gate,
+through the two-phase simulate-then-commit flow, satisfy the operator-approval gate,
 and drive smart-account governance and DeFi. It also covers how to use the SEP, x402, and sponsored
 MPP charge surfaces. Every task above is covered with
 the correct commands, MCP tool names, arguments, and safe call patterns, so the agent does not have to guess or clone the repository.
@@ -58,7 +58,7 @@ stellar-agent-wallet/
     approvals-and-audit.md       # Policy engine, the approval spine, the audit log
     smart-accounts.md            # OpenZeppelin smart-account governance
     defi.md                      # Soroswap, DeFindex, and the channel pool
-    protocols.md                 # SEP support and x402 agent payments
+    protocols.md                 # SEP support, x402 agent payments, and sponsored MPP charges
     toolsets-feature.md          # The wallet's capability-isolation feature
     troubleshooting.md           # Wire and error codes
     security.md                  # The security model and safe operation
@@ -79,12 +79,7 @@ run the agent from the checkout so it can read the repository files.
 
 ## Status
 
-This is a public alpha. The `stellar-agent` and `stellar-agent-mcp` binaries
-install from crates.io with a pinned prerelease version. To install the
-prebuilt release archives, run
-`cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13`;
-to build from the published sources, run
-`cargo install --locked stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13`.
-You can also build from source; the skill teaches the same surface either way.
-See the repository [README](https://github.com/Soneso/stellar-agent-wallet) for
-the full install options.
+This is a public alpha. The skill teaches the same surface whether you install a
+release or build from source.
+See [Install](../README.md#install) in the repository README for the install
+commands.

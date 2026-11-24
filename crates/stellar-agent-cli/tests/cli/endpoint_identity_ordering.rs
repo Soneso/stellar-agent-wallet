@@ -9,6 +9,9 @@
 //! statistics, and the reconcile's transaction lookups. A check placed after
 //! any of those reads would leave the read in the trace, so a refusal whose
 //! trace is exactly `["getNetwork"]` shows the check came first.
+//!
+//! The endpoint checks run under the pre-send budget, not under
+//! `--timeout-seconds`, which bounds only the send and the confirmation poll.
 
 #![allow(
     clippy::unwrap_used,
@@ -18,7 +21,6 @@
 )]
 
 use std::path::Path;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -46,8 +48,8 @@ const DEST_G: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Reports `network` from `getNetwork` and answers every read the verbs make:
-/// the accounts in `accounts`, fee statistics, and a transaction the endpoint
-/// has no record of.
+/// the accounts in `accounts`, fee statistics, a transaction the endpoint has
+/// no record of, and the readiness reads of a healthy, current endpoint.
 #[derive(Clone)]
 struct Rpc {
     network: Arc<Mutex<String>>,
@@ -87,14 +89,9 @@ impl Respond for Rpc {
             "getTransaction" => json!({
                 "status": "NOT_FOUND", "latestLedger": 2000, "oldestLedger": 1
             }),
-            "getHealth" => json!({
-                "status": "healthy", "latestLedger": 2000, "oldestLedger": 1,
-                "ledgerRetentionWindow": 1999
-            }),
-            "getLedgers" => json!({
-                "latestLedger": 2000, "oldestLedger": 1, "latestLedgerCloseTime": "100",
-                "oldestLedgerCloseTime": 1, "cursor": "2000", "ledgers": []
-            }),
+            readiness @ ("getHealth" | "getLedgers") => {
+                crate::classic_ledger::readiness_result(readiness).unwrap()
+            }
             other => panic!("unexpected RPC method {other}"),
         };
         ResponseTemplate::new(200)
@@ -139,15 +136,25 @@ async fn methods(server: &MockServer) -> Vec<String> {
 /// Runs the binary with `args` against an isolated home and returns
 /// `(exit_code, stdout_envelope)`.
 fn run_cli(home: &Path, args: &[&str]) -> (i32, Value) {
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(args)
-        .env("STELLAR_AGENT_HOME", home)
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env_remove("STELLAR_AGENT_RPC_URL")
-        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
-        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
-        .output()
-        .expect("stellar-agent binary must run");
+    run_cli_with(home, args, &[])
+}
+
+/// Runs the binary as [`run_cli`] does, with the variables `envs` set.
+fn run_cli_with(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> (i32, Value) {
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child")
+    .args(args)
+    .envs(envs.iter().copied())
+    .env("STELLAR_AGENT_HOME", home)
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .env_remove("STELLAR_AGENT_RPC_URL")
+    .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+    .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+    .output()
+    .expect("stellar-agent binary must run");
     let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let last = stdout
@@ -230,7 +237,7 @@ async fn pay_refuses_another_network_before_the_build_reads() {
         ),
     ] {
         let (server, _rpc) = start(FUTURENET_PASSPHRASE, &[&source, DEST_G]).await;
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let argv = pay_argv(SEED, &server.uri(), &extra);
         let (code, envelope) = run_cli(home.path(), &as_strs(&argv));
         assert_refused_before_any_read(&format!("pay {label}"), code, &envelope, &server).await;
@@ -247,7 +254,7 @@ async fn pay_sign_only_refuses_another_network_before_the_gate_reads() {
         &[envelope.source(), envelope.destination()],
     )
     .await;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let argv = pay_argv(
         [0x32; 32],
         &server.uri(),
@@ -264,7 +271,7 @@ async fn pay_sign_only_refuses_another_network_before_the_gate_reads() {
 async fn pay_endpoint_refusal_precedes_a_missing_source_account() {
     const SEED: [u8; 32] = [0x33; 32];
     let (server, rpc) = start(TESTNET_PASSPHRASE, &[DEST_G]).await;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let argv = pay_argv(SEED, &server.uri(), &["--build-only"]);
 
     let (code, envelope) = run_cli(home.path(), &as_strs(&argv));
@@ -345,12 +352,17 @@ fn reconciling_stages(profile: &str) -> Vec<(&'static str, Vec<String>)> {
 /// reservation for `source` old enough to reconcile in the profile's window
 /// file, under the keyring store the child processes read.
 fn v1_profile_with_due_reservation(home: &Path, name: &str, rpc_url: &str, source: &str) {
+    assert!(
+        home.join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     use stellar_agent_core::policy::v1::criteria::state_store::{
         StateKey, WindowEntry, WindowLimit,
     };
     use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
     use stellar_agent_headless_keyring::{crypto::ProtectionMode, store::HeadlessStore};
-    use stellar_agent_network::policy_state::{PersistedWindowStore, WindowReservation};
+    use stellar_agent_network::policy_state::{PersistedWindowStore, SubmissionHold};
 
     let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home);
     let profile = Profile::builder_testnet_named(
@@ -387,7 +399,11 @@ fn v1_profile_with_due_reservation(home: &Path, name: &str, rpc_url: &str, sourc
                     max_stroops: 1_000_000_000,
                 },
             )],
-            &WindowReservation {
+            &SubmissionHold {
+                destinations: Default::default(),
+                chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                    profile.chain_id,
+                ),
                 id: "7".repeat(64),
                 tx_hash: "7".repeat(64),
                 source: source.to_owned(),
@@ -395,11 +411,18 @@ fn v1_profile_with_due_reservation(home: &Path, name: &str, rpc_url: &str, sourc
                 max_time: 0,
                 pending_since_ms: since,
                 submission_ledger: 1_500,
+                submission_anchor: None,
                 operator_required: false,
             },
         )
         .expect("the reservation is recorded");
 }
+
+/// The first requests of a stage that reconciles a due reservation on
+/// testnet: the endpoint's identity and readiness, then the reconcile's
+/// transaction lookup.
+const ENDPOINT_CHECK_THEN_RECONCILE: [&str; 4] =
+    ["getNetwork", "getHealth", "getLedgers", "getTransaction"];
 
 /// Mounts `rpc` on `server` again with an empty request trace.
 async fn remount(server: &MockServer, rpc: &Rpc) {
@@ -424,7 +447,7 @@ async fn the_endpoint_check_precedes_the_reconcile_lookup_of_a_due_reservation()
     let source = account_id_for_seed([0x34; 32]);
     for (label, argv) in reconciling_stages(NAME) {
         let (server, rpc) = start(TESTNET_PASSPHRASE, &[&source, DEST_G]).await;
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         v1_profile_with_due_reservation(home.path(), NAME, &server.uri(), &source);
         let mut argv = argv;
         argv.extend(["--rpc-url".to_owned(), server.uri()]);
@@ -432,8 +455,8 @@ async fn the_endpoint_check_precedes_the_reconcile_lookup_of_a_due_reservation()
         let (_code, _envelope) = run_cli(home.path(), &as_strs(&argv));
         let reached = methods(&server).await;
         assert_eq!(
-            reached.get(..2),
-            Some(["getNetwork".to_owned(), "getTransaction".to_owned()].as_slice()),
+            reached.get(..4),
+            Some(ENDPOINT_CHECK_THEN_RECONCILE.map(str::to_owned).as_slice()),
             "{label}: on testnet the reconcile looks the due reservation up right after \
              the endpoint check: {reached:?}"
         );
@@ -456,7 +479,7 @@ fn pay_issued_amount_refuses_xlm_unit_before_rpc() {
     let source = account_id_for_seed([0x36; 32]);
     let descriptor = format!("TST:{DEST_G}");
     for stage in [Some("--build-only"), None] {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let mut argv = vec![
             "pay",
             DEST_G,
@@ -482,7 +505,7 @@ fn pay_issued_amount_refuses_xlm_unit_before_rpc() {
         );
         assert_eq!(
             envelope["error"]["message"],
-            "amount '100 XLM' has unit 'XLM'; expected unit 'TST'"
+            "--amount has the wrong unit; expected unit 'TST'"
         );
     }
 }
@@ -498,7 +521,7 @@ async fn a_malformed_fee_follows_the_endpoint_check_and_the_reconcile() {
     const NAME: &str = "endpoint-v1-malformed-fee";
     let source = account_id_for_seed([0x36; 32]);
     let (server, rpc) = start(FUTURENET_PASSPHRASE, &[&source, DEST_G]).await;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     v1_profile_with_due_reservation(home.path(), NAME, &server.uri(), &source);
     let uri = server.uri();
     let argv = [
@@ -532,10 +555,122 @@ async fn a_malformed_fee_follows_the_endpoint_check_and_the_reconcile() {
         "on testnet the run refuses on the fee: {envelope}"
     );
     assert_eq!(
-        reached.get(..2),
-        Some(["getNetwork".to_owned(), "getTransaction".to_owned()].as_slice()),
+        reached.get(..4),
+        Some(ENDPOINT_CHECK_THEN_RECONCILE.map(str::to_owned).as_slice()),
         "the reconcile looks the due reservation up before the fee check: {reached:?}"
     );
+}
+
+/// Answers as a [`crate::classic_ledger::ClassicLedger`] does, with every
+/// `getNetwork` answer held back by `delay`.
+struct SlowIdentity {
+    ledger: crate::classic_ledger::ClassicLedger,
+    delay: std::time::Duration,
+}
+
+impl Respond for SlowIdentity {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let answer = self.ledger.respond(request);
+        if body["method"] == "getNetwork" {
+            answer.set_delay(self.delay)
+        } else {
+            answer
+        }
+    }
+}
+
+/// With `--timeout-seconds 1`, an endpoint whose identity probe answers after
+/// two seconds still passes the endpoint check, and the payment is sent and
+/// confirmed: the check runs under the pre-send budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pay_identity_check_outlasts_a_short_timeout() {
+    const SEED: [u8; 32] = [0x37; 32];
+    let source = account_id_for_seed(SEED);
+    let ledger = crate::classic_ledger::ClassicLedger::new(&[&source, DEST_G], &[]);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(SlowIdentity {
+            ledger: ledger.clone(),
+            delay: std::time::Duration::from_secs(2),
+        })
+        .mount(&server)
+        .await;
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let argv = pay_argv(
+        SEED,
+        &server.uri(),
+        &[
+            "--fee",
+            "100",
+            "--secret-env",
+            "SLOW_IDENTITY_SIGNER",
+            "--timeout-seconds",
+            "1",
+        ],
+    );
+    let secret = stellar_strkey::ed25519::PrivateKey(SEED)
+        .as_unredacted()
+        .to_string();
+
+    let (code, envelope) = run_cli_with(
+        home.path(),
+        &as_strs(&argv),
+        &[("SLOW_IDENTITY_SIGNER", secret.as_str())],
+    );
+
+    assert_eq!(code, 0, "the payment is sent: {envelope}");
+    assert_eq!(ledger.sends(), 1, "{envelope}");
+    let reached = methods(&server).await;
+    assert_eq!(
+        reached.first().map(String::as_str),
+        Some("getNetwork"),
+        "{reached:?}"
+    );
+    assert!(
+        reached.iter().any(|m| m == "getTransaction"),
+        "the confirmation poll runs: {reached:?}"
+    );
+}
+
+/// The rendered help of each value verb says `--timeout-seconds` bounds the
+/// send and the confirmation poll, falls back to the profile setting, and
+/// leaves the endpoint checks and reads to the pre-send budget.
+#[test]
+fn timeout_flag_help_names_the_send_and_poll() {
+    for verb in [
+        vec!["pay"],
+        vec!["claim"],
+        vec!["accounts", "create"],
+        vec!["trustline"],
+    ] {
+        let mut argv = verb.clone();
+        argv.push("--help");
+        let child_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("sandbox");
+        let output = stellar_agent_test_support::cli_child::cli_command(
+            env!("CARGO_BIN_EXE_stellar-agent"),
+            child_sandbox.path(),
+        )
+        .expect("isolated CLI child")
+        .args(&argv)
+        .env_remove("STELLAR_AGENT_PROFILE")
+        .output()
+        .expect("stellar-agent binary must run");
+        let help = String::from_utf8(output.stdout).expect("help is UTF-8");
+        let flag = help
+            .split_once("--timeout-seconds <SECONDS>")
+            .map(|(_, rest)| rest.split("\n      --").next().unwrap_or(rest))
+            .unwrap_or_else(|| panic!("{verb:?} help names --timeout-seconds: {help}"));
+        let flag = flag.split_whitespace().collect::<Vec<_>>().join(" ");
+        for phrase in [
+            "Timeout in seconds for the send and the confirmation poll",
+            "Default: the profile's `submit_timeout_seconds`, then 60",
+            "The endpoint checks and the reads before the send run under a fixed 30-second budget instead",
+        ] {
+            assert!(flag.contains(phrase), "{verb:?} help: {flag}");
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -549,7 +684,7 @@ async fn sponsored_creation_refuses_another_network_before_the_sponsor_read() {
     let sponsor = account_id_for_seed([0x35; 32]);
     for fee in ["100", "auto"] {
         let (server, _rpc) = start(FUTURENET_PASSPHRASE, &[&sponsor]).await;
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let (code, envelope) = run_cli(
             home.path(),
             &[

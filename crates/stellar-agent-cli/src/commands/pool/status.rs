@@ -30,6 +30,7 @@ pub struct PoolStatusArgs {
     /// Profile name.
     ///
     /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    /// A mainnet profile must be named with this flag.
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 
@@ -84,20 +85,24 @@ pub struct PoolStatusResult {
 ///
 /// Never panics.
 /// The acknowledgement command for a pending initialization whose submission
-/// receipt reconciliation records as ambiguous.
+/// receipt records an unknown outcome or a failure report.
 ///
-/// `pool init --resume` retries such an attempt only once an operator states
-/// out of band that it did not apply, so the one state that needs the
-/// statement names the verb that makes it. Every other receipt state, and a
-/// receipt store this process cannot read, yield no command: the reader is a
-/// diagnostic and answers with what it has.
+/// `pool init --resume` retries a sent attempt only once an operator states
+/// out of band that it did not apply, so the states that need the statement,
+/// `ambiguous` and `failed`, name the verb that makes it. Every other receipt
+/// state, and a receipt store this process cannot read, yield no command: the
+/// reader is a diagnostic and answers with what it has.
 fn operator_clear_command(profile_name: &str, pending: &PoolInitialization) -> Option<String> {
     let submission = pending.submission.as_ref()?;
     let receipt = ReceiptStore::open(profile_name)
         .ok()?
         .get(&submission.envelope_hash)
         .ok()??;
-    (receipt.status == ReceiptStatus::Ambiguous).then(|| {
+    matches!(
+        receipt.status,
+        ReceiptStatus::Ambiguous | ReceiptStatus::Failed { .. }
+    )
+    .then(|| {
         format!(
             "stellar-agent tx receipt clear {} --acknowledge --profile {profile_name}",
             submission.envelope_hash
@@ -114,8 +119,8 @@ pub async fn run(args: &PoolStatusArgs) -> i32 {
     let profile = match load_profile_reconciled(&resolved_profile) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
-            render_json(&profile_access_envelope(&e, &profile_name));
+            tracing::debug!(error = %e, "profile access refused");
+            render_json(&profile_access_envelope(&e));
             return 1;
         }
     };

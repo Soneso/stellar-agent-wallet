@@ -97,11 +97,9 @@ pub fn render_typed_args(
 ) -> Result<TypedPreview, Sep48Error> {
     let spec = Spec::new(entries);
 
-    let func: &ScSpecFunctionV0 =
-        spec.find_function(function_name)
-            .map_err(|_| Sep48Error::FunctionNotFound {
-                function_name: function_name.to_owned(),
-            })?;
+    let func: &ScSpecFunctionV0 = spec
+        .find_function(function_name)
+        .map_err(|_| Sep48Error::FunctionNotFound)?;
 
     // ── Fail-closed arity check ───────────────────────────────────────────────
     //
@@ -163,10 +161,12 @@ pub fn render_typed_args(
         }));
         let json_val = match result {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
+            Ok(Err(_)) => {
                 return Err(Sep48Error::UnsupportedArgType {
                     arg_index: i,
-                    type_hint: format!("{param_type:?}: {e}"),
+                    type_hint: format!(
+                        "{param_type:?}: the argument does not match this parameter type"
+                    ),
                 });
             }
             Err(_panic) => {
@@ -229,9 +229,43 @@ mod tests {
         let entries = make_approve_spec();
         let result = render_typed_args(&entries, "CTEST...", "nonexistent", &[]);
         assert!(
-            matches!(result, Err(Sep48Error::FunctionNotFound { .. })),
+            matches!(result, Err(Sep48Error::FunctionNotFound)),
             "unknown function must return FunctionNotFound"
         );
+    }
+
+    #[test]
+    fn function_not_found_holds_no_requested_name() {
+        let entries = make_approve_spec();
+        let Err(err) = render_typed_args(&entries, "CTEST...", "credmarker7", &[]) else {
+            panic!("the function must be refused");
+        };
+        assert_eq!(
+            err.to_string(),
+            "function must name a function declared in the contract spec"
+        );
+        assert_eq!(format!("{err:?}"), "FunctionNotFound");
+    }
+
+    /// A value that fails its parameter type keeps the position and the type,
+    /// with no rendering of the value or of the foreign error.
+    #[test]
+    fn mismatched_arg_holds_no_refused_value() {
+        use stellar_xdr::{ScSymbol, ScVal, ScVec};
+        let entries = make_approve_spec();
+        let symbol = ScVal::Symbol(ScSymbol("credmarker7".try_into().unwrap()));
+        let vec = ScVal::Vec(Some(ScVec(vec![symbol].try_into().unwrap())));
+        let Err(err) =
+            render_typed_args(&entries, "CTEST...", "approve", &[vec, ScVal::Bool(true)])
+        else {
+            panic!("the argument must be refused");
+        };
+        assert_eq!(
+            err.to_string(),
+            "unsupported arg type at position 0: Address: the argument does not match this \
+             parameter type"
+        );
+        assert!(!format!("{err:?}").contains("credmarker7"), "{err:?}");
     }
 
     /// Verifies that supplying fewer args than spec params (or zero args) returns
@@ -318,6 +352,58 @@ mod tests {
             ),
             "I128 for Address param must return UnsupportedArgType at index 0, got: {result:?}"
         );
+    }
+
+    /// Under the installed panic hook, an argument that reaches the spec tools'
+    /// `todo!()` arm logs the fixed text and returns the clean refusal; the
+    /// panic payload formats the argument and stays out of stderr.
+    ///
+    /// The hook is process-wide, so the conversion runs in a child process.
+    #[test]
+    fn installed_panic_hook_holds_no_argument() {
+        const CHILD_SWITCH: &str = "STELLAR_AGENT_SEP48_PANIC_HOOK_CHILD";
+        const NAME: &str = "render::tests::installed_panic_hook_holds_no_argument";
+        use stellar_agent_core::observability::{SubscriberConfig, init_subscriber_with};
+        use stellar_xdr::{Int128Parts, ScSymbol, ScVal};
+
+        if std::env::var_os(CHILD_SWITCH).is_some() {
+            init_subscriber_with(SubscriberConfig::default().with_install_panic_hook(true))
+                .expect("the subscriber installs");
+            let args = vec![
+                ScVal::Symbol(ScSymbol("credmarker7".try_into().unwrap())),
+                ScVal::I128(Int128Parts { hi: 0, lo: 1 }),
+            ];
+            let entries = make_approve_spec();
+            let Err(Sep48Error::UnsupportedArgType {
+                arg_index: 0,
+                type_hint,
+            }) = render_typed_args(&entries, "CTEST...", "approve", &args)
+            else {
+                panic!("the mismatch is refused at index 0");
+            };
+            assert_eq!(
+                type_hint,
+                "Address: unsupported (soroban_spec_tools todo! path)"
+            );
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD_SWITCH, "1")
+            .env("STELLAR_AGENT_LOG", "trace")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}{stderr}");
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        assert!(
+            stderr.contains("a contract argument does not match its spec type"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("credmarker7"), "{stderr}");
+        assert!(!stdout.contains("credmarker7"), "{stdout}");
     }
 
     /// Verifies that a CAP-85 `ScVal::ExecutableTag` argument for a typed

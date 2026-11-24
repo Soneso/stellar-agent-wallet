@@ -1,0 +1,4 @@
+- Testnet approval escalation queues every supported address form.
+- Testnet approvals refuse a clock reading before their creation without consuming the approval.
+- `stellar-agent approve list` labels a spent x402 approval with its payment digest.
+- `stellar_agent_core::approval::subject::verified_x402_subject` is public.

@@ -25,7 +25,9 @@ pub const MAX_RECEIPT_BYTES: usize = 16 * 1024;
 pub const MAX_CREDENTIAL_BYTES: usize = 128 * 1024;
 /// Maximum transaction XDR bytes embedded in a credential.
 pub const MAX_XDR_BYTES: usize = 128 * 1024;
-/// Default and maximum effective challenge lifetime in seconds.
-pub const MAX_CHALLENGE_LIFETIME_SECS: i64 = 5 * 60;
+/// Maximum time a challenge may expire ahead of its prepare, in seconds: the
+/// reference server's five-minute default plus one minute of clock difference
+/// between payee and host.
+pub const MAX_CHALLENGE_LIFETIME_SECS: i64 = 6 * 60;
 /// Minimum remaining challenge lifetime required for authorization.
 pub const MIN_CHALLENGE_LIFETIME_SECS: i64 = 30;

@@ -44,9 +44,9 @@
 //! `sa.auth_entry_construction_failed`, at `rule_lock`, `baseline_read`, or
 //! `signer_set_compare`. On a rule with a pin record, each live verifier is
 //! compared with the verifier pin, and each live policy with the policy pins.
-//! The first eight bytes of the live code hash must equal the pinned value;
-//! the record stores that prefix. A CAP-85 external reference must also match
-//! its pinned owner, tag, and resolved hash prefix. An empty policy-pin list
+//! All 32 bytes of the live code hash must equal the pinned hash. A CAP-85
+//! external reference must also match its pinned owner, tag, and full
+//! resolved hash. An empty policy-pin list
 //! checks no policy code, so pins do not detect a policyless rule gaining a
 //! policy outside the wallet. During a `migrate-verifier` pair, the migrating
 //! rule skips its verifier pin check. Drift refuses with
@@ -55,7 +55,10 @@
 //! policy pins while the rule has no policy on chain refuses with
 //! `sa.pinned_policy_absent`. A rule holding an `External` signer while its
 //! record pins no verifier refuses with `sa.pinned_verifier_absent`, which
-//! `signers refresh` repairs. A rule without a pin record has no code check.
+//! `signers refresh` repairs. A rule whose record holds eight-byte hash
+//! prefixes refuses with `sa.wasm_pin_incomplete` until it is reinstalled
+//! through an independently authorized rule. A rule without a pin record has
+//! no code check.
 //!
 //! # Mainnet defence
 //!
@@ -74,6 +77,7 @@
 //! - `sa.policy_hash_drift`: `SaError::PolicyHashDrift`
 //! - `sa.pinned_policy_absent`: `SaError::PinnedPolicyAbsent`
 //! - `sa.pinned_verifier_absent`: `SaError::PinnedVerifierAbsent`
+//! - `sa.wasm_pin_incomplete`: `SaError::WasmPinIncomplete`
 //! - `sa.pin_check_unavailable`: `SaError::PinCheckUnavailable`
 //! - `sa.threshold_policy_not_installed`: `SaError::ThresholdPolicyNotInstalled`
 //! - `sa.threshold_policy_identification_failed`: `SaError::ThresholdPolicyIdentificationFailed`
@@ -86,10 +90,11 @@
 //!
 //! On-chain `SaError::DeploymentFailed { phase: "simulate", .. }` failures
 //! carry the OZ symbolic error name inline in `message` (e.g.
-//! `[OZ:SpendingLimitExceeded]`, `[OZ:NotAllowed]`, `[OZ:UnvalidatedContext]`)
-//! — the same annotation mechanism every sibling smart-account write verb
-//! relies on (`augment_with_oz_error_name`, applied inside
-//! `submit_signed_invoke` itself).
+//! `[OZ:SpendingLimitExceeded]`, `[OZ:NotAllowed]`, `[OZ:UnvalidatedContext]`).
+//! Every sibling smart-account write verb uses the same annotation:
+//! `submit_signed_invoke` renders `refusal_text`, which classifies the error
+//! text with `SimulationErrorClass::of` and confirms a code from the
+//! response's events.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -111,14 +116,14 @@ use stellar_agent_smart_account::managers::rules::parse_c_strkey_to_smart_accoun
 use stellar_agent_smart_account::submit::{
     Ed25519RuleSigner, PinCheck, SubmitInvokeArgs, submit_signed_invoke,
 };
-use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use stellar_xdr::{HostFunction, InvokeContractArgs, Limits, ReadXdr as _, ScSymbol, ScVal, VecM};
 use tracing::info;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
     SignerSourceFlags, construct_signers_manager_from_fields, load_command_profile,
-    map_access_error, open_audit_writer, resolve_signer, wrap_sa_error,
+    map_access_error, open_audit_writer, open_verifier_registry, resolve_signer,
+    signing_secondary_rpc_url, wrap_sa_error,
 };
 use crate::commands::value_audit::write_row_logged;
 use crate::common::network::{
@@ -195,7 +200,7 @@ pub struct ExecuteArgs {
     ///
     /// Surfaces a misconfigured `--rule-signer-ed25519-secret-env` client-side
     /// instead of as an on-chain `NotAllowed`.
-    #[arg(long, value_name = "64_HEX")]
+    #[arg(long, value_name = "64_HEX", value_parser = RuleSignerHexFlag)]
     pub expect_rule_signer: Option<String>,
 
     /// Ed25519-verifier contract C-strkey override.
@@ -226,6 +231,7 @@ pub struct ExecuteArgs {
     /// On testnet, this flag overrides the profile endpoint.
     /// On mainnet, this flag is refused, including equal values.
     /// URL credentials are refused.
+    /// Only both endpoints stored in the profile authorize retained charge closure.
     #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub rpc_url: Option<String>,
 
@@ -233,6 +239,7 @@ pub struct ExecuteArgs {
     /// On testnet, this flag overrides the profile endpoint.
     /// On mainnet, this flag is refused, including equal values.
     /// URL credentials are refused.
+    /// Only both endpoints stored in the profile authorize retained charge closure.
     #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub secondary_rpc_url: Option<String>,
 
@@ -315,9 +322,9 @@ fn validate_execute_inputs(
     // ── Client-side refusals before any I/O ────────────────────────────────
 
     if args.function.trim().is_empty() {
-        return Err(WalletError::Validation(ValidationError::AddressInvalid {
-            input: "--function must not be empty".to_owned(),
-        }));
+        return Err(WalletError::Validation(ValidationError::address_check(
+            "--function must not be empty",
+        )));
     }
 
     // Decode each --arg from standard-base64 XDR to validate well-formedness.
@@ -334,12 +341,23 @@ fn validate_execute_inputs(
                 len: raw.len(),
             },
         ) {
-            Ok(v) => sc_args.push(v),
-            Err(e) => {
+            Ok(v) => {
+                if stellar_agent_core::sc_address::scval_has_muxed_contract(&v) {
+                    return Err(WalletError::Validation(
+                        ValidationError::XdrArgumentMalformed {
+                            arg: format!("arg[{idx}]"),
+                            reason: stellar_agent_core::sc_address::MUXED_CONTRACT_REFUSAL
+                                .to_owned(),
+                        },
+                    ));
+                }
+                sc_args.push(v);
+            }
+            Err(_) => {
                 return Err(WalletError::Validation(
                     ValidationError::XdrArgumentMalformed {
                         arg: format!("arg[{idx}]"),
-                        reason: format!("{e}"),
+                        reason: stellar_agent_core::envelope_decode::SCVAL_XDR_FORM.to_owned(),
                     },
                 ));
             }
@@ -353,20 +371,13 @@ fn validate_execute_inputs(
     let verifier_c_strkey = if let Some(explicit) = &args.verifier {
         explicit.clone()
     } else {
-        let registry = VerifierRegistry::open().map_err(|e| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("could not open verifier registry: {e}"),
-            })
-        })?;
+        let registry = open_verifier_registry()?;
         match registry.ed25519_verifier_for(network_passphrase) {
             Some(entry) => entry.address.clone(),
             None => {
-                return Err(WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!(
-                        "no Ed25519 verifier registered for network '{network_passphrase}'; \
-                         run: smart-account deploy-ed25519-verifier (or pass --verifier)"
-                    ),
-                }));
+                return Err(WalletError::Validation(ValidationError::address_check(
+                    "network: no Ed25519 verifier registered; run: smart-account deploy-ed25519-verifier (or pass --verifier)",
+                )));
             }
         }
     };
@@ -378,19 +389,15 @@ fn validate_execute_inputs(
     parse_c_strkey("--account", &args.account)?;
 
     let function_name = ScSymbol::try_from(args.function.as_str()).map_err(|()| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!(
-                "--function '{}' invalid: must be a valid Soroban symbol (<=32 bytes, \
-                 alphanumeric/underscore)",
-                args.function
-            ),
-        })
+        WalletError::Validation(ValidationError::address_check(
+            "--function must be a valid Soroban symbol (<=32 bytes, alphanumeric/underscore)",
+        ))
     })?;
     let arg_count = sc_args.len() as u32;
     let args_vecm: VecM<ScVal> = sc_args.try_into().map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("too many --arg values: {e}"),
-        })
+        WalletError::Validation(ValidationError::address_check(format!(
+            "too many --arg values: {e}"
+        )))
     })?;
     let host_function = HostFunction::InvokeContract(InvokeContractArgs {
         contract_address: contract_sc_addr,
@@ -423,7 +430,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved_profile) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved_profile.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.output, &request_id);
         }
     };
@@ -475,6 +482,11 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
                 return emit_error(&e, args.output, &request_id);
             }
         };
+    // The signature rests on a second endpoint's ledger observation; a command
+    // without one refuses before any key access.
+    if let Err(e) = signing_secondary_rpc_url(&context) {
+        return emit_error_sa(&e, args.output, &request_id);
+    }
 
     // Every non-zero authorizing rule reads its baseline and pin record from
     // this profile's audit log. The signer-set comparison and executable pin
@@ -485,6 +497,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         Duration::from_secs(args.timeout_seconds),
         Arc::clone(&audit_writer),
         &audit_log_path,
+        None,
     ) {
         Ok(manager) => manager,
         Err(e) => return emit_error(&e, args.output, &request_id),
@@ -557,10 +570,9 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         .map(|id| ContextRuleId::new(*id))
         .collect();
 
-    // Record the submission before the bytes leave. The invocation is an
-    // arbitrary contract call the policy engine cannot size, so the record is
-    // the receipt and the audit rows: no spending-window reservation is taken
-    // for a value nothing measured.
+    // Record the submission before the bytes leave.
+    // The call is sized as an unvalued contract call: a matching value rule without
+    // `allow_opaque_signing` refuses it before signing, and count limits charge it as one intent.
     let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
         Ok(v) => v,
         Err(e) => {
@@ -582,13 +594,16 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             &profile_name,
             origin,
             &reconcile_client,
+            crate::commands::submission_record::settlement_oracle(&profile).as_ref(),
             now_ms,
+            None,
         )
         .await;
     }
 
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
+            unvalued: Some(stellar_agent_core::policy::v1::OpaqueReason::UnvaluedContractCall),
             policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
             profile: &profile,
             profile_name: profile_name.clone(),
@@ -625,7 +640,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             .timeout(Duration::from_secs(args.timeout_seconds))
             .op_label("execute")
             .emit_observability_logs(true)
-            .submission_recorder(&recorder)
+            .admission(stellar_agent_network::SigningAdmission::Recorded(&recorder))
             .pin_check(PinCheck {
                 signers_manager: &signers_manager,
                 request_id: &request_id,
@@ -804,9 +819,7 @@ fn classify_invocation_result(err: &SaError) -> SaInvocationResult {
 /// the refusal message on failure.
 fn parse_c_strkey(flag: &str, s: &str) -> Result<stellar_xdr::ScAddress, WalletError> {
     parse_c_strkey_to_smart_account(s).map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("{flag}: {e}"),
-        })
+        WalletError::Validation(ValidationError::address_check(format!("{flag}: {e}")))
     })
 }
 
@@ -837,11 +850,57 @@ fn emit_success(result: &ExecuteResult, output: OutputFormat, request_id: &str) 
     0
 }
 
+/// Typed parser for `--expect-rule-signer`.
+///
+/// Accepts exactly 64 hexadecimal characters, upper- or lowercase, and stores
+/// them lowercased. Any other value, such as an S-strkey seed pasted into the
+/// wrong flag, is refused at parse time, before the profile or the rule key is
+/// read. The refusal never echoes the value.
+#[derive(Clone)]
+struct RuleSignerHexFlag;
+
+impl clap::builder::TypedValueParser for RuleSignerHexFlag {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        _cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<String, clap::Error> {
+        use clap::error::{ContextKind, ContextValue, ErrorKind};
+        let flag = arg
+            .and_then(clap::Arg::get_long)
+            .unwrap_or("expect-rule-signer");
+        let refusal = || {
+            let mut error = clap::Error::raw(
+                ErrorKind::ValueValidation,
+                format!("--{flag} must be exactly 64 hexadecimal characters"),
+            );
+            if let Some(long) = arg.and_then(clap::Arg::get_long) {
+                error.insert(
+                    ContextKind::InvalidArg,
+                    ContextValue::String(format!("--{long}")),
+                );
+            }
+            error
+        };
+        let value = match value.to_str() {
+            Some(value) => value,
+            None => return Err(refusal()),
+        };
+        if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(refusal());
+        }
+        Ok(value.to_ascii_lowercase())
+    }
+}
+
 /// Refuses a rule signer whose public key differs from `--expect-rule-signer`.
 ///
-/// `expected` is the flag value (hex, compared case-insensitively) and
-/// `rule_pubkey_hex` the lowercase hex public key of the resolved rule signer.
-/// No flag means no check.
+/// `expected` is the validated, lowercase hex flag value produced by
+/// [`RuleSignerHexFlag`], and `rule_pubkey_hex` the lowercase hex public key
+/// of the resolved rule signer. No flag means no check.
 ///
 /// # Errors
 ///
@@ -852,7 +911,7 @@ fn check_expected_rule_signer(
     rule_pubkey_hex: &str,
 ) -> Result<(), WalletError> {
     match expected {
-        Some(expected_hex) if expected_hex.to_lowercase() != rule_pubkey_hex => {
+        Some(expected_hex) if expected_hex != rule_pubkey_hex => {
             Err(WalletError::Auth(AuthError::SignerKeyMismatch {
                 what: "--expect-rule-signer",
                 expected: expected_hex.to_owned(),
@@ -1055,8 +1114,9 @@ mod tests {
                 "signing key public key '{got}' does not match --expect-rule-signer '{expected}'"
             )
         );
-        // Matching (case-insensitively) or absent passes.
-        assert!(check_expected_rule_signer(Some(&expected.to_uppercase()), &expected).is_ok());
+        // A matching value or an absent flag passes; the parser has already
+        // lowercased the flag value.
+        assert!(check_expected_rule_signer(Some(&expected), &expected).is_ok());
         assert!(check_expected_rule_signer(None, &got).is_ok());
     }
 
@@ -1073,6 +1133,89 @@ mod tests {
             parsed.args.expect_rule_signer.as_deref(),
             Some(expected.as_str())
         );
+    }
+
+    #[test]
+    fn clap_expect_rule_signer_accepts_uppercase_and_stores_lowercase() {
+        let mut a = base_args();
+        let expected = "AA".repeat(32);
+        a.extend(["--expect-rule-signer", &expected]);
+        let parsed = ExecuteArgsHarness::try_parse_from(a).expect("must parse");
+        let lower = "aa".repeat(32);
+        assert_eq!(
+            parsed.args.expect_rule_signer.as_deref(),
+            Some(lower.as_str())
+        );
+    }
+
+    #[test]
+    fn clap_expect_rule_signer_refuses_a_seed_without_echoing_it() {
+        use clap::error::{ContextKind, ContextValue, ErrorKind};
+        use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+
+        let seed = seed_marker();
+        assert_eq!(seed.len(), 56, "the marker is a 56-character S-strkey");
+        let mut a = base_args();
+        a.extend(["--expect-rule-signer", &seed]);
+        let error =
+            ExecuteArgsHarness::try_parse_from(a).expect_err("a seed is not 64 hex characters");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        assert_eq!(
+            error.get(ContextKind::InvalidArg),
+            Some(&ContextValue::String("--expect-rule-signer".to_owned()))
+        );
+        assert_no_marker(&error, &seed);
+    }
+
+    #[test]
+    fn clap_expect_rule_signer_refuses_wrong_length_and_non_hex() {
+        use clap::error::ErrorKind;
+
+        for value in [
+            String::new(),
+            "a".repeat(63),
+            "a".repeat(65),
+            format!("{}g", "a".repeat(63)),
+            format!(" {}", "a".repeat(63)),
+            format!(" {}", "a".repeat(64)),
+            format!("{} ", "a".repeat(64)),
+        ] {
+            let mut a = base_args();
+            a.extend(["--expect-rule-signer", &value]);
+            let error = ExecuteArgsHarness::try_parse_from(a)
+                .expect_err("a value that is not 64 hex characters must be refused");
+            assert_eq!(error.kind(), ErrorKind::ValueValidation, "{value:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clap_expect_rule_signer_refuses_non_utf8_without_echoing_it() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        use clap::error::{ContextKind, ContextValue, ErrorKind};
+        use stellar_agent_test_support::rejected_value::assert_no_marker;
+
+        let bytes = [0xfe_u8, 0xff].repeat(32);
+        assert_eq!(bytes.len(), 64, "the value has the accepted length");
+        assert!(
+            std::str::from_utf8(&bytes).is_err(),
+            "the value is not UTF-8"
+        );
+        let lossy = String::from_utf8_lossy(&bytes).into_owned();
+        let mut a: Vec<OsString> = base_args().into_iter().map(OsString::from).collect();
+        a.push(OsString::from("--expect-rule-signer"));
+        a.push(OsString::from_vec(bytes));
+        let error = ExecuteArgsHarness::try_parse_from(a)
+            .expect_err("a value that is not UTF-8 must be refused");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        assert_eq!(
+            error.get(ContextKind::InvalidArg),
+            Some(&ContextValue::String("--expect-rule-signer".to_owned()))
+        );
+        assert_no_marker(&error, "\u{FFFD}");
+        assert_no_marker(&error, &lossy);
     }
 
     // ── Envelope shape ──────────────────────────────────────────────────────
@@ -1208,7 +1351,14 @@ mod tests {
     #[serial_test::serial]
     async fn mainnet_flag_without_profile_reaches_no_endpoint() {
         let guard_rpc = wiremock::MockServer::start().await;
-        let guard_home = tempfile::tempdir().expect("home");
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let mut args = minimal_args();
@@ -1226,23 +1376,36 @@ mod tests {
     }
 
     /// An empty `--function` is refused client-side.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn empty_function_refused_client_side() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = minimal_args();
         args.function = String::new();
-        args.rpc_url = Some("http://127.0.0.1:1".to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = run(&args).await;
         assert_eq!(code, 1, "empty function name must be refused");
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--function must not be empty"],
+        );
     }
 
     /// A malformed `--arg` is refused client-side with the failing index named.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn malformed_arg_refused_with_index() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = minimal_args();
         args.arg = vec![VOID_ARG_B64.to_owned(), "not-valid-base64!!".to_owned()];
-        args.rpc_url = Some("http://127.0.0.1:1".to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = run(&args).await;
         assert_eq!(code, 1, "malformed --arg must be refused");
+        fixture.assert_refusal(Some("validation.xdr_argument_malformed"), &["arg[1]"]);
     }
 
     // ── Typed refusal pins (validate_execute_inputs) ────────────────────────
@@ -1291,12 +1454,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn muxed_contract_execute_argument_refuses() {
+        use stellar_xdr::{ContractId, Hash, MuxedContract, ScAddress, WriteXdr};
+        let value = ScVal::Address(ScAddress::MuxedContract(MuxedContract {
+            contract_id: ContractId(Hash([3; 32])),
+            id: 7,
+        }));
+        let mut args = minimal_args();
+        args.arg = vec![value.to_xdr_base64(Limits::none()).unwrap()];
+        let error = validate_execute_inputs(&args, &flag_context(&args)).unwrap_err();
+        assert_eq!(error.code(), "validation.xdr_argument_malformed");
+        assert!(
+            error
+                .to_string()
+                .ends_with("a muxed contract address (W) is not accepted on this path")
+        );
+    }
+
     /// With no `--verifier` and no registry entry, resolution fails closed
     /// naming the deploy verb.
     #[test]
     #[serial]
     fn validate_inputs_missing_verifier_fails_closed_naming_deploy_verb() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         let mut args = minimal_args();
         args.verifier = None;
@@ -1336,7 +1523,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn missing_verifier_refused_before_any_network_call() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard = StellarAgentHomeGuard::new(dir.path());
 
         let mut args = minimal_args();
@@ -1367,17 +1560,14 @@ mod tests {
         let seed: Zeroizing<[u8; 32]> = Zeroizing::new(seed_bytes);
         let wallet = Wallet::unlock(
             "seed-ceremony-test".to_owned(),
-            seed,
+            &seed,
             DEFAULT_TTL_SECONDS,
             MlockRequired::Warn,
         )
-        .await
         .unwrap();
-        let signer = signer_from_wallet(&wallet).unwrap();
+        let signer = signer_from_wallet(wallet).unwrap();
         let derived_pubkey = signer.public_key().await.unwrap();
         drop(signer);
-        let mut wallet = wallet;
-        wallet.dispose();
 
         let expected_pubkey = signing_key.verifying_key().to_bytes();
         assert_eq!(

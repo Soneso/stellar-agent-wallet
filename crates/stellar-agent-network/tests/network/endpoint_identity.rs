@@ -15,18 +15,21 @@
 )]
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_core::profile::caip2::Caip2;
-use stellar_agent_network::{EndpointIdentity, SUPPORTED_PROTOCOL_VERSIONS, StellarRpcClient};
+use stellar_agent_network::{
+    EndpointIdentity, SUPPORTED_PROTOCOL_VERSIONS, SigningLedgerObservation, StellarRpcClient,
+};
 use stellar_agent_test_support::signed_envelope::{
     MAINNET_PASSPHRASE, TESTNET_PASSPHRASE, get_network_result,
 };
 use stellar_agent_test_support::{EchoIdResponder, WarningCapture, rpc_request_count};
 use wiremock::matchers::{body_partial_json, method};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// A network whose passphrase names neither testnet nor mainnet.
 const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
@@ -117,6 +120,26 @@ fn the_shared_get_network_fixture_reports_a_supported_version() {
 }
 
 // ── Outcomes ────────────────────────────────────────────────────────────────
+
+/// Each client carries its own identity into the facts it establishes, so two
+/// clients against one endpoint never yield the same identity.
+#[tokio::test]
+async fn the_identity_names_the_client_it_was_established_through() {
+    let server = serve_get_network(network(TESTNET_PASSPHRASE, 29)).await;
+    let first = StellarRpcClient::new(&server.uri()).unwrap();
+    let second = StellarRpcClient::new(&server.uri()).unwrap();
+    assert_ne!(first.id(), second.id());
+    for client in [&first, &second] {
+        let found = client
+            .endpoint_identity(
+                TESTNET_PASSPHRASE,
+                tokio::time::Instant::now() + GENEROUS_DEADLINE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.client_id(), client.id());
+    }
+}
 
 /// A testnet endpoint at a supported version yields its chain, its version,
 /// and an authority stripped of the userinfo, path, and query the endpoint
@@ -390,4 +413,229 @@ async fn an_answer_that_does_not_parse_under_a_mainnet_expectation_is_unavailabl
     let result = identity(&server, MAINNET_PASSPHRASE).await;
     expect_unavailable(result, &server);
     assert_eq!(rpc_request_count(&server, "getNetwork").await, 1);
+}
+
+// ── The signing ledger observation ──────────────────────────────────────────
+
+/// A `getLatestLedger` result at `sequence`.
+fn latest_ledger(sequence: u32) -> Value {
+    json!({"id": "ab".repeat(32), "sequence": sequence, "protocolVersion": 29})
+}
+
+/// Mounts a `getLatestLedger` answer on `server`.
+async fn mount_latest_ledger(server: &MockServer, result: Value) {
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "getLatestLedger"})))
+        .respond_with(EchoIdResponder::new(result))
+        .mount(server)
+        .await;
+}
+
+/// Prepares a read of `client` under `deadline` and reads one height through
+/// it.
+async fn observation(
+    client: &StellarRpcClient,
+    deadline: Duration,
+) -> Result<SigningLedgerObservation, WalletError> {
+    let prepared = client
+        .prepare_signing_ledger_observation(
+            TESTNET_PASSPHRASE,
+            tokio::time::Instant::now() + deadline,
+        )
+        .await?;
+    prepared.read().await
+}
+
+/// An observation binds the height to the identity of the endpoint that
+/// reported it and to the local time of the answer.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_observation_binds_the_height_to_the_checked_identity() {
+    let server = serve_get_network(network(TESTNET_PASSPHRASE, 29)).await;
+    mount_latest_ledger(&server, latest_ledger(4321)).await;
+    let port = server.address().port();
+    let client = StellarRpcClient::new(&format!(
+        "http://user:SECRET@127.0.0.1:{port}/rpc?token=SECRET"
+    ))
+    .unwrap();
+    let before_ms = stellar_agent_network::mainnet::clock::now_ms().unwrap();
+    let before = tokio::time::Instant::now();
+
+    let found = observation(&client, GENEROUS_DEADLINE).await.unwrap();
+
+    assert_eq!(found.ledger(), 4321);
+    assert_eq!(found.identity().chain_id(), Some(Caip2::Testnet));
+    assert_eq!(found.identity().client_id(), client.id());
+    assert_eq!(
+        found.identity().authority(),
+        format!("http://127.0.0.1:{port}")
+    );
+    assert!(found.arrived_at_ms() >= before_ms);
+    assert!(found.arrived_at_ms() <= stellar_agent_network::mainnet::clock::now_ms().unwrap());
+    assert!(found.observed_at() >= before);
+    assert!(found.observed_at() <= tokio::time::Instant::now());
+    assert_eq!(rpc_request_count(&server, "getNetwork").await, 1);
+    assert_eq!(rpc_request_count(&server, "getLatestLedger").await, 1);
+}
+
+/// The height of an endpoint on another network is never read.
+#[tokio::test]
+async fn an_endpoint_on_another_network_gives_no_observation() {
+    let server = serve_get_network(network(FUTURENET_PASSPHRASE, 29)).await;
+    mount_latest_ledger(&server, latest_ledger(4321)).await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+
+    let error = observation(&client, GENEROUS_DEADLINE).await.unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            WalletError::Network(NetworkError::EndpointNetworkMismatch { .. })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(rpc_request_count(&server, "getLatestLedger").await, 0);
+}
+
+/// A body that does not name a height gives no observation, and the failure
+/// names the endpoint by its authority alone.
+#[tokio::test]
+async fn a_malformed_height_gives_no_observation() {
+    let server = serve_get_network(network(TESTNET_PASSPHRASE, 29)).await;
+    mount_latest_ledger(
+        &server,
+        json!({"id": "ab".repeat(32), "sequence": "not-a-ledger", "protocolVersion": 29}),
+    )
+    .await;
+    let port = server.address().port();
+    let client =
+        StellarRpcClient::new(&format!("http://127.0.0.1:{port}/rpc?token=SECRET")).unwrap();
+
+    let error = observation(&client, GENEROUS_DEADLINE).await.unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            WalletError::Network(NetworkError::RpcUnreachable { .. })
+        ),
+        "{error:?}"
+    );
+    assert!(!format!("{error}").contains("SECRET"), "{error}");
+}
+
+/// A height that arrives after the deadline gives no observation.
+#[tokio::test]
+async fn an_answer_past_the_deadline_gives_no_observation() {
+    let server = serve_get_network(network(TESTNET_PASSPHRASE, 29)).await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "getLatestLedger"})))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let started = std::time::Instant::now();
+
+    let error = observation(&client, Duration::from_millis(300))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            WalletError::Network(
+                NetworkError::RpcUnreachable { .. }
+                    | NetworkError::EndpointIdentityUnavailable { .. }
+            )
+        ),
+        "{error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the deadline ends the read: {:?}",
+        started.elapsed()
+    );
+}
+
+/// Answers `getLatestLedger` with `first`, then `first + 1`, and so on, each
+/// after `delay`, and records when each request arrived.
+struct AdvancingLedger {
+    first: u32,
+    delay: Duration,
+    arrivals: Arc<Mutex<Vec<tokio::time::Instant>>>,
+}
+
+impl Respond for AdvancingLedger {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let mut arrivals = self.arrivals.lock().unwrap();
+        arrivals.push(tokio::time::Instant::now());
+        let sequence = self.first + u32::try_from(arrivals.len() - 1).unwrap();
+        let id = serde_json::from_slice::<Value>(&request.body)
+            .ok()
+            .and_then(|body| body.get("id").cloned())
+            .unwrap_or_else(|| json!(1));
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"jsonrpc": "2.0", "id": id, "result": latest_ledger(sequence)}))
+            .set_delay(self.delay)
+    }
+}
+
+/// Every read of one prepared value goes through the client that checked the
+/// identity, stamps the moment its own answer arrived, and stays under the
+/// deadline given at preparation.
+#[tokio::test]
+#[serial_test::serial(mainnet_clock)]
+#[serial_test::serial]
+async fn prepared_observation_keeps_client_deadline_and_arrival_time() {
+    let server = serve_get_network(network(TESTNET_PASSPHRASE, 29)).await;
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let delay = Duration::from_millis(150);
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "getLatestLedger"})))
+        .respond_with(AdvancingLedger {
+            first: 700,
+            delay,
+            arrivals: Arc::clone(&arrivals),
+        })
+        .mount(&server)
+        .await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let prepared = client
+        .prepare_signing_ledger_observation(TESTNET_PASSPHRASE, deadline)
+        .await
+        .unwrap();
+
+    let first = {
+        let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(1000);
+        prepared.read().await.unwrap()
+    };
+    let second = {
+        let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(2000);
+        prepared.read().await.unwrap()
+    };
+    assert_eq!(first.arrived_at_ms(), 1000);
+    assert_eq!(second.arrived_at_ms(), 2000);
+
+    let arrived = arrivals.lock().unwrap().clone();
+    assert_eq!((first.ledger(), second.ledger()), (700, 701));
+    for (observation, arrival) in [(&first, arrived[0]), (&second, arrived[1])] {
+        assert_eq!(observation.identity().client_id(), client.id());
+        assert!(
+            observation.observed_at() >= arrival + delay,
+            "the stamp follows the answer to its own request"
+        );
+    }
+    assert!(
+        first.observed_at() < arrived[1],
+        "the first stamp precedes the second request"
+    );
+    assert_eq!(rpc_request_count(&server, "getNetwork").await, 1);
+
+    tokio::time::sleep_until(deadline).await;
+    match prepared.read().await {
+        Err(WalletError::Network(NetworkError::RpcUnreachable { reason, .. })) => {
+            assert_eq!(reason, "getLatestLedger exceeded its deadline");
+        }
+        other => panic!("the original deadline bounds a later read: {other:?}"),
+    }
 }

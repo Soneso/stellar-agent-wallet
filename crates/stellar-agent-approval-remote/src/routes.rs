@@ -1,5 +1,11 @@
 //! HTTP router and handlers for the remote-approval server.
 //!
+//! The table describes testnet routes. Signed mode mounts the shared consent router.
+//! Signed login uses current verified policy credentials and the signed RP and origin.
+//! The store supplies counters only, checked once per verified login or decision.
+//! Signed consent uses the page CSRF header; testnet retains its remote header.
+//! One-shot links preserve the selected nonce through login and restrict every listing.
+//!
 //! | Method | Path | Handler | Auth |
 //! |--------|------|---------|------|
 //! | `GET`  | `/` | [`login_page_get`] | none (pre-auth) |
@@ -20,19 +26,40 @@
 //! loopback approval-inbox server's auth-boundary discipline: absent /
 //! malformed / mismatched session collapses to a bare `404`.
 //!
+//! # Authorization is read again at every check
+//!
+//! A login reads the network's current authorization (see [`authorize`])
+//! before it verifies the assertion and again immediately before it creates
+//! the session. Every authenticated request reads it in
+//! [`require_session`]; a session whose credential the current files do
+//! not admit is dropped and answered like no session. A decision also
+//! passes the decision seam's own checks after the attestation key loads.
+//! A refused login or decision answers `400` `webauthn_assertion_invalid`,
+//! the same as a bad assertion, so no response tells an unknown, removed or
+//! unlisted credential apart.
+//! Credential-store contention answers `503` `store_busy` after a bounded wait.
+//! A policy-state lock that a writer holds through the final retry answers the
+//! same `503` `store_busy` at every policy read, and a live session survives it.
+//! A signed-origin login holds the lock shared from before it consumes its
+//! challenge until it publishes the session.
+//!
 //! `/static/login.js` is deliberately ungated: it runs the passkey login
 //! ceremony, which IS the authentication step, so no session can exist yet
-//! for it to run behind. `/enroll` and `/static/enroll.js` are pre-auth for
-//! the same reason: a WebAuthn credential is bound to its rp.id at creation,
-//! so enrollment must run from this origin before any session exists.
-//! `/enroll` (the page load, the only work this pre-auth surface does)
-//! shares the SAME token bucket `/login/challenge` uses — it never accepts
-//! or persists a credential; it only runs `navigator.credentials.create()`
-//! client-side and displays the result for manual entry into the
-//! loopback-only `approve operator enroll` CLI command. `/static/app.js` —
-//! the inbox, detail, and per-action ceremony glue — is gated behind the
+//! for it to run behind. On testnet, `/enroll` and `/static/enroll.js` are
+//! pre-auth for the same reason. A WebAuthn credential is bound to its rp.id
+//! at creation, so enrollment must run from this origin before any session
+//! exists. `/enroll` (the page load, the only work this pre-auth surface
+//! does) shares the SAME token bucket `/login/challenge` uses. It never
+//! accepts or persists a credential; it only runs
+//! `navigator.credentials.create()` client-side and displays the result for
+//! manual entry into the loopback-only `approve operator enroll` CLI
+//! command. The signed router mounts neither path; signed-origin enrollment
+//! runs on its own listener, [`crate::enroll_listener`].
+//! `/static/app.js`, the inbox, detail, and per-action ceremony glue, is gated behind the
 //! session cookie, mirroring the loopback approval-inbox server's own
 //! `/static/app.js` gating.
+
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -43,11 +70,16 @@ use axum::{
 };
 use serde_json::json;
 
-use stellar_agent_approval_ui::{Decision, RequestIdentity, apply_decision};
-use stellar_agent_core::approval::attest::decode_sha256_hex;
+use stellar_agent_approval_ui::{
+    Decision, RequestIdentity, apply_decision, consent_changed, shown_view_digest,
+};
 use stellar_agent_core::approval::error::ApprovalError;
+use stellar_agent_core::approval::operator_credentials::OperatorApprovalCredentialStore;
+use stellar_agent_core::approval::presence_policy::PolicyAdmission;
 use stellar_agent_core::approval::user_id::{ApproverIdentity, VerifiedPasskeyAssertion};
-use stellar_agent_core::approval::{ApprovalKind, PendingApproval, PendingApprovalView};
+use stellar_agent_core::approval::{
+    ApprovalKind, MainnetApprovalCredential, PendingApprovalView, approval_view_digest,
+};
 use stellar_agent_core::timefmt;
 
 use crate::RemoteServeState;
@@ -65,9 +97,14 @@ use crate::verify::verify_wire_assertion;
 use crate::web;
 use crate::wire::{ActionAssertionRequest, LoginAssertionRequest};
 
+/// Allows concurrent verified assertions two seconds to acquire the lock on the blocking pool.
+const ASSERTION_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Build the router (without the outer middleware stack, applied by
 /// [`crate::build_router`]).
-pub(crate) fn build_router() -> Router<RemoteServeState> {
+pub(crate) fn build_router(
+    context: std::sync::Arc<stellar_agent_approval_ui::DecisionContext>,
+) -> Router<RemoteServeState> {
     Router::new()
         .route("/", get(login_page_get))
         .route("/static/login.js", get(login_js_get))
@@ -79,14 +116,252 @@ pub(crate) fn build_router() -> Router<RemoteServeState> {
         .route("/pending.json", get(pending_json))
         .route("/approval/{nonce}", get(approval_detail_get))
         .route("/approval/{nonce}/challenge", post(action_challenge_post))
-        .route("/approval/{nonce}/decision", post(action_decision_post))
+        .route(
+            "/approval/{nonce}/decision",
+            post(action_decision_post).layer(axum::Extension(context)),
+        )
         .route("/static/app-shared.js", get(app_shared_js_get))
         .route("/static/app.js", get(app_js_get))
+}
+
+/// Login, listings, and assets shared with signed consent routes.
+pub(crate) fn signed_router() -> Router<RemoteServeState> {
+    Router::new()
+        .route("/", get(login_page_get))
+        .route("/static/signed-login.js", get(signed_login_js_get))
+        .route("/login/challenge", post(login_challenge_post))
+        .route("/login/assertion", post(login_assertion_post))
+        .route("/approvals/{nonce}", get(approval_link_get))
+        .route("/inbox", get(inbox_get))
+        .route("/pending.json", get(pending_json))
+        .route("/static/app-shared.js", get(app_shared_js_get))
+        .route("/static/app.js", get(app_js_get))
+}
+
+impl stellar_agent_approval_ui::presence::ConsentSessionGate for RemoteServeState {
+    type Session = SessionState;
+
+    fn session(&self, headers: &HeaderMap) -> Result<SessionState, Response> {
+        require_session(self, headers)
+    }
+
+    fn authorize_mutation(&self, headers: &HeaderMap, nonce: &str) -> Result<(), Response> {
+        let session = require_session(self, headers)?;
+        let value = headers
+            .get("x-stellar-approval-csrf")
+            .and_then(|value| value.to_str().ok());
+        if value.is_some_and(|value| verify_csrf(&session.csrf_key, nonce, value)) {
+            Ok(())
+        } else {
+            Err(csrf_rejected())
+        }
+    }
+
+    fn session_key(&self, session: &SessionState) -> String {
+        session.session_id.to_hex()
+    }
+
+    fn csrf(&self, session: &SessionState, nonce: &str) -> String {
+        compute_csrf(&session.csrf_key, nonce)
+    }
+
+    fn verified(
+        &self,
+        presence: &stellar_agent_core::approval::VerifiedMainnetPresence,
+    ) -> Result<(), stellar_agent_core::WalletError> {
+        verified_under(self, presence, None)
+    }
+
+    fn admitted_mutation(
+        &self,
+        headers: &HeaderMap,
+        nonce: &str,
+        admit: &dyn Fn() -> Result<PolicyAdmission, Response>,
+    ) -> Result<(SessionState, PolicyAdmission), Response> {
+        let session = live_session(self, headers)?;
+        let value = headers
+            .get("x-stellar-approval-csrf")
+            .and_then(|value| value.to_str().ok());
+        if !value.is_some_and(|value| verify_csrf(&session.csrf_key, nonce, value)) {
+            return Err(csrf_rejected());
+        }
+        let admission = admit()?;
+        match authorize(self, &session.credential_id_b64url, Some(&admission)) {
+            Authorization::Admitted => Ok((session, admission)),
+            Authorization::Busy => Err(store_busy()),
+            Authorization::Refused => {
+                drop_session(self, &session);
+                Err(not_found())
+            }
+        }
+    }
+
+    fn verified_admitted(
+        &self,
+        presence: &stellar_agent_core::approval::VerifiedMainnetPresence,
+        admission: &PolicyAdmission,
+    ) -> Result<(), stellar_agent_core::WalletError> {
+        verified_under(self, presence, Some(admission))
+    }
+}
+
+/// The consent gate's check of a verified presence, with the policy read
+/// through `admission` when the request holds one.
+fn verified_under(
+    state: &RemoteServeState,
+    presence: &stellar_agent_core::approval::VerifiedMainnetPresence,
+    admission: Option<&PolicyAdmission>,
+) -> Result<(), stellar_agent_core::WalletError> {
+    use stellar_agent_core::{ApprovalFailure, WalletError};
+    let invalid = || WalletError::Approval(ApprovalFailure::PresenceInvalid);
+    match policy_credential(state, &presence.credential_id_b64url(), admission) {
+        PolicyCredential::Listed(credential) if &credential == presence.credential() => {}
+        PolicyCredential::Busy => {
+            return Err(WalletError::Approval(ApprovalFailure::PresencePolicyBusy));
+        }
+        PolicyCredential::Listed(_) | PolicyCredential::Unlisted => return Err(invalid()),
+    }
+    state
+        .operator_credentials
+        .check_policy_sign_count(presence.credential(), &state.rp_id, presence.sign_count())
+        .map_err(|error| match error {
+            ApprovalError::SignCounterRegression { .. } => invalid(),
+            _ => WalletError::Approval(ApprovalFailure::PresenceUnavailable),
+        })
+}
+
+/// What the current owner-signed policy says about one credential.
+enum PolicyCredential {
+    /// The policy lists the credential for this listener's origin.
+    Listed(MainnetApprovalCredential),
+    /// The policy does not list it, or cannot be loaded and verified.
+    Unlisted,
+    /// The policy-state lock stays held by a writer through the final retry.
+    Busy,
+}
+
+/// The outcome of a current authorization read.
+enum Authorization {
+    /// The current files admit the credential.
+    Admitted,
+    /// The current files do not admit it, or cannot be read.
+    Refused,
+    /// The policy-state lock stays held by a writer through the final retry.
+    Busy,
+}
+
+/// Whether `error` is a policy-state lock that stayed busy.
+fn is_policy_busy(error: &stellar_agent_core::WalletError) -> bool {
+    matches!(
+        error,
+        stellar_agent_core::WalletError::Approval(
+            stellar_agent_core::ApprovalFailure::PresencePolicyBusy
+        )
+    )
+}
+
+/// Reads the current policy and looks up the credential `id` in it. A busy
+/// policy-state lock is [`PolicyCredential::Busy`], never a missing
+/// credential. A request that holds `admission` reads through its guard and
+/// takes no lock.
+fn policy_credential(
+    state: &RemoteServeState,
+    id: &str,
+    admission: Option<&PolicyAdmission>,
+) -> PolicyCredential {
+    let Some(authority) = state.ctx.mainnet_authority.as_ref() else {
+        return PolicyCredential::Unlisted;
+    };
+    let loaded = match admission {
+        Some(admission) => authority.load_admitted(admission),
+        None => authority.load_current_compare_only(),
+    };
+    match loaded {
+        Ok(current) => listed_credential(state, &current, id)
+            .map_or(PolicyCredential::Unlisted, |listed| {
+                PolicyCredential::Listed(listed)
+            }),
+        Err(error) if is_policy_busy(&error) => PolicyCredential::Busy,
+        Err(_) => PolicyCredential::Unlisted,
+    }
+}
+
+/// The shared policy-state guard of a signed-origin login, taken before the
+/// login consumes its challenge. `None` on testnet, which reads no policy.
+///
+/// The guard covers the policy loads, the counter commit, and the session
+/// publication, so no writer changes the pin between them. Every policy read
+/// of the login goes through it, so the login takes the lock once. A writer
+/// that arrives later waits for the release.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err variant is the ready-to-return Response for the refusal"
+)]
+fn signed_admission(state: &RemoteServeState) -> Result<Option<PolicyAdmission>, Response> {
+    if state.listener_identity.is_none() {
+        return Ok(None);
+    }
+    let Some(authority) = state.ctx.mainnet_authority.as_ref() else {
+        return Err(assertion_invalid());
+    };
+    match authority.admit() {
+        Ok(admission) => Ok(Some(admission)),
+        Err(error) if is_policy_busy(&error) => Err(store_busy()),
+        Err(_) => Err(assertion_invalid()),
+    }
+}
+
+/// The credential `id` of the loaded policy `current`, when the policy serves
+/// this listener's origin and relying party.
+fn listed_credential(
+    state: &RemoteServeState,
+    current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
+    id: &str,
+) -> Option<MainnetApprovalCredential> {
+    crate::enabled_remote_config(current.profile()).ok()?;
+    let body = current.policy().mainnet()?;
+    let origin = body.approval_origin.as_ref()?;
+    if origin.as_str() != state.expected_origin.as_ref() || origin.rp_id() != state.rp_id.as_ref() {
+        return None;
+    }
+    body.approval_credentials
+        .iter()
+        .find(|credential| credential.credential_id_b64url() == id)
+        .cloned()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared response helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Records a verified counter on the blocking pool, preserving busy and internal failure responses.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err variant is the ready-to-return Response for the counter failure"
+)]
+async fn record_counter(
+    state: &RemoteServeState,
+    credential_id: &str,
+    policy_key: Option<MainnetApprovalCredential>,
+    sign_count: u32,
+) -> Result<(), Response> {
+    let store =
+        OperatorApprovalCredentialStore::new(state.operator_credentials.path().to_path_buf())
+            .with_write_lock_timeout(ASSERTION_LOCK_TIMEOUT);
+    let rp_id = state.rp_id.clone();
+    let credential_id = credential_id.to_owned();
+    match tokio::task::spawn_blocking(move || match policy_key {
+        Some(credential) => store.check_policy_sign_count(&credential, &rp_id, sign_count),
+        None => store.update_sign_count(&credential_id, sign_count),
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(ApprovalError::WriterLocked)) => Err(store_busy()),
+        Ok(Err(_)) => Err(assertion_invalid()),
+        Err(_join) => Err(store_unavailable()),
+    }
+}
 
 fn not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()
@@ -133,6 +408,11 @@ fn store_unavailable() -> Response {
 /// like no session at all: the same `404` response, and the stale session is
 /// dropped from `state.session` so the next login starts clean rather than
 /// leaving a dead entry around indefinitely.
+///
+/// The session's credential must also pass current authorization through [`authorize`].
+/// Signed-origin sessions require a current policy credential; testnet sessions require allowlisting and enrollment.
+/// A failed authorization drops the session and returns the same `404`.
+/// A busy policy-state lock keeps the session and returns `503` `store_busy`.
 #[allow(
     clippy::result_large_err,
     reason = "the Err variant is the ready-to-return Response for the auth-boundary rejection"
@@ -141,6 +421,24 @@ fn require_session(
     state: &RemoteServeState,
     headers: &HeaderMap,
 ) -> Result<SessionState, Response> {
+    let session = live_session(state, headers)?;
+    match authorize(state, &session.credential_id_b64url, None) {
+        Authorization::Admitted => Ok(session),
+        Authorization::Busy => Err(store_busy()),
+        Authorization::Refused => {
+            drop_session(state, &session);
+            Err(not_found())
+        }
+    }
+}
+
+/// The live, unexpired session the request's cookie names, read under the
+/// session mutex alone, before any policy read.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err variant is the ready-to-return Response for the auth-boundary rejection"
+)]
+fn live_session(state: &RemoteServeState, headers: &HeaderMap) -> Result<SessionState, Response> {
     let mut guard = match state.session.lock() {
         Ok(g) => g,
         Err(poison) => poison.into_inner(),
@@ -155,10 +453,52 @@ fn require_session(
 
     let cookie = session_cookie_value(headers).ok_or_else(not_found)?;
     let submitted = crate::session::OpaqueToken::from_hex(&cookie).ok_or_else(not_found)?;
-    if session.session_id.ct_eq(&submitted) {
-        Ok(session.clone())
-    } else {
-        Err(not_found())
+    if !session.session_id.ct_eq(&submitted) {
+        return Err(not_found());
+    }
+    Ok(session.clone())
+}
+
+/// Drops `session` when it is still the live one.
+fn drop_session(state: &RemoteServeState, session: &SessionState) {
+    let mut guard = match state.session.lock() {
+        Ok(g) => g,
+        Err(poison) => poison.into_inner(),
+    };
+    if guard
+        .as_ref()
+        .is_some_and(|live| live.session_id.ct_eq(&session.session_id))
+    {
+        *guard = None;
+    }
+}
+
+/// Checks current policy credentials for signed-origin consent.
+/// Testnet requires a current allowlist entry and enrollment with matching chain and RP.
+/// A read failure refuses either mode. A busy policy-state lock is
+/// [`Authorization::Busy`]; testnet reads no policy and never answers it.
+/// A request that holds `admission` reads the policy through its guard.
+fn authorize(
+    state: &RemoteServeState,
+    credential_id_b64url: &str,
+    admission: Option<&PolicyAdmission>,
+) -> Authorization {
+    if state.listener_identity.is_some() {
+        return match policy_credential(state, credential_id_b64url, admission) {
+            PolicyCredential::Listed(_) => Authorization::Admitted,
+            PolicyCredential::Unlisted => Authorization::Refused,
+            PolicyCredential::Busy => Authorization::Busy,
+        };
+    }
+    match state
+        .authority
+        .require_credential(credential_id_b64url, state.chain, Some(&state.rp_id))
+    {
+        Ok(_) => Authorization::Admitted,
+        Err(error) => {
+            tracing::warn!(code = %error.code(), "remote approval: credential not authorized");
+            Authorization::Refused
+        }
     }
 }
 
@@ -178,56 +518,88 @@ fn require_csrf(session: &SessionState, headers: &HeaderMap, nonce: &str) -> Res
     }
 }
 
-/// Derives the server-side envelope-hash input to the per-action challenge
-/// for `entry`, per [`ApprovalKind`].
-///
-/// `PaymentSimulated`, `ClaimSimulated`, and `TrustlineSimulated` entries carry
-/// a real envelope SHA-256. MPP and rule-proposal entries carry their own content digests.
-/// `RuleProposalSimulated` has no envelope but carries its own
-/// domain-separated `proposal_sha256` digest over the resolved rule
-/// definition — using it here (rather than falling back to the zero
-/// placeholder) binds the per-action challenge to the EXACT rule the
-/// operator reviewed, the same strengthening `envelope_sha256_hex` gives
-/// payments, claims, and trustlines. Other attestable kinds
-/// (`ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`) have no such digest,
-/// and use a fixed all-zero 32-byte placeholder — the challenge's binding for
-/// those kinds rests on `approval_nonce` (unique per entry) rather than a
-/// content digest, which is the same binding the HMAC attestation preimage
-/// itself uses for those kinds (`compute_attestation` with a domain-specific
-/// digest, not an envelope hash).
-fn entry_envelope_sha256(entry: &PendingApproval) -> [u8; 32] {
-    match &entry.kind {
-        ApprovalKind::PaymentSimulated {
-            envelope_sha256_hex,
-            ..
-        }
-        | ApprovalKind::TrustlineSimulated {
-            envelope_sha256_hex,
-            ..
-        }
-        | ApprovalKind::ClaimSimulated {
-            envelope_sha256_hex,
-            ..
-        } => decode_sha256_hex(envelope_sha256_hex).unwrap_or([0u8; 32]),
-        ApprovalKind::RuleProposalSimulated {
-            proposal_sha256, ..
-        } => *proposal_sha256,
-        ApprovalKind::MppChargeSimulated {
-            prepared_artifact_hash,
-            ..
-        } => *prepared_artifact_hash,
-        _ => [0u8; 32],
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Handlers — login
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `GET /` — the login page. No session required; this IS the
-/// pre-authentication surface. Loads the ungated `/static/login.js`.
+/// `GET /` serves the public login page with the asset for its listener mode.
 async fn login_page_get(State(state): State<RemoteServeState>) -> Response {
-    Html(render_login_page(&state.rp_id, &state.identity)).into_response()
+    if state.listener_identity.is_some() {
+        let destination = match state.selected_nonce.as_ref() {
+            None => "/inbox".to_owned(),
+            Some(nonce) => match approval_destination(nonce) {
+                Some(destination) => destination,
+                None => return not_found(),
+            },
+        };
+        return Html(render_login_page(
+            &state.rp_id,
+            &state.identity,
+            crate::templates::LoginMode::Signed {
+                destination: &destination,
+            },
+        ))
+        .into_response();
+    }
+    Html(render_login_page(
+        &state.rp_id,
+        &state.identity,
+        crate::templates::LoginMode::Testnet,
+    ))
+    .into_response()
+}
+
+fn approval_destination(nonce: &str) -> Option<String> {
+    if nonce.is_empty()
+        || nonce.len() > 64
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return None;
+    }
+    Some(format!("/approval/{nonce}"))
+}
+
+async fn approval_link_get(
+    State(state): State<RemoteServeState>,
+    headers: HeaderMap,
+    Path(nonce): Path<String>,
+) -> Response {
+    let Some(destination) = approval_destination(&nonce) else {
+        return not_found();
+    };
+    if state
+        .selected_nonce
+        .as_ref()
+        .is_some_and(|selected| selected.as_ref() != nonce)
+    {
+        return not_found();
+    }
+    match require_session(&state, &headers) {
+        Ok(_) => return axum::response::Redirect::temporary(&destination).into_response(),
+        Err(busy) if busy.status() == StatusCode::SERVICE_UNAVAILABLE => return busy,
+        Err(_) => {}
+    }
+    Html(render_login_page(
+        &state.rp_id,
+        &state.identity,
+        crate::templates::LoginMode::Signed {
+            destination: &destination,
+        },
+    ))
+    .into_response()
+}
+
+async fn signed_login_js_get() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        web::SIGNED_LOGIN_JS,
+    )
+        .into_response()
 }
 
 /// `GET /static/login.js` — the pre-authentication login-ceremony browser
@@ -265,6 +637,13 @@ async fn login_challenge_post(State(state): State<RemoteServeState>) -> Response
         );
     }
 
+    if let Some(authority) = &state.ctx.mainnet_authority {
+        match authority.load_current() {
+            Ok(_) => {}
+            Err(error) if is_policy_busy(&error) => return store_busy(),
+            Err(_) => return assertion_invalid(),
+        }
+    }
     let challenge = {
         let mut store = match state.login_challenges.lock() {
             Ok(g) => g,
@@ -291,12 +670,13 @@ async fn login_challenge_post(State(state): State<RemoteServeState>) -> Response
 /// `POST /login/assertion` — verifies a login assertion and establishes a
 /// session.
 ///
-/// Tries the presented credential id against BOTH the profile's
-/// `allowed_credentials` allowlist and the operator-credential store's
-/// enrolled public key; a credential that is enrolled but not allowlisted
-/// (or vice versa) is refused identically to an unknown credential — see
-/// the module-level error-indistinguishability note in
-/// `crate::verify`.
+/// Reads current authorization before verification and before creating the session.
+/// Signed mode verifies with the policy key; testnet requires enrollment and allowlisting.
+/// Unknown and removed credentials receive the same refusal.
+///
+/// Signed mode first takes the policy admission of [`signed_admission`]. It
+/// holds it through the challenge, the counter and the session publication.
+/// A busy lock therefore answers `503` `store_busy` before anything changes.
 async fn login_assertion_post(
     State(state): State<RemoteServeState>,
     body: axum::body::Bytes,
@@ -306,29 +686,45 @@ async fn login_assertion_post(
     };
 
     let credential_id = request.assertion.id.clone();
-    if !state
-        .allowed_credentials
-        .iter()
-        .any(|c| c == &credential_id)
-    {
-        return assertion_invalid();
+    let admission = match signed_admission(&state) {
+        Ok(admission) => admission,
+        Err(response) => return response,
+    };
+    match authorize(&state, &credential_id, admission.as_ref()) {
+        Authorization::Admitted => {}
+        Authorization::Busy => return store_busy(),
+        Authorization::Refused => return assertion_invalid(),
     }
 
-    let Ok(Some(record)) = state
-        .operator_credentials
-        .find_by_credential_id(&credential_id)
-    else {
-        return assertion_invalid();
+    let policy_key = if state.listener_identity.is_some() {
+        match policy_credential(&state, &credential_id, admission.as_ref()) {
+            PolicyCredential::Listed(credential) => Some(credential),
+            PolicyCredential::Busy => return store_busy(),
+            PolicyCredential::Unlisted => return assertion_invalid(),
+        }
+    } else {
+        None
     };
+    let pubkey = if let Some(credential) = &policy_key {
+        *credential.public_key_sec1()
+    } else {
+        let Ok(Some(record)) = state
+            .operator_credentials
+            .find_by_credential_id(&credential_id)
+        else {
+            return assertion_invalid();
+        };
 
-    let Ok(pubkey_bytes) = base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        &record.public_key_sec1_b64,
-    ) else {
-        return assertion_invalid();
-    };
-    let Ok(pubkey): Result<[u8; 65], _> = pubkey_bytes.try_into() else {
-        return assertion_invalid();
+        let Ok(pubkey_bytes) = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            &record.public_key_sec1_b64,
+        ) else {
+            return assertion_invalid();
+        };
+        let Ok(pubkey): Result<[u8; 65], _> = pubkey_bytes.try_into() else {
+            return assertion_invalid();
+        };
+        pubkey
     };
 
     // The challenge is embedded in clientDataJSON; recover the raw bytes by
@@ -362,16 +758,37 @@ async fn login_assertion_post(
         Err(_) => return assertion_invalid(),
     };
 
+    #[cfg(all(test, feature = "test-helpers"))]
+    login_hook::fire(login_hook::Point::Verified);
     // Sign-counter regression check: a cloned-authenticator signal refuses
     // the login even though the signature itself verified.
-    if state
-        .operator_credentials
-        .update_sign_count(&credential_id, verified.sign_count)
-        .is_err()
+    if let Err(response) = record_counter(
+        &state,
+        &credential_id,
+        policy_key.clone(),
+        verified.sign_count,
+    )
+    .await
     {
-        return assertion_invalid();
+        return response;
     }
 
+    #[cfg(all(test, feature = "test-helpers"))]
+    login_hook::fire(login_hook::Point::Counted);
+    match authorize(&state, &credential_id, admission.as_ref()) {
+        Authorization::Admitted => {}
+        Authorization::Busy => return store_busy(),
+        Authorization::Refused => return assertion_invalid(),
+    }
+    if let Some(credential) = &policy_key {
+        match policy_credential(&state, &credential_id, admission.as_ref()) {
+            PolicyCredential::Listed(current) if current == *credential => {}
+            PolicyCredential::Busy => return store_busy(),
+            PolicyCredential::Listed(_) | PolicyCredential::Unlisted => {
+                return assertion_invalid();
+            }
+        }
+    }
     let session = SessionState::generate(credential_id);
     let cookie_value = session.session_id.to_hex();
     {
@@ -381,12 +798,56 @@ async fn login_assertion_post(
         };
         *guard = Some(session);
     }
+    drop(admission);
 
     let mut resp = json_response(StatusCode::OK, &json!({"status": "logged_in"}));
     if let Ok(hv) = HeaderValue::from_str(&session_set_cookie_header(&cookie_value)) {
         resp.headers_mut().insert(header::SET_COOKIE, hv);
     }
     resp
+}
+
+#[cfg(all(test, feature = "test-helpers"))]
+pub(crate) mod login_hook {
+    //! Runs a test action at two points of a verified login, standing in for
+    //! a writer or an operator that acts during the verification.
+
+    use std::cell::RefCell;
+
+    /// Where the login runs the action.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Point {
+        /// The assertion verified; the counter is not yet recorded.
+        Verified,
+        /// The counter is recorded; the final authorization read follows.
+        Counted,
+    }
+
+    type Action = (Point, Box<dyn FnOnce()>);
+
+    thread_local! {
+        static HOOK: RefCell<Option<Action>> = const { RefCell::new(None) };
+    }
+
+    /// Installs `action` for the next login on this thread that reaches
+    /// `point`.
+    pub(crate) fn install(point: Point, action: impl FnOnce() + 'static) {
+        HOOK.with(|hook| *hook.borrow_mut() = Some((point, Box::new(action))));
+    }
+
+    pub(super) fn fire(point: Point) {
+        let action = HOOK.with(|hook| {
+            let mut slot = hook.borrow_mut();
+            if slot.as_ref().is_some_and(|(at, _)| *at == point) {
+                slot.take().map(|(_, action)| action)
+            } else {
+                None
+            }
+        });
+        if let Some(action) = action {
+            action();
+        }
+    }
 }
 
 /// Extracts the WebAuthn `challenge` field from raw `clientDataJSON` bytes
@@ -410,20 +871,21 @@ fn base64_url(bytes: &[u8]) -> String {
 // Handlers — enrollment helper page
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `GET /enroll` — the passkey-enrollment helper page. No session required:
-/// a WebAuthn credential is bound to its `rp.id` at creation, so enrollment
-/// must run from this origin before any session can exist.
+/// `GET /enroll`: the testnet passkey-enrollment helper page. No session
+/// required: a WebAuthn credential is bound to its `rp.id` at creation, so
+/// enrollment must run from this origin before any session can exist. The
+/// signed router does not mount it.
 ///
 /// Shares the SAME token-bucket rate limiter `/login/challenge` uses — this
 /// is the only other pre-authentication endpoint that does real work before
 /// any WebAuthn assertion is checked.
 ///
-/// Never accepts or persists a credential: the rendered page only runs
-/// `navigator.credentials.create()` client-side (in `/static/enroll.js`) and
-/// displays the resulting credential id and public key for the operator to
-/// copy into the loopback-only `approve operator enroll` CLI command — see
-/// the crate-level "Enrollment stays loopback-only" note. There is no
-/// corresponding write endpoint on this surface.
+/// Never accepts or persists a credential. The rendered page only runs
+/// `navigator.credentials.create()` client-side (in `/static/enroll.js`).
+/// It displays the resulting credential id and public key for the operator to
+/// copy into the loopback-only `approve operator enroll` CLI command, as the
+/// crate documentation states. There is no corresponding write endpoint on
+/// this surface; signed-origin enrollment runs on [`crate::enroll_listener`].
 async fn enroll_page_get(State(state): State<RemoteServeState>) -> Response {
     let allowed = {
         let mut limiter = match state.login_rate_limiter.lock() {
@@ -495,7 +957,8 @@ async fn inbox_get(State(state): State<RemoteServeState>, headers: HeaderMap) ->
         return resp;
     }
     match take_snapshot(&state.ctx.store_path) {
-        SnapshotResult::Ok(pending) => {
+        SnapshotResult::Ok(mut pending) => {
+            scope_snapshot(&state, &mut pending);
             Html(render_inbox_page(&pending, &state.identity)).into_response()
         }
         // The shell still renders on a transient store failure; the
@@ -514,20 +977,31 @@ async fn pending_json(State(state): State<RemoteServeState>, headers: HeaderMap)
         return resp;
     }
     match take_snapshot(&state.ctx.store_path) {
-        SnapshotResult::Ok(pending) => {
-            json_response(StatusCode::OK, &json!({ "pending": pending }))
+        SnapshotResult::Ok(mut pending) => {
+            scope_snapshot(&state, &mut pending);
+            json_response(
+                StatusCode::OK,
+                &json!({ "pending": stellar_agent_approval_ui::pending_json_value(&pending) }),
+            )
         }
         SnapshotResult::Busy => store_busy(),
         SnapshotResult::Unavailable => store_unavailable(),
     }
 }
 
+fn scope_snapshot(state: &RemoteServeState, pending: &mut Vec<PendingApprovalView>) {
+    if let Some(nonce) = &state.selected_nonce {
+        pending.retain(|entry| entry.approval_nonce == nonce.as_ref());
+    }
+}
+
 /// `GET /approval/{nonce}` — the per-approval detail page.
 ///
-/// Renders the same entry fields (`PendingApprovalView`) that
-/// `entry_envelope_sha256` reads to derive the per-action challenge's
-/// envelope hash, so what the operator reads here is what the challenge
-/// minted by [`action_challenge_post`] is over.
+/// The view and the [`approval_view_digest`] the page carries come from one
+/// store handle. An approve sends that digest to [`action_challenge_post`],
+/// which mints a challenge only while it is the digest of the current entry
+/// and binds the challenge to it, so what the operator reads here is what
+/// the passkey assertion and the attestation are over.
 async fn approval_detail_get(
     State(state): State<RemoteServeState>,
     headers: HeaderMap,
@@ -553,7 +1027,7 @@ async fn approval_detail_get(
 
     let Some(view) = view else {
         drop(store);
-        return Html(render_not_found_page(&nonce, &state.identity)).into_response();
+        return Html(render_not_found_page(&state.identity)).into_response();
     };
 
     // For an already-attested payment-style entry, surface the stored blob
@@ -565,6 +1039,10 @@ async fn approval_detail_get(
     } else {
         None
     };
+    let view_digest = store
+        .get(&nonce)
+        .and_then(|entry| approval_view_digest(entry, &state.ctx.context.binding()).ok())
+        .map(|digest| stellar_agent_core::hex::encode(&digest));
     drop(store);
 
     let csrf = compute_csrf(&session.csrf_key, &nonce);
@@ -573,6 +1051,7 @@ async fn approval_detail_get(
         &state.ctx.context,
         &csrf,
         attestation_blob.as_deref(),
+        view_digest.as_deref(),
         &state.identity,
     ))
     .into_response()
@@ -619,12 +1098,20 @@ async fn app_js_get(State(state): State<RemoteServeState>, headers: HeaderMap) -
 // Handlers — per-action ceremony
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `POST /approval/{nonce}/challenge` — mints the per-action challenge,
-/// server-deriving the envelope hash from the parked entry.
+/// `POST /approval/{nonce}/challenge`: mints the per-action challenge.
+///
+/// An approve posts `{"view_digest":"<hex>"}`, the digest its page rendered.
+/// The mint refuses with `409` `approval.presence_changed` unless that is
+/// the digest of the current entry, so a stale page never reaches a passkey
+/// prompt; otherwise the challenge is derived over the digest and stores
+/// it. A request without a well-formed digest, as a reject sends, mints a
+/// challenge over 32 zero bytes that stores none: it can reject, and an
+/// approve over it refuses.
 async fn action_challenge_post(
     State(state): State<RemoteServeState>,
     headers: HeaderMap,
     Path(nonce): Path<String>,
+    body: axum::body::Bytes,
 ) -> Response {
     let session = match require_session(&state, &headers) {
         Ok(s) => s,
@@ -644,16 +1131,26 @@ async fn action_challenge_post(
     };
     drop(store);
 
-    let envelope_sha256 = entry_envelope_sha256(&entry);
+    if matches!(entry.kind, ApprovalKind::X402Payment { .. }) {
+        return json_response(StatusCode::BAD_REQUEST, &json!({"error": "wrong_kind"}));
+    }
+
+    let shown = shown_view_digest(&body);
+    if let Some(shown) = shown
+        && approval_view_digest(&entry, &state.ctx.context.binding()).ok() != Some(shown)
+    {
+        return outcome_to_response(consent_changed());
+    }
     let rand32 = crate::challenge_store::random_32();
-    let challenge = derive_action_challenge(&rand32, &envelope_sha256, &entry.approval_nonce);
+    let challenge =
+        derive_action_challenge(&rand32, &shown.unwrap_or([0u8; 32]), &entry.approval_nonce);
 
     {
         let mut store = match state.action_challenges.lock() {
             Ok(g) => g,
             Err(poison) => poison.into_inner(),
         };
-        store.mint(challenge, entry.approval_nonce.clone());
+        store.mint(challenge, entry.approval_nonce.clone(), shown);
     }
 
     json_response(
@@ -666,6 +1163,9 @@ async fn action_challenge_post(
 /// applies the decision.
 async fn action_decision_post(
     State(state): State<RemoteServeState>,
+    axum::Extension(context): axum::Extension<
+        std::sync::Arc<stellar_agent_approval_ui::DecisionContext>,
+    >,
     headers: HeaderMap,
     Path(nonce): Path<String>,
     body: axum::body::Bytes,
@@ -728,9 +1228,9 @@ async fn action_decision_post(
         };
         store.consume(&challenge, &nonce)
     };
-    if !consumed {
+    let Some(consumed) = consumed else {
         return assertion_invalid();
-    }
+    };
 
     let verify_result = verify_wire_assertion(
         &request.assertion,
@@ -743,12 +1243,10 @@ async fn action_decision_post(
         return assertion_invalid();
     };
 
-    if state
-        .operator_credentials
-        .update_sign_count(&request.assertion.id, verified.sign_count)
-        .is_err()
+    if let Err(response) =
+        record_counter(&state, &request.assertion.id, None, verified.sign_count).await
     {
-        return assertion_invalid();
+        return response;
     }
 
     // The witness is bound to `nonce` — the entry actually being decided —
@@ -767,18 +1265,25 @@ async fn action_decision_post(
 
     let requester = RequestIdentity::Remote {
         identity,
-        allowed_credentials: state.allowed_credentials.as_ref().clone(),
+        authority: std::sync::Arc::clone(&state.authority),
+        chain: state.chain,
+        rp_id: state.rp_id.to_string(),
     };
 
     // `request.decision` was already validated to be exactly "approve" or
-    // "reject" immediately after body parsing, above.
+    // "reject" immediately after body parsing, above. An approve compares the
+    // view digest the signed challenge was minted over, never one from this
+    // body, so the assertion fixes the terms the decision attests.
     let decision = if request.decision == "approve" {
-        Decision::Approve { nonce }
+        Decision::Approve {
+            nonce,
+            shown_view_digest: consumed.shown_view_digest,
+        }
     } else {
         Decision::Reject { nonce }
     };
 
-    let outcome = apply_decision(&state.ctx, decision, &requester);
+    let outcome = apply_decision(&context, decision, requester);
     outcome_to_response(outcome)
 }
 
@@ -807,7 +1312,18 @@ fn outcome_to_response(outcome: stellar_agent_approval_ui::Outcome) -> Response 
         ),
         Outcome::UserMismatch => (StatusCode::OK, json!({"status": "user_mismatch"})),
         Outcome::NotFound => (StatusCode::OK, json!({"status": "not_found"})),
-        Outcome::WrongKind => (StatusCode::OK, json!({"status": "wrong_kind"})),
+        Outcome::WrongKind => (
+            StatusCode::CONFLICT,
+            json!({"status": "wrong_kind", "error": "approval.wrong_kind"}),
+        ),
+        Outcome::Inconsistent => (
+            StatusCode::CONFLICT,
+            json!({
+                "status": "inconsistent",
+                "error": "approval.entry_inconsistent",
+                "message": stellar_agent_approval_ui::INCONSISTENT_MESSAGE,
+            }),
+        ),
         Outcome::Busy => (
             StatusCode::SERVICE_UNAVAILABLE,
             json!({"status": "busy", "retriable": true}),
@@ -815,6 +1331,19 @@ fn outcome_to_response(outcome: stellar_agent_approval_ui::Outcome) -> Response 
         Outcome::Unavailable => (
             StatusCode::SERVICE_UNAVAILABLE,
             json!({"status": "unavailable", "retriable": false}),
+        ),
+        // A credential the current authorization does not admit answers
+        // like an invalid assertion, so the response does not tell a
+        // removed credential from a bad signature.
+        Outcome::Unauthorized => return assertion_invalid(),
+        Outcome::PresenceRefused { code, .. }
+            if code == stellar_agent_core::ApprovalFailure::PresencePolicyBusy.code() =>
+        {
+            return store_busy();
+        }
+        Outcome::PresenceRefused { code, message } => (
+            stellar_agent_approval_ui::presence::refusal_status_of_code(code),
+            json!({"error": code, "message": message}),
         ),
         _ => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -829,6 +1358,10 @@ fn outcome_to_response(outcome: stellar_agent_approval_ui::Outcome) -> Response 
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "test-helpers"))]
+#[path = "counter_tests.rs"]
+mod counter_tests;
+
+#[cfg(all(test, feature = "test-helpers"))]
 mod tests {
     #![allow(
         clippy::unwrap_used,
@@ -836,16 +1369,35 @@ mod tests {
         clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
-
-    // ChangeTrust with transaction source [1; 32] and operation source [2; 32].
-    const CHANGE_TRUST_ENVELOPE: &str = concat!(
-        "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
-        "AAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAGAAAAAVVT",
-        "REMAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAR//////////wAAAAAAAAAA",
-    );
+    #[tokio::test]
+    async fn remote_wrong_kind_and_inconsistent_answer_conflict() {
+        use stellar_agent_approval_ui::Outcome;
+        for (outcome, status, code) in [
+            (Outcome::WrongKind, "wrong_kind", "approval.wrong_kind"),
+            (
+                Outcome::Inconsistent,
+                "inconsistent",
+                "approval.entry_inconsistent",
+            ),
+        ] {
+            let response = super::outcome_to_response(outcome);
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["status"], status);
+            assert_eq!(value["error"], code);
+        }
+        assert_eq!(
+            super::outcome_to_response(Outcome::NotFound).status(),
+            axum::http::StatusCode::OK
+        );
+    }
 
     use std::sync::{Arc, Mutex as StdMutex};
 
+    use super::counter_tests::{Holder, assert_counter, counter_bytes};
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
@@ -860,7 +1412,7 @@ mod tests {
     use stellar_agent_core::approval::operator_credentials::{
         OperatorApprovalCredential, OperatorApprovalCredentialStore,
     };
-    use stellar_agent_core::approval::{DEFAULT_TTL_MS, PendingApprovalStore};
+    use stellar_agent_core::approval::{DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore};
     use stellar_agent_core::audit_log::writer::AuditWriter;
     use stellar_agent_core::profile::schema::KeyringEntryRef;
 
@@ -873,9 +1425,77 @@ mod tests {
     const ORIGIN: &str = "https://wallet.test.internal:8443";
 
     struct Fixture {
-        _dir: TempDir,
+        dir: TempDir,
         state: RemoteServeState,
         authenticator: SoftwareAuthenticator,
+    }
+
+    impl Fixture {
+        fn profile_dir(&self) -> std::path::PathBuf {
+            self.dir.path().join("profiles")
+        }
+
+        /// Rewrites the served profile with remote approval enabled for
+        /// exactly `ids`, the way an operator edits `allowed_credentials`
+        /// while the listener runs.
+        fn allow(&self, ids: &[String]) {
+            write_profile(&self.profile_dir(), ids);
+        }
+
+        fn audit_rows(&self, kind: &str) -> usize {
+            std::fs::read_to_string(self.dir.path().join("audit.log"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.contains(&format!(r#""kind":"{kind}""#)))
+                .count()
+        }
+
+        /// Enrolls a second operator credential and returns its
+        /// authenticator.
+        fn enroll_second(&self) -> SoftwareAuthenticator {
+            let second =
+                SoftwareAuthenticator::new([0x12u8; 32], URL_SAFE_NO_PAD.encode([0x43u8; 16]));
+            OperatorApprovalCredentialStore::new(
+                self.state.authority.credentials_path().to_path_buf(),
+            )
+            .enroll(OperatorApprovalCredential {
+                credential_id_b64url: second.credential_id_b64url().to_owned(),
+                public_key_sec1_b64: second.pubkey_uncompressed_b64(),
+                rp_id: RP_ID.to_owned(),
+                label: "second-device".to_owned(),
+                registered_at_unix_ms: 1_750_000_000_000,
+                sign_count: None,
+                source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
+            })
+            .unwrap();
+            second
+        }
+    }
+
+    /// The served profile's name.
+    const PROFILE: &str = "remote-test";
+
+    fn served_profile() -> stellar_agent_core::profile::schema::Profile {
+        stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "default", "nonce", "default",
+        )
+        .build()
+    }
+
+    /// Writes the served profile to `profile_dir` with remote approval
+    /// enabled for exactly `ids`.
+    fn write_profile(profile_dir: &std::path::Path, ids: &[String]) {
+        let mut profile = served_profile();
+        profile.remote_approval = Some(
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "bind": "127.0.0.1:8443",
+                "rp_id": RP_ID,
+                "allowed_credentials": ids,
+            }))
+            .unwrap(),
+        );
+        stellar_agent_core::profile::loader::save_to_dir(PROFILE, &profile, profile_dir).unwrap();
     }
 
     fn seed_attestation_key(service: &str) -> [u8; 32] {
@@ -908,20 +1528,17 @@ mod tests {
                 label: "test-device".to_owned(),
                 registered_at_unix_ms: 1_750_000_000_000,
                 sign_count: None,
+                source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
             })
             .unwrap();
 
         let audit_writer = Arc::new(std::sync::Mutex::new(
             AuditWriter::open(audit_path, None).expect("open audit writer"),
         ));
+        let profile_dir = dir.path().join("profiles");
+        write_profile(&profile_dir, std::slice::from_ref(&credential_id));
         let ctx = DecisionContext::new(
-            stellar_agent_core::approval::ApprovalContext::from_profile(
-                "remote-test",
-                &stellar_agent_core::profile::schema::Profile::builder_testnet(
-                    "svc", "default", "nonce", "default",
-                )
-                .build(),
-            ),
+            stellar_agent_core::approval::ApprovalContext::from_profile(PROFILE, &served_profile()),
             store_path,
             KeyringEntryRef::new(svc, "default"),
             stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile_name("ui-test"),
@@ -930,10 +1547,20 @@ mod tests {
         );
 
         let state = RemoteServeState {
+            listener_identity: None,
+            selected_nonce: None,
             rp_id: RP_ID.into(),
             expected_origin: ORIGIN.into(),
-            allowed_credentials: Arc::new(vec![credential_id.clone()]),
-            ctx: Arc::new(ctx),
+            authority: Arc::new(
+                stellar_agent_core::approval::RemoteApprovalAuthority::from_paths(
+                    PROFILE.to_owned(),
+                    profile_dir,
+                    operator_credentials_path.clone(),
+                )
+                .unwrap(),
+            ),
+            chain: stellar_agent_core::profile::caip2::Caip2::Testnet,
+            ctx: Arc::new(ctx.into()),
             operator_credentials: Arc::new(OperatorApprovalCredentialStore::new(
                 operator_credentials_path,
             )),
@@ -945,7 +1572,7 @@ mod tests {
         };
 
         Fixture {
-            _dir: dir,
+            dir,
             state,
             authenticator,
         }
@@ -953,12 +1580,11 @@ mod tests {
 
     fn insert_payment_entry(store_path: &std::path::Path) -> String {
         let mut store = PendingApprovalStore::open(store_path.to_path_buf()).unwrap();
-        let entry = stellar_agent_core::approval::PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = stellar_agent_core::approval::fixtures::payment_pending(
+            "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+            "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+            "XLM",
             2_500_000,
-            "XLM".to_owned(),
             None,
             100,
             1_234_567,
@@ -969,13 +1595,87 @@ mod tests {
             // for that variant.
             "424242".to_owned(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         let nonce = entry.approval_nonce.clone();
         store
             .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
             .unwrap();
         nonce
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn testnet_remote_transcript_keeps_base_bytes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let fixture = fixture("transcript");
+        let router = crate::build_router(
+            fixture.state.clone(),
+            fixture.state.ctx.decision.clone().unwrap(),
+            RP_ID,
+            8443,
+        );
+        let mut transcript = Vec::new();
+        for (method, path, origin) in [
+            ("GET", "/", None),
+            ("GET", "/static/login.js", None),
+            ("GET", "/static/enroll.js", None),
+            ("GET", "/inbox", None),
+            ("GET", "/pending.json", None),
+            ("GET", "/static/app.js", None),
+            ("POST", "/login/assertion", None),
+            ("POST", "/login/challenge", Some("https://foreign.example")),
+        ] {
+            let mut request = Request::builder().method(method).uri(path);
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            transcript.extend_from_slice(response.status().as_str().as_bytes());
+            for name in [header::CONTENT_TYPE, header::CONTENT_SECURITY_POLICY] {
+                if let Some(value) = response.headers().get(name) {
+                    transcript.extend_from_slice(value.as_bytes());
+                }
+            }
+            transcript
+                .extend_from_slice(&to_bytes(response.into_body(), 128 * 1024).await.unwrap());
+        }
+        assert_transcript_fixture("testnet-transcript.txt", &transcript);
+    }
+
+    fn assert_transcript_fixture(name: &str, actual: &[u8]) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        // A final framing newline keeps the captured bytes in a text fixture.
+        let actual = format!("{}\n", String::from_utf8(actual.to_vec()).unwrap());
+        if std::env::var("UPDATE_FIXTURES").as_deref() == Ok("1") {
+            std::fs::write(&path, &actual).unwrap();
+        }
+        assert_eq!(
+            actual,
+            std::fs::read_to_string(path).unwrap(),
+            "captured response bytes"
+        );
+    }
+
+    #[test]
+    fn signed_login_template_keeps_fixture_bytes() {
+        let page = render_login_page(
+            "wallet.internal",
+            &PageIdentity::neutral(),
+            crate::templates::LoginMode::Signed {
+                destination: "/approval/selected",
+            },
+        );
+        assert!(page.contains("/static/signed-login.js"));
+        assert!(!page.contains("/static/login.js"));
+        assert_transcript_fixture("signed-login.html", page.as_bytes());
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -1052,8 +1752,11 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn served_shared_app_js_is_the_approval_ui_bytes_verbatim() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = fixture("shared-js");
-        let router = build_router();
+        let router = build_router(f.state.ctx.decision.clone().unwrap());
         let cookie = login(&router, &f.state, &f.authenticator).await;
 
         let resp = router
@@ -1083,8 +1786,11 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn shared_app_js_without_cookie_is_not_found() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let f = fixture("shared-js-nocookie");
-        let resp = build_router()
+        let resp = build_router(f.state.ctx.decision.clone().unwrap())
             .with_state(f.state.clone())
             .oneshot(
                 Request::builder()
@@ -1097,18 +1803,58 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// An unknown approval nonce renders the fixed page with the inbox link
+    /// and without the requested value.
+    #[tokio::test]
+    #[serial]
+    async fn unknown_approval_page_holds_no_nonce() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let f = fixture("unknown-nonce");
+        let router = build_router(f.state.ctx.decision.clone().unwrap());
+        let cookie = login(&router, &f.state, &f.authenticator).await;
+        let resp = router
+            .clone()
+            .with_state(f.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/approval/credmarker7AAAAAAAAAAA")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("Approval nonce must identify a pending approval"),
+            "{body}"
+        );
+        assert!(body.contains(r#"href="/inbox""#), "{body}");
+        assert!(!body.contains("credmarker7"), "{body}");
+    }
+
     /// Extracts a named string field out of a `<script type="application/json"
     /// id="{island_id}">…</script>` data island embedded in rendered page
     /// HTML — the same island `/static/app.js` reads via `readIsland` in a
     /// real browser.
     fn extract_data_island_field(html: &str, island_id: &str, field: &str) -> String {
+        data_island(html, island_id)[field]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// The JSON value of the data island `island_id` in rendered page HTML.
+    fn data_island(html: &str, island_id: &str) -> serde_json::Value {
         let marker = format!(r#"id="{island_id}""#);
         let tag_start = html.find(&marker).expect("data island tag present");
         let content_start = html[tag_start..].find('>').unwrap() + tag_start + 1;
         let content_end = html[content_start..].find("</script>").unwrap() + content_start;
-        let json_text = &html[content_start..content_end];
-        let value: serde_json::Value = serde_json::from_str(json_text).unwrap();
-        value[field].as_str().unwrap().to_owned()
+        serde_json::from_str(&html[content_start..content_end]).unwrap()
     }
 
     async fn html_body(resp: axum::response::Response) -> String {
@@ -1161,14 +1907,49 @@ mod tests {
         );
     }
 
-    async fn mint_action_challenge(
+    /// Fetches the detail page and extracts the view digest its
+    /// `#approval-data` island carries, the value `/static/app.js` posts with
+    /// an approve; `None` when the page offers no approve.
+    async fn get_view_digest(
+        router: &Router<RemoteServeState>,
+        state: &RemoteServeState,
+        cookie: &str,
+        nonce: &str,
+    ) -> Option<String> {
+        let resp = router
+            .clone()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/approval/{nonce}"))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = html_body(resp).await;
+        data_island(&html, "approval-data")["view_digest"]
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    /// Posts a challenge request with `view_digest` as its body, as an
+    /// approve sends it, or with no body, as a reject sends it.
+    async fn post_challenge(
         router: &Router<RemoteServeState>,
         state: &RemoteServeState,
         cookie: &str,
         csrf: &str,
         nonce: &str,
-    ) -> [u8; 32] {
-        let resp = router
+        view_digest: Option<&str>,
+    ) -> Response {
+        let body = view_digest.map_or_else(Body::empty, |digest| {
+            Body::from(serde_json::json!({ "view_digest": digest }).to_string())
+        });
+        router
             .clone()
             .with_state(state.clone())
             .oneshot(
@@ -1177,22 +1958,339 @@ mod tests {
                     .uri(format!("/approval/{nonce}/challenge"))
                     .header(header::COOKIE, cookie)
                     .header(CSRF_HEADER_NAME, csrf)
-                    .body(Body::empty())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body)
                     .unwrap(),
             )
             .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "action challenge mint must succeed"
-        );
-        let body = body_json(resp).await;
+            .unwrap()
+    }
+
+    fn challenge_of(body: &serde_json::Value) -> [u8; 32] {
         URL_SAFE_NO_PAD
             .decode(body["challenge"].as_str().unwrap())
             .unwrap()
             .try_into()
             .unwrap()
+    }
+
+    /// Mints an action challenge the way the detail page does: over the
+    /// view digest its island carries.
+    async fn mint_action_challenge(
+        router: &Router<RemoteServeState>,
+        state: &RemoteServeState,
+        cookie: &str,
+        csrf: &str,
+        nonce: &str,
+    ) -> [u8; 32] {
+        let view_digest = get_view_digest(router, state, cookie, nonce).await;
+        let resp = post_challenge(router, state, cookie, csrf, nonce, view_digest.as_deref()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "action challenge mint must succeed"
+        );
+        challenge_of(&body_json(resp).await)
+    }
+
+    /// Replaces the entry under `nonce` with `entry`, which takes the same
+    /// nonce, the way a same-user writer of the pending store swaps it.
+    fn swap_entry(store_path: &std::path::Path, nonce: &str, mut entry: PendingApproval) {
+        entry.approval_nonce = nonce.to_owned();
+        let mut store = PendingApprovalStore::open(store_path.to_path_buf()).unwrap();
+        assert!(store.remove(nonce).unwrap());
+        store
+            .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
+            .unwrap();
+    }
+
+    /// A payment of `amount_stroops` with its own valid digest.
+    fn payment_entry(amount_stroops: i64) -> PendingApproval {
+        stellar_agent_core::approval::fixtures::payment_pending(
+            "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+            "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+            "XLM",
+            amount_stroops,
+            None,
+            100,
+            1_234_567,
+            "424242".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+    }
+
+    /// Asserts the refusal body of a page whose request changed.
+    async fn assert_presence_changed(resp: Response) {
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "approval.presence_changed");
+        assert_eq!(
+            body["message"],
+            "The consent details have changed; reload the approval page and review them again."
+        );
+    }
+
+    async fn post_decision(
+        router: &Router<RemoteServeState>,
+        state: &RemoteServeState,
+        cookie: &str,
+        csrf: &str,
+        nonce: &str,
+        body: Vec<u8>,
+    ) -> Response {
+        router
+            .clone()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/approval/{nonce}/decision"))
+                    .header(header::COOKIE, cookie)
+                    .header(CSRF_HEADER_NAME, csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A page rendered for one request, whose entry is replaced before the
+    /// approve asks for a challenge, gets no challenge and so no passkey
+    /// prompt; nothing is attested.
+    #[test]
+    #[serial]
+    fn an_entry_swapped_before_the_challenge_mints_no_challenge() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("swap-before-challenge");
+            let store_path = fx.state.ctx.store_path.clone();
+            let nonce = insert_payment_entry(&store_path);
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
+            let cookie = login(&router, &fx.state, &fx.authenticator).await;
+            let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+            let shown = get_view_digest(&router, &fx.state, &cookie, &nonce)
+                .await
+                .expect("an approvable page carries its digest");
+
+            let swapped = stellar_agent_core::approval::fixtures::trustline_pending(
+                "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+                "USDC",
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                None,
+                100,
+                42,
+                "424242".to_owned(),
+                DEFAULT_TTL_MS,
+            );
+            swap_entry(&store_path, &nonce, swapped);
+            let current = get_view_digest(&router, &fx.state, &cookie, &nonce)
+                .await
+                .expect("the swapped-in entry holds a valid digest of its own");
+            assert_ne!(current, shown);
+
+            let resp =
+                post_challenge(&router, &fx.state, &cookie, &csrf, &nonce, Some(&shown)).await;
+            assert_presence_changed(resp).await;
+            assert!(fx.state.action_challenges.lock().unwrap().is_empty());
+            assert_entry_untouched(&store_path, &nonce);
+            assert_eq!(fx.audit_rows("approval_attested_remote"), 0);
+        });
+    }
+
+    /// A challenge minted over the page's digest, whose entry is replaced
+    /// before the signed decision arrives, approves nothing: the decision
+    /// compares the digest the signed challenge fixed with the entry it
+    /// would attest. A reload shows the current entry, and its approve
+    /// attests that entry.
+    #[test]
+    #[serial]
+    fn an_entry_swapped_after_the_challenge_is_not_attested() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("swap-after-challenge");
+            let store_path = fx.state.ctx.store_path.clone();
+            let nonce = insert_payment_entry(&store_path);
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
+            let cookie = login(&router, &fx.state, &fx.authenticator).await;
+            let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+            let challenge = mint_action_challenge(&router, &fx.state, &cookie, &csrf, &nonce).await;
+
+            let swapped = payment_entry(90_000_000);
+            swap_entry(&store_path, &nonce, swapped.clone());
+            let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 2);
+            let resp = post_decision(
+                &router,
+                &fx.state,
+                &cookie,
+                &csrf,
+                &nonce,
+                decision_body("approve", &assertion),
+            )
+            .await;
+            assert_presence_changed(resp).await;
+            assert_entry_untouched(&store_path, &nonce);
+            assert_eq!(fx.audit_rows("approval_attested_remote"), 0);
+
+            let challenge = mint_action_challenge(&router, &fx.state, &cookie, &csrf, &nonce).await;
+            let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 3);
+            let resp = post_decision(
+                &router,
+                &fx.state,
+                &cookie,
+                &csrf,
+                &nonce,
+                decision_body("approve", &assertion),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_json(resp).await["status"], "attested");
+            let store = PendingApprovalStore::open(store_path.clone()).unwrap();
+            let entry = store.get(&nonce).unwrap();
+            assert_eq!(
+                entry.kind, swapped.kind,
+                "the reloaded page's entry is attested"
+            );
+            assert!(entry.attestation_blob_b64.is_some());
+            drop(store);
+            assert_eq!(fx.audit_rows("approval_attested_remote"), 1);
+        });
+    }
+
+    /// A challenge minted without a view digest, as a reject asks for one,
+    /// signs a reject but not an approve.
+    #[test]
+    #[serial]
+    fn a_challenge_without_a_digest_rejects_but_cannot_approve() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("digest-less-challenge");
+            let store_path = fx.state.ctx.store_path.clone();
+            let nonce = insert_payment_entry(&store_path);
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
+            let cookie = login(&router, &fx.state, &fx.authenticator).await;
+            let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+
+            let resp = post_challenge(&router, &fx.state, &cookie, &csrf, &nonce, None).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let challenge = challenge_of(&body_json(resp).await);
+            let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 2);
+            let resp = post_decision(
+                &router,
+                &fx.state,
+                &cookie,
+                &csrf,
+                &nonce,
+                decision_body("approve", &assertion),
+            )
+            .await;
+            assert_presence_changed(resp).await;
+            assert_entry_untouched(&store_path, &nonce);
+            assert_eq!(fx.audit_rows("approval_attested_remote"), 0);
+
+            let resp = post_challenge(&router, &fx.state, &cookie, &csrf, &nonce, None).await;
+            let challenge = challenge_of(&body_json(resp).await);
+            let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 3);
+            let resp = post_decision(
+                &router,
+                &fx.state,
+                &cookie,
+                &csrf,
+                &nonce,
+                decision_body("reject", &assertion),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_json(resp).await["status"], "rejected");
+            assert_eq!(fx.audit_rows("approval_rejected_remote"), 1);
+        });
+    }
+
+    /// A stored summary destination that fails its checksum is an ordinary
+    /// entry: the remote reject challenge finds it and the reject writes the
+    /// tombstone. An approve over the shown view answers `inconsistent` from
+    /// the attestation check and changes nothing.
+    #[test]
+    #[serial]
+    fn a_refused_destination_is_rejected_remotely_and_never_approved() {
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("refused-destination");
+            let store_path = fx.state.ctx.store_path.clone();
+            let nonce = insert_payment_entry(&store_path);
+            let good = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+            let line = format!("summary_to = \"{good}\"");
+            let text = std::fs::read_to_string(&store_path).unwrap();
+            assert_eq!(text.matches(&line).count(), 1);
+            let bad = format!("summary_to = \"{}A\"", &good[..55]);
+            std::fs::write(&store_path, text.replace(&line, &bad)).unwrap();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
+            let cookie = login(&router, &fx.state, &fx.authenticator).await;
+            let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+            let shown = get_view_digest(&router, &fx.state, &cookie, &nonce)
+                .await
+                .expect("the page shows the envelope terms");
+
+            let resp =
+                post_challenge(&router, &fx.state, &cookie, &csrf, &nonce, Some(&shown)).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let challenge = challenge_of(&body_json(resp).await);
+            let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 2);
+            let resp = post_decision(
+                &router,
+                &fx.state,
+                &cookie,
+                &csrf,
+                &nonce,
+                decision_body("approve", &assertion),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let value = body_json(resp).await;
+            assert_eq!(value["status"], "inconsistent");
+            assert_eq!(value["error"], "approval.entry_inconsistent");
+            assert_entry_untouched(&store_path, &nonce);
+            assert_eq!(fx.audit_rows("approval_attested_remote"), 0);
+
+            let resp = post_challenge(&router, &fx.state, &cookie, &csrf, &nonce, None).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let challenge = challenge_of(&body_json(resp).await);
+            let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 3);
+            let resp = post_decision(
+                &router,
+                &fx.state,
+                &cookie,
+                &csrf,
+                &nonce,
+                decision_body("reject", &assertion),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_json(resp).await["status"], "rejected");
+            let store = PendingApprovalStore::open(store_path.clone()).unwrap();
+            assert!(matches!(
+                store.get(&nonce).unwrap().kind,
+                ApprovalKind::Rejected { .. }
+            ));
+        });
     }
 
     fn decision_body(decision: &str, assertion: &crate::wire::AssertionWire) -> Vec<u8> {
@@ -1213,6 +2311,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_route_reports_binding_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("binding-mismatch-route");
@@ -1234,7 +2335,6 @@ mod tests {
                 "Public Global Stellar Network ; September 2015".to_owned(),
                 "stellar:mainnet".to_owned(),
                 definition,
-                [1; 32],
                 "rule".to_owned(),
                 stellar_agent_core::approval::process_uid_for_attestation().unwrap(),
                 stellar_agent_core::approval::DEFAULT_TTL_MS,
@@ -1248,7 +2348,7 @@ mod tests {
                     .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
                     .unwrap();
             }
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
             let challenge = mint_action_challenge(&router, &fx.state, &cookie, &csrf, &nonce).await;
@@ -1282,11 +2382,14 @@ mod tests {
     #[test]
     #[serial]
     fn happy_path_approve_mints_attestation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("happy");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
@@ -1313,13 +2416,10 @@ mod tests {
             assert_eq!(body["status"], "attested");
             let attestation_b64 = body["attestation"].as_str().expect("attestation string");
 
-            // Byte-identical-to-loopback check: independently recompute the
-            // HMAC attestation from the entry's own stored fields and the
-            // fixed test attestation key, and assert it matches exactly what
-            // the remote ceremony surfaced. The preimage is unchanged by
-            // remote approval — it binds the nonce, envelope SHA-256, and
-            // the entry's stored `process_uid`, never the operator's
-            // passkey identity.
+            // Independently recompute the version 4 HMAC attestation from
+            // the entry's own stored fields, the fixed test attestation key,
+            // and the credential that logged in, and assert it matches
+            // exactly what the remote ceremony surfaced and recorded.
             let store = PendingApprovalStore::open(fx.state.ctx.store_path.clone()).unwrap();
             let entry = store.get(&nonce).unwrap().clone();
             drop(store);
@@ -1332,12 +2432,19 @@ mod tests {
             };
             let envelope_sha256 =
                 stellar_agent_core::approval::decode_sha256_hex(&envelope_sha256_hex).unwrap();
-            let expected = stellar_agent_core::approval::compute_attestation(
+            let approver = stellar_agent_core::approval::AttestedApprover::Remote {
+                credential_id_b64url: fx.authenticator.credential_id_b64url().to_owned(),
+            };
+            assert!(entry.attested_approver.as_ref() == Some(&approver));
+            assert_eq!(entry.attestation_version, 4);
+            let expected = stellar_agent_core::approval::compute_attestation_v4(
                 &[0xABu8; 32],
                 &fx.state.ctx.context.binding(),
                 &nonce,
                 &envelope_sha256,
                 &entry.process_uid,
+                &entry.attested_lifetime(),
+                &approver,
             );
             let actual: [u8; 32] = URL_SAFE_NO_PAD
                 .decode(attestation_b64)
@@ -1346,20 +2453,24 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 actual, expected,
-                "remote-approval attestation must be byte-identical to the loopback HMAC preimage"
+                "the remote attestation authenticates the approving credential"
             );
+            assert_eq!(fx.audit_rows("approval_attested_remote"), 1);
         });
     }
 
     #[test]
     #[serial]
     fn wysiwys_challenge_for_entry_a_does_not_authorize_entry_b() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("wysiwys");
             let nonce_a = insert_payment_entry(&fx.state.ctx.store_path);
             let nonce_b = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf_a = get_csrf(&router, &fx.state, &cookie, &nonce_a).await;
@@ -1398,11 +2509,14 @@ mod tests {
     #[test]
     #[serial]
     fn unminted_challenge_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("unminted");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
@@ -1436,11 +2550,14 @@ mod tests {
     #[test]
     #[serial]
     fn replayed_challenge_is_refused_second_time() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("replay");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
@@ -1505,11 +2622,14 @@ mod tests {
     #[test]
     #[serial]
     fn wrong_origin_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("wrong-origin");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
@@ -1548,11 +2668,14 @@ mod tests {
     #[test]
     #[serial]
     fn origin_port_mismatch_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("origin-port-mismatch");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
@@ -1592,10 +2715,13 @@ mod tests {
     #[test]
     #[serial]
     fn expired_session_is_refused_like_no_session() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("expired-session");
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
 
@@ -1645,14 +2771,89 @@ mod tests {
         });
     }
 
+    /// Both remote inbox sinks, the `/inbox` data island and the
+    /// `/pending.json` poll, carry a memo's U+202E only as the visible escape.
+    #[test]
+    #[serial]
+    fn inbox_sinks_carry_a_bidi_memo_escaped() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("inbox-bidi");
+            // The envelope carries the memo; the stored summary memo, which
+            // no surface displays, is absent.
+            let envelope = stellar_agent_core::approval::fixtures::payment_envelope(
+                "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+                "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+                "XLM",
+                2_500_000,
+                Some("memo\u{202e}"),
+                100,
+                1_234_567,
+            );
+            let entry = PendingApproval::new_payment_pending(
+                envelope.clone(),
+                envelope.as_bytes(),
+                "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
+                2_500_000,
+                "XLM".to_owned(),
+                None,
+                100,
+                1_234_567,
+                "424242".to_owned(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap();
+            PendingApprovalStore::open(fx.state.ctx.store_path.clone())
+                .unwrap()
+                .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
+                .unwrap();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
+            let cookie = login(&router, &fx.state, &fx.authenticator).await;
+            let get = |uri: &'static str| {
+                router.clone().with_state(fx.state.clone()).oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .header(header::COOKIE, &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+            };
+
+            let resp = get("/inbox").await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+            let html = std::str::from_utf8(&bytes).unwrap();
+            assert!(html.contains(r#""value":"memo\\u{202e}""#), "{html}");
+            assert!(!html.contains('\u{202e}'), "{html}");
+
+            let resp = get("/pending.json").await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            let body = std::str::from_utf8(&bytes).unwrap();
+            assert!(!body.contains('\u{202e}'), "{body}");
+            let json: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(
+                json["pending"][0]["summary"]["memo"]["value"],
+                r"memo\u{202e}"
+            );
+        });
+    }
+
     #[test]
     #[serial]
     fn wrong_rp_id_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("wrong-rp-id");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
@@ -1685,11 +2886,14 @@ mod tests {
     #[test]
     #[serial]
     fn uv_absent_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("uv-absent");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
@@ -1726,10 +2930,13 @@ mod tests {
     #[test]
     #[serial]
     fn credential_not_allowlisted_is_refused_at_login() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("not-allowlisted");
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             // A DIFFERENT authenticator/credential, never allowlisted (and
             // never enrolled).
@@ -1777,6 +2984,503 @@ mod tests {
         });
     }
 
+    /// Attempts a fresh, valid login with `auth` and returns the response.
+    async fn try_login_response(
+        router: &Router<RemoteServeState>,
+        state: &RemoteServeState,
+        auth: &SoftwareAuthenticator,
+        sign_count: u32,
+    ) -> Response {
+        let resp = router
+            .clone()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login/challenge")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        let challenge: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(body["challenge"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let assertion = auth.sign_valid(&challenge, RP_ID, ORIGIN, sign_count);
+        router
+            .clone()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login/assertion")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(decision_body_login(&assertion)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Attempts a fresh login and checks the invalid-assertion body on refusal.
+    async fn try_login(
+        router: &Router<RemoteServeState>,
+        state: &RemoteServeState,
+        auth: &SoftwareAuthenticator,
+        sign_count: u32,
+    ) -> StatusCode {
+        let resp = try_login_response(router, state, auth, sign_count).await;
+        let status = resp.status();
+        if status != StatusCode::OK {
+            assert_eq!(
+                body_json(resp).await,
+                serde_json::json!({"error": "webauthn_assertion_invalid"})
+            );
+        }
+        status
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn testnet_login_lock_timeout_is_busy_and_retryable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let fx = fixture("login-lock-timeout");
+        let router = build_router(fx.state.ctx.decision.clone().unwrap());
+        let cookie = login(&router, &fx.state, &fx.authenticator).await;
+        let before = counter_bytes(&fx.state);
+        let mut holder = Holder::new(&fx.state);
+        let started = std::time::Instant::now();
+        let response = try_login_response(&router, &fx.state, &fx.authenticator, 7).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(
+            body_json(response).await,
+            json!({"error":"store_busy", "retriable":true})
+        );
+        assert_eq!(counter_bytes(&fx.state), before);
+        assert!(
+            cookie.ends_with(
+                &fx.state
+                    .session
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .session_id
+                    .to_hex()
+            )
+        );
+        holder.release();
+        assert_eq!(
+            try_login(&router, &fx.state, &fx.authenticator, 7).await,
+            StatusCode::OK
+        );
+        assert_counter(&fx.state, 7);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn testnet_decision_lock_timeout_is_busy_and_retryable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let fx = fixture("decision-lock-timeout");
+        let nonce = insert_payment_entry(&fx.state.ctx.store_path);
+        let router = build_router(fx.state.ctx.decision.clone().unwrap());
+        let cookie = login(&router, &fx.state, &fx.authenticator).await;
+        let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+        let challenge = mint_action_challenge(&router, &fx.state, &cookie, &csrf, &nonce).await;
+        let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 2);
+        let before = counter_bytes(&fx.state);
+        let entries = std::fs::read(&fx.state.ctx.store_path).unwrap();
+        let audit = std::fs::read(fx.dir.path().join("audit.log")).unwrap();
+        let mut holder = Holder::new(&fx.state);
+        let started = std::time::Instant::now();
+        let response = post_decision(
+            &router,
+            &fx.state,
+            &cookie,
+            &csrf,
+            &nonce,
+            decision_body("approve", &assertion),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert_eq!(
+            body_json(response).await,
+            json!({"error":"store_busy", "retriable":true})
+        );
+        assert_eq!(counter_bytes(&fx.state), before);
+        assert_eq!(std::fs::read(&fx.state.ctx.store_path).unwrap(), entries);
+        assert_eq!(
+            std::fs::read(fx.dir.path().join("audit.log")).unwrap(),
+            audit
+        );
+        assert_entry_untouched(&fx.state.ctx.store_path, &nonce);
+        assert!(
+            cookie.ends_with(
+                &fx.state
+                    .session
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .session_id
+                    .to_hex()
+            )
+        );
+        holder.release();
+        let challenge = mint_action_challenge(&router, &fx.state, &cookie, &csrf, &nonce).await;
+        let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 2);
+        let response = post_decision(
+            &router,
+            &fx.state,
+            &cookie,
+            &csrf,
+            &nonce,
+            decision_body("approve", &assertion),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_counter(&fx.state, 2);
+        let store = PendingApprovalStore::open(fx.state.ctx.store_path.clone()).unwrap();
+        assert!(store.get(&nonce).unwrap().attestation_blob_b64.is_some());
+    }
+
+    /// Editing only the profile's allowlist, with the listener state and the
+    /// enrollment untouched, refuses the next valid login of the removed
+    /// credential; restoring the entry admits it again.
+    #[test]
+    #[serial]
+    fn revoked_credential_cannot_login_without_restart() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("revoked-login");
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
+            let id = fx.authenticator.credential_id_b64url().to_owned();
+            assert_eq!(
+                try_login(&router, &fx.state, &fx.authenticator, 1).await,
+                StatusCode::OK
+            );
+
+            fx.allow(&[]);
+            assert_eq!(
+                try_login(&router, &fx.state, &fx.authenticator, 2).await,
+                StatusCode::BAD_REQUEST
+            );
+            assert!(
+                fx.state
+                    .operator_credentials
+                    .find_by_credential_id(&id)
+                    .unwrap()
+                    .is_some(),
+                "the enrollment is untouched"
+            );
+
+            fx.allow(std::slice::from_ref(&id));
+            assert_eq!(
+                try_login(&router, &fx.state, &fx.authenticator, 3).await,
+                StatusCode::OK
+            );
+
+            assert!(
+                OperatorApprovalCredentialStore::new(
+                    fx.state.authority.credentials_path().to_path_buf()
+                )
+                .remove(&id)
+                .unwrap()
+            );
+            assert_eq!(
+                try_login(&router, &fx.state, &fx.authenticator, 4).await,
+                StatusCode::BAD_REQUEST
+            );
+        });
+    }
+
+    /// Re-enrolls the fixture's credential after a test removed it.
+    fn reenroll(fx: &Fixture) {
+        OperatorApprovalCredentialStore::new(fx.state.authority.credentials_path().to_path_buf())
+            .enroll(OperatorApprovalCredential {
+                credential_id_b64url: fx.authenticator.credential_id_b64url().to_owned(),
+                public_key_sec1_b64: fx.authenticator.pubkey_uncompressed_b64(),
+                rp_id: RP_ID.to_owned(),
+                label: "test-device".to_owned(),
+                registered_at_unix_ms: 1_750_000_000_000,
+                sign_count: None,
+                source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
+            })
+            .unwrap();
+    }
+
+    /// Revokes the fixture's credential the way `revoke` names: by emptying
+    /// the profile's allowlist or by removing its enrollment.
+    fn revoke_fixture_credential(
+        profile_dir: &std::path::Path,
+        credentials_path: &std::path::Path,
+        id: &str,
+        revoke: &str,
+    ) {
+        if revoke == "allowlist" {
+            write_profile(profile_dir, &[]);
+        } else {
+            assert!(
+                OperatorApprovalCredentialStore::new(credentials_path.to_path_buf())
+                    .remove(id)
+                    .unwrap()
+            );
+        }
+    }
+
+    /// The credential is revoked after the login's first authorization read
+    /// and its verification, before the session is created: the verified
+    /// login refuses and no session exists. Once authorization is restored,
+    /// the next login succeeds.
+    #[test]
+    #[serial]
+    fn revocation_during_login_verification_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            for revoke in ["allowlist", "enrollment"] {
+                let fx = fixture(&format!("login-verify-{revoke}"));
+                let router = build_router(fx.state.ctx.decision.clone().unwrap());
+                let id = fx.authenticator.credential_id_b64url().to_owned();
+                let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+                let hook_fired = std::rc::Rc::clone(&fired);
+                let profile_dir = fx.profile_dir();
+                let credentials_path = fx.state.authority.credentials_path().to_path_buf();
+                let revoked_id = id.clone();
+                login_hook::install(login_hook::Point::Counted, move || {
+                    hook_fired.set(true);
+                    revoke_fixture_credential(&profile_dir, &credentials_path, &revoked_id, revoke);
+                });
+                assert_eq!(
+                    try_login(&router, &fx.state, &fx.authenticator, 1).await,
+                    StatusCode::BAD_REQUEST,
+                    "{revoke}"
+                );
+                assert!(fired.get(), "{revoke}");
+                assert!(fx.state.session.lock().unwrap().is_none(), "{revoke}");
+
+                if revoke == "allowlist" {
+                    fx.allow(std::slice::from_ref(&id));
+                } else {
+                    reenroll(&fx);
+                }
+                assert_eq!(
+                    try_login(&router, &fx.state, &fx.authenticator, 2).await,
+                    StatusCode::OK,
+                    "{revoke}"
+                );
+            }
+        });
+    }
+
+    /// The status of a `GET` of `uri` with the session `cookie`.
+    async fn get_status(
+        router: &Router<RemoteServeState>,
+        state: &RemoteServeState,
+        cookie: &str,
+        uri: &str,
+    ) -> StatusCode {
+        router
+            .clone()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A live session whose credential is revoked serves no further GET.
+    /// With no decision in between, each authenticated GET route answers
+    /// `404` on the next request and drops the session.
+    #[test]
+    #[serial]
+    fn revoked_session_serves_no_authenticated_get() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            for revoke in ["allowlist", "enrollment"] {
+                for route in [
+                    "/inbox",
+                    "/pending.json",
+                    "/approval/{nonce}",
+                    "/static/app.js",
+                    "/static/app-shared.js",
+                ] {
+                    let tag = route.replace(['/', '{', '}', '.'], "-");
+                    let fx = fixture(&format!("revoked-get-{revoke}{tag}"));
+                    let nonce = insert_payment_entry(&fx.state.ctx.store_path);
+                    let router = build_router(fx.state.ctx.decision.clone().unwrap());
+                    let cookie = login(&router, &fx.state, &fx.authenticator).await;
+                    let uri = route.replace("{nonce}", &nonce);
+                    assert_eq!(
+                        get_status(&router, &fx.state, &cookie, &uri).await,
+                        StatusCode::OK,
+                        "{revoke} {uri}"
+                    );
+
+                    revoke_fixture_credential(
+                        &fx.profile_dir(),
+                        fx.state.authority.credentials_path(),
+                        fx.authenticator.credential_id_b64url(),
+                        revoke,
+                    );
+                    assert_eq!(
+                        get_status(&router, &fx.state, &cookie, &uri).await,
+                        StatusCode::NOT_FOUND,
+                        "{revoke} {uri}"
+                    );
+                    assert!(fx.state.session.lock().unwrap().is_none(), "{revoke} {uri}");
+                }
+            }
+        });
+    }
+
+    /// Removing one credential from the list leaves a still-listed one
+    /// logging in.
+    #[test]
+    #[serial]
+    fn unaffected_credential_survives_allowlist_edit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("unaffected-login");
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
+            let second = fx.enroll_second();
+            let first_id = fx.authenticator.credential_id_b64url().to_owned();
+            let second_id = second.credential_id_b64url().to_owned();
+            fx.allow(&[first_id, second_id.clone()]);
+            assert_eq!(
+                try_login(&router, &fx.state, &second, 1).await,
+                StatusCode::OK
+            );
+            fx.allow(std::slice::from_ref(&second_id));
+            assert_eq!(
+                try_login(&router, &fx.state, &fx.authenticator, 1).await,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                try_login(&router, &fx.state, &second, 2).await,
+                StatusCode::OK
+            );
+        });
+    }
+
+    /// A logged-in session whose credential is removed from the allowlist
+    /// after it minted the action challenge cannot approve or reject with a
+    /// valid assertion: nothing is attested or rejected, no decision row is
+    /// written, and the session stops being served.
+    #[test]
+    #[serial]
+    fn revoked_session_cannot_approve_or_reject() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            for (decision, revoke) in [
+                ("approve", "allowlist"),
+                ("reject", "allowlist"),
+                ("approve", "enrollment"),
+            ] {
+                let fx = fixture(&format!("revoked-session-{decision}-{revoke}"));
+                let nonce = insert_payment_entry(&fx.state.ctx.store_path);
+                let router = build_router(fx.state.ctx.decision.clone().unwrap());
+                let cookie = login(&router, &fx.state, &fx.authenticator).await;
+                let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+                let challenge =
+                    mint_action_challenge(&router, &fx.state, &cookie, &csrf, &nonce).await;
+                let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 2);
+
+                if revoke == "allowlist" {
+                    fx.allow(&[]);
+                } else {
+                    assert!(
+                        OperatorApprovalCredentialStore::new(
+                            fx.state.authority.credentials_path().to_path_buf()
+                        )
+                        .remove(fx.authenticator.credential_id_b64url())
+                        .unwrap()
+                    );
+                }
+
+                let resp = router
+                    .clone()
+                    .with_state(fx.state.clone())
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(format!("/approval/{nonce}/decision"))
+                            .header(header::COOKIE, &cookie)
+                            .header(CSRF_HEADER_NAME, &csrf)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(decision_body(decision, &assertion)))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{decision} {revoke}");
+                assert_entry_untouched(&fx.state.ctx.store_path, &nonce);
+                assert_eq!(fx.audit_rows("approval_attested_remote"), 0);
+                assert_eq!(fx.audit_rows("approval_rejected_remote"), 0);
+
+                let resp = router
+                    .clone()
+                    .with_state(fx.state.clone())
+                    .oneshot(
+                        Request::builder()
+                            .uri("/pending.json")
+                            .header(header::COOKIE, &cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+                assert!(fx.state.session.lock().unwrap().is_none());
+            }
+        });
+    }
+
+    /// The decision seam's own authorization refusal answers like an invalid
+    /// assertion.
+    #[test]
+    fn unauthorized_outcome_answers_as_an_invalid_assertion() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let resp = outcome_to_response(stellar_agent_approval_ui::Outcome::Unauthorized);
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                body_json(resp).await,
+                serde_json::json!({"error": "webauthn_assertion_invalid"})
+            );
+        });
+    }
+
     fn decision_body_login(assertion: &crate::wire::AssertionWire) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "assertion": {
@@ -1794,11 +3498,14 @@ mod tests {
     #[test]
     #[serial]
     fn sign_counter_regression_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("counter-regression");
             let nonce = insert_payment_entry(&fx.state.ctx.store_path);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             // First login advances the counter to 5.
             let challenge_resp = router
@@ -1880,13 +3587,53 @@ mod tests {
     // Tests — enrollment helper page
     // ─────────────────────────────────────────────────────────────────────
 
+    /// The signed-origin router mounts neither enrollment helper path,
+    /// while the testnet router keeps serving both.
+    #[test]
+    #[serial]
+    fn signed_origin_listener_serves_no_enroll_helper() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("enroll-signed-absent");
+            for (path, testnet_status) in [
+                ("/enroll", StatusCode::OK),
+                ("/static/enroll.js", StatusCode::OK),
+            ] {
+                let request = || {
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap()
+                };
+                let signed = crate::layer_router(signed_router().with_state(fx.state.clone()))
+                    .oneshot(request())
+                    .await
+                    .unwrap();
+                assert_eq!(signed.status(), StatusCode::NOT_FOUND, "{path}");
+                let testnet = build_router(fx.state.ctx.decision.clone().unwrap())
+                    .with_state(fx.state.clone())
+                    .oneshot(request())
+                    .await
+                    .unwrap();
+                assert_eq!(testnet.status(), testnet_status, "{path}");
+            }
+        });
+    }
+
     #[test]
     #[serial]
     fn enroll_page_is_reachable_pre_auth() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("enroll-reachable");
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let resp = router
                 .clone()
@@ -1914,13 +3661,16 @@ mod tests {
     #[test]
     #[serial]
     fn enroll_page_shares_login_rate_limiter_and_refuses_once_exhausted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("enroll-rate-limited");
             const CAPACITY: usize = 3;
             // A non-refilling bucket isolates the routes' shared capacity.
             *fx.state.login_rate_limiter.lock().unwrap() = TokenBucket::new(CAPACITY as f64, 0.0);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             for attempt in 0..=CAPACITY {
                 let resp = router
@@ -1966,10 +3716,13 @@ mod tests {
     #[test]
     #[serial]
     fn enroll_page_interaction_leaves_operator_credential_store_untouched() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("enroll-no-side-effect");
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let before = fx.state.operator_credentials.list().unwrap();
 
@@ -2015,10 +3768,13 @@ mod tests {
     #[test]
     #[serial]
     fn enroll_page_has_no_inline_event_handler_attributes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("enroll-no-inline-handlers");
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
 
             let resp = router
                 .clone()
@@ -2070,6 +3826,9 @@ mod tests {
     #[test]
     #[serial]
     fn csp_contract_holds_across_html_routes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let fx = fixture("csp-contract");
@@ -2079,7 +3838,12 @@ mod tests {
             // module's unlayered `build_router`) is the only one that applies
             // `SecurityHeadersLayer` — the CSP contract only holds through
             // that stack, exactly as a real browser experiences it.
-            let layered_router = crate::build_router(fx.state.clone(), RP_ID, 8443);
+            let layered_router = crate::build_router(
+                fx.state.clone(),
+                fx.state.ctx.decision.clone().unwrap(),
+                RP_ID,
+                8443,
+            );
 
             // Pre-auth: GET / (the login page).
             let resp = layered_router
@@ -2114,7 +3878,7 @@ mod tests {
             // juggling is required here) using the unlayered router the
             // `login` helper expects, then reuse the resulting cookie
             // against the layered router.
-            let unlayered = build_router();
+            let unlayered = build_router(fx.state.ctx.decision.clone().unwrap());
             let cookie = login(&unlayered, &fx.state, &fx.authenticator).await;
 
             let resp = layered_router
@@ -2145,145 +3909,6 @@ mod tests {
                 .unwrap();
             assert_csp_contract(resp).await;
         });
-    }
-
-    // ── entry_envelope_sha256: non-zero binding for every digest-carrying kind ─
-    //
-    // Package D, GH issue #8, Leg 3: `RuleProposalSimulated` must bind the
-    // per-action challenge to its `proposal_sha256`, exactly as
-    // `PaymentSimulated` / `ClaimSimulated` bind to their envelope digest.
-    // Regression guard: if the `RuleProposalSimulated` arm were ever removed
-    // or fell through to the wildcard, this test catches it immediately
-    // (the fallback zero placeholder is the WRONG behaviour for a kind that
-    // has a real content digest to bind to).
-
-    #[test]
-    fn entry_envelope_sha256_is_non_zero_for_every_digest_carrying_kind() {
-        let payment = stellar_agent_core::approval::PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            2_500_000,
-            "XLM".to_owned(),
-            None,
-            100,
-            1_234_567,
-            "424242".to_owned(),
-            DEFAULT_TTL_MS,
-        )
-        .unwrap();
-        assert_ne!(
-            entry_envelope_sha256(&payment),
-            [0u8; 32],
-            "PaymentSimulated"
-        );
-
-        let claim = stellar_agent_core::approval::PendingApproval::new_claim_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "a".repeat(72),
-            "B".to_owned() + &"A".repeat(57),
-            "XLM".to_owned(),
-            500,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            100,
-            1,
-            "424242".to_owned(),
-            DEFAULT_TTL_MS,
-        )
-        .unwrap();
-        assert_ne!(entry_envelope_sha256(&claim), [0u8; 32], "ClaimSimulated");
-
-        let definition = stellar_agent_core::approval::ContextRuleProposalSnapshot::new(
-            stellar_agent_core::approval::RuleProposalContextType::Default,
-            "spend-daily".to_owned(),
-            None,
-            vec![stellar_agent_core::approval::RuleProposalSigner::delegated(
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                true,
-            )],
-            vec![],
-            vec![0],
-            false,
-            false,
-        );
-        let rule_proposal =
-            stellar_agent_core::approval::PendingApproval::new_rule_proposal_pending(
-                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-                "Test SDF Network ; September 2015".to_owned(),
-                "stellar:testnet".to_owned(),
-                definition,
-                [0x11u8; 32],
-                "Default rule \"spend-daily\"".to_owned(),
-                "424242".to_owned(),
-                DEFAULT_TTL_MS,
-            )
-            .unwrap();
-        assert_eq!(
-            entry_envelope_sha256(&rule_proposal),
-            [0x11u8; 32],
-            "RuleProposalSimulated must bind to proposal_sha256, not the zero placeholder"
-        );
-
-        let mpp = stellar_agent_core::approval::PendingApproval::new_mpp_charge_pending(
-            [0x22; 32],
-            [0x33; 32],
-            "default".to_owned(),
-            "stellar:testnet".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            "http".to_owned(),
-            "merchant.example".to_owned(),
-            "/checkout".to_owned(),
-            "1000".to_owned(),
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            u64::MAX / 1_000,
-            1_000,
-            "424242".to_owned(),
-            DEFAULT_TTL_MS,
-        )
-        .unwrap();
-        assert_eq!(
-            entry_envelope_sha256(&mpp),
-            [0x33; 32],
-            "MppChargeSimulated must bind to its prepared artifact"
-        );
-
-        // Kinds with no content digest of their own correctly fall back to
-        // the zero placeholder — binding for these rests on approval_nonce
-        // alone, by design (see the fn's doc comment).
-        let toolset_gate =
-            stellar_agent_core::approval::PendingApproval::new_toolset_first_invoke_gate_pending(
-                "my-toolset".to_owned(),
-                "sign-payment".to_owned(),
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                "XLM".to_owned(),
-                0,
-                1_000_000,
-                "424242".to_owned(),
-                DEFAULT_TTL_MS,
-            )
-            .unwrap();
-        assert_eq!(
-            entry_envelope_sha256(&toolset_gate),
-            [0u8; 32],
-            "ToolsetFirstInvokeGate has no content digest; must use the placeholder"
-        );
-
-        let clawback =
-            stellar_agent_core::approval::PendingApproval::new_trustline_clawback_opt_in_pending(
-                "Test SDF Network ; September 2015".to_owned(),
-                "USDC".to_owned(),
-                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
-                "424242".to_owned(),
-                DEFAULT_TTL_MS,
-            )
-            .unwrap();
-        assert_eq!(
-            entry_envelope_sha256(&clawback),
-            [0u8; 32],
-            "TrustlineClawbackOptIn has no content digest; must use the placeholder"
-        );
     }
 
     /// Asserts `resp` carries the hardened CSP (`script-src 'self'`, no
@@ -2344,6 +3969,9 @@ mod tests {
     #[test]
     #[serial]
     fn authenticated_detail_renders_selected_context_and_envelope_source() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut fx = fixture("context-source");
@@ -2353,13 +3981,13 @@ mod tests {
             context.endpoint_host = "https://remote-rpc.example".to_owned();
             context.signer_account = Some("GREMOTEENROLLED".to_owned());
             let entry = stellar_agent_core::approval::PendingApproval::new_payment_pending(
-                "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=".to_owned(), b"AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=", "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(), 1_000_000, "XLM".to_owned(), None, 100, 1, "1000".to_owned(), stellar_agent_core::approval::DEFAULT_TTL_MS,
+                "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=".to_owned(), b"AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=", "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(), 1_000_000, "XLM".to_owned(), None, 100, 1, "1000".to_owned(), stellar_agent_core::approval::DEFAULT_TTL_MS,
             ).unwrap();
             let nonce = entry.approval_nonce.clone();
             let mut store = PendingApprovalStore::open(fx.state.ctx.store_path.clone()).unwrap();
             store.insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap()).unwrap();
             drop(store);
-            let router = build_router();
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
             let cookie = login(&router, &fx.state, &fx.authenticator).await;
             let response = router.with_state(fx.state).oneshot(Request::builder().uri(format!("/approval/{nonce}")).header(header::COOKIE, cookie).body(Body::empty()).unwrap()).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -2370,25 +3998,54 @@ mod tests {
         });
     }
 
+    /// A `transfer` invocation of contract `[3; 32]` with no arguments.
+    const X402_ROOT_XDR: &str =
+        "AAAAAAAAAAEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAAAh0cmFuc2ZlcgAAAAAAAAAA";
+
     #[test]
-    fn remote_trustline_challenge_uses_envelope_digest() {
-        let limit = None;
-        let entry = PendingApproval::new_trustline_pending(
-            CHANGE_TRUST_ENVELOPE.to_owned(),
-            CHANGE_TRUST_ENVELOPE.as_bytes(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            "USDC".to_owned(),
-            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
-            limit,
-            100,
-            42,
-            "1000".to_owned(),
-            stellar_agent_core::approval::DEFAULT_TTL_MS,
-        )
-        .unwrap();
-        let expected =
-            stellar_agent_core::approval::envelope_sha256(CHANGE_TRUST_ENVELOPE.as_bytes());
-        assert_ne!(expected, [0; 32]);
-        assert_eq!(entry_envelope_sha256(&entry), expected);
+    #[serial]
+    fn remote_refuses_x402_challenge() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("x402-challenge");
+            let nonce = insert_payment_entry(&fx.state.ctx.store_path);
+            let mut store = PendingApprovalStore::open(fx.state.ctx.store_path.clone()).unwrap();
+            let mut entry = store.get(&nonce).unwrap().clone();
+            entry.kind = ApprovalKind::X402Payment {
+                intent_digest: [1; 32],
+                root_invocation_xdr: X402_ROOT_XDR.to_owned(),
+                payee: "payee".into(),
+                amount: "10".into(),
+                asset: "asset".into(),
+                home_domain: None,
+            };
+            store.remove(&nonce).unwrap();
+            store
+                .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
+                .unwrap();
+            drop(store);
+            let router = build_router(fx.state.ctx.decision.clone().unwrap());
+            let cookie = login(&router, &fx.state, &fx.authenticator).await;
+            let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+            let response = router
+                .with_state(fx.state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/approval/{nonce}/challenge"))
+                        .header(header::COOKIE, cookie)
+                        .header(CSRF_HEADER_NAME, csrf)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(body_json(response).await["error"], "wrong_kind");
+            assert_entry_untouched(&fx.state.ctx.store_path, &nonce);
+        });
     }
 }

@@ -264,10 +264,15 @@ fn challenge(round: u8) -> ChallengeInput {
         None,
     )
     .expect("valid request context");
+    let expires_at = stellar_agent_core::timefmt::now_unix_ms().expect("clock") / 1_000 + 300;
+    let expires = stellar_agent_core::timefmt::format_rfc3339_utc(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(expires_at),
+    );
     ChallengeInput::Http {
         www_authenticate: vec![format!(
             "Payment id=\"challenge-{round}\", realm=\"merchant.example\", \
-             method=\"stellar\", intent=\"charge\", request={encoded}"
+             method=\"stellar\", intent=\"charge\", request={encoded}, \
+             expires=\"{expires}\""
         )],
         selected_challenge_id: None,
         context,
@@ -302,7 +307,13 @@ async fn cli_and_mcp_authorization_fingerprint_and_preview_match() {
     };
 
     const PROFILE_NAME: &str = "mpp-preview-parity";
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home_guard = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().expect("mock keyring");
     install_test_nonce_key(243);
@@ -459,7 +470,13 @@ fn row_count(path: &std::path::Path) -> usize {
 #[tokio::test]
 #[serial]
 async fn mpp_charge_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_back() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home_guard = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(240);
@@ -470,6 +487,7 @@ async fn mpp_charge_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_ba
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_named_signer_identity(PROFILE, SIGNER_SERVICE, &payer_g, seed);
 
     let mut profile =
         Profile::builder_testnet_named(PROFILE, SIGNER_SERVICE, &payer_g, "n-svc", "n-acct")
@@ -590,7 +608,13 @@ async fn mpp_accounting_cap_refusal_withholds_the_credential() {
     use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
     use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
     use stellar_agent_network::policy_state::PersistedWindowStore;
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().unwrap();
     install_test_nonce_key(241);
@@ -600,6 +624,7 @@ async fn mpp_accounting_cap_refusal_withholds_the_credential() {
         .unwrap()
         .set_password(&sstrkey_for_seed(seed))
         .unwrap();
+    crate::common::store_named_signer_identity(PROFILE, SIGNER_SERVICE, &payer, seed);
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(SponsoredSimulateResponder::new(payer_sc_address(&payer)))
@@ -671,7 +696,13 @@ async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
     use stellar_agent_mcp::server::X402CreatePaymentArgs;
     use stellar_agent_network::policy_state::PersistedWindowStore;
     const PROFILE: &str = "x402-admission";
-    let home = tempfile::tempdir().unwrap();
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let _home = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().unwrap();
     install_test_nonce_key(242);
@@ -681,6 +712,7 @@ async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
         .unwrap()
         .set_password(&sstrkey_for_seed(seed))
         .unwrap();
+    crate::common::store_named_signer_identity(PROFILE, SIGNER_SERVICE, &payer, seed);
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(SponsoredSimulateResponder::new(payer_sc_address(&payer)))
@@ -718,6 +750,8 @@ async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
     )));
     let result = server
         .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+            approval_nonce: None,
+            approval_attestation: None,
             chain_id: "stellar:testnet".into(),
             address: None,
             payment_required: serde_json::json!({
@@ -726,6 +760,7 @@ async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
                 "extra": { "areFeesSponsored": true }
             })
             .to_string(),
+            business_id: None,
         })
         .await
         .unwrap();
@@ -758,13 +793,13 @@ async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
 
 /// One MPP server over a mock RPC: the payer, the profile, and the server.
 struct MppFixture {
-    _home: tempfile::TempDir,
-    _home_guard: StellarAgentHomeGuard,
     _mock: MockServer,
     profile: Profile,
     server: WalletServer,
     signed_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     payer: String,
+    _home_guard: StellarAgentHomeGuard,
+    _home: stellar_agent_test_support::sandbox::StateSandbox,
 }
 
 /// Builds a server for `profile_name`. `seed_secret` decides whether the
@@ -780,7 +815,13 @@ async fn mpp_fixture(
     seed_secret: bool,
     configure: impl FnOnce(SponsoredSimulateResponder, &Profile) -> SponsoredSimulateResponder,
 ) -> MppFixture {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
     let home_guard = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().expect("mock keyring");
     install_test_nonce_key(244);
@@ -791,6 +832,7 @@ async fn mpp_fixture(
             .set_password(&sstrkey_for_seed(seed))
             .expect("set_password");
     }
+    crate::common::store_named_signer_identity(profile_name, SIGNER_SERVICE, &payer, seed);
     let mut profile =
         Profile::builder_testnet_named(profile_name, SIGNER_SERVICE, &payer, "n-svc", "n-acct")
             .with_noop_engine()
@@ -1108,7 +1150,13 @@ async fn mpp_commit_drains_a_queued_consent_row_before_the_signed_resimulation()
     let store_path = approvals.path().join(format!("{NAME}.toml"));
     let mut store = PendingApprovalStore::open(store_path).expect("approval store");
     let entry = store.get(&approval_id).expect("pending entry").clone();
-    let outbox = AuditOutbox::for_log(&fixture.profile.audit_log_path);
+    let outbox = AuditOutbox::for_log(
+        &fixture.profile.audit_log_path,
+        stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+            &fixture.profile.audit_log_hash_chain_key_id,
+            &fixture.profile.audit_log_path,
+        ),
+    );
     attest_and_persist(
         &mut store,
         &entry,
@@ -1116,7 +1164,9 @@ async fn mpp_commit_drains_a_queued_consent_row_before_the_signed_resimulation()
         &AttestationBinding::new(NAME, "stellar:testnet"),
         Surface::Cli,
         ConsentAudit::Outbox(&outbox),
-        None,
+        stellar_agent_core::approval::ConsentAuthorization::Standard(
+            &stellar_agent_core::approval::AttestedApprover::Local,
+        ),
         |_, _| Err("no grant".to_owned()),
     )
     .expect("approve");
@@ -1265,6 +1315,8 @@ async fn profile_chain_x402_accounting_persists_cap() {
         .server
         .set_policy_engine_for_test(std::sync::Arc::new(profile_chain_cap_engine(NAME)));
     let args = || X402CreatePaymentArgs {
+        approval_nonce: None,
+        approval_attestation: None,
         chain_id: "stellar:testnet".into(),
         address: None,
         payment_required: serde_json::json!({
@@ -1273,6 +1325,7 @@ async fn profile_chain_x402_accounting_persists_cap() {
             "extra": { "areFeesSponsored": true }
         })
         .to_string(),
+        business_id: None,
     };
     let first = fixture
         .server
@@ -1307,13 +1360,17 @@ async fn split_mpp_approval_prepare_records_commit_request() {
     use stellar_agent_core::approval::{
         AttestationBinding, ConsentAudit, PendingApprovalStore, Surface, attest_and_persist,
     };
-    use stellar_agent_core::audit_log::AuditOutbox;
+    use stellar_agent_core::audit_log::{AuditOutbox, AuditWriterRegistry};
     use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
     use stellar_agent_core::policy::{ApprovalRequest, Decision};
     use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
 
     const NAME: &str = "mpp-split-approval";
     let mut fixture = mpp_fixture(NAME, [0xb7; 32], true, |r, _| r).await;
+    let cache = std::sync::Arc::new(crate::common::CountingCounterpartyCache::default());
+    fixture
+        .server
+        .set_counterparty_resolver_for_test(cache.clone());
     let approvals = tempfile::tempdir().unwrap();
     fixture
         .server
@@ -1361,13 +1418,30 @@ async fn split_mpp_approval_prepare_records_commit_request() {
     .unwrap()
     .set_password(&URL_SAFE_NO_PAD.encode(key))
     .unwrap();
+    // An earlier keyed call caches the writer in this process, so the row the
+    // third attempt queues waits beside a live keyed writer that enrolled the log.
+    let access = stellar_agent_network::keyring::keyed_audit_access(
+        &fixture.profile,
+        NAME,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    )
+    .expect("access");
+    let _cached =
+        AuditWriterRegistry::get_or_open_keyed(NAME, &fixture.profile.audit_log_path, access)
+            .expect("writer cached");
     for attempt in 0..3 {
+        let cache_reads = cache.reads();
         let result = fixture
             .server
             .call_stellar_mpp_charge_prepare(NAME.into(), challenge(30 + attempt))
             .await
             .unwrap();
         let prepared = result_json(&result);
+        assert_eq!(
+            cache.reads() - cache_reads,
+            1,
+            "MPP pair shares one cache acquisition"
+        );
         assert_eq!(prepared["ok"], true, "{prepared}");
         let data = &prepared["data"];
         let approval_id = data["authorization"]["approval_id"]
@@ -1382,9 +1456,21 @@ async fn split_mpp_approval_prepare_records_commit_request() {
                 <= data["authorization"]["expires_at_unix"].as_u64().unwrap() * 1_000
         );
         if attempt == 1 {
-            store.record_attestation(approval_id, [0; 32]).unwrap();
+            store
+                .record_attestation(
+                    approval_id,
+                    [0; 32],
+                    stellar_agent_core::approval::AttestedApprover::Local,
+                )
+                .unwrap();
         } else if attempt == 2 {
-            let outbox = AuditOutbox::for_log(&fixture.profile.audit_log_path);
+            let outbox = AuditOutbox::for_log(
+                &fixture.profile.audit_log_path,
+                stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                    &fixture.profile.audit_log_hash_chain_key_id,
+                    &fixture.profile.audit_log_path,
+                ),
+            );
             attest_and_persist(
                 &mut store,
                 &entry,
@@ -1392,7 +1478,9 @@ async fn split_mpp_approval_prepare_records_commit_request() {
                 &AttestationBinding::new(NAME, "stellar:testnet"),
                 Surface::Cli,
                 ConsentAudit::Outbox(&outbox),
-                None,
+                stellar_agent_core::approval::ConsentAuthorization::Standard(
+                    &stellar_agent_core::approval::AttestedApprover::Local,
+                ),
                 |_, _| Err("no grant".into()),
             )
             .unwrap();

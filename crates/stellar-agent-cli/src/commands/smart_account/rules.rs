@@ -69,7 +69,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
-use stellar_agent_core::audit_log::ExecutableRefPin;
+use stellar_agent_core::audit_log::{ExecutableRefPin, WasmHashPin};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::CapKind;
 use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
@@ -87,6 +87,7 @@ use stellar_agent_smart_account::managers::rules::{
     decode_policy_count_from_scval, parse_c_strkey_to_smart_account,
     parse_delegated_signer_address, parse_g_strkey_to_signer_address,
 };
+use stellar_agent_smart_account::managers::signers::SPENDING_LIMIT_POSITIVE_REASON;
 use stellar_agent_smart_account::simple_threshold_policy::build_simple_threshold_install_param;
 use stellar_agent_smart_account::spending_limit_policy::{
     build_spending_limit_install_param, ensure_call_contract_context_for_spending_limit,
@@ -103,7 +104,8 @@ use uuid::Uuid;
 use crate::commands::smart_account::common::{
     CommonArgsView, CommonHandlerContext, ReadArgsView, ReadHandlerContext, SignerSourceFlags,
     construct_signers_manager_from_fields, impl_common_args_view, impl_read_args_view,
-    load_command_profile, map_access_error, open_audit_writer_read_only, validate_source_account,
+    load_command_profile, map_access_error, open_audit_writer_read_only, open_verifier_registry,
+    validate_source_account,
 };
 use crate::commands::smart_account::list_rules as sa_list_rules;
 use crate::common::network::{
@@ -264,9 +266,16 @@ async fn prepare_write_context<A>(
 where
     A: CommonArgsView + Sync,
 {
-    let ctx = CommonHandlerContext::new(args, resolved, profile, origin, context)
-        .await
-        .map_err(|e| emit_error(&e, output, request_id))?;
+    let ctx = CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        context,
+        "stellar_smart_account_rules",
+    )
+    .await
+    .map_err(|e| emit_error(&e, output, request_id))?;
     let manager = ctx
         .context_rule_manager()
         .map_err(|e| emit_error(&e, output, request_id))?;
@@ -334,9 +343,10 @@ pub enum RulesSubcommand {
     /// Read-only; no signing, no submission. Reports `verifier_pin_status`
     /// and `policy_pin_status` each as one of `"match"`, `"drift"`,
     /// `"unavailable"`, `"no_pin"`, or `"no_contracts"`. The
-    /// `pinned_*_first8` fields carry the stored pin from the audit log;
-    /// `observed_*_first8` carry the live values fetched via two-RPC
-    /// consultation. Loads no signer and accepts a mainnet profile. The
+    /// `pinned_*_hashes` fields carry the full stored pins from the audit
+    /// log; `observed_*_hashes` carry the full live hashes fetched via
+    /// two-RPC consultation. A pin record of eight-byte hash prefixes
+    /// reports both statuses `"unavailable"` with `sa.wasm_pin_incomplete`. Loads no signer and accepts a mainnet profile. The
     /// optional `--source-account` names an existing account as the source
     /// of the `get_context_rule` simulation.
     VerifyPins(Box<VerifyPinsArgs>),
@@ -388,8 +398,8 @@ pub enum RulesSubcommand {
     /// [`crate::commands::smart_account::list_rules::run`]; argument shape and
     /// JSON envelope are identical to `smart-account list-rules`.
     ///
-    /// `smart-account list-rules` is retained unchanged as a secondary entry point
-    /// for backwards-compat. No deprecation warning is emitted.
+    /// `smart-account list-rules` is a second entry point for the same command
+    /// and prints no warning.
     ///
     /// A `tracing::info!` row carrying `command = "smart-account rules list"` is
     /// emitted at the dispatch site so the operator-invoked command name is
@@ -448,9 +458,6 @@ pub async fn run(args: &RulesArgs) -> i32 {
 async fn list_rules_run(args: &ListArgs) -> i32 {
     info!(
         command = "smart-account rules list",
-        account = tracing::field::display(
-            stellar_agent_core::observability::redact_strkey_first5_last5(&args.account)
-        ),
         network = ?args.network,
         "smart-account rules list: dispatching to list-rules handler"
     );
@@ -575,7 +582,7 @@ pub struct CreateArgs {
     /// against that.
     ///
     /// For an external reference the pin records the owner, the tag and the
-    /// hash the tag resolves to. When the owner repoints the tag, the
+    /// full hash the tag resolves to. When the owner repoints the tag, the
     /// reference changes or the executable kind changes, the pinned-hash
     /// drift check refuses signing under the rule with
     /// `sa.verifier_hash_drift` / `sa.policy_hash_drift` before anything is
@@ -585,7 +592,9 @@ pub struct CreateArgs {
     /// policy pins while the rule has no policy on chain refuses with
     /// `sa.pinned_policy_absent`. A rule holding an `External` signer while
     /// its record pins no verifier refuses with `sa.pinned_verifier_absent`,
-    /// and a check that cannot run with `sa.pin_check_unavailable`.
+    /// a rule whose record holds eight-byte hash prefixes with
+    /// `sa.wasm_pin_incomplete`, and a check that cannot run with
+    /// `sa.pin_check_unavailable`.
     /// `--accept-unknown-verifier` is also required when the resolved hash is
     /// outside the allowlist.
     ///
@@ -598,7 +607,7 @@ pub struct CreateArgs {
     /// `SaMutableContractOverride { rule_id, contract_kind,
     /// contract_address_redacted }`, naming the owner and tag of an external
     /// reference. The row carries the new rule's id and is written after the
-    /// install confirms, before the `SaContextRuleCreated` row; a refused
+    /// install confirms, before the `SaContextRuleCreatedV2` row; a refused
     /// install writes none.
     /// The JSON envelope reflects `mutable_override: true`.
     #[arg(long)]
@@ -617,7 +626,7 @@ pub struct CreateArgs {
     /// `SaUnknownContractOverride { rule_id, contract_kind,
     /// contract_address_redacted, observed_hash_first8 }`. The row carries the
     /// new rule's id and is written after the install confirms, before the
-    /// `SaContextRuleCreated` row; a refused install writes none.
+    /// `SaContextRuleCreatedV2` row; a refused install writes none.
     /// The JSON envelope reflects `unknown_override: true`.
     #[arg(long)]
     pub accept_unknown_verifier: bool,
@@ -647,8 +656,8 @@ pub struct CreateArgs {
 
 /// Result envelope for `smart-account rules create`.
 ///
-/// Carries the wasm-pinning fields `pinned_verifier_wasm_hashes_first8`,
-/// `pinned_policy_wasm_hashes_first8`, `pinned_verifier_executable_refs`,
+/// Carries the wasm-pinning fields `pinned_verifier_wasm_hashes`,
+/// `pinned_policy_wasm_hashes`, `pinned_verifier_executable_refs`,
 /// `pinned_policy_executable_refs`, `mutable_override`, and
 /// `unknown_override` — all sourced from the `PinResult` returned by
 /// `install_rule`.
@@ -671,13 +680,14 @@ pub struct CreateResult {
     pub signer_ed25519_count: u32,
     /// Optional ledger expiry, `null` for permanent rules.
     pub valid_until: Option<u32>,
-    /// First-8-hex of each pinned verifier wasm hash (one per distinct
-    /// External signer verifier contract).  Empty when no External signers
-    /// are present.  Non-empty values confirm the wasm-hash pin was recorded.
-    pub pinned_verifier_wasm_hashes_first8: Vec<String>,
-    /// First-8-hex of each pinned policy wasm hash (one per policy attached
-    /// to the rule).  Empty when no policies are present.
-    pub pinned_policy_wasm_hashes_first8: Vec<String>,
+    /// Each pinned verifier wasm hash in full, 64 lowercase hex characters
+    /// (one per distinct External signer verifier contract).  Empty when no
+    /// External signers are present.  Non-empty values confirm the
+    /// wasm-hash pin was recorded.
+    pub pinned_verifier_wasm_hashes: Vec<WasmHashPin>,
+    /// Each pinned policy wasm hash in full (one per policy attached to the
+    /// rule).  Empty when no policies are present.
+    pub pinned_policy_wasm_hashes: Vec<WasmHashPin>,
     /// `true` when `--accept-mutable-verifier` was set AND at least one
     /// referenced contract had a mutable admin / owner key.
     pub mutable_override: bool,
@@ -685,14 +695,14 @@ pub struct CreateResult {
     /// referenced contract had a wasm hash outside the allowlist.
     pub unknown_override: bool,
     /// Executable-reference pins aligned with
-    /// `pinned_verifier_wasm_hashes_first8`: an object (redacted owner,
-    /// bounded tag, tag-key digest, resolved first-8) for a verifier whose
+    /// `pinned_verifier_wasm_hashes`: an object (redacted owner, bounded
+    /// tag, tag-key digest, full resolved hash) for a verifier whose
     /// executable is an external reference, `null` otherwise. Omitted when no
     /// verifier is an external reference.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
     /// Executable-reference pins aligned with
-    /// `pinned_policy_wasm_hashes_first8`, in the same form. Omitted when no
+    /// `pinned_policy_wasm_hashes`, in the same form. Omitted when no
     /// policy is an external reference.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
@@ -704,7 +714,7 @@ async fn create_run(args: &CreateArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.common.output, &request_id);
         }
     };
@@ -733,11 +743,10 @@ async fn create_run(args: &CreateArgs) -> i32 {
         && args.signer_ed25519.is_empty()
     {
         return emit_error(
-            &WalletError::Validation(ValidationError::AddressInvalid {
-                input: "at least one of --signer-delegated, --signer-webauthn, or \
-                        --signer-ed25519 is required"
-                    .to_owned(),
-            }),
+            &WalletError::Validation(ValidationError::address_check(
+                "at least one of --signer-delegated, --signer-webauthn, or \
+                        --signer-ed25519 is required",
+            )),
             args.common.output,
             &request_id,
         );
@@ -840,16 +849,10 @@ async fn create_run(args: &CreateArgs) -> i32 {
     if !args.signer_webauthn.is_empty() {
         // Load the VerifierRegistry to get the verifier contract address for
         // this network (written by `smart-account deploy-webauthn-verifier`).
-        let verifier_registry = match VerifierRegistry::open() {
+        let verifier_registry = match open_verifier_registry() {
             Ok(r) => r,
             Err(e) => {
-                return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!("could not open verifier registry: {e}"),
-                    }),
-                    args.common.output,
-                    &request_id,
-                );
+                return emit_error(&e, args.common.output, &request_id);
             }
         };
 
@@ -858,13 +861,9 @@ async fn create_run(args: &CreateArgs) -> i32 {
             Some(e) => e,
             None => {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!(
-                            "no WebAuthn verifier deployed for network '{}'; \
-                                 run: smart-account deploy-webauthn-verifier",
-                            network_passphrase
-                        ),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(
+                        "network: no WebAuthn verifier deployed; run: smart-account deploy-webauthn-verifier",
+                    )),
                     args.common.output,
                     &request_id,
                 );
@@ -881,9 +880,9 @@ async fn create_run(args: &CreateArgs) -> i32 {
         let profile = resolved.name.clone();
         if let Err(reason) = validate_path_component_ascii_safe(&profile) {
             return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("invalid profile name '{profile}': {reason}"),
-                }),
+                &WalletError::Validation(ValidationError::address_check(format!(
+                    "the profile name is not a valid profile name: {reason}"
+                ))),
                 args.common.output,
                 &request_id,
             );
@@ -893,9 +892,9 @@ async fn create_run(args: &CreateArgs) -> i32 {
             Ok(m) => m,
             Err(e) => {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!("could not open passkeys registry: {e}"),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(format!(
+                        "could not open passkeys registry: {e}"
+                    ))),
                     args.common.output,
                     &request_id,
                 );
@@ -905,11 +904,11 @@ async fn create_run(args: &CreateArgs) -> i32 {
         for credential_name in &args.signer_webauthn {
             let metadata = match creds_mgr.show(credential_name) {
                 Ok(m) => m,
-                Err(e) => {
+                Err(_) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("--signer-webauthn '{}': {e}", credential_name),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--signer-webauthn names a passkey credential that cannot be read; `stellar-agent credentials list` shows the registered credentials",
+                        )),
                         args.common.output,
                         &request_id,
                     );
@@ -918,13 +917,9 @@ async fn create_run(args: &CreateArgs) -> i32 {
 
             if metadata.public_key_sec1_b64.is_empty() {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!(
-                            "--signer-webauthn '{}': credential is missing \
-                             public_key_sec1_b64 (delete and re-register)",
-                            credential_name
-                        ),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(
+                        "--signer-webauthn: credential is missing public_key_sec1_b64 (delete and re-register)",
+                    )),
                     args.common.output,
                     &request_id,
                 );
@@ -937,13 +932,9 @@ async fn create_run(args: &CreateArgs) -> i32 {
                 Ok(b) => b,
                 Err(_) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!(
-                                "--signer-webauthn '{}': public_key_sec1_b64 \
-                                 is not valid base64url",
-                                credential_name
-                            ),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--signer-webauthn: public_key_sec1_b64 is not valid base64url",
+                        )),
                         args.common.output,
                         &request_id,
                     );
@@ -951,14 +942,10 @@ async fn create_run(args: &CreateArgs) -> i32 {
             };
             if pubkey_bytes.len() != 65 {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!(
-                            "--signer-webauthn '{}': public_key_sec1_b64 decodes to \
-                             {} bytes, expected 65",
-                            credential_name,
-                            pubkey_bytes.len()
-                        ),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(format!(
+                        "--signer-webauthn: public_key_sec1_b64 decodes to {} bytes, expected 65",
+                        pubkey_bytes.len()
+                    ))),
                     args.common.output,
                     &request_id,
                 );
@@ -971,13 +958,9 @@ async fn create_run(args: &CreateArgs) -> i32 {
                 Ok(b) => b,
                 Err(_) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!(
-                                "--signer-webauthn '{}': credential_id_b64url \
-                                 is not valid base64url",
-                                credential_name
-                            ),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--signer-webauthn: credential_id_b64url is not valid base64url",
+                        )),
                         args.common.output,
                         &request_id,
                     );
@@ -1009,16 +992,10 @@ async fn create_run(args: &CreateArgs) -> i32 {
         let ed25519_verifier_c_strkey = if let Some(explicit) = &args.verifier {
             explicit.clone()
         } else {
-            let verifier_registry = match VerifierRegistry::open() {
+            let verifier_registry = match open_verifier_registry() {
                 Ok(r) => r,
                 Err(e) => {
-                    return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("could not open verifier registry: {e}"),
-                        }),
-                        args.common.output,
-                        &request_id,
-                    );
+                    return emit_error(&e, args.common.output, &request_id);
                 }
             };
             let network_passphrase = context.network_passphrase();
@@ -1026,13 +1003,9 @@ async fn create_run(args: &CreateArgs) -> i32 {
                 Some(entry) => entry.address.clone(),
                 None => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!(
-                                "no Ed25519 verifier registered for network \
-                                 '{network_passphrase}'; run: \
-                                 smart-account deploy-ed25519-verifier (or pass --verifier)"
-                            ),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "network: no Ed25519 verifier registered; run: smart-account deploy-ed25519-verifier (or pass --verifier)",
+                        )),
                         args.common.output,
                         &request_id,
                     );
@@ -1047,11 +1020,11 @@ async fn create_run(args: &CreateArgs) -> i32 {
         for hex_pubkey in &args.signer_ed25519 {
             let key_data = match hex::decode(hex_pubkey) {
                 Ok(b) => b,
-                Err(e) => {
+                Err(_) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("--signer-ed25519 is not valid hex: {e}"),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--signer-ed25519 is not valid hex",
+                        )),
                         args.common.output,
                         &request_id,
                     );
@@ -1059,13 +1032,11 @@ async fn create_run(args: &CreateArgs) -> i32 {
             };
             if key_data.len() != 32 {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!(
-                            "--signer-ed25519 must decode to exactly 32 bytes (a raw Ed25519 \
+                    &WalletError::Validation(ValidationError::address_check(format!(
+                        "--signer-ed25519 must decode to exactly 32 bytes (a raw Ed25519 \
                              public key), got {} bytes",
-                            key_data.len()
-                        ),
-                    }),
+                        key_data.len()
+                    ))),
                     args.common.output,
                     &request_id,
                 );
@@ -1093,7 +1064,16 @@ async fn create_run(args: &CreateArgs) -> i32 {
     // `prepare_write_context` because it has substantial pre-validation above.
     // The explicit `context_rule_manager()` call is required to wire the
     // `SignersManager` for wasm-hash pin enforcement.
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_rules",
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.common.output, &request_id),
     };
@@ -1135,8 +1115,8 @@ async fn create_run(args: &CreateArgs) -> i32 {
             pin_result,
             ..
         }) => {
-            let pinned_verifier_wasm_hashes_first8 = pin_result.pinned_verifier_hashes_first8();
-            let pinned_policy_wasm_hashes_first8 = pin_result.pinned_policy_hashes_first8();
+            let pinned_verifier_wasm_hashes = pin_result.pinned_verifier_hashes();
+            let pinned_policy_wasm_hashes = pin_result.pinned_policy_hashes();
             info!(
                 smart_account = %account_redacted,
                 rule_id,
@@ -1157,8 +1137,8 @@ async fn create_run(args: &CreateArgs) -> i32 {
                 signer_webauthn_count: webauthn_count,
                 signer_ed25519_count: ed25519_count,
                 valid_until,
-                pinned_verifier_wasm_hashes_first8,
-                pinned_policy_wasm_hashes_first8,
+                pinned_verifier_wasm_hashes,
+                pinned_policy_wasm_hashes,
                 mutable_override: pin_result.mutable_override,
                 unknown_override: pin_result.unknown_override,
                 pinned_verifier_executable_refs: pin_result.verifier_executable_refs(),
@@ -1215,7 +1195,7 @@ async fn get_run(args: &GetArgs) -> i32 {
     let (profile, _origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.common.output, &request_id);
         }
     };
@@ -1328,7 +1308,7 @@ async fn set_name_run(args: &SetNameArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.common.output, &request_id);
         }
     };
@@ -1454,7 +1434,7 @@ async fn set_valid_until_run(args: &SetValidUntilArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.common.output, &request_id);
         }
     };
@@ -1575,7 +1555,7 @@ async fn delete_run(args: &DeleteArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.common.output, &request_id);
         }
     };
@@ -1721,44 +1701,46 @@ pub struct VerifyPinsResult {
     pub verifier_pin_status: PinStatus,
     /// Pin status for policy contracts.
     pub policy_pin_status: PinStatus,
-    /// Pinned verifier wasm hashes first-8-hex (from audit log).
-    pub pinned_verifier_first8: Vec<String>,
-    /// Pinned policy wasm hashes first-8-hex (from audit log).
-    pub pinned_policy_first8: Vec<String>,
-    /// Observed live verifier wasm hashes first-8-hex (from chain).
-    pub observed_verifier_first8: Vec<String>,
-    /// Observed live policy wasm hashes first-8-hex (from chain).
-    pub observed_policy_first8: Vec<String>,
+    /// Pinned verifier wasm hashes in full (from audit log). Empty when the
+    /// rule's pin record is incomplete.
+    pub pinned_verifier_hashes: Vec<WasmHashPin>,
+    /// Pinned policy wasm hashes in full (from audit log). Empty when the
+    /// rule's pin record is incomplete.
+    pub pinned_policy_hashes: Vec<WasmHashPin>,
+    /// Observed live verifier effective hashes in full (from chain); `null`
+    /// for a verifier with no Wasm code, which has no hash.
+    pub observed_verifier_hashes: Vec<Option<WasmHashPin>>,
+    /// Observed live policy effective hashes in full (from chain); `null` for
+    /// a policy with no Wasm code.
+    pub observed_policy_hashes: Vec<Option<WasmHashPin>>,
     /// Observed executable of each verifier, aligned with
-    /// `observed_verifier_first8`: the bounded summary of an external
+    /// `observed_verifier_hashes`: the bounded summary of an external
     /// reference (owner, tag and resolved hash) or `"no code"`, and `null` for
     /// a plain Wasm executable. Omitted when no verifier was observed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed_verifier_executable: Vec<Option<String>>,
     /// Observed executable of each policy, aligned with
-    /// `observed_policy_first8`, in the form of
+    /// `observed_policy_hashes`, in the form of
     /// `observed_verifier_executable`. Omitted when no policy was observed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed_policy_executable: Vec<Option<String>>,
-    /// Executable-reference pins (owner, tag, tag-key digest, resolved
-    /// first-8) from the audit log, aligned with `pinned_verifier_first8`,
+    /// Executable-reference pins (owner, tag, tag-key digest, full resolved
+    /// hash) from the audit log, aligned with `pinned_verifier_hashes`,
     /// `null` at a position pinned by its Wasm hash. Omitted when no pinned
     /// verifier is an external reference.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
     /// Executable-reference pins from the audit log, aligned with
-    /// `pinned_policy_first8`, in the form of
+    /// `pinned_policy_hashes`, in the form of
     /// `pinned_verifier_executable_refs`. Omitted when no pinned policy is an
     /// external reference.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
-    /// Install-time mutable-contract override flag, sourced from the
-    /// `SaContextRuleCreated` audit row. `false` for rules installed before
-    /// override tracking was added.
+    /// Mutable-contract override flag of the rule's pin record. `false`
+    /// without a complete pin record.
     pub mutable_override: bool,
-    /// Install-time unknown-wasm override flag, sourced from the
-    /// `SaContextRuleCreated` audit row. `false` for rules installed before
-    /// override tracking was added.
+    /// Unknown-wasm override flag of the rule's pin record. `false` without
+    /// a complete pin record.
     pub unknown_override: bool,
     /// Present when `verifier_pin_status` or `policy_pin_status` is
     /// `Unavailable`, carrying the inner `SaError` wire code.
@@ -1775,10 +1757,10 @@ impl VerifyPinsResult {
             rule_id: sa.rule_id,
             verifier_pin_status: sa.verifier_pin_status,
             policy_pin_status: sa.policy_pin_status,
-            pinned_verifier_first8: sa.pinned_verifier_first8,
-            pinned_policy_first8: sa.pinned_policy_first8,
-            observed_verifier_first8: sa.observed_verifier_first8,
-            observed_policy_first8: sa.observed_policy_first8,
+            pinned_verifier_hashes: sa.pinned_verifier_hashes,
+            pinned_policy_hashes: sa.pinned_policy_hashes,
+            observed_verifier_hashes: sa.observed_verifier_hashes,
+            observed_policy_hashes: sa.observed_policy_hashes,
             observed_verifier_executable: sa.observed_verifier_executable,
             observed_policy_executable: sa.observed_policy_executable,
             pinned_verifier_executable_refs: sa.pinned_verifier_executable_refs,
@@ -1806,7 +1788,7 @@ async fn verify_pins_run(args: &VerifyPinsArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.output, &request_id);
         }
     };
@@ -1836,7 +1818,6 @@ async fn verify_pins_run(args: &VerifyPinsArgs) -> i32 {
 
     info!(
         smart_account = %account_redacted,
-        rule_id = args.rule_id,
         "smart-account rules verify-pins: running",
     );
 
@@ -2092,7 +2073,7 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.output, &request_id);
         }
     };
@@ -2132,9 +2113,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Some(a) => a.clone(),
                 None => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: "--kind raw requires --policy-address".to_owned(),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--kind raw requires --policy-address",
+                        )),
                         args.output,
                         &request_id,
                     );
@@ -2144,9 +2125,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Some(p) => p,
                 None => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: "--kind raw requires --install-param".to_owned(),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--kind raw requires --install-param",
+                        )),
                         args.output,
                         &request_id,
                     );
@@ -2154,11 +2135,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
             };
             if args.limit.is_some() || args.period.is_some() || args.policy.is_some() {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: "--limit / --period / --policy are only valid with \
-                                --kind spending-limit"
-                            .to_owned(),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(
+                        "--limit / --period / --policy are only valid with \
+                                --kind spending-limit",
+                    )),
                     args.output,
                     &request_id,
                 );
@@ -2168,9 +2148,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Ok(addr) => addr,
                 Err(e) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("--policy-address: {e}"),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(format!(
+                            "--policy-address: {e}"
+                        ))),
                         args.output,
                         &request_id,
                     );
@@ -2194,11 +2174,11 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 },
             ) {
                 Ok(v) => v,
-                Err(e) => {
+                Err(_) => {
                     return emit_error(
                         &WalletError::Validation(ValidationError::XdrArgumentMalformed {
                             arg: "install-param".to_owned(),
-                            reason: format!("{e}"),
+                            reason: stellar_agent_core::envelope_decode::SCVAL_XDR_FORM.to_owned(),
                         }),
                         args.output,
                         &request_id,
@@ -2213,9 +2193,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Some(v) => v,
                 None => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: "--kind spending-limit requires --limit".to_owned(),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--kind spending-limit requires --limit",
+                        )),
                         args.output,
                         &request_id,
                     );
@@ -2225,9 +2205,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Some(v) => v,
                 None => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: "--kind spending-limit requires --period".to_owned(),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--kind spending-limit requires --period",
+                        )),
                         args.output,
                         &request_id,
                     );
@@ -2235,11 +2215,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
             };
             if args.policy_address.is_some() || args.install_param.is_some() {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: "--policy-address / --install-param are only valid with \
-                                --kind raw (use --policy for the typed override)"
-                            .to_owned(),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(
+                        "--policy-address / --install-param are only valid with \
+                                --kind raw (use --policy for the typed override)",
+                    )),
                     args.output,
                     &request_id,
                 );
@@ -2264,16 +2243,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
             let policy_address = if let Some(explicit) = &args.policy {
                 explicit.clone()
             } else {
-                let registry = match VerifierRegistry::open() {
+                let registry = match open_verifier_registry() {
                     Ok(r) => r,
                     Err(e) => {
-                        return emit_error(
-                            &WalletError::Validation(ValidationError::AddressInvalid {
-                                input: format!("could not open verifier registry: {e}"),
-                            }),
-                            args.output,
-                            &request_id,
-                        );
+                        return emit_error(&e, args.output, &request_id);
                     }
                 };
                 let passphrase = context.network_passphrase();
@@ -2281,14 +2254,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                     Some(entry) => entry.address.clone(),
                     None => {
                         return emit_error(
-                            &WalletError::Validation(ValidationError::AddressInvalid {
-                                input: format!(
-                                    "no spending-limit policy deployed for network \
-                                     '{passphrase}'; run: \
-                                     smart-account deploy-spending-limit-policy \
-                                     (or pass --policy)"
-                                ),
-                            }),
+                            &WalletError::Validation(ValidationError::address_check(
+                                "network: no spending-limit policy deployed; run: smart-account deploy-spending-limit-policy (or pass --policy)",
+                            )),
                             args.output,
                             &request_id,
                         );
@@ -2300,9 +2268,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Ok(addr) => addr,
                 Err(e) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("spending-limit policy address: {e}"),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(format!(
+                            "spending-limit policy address: {e}"
+                        ))),
                         args.output,
                         &request_id,
                     );
@@ -2331,9 +2299,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Some(v) => v,
                 None => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: "--kind simple-threshold requires --threshold".to_owned(),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--kind simple-threshold requires --threshold",
+                        )),
                         args.output,
                         &request_id,
                     );
@@ -2347,11 +2315,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 || !args.weighted_signer_webauthn.is_empty()
             {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: "--policy-address / --install-param / --limit / --period / \
-                                --weighted-signer-* are only valid with the matching --kind"
-                            .to_owned(),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(
+                        "--policy-address / --install-param / --limit / --period / \
+                                --weighted-signer-* are only valid with the matching --kind",
+                    )),
                     args.output,
                     &request_id,
                 );
@@ -2375,9 +2342,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Ok(addr) => addr,
                 Err(e) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("simple-threshold policy address: {e}"),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(format!(
+                            "simple-threshold policy address: {e}"
+                        ))),
                         args.output,
                         &request_id,
                     );
@@ -2405,9 +2372,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Some(v) => v,
                 None => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: "--kind weighted-threshold requires --threshold".to_owned(),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(
+                            "--kind weighted-threshold requires --threshold",
+                        )),
                         args.output,
                         &request_id,
                     );
@@ -2419,11 +2386,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 || args.period.is_some()
             {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: "--policy-address / --install-param / --limit / --period are \
-                                only valid with the matching --kind"
-                            .to_owned(),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(
+                        "--policy-address / --install-param / --limit / --period are \
+                                only valid with the matching --kind",
+                    )),
                     args.output,
                     &request_id,
                 );
@@ -2431,11 +2397,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
             if args.weighted_signer_delegated.is_empty() && args.weighted_signer_webauthn.is_empty()
             {
                 return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: "--kind weighted-threshold requires at least one \
-                                --weighted-signer-delegated or --weighted-signer-webauthn"
-                            .to_owned(),
-                    }),
+                    &WalletError::Validation(ValidationError::address_check(
+                        "--kind weighted-threshold requires at least one \
+                                --weighted-signer-delegated or --weighted-signer-webauthn",
+                    )),
                     args.output,
                     &request_id,
                 );
@@ -2459,9 +2424,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 Ok(addr) => addr,
                 Err(e) => {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("weighted-threshold policy address: {e}"),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(format!(
+                            "weighted-threshold policy address: {e}"
+                        ))),
                         args.output,
                         &request_id,
                     );
@@ -2484,16 +2449,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
             }
 
             if !args.weighted_signer_webauthn.is_empty() {
-                let verifier_registry = match VerifierRegistry::open() {
+                let verifier_registry = match open_verifier_registry() {
                     Ok(r) => r,
                     Err(e) => {
-                        return emit_error(
-                            &WalletError::Validation(ValidationError::AddressInvalid {
-                                input: format!("could not open verifier registry: {e}"),
-                            }),
-                            args.output,
-                            &request_id,
-                        );
+                        return emit_error(&e, args.output, &request_id);
                     }
                 };
                 let network_passphrase = context.network_passphrase();
@@ -2503,12 +2462,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                     Some(e) => e,
                     None => {
                         return emit_error(
-                            &WalletError::Validation(ValidationError::AddressInvalid {
-                                input: format!(
-                                    "no WebAuthn verifier deployed for network '{network_passphrase}'; \
-                                     run: smart-account deploy-webauthn-verifier"
-                                ),
-                            }),
+                            &WalletError::Validation(ValidationError::address_check(
+                                "network: no WebAuthn verifier deployed; run: smart-account deploy-webauthn-verifier",
+                            )),
                             args.output,
                             &request_id,
                         );
@@ -2522,9 +2478,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                 let profile = resolved.name.clone();
                 if let Err(reason) = validate_path_component_ascii_safe(&profile) {
                     return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("invalid profile name '{profile}': {reason}"),
-                        }),
+                        &WalletError::Validation(ValidationError::address_check(format!(
+                            "the profile name is not a valid profile name: {reason}"
+                        ))),
                         args.output,
                         &request_id,
                     );
@@ -2534,9 +2490,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                         Ok(m) => m,
                         Err(e) => {
                             return emit_error(
-                                &WalletError::Validation(ValidationError::AddressInvalid {
-                                    input: format!("could not open passkeys registry: {e}"),
-                                }),
+                                &WalletError::Validation(ValidationError::address_check(format!(
+                                    "could not open passkeys registry: {e}"
+                                ))),
                                 args.output,
                                 &request_id,
                             );
@@ -2583,7 +2539,16 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
     };
 
     // Build CommonHandlerContext (signer + manager + audit writer).
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_rules",
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
@@ -2593,9 +2558,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
         Ok(pk) => pk.to_string(),
         Err(e) => {
             return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("signer.public_key(): {e}"),
-                }),
+                &WalletError::Validation(ValidationError::address_check(format!(
+                    "signer.public_key(): {e}"
+                ))),
                 args.output,
                 &request_id,
             );
@@ -2623,12 +2588,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
         Ok(Some(scval)) => scval,
         Ok(None) => {
             return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!(
-                        "rule_id {} not found on smart account {account_redacted}",
-                        args.rule_id
-                    ),
-                }),
+                &WalletError::Validation(ValidationError::address_check(
+                    "--rule-id must identify a rule on the smart account; run \
+                     'smart-account list-rules' to list the rules",
+                )),
                 args.output,
                 &request_id,
             );
@@ -2801,7 +2764,7 @@ async fn remove_policy_run(args: &RemovePolicyArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.output, &request_id);
         }
     };
@@ -2832,7 +2795,16 @@ async fn remove_policy_run(args: &RemovePolicyArgs) -> i32 {
     };
 
     // Build CommonHandlerContext.
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_rules",
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
@@ -2964,7 +2936,7 @@ async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.common.output, &request_id);
         }
     };
@@ -3004,6 +2976,7 @@ async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
         Duration::from_secs(args.common.timeout_seconds),
         audit_writer,
         &audit_log_path,
+        None,
     ) {
         Ok(m) => m,
         Err(e) => return emit_error(&e, args.common.output, &request_id),
@@ -3164,7 +3137,7 @@ async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.output, &request_id);
         }
     };
@@ -3195,19 +3168,23 @@ async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
     if args.limit <= 0 {
         return emit_error_sa(
             &SaError::SpendingLimitInstallRefused {
-                reason: format!(
-                    "set-spending-limit refused: --limit must be positive; got {} \
-                     (OZ set_spending_limit rejects non-positive values with \
-                     InvalidLimitOrPeriod)",
-                    args.limit
-                ),
+                reason: SPENDING_LIMIT_POSITIVE_REASON.to_owned(),
             },
             args.output,
             &request_id,
         );
     }
 
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match CommonHandlerContext::new_admitted(
+        args,
+        resolved,
+        profile,
+        origin,
+        &context,
+        "stellar_smart_account_rules",
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
@@ -3217,8 +3194,9 @@ async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
 
+    // The manager checks that the rule holds a spending-limit policy after
+    // this event, so the event omits the rule id.
     info!(
-        rule_id = args.rule_id,
         new_limit = args.limit,
         account = %account_redacted,
         "smart-account rules set-spending-limit: submitting set_spending_limit"
@@ -3256,9 +3234,7 @@ async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
 /// to a `WalletError::Validation` envelope-friendly error.
 fn parse_c_strkey(s: &str) -> Result<SmartAccountAddress, WalletError> {
     parse_c_strkey_to_smart_account(s).map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("--account: {e}"),
-        })
+        WalletError::Validation(ValidationError::address_check(format!("--account: {e}")))
     })
 }
 
@@ -3279,12 +3255,9 @@ fn contract_scaddress_to_strkey(addr: &stellar_xdr::ScAddress) -> Result<String,
                 .as_str()
                 .to_owned())
         }
-        other => Err(WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!(
-                "policy address is not a contract address; expected a spending-limit-policy \
-                 contract, got {other:?}"
-            ),
-        })),
+        _other => Err(WalletError::Validation(ValidationError::address_check(
+            "the identified spending-limit policy is not a contract address",
+        ))),
     }
 }
 
@@ -3292,9 +3265,9 @@ fn contract_scaddress_to_strkey(addr: &stellar_xdr::ScAddress) -> Result<String,
 /// `--weighted-signer-delegated` args, which take an account only.
 fn parse_g_strkey_for_signer(s: &str) -> Result<SmartAccountAddress, WalletError> {
     parse_g_strkey_to_signer_address(s).map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("--signer-delegated: {e}"),
-        })
+        WalletError::Validation(ValidationError::address_check(format!(
+            "--signer-delegated: {e}"
+        )))
     })
 }
 
@@ -3303,9 +3276,9 @@ fn parse_g_strkey_for_signer(s: &str) -> Result<SmartAccountAddress, WalletError
 /// parser's reason, since the value is typed by the operator.
 fn parse_delegated_signer_for_rule(s: &str) -> Result<SmartAccountAddress, WalletError> {
     parse_delegated_signer_address(s).map_err(|_| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("--signer-delegated: {DELEGATED_SIGNER_ADDRESS_REASON}"),
-        })
+        WalletError::Validation(ValidationError::address_check(format!(
+            "--signer-delegated: {DELEGATED_SIGNER_ADDRESS_REASON}"
+        )))
     })
 }
 
@@ -3345,18 +3318,11 @@ fn resolve_policy_address_override_or_registry(
     if let Some(explicit) = policy_override {
         return Ok(explicit.clone());
     }
-    let registry = VerifierRegistry::open().map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("could not open verifier registry: {e}"),
-        })
-    })?;
+    let registry = open_verifier_registry()?;
     getter(&registry, network_passphrase).ok_or_else(|| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!(
-                "no {kind} policy deployed for network '{network_passphrase}'; \
-                 run: {deploy_verb} (or pass --policy)"
-            ),
-        })
+        WalletError::Validation(ValidationError::address_check(format!(
+            "network: no {kind} policy deployed; run: {deploy_verb} (or pass --policy)"
+        )))
     })
 }
 
@@ -3369,19 +3335,19 @@ fn resolve_policy_address_override_or_registry(
 /// unambiguously.
 fn parse_weighted_signer_flag(spec: &str) -> Result<(String, u32), WalletError> {
     let (identity, weight_str) = spec.rsplit_once('=').ok_or_else(|| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("'{spec}': expected '<identity>=<weight>'"),
-        })
+        WalletError::Validation(ValidationError::address_check(
+            "a --weighted-signer-* value must have the form <identity>=<weight>",
+        ))
     })?;
     let weight = weight_str.parse::<u32>().map_err(|_| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("'{spec}': weight '{weight_str}' is not a valid u32"),
-        })
+        WalletError::Validation(ValidationError::address_check(
+            "a --weighted-signer-* weight must be a u32",
+        ))
     })?;
     if identity.is_empty() {
-        return Err(WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("'{spec}': identity must not be empty"),
-        }));
+        return Err(WalletError::Validation(ValidationError::address_check(
+            "a --weighted-signer-* identity must not be empty",
+        )));
     }
     Ok((identity.to_owned(), weight))
 }
@@ -3393,50 +3359,38 @@ fn resolve_weighted_webauthn_key_data(
     creds_mgr: &CredentialsManager,
     credential_name: &str,
 ) -> Result<Vec<u8>, WalletError> {
-    let metadata = creds_mgr.show(credential_name).map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("--weighted-signer-webauthn '{credential_name}': {e}"),
-        })
+    let metadata = creds_mgr.show(credential_name).map_err(|_| {
+        WalletError::Validation(ValidationError::address_check("--weighted-signer-webauthn names a passkey credential that cannot be read; `stellar-agent credentials list` shows the registered credentials"))
     })?;
 
     if metadata.public_key_sec1_b64.is_empty() {
-        return Err(WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!(
-                "--weighted-signer-webauthn '{credential_name}': credential is missing \
-                 public_key_sec1_b64 (delete and re-register)"
-            ),
-        }));
+        return Err(WalletError::Validation(ValidationError::address_check(
+            "--weighted-signer-webauthn: credential is missing public_key_sec1_b64 (delete and re-register)",
+        )));
     }
 
     let pubkey_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&metadata.public_key_sec1_b64)
         .map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!(
-                    "--weighted-signer-webauthn '{credential_name}': public_key_sec1_b64 \
-                     is not valid base64url"
-                ),
-            })
+            WalletError::Validation(ValidationError::address_check(
+                "--weighted-signer-webauthn: public_key_sec1_b64 is not valid base64url",
+            ))
         })?;
     if pubkey_bytes.len() != 65 {
-        return Err(WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!(
-                "--weighted-signer-webauthn '{credential_name}': public_key_sec1_b64 decodes \
-                 to {} bytes, expected 65",
+        return Err(WalletError::Validation(ValidationError::address_check(
+            format!(
+                "--weighted-signer-webauthn: public_key_sec1_b64 decodes to {} bytes, expected 65",
                 pubkey_bytes.len()
             ),
-        }));
+        )));
     }
 
     let credential_id_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&metadata.credential_id_b64url)
         .map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!(
-                    "--weighted-signer-webauthn '{credential_name}': credential_id_b64url \
-                     is not valid base64url"
-                ),
-            })
+            WalletError::Validation(ValidationError::address_check(
+                "--weighted-signer-webauthn: credential_id_b64url is not valid base64url",
+            ))
         })?;
 
     // pubkey_data = pubkey_65_bytes || credential_id_bytes, per the OZ
@@ -3452,11 +3406,9 @@ fn parse_valid_until(s: &str) -> Result<Option<u32>, WalletError> {
     if s.eq_ignore_ascii_case("none") {
         return Ok(None);
     }
-    s.parse::<u32>().map(Some).map_err(|_| {
-        WalletError::Validation(ValidationError::ValidUntilInvalid {
-            input: s.to_owned(),
-        })
-    })
+    s.parse::<u32>()
+        .map(Some)
+        .map_err(|_| WalletError::Validation(ValidationError::ValidUntilInvalid))
 }
 
 /// Accepted `--context` grammar, embedded verbatim in every parse error so the
@@ -3513,9 +3465,7 @@ fn parse_rule_context(s: &str) -> Result<RuleContext, WalletError> {
         return Ok(RuleContext::CreateContract { wasm_hash });
     }
 
-    Err(config_err(format!(
-        "unknown context '{s}'; {CONTEXT_GRAMMAR}"
-    )))
+    Err(config_err(format!("unknown context; {CONTEXT_GRAMMAR}")))
 }
 
 /// Builds a read-only [`ContextRuleManager`] (no signing, no divergence check).
@@ -3648,6 +3598,22 @@ mod tests {
     )]
 
     use super::*;
+    use stellar_agent_test_support::rejected_value::{assert_refusal_text, capture_refusal};
+
+    #[test]
+    fn valid_until_seed_input_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+        let marker = seed_marker();
+        let error = parse_valid_until(&marker).expect_err("a seed is not a ledger sequence");
+        assert_no_marker(&error, &marker);
+        assert_eq!(error.code(), "validation.valid_until_invalid");
+        let json =
+            serde_json::to_string(&stellar_agent_core::envelope::Envelope::<()>::err(&error))
+                .unwrap();
+        assert!(!json.contains(&marker));
+        assert!(json.contains("--valid-until"));
+    }
+
     use clap::Parser;
     use serial_test::serial;
     use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
@@ -3667,8 +3633,8 @@ mod tests {
             signer_webauthn_count: 1,
             signer_ed25519_count: 1,
             valid_until: None,
-            pinned_verifier_wasm_hashes_first8: vec![],
-            pinned_policy_wasm_hashes_first8: vec![],
+            pinned_verifier_wasm_hashes: vec![],
+            pinned_policy_wasm_hashes: vec![],
             mutable_override: false,
             unknown_override: false,
             pinned_verifier_executable_refs: vec![],
@@ -3687,8 +3653,9 @@ mod tests {
     }
 
     /// The executable-reference lists are omitted when empty, serialised
-    /// aligned with the first-8 lists when present, and default to empty for
-    /// envelopes without them.
+    /// aligned with the hash lists when present, and default to empty for
+    /// envelopes without them. Every hash, the resolved hash of a reference
+    /// pin included, is serialised in full and no `_first8` field appears.
     #[test]
     fn create_result_executable_refs_are_optional_and_aligned() {
         use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
@@ -3708,17 +3675,23 @@ mod tests {
             signer_webauthn_count: 1,
             signer_ed25519_count: 0,
             valid_until: None,
-            pinned_verifier_wasm_hashes_first8: vec![
-                "1111111111111111".to_owned(),
-                "4242424242424242".to_owned(),
+            pinned_verifier_wasm_hashes: vec![
+                WasmHashPin::new([0x11; 32]),
+                WasmHashPin::new([0x42; 32]),
             ],
-            pinned_policy_wasm_hashes_first8: vec![],
+            pinned_policy_wasm_hashes: vec![],
             mutable_override: true,
             unknown_override: false,
             pinned_verifier_executable_refs: vec![],
             pinned_policy_executable_refs: vec![],
         };
         let without = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            without["pinned_verifier_wasm_hashes"],
+            serde_json::json!(["11".repeat(32), "42".repeat(32)])
+        );
+        assert!(without.get("pinned_verifier_wasm_hashes_first8").is_none());
+        assert!(without.get("pinned_policy_wasm_hashes_first8").is_none());
         assert!(without.get("pinned_verifier_executable_refs").is_none());
         assert!(without.get("pinned_policy_executable_refs").is_none());
         let legacy: CreateResult = serde_json::from_value(without).unwrap();
@@ -3731,8 +3704,13 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(
-            with["pinned_verifier_executable_refs"][1]["resolved_hash_first8"],
-            "4242424242424242"
+            with["pinned_verifier_executable_refs"][1]["resolved_hash"],
+            "42".repeat(32)
+        );
+        assert!(
+            with["pinned_verifier_executable_refs"][1]
+                .get("resolved_hash_first8")
+                .is_none()
         );
         assert_eq!(with["pinned_verifier_executable_refs"][1]["tag"], "v1");
         assert!(with.get("pinned_policy_executable_refs").is_none());
@@ -4235,7 +4213,13 @@ mod tests {
     #[test]
     #[serial]
     fn webauthn_registry_lookup_via_from_defaults_readonly() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let passkeys_dir = dir.path().join("passkeys");
         std::fs::create_dir_all(&passkeys_dir).unwrap();
         std::fs::write(passkeys_dir.join("project-a.toml"), PASSKEY_PROJECT_A_TOML).unwrap();
@@ -4523,10 +4507,10 @@ mod tests {
                 rule_id: 7,
                 verifier_pin_status,
                 policy_pin_status,
-                pinned_verifier_first8: vec![],
-                pinned_policy_first8: vec![],
-                observed_verifier_first8: vec![],
-                observed_policy_first8: vec![],
+                pinned_verifier_hashes: vec![],
+                pinned_policy_hashes: vec![],
+                observed_verifier_hashes: vec![],
+                observed_policy_hashes: vec![],
                 observed_verifier_executable: vec![],
                 observed_policy_executable: vec![],
                 pinned_verifier_executable_refs: vec![],
@@ -4553,10 +4537,10 @@ mod tests {
             rule_id: 2,
             verifier_pin_status: PinStatus::Match,
             policy_pin_status: PinStatus::Match,
-            pinned_verifier_first8: vec!["ab12cd34".to_owned()],
-            pinned_policy_first8: vec!["ef56gh78".to_owned()],
-            observed_verifier_first8: vec!["ab12cd34".to_owned()],
-            observed_policy_first8: vec!["ef56gh78".to_owned()],
+            pinned_verifier_hashes: vec![WasmHashPin::new([0xab; 32])],
+            pinned_policy_hashes: vec![WasmHashPin::new([0xef; 32])],
+            observed_verifier_hashes: vec![Some(WasmHashPin::new([0xab; 32]))],
+            observed_policy_hashes: vec![Some(WasmHashPin::new([0xef; 32]))],
             observed_verifier_executable: vec![],
             observed_policy_executable: vec![],
             pinned_verifier_executable_refs: vec![],
@@ -4572,7 +4556,10 @@ mod tests {
 
         assert_eq!(round_trip.verifier_pin_status, PinStatus::Match);
         assert_eq!(round_trip.policy_pin_status, PinStatus::Match);
-        assert_eq!(round_trip.pinned_verifier_first8, vec!["ab12cd34"]);
+        assert_eq!(
+            round_trip.pinned_verifier_hashes,
+            vec![WasmHashPin::new([0xab; 32])]
+        );
         assert_eq!(round_trip.chain_id, "stellar:testnet");
         assert!(!round_trip.mutable_override);
         assert!(!round_trip.unknown_override);
@@ -4599,7 +4586,7 @@ mod tests {
     }
 
     /// A verifier pinned to an external reference reports the pin and the
-    /// observed reference summary, aligned with the first-8 lists.
+    /// observed reference summary, aligned with the hash lists.
     #[test]
     fn verify_pins_result_carries_external_reference_executables() {
         let pin = ExecutableRefPin {
@@ -4609,20 +4596,22 @@ mod tests {
                 ),
             tag: "verifier-v1".to_owned(),
             ref_key_hex: "ab".repeat(32),
-            resolved_hash_first8: "0102030405060708".to_owned(),
+            resolved_hash: WasmHashPin::parse(&"0102030405060708".repeat(4)).unwrap(),
         };
-        let summary = "external reference owner GAAAA...AAWHF tag \"verifier-v1\" \
-                       resolved 0102030405060708";
+        let summary = format!(
+            "external reference owner GAAAA...AAWHF tag \"verifier-v1\" resolved {}",
+            "0102030405060708".repeat(4)
+        );
         let result = VerifyPinsResult {
             smart_account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
             rule_id: 3,
             verifier_pin_status: PinStatus::Match,
             policy_pin_status: PinStatus::Match,
-            pinned_verifier_first8: vec!["0102030405060708".to_owned()],
-            pinned_policy_first8: vec!["ef56ab78".to_owned()],
-            observed_verifier_first8: vec!["0102030405060708".to_owned()],
-            observed_policy_first8: vec!["ef56ab78".to_owned()],
-            observed_verifier_executable: vec![Some(summary.to_owned())],
+            pinned_verifier_hashes: vec![WasmHashPin::new([0x01; 32])],
+            pinned_policy_hashes: vec![WasmHashPin::new([0xef; 32])],
+            observed_verifier_hashes: vec![Some(WasmHashPin::new([0x01; 32]))],
+            observed_policy_hashes: vec![Some(WasmHashPin::new([0xef; 32]))],
+            observed_verifier_executable: vec![Some(summary.clone())],
             observed_policy_executable: vec![None],
             pinned_verifier_executable_refs: vec![Some(pin.clone())],
             pinned_policy_executable_refs: vec![],
@@ -4661,6 +4650,43 @@ mod tests {
         assert!(round_trip.pinned_policy_executable_refs.is_empty());
     }
 
+    /// A drifted contract with no Wasm code is reported with a `null` observed
+    /// hash beside its `"no code"` executable summary, never as a zero hash.
+    #[test]
+    fn verify_pins_result_reports_absent_code_as_null() {
+        let result = VerifyPinsResult {
+            smart_account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+            rule_id: 5,
+            verifier_pin_status: PinStatus::Drift,
+            policy_pin_status: PinStatus::Drift,
+            pinned_verifier_hashes: vec![WasmHashPin::new([0xaa; 32])],
+            pinned_policy_hashes: vec![WasmHashPin::new([0xef; 32])],
+            observed_verifier_hashes: vec![None],
+            observed_policy_hashes: vec![None],
+            observed_verifier_executable: vec![Some("no code".to_owned())],
+            observed_policy_executable: vec![Some("no code".to_owned())],
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
+            mutable_override: false,
+            unknown_override: false,
+            unavailable_reason: None,
+            chain_id: "stellar:testnet".to_owned(),
+        };
+
+        let json = serde_json::to_value(&result).unwrap();
+        for field in ["observed_verifier_hashes", "observed_policy_hashes"] {
+            assert_eq!(json[field], serde_json::json!([null]), "{field}");
+        }
+        for field in ["observed_verifier_executable", "observed_policy_executable"] {
+            assert_eq!(json[field], serde_json::json!(["no code"]), "{field}");
+        }
+        assert!(!json.to_string().contains(&"0".repeat(64)), "{json}");
+
+        let round_trip: VerifyPinsResult = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip.observed_verifier_hashes, vec![None]);
+        assert_eq!(round_trip.observed_policy_hashes, vec![None]);
+    }
+
     /// An envelope without the executable fields deserialises with them empty.
     #[test]
     fn verify_pins_result_without_executable_fields_deserialises_empty() {
@@ -4669,10 +4695,10 @@ mod tests {
             "rule_id": 2,
             "verifier_pin_status": "match",
             "policy_pin_status": "no_contracts",
-            "pinned_verifier_first8": ["ab12cd34"],
-            "pinned_policy_first8": [],
-            "observed_verifier_first8": ["ab12cd34"],
-            "observed_policy_first8": [],
+            "pinned_verifier_hashes": ["ab12cd34".repeat(8)],
+            "pinned_policy_hashes": [],
+            "observed_verifier_hashes": ["ab12cd34".repeat(8)],
+            "observed_policy_hashes": [],
             "mutable_override": false,
             "unknown_override": false,
             "chain_id": "stellar:testnet",
@@ -4691,10 +4717,10 @@ mod tests {
             rule_id: 1,
             verifier_pin_status: PinStatus::Unavailable,
             policy_pin_status: PinStatus::Unavailable,
-            pinned_verifier_first8: vec![],
-            pinned_policy_first8: vec![],
-            observed_verifier_first8: vec![],
-            observed_policy_first8: vec![],
+            pinned_verifier_hashes: vec![],
+            pinned_policy_hashes: vec![],
+            observed_verifier_hashes: vec![],
+            observed_policy_hashes: vec![],
             observed_verifier_executable: vec![],
             observed_policy_executable: vec![],
             pinned_verifier_executable_refs: vec![],
@@ -4725,10 +4751,10 @@ mod tests {
             rule_id: 4,
             verifier_pin_status: PinStatus::Drift,
             policy_pin_status: PinStatus::NoPin,
-            pinned_verifier_first8: vec!["aaaaaaaa".to_owned()],
-            pinned_policy_first8: vec![],
-            observed_verifier_first8: vec!["bbbbbbbb".to_owned()],
-            observed_policy_first8: vec![],
+            pinned_verifier_hashes: vec![WasmHashPin::new([0xaa; 32])],
+            pinned_policy_hashes: vec![],
+            observed_verifier_hashes: vec![Some(WasmHashPin::new([0xbb; 32]))],
+            observed_policy_hashes: vec![],
             observed_verifier_executable: vec![],
             observed_policy_executable: vec![],
             pinned_verifier_executable_refs: vec![],
@@ -5134,10 +5160,10 @@ mod tests {
             rule_id: 3,
             verifier_pin_status: PinStatus::Match,
             policy_pin_status: PinStatus::NoContracts,
-            pinned_verifier_first8: vec!["deadbeef".to_owned()],
-            pinned_policy_first8: vec![],
-            observed_verifier_first8: vec!["deadbeef".to_owned()],
-            observed_policy_first8: vec![],
+            pinned_verifier_hashes: vec![WasmHashPin::new([0xde; 32])],
+            pinned_policy_hashes: vec![],
+            observed_verifier_hashes: vec![Some(WasmHashPin::new([0xde; 32]))],
+            observed_policy_hashes: vec![],
             observed_verifier_executable: vec![],
             observed_policy_executable: vec![],
             pinned_verifier_executable_refs: vec![],
@@ -5310,16 +5336,12 @@ mod tests {
             .finish();
 
         // Emit the same structured event that `list_rules_run` emits at the
-        // dispatch site. The account field is redacted per the redaction rules.
-        let account_redacted = stellar_agent_core::observability::redact_strkey_first5_last5(
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-        );
+        // dispatch site.
         let network = TargetNetwork::Testnet;
         tracing::subscriber::with_default(subscriber, || {
             tracing::callsite::rebuild_interest_cache();
             tracing::info!(
                 command = "smart-account rules list",
-                account = tracing::field::display(&account_redacted),
                 network = %network,
                 "smart-account rules list: dispatching to list-rules handler"
             );
@@ -5615,122 +5637,182 @@ mod tests {
 
     /// `--kind raw` without `--policy-address` is refused before any network
     /// call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn add_policy_raw_requires_policy_address() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::Raw);
         args.install_param = Some("AAAAAA==".to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(code, 1, "raw mode without --policy-address must be refused");
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--kind raw requires --policy-address"],
+        );
     }
 
     /// `--kind spending-limit` without `--limit` is refused before any network
     /// call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn add_policy_spending_limit_requires_limit() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.period = Some(17_280);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "spending-limit mode without --limit must be refused"
         );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--kind spending-limit requires --limit"],
+        );
     }
 
     /// `--kind spending-limit` combined with the raw-mode `--policy-address`
     /// flag is refused (mode conflict) before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn add_policy_spending_limit_rejects_raw_flags() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.limit = Some(10_000_000);
         args.period = Some(17_280);
         args.policy_address = Some(ADD_POLICY_TEST_ACCOUNT.to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "spending-limit mode must reject the raw --policy-address flag"
         );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--policy-address / --install-param", "--kind raw"],
+        );
     }
 
     /// `--kind spending-limit` with no `--policy` override and no registered
     /// policy for the network fails closed before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn add_policy_spending_limit_missing_registry_fails_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry_path = dir.path().join("networks.toml");
-
-        // SAFETY: serialised by #[serial]; no concurrent env access.
-        #[allow(unsafe_code, reason = "test-only env override; #[serial] serialises")]
-        unsafe {
-            std::env::set_var(
-                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-                &registry_path,
-            );
-        }
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let registry_path = fixture.sandbox.path().join("missing-networks.toml");
+        let _registry = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+            stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+            Some(registry_path.as_os_str()),
+        );
 
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.limit = Some(10_000_000);
         args.period = Some(17_280);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
-
-        // SAFETY: same as set; serialised by #[serial].
-        #[allow(unsafe_code, reason = "test-only env cleanup; #[serial] serialises")]
-        unsafe {
-            std::env::remove_var(
-                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-            );
-        }
 
         assert_eq!(
             code, 1,
             "spending-limit mode must fail closed when no policy is registered"
         );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &[
+                "no spending-limit policy deployed",
+                "smart-account deploy-spending-limit-policy",
+            ],
+        );
     }
 
     /// `--kind spending-limit --limit 0` is refused before any registry lookup
     /// or network call (OZ `InvalidLimitOrPeriod` pre-flight).
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn add_policy_spending_limit_rejects_zero_limit() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.limit = Some(0);
         args.period = Some(17_280);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(code, 1, "limit == 0 must be refused");
+        fixture.assert_refusal(
+            Some("sa.spending_limit_install_refused"),
+            &["--limit must be positive"],
+        );
     }
 
     /// `--kind spending-limit --limit -1` is refused before any registry
     /// lookup or network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn add_policy_spending_limit_rejects_negative_limit() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.limit = Some(-1);
         args.period = Some(17_280);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(code, 1, "negative limit must be refused");
+        fixture.assert_refusal(
+            Some("sa.spending_limit_install_refused"),
+            &["--limit must be positive"],
+        );
     }
 
     /// `--kind spending-limit --period 0` is refused before any registry
     /// lookup or network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn add_policy_spending_limit_rejects_zero_period() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::SpendingLimit);
         args.limit = Some(10_000_000);
         args.period = Some(0);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(code, 1, "period == 0 must be refused");
+        fixture.assert_refusal(
+            Some("sa.spending_limit_install_refused"),
+            &["--period must be non-zero"],
+        );
     }
 
     // ── add-policy --kind simple-threshold pre-flight tests ───────────────────
 
     /// `--kind simple-threshold` without `--threshold` is refused before any
     /// network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn add_policy_simple_threshold_requires_threshold() {
-        let args = add_policy_args(PolicyKind::SimpleThreshold);
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let mut args = add_policy_args(PolicyKind::SimpleThreshold);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "simple-threshold mode without --threshold must be refused"
+        );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--kind simple-threshold requires --threshold"],
         );
     }
 
@@ -5738,59 +5820,77 @@ mod tests {
     /// lookup (the builder's client-side `InvalidThreshold` pre-flight fires
     /// even when `--policy` is supplied, so no registry access is needed for
     /// this assertion).
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn add_policy_simple_threshold_rejects_zero_threshold() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::SimpleThreshold);
         args.threshold = Some(0);
         args.policy = Some(ADD_POLICY_TEST_ACCOUNT.to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
+        args.policy = Some(stellar_strkey::Contract([8; 32]).to_string().to_string());
         let code = add_policy_run(&args).await;
         assert_eq!(code, 1, "threshold == 0 must be refused");
+        fixture.assert_refusal(
+            Some("sa.simple_threshold_install_refused"),
+            &["--threshold must be non-zero"],
+        );
     }
 
     /// `--kind simple-threshold` combined with the raw-mode `--policy-address`
     /// flag is refused (mode conflict) before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn add_policy_simple_threshold_rejects_raw_flags() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::SimpleThreshold);
         args.threshold = Some(2);
         args.policy_address = Some(ADD_POLICY_TEST_ACCOUNT.to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "simple-threshold mode must reject the raw --policy-address flag"
         );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--weighted-signer-* are only valid with the matching --kind"],
+        );
     }
 
     /// `--kind simple-threshold` with no `--policy` override and no
     /// registered policy for the network fails closed before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn add_policy_simple_threshold_missing_registry_fails_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry_path = dir.path().join("networks.toml");
-
-        #[allow(unsafe_code, reason = "test-only env override; #[serial] serialises")]
-        unsafe {
-            std::env::set_var(
-                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-                &registry_path,
-            );
-        }
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let registry_path = fixture.sandbox.path().join("missing-networks.toml");
+        let _registry = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+            stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+            Some(registry_path.as_os_str()),
+        );
 
         let mut args = add_policy_args(PolicyKind::SimpleThreshold);
         args.threshold = Some(2);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
-
-        #[allow(unsafe_code, reason = "test-only env cleanup; #[serial] serialises")]
-        unsafe {
-            std::env::remove_var(
-                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-            );
-        }
 
         assert_eq!(
             code, 1,
             "simple-threshold mode must fail closed when no policy is registered"
+        );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &[
+                "no simple-threshold policy deployed",
+                "smart-account deploy-policy --kind simple-threshold",
+            ],
         );
     }
 
@@ -5798,100 +5898,155 @@ mod tests {
 
     /// `--kind weighted-threshold` without `--threshold` is refused before any
     /// network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn add_policy_weighted_threshold_requires_threshold() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=1")];
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
+        args.weighted_signer_delegated =
+            vec![format!("{}=1", stellar_strkey::ed25519::PublicKey([9; 32]))];
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "weighted-threshold mode without --threshold must be refused"
         );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["--kind weighted-threshold requires --threshold"],
+        );
     }
 
     /// `--kind weighted-threshold` without any `--weighted-signer-*` flag is
     /// refused before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn add_policy_weighted_threshold_requires_a_signer() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.threshold = Some(1);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "weighted-threshold mode without any weighted-signer flag must be refused"
         );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &[
+                "requires at least one",
+                "--weighted-signer-delegated or --weighted-signer-webauthn",
+            ],
+        );
     }
 
     /// `--kind weighted-threshold` combined with the raw-mode `--policy-address`
     /// flag is refused (mode conflict) before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn add_policy_weighted_threshold_rejects_raw_flags() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.threshold = Some(1);
         args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=1")];
         args.policy_address = Some(ADD_POLICY_TEST_ACCOUNT.to_owned());
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
+        args.weighted_signer_delegated =
+            vec![format!("{}=1", stellar_strkey::ed25519::PublicKey([9; 32]))];
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "weighted-threshold mode must reject the raw --policy-address flag"
         );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &[
+                "--policy-address / --install-param / --limit / --period",
+                "only valid with the matching --kind",
+            ],
+        );
     }
 
     /// A malformed `--weighted-signer-delegated` flag (missing `=<weight>`) is
     /// refused before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn add_policy_weighted_threshold_rejects_malformed_signer_flag() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.threshold = Some(1);
         args.weighted_signer_delegated = vec![ADD_POLICY_TEST_ACCOUNT_G.to_owned()];
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
+        args.policy = Some(stellar_strkey::Contract([8; 32]).to_string().to_string());
         let code = add_policy_run(&args).await;
         assert_eq!(
             code, 1,
             "a weighted-signer flag missing '=<weight>' must be refused"
         );
+        fixture.assert_refusal(Some("validation.address_invalid"), &["<identity>=<weight>"]);
     }
 
     /// A non-numeric weight suffix is refused before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn add_policy_weighted_threshold_rejects_non_numeric_weight() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.threshold = Some(1);
         args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=not-a-number")];
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
+        args.policy = Some(stellar_strkey::Contract([8; 32]).to_string().to_string());
         let code = add_policy_run(&args).await;
         assert_eq!(code, 1, "a non-numeric weight must be refused");
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &["weight must be a u32"],
+        );
     }
 
     /// `--kind weighted-threshold` with no `--policy` override and no
     /// registered policy for the network fails closed before any network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn add_policy_weighted_threshold_missing_registry_fails_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry_path = dir.path().join("networks.toml");
-
-        #[allow(unsafe_code, reason = "test-only env override; #[serial] serialises")]
-        unsafe {
-            std::env::set_var(
-                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-                &registry_path,
-            );
-        }
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let registry_path = fixture.sandbox.path().join("missing-networks.toml");
+        let _registry = stellar_agent_test_support::env_guard::ScopedEnvVar::new(
+            stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+            Some(registry_path.as_os_str()),
+        );
 
         let mut args = add_policy_args(PolicyKind::WeightedThreshold);
         args.threshold = Some(1);
         args.weighted_signer_delegated = vec![format!("{ADD_POLICY_TEST_ACCOUNT_G}=1")];
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
+        args.weighted_signer_delegated =
+            vec![format!("{}=1", stellar_strkey::ed25519::PublicKey([9; 32]))];
         let code = add_policy_run(&args).await;
-
-        #[allow(unsafe_code, reason = "test-only env cleanup; #[serial] serialises")]
-        unsafe {
-            std::env::remove_var(
-                stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-            );
-        }
 
         assert_eq!(
             code, 1,
             "weighted-threshold mode must fail closed when no policy is registered"
+        );
+        fixture.assert_refusal(
+            Some("validation.address_invalid"),
+            &[
+                "no weighted-threshold policy deployed",
+                "smart-account deploy-policy --kind weighted-threshold",
+            ],
         );
     }
 
@@ -5995,9 +6150,11 @@ mod tests {
 
     /// An invalid `--source-account` G-strkey is refused before any manager
     /// construction or network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn get_spending_limit_run_rejects_invalid_source_account() {
-        let args = GetSpendingLimitArgs {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let mut args = GetSpendingLimitArgs {
             common: CommonRulesReadArgs {
                 profile: None,
                 account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
@@ -6009,8 +6166,12 @@ mod tests {
             rule_id: 1,
             source_account: "not-a-valid-g-strkey".to_owned(),
         };
+        args.common.profile = None;
+        args.common.rpc_url = Some(fixture.rpc.https_uri());
+        args.common.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = get_spending_limit_run(&args).await;
         assert_eq!(code, 1, "invalid --source-account must be refused");
+        fixture.assert_refusal(Some("validation.address_invalid"), &["--source-account"]);
     }
 
     // ── set-spending-limit ────────────────────────────────────────────────────
@@ -6107,19 +6268,37 @@ mod tests {
     }
 
     /// `--limit 0` is refused before any signer resolution or network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn set_spending_limit_rejects_zero_limit() {
-        let args = set_spending_limit_args(0);
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let mut args = set_spending_limit_args(0);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = set_spending_limit_run(&args).await;
         assert_eq!(code, 1, "limit == 0 must be refused");
+        fixture.assert_refusal(
+            Some("sa.spending_limit_install_refused"),
+            &["--limit must be positive"],
+        );
     }
 
     /// `--limit -1` is refused before any signer resolution or network call.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn set_spending_limit_rejects_negative_limit() {
-        let args = set_spending_limit_args(-1);
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
+        let mut args = set_spending_limit_args(-1);
+        args.profile = None;
+        args.rpc_url = Some(fixture.rpc.https_uri());
+        args.account = stellar_strkey::Contract([7; 32]).to_string().to_string();
         let code = set_spending_limit_run(&args).await;
         assert_eq!(code, 1, "negative limit must be refused");
+        fixture.assert_refusal(
+            Some("sa.spending_limit_install_refused"),
+            &["--limit must be positive"],
+        );
     }
 
     /// A mainnet profile exits 1 before any request reaches its endpoint.
@@ -6150,7 +6329,13 @@ mod tests {
     #[serial_test::serial]
     async fn set_spending_limit_mainnet_flag_without_profile_reaches_no_endpoint() {
         let rpc = wiremock::MockServer::start().await;
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let mut args = set_spending_limit_args(10_000_000);
@@ -6189,9 +6374,9 @@ mod tests {
             Ok(SmartAccountAddress::Contract(_))
         ));
         match parse_delegated_signer_for_rule(&muxed_strkey()) {
-            Err(WalletError::Validation(ValidationError::AddressInvalid { input })) => {
+            Err(WalletError::Validation(ValidationError::AddressInvalid { field })) => {
                 assert_eq!(
-                    input,
+                    field.as_str(),
                     "--signer-delegated: invalid delegated signer address: expected a G-strkey \
                      or a C-strkey"
                 );
@@ -6247,5 +6432,18 @@ mod tests {
             no_delegated_fallback_refusal(&[], 0, false).is_none(),
             "a rule without External signers needs no fallback"
         );
+    }
+
+    #[test]
+    fn rejected_input_rule_context_helper() {
+        capture_refusal(|| {
+            let error = parse_rule_context("CREDMARKER7").expect_err("unknown context");
+            assert_eq!(error.code(), "validation.config_invalid");
+            let expected = format!(
+                "configuration invalid for '--context': unknown context; {}",
+                CONTEXT_GRAMMAR
+            );
+            assert_refusal_text(&error, &expected);
+        });
     }
 }

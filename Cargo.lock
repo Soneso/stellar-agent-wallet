@@ -107,7 +107,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -118,7 +118,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -510,6 +510,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -592,7 +598,7 @@ dependencies = [
  "arrayvec",
  "cc",
  "cfg-if",
- "constant_time_eq",
+ "constant_time_eq 0.4.2",
  "cpufeatures 0.3.0",
 ]
 
@@ -705,9 +711,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.64"
+version = "1.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dad887fd958be91b5098c0248def011f4523ab786cd411be668777e55063501f"
+checksum = "33ef9e3e8154a45c7a95cff4c1299702106ad94062d7bb85fdc5d3a5afd91d45"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -942,6 +948,15 @@ name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb6feb175df65d0a3ccd3e73484e940d0ac664e8034f0519fd49a93db3071d9"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "core-foundation"
@@ -1313,7 +1328,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1471,7 +1486,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1534,9 +1549,9 @@ dependencies = [
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.9"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "flate2"
@@ -1578,9 +1593,9 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -1938,15 +1953,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest 0.11.3",
-]
-
-[[package]]
-name = "home"
-version = "0.5.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
-dependencies = [
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2536,9 +2542,9 @@ dependencies = [
 
 [[package]]
 name = "libflate"
-version = "2.3.0"
+version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd96e993e5f3368b0cb8497dae6c860c22af8ff18388c61c6c0b86c58d86b5df"
+checksum = "561a8da1a50e1428d3c51321dafeca849df992a5bb67720c386131234caba82e"
 dependencies = [
  "adler32",
  "crc32fast",
@@ -2575,9 +2581,9 @@ dependencies = [
 
 [[package]]
 name = "libsodium-sys-stable"
-version = "1.24.0"
+version = "1.24.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b04bf6da2c98b727af37ab62cb505f4d751b975b034a9b9ad491d333b0564e"
+checksum = "b6513f7ca2de7338a74fab1e69ffaee2bf9897d111d571915355251e0ca661f5"
 dependencies = [
  "cc",
  "libc",
@@ -2678,9 +2684,9 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "minisign-verify"
-version = "0.2.5"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
+checksum = "871285dc19d8d0ebe0eef3d0e99a205f2a71363b122632cbbfa4a6c370a960ce"
 
 [[package]]
 name = "miniz_oxide"
@@ -2716,6 +2722,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "no-std-compat"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2746,7 +2764,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3134,9 +3152,9 @@ dependencies = [
 
 [[package]]
 name = "pkg-config"
-version = "0.3.33"
+version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "poly1305"
@@ -3688,15 +3706,15 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.0",
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4273,7 +4291,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4421,13 +4439,12 @@ dependencies = [
 
 [[package]]
 name = "soroban-spec"
-version = "28.0.0"
+version = "30.0.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f48c8e183fc140ccd89e1fe1663cc605fb18641967c0bb591f64887599fde59"
+checksum = "7b301fc1006c34f9d713960c5fd9d74490824ef3aa4b8eca27e780509e8324c5"
 dependencies = [
  "base64 0.22.1",
- "sha2 0.10.9",
- "stellar-xdr 28.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 1.0.69",
  "wasmparser 0.116.1",
 ]
@@ -4450,9 +4467,9 @@ dependencies = [
 
 [[package]]
 name = "soroban-spec-tools"
-version = "28.0.0"
+version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bba48e39e7eab8eda92435231d40535eb9b8f73719f3e8fac522b39f366cdbc4"
+checksum = "5083fd4e05d3ac3fdc509511a74a4cc32a30c0db284348e1833ffc7447d40f64"
 dependencies = [
  "base64 0.21.7",
  "escape-bytes",
@@ -4462,9 +4479,9 @@ dependencies = [
  "itertools 0.10.5",
  "serde",
  "serde_json",
- "soroban-spec 28.0.0",
- "stellar-strkey 0.0.16",
- "stellar-xdr 28.0.0",
+ "soroban-spec 30.0.0-rc.1",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 1.0.69",
  "wasm-encoder",
  "wasmparser 0.116.1",
@@ -4531,6 +4548,7 @@ dependencies = [
  "serde_json",
  "stellar-agent-network",
  "stellar-agent-sep10",
+ "stellar-agent-test-support",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -4571,7 +4589,7 @@ dependencies = [
  "stellar-agent-test-support",
  "stellar-agent-toolsets-runtime",
  "stellar-agent-webauthn-bridge",
- "stellar-strkey 0.0.18",
+ "stellar-strkey 1.0.0",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
@@ -4594,7 +4612,10 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "keyring-core",
+ "p256",
  "rand_core 0.6.4",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "serial_test",
@@ -4603,11 +4624,12 @@ dependencies = [
  "stellar-agent-loopback-http",
  "stellar-agent-test-support",
  "stellar-agent-toolsets-runtime",
- "stellar-xdr 28.0.0",
+ "stellar-xdr 30.0.0",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tower-http 0.7.0",
  "tracing",
@@ -4624,8 +4646,8 @@ dependencies = [
  "stellar-agent-network",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "wiremock",
@@ -4641,7 +4663,9 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "hex",
+ "hmac 0.13.0",
  "keyring-core",
+ "libc",
  "rand_core 0.6.4",
  "reqwest 0.12.28",
  "rpassword",
@@ -4671,9 +4695,11 @@ dependencies = [
  "stellar-agent-toolsets-install",
  "stellar-agent-toolsets-runtime",
  "stellar-agent-webauthn-bridge",
+ "stellar-agent-windows-identity",
+ "stellar-agent-xdr-limits",
  "stellar-baselib",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "syn 2.0.118",
  "tar",
  "tempfile",
@@ -4702,20 +4728,26 @@ dependencies = [
  "hmac 0.13.0",
  "inventory",
  "keyring-core",
+ "libc",
+ "p256",
  "proptest",
  "rand_core 0.6.4",
  "region",
+ "rustix",
  "same-file",
  "schemars 1.2.1",
+ "security-framework",
  "serde",
  "serde_json",
  "serial_test",
  "sha2 0.11.0",
+ "stellar-agent-core",
+ "stellar-agent-soroban-auth",
  "stellar-agent-test-support",
  "stellar-agent-windows-identity",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
@@ -4742,13 +4774,14 @@ dependencies = [
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]
@@ -4758,14 +4791,15 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "serial_test",
  "stellar-agent-core",
  "stellar-agent-defi",
  "stellar-agent-network",
  "stellar-agent-smart-account",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -4779,6 +4813,7 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "serial_test",
  "sha2 0.11.0",
  "stellar-agent-core",
  "stellar-agent-defi",
@@ -4786,8 +4821,8 @@ dependencies = [
  "stellar-agent-smart-account",
  "stellar-agent-test-support",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -4807,6 +4842,8 @@ dependencies = [
  "serde_json",
  "serial_test",
  "stellar-agent-core",
+ "stellar-agent-headless-keyring",
+ "stellar-agent-test-support",
  "stellar-agent-windows-identity",
  "tempfile",
  "thiserror 2.0.21",
@@ -4853,32 +4890,39 @@ dependencies = [
  "stellar-agent-defi",
  "stellar-agent-defindex",
  "stellar-agent-dex",
+ "stellar-agent-headless-keyring",
  "stellar-agent-mcp",
  "stellar-agent-mcp-macros",
  "stellar-agent-mpp",
  "stellar-agent-network",
  "stellar-agent-nonce",
+ "stellar-agent-sep10",
  "stellar-agent-sep43",
  "stellar-agent-sep48",
  "stellar-agent-sep53",
  "stellar-agent-sep7",
  "stellar-agent-smart-account",
+ "stellar-agent-soroban-auth",
  "stellar-agent-stablecoin",
  "stellar-agent-test-support",
  "stellar-agent-toolsets",
+ "stellar-agent-toolsets-install",
  "stellar-agent-toolsets-runtime",
  "stellar-agent-x402",
  "stellar-agent-x402-identity",
+ "stellar-agent-xdr-limits",
  "stellar-baselib",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml_edit 0.25.12+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
  "wiremock",
  "zeroize",
 ]
@@ -4920,8 +4964,8 @@ dependencies = [
  "stellar-agent-xdr-limits",
  "stellar-baselib",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
@@ -4945,6 +4989,7 @@ dependencies = [
  "ed25519-dalek",
  "hmac 0.13.0",
  "http",
+ "http-body-util",
  "jsonrpsee-core",
  "jsonrpsee-http-client",
  "keyring-core",
@@ -4959,13 +5004,15 @@ dependencies = [
  "sha2 0.11.0",
  "stellar-agent-core",
  "stellar-agent-headless-keyring",
+ "stellar-agent-network",
+ "stellar-agent-soroban-auth",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
  "stellar-baselib",
  "stellar-ledger",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "subtle",
  "syn 2.0.118",
  "tempfile",
@@ -4976,6 +5023,7 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "url",
+ "uuid",
  "windows-native-keyring-store",
  "wiremock",
  "zeroize",
@@ -5019,8 +5067,8 @@ dependencies = [
  "stellar-agent-network",
  "stellar-agent-sep5",
  "stellar-agent-test-support",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -5041,9 +5089,11 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2 0.11.0",
+ "stellar-agent-core",
+ "stellar-agent-network",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "wiremock",
@@ -5067,8 +5117,8 @@ dependencies = [
  "stellar-agent-soroban-auth",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -5085,9 +5135,10 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2 0.11.0",
+ "stellar-agent-core",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "wiremock",
@@ -5103,11 +5154,12 @@ dependencies = [
  "serial_test",
  "sha2 0.11.0",
  "soroban-spec-tools",
+ "stellar-agent-core",
  "stellar-agent-network",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -5125,7 +5177,7 @@ dependencies = [
  "hmac 0.13.0",
  "secrecy",
  "sha2 0.11.0",
- "stellar-strkey 0.0.18",
+ "stellar-strkey 1.0.0",
  "thiserror 2.0.21",
  "zeroize",
 ]
@@ -5136,10 +5188,10 @@ version = "0.1.0-alpha.13"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
- "sha2 0.11.0",
+ "stellar-agent-core",
  "stellar-agent-network",
  "stellar-agent-test-support",
- "stellar-strkey 0.0.18",
+ "stellar-strkey 1.0.0",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -5155,8 +5207,8 @@ dependencies = [
  "stellar-agent-network",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -5186,18 +5238,21 @@ dependencies = [
  "stellar-accounts",
  "stellar-agent-core",
  "stellar-agent-network",
+ "stellar-agent-smart-account",
+ "stellar-agent-soroban-auth",
  "stellar-agent-test-support",
  "stellar-agent-xdr-limits",
  "stellar-baselib",
  "stellar-governance",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "webauthn-rs-core",
  "wiremock",
@@ -5215,9 +5270,9 @@ dependencies = [
  "hex",
  "keyring-core",
  "rand_core 0.6.4",
- "reqwest 0.12.28",
  "rmcp",
  "serde_json",
+ "serial_test",
  "sha2 0.11.0",
  "soroban-spec-tools",
  "stellar-agent-core",
@@ -5228,11 +5283,12 @@ dependencies = [
  "stellar-agent-sep48",
  "stellar-agent-smart-account",
  "stellar-agent-test-support",
+ "stellar-agent-toolsets-install",
  "stellar-agent-webauthn-bridge",
  "stellar-baselib",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "tempfile",
  "tokio",
  "url",
@@ -5246,8 +5302,8 @@ version = "0.1.0-alpha.13"
 dependencies = [
  "serde_json",
  "sha2 0.11.0",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
 ]
 
@@ -5263,7 +5319,7 @@ dependencies = [
  "stellar-agent-core",
  "stellar-agent-network",
  "stellar-agent-test-support",
- "stellar-strkey 0.0.18",
+ "stellar-strkey 1.0.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -5276,9 +5332,12 @@ name = "stellar-agent-test-support"
 version = "0.1.0-alpha.13"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "ed25519-dalek",
  "keyring-core",
+ "libc",
  "memchr",
+ "p256",
  "rand_core 0.6.4",
  "regex-lite",
  "reqwest 0.12.28",
@@ -5287,8 +5346,8 @@ dependencies = [
  "sha2 0.11.0",
  "stellar-baselib",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "tempfile",
  "tokio",
  "tracing",
@@ -5315,6 +5374,7 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "hex",
+ "hmac 0.13.0",
  "rand_core 0.6.4",
  "semver",
  "serde",
@@ -5323,27 +5383,34 @@ dependencies = [
  "stellar-agent-core",
  "stellar-agent-test-support",
  "stellar-agent-toolsets",
- "stellar-strkey 0.0.18",
+ "stellar-strkey 1.0.0",
  "subtle",
  "tar",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
 name = "stellar-agent-toolsets-runtime"
 version = "0.1.0-alpha.13"
 dependencies = [
+ "ed25519-dalek",
+ "flate2",
  "serde",
  "serde_json",
+ "serial_test",
  "stellar-agent-core",
  "stellar-agent-test-support",
  "stellar-agent-toolsets",
  "stellar-agent-toolsets-install",
+ "stellar-strkey 1.0.0",
+ "tar",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -5359,6 +5426,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "stellar-agent-approval-ui",
  "stellar-agent-core",
  "stellar-agent-loopback-http",
  "stellar-agent-smart-account",
@@ -5386,7 +5454,6 @@ dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
  "rand_core 0.6.4",
- "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serial_test",
@@ -5397,8 +5464,8 @@ dependencies = [
  "stellar-agent-test-support",
  "stellar-baselib",
  "stellar-rpc-client",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -5417,10 +5484,11 @@ dependencies = [
  "reqwest 0.12.28",
  "serde_json",
  "sha2 0.11.0",
+ "stellar-agent-core",
  "stellar-agent-network",
  "stellar-agent-sep10",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -5432,14 +5500,14 @@ dependencies = [
 name = "stellar-agent-xdr-limits"
 version = "0.1.0-alpha.13"
 dependencies = [
- "stellar-xdr 28.0.0",
+ "stellar-xdr 30.0.0",
 ]
 
 [[package]]
 name = "stellar-baselib"
-version = "0.6.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9b66c47ab1e51d5b504f5360a63ba97b220b871a89337ef3c76a555920e651a"
+checksum = "14640925d6c1f5dd8f3488976392fcb97fbb0d928cf976dffb1cf1f475d5dc7c"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
@@ -5451,8 +5519,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "stellar-strkey 0.0.15",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
 ]
 
 [[package]]
@@ -5466,24 +5534,20 @@ dependencies = [
 
 [[package]]
 name = "stellar-ledger"
-version = "28.0.0"
+version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b378e7301e3a7854e0797fdc125e2285a04770e1ea1ca773dfcac93b0380e980"
+checksum = "70680e399d983e377cd98402f6bfd6bb1742fad5db6cace48220093925e2a845"
 dependencies = [
  "async-trait",
- "byteorder",
- "ed25519-dalek",
  "hex",
- "home",
  "ledger-transport",
  "ledger-transport-hid",
  "reqwest 0.12.28",
  "serde",
- "serde_derive",
  "serde_json",
  "sha2 0.10.9",
- "stellar-strkey 0.0.16",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -5491,9 +5555,9 @@ dependencies = [
 
 [[package]]
 name = "stellar-rpc-client"
-version = "28.0.0"
+version = "30.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "808ecdeac737f975c52e0fd21236a56c02921ead20858dd818b870d63a53edc5"
+checksum = "a97e2088ac568e83bbd7db82c70f225d712903a366c287a6cdfc5f78aa67ebe5"
 dependencies = [
  "clap",
  "hex",
@@ -5506,8 +5570,8 @@ dependencies = [
  "serde_json",
  "serde_with",
  "sha2 0.10.9",
- "stellar-strkey 0.0.18",
- "stellar-xdr 28.0.0",
+ "stellar-strkey 1.0.0",
+ "stellar-xdr 30.0.0",
  "termcolor",
  "termcolor_output",
  "thiserror 1.0.69",
@@ -5526,16 +5590,6 @@ dependencies = [
 
 [[package]]
 name = "stellar-strkey"
-version = "0.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97e1a364048067bfcd24e6f1a93bba43eeb79c16b854596c841c3e8bab0bfa0c"
-dependencies = [
- "crate-git-revision 0.0.6",
- "data-encoding",
-]
-
-[[package]]
-name = "stellar-strkey"
 version = "0.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "084afcb0d458c3d5d5baa2d294b18f881e62cc258ef539d8fdf68be7dbe45520"
@@ -5547,9 +5601,9 @@ dependencies = [
 
 [[package]]
 name = "stellar-strkey"
-version = "0.0.18"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f34ff61c0ca6f1c2b4169e8d1633417bd9225f58b6175e4e317204565d16277"
+checksum = "5038ed2bf4e11842210d118f65791d8ca4747622daddd222338b3d06b6051bc1"
 dependencies = [
  "crate-git-revision 0.0.9",
  "data-encoding",
@@ -5577,9 +5631,9 @@ dependencies = [
 
 [[package]]
 name = "stellar-xdr"
-version = "28.0.0"
+version = "30.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f93d09ff8b9f919b084f664003c4c546ac66a76affd5429460dbe29f4b326f8e"
+checksum = "56f2fb2008b42fc746c0f6b46e375600068dd91f07748e9f1737c6341a2255f2"
 dependencies = [
  "base64 0.22.1",
  "cfg_eval",
@@ -5590,7 +5644,7 @@ dependencies = [
  "serde",
  "serde_with",
  "sha2 0.10.9",
- "stellar-strkey 0.0.13",
+ "stellar-strkey 1.0.0",
 ]
 
 [[package]]
@@ -5685,7 +5739,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6136,9 +6190,9 @@ dependencies = [
 
 [[package]]
 name = "typed-path"
-version = "0.12.3"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
 
 [[package]]
 name = "typenum"
@@ -6194,11 +6248,11 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "ureq"
-version = "3.3.0"
+version = "3.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
+checksum = "3ac5cecf619ca81f66a96482db09687c9f7465af65f4300a8c30cca05bd5a59d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "log",
  "percent-encoding",
  "ureq-proto",
@@ -6207,11 +6261,11 @@ dependencies = [
 
 [[package]]
 name = "ureq-proto"
-version = "0.6.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e994ba84b0bd1b1b0cf92878b7ef898a5c1760108fe7b6010327e274917a808c"
+checksum = "622dce33c252115466d83f63e9744a18f12b4406aae51a01c15ad8fcf1185eb3"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "http",
  "httparse",
  "log",
@@ -6219,9 +6273,9 @@ dependencies = [
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -6599,7 +6653,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7155,15 +7209,21 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.6.0"
+version = "9.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+checksum = "e3476fd497ac8af5b1ec7b51acab7bef380f7e8dd8e0487595bafd839417a302"
 dependencies = [
+ "constant_time_eq 0.6.1",
  "crc32fast",
  "flate2",
+ "getrandom 0.4.3",
  "indexmap 2.14.0",
+ "libc",
  "memchr",
+ "nix",
  "typed-path",
+ "windows-sys 0.61.2",
+ "zeroize",
  "zopfli",
 ]
 

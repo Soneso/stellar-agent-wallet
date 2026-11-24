@@ -54,6 +54,9 @@ fn manager_with_url(
         "test-profile".to_owned(),
         Duration::from_secs(5),
         "stellar:testnet".to_owned(),
+    )
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
     );
     SignersManager::new(config).expect("SignersManager::new must succeed")
 }
@@ -98,7 +101,12 @@ fn write_baseline(
 /// the victim's `(rule_id, smart_account_redacted)` pair because it does not appear
 /// in the attacker's log.
 #[tokio::test]
+#[serial_test::serial]
 async fn wholesale_replacement_with_wrong_account_returns_missing_baseline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let dir = tempfile::tempdir().expect("tempdir must succeed");
     let log_path = dir.path().join("audit.jsonl");
 
@@ -144,10 +152,7 @@ async fn wholesale_replacement_with_wrong_account_returns_missing_baseline() {
         .await;
 
     assert!(
-        matches!(
-            result,
-            Err(SaError::SignerSetMissingBaseline { rule_id: 1, .. })
-        ),
+        matches!(result, Err(SaError::SignerSetMissingBaseline { .. })),
         "wholesale replacement for wrong account must return SignerSetMissingBaseline; got: {result:?}"
     );
 }
@@ -155,7 +160,12 @@ async fn wholesale_replacement_with_wrong_account_returns_missing_baseline() {
 /// A wholesale-replaced log written for a DIFFERENT rule_id is not matched →
 /// `SignerSetMissingBaseline` for the queried rule_id.
 #[tokio::test]
+#[serial_test::serial]
 async fn wholesale_replacement_with_wrong_rule_id_returns_missing_baseline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let dir = tempfile::tempdir().expect("tempdir must succeed");
     let log_path = dir.path().join("audit.jsonl");
 
@@ -189,10 +199,7 @@ async fn wholesale_replacement_with_wrong_rule_id_returns_missing_baseline() {
         .await;
 
     assert!(
-        matches!(
-            result,
-            Err(SaError::SignerSetMissingBaseline { rule_id: 1, .. })
-        ),
+        matches!(result, Err(SaError::SignerSetMissingBaseline { .. })),
         "wholesale replacement for wrong rule must return SignerSetMissingBaseline; got: {result:?}"
     );
 }

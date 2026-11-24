@@ -1,11 +1,15 @@
 # Building and testing
 
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This guide is for maintainers and contributors building the `stellar-agent-wallet`
 workspace and running the gates that apply to each change. The workspace is a Cargo
-workspace of `stellar-agent-*` crates that produces two binaries: `stellar-agent`
-(the CLI, from crate `stellar-agent-cli`) and `stellar-agent-mcp` (the MCP stdio
-server, from crate `stellar-agent-mcp`). For the crate layout and dependency
-layering, see [architecture.md](architecture.md).
+workspace of `stellar-agent-*` crates that produces one executable,
+`stellar-agent`, from crate `stellar-agent-cli`. It runs the CLI and the MCP
+stdio server of the `stellar-agent-mcp` library crate; the release delivers it
+under a second name, `stellar-agent-mcp`, as a byte-equal copy. For the crate
+layout and dependency layering, see [architecture.md](architecture.md).
 
 ## Prerequisites
 
@@ -57,7 +61,8 @@ cargo install --locked cargo-machete --version 0.9.2
 cargo install --locked cargo-deny --version 0.19.9
 ```
 
-`cargo-llvm-cov` uses the reference pin in `.github/workflows/coverage.yml`.
+`cargo-llvm-cov` uses the reference pins in `.github/workflows/coverage.yml`,
+one for each coverage measurement job.
 `cargo-machete` and `cargo-deny` use the reference pins in
 `.github/workflows/ci.yml`. The `Install surface` workflow checks this guide
 against those pins with `.github/scripts/check-gate-tool-versions.sh`.
@@ -70,11 +75,23 @@ rustup component add llvm-tools-preview
 
 ## Building
 
+The `mainnet-write` Cargo feature controls authorization representation,
+enabled-policy checks, and build reporting. `stellar-agent-cli` and
+`stellar-agent-mcp` enable it by default; the other library crates leave it
+off. The `stellar-agent` executable reports its state as
+`STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on` on the second line of
+`--version` and `-V` output, under either name.
+
 Build the whole workspace:
 
 ```bash
 cargo build
 ```
+
+`cargo build` builds `stellar-agent` with `mainnet-write` on;
+`cargo build --no-default-features` builds it with the feature off. To run the
+server under its second name, copy the executable:
+`cp target/debug/stellar-agent target/debug/stellar-agent-mcp`.
 
 For maintainer release validation:
 
@@ -154,12 +171,13 @@ same Mac, toolchain, tool versions, jobs, and sampling on 2026-10-10, with
 housekeeping paused. The consolidated CLI run reported
 `8 gates run, 0 failed, 0 unavailable`, using the same eight gates as the
 earlier CLI runs. The consolidated full-suite run reported
-`34 gates run, 0 failed, 5 unavailable`, with one more gate than the earlier
-full-suite runs. Both earlier full-suite runs reported
+`34 gates run, 0 failed, 5 unavailable`. Both earlier full-suite runs reported
 `33 gates run, 0 failed, 5 unavailable`. The five unavailable gates were the
 same Python checks that need PyYAML and build nothing: `workflow-invariants` and
 the `test-check-workflow-invariants.py`, `test-sync-labels.py`,
 `test-take-workflow.py`, and `test-triage-workflow.py` self-tests.
+These figures record the runs at the named commits. Seven gates of the current
+`--full` registry need PyYAML, and `--full --list` names the set.
 The docs-only run selected no Cargo gate, so its target directory stayed empty. The
 earlier coverage-alone run shared the machine with three unrelated builds, so
 its elapsed time is not comparable. The consolidated coverage-alone run executed
@@ -230,11 +248,41 @@ Start local verification with `bash .github/scripts/preflight.sh` and run the
 issue-specific acceptance commands. `bash .github/scripts/preflight.sh --full`
 runs the complete local registry, including coverage.
 
-CI runs the offline workspace suite on every pull request. Pull-request
+CI runs the offline gates on every pull request to `main` or
+`mainnet-write`. Pull-request
 coverage requires the `coverage` label; live acceptance uses its separate
-workflow. Local coverage, `cargo machete`, and `cargo deny check` are optional
+workflow. A pull request into `mainnet-write` that changes only documentation,
+as `.github/scripts/classify-docs-only.py` decides, skips the `ci.yml` build
+and test jobs and runs `docs-tests`: the tests that `.github/docs-tests.tsv`
+lists, which `.github/scripts/check-docs-reads.py` keeps complete.
+The check counts as a documentation read an `include_str!` or `include_bytes!`
+of a documentation path, in an attribute too, and a crate-level inner
+`#![doc = include_str!(..)]`.
+It also counts a string literal in test code or in a build script that names a
+documentation path or directory: whole, as a slash-free directory such as
+`"docs"`, as a prefix before a placeholder or wildcard such as
+`"../../docs/{name}.md"`, or after one, such as `"{}/../../docs/guide.md"` or
+`"{}/../../README.md"`.
+An include or a build-script literal outside test code fails, and only the
+crate-level doc include takes a `doc` row.
+The check does not see a test that walks the repository root, a helper in
+another package that holds the documentation path, an include whose file name
+arrives as a macro argument, a proc macro that reads a documentation file, or
+an embedding crate that takes a directory; review such code by hand.
+The full suite still covers them: every pull request into `main` runs the full
+`ci.yml` suite, every push to `mainnet-write` or `main` runs the workspace
+tests of `coverage.yml`, and a push that changes a path other than Markdown,
+`LICENSE`, or `.claude-plugin/**` runs `ci.yml`. A path under `skills/` counts,
+Markdown included.
+A push that changes only Markdown outside `skills/` skips `ci.yml`.
+A pull request retargeted to `main` runs the full set only after a new push.
+Local coverage, `cargo machete`, and `cargo deny check` are optional
 reproductions. See the build-gate dimension of the
 [review checklist](review-checklist.md#8-build-gates).
+
+CI also checks the skill archive.
+CI skips this check for pull requests into and pushes to the `mainnet-write` integration branch.
+The pull request that merges that branch into `main` runs the check.
 
 ### Preflight
 
@@ -270,15 +318,18 @@ python3 -m venv .venv && .venv/bin/python -m pip install --require-hashes -r .gi
 
 The changed set is the union of the paths that differ from the merge base and
 the paths that `git status` lists. It includes untracked and deleted files.
-Every run includes the three always gates: `docs-style`, `install-surface`,
-and `gate-tool-versions`. Each path selects the gates of every scope class it
+Every run includes the four always gates: `docs-style`, `install-surface`,
+`gate-tool-versions`, and `docs-reads`. Each path selects the gates of every scope class it
 matches:
 
 - A file that the install surface check reads, as its `is_scanned` function
   decides, selects that check's self-test, which injects violations into
   copies of those files. A deleted path counts too.
-- Any other docs file adds no gates beyond the three always gates. Directory
+- Any other docs file adds no gates beyond the four always gates. Directory
   scopes also apply to Markdown files.
+- A fragment under `changelog.d/`, the changelog utility, or its test selects
+  `changelog` and `self-test:test-changelog.py`.
+  The changelog workflow selects both workflow invariant gates.
 - A workflow under `.github/workflows/`, a file under `.github/actions/`, or
   `.github/labels.yml` selects `actionlint`.
 - A file under `.github/scripts/` selects the self-test of the script it
@@ -292,11 +343,16 @@ matches:
 
 Clippy, rustdoc, and tests select the packages that own the changed Rust
 paths, in path order, followed by their direct dependents, sorted by name.
+A selection that holds `stellar-agent-mcp` also takes `stellar-agent-cli`,
+whose executable the MCP tests start.
 Cargo builds the required dependency closures. A dependent names an owner by
 `path`, directly or through `workspace = true`, in `[dependencies]`,
 `[dev-dependencies]`, or a target-specific dependency table.
 
-Clippy and rustdoc use the same `-p` list as tests, with `--all-features`.
+Clippy and rustdoc use the same `-p` list as tests, with every declared feature
+except `default` and `mainnet-write`. Clippy, rustdoc, and tests pass
+`--no-default-features`. Feature-on rows keep the default features and add
+`mainnet-write` only when a selected package declares it.
 Tests use the offline features that at least one selected package declares:
 `test-helpers`, `test-hooks`, `test-loopback`, and `verifier-registry`, in that
 order.
@@ -321,10 +377,11 @@ table for the pull request description and a summary line:
 - `python3 .github/scripts/check-docs-style.py`: exit 0
 - `python3 .github/scripts/check-install-surface.py`: exit 0
 - `bash .github/scripts/check-gate-tool-versions.sh`: exit 1
+- `python3 .github/scripts/check-docs-reads.py`: exit 0
 - `actionlint`: unavailable (actionlint: brew install actionlint, or the <version> release archive for your platform (actionlint_<version>_<os>_<arch>.tar.gz))
 - `.github/scripts/test-mpp-interop.sh`: not run (--full; needs Node <version> and Corepack)
 - `.github/scripts/test-sdk-v17-interop.sh`: not run (--full; needs Node <version> and Corepack)
-preflight: 3 gates run, 1 failed, 1 unavailable
+preflight: 4 gates run, 1 failed, 1 unavailable
 ```
 
 A gate that ran reads `exit <n>`. The two interop harnesses read `not run`
@@ -337,36 +394,57 @@ or, without `--full`, an install surface check that Python cannot load.
 The registry, in run order, with what selects each gate. `--full` selects every
 gate except `shellcheck-changed`, which needs a changed shell script.
 
-1. `docs-style`, `install-surface`, and `gate-tool-versions`: every run.
+1. `docs-style`, `install-surface`, `gate-tool-versions`, and `docs-reads`: every run.
+   `changelog` and its self-test `test-changelog.py`: a change under
+   `changelog.d/` or to `changelog.py`. A change to the self-test also runs
+   `changelog`.
 2. `actionlint`: a workflow change.
-3. `workflow-invariants`: a change to `release.yml`, `publish.yml`,
+3. `feature-discipline` and its self-test: a change to a manifest, the
+   lockfile, a workflow, a composite action, a file under `.github/scripts/`,
+   `Cross.toml`, a cargo config path, a build script, a Rust source under
+   `crates/`, or this guide. The checker fetches the locked graph, then
+   checks the topology, the workflow commands, and the resolved features
+   offline.
+4. Three self-tests, each on a change to itself or to a file in its list:
+   - `test-check-binary-marker.sh`: `check-binary-marker.sh`
+   - `test-release-checks.sh`: `check-binary-marker.sh`,
+     `check-packaged-markers.sh`, `release/verify-*.sh`, or `release/sodium.sh`.
+     It also tests `release/check-host.sh` and `derive-alias.sh`; a change to
+     those selects it only under `--full`.
+   - `test-check-provenance.py`: `check-provenance.py` or a provenance fixture
+5. `workflow-invariants`: a change to `release.yml`, `publish.yml`,
    `notarize-smoke.yml`, `labels.yml`, `stale.yml`, `triage.yml`,
-   `triage-review.yml`, `triage-sweep.yml`, `welcome.yml`, `coverage.yml`, or
-   `release-rehearsal.yml` under `.github/workflows/`, to
+   `triage-review.yml`, `triage-sweep.yml`, `welcome.yml`, `coverage.yml`,
+   `release-rehearsal.yml`, `ci.yml`, `vendored-wasm.yml`, or `changelog.yml`
+   under `.github/workflows/`, to
    `.github/actions/`, or to a file under `.github/scripts/` that one of them
    names.
    `triage.yml` handles item events; `triage-review.yml` starts `triage-sweep.yml`
    after a submitted review, with a schedule as the fallback; an approving review
    leaves the labels alone.
-4. The self-tests, in filename order. Each runs when the file it tests or the
-   self-test itself changes:
+6. The other self-tests, in filename order. Each runs when the file it
+   tests or the self-test itself changes:
    - `test-check-coverage.py`: `check-coverage.py`
    - `test-check-crates-exist.sh`: `check-crates-exist.sh`
+   - `test-check-docs-reads.py`: `check-docs-reads.py`
    - `test-check-docs-style.py`: `check-docs-style.py`
    - `test-check-gate-tool-versions.sh`: `check-gate-tool-versions.sh`
    - `test-check-install-surface.py`: `check-install-surface.py`, or a file
      that check reads
    - `test-check-no-direct-sasignersetbaselined-emit.sh`:
      `check-no-direct-sasignersetbaselined-emit.sh`
+   - `test-check-proof-matrix.py`: `check-proof-matrix.py`
    - `test-check-ref-on-main.sh`: `check-ref-on-main.sh`
    - `test-check-workflow-invariants.py`: `check-workflow-invariants.py`, or
      any change that selects `workflow-invariants`, because the self-test
      runs that check on copies of the same files
+   - `test-classify-docs-only.py`: `classify-docs-only.py`
    - `test-compare-crate-sums.py`: `compare-crate-sums.py`
    - `test-preflight.sh`: `preflight.sh`
    - `test-publish-crates-check.sh`: `publish-crates.sh`
    - `test-publish-crates-verify.sh`: `publish-crates.sh`
    - `test-rebuild-vendored-wasm.sh`: `rebuild-vendored-wasm.sh`
+   - `test-run-testnet-acceptance.sh`: `run-testnet-acceptance.sh`
    - `test-sync-labels.py`: `sync-labels.py`, `.github/labels.yml`, or
      `.github/workflows/labels.yml`
    - `test-take-workflow.py`: `.github/workflows/take.yml`
@@ -376,28 +454,51 @@ gate except `shellcheck-changed`, which needs a changed shell script.
      with a schedule as the fallback
    - `test-validate-unsigned-archive.py`: `validate-unsigned-archive.py`
    - `test-welcome-workflow.py`: `.github/workflows/welcome.yml`
-5. `shellcheck-preflight`: a change to `preflight.sh` or `test-preflight.sh`.
-6. `shellcheck-changed`: any other changed shell script under
+7. `shellcheck-preflight`: a change to `preflight.sh` or `test-preflight.sh`.
+8. `shellcheck-changed`: any other changed shell script under
    `.github/scripts/` or `.github/actions/` that still exists, under `--full`
    too.
-7. `package-skill`: a change under `skills/` or `.claude-plugin/`.
-8. `vendored-tree-check`: a change under `crates/stellar-agent-smart-account/`
-   or `contracts/`, or to `rebuild-vendored-wasm.sh`.
-9. `publish-check` and `baseline-gate`: `--full` only.
-10. `fmt`, `clippy`, `rustdoc`, and `test`: a Rust change.
-11. `test-vendored-release-cfg`: a Rust change whose test packages include
+   `deploy-shellcheck` and `deploy-harness`: a change under `scripts/deploy/`.
+9. `package-skill`: a change under `skills/` or `.claude-plugin/`.
+10. `vendored-tree-check`: a change under `crates/stellar-agent-smart-account/`
+    or `contracts/`, or to `rebuild-vendored-wasm.sh`.
+11. `publish-check` and `baseline-gate`: `--full` only.
+12. `fmt`, `clippy`, `rustdoc`, and `test`: a Rust change. `proof-matrix`: a
+    change under a crate's `src/` or `tests/`, or to `proof-matrix.toml` or
+    `check-proof-matrix.py`.
+13. `feature-on:clippy`, `feature-on:doc`, `feature-on:test`, and
+    `feature-on:network`: a Rust change. `feature-on:network` checks the
+    forwarding of the network crate without the CLI or MCP feature
+    unification. `proof-matrix:feature-on`: the changes that select
+    `proof-matrix`.
+14. `release-shape`: `--full` only. It needs libudev on Linux; see
+    [Feature discipline and release markers](#feature-discipline-and-release-markers).
+15. `test-support-friendbot`: a Rust change whose test packages include
+    `stellar-agent-test-support`, or that selects the workspace command.
+16. `test-vendored-release-cfg`: a Rust change whose test packages include
     `stellar-agent-smart-account`, or that selects the workspace command.
-12. `machete`, `deny`, `coverage`, and `coverage-floors`: `--full` only.
-13. `interop:mpp` and `interop:sdk-v17`: `--full` only.
+17. `test-policy-pin-release-cfg`: a Rust change whose test packages include
+    `stellar-agent-core`, or that selects the workspace command.
+18. `machete`, `deny`, `coverage`, `coverage-floors`, `coverage:feature-on`,
+    and `coverage-floors:feature-on`: `--full` only. Each floor check
+    requires its own successful measurement in the current run.
+19. `inbox-js` and `mainnet-presence-js`: a change under
+    `crates/stellar-agent-approval-ui/src/web/` or
+    `crates/stellar-agent-approval-ui/src/operator_enroll/web/`. `inbox-js`
+    also runs on a change under `crates/stellar-agent-webauthn-bridge/src/web/`.
+20. `interop:mpp` and `interop:sdk-v17`: `--full` only.
 
-`package-skill.sh`, `run-testnet-acceptance.sh`, and
-`release-preflight-version-check.sh` have no self-test. The preflight runs the
-workflow checks with `python3`, which needs PyYAML importable, for example from
+`package-skill.sh`, `release-preflight-version-check.sh`, `run-docs-tests.py`,
+and `check-payment-evidence.py` have no self-test.
+The preflight runs the workflow checks with `python3`, which needs PyYAML importable, for example from
 the `.venv` virtual environment of the PyYAML install command.
 
-The preflight does not carry these CI checks: the `windows-storage` job, the
-`stellar-agent-test-support` feature matrix of the `test` job, the setup steps,
-and the virtual environment of the workflow checks. Nor does it carry the
+The preflight does not carry these CI checks: the `windows-storage` and
+`platform-keyring` jobs, the `stellar-agent-test-support` feature matrix of the
+`test` job, the setup steps, and the virtual environment of the workflow checks.
+It also omits the integration changelog guard of `changelog.yml`, the
+measurement and cancellation checks of the `coverage` job, and the Python 3.11
+repeat of the Python self-tests. Nor does it carry the
 rebuild of the `vendored-wasm` workflow: its two stellar-cli build jobs, its
 `rebuild` and `vendored-wasm` jobs, and the rebuild decision of its `check` job.
 
@@ -427,7 +528,10 @@ Run `cargo fmt --all` to format Rust sources.
 #### Lint
 
 ```bash
-cargo clippy --all-targets --all-features -- -D warnings
+# operator-enroll-browser-acceptance covers browser acceptance tests of the approval pages.
+FEATURES_EXCEPT_MAINNET_WRITE=deploy-cli,operator-enroll-browser-acceptance,live-platform-keyring,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
+cargo clippy --workspace --all-targets --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings
+cargo clippy --workspace --all-targets --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings
 ```
 
 Warnings are denied. The workspace lints (declared in the root `Cargo.toml`)
@@ -438,7 +542,8 @@ restriction lints `unwrap_used`, `expect_used`, `panic`, `print_stdout`,
 #### Rustdoc
 
 ```bash
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE"
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE"
 ```
 
 Rustdoc warnings are denied.
@@ -446,7 +551,9 @@ Rustdoc warnings are denied.
 #### Test
 
 ```bash
-cargo test --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry
+cargo test --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry
+cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry
+cargo check -p stellar-agent-network --features mainnet-write
 ```
 
 This runs the offline unit, integration, and doc-tests. Live acceptance uses
@@ -455,8 +562,10 @@ its separate workflow and feature selections; see [Test tiers](#test-tiers).
 #### Coverage
 
 ```bash
-cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov.json
-python3 .github/scripts/check-coverage.py cov.json
+cargo llvm-cov --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json
+python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off
+cargo llvm-cov --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-on.json
+python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on
 ```
 
 Coverage enforces the per-crate floors in `.github/scripts/check-coverage.py`.
@@ -467,13 +576,29 @@ suites.
 
 The floors form a regression ratchet, set a few points below each crate's
 current offline coverage. The aspirational target for new code is 90% per
-crate. Coverage uses the offline feature set; `--all-features` enables the
-live tiers that attempt RPC and Friendbot access.
+crate. Coverage measures feature-off and feature-on independently. Two
+parallel report-only checks, `coverage (feature-off)` and
+`coverage (feature-on)`, each write one report. The required check `coverage`
+checks both job results and enforces both floors on the reports of the same
+run. Each run resets its instrumentation data, writes a separate report and
+uses the selected configuration's floors. Live tiers that attempt RPC and
+Friendbot access remain disabled.
 
-CI runs this gate in the Coverage workflow: weekly on main, on a pull request
-that carries the `coverage` label, and on demand through `workflow_dispatch`.
-A maintainer adds the label to a pull request that changes Rust code.
-Local reproduction is optional.
+CI runs this gate in the Coverage workflow. A push to `mainnet-write` or
+`main` runs it and seeds the coverage caches. It also runs weekly on main, on a
+pull request that carries the `coverage` label, and on demand through
+`workflow_dispatch`. A failed, canceled, or skipped measurement fails
+`coverage`. A maintainer adds the label to a pull request that changes Rust
+code. Local reproduction is optional.
+
+Each report artifact carries the run attempt in its name, so `coverage` reads
+only the reports of its own attempt. A rerun of the gate alone, or of one
+measurement job, finds no report of its attempt and fails. After a failed
+download, a maintainer reruns all jobs.
+
+Rust caches in `ci.yml` and `coverage.yml` save on push runs only. A pull
+request restores matching entries from its base branch and the default branch,
+subject to eviction.
 
 #### Unused dependencies
 
@@ -504,8 +629,10 @@ actionlint
 ```
 
 The install surface check covers the documented install commands, version
-pins, and secret-seed procedures, and the binstall metadata of both wallet
-crates; its header defines each rule. Its self-test runs the check on copies of
+pins, and secret-seed procedures, the binstall metadata of the CLI crate, and
+the library-only shape of the MCP crate, which names no executable target and
+no binstall table and is never an install target; its header defines each
+rule. Its self-test runs the check on copies of
 the tree, with one violation injected per case. The docs style check applies
 the writing rules of CONTRIBUTING.md to the tracked Markdown files; its header
 defines each rule and the baseline. The Python scripts need Python 3.11 or
@@ -514,8 +641,10 @@ later.
 The gate tool check compares the versions in [Gate tools](#gate-tools), in the
 other workflows, and in the composite actions with each tool's reference
 workflow pin: `coverage.yml` for `cargo-llvm-cov`, `ci.yml` for
-`cargo-machete` and `cargo-deny`. Its header defines the accepted line shapes,
-and its self-test runs it on fixture trees with one drift form per case.
+`cargo-machete` and `cargo-deny`. `coverage.yml` holds two `cargo-llvm-cov`
+pins at one version; the first is the reference pin. Its header defines the
+accepted line shapes, and its self-test runs it on fixture trees with one drift
+form per case.
 
 ### Windows storage regression (CI-only)
 
@@ -524,9 +653,57 @@ behaviors that differ on Windows and cannot be exercised locally on
 macOS/Linux: the audit-log module (including the writer's sidecar-lock
 semantics, where `LockFileEx` on the log file itself would block readers) and
 the approval / toolset-grant store persistence tests, scoped to
-`stellar-agent-core`. There is no local equivalent off Windows; changes to
+`stellar-agent-core`. The job also tests the headless keyring, Windows
+identity, DPAPI, the MPP store, the smart-account crate, the MCP rule tools,
+and the MCP console events with the feature off and on. There is no local
+equivalent off Windows; changes to
 `audit_log`, the approval store, or file-locking behavior should expect this
 job to be the deciding signal.
+
+### Platform keyring and deployment scripts (CI-only)
+
+CI runs a `platform-keyring` job on an Ubuntu runner. It starts GNOME Keyring
+in a private D-Bus session and runs `keyring_platform_roundtrip` in
+`stellar-agent-network`. The test writes, reads, and deletes one entry through
+the Secret Service store that the binaries register. It is ignored by default,
+because a local run writes to the keyring of the person at the machine, so a
+local check only builds it:
+
+```sh
+cargo test -p stellar-agent-network --features live-platform-keyring --test keyring_platform --no-run
+```
+
+A `deploy-scripts` job runs on Ubuntu and on macOS. Its Linux leg runs
+shellcheck on the scripts in `scripts/deploy/`, and both legs run the
+deployment harness:
+
+```sh
+bash scripts/deploy/test-deploy.sh
+```
+
+The harness renders the wrapper and sudoers templates into a temporary root
+and runs them against logging stubs. It needs bash, python3, and perl, and no
+root, sudo, or network. Each host checks the wrappers against its own `stat`,
+`ls`, and `pgrep`. The preflight runs shellcheck and the harness when a file
+under `scripts/deploy/` changes.
+
+The `providers` form of `provision` reads a TOML fragment on standard input.
+It accepts `oracle_provider_url` only on one top-level line, in double quotes
+without a backslash or in single quotes, optionally followed by a comment:
+
+```toml
+oracle_provider_url = "https://oracle.example/v1" # production oracle
+```
+
+A multi-line string refuses with the reason that the value is a multi-line
+string. An escape sequence refuses with the reason that the value holds an
+escape sequence. Both reasons say how to write the value.
+
+On macOS, `cli-launch keychain-access-lists` runs
+`security dump-keychain -a` on the wallet account's login keychain. It is a
+tier B form, which accepts the profile absent or account-owned, is exempt
+from the mainnet state check, and refuses any further token with exit 64. The command prints item attributes and access
+lists, never secret data.
 
 ## Test tiers
 
@@ -541,7 +718,8 @@ declared on individual crates (and on `stellar-agent-test-support`), are:
 - `test-helpers`: exposes test-only helpers and fixtures. Must not be enabled in
   production builds.
 - `test-hooks`: test-only observation and fault-injection hooks in
-  `stellar-agent-network` and `stellar-agent-nonce`.
+  `stellar-agent-network`, `stellar-agent-nonce`, `stellar-agent-pool`, and
+  `stellar-agent-smart-account`.
 - `test-loopback`: loopback-listener test surface in `stellar-agent-network`.
 - `testnet-helpers`: keypair generation, Friendbot HTTP, and live-network client
   helpers in `stellar-agent-test-support`. Pulled in transitively by the
@@ -581,11 +759,24 @@ the post-bump verification.
 Release preparation also bumps the version pins in the documentation and the
 crate READMEs, which a CI check compares with the workspace version.
 
+Release preparation creates the dated version section below a fresh
+Unreleased heading. It runs the fold before tagging:
+
+```bash
+python3 .github/scripts/changelog.py release --version VERSION
+```
+
+Review the folded entries and fragment deletions before merging the
+preparation pull request to `main`.
+Rerun release mode when pending fragments remain.
+Tag only the merged, passing commit with no pending fragments.
+See [Releasing](releasing.md#cut-a-release-tag) for the full sequence.
+
 MPP storage uses the same cross-platform locking contract as the approval and
 policy stores. Windows CI must cover MPP state lock contention, atomic replace,
 symlink/reparse-point refusal, tamper failure, and restart behavior whenever the
-store changes. The new crate has an explicit coverage floor and a 90% offline
-target; live SDK/RPC paths do not justify weakening parser, state, or signing
+store changes. `stellar-agent-mpp` has an explicit 90% offline line-coverage
+floor in `check-coverage.py`; live SDK/RPC paths do not justify weakening parser, state, or signing
 branch coverage.
 
 ### Live testnet-acceptance tests
@@ -595,12 +786,22 @@ testnet RPC and Friendbot. These tests are not run under default `cargo test`; e
 is enabled per crate. For example:
 
 ```bash
-cargo test -p stellar-agent-mcp --features testnet-acceptance \
+cargo test -p stellar-agent-mcp --no-default-features --features testnet-acceptance \
   --test sep43_sign_and_submit_transaction_testnet_acceptance
 ```
 
+The MCP suites that compile the shared `tests/common` module start the
+`stellar-agent` executable as a server child. Before such a suite, build the
+CLI and MCP tests together with the same flags; `run-testnet-acceptance.sh`
+runs this prebuild for them:
+
 ```bash
-cargo test -p stellar-agent-network --features testnet-acceptance
+cargo test -p stellar-agent-cli -p stellar-agent-mcp --no-default-features \
+  --features testnet-acceptance --no-run
+```
+
+```bash
+cargo test -p stellar-agent-network --no-default-features --features testnet-acceptance
 ```
 
 The `testnet-acceptance` feature is dev- and CI-only and must not be enabled in any
@@ -618,8 +819,14 @@ crates, so a test build of `stellar-agent-smart-account` alone compiles none
 of them.
 
 These tests require network reachability to testnet RPC and Friendbot. Testnet is
-the default network; Friendbot funding is testnet-only. Write and signing commands
-structurally refuse mainnet in this alpha, so there is no mainnet acceptance tier.
+the default network; Friendbot funding is testnet-only. Live acceptance runs
+with `mainnet-write` off by default: the runner passes `--no-default-features`
+to every suite. With `MAINNET_WRITE=on`, each suite of a crate that declares a
+`mainnet-write` feature also enables that feature, which is the build the
+binaries ship by default. A crate without the feature builds as with
+`MAINNET_WRITE=off`. Any other value fails the run before the first suite.
+Either way the suites run against testnet, so these tests establish no
+live-mainnet acceptance.
 
 The MPP acceptance target also requires Node.js and pnpm for the pinned released
 `@stellar/mpp` server harness. Its package and lock files must contain the exact
@@ -650,18 +857,82 @@ Friendbot and the RPC load balancer are not hit back-to-back:
 ```bash
 .github/scripts/run-testnet-acceptance.sh                # everything
 FILTER=stellar-agent-dex .github/scripts/run-testnet-acceptance.sh   # one crate
+SHARE=1/2 .github/scripts/run-testnet-acceptance.sh          # first share
+MAINNET_WRITE=on .github/scripts/run-testnet-acceptance.sh   # mainnet-write build
 ```
 
-The driver enforces a completeness guard: it fails the run if any `tests/*testnet*.rs`
-file on disk is missing from its suite list, so a new live suite must be added to
-`SUITES` in `.github/scripts/run-testnet-acceptance.sh`.
+`SHARE=k/N` selects zero-based registry indices `i` where `i % N == k - 1`, preserving registry order. Unset or empty `SHARE` selects all suites. Other values require positive decimal integers with `k <= N`; invalid values refuse before any build.
+
+`FILTER` applies inside the selected share. A filter matching no registered suite refuses in every share. A share with no matching entries reports zero selected suites and succeeds.
+
+The driver enforces a completeness guard: it fails the run if any
+`tests/*testnet*.rs` or `tests/*_browser_acceptance.rs` file on disk is missing
+from its suite list, so a new live suite must be added to `SUITES` in
+`.github/scripts/run-testnet-acceptance.sh`. The self-test
+`.github/scripts/test-run-testnet-acceptance.sh` checks the suite list against
+the files in both directions, the browser suite list, the feature selection,
+and the refusal of an unknown `MAINNET_WRITE` value. The `release contracts` CI
+job runs it with a 20-minute job timeout. The budget covers the signer-set
+baseline self-test, workflow invariant cases and mutation controls, and the
+other release contract checks.
+
+Each result line carries the wall seconds of the attempt that produced the
+result. A retried suite also carries the seconds of all its attempts, as in
+`pass (retry, 412 s, 830 s total)`. Console and workflow summary headers name
+the share, selected suite count and build, `mainnet-write off` or `mainnet-write on`.
+The summary closes with the leg's wall time. In a workflow run the step summary table has a `seconds`
+column with each suite's seconds across its attempts.
 
 The same script backs the `Testnet acceptance` workflow
-(`.github/workflows/testnet.yml`), which runs on manual dispatch (with an
-optional suite filter input) and on a weekly schedule; it is deliberately not
-part of per-push CI. The WebAuthn suite needs a Chromium binary on `PATH` (or
-the `CHROME` env var). The driver reports each self-skip as a skip marker in
-the run summary, so a green leg states what did not execute.
+(`.github/workflows/testnet.yml`), which runs on manual dispatch and on a
+weekly schedule; it is deliberately not part of per-push CI. A dispatch takes
+an optional suite filter input, a `keyring` choice of `headless` (the default)
+or `platform` for native-capable suites, and the boolean `mainnet_write` input, which
+runs every suite against the build with `mainnet-write` on. A scheduled run
+builds with `mainnet-write` off.
+
+The workflow chains `acceptance-1` with `SHARE=1/2` and `acceptance-2` with
+`SHARE=2/2`. Each job has a 360-minute limit. The second job waits for the first
+and runs after failure unless the workflow is canceled. Both jobs honor
+`TESTNET_SCHEDULE=off` on scheduled events. Workflow concurrency serializes runs,
+and each driver serializes its selected suites. Both jobs use the filter,
+build selection, browser setup, and secondary RPC environment. Each job then
+checks its payment evidence with `check-payment-evidence.py` and uploads it as
+an artifact, also after a failed run.
+
+The browser suites need a Chromium binary on `PATH` (or the `CHROME` env var).
+Among them, the mainnet consent browser suite
+`stellar-agent-approval-remote` / `mainnet_presence_browser_acceptance`
+(feature `operator-enroll-browser-acceptance`) enrolls an approval credential
+and drives the mainnet consent pages over loopback HTTP; like the
+operator-enroll suite, it needs no testnet. The driver reports each self-skip
+as a skip marker in the run summary, so a green leg states what did not
+execute.
+
+Both suites also carry HTTPS cases at a signed origin, and these run on Linux
+only. Before each attempt of either suite, the driver generates a test
+certificate authority and a leaf for `approve.example.invalid` and
+`foreign.example.invalid` with `openssl`.
+It installs only that authority into fresh NSS databases with `certutil`, from
+the `libnss3-tools` package. The databases live in a private directory below
+`target/tmp/browser-trust`, which the driver names to cargo in
+`STELLAR_AGENT_BROWSER_TRUST_DIR`. The suites start Chromium with that
+directory's `home` as its `HOME`, a resolver rule for the test name, and
+certificate errors kept fatal. Cargo, the tests and the driver keep their own
+`HOME`, and no host trust store or keychain changes. Each suite's trust
+control loads a page the test authority issued and refuses a listener whose
+leaf another authority issued. The operator-enroll suite enrolls a
+credential at the signed origin and exports it only after the terminal
+confirmation. The consent suite consents there through the approval link and
+refuses an assertion from another origin, a page of another RP, and the
+local inbox under the signed policy. A missing tool or a failed import fails the
+suite before cargo runs. On another OS the HTTPS cases fail with a message
+instead of passing. The self-test covers the setup with stub `certutil` and
+`uname` commands and the system `openssl`.
+
+The remote approval crate declares a default-off `mainnet-write` feature that
+forwards to the core, network and MCP crates, so `MAINNET_WRITE=on` builds its
+suites against the `mainnet-write` build of the crates they drive.
 
 The multicall suites run without extra configuration. The library suite
 `stellar-agent-smart-account` / `smart_account_multicall_testnet_acceptance`
@@ -670,14 +941,16 @@ native-SAC `symbol` bundles under rule 0 and under a rule other than 0. The CLI
 suite `stellar-agent-cli` / `smart_account_multicall_cli_testnet_acceptance`
 (feature `testnet-acceptance`) provisions a signed V1 policy on the headless
 keyring, registers a freshly deployed router, and submits a bundle through the
-test-built binary. Without overrides, the primary endpoint also serves as secondary,
-so this testnet suite exercises one provider. Different hosts alone do not
-establish separate administration.
-The library suite reads two optional overrides:
-`STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS` names a deployed router, and
-`STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL` selects the secondary endpoint;
-choose a separately administered provider to exercise independence.
-An override that does not parse fails the suite.
+test-built binary.
+Every live suite that signs a smart-account authorization reads
+`STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL`: a testnet Soroban RPC endpoint on a
+host other than the primary's, for the ledger witness and the cross-RPC check.
+A suite fails when the variable is unset or does not parse. CI sets it from the
+repository variable `TESTNET_SECONDARY_RPC_URL`. Different hosts alone do not
+establish separate administration, so choose a separately administered provider
+to exercise independence.
+The library suite also reads `STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS`,
+which names a deployed router. An override that does not parse fails the suite.
 
 #### CAP-85 external-reference suites
 
@@ -779,10 +1052,12 @@ binary, build command, and digest.
 
 The `vendored-wasm` workflow (`.github/workflows/vendored-wasm.yml`) runs
 `.github/scripts/rebuild-vendored-wasm.sh`, which holds the manifest of
-rebuildable files, the exception list, and every pinned version.
+rebuildable files, the exception list, and every pinned version. Tag runs
+happen inside the release through its local reusable workflow call. Crate
+publication calls it for the verified commit of the tag.
 
-- The tree check runs on every pull request, every push to `main`, every tag,
-  twice a week, and on dispatch. It fails unless every tracked Wasm file is a
+- The tree check runs on pull requests to `main`, pushes to `main`, tags, crate
+  publication, twice a week, and on dispatch. It fails unless every tracked Wasm file is a
   manifest file, an exception, or out of scope. Each vendored file must equal
   its record and, where one exists, its `WASM_PINS` row in `build.rs`. Every
   `include_bytes!` or `include_str!` in the crate's `src/` must name one string
@@ -813,9 +1088,14 @@ rebuildable files, the exception list, and every pinned version.
   deployment wrappers, in the builds they run.
 - When a change touches `vendor/`, `build.rs`, `contracts/`, the two scripts,
   or the workflow, and on every tag, scheduled, or dispatched run, two macOS
-  jobs build the pinned stellar-cli binaries. The `rebuild` job then rebuilds
-  every manifest file from its pinned source with its pinned toolchain and
-  fails unless the rebuilt bytes equal the vendored file.
+  jobs provide the pinned stellar-cli binaries. The stellar-cli caches restore
+  on pull request, `main`, scheduled, and dispatched runs. Only push and
+  schedule runs save missing entries. A tag or crate
+  publication run builds both binaries from source. Each job packs its install
+  root as a tar artifact to preserve executable permissions. The `rebuild` job
+  reads those artifacts from the same run and uses no cache. It rebuilds every
+  manifest file from its pinned source with its pinned toolchain and fails
+  unless the rebuilt bytes equal the vendored file.
 - The unit tests in `src/vendored_wasm_tests.rs` and the integration target
   `tests/vendored_wasm_release_cfg.rs` bind the table, embedded constants,
   digest constants, and three allowlists to vendored files. The integration
@@ -830,7 +1110,10 @@ rebuildable files, the exception list, and every pinned version.
   file. An exception is a vendored file that no pinned source rebuilds; the
   tree check holds its bytes at one frozen digest.
 
-The `vendored-wasm` job reads every job result and is the check to require.
+The `vendored-wasm` job reads every job result. On a tag or crate publication
+run it passes only after a rebuild. Release signing, provenance, and
+publication wait for the rebuild of the tagged commit, and crate publication
+waits for the rebuild of the verified commit.
 
 Run the identity and deployment gates locally with:
 
@@ -945,8 +1228,9 @@ and every constant and allowlist entry that pins it in the same change.
   bytes passes. So does one that points an embedded constant at another
   vendored file and edits both identity-test mappings to match. Review of
   `vendor/`, `.github/`, `src/vendored_wasm_tests.rs`, and
-  `tests/vendored_wasm_release_cfg.rs` by named owners needs a `CODEOWNERS`
-  file and a ruleset that requires code-owner review.
+  `tests/vendored_wasm_release_cfg.rs`: `.github/CODEOWNERS` routes these paths
+  to an owner. A blocking review needs a ruleset that requires code-owner
+  review, which is a repository setting.
 - The tree check lexes the smart-account source for its attribute rules.
   A workspace dependency can export a macro that expands in this crate.
   The integration test checks the resulting compiled value for each mapped
@@ -965,18 +1249,19 @@ and every constant and allowlist entry that pins it in the same change.
   `contracts/multicall-router/`), the rebuild proves the bytes match the
   committed source; review of the source diff remains the defense. A
   compromise of an upstream source at its pinned commit is outside this check.
-- Two checks prove a cached stellar-cli binary: its version line and the byte
-  comparison of its output. A binary that writes the vendored bytes whatever
-  its input passes both. Every workflow of a branch shares the cache. Code that
-  runs in any job on `main` can therefore create an entry under a key that does
-  not exist yet, such as after an eviction or a recipe revision bump. An
-  existing entry never changes. Delete the stellar-cli cache entries after any
-  suspected compromise of a workflow run on `main`, and after reverting a
-  change to the workflow or the scripts.
-- A failed cache save is a warning in the stellar-cli job, and the `rebuild`
-  job then fails on the cache miss. Two concurrent cold runs on `main` can do
-  the same. A re-run clears both.
-- A tag run does not gate the release workflow.
+- On runs other than tag and crate publication runs, two checks test a cached
+  stellar-cli binary: its version line and the byte comparison of its output.
+  A binary that writes the vendored bytes whatever its input passes both.
+  Every workflow of a branch shares the cache. Code that runs in any job on
+  `main` can therefore create an entry under a key that does not exist yet,
+  such as after an eviction or a recipe revision bump. An existing entry never
+  changes. Delete the stellar-cli cache entries after any suspected compromise
+  of a workflow run on `main`, and after reverting a change to the workflow or
+  the scripts.
+- Cache saves serve future runs that restore the cache. The current rebuild
+  consumes the install-root artifacts produced by its own stellar-cli jobs.
+  Tag and crate publication runs build both binaries from source and gate
+  release signing, provenance, and publication.
 - Pull-request CI does not run the release-profile tests. The deploy's digest
   check runs in every profile; review and the release-profile test run keep it
   out of a `debug_assertions` gate. The local release gate also checks the
@@ -995,17 +1280,16 @@ and every constant and allowlist entry that pins it in the same change.
 
 ## Review process
 
-The depth of the review follows what a change touches:
+[Review process](../../CONTRIBUTING.md#review-process) in `CONTRIBUTING.md`
+defines the review depth for each kind of change. The second review pass uses
+the full [review checklist](review-checklist.md). Review repeats until a pass
+ends with no blocking findings.
 
-- A maintainer reviews a change to documentation, scripts, or workflows from the
-  diff and the CI checks.
-- A change to Rust code gets the same review and must also pass the
-  [gate suite](#gate-suite).
-- A change to signing paths, key handling, or serialized state also gets a
-  second review pass against the full [review checklist](review-checklist.md).
-
-The second review pass checks the change against every dimension of the
-checklist. Review repeats until a pass ends with no blocking findings.
+A release that ships the `mainnet-write` build also gets the signing-authority
+and approval-flow reviews that
+[Mainnet release reviews](review-checklist.md#mainnet-release-reviews)
+describes. The [keychain measurement](keychain-measurement.md) records the
+macOS keychain dialogs that the signed binaries raise.
 
 See [../../CONTRIBUTING.md](../../CONTRIBUTING.md) for the contribution workflow.
 
@@ -1018,11 +1302,196 @@ See [../../CONTRIBUTING.md](../../CONTRIBUTING.md) for the contribution workflow
 exception allows `LGPL-3.0-or-later` for `nacl`, a wasm32-only transitive of
 `stellar-baselib` that is never compiled into the native binaries this project
 builds. The advisories section denies yanked crates and active security
-advisories, with one unmaintained-class advisory ignored (RUSTSEC-2024-0436, on
-the `paste` macro helper pulled deep through the OpenZeppelin Stellar contract
-crates), which has no fixed release. Three advisories on `zip` 8.6.0 are
-accepted (RUSTSEC-2026-0367, RUSTSEC-2026-0368, and RUSTSEC-2026-0369). `zip` is
-a build dependency of `libsodium-sys-stable` that only unpacks the
-signature-verified prebuilt libsodium archive on Windows MSVC targets, and no
-`libsodium-sys-stable` release accepts `zip` 9. Unknown registries and unknown
-git sources are denied.
+advisories. `deny.toml` ignores four advisories, each with its rationale:
+RUSTSEC-2024-0436 on `paste`, RUSTSEC-2026-0387 on `crypto-bigint`,
+RUSTSEC-2026-0462 on `rmcp`, and RUSTSEC-2026-0543 on `chrono`. The lockfile
+resolves `zip` 9.5.1, and `deny.toml` accepts no advisory on `zip`. Unknown
+registries and unknown git sources are denied.
+
+### Feature discipline and release markers
+
+```bash
+cargo fetch --locked
+python3 .github/scripts/check-feature-discipline.py
+python3 .github/scripts/test-check-feature-discipline.py --mutations
+bash .github/scripts/test-check-binary-marker.sh
+bash .github/scripts/test-release-checks.sh
+python3 .github/scripts/test-check-provenance.py --mutations
+bash .github/scripts/release/check-host.sh
+```
+
+The checker reads metadata and Cargo trees with `--locked --offline`.
+Each resolving inventory row uses its explicit target, or the runner's
+triple from `RUNNER_TARGETS` in the checker:
+
+| Runner | Implicit target |
+|---|---|
+| `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
+| `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
+| `windows-2025` | `x86_64-pc-windows-msvc` |
+| `macos-26` | `aarch64-apple-darwin` |
+
+Unknown runners and unresolved hosts fail. The release and rehearsal recipe
+resolves each of its five target triples. The Linux feature-discipline job
+runs every query; foreign-target resolution needs no target compiler.
+The query cache includes the target, selection, features, and dependency edges.
+`cargo tree --target` filters a target-specific build-dependency table by the
+host that runs the checker, not by the queried triple: on an Apple silicon
+host, the Windows and Linux queries of a fixture omit its `cfg(windows)` and
+`cfg(target_os = "linux")` build dependencies and list its
+`cfg(target_os = "macos")` one.
+
+Workspace queries keep feature unification. Each selected binary gets a root
+view of that resolution, including Cargo's deduplicated subtree references.
+A binary outside the command's package or binary selection reports `not selected`.
+Integration-test and benchmark selections include their package binaries.
+Feature-off checks refuse `mainnet-write` on any resolved package.
+Feature-on checks require each selected binary's positive-control closure.
+Missing roots and unknown Cargo tree output fail.
+
+Each error message names its rule:
+
+- D1: the `mainnet-write` declarations and the `default = ["mainnet-write"]`
+  of `stellar-agent-cli` and `stellar-agent-mcp` that the checker pins hold,
+  and no other feature, no other `default`, and no normal dependency
+  declaration reaches `mainnet-write`. Both packages keep that default: the
+  CLI package builds the executable, and the MCP library's default serves
+  its direct dependents.
+- D2: no dev or build dependency declaration requests a feature that reaches
+  `mainnet-write`. A declaration that keeps the default of the CLI or MCP
+  package reaches it, so each one, the MCP self dev-dependency included, sets
+  `default-features = false`.
+- D3: every cargo and cross call of the workflows and of the scripts they name
+  matches the reviewed inventory in the checker, and each resolved graph has
+  `mainnet-write` in the state its record relies on. The only executable
+  target of the queried packages is `stellar-agent` of the CLI package, and
+  the metadata must list exactly that one; its graph view includes the MCP
+  closure. The paired CLI and MCP prebuild of the testnet driver has one
+  reviewed record per job and feature state. A record relies on the
+  feature when its feature list names `mainnet-write`, or when it keeps the
+  default features and selects the workspace, the CLI package, or the MCP
+  package. A
+  `--config` word anywhere in a call, a `+toolchain` word after `cargo` or
+  `cross`, and an option before the subcommand other than `-V`, `--version`,
+  `-v`, `-vv`, `--verbose`, `-q`, `--quiet`, `--locked`, `--frozen`,
+  `--offline`, and `--color` fail. The subcommand is the first word after
+  those options, and a `$` left in it or in a word before it fails. The
+  scanner reads
+  spaces and tabs as the only blanks, and a physical line ends at a line
+  feed. It reads a heredoc only when its delimiter, after `<<` and at most
+  one space, is an identifier, an ASCII letter or underscore followed by
+  ASCII letters, digits, or underscores, alone or in one pair of single or
+  double quotes. It ends the body at the first line that equals the
+  delimiter. Any other text after `<<` fails the check, and so does a body
+  line of an unquoted heredoc that ends in a backslash, because the shell
+  joins it with the next line. A here-string whose text runs cargo passes
+  only when the command word of its segment, and of each command a pipe
+  after it feeds, is a bare word that names no interpreter or command
+  runner. A command substitution keeps its own pipeline. An interpreter
+  outside the scanner's table, such as `busybox sh`, reads a here-string
+  unseen. The scanner counts every unquoted parenthesis inside a command
+  substitution, so a `)` that the shell reads as the end of a `case` pattern
+  or as part of a parameter-expansion value ends the substitution early in
+  the scanner's reading. The rest of the substitution is then read as outer
+  text, where a `;` ends the here-string's pipeline, so the scanner admits
+  `cat <<< 'cargo build' $(case x in x) true;; esac) | sh` and
+  `cat <<< 'cargo build' $( : ${v:-)}; true) | sh`.
+- D4: no build script, including a `build.rs` outside workspace metadata,
+  emits a feature cfg, and every line it prints is a
+  string literal or a formatted line whose placeholders are `{}` or `{name}`
+  and whose arguments are plain string literals or form a statement reviewed
+  in the checker.
+- D5: the tree holds no cargo configuration file.
+- D6: `Cross.toml` holds only a digest-pinned cross-rs aarch64 image and the
+  two pre-build commands.
+- D7: no workflow, composite action, or named script sets a variable that
+  injects compiler flags, compiler wrappers, or features. A text is a script
+  file, or a string of a workflow or action after YAML decoding, and its
+  physical lines end at line feeds. A text names the environment file when
+  it holds `GITHUB_ENV` in any case. In such a text, every line other than a
+  comment, a line whose first character after spaces and tabs is `#`, must
+  hold an even number of `"` and an even number of `'`, and no line that
+  holds `GITHUB_ENV` may follow a line that ends in a backslash or a
+  backtick, because the shell joins the two. Each line that holds
+  `GITHUB_ENV`, a comment included, must then be one of two writes of one
+  `NAME=VALUE` entry. The check ignores spaces and tabs at both ends of the
+  line and requires one or more spaces or tabs between its words. The first
+  write is `echo` with one argument, bare or in double quotes, then `>>`,
+  then one of `$GITHUB_ENV`, `"$GITHUB_ENV"`, `${GITHUB_ENV}`, and
+  `"${GITHUB_ENV}"`. The second is `Add-Content` with `$env:GITHUB_ENV`, or
+  with `-Path $env:GITHUB_ENV -Value`, and one value in single or double
+  quotes. `echo`, `Add-Content`, `-Path`, `-Value`, and
+  `$env:GITHUB_ENV` must appear in exactly this case. NAME is an ASCII
+  letter or underscore followed by ASCII letters, digits, or underscores.
+  The value holds ASCII letters, digits, and `_./:@+-`, plus `$NAME` and
+  `${NAME}` references in the `echo` form and backslashes in the
+  `Add-Content` form. Every other line that names the file fails the
+  check, including `printf`, `tee`, `Set-Content`, multiline entries, options
+  other than `-Path` and `-Value`, arrays, and reads. In a named Python
+  script no line may hold `GITHUB_ENV` in any case, apart from the two
+  workflow invariants files, which spell the toolchain pin as text they
+  compare. The scanner does not read the value of a referenced variable: a
+  variable whose value holds a line break, or backslashes under a shell
+  whose `echo` expands them, writes more than one entry. The `echo` form
+  admits references because the toolchain pins need them. A function or
+  alias defined earlier in the text that redefines `echo` or `Add-Content`
+  changes what a shape line writes. Escaped quotes keep the raw counts even
+  while an argument spans lines, as after `printf "\"`. A shape line inside a
+  heredoc body or a PowerShell block comment is data and writes nothing. A
+  write that reaches the file without spelling `GITHUB_ENV`, through another
+  variable or a path found at run time, is outside the scan.
+  Rustflags and rustdocflags inputs that contain `--cfg` also fail.
+  The invocation inventory refuses a compiler argument that passes `--cfg`.
+- D8: no workflow, named script, or this guide enables every feature.
+- D9: only the CI feature-on jobs and the feature-on coverage job name
+  `mainnet-write` in a feature list; release-shaped builds activate it through the binary
+  defaults.
+- D10: the feature list of `ci.yml` and the list in this guide equal the
+  declared features except `default` and `mainnet-write`.
+- D11: the release, publish, and rehearsal workflows expect the marker on.
+- D12: the marker literal appears in `crates/` only in the two cfg arms of the
+  core crate.
+- D13: every declared feature belongs to exactly one of the product and test
+  sets in the checker. Product features reach no workspace test feature and
+  activate no optional dependency on a test package. Non-optional normal and
+  build dependencies request no test feature and name no test package.
+- D14: every development graph enables storage isolation on the protected
+  storage crates, no build dependency reaches a storage crate, and live
+  platform-keyring tests run only in acceptance.
+- D15: a lexical guard keeps storage constructors, storage dependency renames,
+  and live acceptance entry points inside their permitted files.
+
+Release builds refuse compiler overrides and cargo configuration files
+through the checker's `--env-guard` mode, which `build.sh` runs on its own
+checkout. `check-binary-marker.sh <binary> <on|off>` checks the second version
+line, the embedded expected marker, and the absence of the opposite marker
+and test-override literals.
+
+The [release provenance boundary](releasing.md#feature-state-checks) combines
+statement-content validation, workflow guards and resolved graphs, and packaged
+binary markers. Package and registry-install rows retain marker evidence;
+their packaged or registry source graphs are outside this check.
+
+`check-host.sh` builds the release executable for the host target through
+`build.sh`, which copies it to `stellar-agent-mcp`, compares the two files and
+checks both markers. It then builds the CLI package alone with
+`cargo build --locked -p stellar-agent-cli`, copies the debug executable to
+`target/tmp/host-alias/stellar-agent-mcp`, compares the bytes and checks the
+marker under both names; the preflight row `release-shape` runs it.
+It installs nothing, and it stops in these cases:
+
+- On Linux without libudev, it prints the install command and exits 2. The
+  preflight row reports itself unavailable with that command.
+- The environment guard of `build.sh` refuses a cargo configuration file in
+  `CARGO_HOME`, in the checkout, or in one of its parent directories, and a
+  compiler variable such as `RUSTC_WRAPPER`.
+- On an aarch64 Linux host, the host target is the cross target, so
+  `build.sh` builds through `cross`, which needs `cross` and a container
+  engine.
+
+The release rehearsal checks both executable names from every packed archive on a
+native runner, including Rosetta for the Intel macOS archive. Its crate job
+packages with the publish toolchain and checks fresh package-verification
+outputs. Live acceptance builds with `mainnet-write` off by default: the runner
+passes `--no-default-features` to every suite. `MAINNET_WRITE=on` adds the
+feature to each suite whose crate declares it.

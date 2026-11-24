@@ -1,0 +1,36 @@
+{
+  "test_kind": "sequence",
+  "name": "equal_tables_shared_counter",
+  "category": "extended_grammar",
+  "description": "Two rules for different tools carry equal unlisted tables (written in another key order) and share one counter: an unlisted payment recorded under the first rule consumes the second rule's period budget.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "amount_stroops": "100", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "record": true,
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "tool": "stellar_pay_commit",
+      "args": { "amount_stroops": "51", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": {
+        "kind": "Deny",
+        "deny_reason": "unlisted_budget_exceeded",
+        "wire_code": "policy.deny.unlisted_budget_exceeded",
+        "reason": { "UnlistedBudgetExceeded": { "asset": "native", "bound": "per_period", "max_stroops": "150", "attempted_stroops": "51" } }
+      }
+    },
+    {
+      "tool": "stellar_pay_commit",
+      "args": { "amount_stroops": "50", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": { "kind": "Allow" }
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+version = 2
+scope = "profile:*"
+sequence = 1
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = []
+decision = "allow"

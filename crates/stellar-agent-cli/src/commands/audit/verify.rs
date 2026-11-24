@@ -11,6 +11,16 @@
 //! `--profile`, the CLI verifies the hash chain only and `hmac_verified`
 //! remains `false`.
 //!
+//! # Entry tags
+//!
+//! With `--profile <name>`, the walk also checks the keyed entry tag of every
+//! entry from the log's boundary row on, under a key derived from the
+//! profile's audit key. An entry past that boundary with a missing or wrong
+//! tag exits 1 with `audit.entry_tag_invalid`. `entry_tags_verified` reports
+//! whether tags were in force and checked, and `entry_tags_boundary` names
+//! the newest keyed start the walk found. Without `--profile` no tag is
+//! checked and `entry_tags_verified` is `false`.
+//!
 //! # Tip-anchor verification
 //!
 //! The chain walk and the chain-root signatures verify a PREFIX of the log, so
@@ -21,6 +31,13 @@
 //! against a file it does not describe would report a mismatch that means
 //! nothing.  Every other case reports `anchor.status = "not_checked"` with the
 //! reason, and the hash chain is still fully verified.
+//!
+//! When the path is the profile's and no anchor is stored, the log must show it
+//! was never anchored. An audit binding recorded for the profile, a chain-root
+//! sidecar on the active file, or an `audit_tip_anchored` row in it shows it
+//! was, and the verify exits 1 with `audit.tip_anchor_missing`
+//! (`anchor: missing`). A log with none of these reports the anchor as
+//! `not_checked`.
 //!
 //! # Audit binding
 //!
@@ -49,11 +66,14 @@ use serde::{Deserialize, Serialize};
 use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::{
     audit_log::{
-        BindingCheck,
+        BindingCheck, BindingHistory, WriterError,
         health::AuditWriterHealth,
         outbox::inspect_outbox,
-        tip_anchor::{TipAnchor, TipAnchorStore as _, normalize_path_lexically},
-        verify::{FileVerifyResult, VerifyError, VerifyWarning, verify_log_with_health},
+        tip_anchor::{TipAnchor, normalize_path_lexically},
+        verify::{
+            EntryTagsBoundary, FileVerifyResult, VerifyError, VerifyWarning, check_missing_anchor,
+            verify_log_with_health,
+        },
     },
     envelope::{Envelope, OutputFormat},
     error::{InternalError, WalletError},
@@ -125,11 +145,23 @@ pub struct AuditVerifyResult {
     pub entries_verified: usize,
     /// Number of log files walked (active + rotated).
     pub files_walked: usize,
-    /// Whether the HMAC chain-root signature was verified.
+    /// Whether the HMAC chain-root signatures were verified.
     ///
-    /// The CLI emits `true` only when `--profile <name>` supplies an audit key
-    /// and every chain-root sidecar verifies.
+    /// `true` when `--profile <name>` supplies the audit key and every walked
+    /// file's chain-root sidecar verifies over that file's first entry. It
+    /// covers no later entry: [`Self::entry_tags_verified`] reports the check
+    /// that covers them.
     pub hmac_verified: bool,
+    /// Whether the walk checked entry tags under the profile's audit key and
+    /// found them in force: from the boundary row on, every entry carries a
+    /// valid tag. `false` without `--profile`, and on a log whose tags are not
+    /// in force.
+    pub entry_tags_verified: bool,
+    /// The newest `audit_entry_tags_started` or `audit_entry_tags_rekeyed`
+    /// row with a valid tag in the walked chain, as its file basename,
+    /// one-based line, and kind. `null` when the walk checked no tags or a
+    /// prune removed that row.
+    pub entry_tags_boundary: Option<EntryTagsBoundary>,
     /// Per-file verification results in verifier walk order.
     pub per_file: Vec<FileVerifyResult>,
     /// Informational verifier warnings that do not make verification fail.
@@ -140,15 +172,20 @@ pub struct AuditVerifyResult {
     pub audit_writer_degraded: bool,
     /// Whether the keyring-held tip anchor was checked, and if not, why.
     pub anchor: AuditAnchorStatus,
-    /// Number of consent rows queued in the audit outbox beside the log and
+    /// Number of operator rows queued in the audit outbox beside the log and
     /// not yet drained into it: the newline-terminated lines of
-    /// `<log>.outbox`, read without taking the outbox lock.
+    /// `<log>.outbox`, counted after the commitment check and apart from it.
     ///
-    /// Queued rows sit outside the tip anchor until a draining writer appends
-    /// them. A torn or unparseable outbox adds a warning and leaves the chain
-    /// verdict unchanged. An outbox that cannot be read has no count: the
-    /// field is omitted, an `outbox_unreadable` warning names the condition,
-    /// and the chain verdict is unchanged.
+    /// A queue without owner state commits its rows by count and chain head
+    /// in the keyring until a draining writer appends them; a queue under
+    /// owner state authenticates each row by its tag and commits delivered
+    /// batches. With `--profile` on the profile's own log, verification checks
+    /// the commitment under the outbox lock and fails when committed rows are
+    /// missing or changed. Under owner state, a dropped tail of queued rows
+    /// that carry no reference, such as halt and resume rows, passes. A torn or unparseable outbox adds a
+    /// warning and leaves the chain verdict unchanged. An outbox that cannot
+    /// be read has no count: the field is omitted, an `outbox_unreadable`
+    /// warning names the condition, and the chain verdict is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outbox_pending: Option<usize>,
 }
@@ -157,15 +194,20 @@ pub struct AuditVerifyResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct AuditAnchorStatus {
-    /// `"verified"` when the anchor was loaded and matched the log's tip;
-    /// `"not_checked"` otherwise.
+    /// `"verified"` when the anchor was loaded and the walk found the
+    /// anchored entry intact; `"not_checked"` otherwise.
+    ///
+    /// `verified` means the anchored entry is intact at the anchored offset
+    /// and the active file ends at or past it. Entries past the anchor are
+    /// authenticated only when `entry_tags_verified` is `true`.
     pub status: String,
     /// Why the anchor was not checked.  `None` when it was.
     pub reason: Option<String>,
 }
 
 impl AuditAnchorStatus {
-    /// The anchor was loaded and the walk matched it.
+    /// The anchor was loaded and the walk found the anchored entry intact at
+    /// the anchored offset.
     fn verified() -> Self {
         Self {
             status: "verified".to_owned(),
@@ -258,11 +300,28 @@ impl From<WalletError> for VerifyFailure {
 /// whether the tip anchor was checked and why — is reachable without capturing
 /// stdout.
 fn verify_to_result(args: &VerifyArgs) -> Result<AuditVerifyResult, VerifyFailure> {
+    let inputs = resolve_profile_inputs(args.profile.as_deref(), &args.log_path)?;
+    verify_resolved(&args.log_path, inputs)
+}
+
+/// Walks the log at `log_path` against resolved inputs and builds the result
+/// payload.
+///
+/// An absent anchor for the profile's own log is checked here, after an
+/// unkeyed walk and before the keyed walk: the evidence includes what the
+/// unkeyed walk read from the active file, and a missing anchor takes
+/// precedence over a missing or invalid HMAC sidecar.
+fn verify_resolved(
+    log_path: &std::path::Path,
+    inputs: ResolvedVerifyInputs,
+) -> Result<AuditVerifyResult, VerifyFailure> {
     let ResolvedVerifyInputs {
         hmac_key,
         anchor,
         anchor_skip_reason,
-    } = resolve_profile_inputs(args.profile.as_deref(), &args.log_path)?;
+        missing_anchor_binding,
+        outbox_check,
+    } = inputs;
 
     // Create a fresh health instance — in the CLI context the health latch is
     // never marked degraded (health is a session property of the MCP server).
@@ -270,21 +329,30 @@ fn verify_to_result(args: &VerifyArgs) -> Result<AuditVerifyResult, VerifyFailur
     // with any future MCP-tool caller that has access to a live handle.
     let health = AuditWriterHealth::new();
     let handle = health.handle();
-    let ok_with_health = verify_log_with_health(
-        &args.log_path,
-        hmac_key.as_deref(),
-        anchor.as_ref(),
-        &handle,
-    )
-    .map_err(|err| verify_failure(&err))?;
+    if let Some(binding) = missing_anchor_binding {
+        // Anchor evidence takes precedence over a missing or invalid HMAC sidecar.
+        let walked = verify_log_with_health(log_path, None, None, &handle)
+            .map_err(|err| verify_failure(&err))?;
+        check_missing_anchor(log_path, binding, walked.verify_ok.active_tip.as_ref())
+            .map_err(|err| verify_failure(&err))?;
+    }
+    let ok_with_health =
+        verify_log_with_health(log_path, hmac_key.as_deref(), anchor.as_ref(), &handle)
+            .map_err(|err| verify_failure(&err))?;
 
+    if let Some(check) = outbox_check {
+        stellar_agent_core::audit_log::check_outbox_commitment(log_path, check.store.as_ref())
+            .map_err(|e| outbox_commitment_failure(&e, &check.profile_name))?;
+    }
     let ok = ok_with_health.verify_ok;
     let mut warnings = ok.warnings;
-    let outbox_pending = inspect_outbox_into(&args.log_path, &mut warnings);
+    let outbox_pending = inspect_outbox_into(log_path, &mut warnings);
     Ok(AuditVerifyResult {
         entries_verified: ok.entries_verified,
         files_walked: ok.files_walked,
         hmac_verified: ok.hmac_verified,
+        entry_tags_verified: ok.entry_tags_verified,
+        entry_tags_boundary: ok.entry_tags_boundary,
         per_file: ok.per_file,
         warnings,
         audit_writer_degraded: ok_with_health.audit_writer_degraded,
@@ -296,12 +364,46 @@ fn verify_to_result(args: &VerifyArgs) -> Result<AuditVerifyResult, VerifyFailur
     })
 }
 
+/// Maps a refused outbox commitment check onto the verify failure model.
+///
+/// A held outbox lock carries `audit.outbox_busy`, and an outbox that cannot
+/// be read carries `audit.io_error`, the verifier's code for a file it cannot
+/// read. Missing or changed committed rows carry `audit.outbox_rows_missing`,
+/// as the writer's refusal does. A commitment the keyring refuses to read
+/// reports the keyring's `auth.*` code; any other commitment read failure
+/// carries `audit.tip_anchor_unavailable`, as an anchor that cannot be read
+/// does.
+fn outbox_commitment_failure(e: &WriterError, profile_name: &str) -> VerifyFailure {
+    match e {
+        WriterError::OutboxBusy => VerifyFailure::Raw {
+            code: "audit.outbox_busy",
+            message: e.to_string(),
+        },
+        WriterError::Io(io) => VerifyFailure::Raw {
+            code: "audit.io_error",
+            message: format!(
+                "audit.io_error: the audit outbox could not be read ({})",
+                io.kind()
+            ),
+        },
+        WriterError::TipAnchorStore(store) => {
+            VerifyFailure::Wallet(super::tip_anchor_unavailable(store))
+        }
+        _ => VerifyFailure::Wallet(super::audit_writer_error(
+            e,
+            "audit.tip_anchor_unavailable",
+            profile_name,
+        )),
+    }
+}
+
 /// Counts the rows queued in the audit outbox beside `log_path`, adding a
 /// warning for a torn, unparseable, or unreadable outbox.
 ///
-/// Reads without the outbox lock, so the count describes the file at the
-/// moment it was read. An absent outbox counts zero; an outbox that cannot be
-/// read has no count, `None`. Nothing here changes the chain verdict.
+/// The count is read apart from the locked commitment check, so it describes
+/// the file at the moment it was read. An absent outbox counts zero; an
+/// outbox that cannot be read has no count, `None`. Nothing here changes the
+/// chain verdict.
 fn inspect_outbox_into(
     log_path: &std::path::Path,
     warnings: &mut Vec<VerifyWarning>,
@@ -329,8 +431,18 @@ fn inspect_outbox_into(
     }
 }
 
+/// The outbox commitment `audit verify` checks for the profile's own log.
+struct OutboxCommitmentCheck {
+    /// The store holding the commitment: the profile's tip-anchor store.
+    store: std::sync::Arc<dyn stellar_agent_core::audit_log::TipAnchorStore>,
+    /// The profile name a refusal names.
+    profile_name: String,
+}
+
 /// What `--profile` contributed to this verification.
 struct ResolvedVerifyInputs {
+    /// The outbox commitment check, only for the profile's own log path.
+    outbox_check: Option<OutboxCommitmentCheck>,
     /// The profile's audit chain-root HMAC key, when `--profile` was supplied.
     hmac_key: Option<Zeroizing<[u8; 32]>>,
     /// The keyring-held tip anchor, when it applies to the supplied path and
@@ -338,6 +450,10 @@ struct ResolvedVerifyInputs {
     anchor: Option<TipAnchor>,
     /// Why the anchor was not checked.  `None` means it was.
     anchor_skip_reason: Option<String>,
+    /// The profile's binding history, when the path is the profile's and no
+    /// anchor is stored for it: the walk must then show the log was never
+    /// anchored.
+    missing_anchor_binding: Option<BindingHistory>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -346,19 +462,22 @@ struct ResolvedVerifyInputs {
 ///
 /// The anchor names a PATH, so it is loaded only when `log_path` is the very
 /// file the profile configures; a path that differs is verified as a plain chain
-/// walk and the reason is reported. An absent anchor is likewise a reason, not a
-/// failure: a log whose first keyed use has not happened yet has none.
+/// walk and the reason is reported. An absent anchor is a reason, not a
+/// failure, for a log whose first keyed use has not happened yet; the walk
+/// refuses it for a log that shows it was anchored before.
 fn resolve_profile_inputs(
     profile_name: Option<&str>,
     log_path: &std::path::Path,
 ) -> Result<ResolvedVerifyInputs, WalletError> {
     let Some(profile_name) = profile_name else {
         return Ok(ResolvedVerifyInputs {
+            outbox_check: None,
             hmac_key: None,
             anchor: None,
             anchor_skip_reason: Some(
                 "no --profile supplied; the tip anchor is held per profile".to_owned(),
             ),
+            missing_anchor_binding: None,
         });
     };
     let resolved = ResolvedProfileName::from_flag(profile_name);
@@ -375,34 +494,47 @@ fn resolve_profile_inputs(
 ///
 /// The profile's audit binding is read first and never written: a record that
 /// differs or does not parse refuses with `audit.log_binding_changed`, an
-/// absent or equal one proceeds, and a read error fails closed.
+/// absent or equal one proceeds, and a read error fails closed. Whether it was
+/// recorded is kept for an absent anchor, which the walk then checks against
+/// [`check_missing_anchor`].
 fn resolve_profile_inputs_with_profile(
     profile: &Profile,
     profile_name: &str,
     log_path: &std::path::Path,
 ) -> Result<ResolvedVerifyInputs, WalletError> {
-    check_audit_binding(profile, profile_name, BindingCheck::CheckOnly)?;
+    let binding = check_audit_binding(profile, profile_name, BindingCheck::CheckOnly)?;
     let hmac_key = Some(load_audit_hmac_key(profile, profile_name)?);
 
     if normalize_path_lexically(log_path) != normalize_path_lexically(&profile.audit_log_path) {
         return Ok(ResolvedVerifyInputs {
+            outbox_check: None,
             hmac_key,
             anchor: None,
             anchor_skip_reason: Some(format!(
                 "the supplied log path is not the audit log profile '{profile_name}' \
                  configures; the tip anchor names a path, not a profile"
             )),
+            missing_anchor_binding: None,
         });
     }
 
-    let store = KeyringTipAnchorStore::new(&profile.audit_log_hash_chain_key_id, log_path);
+    let store = KeyringTipAnchorStore::shared(&profile.audit_log_hash_chain_key_id, log_path);
     match store.load_anchor() {
         Ok(Some(anchor)) => Ok(ResolvedVerifyInputs {
+            outbox_check: Some(OutboxCommitmentCheck {
+                store: store.clone(),
+                profile_name: profile_name.to_owned(),
+            }),
             hmac_key,
             anchor: Some(anchor),
             anchor_skip_reason: None,
+            missing_anchor_binding: None,
         }),
         Ok(None) => Ok(ResolvedVerifyInputs {
+            outbox_check: Some(OutboxCommitmentCheck {
+                store: store.clone(),
+                profile_name: profile_name.to_owned(),
+            }),
             hmac_key,
             anchor: None,
             anchor_skip_reason: Some(
@@ -410,10 +542,9 @@ fn resolve_profile_inputs_with_profile(
                  next value-moving verb"
                     .to_owned(),
             ),
+            missing_anchor_binding: Some(binding),
         }),
-        Err(e) => Err(WalletError::Internal(InternalError::UnexpectedState {
-            detail: format!("audit.tip_anchor_unavailable: {e}"),
-        })),
+        Err(e) => Err(super::tip_anchor_unavailable(&e)),
     }
 }
 
@@ -425,14 +556,9 @@ fn resolve_profile_inputs_with_profile(
 /// another profile" and "the file is malformed" must be distinguishable in the
 /// refusal.
 fn load_profile_for_verify(resolved: &ResolvedProfileName) -> Result<Profile, WalletError> {
-    let profile_name = &resolved.name;
     load_profile_reconciled(resolved).map_err(|e| {
-        tracing::debug!(
-            profile = %profile_name,
-            error = %e,
-            "profile access refused for audit verify"
-        );
-        e.to_wallet_error(profile_name)
+        tracing::debug!(error = %e, "profile access refused for audit verify");
+        e.to_wallet_error()
     })
 }
 
@@ -457,23 +583,17 @@ fn load_audit_hmac_key(
         stellar_agent_network::keyring::AUDIT_KEY_FIELD,
     )?;
     let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
-        tracing::debug!(
-            service = %entry_ref.service,
-            "keyring Entry::new failed for audit verify HMAC key"
-        );
+        tracing::debug!("keyring Entry::new failed for audit verify HMAC key");
         map_keyring_operation_error(&e, KeyringOperation::Construct, &entry_ref.service)
     })?;
 
     let secret_b64 = Zeroizing::new(entry.get_password().map_err(|e| {
-        tracing::debug!(
-            service = %entry_ref.service,
-            "get_password failed for audit verify HMAC key"
-        );
+        tracing::debug!("get_password failed for audit verify HMAC key");
         map_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service)
     })?);
 
-    let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {
-        tracing::debug!(error = %e, "audit verify HMAC key base64 decode failed");
+    let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|_| {
+        tracing::debug!("audit verify HMAC key base64 decode failed");
         WalletError::Internal(InternalError::UnexpectedState {
             detail: "audit.key_decode_failed: audit HMAC key is not valid base64".to_owned(),
         })
@@ -563,8 +683,8 @@ fn check_parent_owner(path: &std::path::Path) -> Result<(), String> {
 /// A missing log carries the validation message with its remediation.
 fn verify_failure(err: &VerifyError) -> VerifyFailure {
     match err {
-        VerifyError::LogNotFound { path } => VerifyFailure::Wallet(WalletError::Validation(
-            stellar_agent_core::ValidationError::AuditLogNotFound { path: path.clone() },
+        VerifyError::LogNotFound => VerifyFailure::Wallet(WalletError::Validation(
+            stellar_agent_core::ValidationError::AuditLogNotFound,
         )),
         _ => VerifyFailure::Raw {
             code: err.wire_code(),
@@ -696,6 +816,9 @@ mod tests {
     #[test]
     #[serial]
     fn load_audit_hmac_key_decodes_profile_keyring_entry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
 
         let profile = Profile::builder_testnet_named(
@@ -718,6 +841,9 @@ mod tests {
     #[test]
     #[serial]
     fn load_audit_hmac_key_rejects_wrong_length_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
 
         let profile = Profile::builder_testnet_named(
@@ -753,6 +879,9 @@ mod tests {
     #[test]
     #[serial]
     fn load_audit_hmac_key_refuses_owner_key_forms() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::KeyringEntryRef;
         stellar_agent_test_support::keyring_mock::install().ok();
         let name = "audit-verify-owner";
@@ -811,6 +940,9 @@ mod tests {
     #[test]
     #[serial]
     fn load_audit_hmac_key_surfaces_interactive_session_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
 
         let profile = Profile::builder_testnet_named(
@@ -834,11 +966,92 @@ mod tests {
         assert_eq!(err.code(), "auth.keyring_interactive_session_required");
     }
 
+    /// The profile whose audit key sits at a coordinate holding the marker.
+    fn marker_coordinate_profile() -> Profile {
+        let mut profile = Profile::builder_testnet_named(
+            "audit-verify-marker-test",
+            "stellar-agent-signer",
+            "audit-verify-marker-test",
+            "stellar-agent-nonce",
+            "audit-verify-marker-test",
+        )
+        .build();
+        profile.audit_log_hash_chain_key_id =
+            stellar_agent_core::profile::schema::KeyringEntryRef::new("credmarker7", "default");
+        profile
+    }
+
+    /// A failed entry construction emits its event without the keyring
+    /// service, and the refusal holds no service.
+    #[test]
+    #[serial]
+    fn entry_construction_failure_holds_no_service() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let profile = marker_coordinate_profile();
+        keyring_core::unset_default_store();
+        let mut result = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            result = Some(load_audit_hmac_key(&profile, "test-profile"));
+        });
+        stellar_agent_test_support::keyring_mock::install().ok();
+
+        assert!(
+            logs.contains("keyring Entry::new failed for audit verify HMAC key"),
+            "{logs}"
+        );
+        assert!(!logs.contains("credmarker7"), "{logs}");
+        let Some(Err(err)) = result else {
+            panic!("the load refuses");
+        };
+        assert!(!err.to_string().contains("credmarker7"), "{err}");
+        assert!(!format!("{err:?}").contains("credmarker7"), "{err:?}");
+    }
+
+    /// A stored audit key that is not base64 emits its event without the
+    /// decoder's diagnostic, which quotes the offending byte.
+    #[test]
+    #[serial]
+    fn stored_key_decode_failure_holds_no_decoder_diagnostic() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let profile = marker_coordinate_profile();
+        let entry_ref = &profile.audit_log_hash_chain_key_id;
+        KeyringEntry::new(&entry_ref.service, &entry_ref.account)
+            .unwrap()
+            .set_password("~")
+            .unwrap();
+        let mut result = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            result = Some(load_audit_hmac_key(&profile, "test-profile"));
+        });
+
+        assert!(
+            logs.contains("audit verify HMAC key base64 decode failed"),
+            "{logs}"
+        );
+        assert!(!logs.contains("Invalid symbol"), "{logs}");
+        let Some(Err(err)) = result else {
+            panic!("the load refuses");
+        };
+        assert_eq!(
+            err.to_string(),
+            "unexpected internal state: audit.key_decode_failed: audit HMAC key is not valid \
+             base64"
+        );
+    }
+
     /// A platform-store failure at the audit-key coordinates must surface as
     /// `auth.keyring_platform_error`, not `auth.keyring_not_found`.
     #[test]
     #[serial]
     fn load_audit_hmac_key_surfaces_platform_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
 
         let profile = Profile::builder_testnet_named(
@@ -911,6 +1124,14 @@ mod tests {
                 "audit.hmac_mismatch",
             ),
             (
+                VerifyError::EntryTagInvalid {
+                    file: "f.jsonl".to_owned(),
+                    line: 4,
+                    reason: "missing",
+                },
+                "audit.entry_tag_invalid",
+            ),
+            (
                 VerifyError::HmacSidecarMissing {
                     file: "f.jsonl".to_owned(),
                 },
@@ -921,9 +1142,7 @@ mod tests {
                 "audit.too_many_rotated_files",
             ),
             (
-                VerifyError::NonRegularFileLogPath {
-                    path: "f.jsonl".into(),
-                },
+                VerifyError::NonRegularFileLogPath,
                 "audit.non_regular_file_log_path",
             ),
             (
@@ -939,12 +1158,7 @@ mod tests {
                 },
                 "audit.path_contract",
             ),
-            (
-                VerifyError::LogNotFound {
-                    path: "/tmp/audit.jsonl".to_owned(),
-                },
-                "audit.log_not_found",
-            ),
+            (VerifyError::LogNotFound, "audit.log_not_found"),
             (
                 VerifyError::Io(std::io::Error::other("read failed")),
                 "audit.io_error",
@@ -977,6 +1191,14 @@ mod tests {
                 },
                 "audit.tip_anchor_mismatch",
             ),
+            (
+                VerifyError::TipAnchorMissing {
+                    evidence: stellar_agent_core::audit_log::PriorAnchoring::BindingRecorded,
+                    actual_count: 1,
+                    actual_offset: 10,
+                },
+                "audit.tip_anchor_missing",
+            ),
         ];
         for (err, expected_code) in cases {
             match verify_failure(&err) {
@@ -994,7 +1216,7 @@ mod tests {
                     );
                     assert_eq!(
                         error.message(),
-                        "audit log not found at /tmp/audit.jsonl; nothing has been written to the audit log yet, or the log path is incorrect"
+                        "log_path must name an existing audit log file; choose an existing file and retry audit verify."
                     );
                 }
             }
@@ -1037,9 +1259,7 @@ mod tests {
     /// `audit.log_not_found` code and an actionable, single-prefix message.
     #[test]
     fn verify_failure_log_not_found_is_validation_class() {
-        let err = VerifyError::LogNotFound {
-            path: "/tmp/audit.jsonl".to_owned(),
-        };
+        let err = VerifyError::LogNotFound;
         let VerifyFailure::Wallet(we) = verify_failure(&err) else {
             panic!("missing log has a validation error");
         };
@@ -1052,14 +1272,11 @@ mod tests {
             "audit.log_not_found",
             "envelope code must be audit.log_not_found"
         );
-        let message = we.message();
-        assert!(
-            message.contains("/tmp/audit.jsonl"),
-            "message must name the missing path: {message}"
-        );
-        assert!(
-            !message.contains("audit.log_not_found:"),
-            "the code is the envelope code field, not a message prefix: {message}"
+        assert_eq!(
+            we.message(),
+            "log_path must name an existing audit log file; choose an existing file and retry \
+             audit verify.",
+            "the code is the envelope code field, not a message prefix"
         );
     }
 
@@ -1122,6 +1339,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_path_other_than_the_profile_log_reports_the_anchor_as_not_checked() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = TempDir::new().unwrap();
@@ -1151,6 +1371,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_unanchored_log_reports_the_anchor_as_not_checked() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = TempDir::new().unwrap();
@@ -1175,6 +1398,153 @@ mod tests {
         );
     }
 
+    /// Resolves `profile`'s inputs for its own log and walks it, as
+    /// `audit verify --profile` does.
+    fn verify_profile_log(
+        profile: &Profile,
+        name: &str,
+    ) -> Result<AuditVerifyResult, VerifyFailure> {
+        let inputs = resolve_profile_inputs_with_profile(profile, name, &profile.audit_log_path)?;
+        verify_resolved(&profile.audit_log_path, inputs)
+    }
+
+    /// Keeps the first `entries` lines of the log at `path`.
+    fn truncate_to_entries(path: &std::path::Path, entries: usize) {
+        let content = std::fs::read_to_string(path).unwrap();
+        let kept: String = content.split_inclusive('\n').take(entries).collect();
+        std::fs::write(path, kept).unwrap();
+    }
+
+    /// A profile whose audit key is minted and whose log holds `entries` rows
+    /// written under that key, so every file carries a verifying chain-root
+    /// sidecar, with no tip anchor stored.
+    fn keyed_unanchored_profile(name: &str, dir: &std::path::Path, entries: usize) -> Profile {
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = dir.join("audit.jsonl");
+        let coord = profile.audit_log_hash_chain_key_id.clone();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .expect("seed audit key");
+        let key = load_audit_hmac_key(&profile, name).expect("load audit key");
+        make_writer_and_entries(profile.audit_log_path.clone(), entries, Some(&key));
+        stellar_agent_core::audit_log::test_helpers::enroll_carriers(
+            &profile.audit_log_path,
+            &stellar_agent_network::keyring::KeyringTipAnchorStore::new(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        )
+        .unwrap();
+        profile
+    }
+
+    /// The profile's binding is recorded, so a keyed use reached its log, and
+    /// the anchor that use left is gone while the log is truncated. Verify
+    /// exits with `audit.tip_anchor_missing` and says `anchor: missing`.
+    #[test]
+    #[serial]
+    fn verify_fails_with_anchor_missing_under_a_recorded_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock keyring store");
+        let dir = TempDir::new().unwrap();
+        let profile = keyed_unanchored_profile("verify-missing", dir.path(), 3);
+        truncate_to_entries(&profile.audit_log_path, 2);
+        stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile("verify-missing")
+            .store(&stellar_agent_core::audit_log::AuditBinding::for_profile(
+                &profile,
+            ))
+            .expect("record the binding");
+
+        let Err(VerifyFailure::Raw { code, message }) =
+            verify_profile_log(&profile, "verify-missing")
+        else {
+            panic!("a missing anchor under a recorded binding must fail verify");
+        };
+        assert_eq!(code, "audit.tip_anchor_missing");
+        assert!(message.contains("anchor: missing"), "{message}");
+        assert!(message.contains("audit binding is recorded"), "{message}");
+        assert!(message.contains("2 entries"), "{message}");
+    }
+
+    #[test]
+    #[serial]
+    fn verify_reports_missing_anchor_before_missing_hmac_sidecar() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock keyring store");
+        let dir = TempDir::new().unwrap();
+        let name = "verify-binding-only";
+        let profile = keyed_unanchored_profile(name, dir.path(), 2);
+        stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(name)
+            .store(&stellar_agent_core::audit_log::AuditBinding::for_profile(
+                &profile,
+            ))
+            .unwrap();
+        std::fs::remove_file(profile.audit_log_path.with_extension("jsonl.root_hmac")).unwrap();
+        let bytes = std::fs::read(&profile.audit_log_path).unwrap();
+        let Err(VerifyFailure::Raw { code, message }) = verify_profile_log(&profile, name) else {
+            panic!("a recorded binding alone must report the missing anchor");
+        };
+        assert_eq!(code, "audit.tip_anchor_missing");
+        assert!(message.contains("anchor: missing"), "{message}");
+        assert_eq!(std::fs::read(&profile.audit_log_path).unwrap(), bytes);
+    }
+
+    /// With no binding recorded, the chain-root sidecar alone shows a keyed
+    /// writer wrote the log, and a missing anchor fails verify the same way.
+    #[test]
+    #[serial]
+    fn verify_fails_with_anchor_missing_when_the_sidecar_shows_a_keyed_writer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock keyring store");
+        let dir = TempDir::new().unwrap();
+        let profile = keyed_unanchored_profile("verify-sidecar", dir.path(), 2);
+
+        let Err(VerifyFailure::Raw { code, message }) =
+            verify_profile_log(&profile, "verify-sidecar")
+        else {
+            panic!("a missing anchor with a chain-root sidecar must fail verify");
+        };
+        assert_eq!(code, "audit.tip_anchor_missing");
+        assert!(message.contains("anchor: missing"), "{message}");
+        assert!(message.contains("chain-root sidecar"), "{message}");
+    }
+
+    /// Regression guard: an unanchored quickstart log, written only by
+    /// unkeyed writers and with no binding recorded, verifies as it does
+    /// without the missing-anchor check. Without `--profile` the chain walk
+    /// passes with the anchor not checked; with `--profile` the walk reports
+    /// the missing chain-root sidecar, never a missing anchor.
+    #[test]
+    #[serial]
+    fn an_unanchored_quickstart_log_verifies_as_without_the_anchor_check() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock keyring store");
+        let dir = TempDir::new().unwrap();
+        let profile = binding_profile("verify-quickstart", dir.path());
+
+        let plain = verify_resolved(
+            &profile.audit_log_path,
+            resolve_profile_inputs(None, &profile.audit_log_path).expect("no profile"),
+        )
+        .expect("the chain walk passes");
+        assert_eq!(plain.entries_verified, 1);
+        assert_eq!(plain.anchor.status, "not_checked");
+
+        let Err(VerifyFailure::Raw { code, .. }) =
+            verify_profile_log(&profile, "verify-quickstart")
+        else {
+            panic!("an unkeyed log has no chain-root sidecar to verify under the profile key");
+        };
+        assert_eq!(code, "audit.hmac_sidecar_missing");
+    }
+
     /// A profile whose audit key is minted and whose log holds one entry.
     fn binding_profile(name: &str, dir: &std::path::Path) -> Profile {
         let path = dir.join("audit.jsonl");
@@ -1196,6 +1566,9 @@ mod tests {
     #[test]
     #[serial]
     fn verify_refuses_a_changed_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = TempDir::new().unwrap();
         let profile = binding_profile("verify-binding", dir.path());
@@ -1223,6 +1596,9 @@ mod tests {
     #[test]
     #[serial]
     fn verify_reads_an_absent_binding_and_writes_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = TempDir::new().unwrap();
         let profile = binding_profile("verify-absent", dir.path());
@@ -1245,6 +1621,9 @@ mod tests {
     #[test]
     #[serial]
     fn verify_fails_closed_on_a_binding_read_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = TempDir::new().unwrap();
         let profile = binding_profile("verify-read-error", dir.path());
@@ -1305,10 +1684,96 @@ mod tests {
         );
     }
 
+    /// `audit verify --profile` reports both entry-tag fields on a log whose
+    /// tags are in force, and a chained row without a tag past the boundary
+    /// fails with `audit.entry_tag_invalid`.
+    #[test]
+    #[serial]
+    fn verify_json_reports_entry_tag_fields() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock keyring store");
+        let dir = TempDir::new().unwrap();
+        let name = "verify-entry-tags";
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let coord = profile.audit_log_hash_chain_key_id.clone();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .expect("seed audit key");
+        let key = load_audit_hmac_key(&profile, name).expect("load audit key");
+        {
+            let mut writer = AuditWriter::open_with_tip_anchor(
+                profile.audit_log_path.clone(),
+                Some(key),
+                stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                    &coord,
+                    &profile.audit_log_path,
+                ),
+                BindingHistory::NotRecorded,
+            )
+            .expect("keyed writer");
+            writer
+                .write_entry(AuditEntry::new_tool_invocation(NewToolInvocation::new(
+                    "stellar_pay_commit",
+                    "stellar:testnet",
+                    vec![],
+                    PolicyDecision::Allow,
+                    "req-tagged",
+                )))
+                .expect("append");
+        }
+
+        let result = verify_profile_log(&profile, name).expect("the tagged log verifies");
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["entry_tags_verified"], true);
+        assert_eq!(json["entry_tags_boundary"]["file"], "audit.jsonl");
+        assert_eq!(json["entry_tags_boundary"]["line"], 1);
+        assert_eq!(
+            json["entry_tags_boundary"]["kind"],
+            "audit_entry_tags_started"
+        );
+
+        stellar_agent_core::audit_log::test_helpers::append_forged_entry(
+            &profile.audit_log_path,
+            AuditEntry::new_tool_invocation(NewToolInvocation::new(
+                "stellar_pay_commit",
+                "stellar:testnet",
+                vec![],
+                PolicyDecision::Allow,
+                "req-forged",
+            )),
+            |_| None,
+        );
+        let Err(VerifyFailure::Raw { code, message }) = verify_profile_log(&profile, name) else {
+            panic!("a forged tail must fail with the verifier's own code");
+        };
+        assert_eq!(code, "audit.entry_tag_invalid", "{message}");
+        assert!(message.contains("missing"), "{message}");
+    }
+
     // ── The audit outbox ──────────────────────────────────────────────────────
 
+    /// Queues one consent row for the log at `path`, committed in a fresh
+    /// in-memory store.
     fn queue_consent(path: &std::path::Path, request_id: &str) {
-        stellar_agent_core::audit_log::AuditOutbox::for_log(path)
+        queue_consent_in(
+            path,
+            std::sync::Arc::new(
+                stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore::new(),
+            ),
+            request_id,
+        );
+    }
+
+    /// Queues one consent row for the log at `path`, committed in `store`.
+    fn queue_consent_in(
+        path: &std::path::Path,
+        store: std::sync::Arc<stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore>,
+        request_id: &str,
+    ) {
+        stellar_agent_core::audit_log::test_helpers::enroll_carriers(path, store.as_ref()).unwrap();
+        stellar_agent_core::audit_log::AuditOutbox::for_log(path, store)
             .append(
                 &stellar_agent_core::audit_log::AuditEntry::new_approval_attested(
                     "PaymentSimulated",
@@ -1324,10 +1789,10 @@ mod tests {
 
     fn append_to_outbox(path: &std::path::Path, bytes: &[u8]) {
         use std::io::Write as _;
-        let outbox = stellar_agent_core::audit_log::AuditOutbox::for_log(path);
+        let outbox = stellar_agent_core::audit_log::outbox_path(path);
         std::fs::OpenOptions::new()
             .append(true)
-            .open(outbox.path())
+            .open(&outbox)
             .unwrap()
             .write_all(bytes)
             .unwrap();
@@ -1338,8 +1803,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("audit.jsonl");
         make_writer_and_entries(path.clone(), 2, None);
-        queue_consent(&path, "queued-1");
-        queue_consent(&path, "queued-2");
+        let store = std::sync::Arc::new(
+            stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore::new(),
+        );
+        queue_consent_in(&path, std::sync::Arc::clone(&store), "queued-1");
+        queue_consent_in(&path, store, "queued-2");
         append_to_outbox(&path, b"{\"ts\":\"torn");
 
         let result = verify_to_result(&VerifyArgs {
@@ -1415,7 +1883,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("audit.jsonl");
         make_writer_and_entries(path.clone(), 2, None);
-        let outbox = stellar_agent_core::audit_log::AuditOutbox::for_log(&path);
+        let outbox = stellar_agent_core::audit_log::AuditOutbox::for_log(
+            &path,
+            std::sync::Arc::new(
+                stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore::new(),
+            ),
+        );
         let args = || VerifyArgs {
             log_path: path.clone(),
             profile: None,
@@ -1446,6 +1919,268 @@ mod tests {
         assert!(
             json.get("outbox_pending").is_none(),
             "an unreadable outbox omits the count: {json}"
+        );
+    }
+    #[test]
+    #[serial]
+    fn verify_fails_on_a_deleted_outbox_line() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "verify-outbox-loss";
+        let profile = keyed_unanchored_profile(name, dir.path(), 0);
+        let store = KeyringTipAnchorStore::shared(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        );
+        let outbox =
+            stellar_agent_core::audit_log::AuditOutbox::for_log(&profile.audit_log_path, store);
+        for id in ["one", "two"] {
+            outbox
+                .append(
+                    &stellar_agent_core::audit_log::AuditEntry::new_approval_attested(
+                        "PaymentSimulated",
+                        "stellar_pay_commit",
+                        None,
+                        "AAAAAAAAAAAAAAAAAAAAAA",
+                        "cli",
+                        id,
+                    ),
+                )
+                .unwrap();
+        }
+        let bytes = std::fs::read_to_string(outbox.path()).unwrap();
+        std::fs::write(
+            outbox.path(),
+            bytes.split_inclusive('\n').skip(1).collect::<String>(),
+        )
+        .unwrap();
+        let error = verify_profile_log(&profile, name).unwrap_err();
+        assert!(
+            matches!(error, VerifyFailure::Wallet(ref e) if e.code() == "audit.outbox_rows_missing" && e.message().starts_with("audit.outbox_rows_missing")),
+            "{error:?}"
+        );
+    }
+
+    /// A held outbox lock fails the profile's verification with
+    /// `audit.outbox_busy` once the lock wait runs out.
+    #[test]
+    #[serial]
+    fn verify_reports_a_held_outbox_lock_as_outbox_busy() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "verify-outbox-busy";
+        let profile = keyed_unanchored_profile(name, dir.path(), 0);
+        let lock_path = dir.path().join("audit.jsonl.outbox.lock");
+        let held =
+            stellar_agent_core::audit_log::test_helpers::hold_audit_lock(&lock_path).unwrap();
+        let error = verify_profile_log(&profile, name).unwrap_err();
+        drop(held);
+        assert!(
+            matches!(error, VerifyFailure::Raw { code: "audit.outbox_busy", ref message }
+                if message.starts_with("audit.outbox_busy")),
+            "{error:?}"
+        );
+    }
+
+    /// An outbox that cannot be read fails the profile's verification with
+    /// `audit.io_error`, the code of a file the verifier cannot read.
+    #[test]
+    #[serial]
+    fn verify_reports_an_unreadable_outbox_as_io_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "verify-outbox-unreadable";
+        let profile = keyed_unanchored_profile(name, dir.path(), 0);
+        std::fs::create_dir(stellar_agent_core::audit_log::outbox_path(
+            &profile.audit_log_path,
+        ))
+        .unwrap();
+        let error = verify_profile_log(&profile, name).unwrap_err();
+        assert!(
+            matches!(error, VerifyFailure::Raw { code: "audit.io_error", ref message }
+                if message.starts_with("audit.io_error: the audit outbox")),
+            "{error:?}"
+        );
+    }
+
+    /// A commitment read the keyring refuses fails the profile's verification
+    /// with the keyring's `auth.*` code.
+    #[test]
+    #[serial]
+    fn verify_reports_a_refused_commitment_read_under_its_auth_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "verify-commitment-refused";
+        let profile = keyed_unanchored_profile(name, dir.path(), 0);
+        let carrier =
+            stellar_agent_core::audit_log::tip_anchor::AuditKeyringEntries::for_path_digest(
+                &profile.audit_log_hash_chain_key_id,
+                &stellar_agent_core::audit_log::log_path_sha256(&profile.audit_log_path),
+            )
+            .carrier_record;
+        keyring_mock::inject_error(
+            &carrier.service,
+            &carrier.account,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                "credential store locked",
+            ))),
+        )
+        .unwrap();
+        let error = verify_profile_log(&profile, name).unwrap_err();
+        assert!(
+            matches!(error, VerifyFailure::Wallet(ref e) if e.code() == "auth.keyring_platform_error"),
+            "{error:?}"
+        );
+    }
+
+    /// An anchor read the keyring refuses fails the profile's verification
+    /// with the keyring's `auth.*` code.
+    #[test]
+    #[serial]
+    fn verify_reports_a_refused_anchor_read_under_its_auth_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "verify-anchor-refused";
+        let profile = keyed_unanchored_profile(name, dir.path(), 1);
+        let anchor = KeyringTipAnchorStore::new(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        )
+        .anchor_entry_ref()
+        .clone();
+        keyring_mock::inject_error(
+            &anchor.service,
+            &anchor.account,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                "credential store locked",
+            ))),
+        )
+        .unwrap();
+        let Err(error) =
+            resolve_profile_inputs_with_profile(&profile, name, &profile.audit_log_path)
+        else {
+            panic!("a refused anchor read fails the verification");
+        };
+        assert_eq!(error.code(), "auth.keyring_platform_error", "{error}");
+    }
+
+    #[test]
+    fn verify_without_a_profile_checks_no_commitment() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        make_writer_and_entries(path.clone(), 1, None);
+        queue_consent(&path, "lost");
+        std::fs::remove_file(stellar_agent_core::audit_log::outbox_path(&path)).unwrap();
+        let result = verify_to_result(&VerifyArgs {
+            log_path: path,
+            profile: None,
+            output: OutputFormat::DEFAULT,
+        })
+        .unwrap();
+        assert_eq!(result.entries_verified, 1);
+        assert_eq!(result.outbox_pending, Some(0));
+    }
+
+    /// The refusal event for an absent profile names the failure class and
+    /// never the requested profile name.
+    #[test]
+    #[serial]
+    fn absent_profile_refusal_log_omits_the_requested_name() {
+        use crate::common::refusal_log_fixture::{
+            ABSENT_PROFILE_MARKER, assert_refusal_omits_requested_profile,
+            capture_absent_profile_refusal,
+        };
+        let (code, logs) = capture_absent_profile_refusal(|home| {
+            let args = VerifyArgs {
+                log_path: home.join("audit.jsonl"),
+                profile: Some(ABSENT_PROFILE_MARKER.to_owned()),
+                output: OutputFormat::DEFAULT,
+            };
+            async move { run(&args).await }
+        });
+        assert_refusal_omits_requested_profile(
+            code,
+            &logs,
+            "profile access refused for audit verify",
+        );
+    }
+
+    /// `audit verify --profile` reports carrier refusals under their own
+    /// documented `audit.*` envelope codes, never `internal.*`.
+    #[test]
+    #[serial]
+    fn verify_reports_carrier_refusals_under_their_own_audit_codes() {
+        use stellar_agent_core::audit_log::TipAnchorStore as _;
+
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+
+        // 1. Upgraded keyed log with a tip anchor and no carrier record -> `audit.carriers_unbound`.
+        let unbound_name = "verify-carriers-unbound";
+        let mut unbound = Profile::builder_testnet(unbound_name, "acct", "n-svc", "n-acct").build();
+        unbound.audit_log_path = dir.path().join("unbound.jsonl");
+        let coord = unbound.audit_log_hash_chain_key_id.clone();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .unwrap();
+        let key = load_audit_hmac_key(&unbound, unbound_name).unwrap();
+        make_writer_and_entries(unbound.audit_log_path.clone(), 1, Some(&key));
+        let tip = verify_log(&unbound.audit_log_path, Some(&key))
+            .unwrap()
+            .active_tip
+            .unwrap();
+        let unbound_store = KeyringTipAnchorStore::new(&coord, &unbound.audit_log_path);
+        unbound_store
+            .store_anchor(&TipAnchor::new(
+                tip.entry_count,
+                tip.tip_hash,
+                tip.end_offset,
+            ))
+            .unwrap();
+        let error = verify_profile_log(&unbound, unbound_name).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                VerifyFailure::Wallet(ref e)
+                    if e.code() == "audit.carriers_unbound"
+                        && e.message().starts_with("audit.carriers_unbound:")
+            ),
+            "{error:?}"
+        );
+
+        // 2. Replaced outbox carrier lock file -> `audit.carrier_replaced`.
+        let replaced_name = "verify-carrier-replaced";
+        let replaced = keyed_unanchored_profile(replaced_name, dir.path(), 0);
+        let outbox_lock = dir.path().join("audit.jsonl.outbox.lock");
+        let retired = dir.path().join("audit.jsonl.outbox.lock.moved");
+        std::fs::rename(&outbox_lock, &retired).unwrap();
+        std::fs::write(&outbox_lock, b"").unwrap();
+        let error = verify_profile_log(&replaced, replaced_name).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                VerifyFailure::Wallet(ref e)
+                    if e.code() == "audit.carrier_replaced"
+                        && e.message().starts_with("audit.carrier_replaced:")
+            ),
+            "{error:?}"
         );
     }
 }

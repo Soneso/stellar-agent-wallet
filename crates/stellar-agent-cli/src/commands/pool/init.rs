@@ -3,8 +3,11 @@
 //! The profile records channel identities before the keyring seed is written.
 //! The seed is durable before the submission can leave. A pending lifecycle
 //! excludes replacement; `pool init --resume` completes it using the same keys.
-//! An attempt whose outcome is recorded as unknown is retried only after an
-//! operator acknowledges it through `tx receipt clear --acknowledge`.
+//! A sent attempt is retried only after an operator acknowledges it through
+//! `tx receipt clear --acknowledge`, whose clear row the verified audit
+//! history holds. An endpoint failure report is not that acknowledgement.
+//! An unsent attempt, proved by the durable send barrier, is retired with one
+//! `submission.not_transmitted` row when its pending row is still open.
 //! Only the pool keys in the stored profile are patched, so runtime environment
 //! overlays remain transient. The profile contains no signing material.
 
@@ -12,18 +15,18 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::Args;
 use keyring_core::Entry as KeyringEntry;
 use rand_core::{OsRng, RngCore};
-use std::{
-    fs::{File, OpenOptions},
-    sync::Mutex,
-    time::Duration,
+use std::{fs::OpenOptions, path::Path, sync::Mutex, time::Duration};
+use stellar_agent_core::audit_log::{
+    entry::AuditEntry,
+    reader::{AuditReader, audit_history_refusal},
 };
-use stellar_agent_core::audit_log::{entry::AuditEntry, reader::AuditReader};
 use stellar_agent_core::cross_check::CrossCheckValue;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::FeeSource;
 use stellar_agent_core::error::{
     AuthError, InternalError, NetworkError, SubmissionError, WalletError,
 };
+use stellar_agent_core::file_lock::HeldFileLock;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::profile::schema::{
     KeyringEntryRef, PoolChannelRecord, PoolConfig, PoolInitSubmission, PoolInitialization, Profile,
@@ -50,7 +53,7 @@ use stellar_agent_pool::{
 use stellar_agent_sep5::Sep5Wallet;
 use zeroize::Zeroizing;
 
-use crate::commands::submission_record::{SubmitRecord, build_recorder, write_settled_row};
+use crate::commands::submission_record::{SubmitRecord, build_recorder};
 use crate::common::network::{check_endpoint_identity, mainnet_write_refusal};
 use crate::common::profile_access::load_profile_reconciled;
 use crate::common::{render::render_json, resolve_profile_name};
@@ -136,9 +139,14 @@ fn persist(
         .map_err(|error| unavailable(format!("pool recovery state could not be saved: {error}")))
 }
 
-/// Serialises seed replacement, recovery and completion across processes.
-fn lifecycle_lock(name: &str) -> Result<File, WalletError> {
+/// Serializes seed replacement, recovery and completion across processes.
+fn lifecycle_lock(name: &str) -> Result<HeldFileLock, WalletError> {
     let dir = loader::default_profile_dir().map_err(|error| unavailable(error.to_string()))?;
+    lifecycle_lock_in_dir(name, &dir)
+}
+
+/// Takes the `<name>.pool-init.lock` file lock in `dir` for [`lifecycle_lock`] and the tests.
+fn lifecycle_lock_in_dir(name: &str, dir: &Path) -> Result<HeldFileLock, WalletError> {
     let mut options = OpenOptions::new();
     options.create(true).write(true).truncate(false);
     #[cfg(unix)]
@@ -149,9 +157,7 @@ fn lifecycle_lock(name: &str) -> Result<File, WalletError> {
     let file = options
         .open(dir.join(format!("{name}.pool-init.lock")))
         .map_err(|error| unavailable(error.to_string()))?;
-    file.try_lock()
-        .map_err(|_| unavailable("another pool initialization is running"))?;
-    Ok(file)
+    HeldFileLock::try_lock(file).map_err(|_| unavailable("another pool initialization is running"))
 }
 
 fn fresh_seed() -> Zeroizing<[u8; 64]> {
@@ -165,17 +171,17 @@ fn channels(
     size: usize,
 ) -> Result<Vec<PoolChannelRecord>, WalletError> {
     if !(1..=stellar_agent_pool::ChannelPool::MAX_SIZE).contains(&size) {
-        return Err(pool_err_to_wallet_err(&PoolError::SizeOutOfRange {
-            requested: size,
-        }));
+        return Err(pool_err_to_wallet_err(&PoolError::SizeOutOfRange));
     }
-    let wallet = Sep5Wallet::from_bip39_seed_zeroizing(Zeroizing::new(**seed));
+    let mut seed_copy = Zeroizing::new([0u8; 64]);
+    seed_copy.copy_from_slice(seed.as_ref());
+    let wallet = Sep5Wallet::from_bip39_seed_zeroizing(seed_copy);
     (1..=size as u32)
         .map(|index| {
             wallet
                 .derive_account(index)
                 .map(|key| PoolChannelRecord::new(index, key.public_key_strkey()))
-                .map_err(|error| pool_err_to_wallet_err(&PoolError::from(error)))
+                .map_err(|_| pool_err_to_wallet_err(&PoolError::DeriveFailed))
         })
         .collect()
 }
@@ -335,16 +341,13 @@ where
     if let Some(size) = args.size
         && !(1..=stellar_agent_pool::ChannelPool::MAX_SIZE).contains(&size)
     {
-        return Err(pool_err_to_wallet_err(&PoolError::SizeOutOfRange {
-            requested: size,
-        }));
+        return Err(pool_err_to_wallet_err(&PoolError::SizeOutOfRange));
     }
     let resolved = resolve_profile_name(args.profile.as_deref());
     // Validate the name and existing profile before constructing the sidecar path.
-    load_profile_reconciled(&resolved).map_err(|error| error.to_wallet_error(&resolved.name))?;
+    load_profile_reconciled(&resolved).map_err(|error| error.to_wallet_error())?;
     let _lock = lifecycle_lock(&resolved.name)?;
-    let profile = load_profile_reconciled(&resolved)
-        .map_err(|error| error.to_wallet_error(&resolved.name))?;
+    let profile = load_profile_reconciled(&resolved).map_err(|error| error.to_wallet_error())?;
     // Halt check: ahead of the fresh and the resume branch, the keyring store,
     // the seed, the signer and any RPC request.
     stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name)?;
@@ -369,12 +372,20 @@ where
             None => Err(unavailable("there is no pool initialization to resume")),
         };
     }
-    init_keyring()?;
-    let audit = crate::commands::value_audit::require_value_audit_writer(&profile, name)?;
     let master = profile
         .pool_master_key_id
         .clone()
         .unwrap_or_else(|| KeyringEntryRef::default_pool_master_key(name));
+    stellar_agent_core::profile::owner_key::refuse_policy_pin_coordinate(
+        &master,
+        "pool_master_key_id",
+    )?;
+    stellar_agent_core::profile::owner_key::refuse_installation_key_coordinate(
+        &master,
+        "pool_master_key_id",
+    )?;
+    init_keyring()?;
+    let audit = crate::commands::value_audit::require_value_audit_writer(&profile, name)?;
     let fee_per_op = profile
         .classic_fee_per_op_stroops
         .unwrap_or(stellar_agent_core::DEFAULT_CLASSIC_FEE_STROOPS);
@@ -395,7 +406,7 @@ where
                 .ok_or_else(|| unavailable("pool size is required"))?;
             precheck_init_fee(fee_per_op, size, &profile, name)?;
             let signer =
-                enrolled_keyring_signer(name, &profile, &profile.mcp_signer_default.account)
+                enrolled_keyring_signer(name, &profile, &profile.mcp_signer_default.account, None)
                     .await?;
             let seed = fresh_seed();
             let pending = PoolInitialization {
@@ -442,25 +453,11 @@ where
         if ledger == 0 {
             return Err(unavailable("the channel observation has no ledger"));
         }
-        // A definitive answer also settles the receipt; account existence can
-        // finish configuration when the transaction is outside RPC retention.
+        // The endpoint's answer is recorded on the receipt for display;
+        // account existence finishes configuration, also when the transaction
+        // is outside RPC retention. Neither writes a transaction outcome row.
         if let Some(submission) = &pending.submission {
             settle_record(&client, &receipts, submission).await?;
-            if let Some(receipt) = receipts
-                .get(&submission.envelope_hash)
-                .map_err(|error| unavailable(error.to_string()))?
-            {
-                write_settled_row(
-                    &profile,
-                    name,
-                    &audit,
-                    &receipt.envelope_hash,
-                    &receipt.tx_hash,
-                    &receipt.status,
-                    receipt.ledger,
-                    stellar_agent_core::audit_log::PolicyDecision::Allow,
-                );
-            }
         }
         pending.completion_ledger = Some(ledger);
         persist(name, &master, &pending)?;
@@ -470,57 +467,41 @@ where
         return Ok(pending_data(name, &pending));
     }
     if let Some(submission) = &pending.submission {
-        let status = if submission.send_started {
-            settle_record(&client, &receipts, submission).await?
+        if submission.send_started {
+            // No channel account exists, so a fresh envelope cannot create one
+            // twice. Retry requires the operator's verified clear row. The
+            // endpoint must not report success. An endpoint failure report, an
+            // unknown outcome and a receipt status each hold the checkpoint.
+            settle_record(&client, &receipts, submission).await?;
+            if !operator_clear_recorded(name, &audit, submission)? {
+                return Ok(pending_data(name, &pending));
+            }
         } else {
-            // The durable barrier proves that no bytes left for this receipt.
+            // The durable barrier proves that no bytes left for this attempt.
             if let Some(receipt) = receipts
                 .get(&submission.envelope_hash)
                 .map_err(|error| unavailable(error.to_string()))?
+                && receipt.status == ReceiptStatus::Success
             {
-                if receipt.status == ReceiptStatus::Success {
-                    return Err(unavailable("an unsent checkpoint has a successful receipt"));
-                }
+                return Err(unavailable("an unsent checkpoint has a successful receipt"));
+            }
+            write_not_transmitted_row(name, &audit, submission)?;
+            // The receipt is display data; it follows the audit decision.
+            if receipts
+                .get(&submission.envelope_hash)
+                .map_err(|error| unavailable(error.to_string()))?
+                .is_some_and(|receipt| receipt.status == ReceiptStatus::Pending)
+            {
                 receipts
                     .finalize(
                         &submission.envelope_hash,
                         ReceiptStatus::Failed {
-                            code: "submission.not_transmitted".to_owned(),
+                            code: NOT_TRANSMITTED_CODE.to_owned(),
                         },
                         None,
                     )
                     .map_err(|error| unavailable(error.to_string()))?;
             }
-            Some(ReceiptStatus::Failed {
-                code: "submission.not_transmitted".to_owned(),
-            })
-        };
-        // No channel account exists at this point, so a fresh envelope cannot
-        // create one twice. Two records permit it. A definitive failure is one.
-        // The other is the operator's acknowledgement through
-        // `tx receipt clear --acknowledge`, which states that the transaction
-        // did not apply and which that verb writes only after the endpoint
-        // declines to report the transaction as successful or failed. An
-        // outcome recorded as merely unknown is not that statement: it is the
-        // state where a second envelope could create the channels a second
-        // time, so it holds the checkpoint until an operator resolves it.
-        let Some(ReceiptStatus::Failed { .. } | ReceiptStatus::ClearedByOperator) = status else {
-            return Ok(pending_data(name, &pending));
-        };
-        if let Some(receipt) = receipts
-            .get(&submission.envelope_hash)
-            .map_err(|error| unavailable(error.to_string()))?
-        {
-            write_settled_row(
-                &profile,
-                name,
-                &audit,
-                &receipt.envelope_hash,
-                &receipt.tx_hash,
-                &receipt.status,
-                receipt.ledger,
-                stellar_agent_core::audit_log::PolicyDecision::Allow,
-            );
         }
     }
     if args.resume {
@@ -547,13 +528,14 @@ where
     )
     .await?;
     let signer =
-        enrolled_keyring_signer(name, &profile, &profile.mcp_signer_default.account).await?;
+        enrolled_keyring_signer(name, &profile, &profile.mcp_signer_default.account, None).await?;
     if signer.public_key().to_string().as_str() != pending.funder {
         return Err(unavailable(
             "the profile signer is not the recorded pool funder",
         ));
     }
     let inner = build_recorder(SubmitRecord {
+        unvalued: None,
         policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
         profile: &profile,
         profile_name: name.clone(),
@@ -576,7 +558,9 @@ where
         .channels
         .iter()
         .map(|channel| {
-            derive_channel_signer(Zeroizing::new(*seed), channel.index)
+            let mut seed_copy = Zeroizing::new([0u8; 64]);
+            seed_copy.copy_from_slice(seed.as_ref());
+            derive_channel_signer(seed_copy, channel.index)
                 .map_err(|error| pool_err_to_wallet_err(&error))
         })
         .collect::<Result<_, _>>()?;
@@ -636,14 +620,8 @@ fn precheck_init_fee(
 fn map_init_error(error: PoolError, name: &str) -> WalletError {
     match error {
         // Nothing was built, signed, or sent: the operator lowers the fee.
-        PoolError::FeeOverflow {
-            fee_per_op,
-            op_count,
-        } => WalletError::Validation(
-            stellar_agent_core::error::ValidationError::FeeTotalOverflow {
-                per_op: fee_per_op,
-                op_count,
-            },
+        PoolError::FeeOverflow { op_count } => WalletError::Validation(
+            stellar_agent_core::error::ValidationError::FeeTotalOverflow { op_count },
         ),
         other => WalletError::Internal(InternalError::UnexpectedState {
             detail: format!("{other}; run 'stellar-agent pool init --resume --profile {name}'"),
@@ -651,37 +629,171 @@ fn map_init_error(error: PoolError, name: &str) -> WalletError {
     }
 }
 
+/// The failure code of an attempt the send barrier proves was never sent.
+const NOT_TRANSMITTED_CODE: &str = "submission.not_transmitted";
+
+/// The audit tool name of the pool initialization's pending row.
+const POOL_INIT_TOOL: &str = "pool init";
+
+/// Records the endpoint's answer for a sent attempt on its receipt, for
+/// display, and returns the receipt's status.
+///
+/// `SUCCESS` records success. `FAILED` moves only a `Pending` receipt, to
+/// `Ambiguous` without evidence: an endpoint failure report is
+/// unauthenticated and authorizes neither a failure row nor a retry. A receipt
+/// already `Ambiguous`, `Failed` or `ClearedByOperator` keeps its status. The
+/// checkpoint stays in every case.
+///
+/// # Errors
+///
+/// `submission.record_unavailable` for a missing or unreadable receipt, and
+/// the endpoint's error for an answer it could not give.
 async fn settle_record(
     client: &StellarRpcClient,
     receipts: &ReceiptStore,
     submission: &PoolInitSubmission,
 ) -> Result<Option<ReceiptStatus>, WalletError> {
-    if receipts
+    let Some(recorded) = receipts
         .get(&submission.envelope_hash)
         .map_err(|error| unavailable(error.to_string()))?
-        .is_none()
-    {
+    else {
         return Err(unavailable(
             "the pending pool receipt is missing; restore it before resuming",
         ));
-    }
-    let answer = client.get_transaction_status(&submission.tx_hash).await?;
-    let status = match answer.status.as_str() {
-        "SUCCESS" => Some(ReceiptStatus::Success),
-        "FAILED" => Some(ReceiptStatus::Failed {
-            code: "ledger.op_failed".to_owned(),
-        }),
-        _ => None,
     };
-    if let Some(status) = status {
-        receipts
-            .finalize(&submission.envelope_hash, status, answer.ledger)
-            .map_err(|error| unavailable(error.to_string()))?;
+    let answer = client.get_transaction_status(&submission.tx_hash).await?;
+    match answer.status.as_str() {
+        "SUCCESS" => receipts
+            .finalize(
+                &submission.envelope_hash,
+                ReceiptStatus::Success,
+                answer.ledger,
+            )
+            .map_err(|error| unavailable(error.to_string()))?,
+        "FAILED" if recorded.status == ReceiptStatus::Pending => receipts
+            .finalize(&submission.envelope_hash, ReceiptStatus::Ambiguous, None)
+            .map_err(|error| unavailable(error.to_string()))?,
+        _ => {}
     }
     Ok(receipts
         .get(&submission.envelope_hash)
         .map_err(|error| unavailable(error.to_string()))?
         .map(|receipt| receipt.status))
+}
+
+/// Takes the writer guard and verifies its tip anchor and retained history.
+fn verified_guard<'a>(
+    profile_name: &str,
+    audit: &'a stellar_agent_network::submission_record::AuditWriterHandle,
+) -> Result<std::sync::MutexGuard<'a, stellar_agent_core::audit_log::AuditWriter>, WalletError> {
+    let mut guard = audit
+        .lock()
+        .map_err(|_| unavailable("audit writer mutex is poisoned"))?;
+    guard.verify_tip_anchor().map_err(|error| {
+        stellar_agent_core::audit_log::audit_writer_refusal(profile_name, &error)
+    })?;
+    Ok(guard)
+}
+
+/// Whether the verified audit history holds an operator's
+/// `submission_receipt_cleared` row for the attempt.
+///
+/// The row is read under the writer guard, up to the writer's verified tip.
+/// The receipt's own `cleared_by_operator` status authorizes nothing.
+///
+/// # Errors
+///
+/// The writer's refusal of its tip anchor or retained history, and
+/// `audit.chain_key_unavailable` for a history the lookup cannot read.
+fn operator_clear_recorded(
+    profile_name: &str,
+    audit: &stellar_agent_network::submission_record::AuditWriterHandle,
+    submission: &PoolInitSubmission,
+) -> Result<bool, WalletError> {
+    let guard = verified_guard(profile_name, audit)?;
+    stellar_agent_core::audit_log::reader::try_submission_receipt_cleared_exists(
+        &guard,
+        &submission.envelope_hash,
+    )
+    .map_err(|error| audit_history_refusal(profile_name, &error))
+}
+
+/// Settles the audit record of an attempt the durable send barrier proves
+/// was never sent, before the attempt is retired.
+///
+/// `submission` is the durable checkpoint's attempt; it must record
+/// `send_started == false`.
+///
+/// The writer guard spans the verification, the lookup and the append. The
+/// lookup reads the verified history for the checkpoint's envelope hash:
+///
+/// - an open pending row written by `pool init` takes one
+///   `value_action_failed` row with the fixed code
+///   `submission.not_transmitted`, carrying that pending row's legs, nonce,
+///   policy decision and approval nonce;
+/// - a latest `value_action_failed` row, or no row at all, means no pending
+///   row is open, and nothing is appended;
+/// - an open pending row of another tool, or a latest
+///   `value_action_submitted` row, refuses with
+///   `submission.record_unavailable` and keeps the checkpoint.
+///
+/// No receipt status or receipt code takes part.
+///
+/// # Errors
+///
+/// The refusals above, the writer's refusal of its tip anchor, retained
+/// history or append, and `audit.chain_key_unavailable` for a history the
+/// lookup cannot read.
+fn write_not_transmitted_row(
+    profile_name: &str,
+    audit: &stellar_agent_network::submission_record::AuditWriterHandle,
+    submission: &PoolInitSubmission,
+) -> Result<(), WalletError> {
+    use stellar_agent_core::audit_log::reader::{
+        SettledValueAction, ValueActionSettlement, try_value_action_settled_row,
+        try_value_action_settlement,
+    };
+
+    if submission.send_started {
+        return Err(unavailable(
+            "a sent pool attempt cannot be recorded as not transmitted",
+        ));
+    }
+    let mut guard = verified_guard(profile_name, audit)?;
+    let settlement = try_value_action_settlement(&guard, &submission.envelope_hash)
+        .map_err(|error| audit_history_refusal(profile_name, &error))?;
+    let open = match settlement {
+        ValueActionSettlement::Owed(open) if open.tool == POOL_INIT_TOOL => open,
+        ValueActionSettlement::Owed(_) => {
+            return Err(unavailable(
+                "the unsent pool attempt's envelope has an open pending row of another tool",
+            ));
+        }
+        ValueActionSettlement::OwedWithoutLegs => return Ok(()),
+        ValueActionSettlement::Settled => {
+            return match try_value_action_settled_row(&guard, &submission.envelope_hash)
+                .map_err(|error| audit_history_refusal(profile_name, &error))?
+            {
+                Some(SettledValueAction::Failed { .. }) => Ok(()),
+                _ => Err(unavailable(
+                    "the unsent pool attempt's envelope has a submitted row",
+                )),
+            };
+        }
+    };
+    let entry = AuditEntry::new_value_action_failed(
+        POOL_INIT_TOOL,
+        open.chain_id,
+        open.legs,
+        stellar_agent_network::redact_tx_hash(&submission.tx_hash).as_str(),
+        NOT_TRANSMITTED_CODE,
+        open.policy_decision,
+        Some(submission.envelope_hash.clone()),
+        open.nonce_id,
+        open.approval_nonce,
+        uuid::Uuid::new_v4().to_string(),
+    );
+    crate::commands::value_audit::append_value_audit_row_strict(&mut guard, profile_name, entry)
 }
 
 fn complete(
@@ -776,7 +888,10 @@ fn probe_keyring_entry(service: &str, account: &str) -> KeyringProbe {
         }
     };
     match entry.get_password() {
-        Ok(_) => KeyringProbe::Present,
+        Ok(secret) => {
+            drop(Zeroizing::new(secret));
+            KeyringProbe::Present
+        }
         Err(keyring_core::Error::NoEntry) => KeyringProbe::Absent,
         Err(e) => KeyringProbe::BackendError(e, KeyringOperation::Read),
     }
@@ -846,33 +961,32 @@ mod tests {
     use serial_test::serial;
     use stellar_agent_core::profile::schema::Profile;
 
-    /// RAII env-var guard; `#[serial]` on every test using it prevents
-    /// concurrent env access.
-    struct EnvGuard {
-        var: String,
+    #[cfg(unix)]
+    #[test]
+    fn dropping_lifecycle_lock_unlocks_with_a_duplicate_descriptor_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = lifecycle_lock_in_dir("pool-lock-test", dir.path()).unwrap();
+        let duplicate = guard.try_clone_file().unwrap();
+        assert_contended(dir.path());
+        drop(guard);
+        let _next = lifecycle_lock_in_dir("pool-lock-test", dir.path()).unwrap();
+        drop(duplicate);
+        assert_contended(dir.path());
     }
-    impl EnvGuard {
-        #[allow(
-            unsafe_code,
-            reason = "test-only env mutation; #[serial] prevents concurrent access"
-        )]
-        fn set(var: String, value: &str) -> Self {
-            // SAFETY: serialised by #[serial]; no concurrent env access.
-            unsafe {
-                std::env::set_var(&var, value);
-            }
-            Self { var }
-        }
+
+    #[cfg(unix)]
+    fn assert_contended(dir: &Path) {
+        let error = lifecycle_lock_in_dir("pool-lock-test", dir)
+            .expect_err("a held lifecycle lock excludes a second opener");
+        assert!(
+            error
+                .to_string()
+                .contains("another pool initialization is running"),
+            "{error}"
+        );
     }
-    impl Drop for EnvGuard {
-        #[allow(unsafe_code, reason = "test-only env cleanup")]
-        fn drop(&mut self) {
-            // SAFETY: same as set(); serialised by #[serial].
-            unsafe {
-                std::env::remove_var(&self.var);
-            }
-        }
-    }
+
+    use crate::common::test_support::EnvGuard;
 
     /// End-to-end environment immunity for the pool persistence step, through
     /// the PRODUCTION loader functions `run()` uses: a `STELLAR_AGENT_RPC_URL`
@@ -1034,11 +1148,17 @@ mod tests {
         rpc_url: &str,
         pending: Option<PoolInitialization>,
     ) -> (
-        tempfile::TempDir,
+        stellar_agent_test_support::sandbox::StateSandbox,
         stellar_agent_test_support::StellarAgentHomeGuard,
         stellar_agent_test_support::ProfileEnvVarGuard,
     ) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let mut profile =
@@ -1128,7 +1248,13 @@ mod tests {
         let server = crate::test_rpc::ClassicRpc::testnet(&[&funder])
             .serve()
             .await;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         stellar_agent_test_support::keyring_mock::install().unwrap();
@@ -1151,6 +1277,7 @@ mod tests {
                 .as_str(),
         )
         .unwrap();
+        crate::common::identity_fixture::store_signer_identity_of_seed(NAME, &profile, FUNDER_SEED);
         KeyringEntry::new(
             &profile.audit_log_hash_chain_key_id.service,
             &profile.audit_log_hash_chain_key_id.account,
@@ -1215,17 +1342,50 @@ mod tests {
              profile writes the env-merged view into the profile TOML"
         );
     }
+
+    /// A fee per operation that overflows the transaction fee is refused
+    /// with the fixed text, on the pool error and on the wallet error it maps
+    /// to, and stays out of the events of the check.
+    #[test]
+    #[serial_test::serial]
+    fn overflowing_fee_stays_out_of_the_refusal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_test_support::rejected_value::{
+            assert_no_marker, assert_no_marker_in_text,
+        };
+
+        const OVERFLOWING_FEE: &str = "4294967295";
+        let produced = total_init_fee(u32::MAX, 1).unwrap_err();
+        assert_no_marker(&produced, OVERFLOWING_FEE);
+        let profile = Profile::builder_testnet_named("pool-fee-test", "s", "a", "n", "a")
+            .with_noop_engine()
+            .build();
+        let mut mapped = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            mapped = precheck_init_fee(u32::MAX, 1, &profile, "pool-fee-test").err();
+        });
+        let mapped = mapped.expect("the fee overflows");
+        assert_eq!(mapped.code(), "validation.fee_total_overflow");
+        assert_eq!(
+            mapped.to_string(),
+            "classic_fee_per_op_stroops multiplied by the operation count must fit in u32; lower \
+             classic_fee_per_op_stroops."
+        );
+        assert_no_marker(&mapped, OVERFLOWING_FEE);
+        assert_no_marker_in_text(&logs, OVERFLOWING_FEE);
+    }
+
     #[test]
     fn fee_overflow_maps_to_validation() {
-        let error = map_init_error(
-            PoolError::FeeOverflow {
-                fee_per_op: u32::MAX,
-                op_count: 3,
-            },
-            "pool-fee-test",
-        );
+        let error = map_init_error(PoolError::FeeOverflow { op_count: 3 }, "pool-fee-test");
         assert_eq!(error.code(), "validation.fee_total_overflow");
-        assert!(error.to_string().contains("3 operations"));
+        assert_eq!(
+            error.to_string(),
+            "classic_fee_per_op_stroops multiplied by the operation count must fit in u32; lower \
+             classic_fee_per_op_stroops."
+        );
     }
     #[test]
     fn pool_result_omits_an_absent_witness_and_reads_legacy_json() {
@@ -1245,14 +1405,22 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn pool_fee_precheck_caps_before_checking_total() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = Profile::builder_testnet("fee", "default", "nonce", "default")
             .with_noop_engine()
             .build();
         profile.classic_max_fee_per_op_stroops = Some(100);
         let error = precheck_init_fee(u32::MAX, 2, &profile, "fee").unwrap_err();
         assert_eq!(error.code(), "fees.percentile_exceeds_cap");
-        assert!(error.to_string().contains("profile's per-operation fee"));
+        assert!(
+            error
+                .to_string()
+                .contains("classic_fee_per_op_stroops must not exceed")
+        );
         profile.classic_max_fee_per_op_stroops = None;
         let error = precheck_init_fee(u32::MAX, 2, &profile, "fee").unwrap_err();
         assert_eq!(error.code(), "validation.fee_total_overflow");
@@ -1261,8 +1429,8 @@ mod tests {
     mod witness {
         use super::*;
         use crate::test_rpc::{
-            ACCOUNT_SEQUENCE, ClassicRpc, account_key, account_xdr, assert_rows_carry_witness,
-            methods, sent,
+            ACCOUNT_SEQUENCE, ClassicRpc, account_key, account_xdr,
+            assert_pending_row_carries_witness, methods, sent,
         };
         use std::sync::{
             Arc,
@@ -1325,7 +1493,13 @@ mod tests {
         }
 
         async fn exercise(case: Case) {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            assert!(
+                dir.path()
+                    .join(stellar_agent_test_support::sandbox::MARKER)
+                    .is_file(),
+                "owned wallet root is marked before the home guard"
+            );
             let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
             let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
             let name = format!("pool-witness-{case:?}").to_ascii_lowercase();
@@ -1475,6 +1649,9 @@ mod tests {
                         .as_str(),
                 )
                 .unwrap();
+                crate::common::identity_fixture::store_signer_identity_of_seed(
+                    &name, &profile, [0x91; 32],
+                );
             }
             if resumed {
                 KeyringEntry::new(&master.service, &master.account)
@@ -1615,7 +1792,7 @@ mod tests {
                         }
                     );
                     if !matches!(case, Case::Skipped) {
-                        assert_rows_carry_witness(&profile, &oracle.uri());
+                        assert_pending_row_carries_witness(&profile, &oracle.uri());
                     }
                     // A resume loads the signer after the witness and reads
                     // it again to sign. The fresh path also loads it once
@@ -1690,5 +1867,72 @@ mod tests {
         async fn present_channels_complete_without_cap_or_witness() {
             exercise(Case::Present).await;
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn policy_pin_coordinate_refuses_without_writing() {
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let name = "pin-refusal";
+        let coordinate = KeyringEntryRef::new("custom", "default-PoLiCy-PiN");
+        for initial in [None, Some("untouched")] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let entry = KeyringEntry::new(&coordinate.service, &coordinate.account).unwrap();
+            if let Some(value) = initial {
+                entry.set_password(value).unwrap();
+            }
+            let mut profile = Profile::builder_testnet_named(name, "s", "a", "n", "a").build();
+            profile.pool_master_key_id = Some(coordinate.clone());
+            loader::save_to_dir(name, &profile, &dir.path().join("profiles")).unwrap();
+            let args = PoolInitArgs {
+                size: Some(2),
+                profile: Some(name.to_owned()),
+                force: true,
+                resume: false,
+                timeout_seconds: 5,
+                output: OutputFormat::Json,
+            };
+            let calls = std::cell::Cell::new(0);
+            let error = execute(&args, || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), "validation.policy_pin_coordinate");
+            assert_eq!(calls.get(), 0);
+            assert_eq!(entry.get_password().ok().as_deref(), initial);
+        }
+    }
+
+    /// Pool initialization refuses an installation coordinate before opening keys.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn installation_coordinate_refuses_without_writing() {
+        use crate::common::installation_key_fixture::InstallationKeyFixture;
+        let fixture = InstallationKeyFixture::new("stellar-agent-toolsets");
+        let name = "pin-coordinate-refusal";
+        let mut profile = Profile::builder_testnet_named(name, "s", "a", "n", "a").build();
+        profile.pool_master_key_id = Some(fixture.coordinate.clone());
+        loader::save_to_dir(name, &profile, &fixture.home().join("profiles")).unwrap();
+        let args = PoolInitArgs {
+            size: Some(2),
+            profile: Some(name.to_owned()),
+            force: true,
+            resume: false,
+            timeout_seconds: 5,
+            output: OutputFormat::Json,
+        };
+        let error = execute(&args, || fixture.init()).await.unwrap_err();
+        assert_eq!(error.code(), "validation.installation_key_coordinate");
+        fixture.assert_refused(1);
     }
 }

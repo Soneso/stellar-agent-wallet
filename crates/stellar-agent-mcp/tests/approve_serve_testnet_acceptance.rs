@@ -7,8 +7,10 @@
 //! attestation: `stellar_pay` (under a `RequireApproval` policy) persists the
 //! pending entry exactly as production does, the approval-inbox server is
 //! started against the same store + attestation key, and a `reqwest` client
-//! drives the bootstrap → session-cookie → CSRF → approve/reject flow a
-//! browser would.
+//! drives the bootstrap → session cookie and session proof → CSRF →
+//! approve/reject flow a browser would. A signed, verified fixture policy
+//! binds each pending entry for recovery; a direct preparation queues a new
+//! payment approval only under one.
 //!
 //! Gated behind the `testnet-acceptance` feature flag:
 //!
@@ -43,7 +45,7 @@ use stellar_agent_core::policy::{
 };
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::{StellarPayArgs, StellarPayCommitArgs, WalletServer};
-use stellar_agent_network::{StellarRpcClient, fetch_account};
+use stellar_agent_network::{AssetType, StellarRpcClient, fetch_account};
 use stellar_agent_test_support::keyring_mock;
 use tempfile::TempDir;
 use zeroize::Zeroizing;
@@ -58,6 +60,52 @@ const TESTNET_CHAIN_ID: &str = "stellar:testnet";
 const FEE_STROOPS: u32 = 100_000;
 const PAYMENT_STROOPS: i64 = 10_000_000; // 1 XLM
 
+/// A signed, verified allow-all policy for `server`'s approval profile.
+///
+/// A direct `stellar_pay` preparation queues a new payment approval only
+/// under a verified policy, which binds the entry for recovery. The
+/// synthetic engine set through `set_policy_engine_for_test` carries none,
+/// so each scenario supplies this one through
+/// `set_payment_recovery_policy_for_test`.
+///
+/// This target keeps its own copy of the fixture in `tests/common/mod.rs`:
+/// `mod common;` would compile the shared module's child-process tests into
+/// this live target.
+fn payment_recovery_policy(
+    server: &WalletServer,
+) -> stellar_agent_core::mainnet::verified_policy::VerifiedPolicy {
+    use stellar_agent_core::policy::v1::{
+        PolicyStateStore,
+        verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+    };
+    let dir = tempfile::tempdir().expect("fixture policy directory");
+    let path = dir.path().join("policy.toml");
+    let name = server.profile_name_for_approval();
+    let body = format!(
+        "version = 1\nscope = \"profile:{name}\"\n[[rules]]\nmatch = {{ tool = \"*\", chain = \"*\" }}\ncriteria = []\ndecision = \"allow\"\n"
+    );
+    let profile = Profile::builder_testnet("fixture", "signer", "fixture", "nonce").build();
+    let owner = ed25519_dalek::SigningKey::from_bytes(&[61; 32]);
+    std::fs::write(
+        &path,
+        stellar_agent_core::approval::mainnet_fixtures::signed_policy_text(&body, &owner),
+    )
+    .expect("signed fixture policy");
+    load_verified_policy(
+        &PolicyLoad {
+            path: &path,
+            profile: &profile,
+            profile_name: &name,
+            owner_pubkey: &owner.verifying_key().to_bytes(),
+            owner_source: OwnerKeySource::Keyring,
+            window_path: &dir.path().join("window"),
+        },
+        PolicyStateStore::new(),
+        PinMode::CompareOnly,
+    )
+    .expect("fixture signature verifies")
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // RequireApproval engine — forces the simulate call to park a pending entry
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,6 +113,33 @@ const PAYMENT_STROOPS: i64 = 10_000_000; // 1 XLM
 struct RequireApprovalEngine;
 
 impl PolicyEngine for RequireApprovalEngine {
+    fn record_confirmed_checked(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &stellar_agent_core::policy::v1::ValueClass,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.record_confirmed_checked(tool, profile, value)
+    }
+    fn size_unvalued_call(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        reason: stellar_agent_core::policy::v1::OpaqueReason,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine
+            .size_unvalued_call(tool, profile, reason, now_ms)
+    }
+    fn size_no_value(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::CheckedSizing, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.size_no_value(tool, profile, now_ms)
+    }
+
     fn evaluate(
         &self,
         _tool: &ToolDescriptor,
@@ -75,6 +150,7 @@ impl PolicyEngine for RequireApprovalEngine {
         _counterparty_cache: Option<&dyn CounterpartyCacheView>,
         _sep10_sessions: Option<&dyn Sep10SessionView>,
         _sep45_sessions: Option<&dyn Sep45SessionView>,
+        _now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         Ok(Decision::RequireApproval(ApprovalRequest::new(
             "approve-serve-testnet-approval".into(),
@@ -98,14 +174,9 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 2xx for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Polls RPC until the freshly-funded account is queryable, tolerating
@@ -129,7 +200,7 @@ async fn native_balance_stroops(g_strkey: &str) -> i64 {
         .expect("fetch_account must succeed for a funded, queryable account");
     view.balances
         .iter()
-        .find(|b| b.asset.asset_type == "native")
+        .find(|b| b.asset.asset_type == AssetType::Native)
         .map(|b| b.balance_stroops().expect("native balance parses"))
         .unwrap_or(0)
 }
@@ -155,6 +226,20 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .expect("signer keyring entry")
         .set_password(&s_strkey)
         .expect("set signing key");
+    // The identity record an enrollment stores beside the seed.
+    stellar_agent_network::keyring::write_keyring_string(
+        &stellar_agent_core::profile::schema::signer_identity_entry_ref(signer_ref),
+        &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .to_bytes(),
+            stellar_agent_core::profile::name::profile_name_for_approval(profile),
+            profile.chain_id,
+        )
+        .render()
+        .expect("an agent record renders"),
+    )
+    .expect("set identity record");
 
     // Nonce key.
     let nonce_ref = &profile.mcp_nonce_key_alias;
@@ -243,9 +328,10 @@ async fn start_serve_for_profile(
     (handle, base, rx)
 }
 
-/// A `reqwest::Client` that does not auto-follow redirects, so the bootstrap
-/// exchange's `303 See Other` + `Set-Cookie` can be observed directly, the
-/// same posture the in-crate router tests take against the assembled router.
+/// A `reqwest::Client` that does not auto-follow redirects, so every
+/// response, the bootstrap exchange's `Set-Cookie` included, is observed
+/// directly, the same posture the in-crate router tests take against the
+/// assembled router.
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -253,9 +339,16 @@ fn http_client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
-/// Performs the one-time bootstrap exchange and returns the `name=value`
-/// session-cookie header.
-async fn bootstrap_session(client: &reqwest::Client, bootstrap_url: &str) -> String {
+/// The session a bootstrap exchange establishes: the `name=value` cookie
+/// header and the session proof the bootstrap page hands its script.
+struct Session {
+    cookie: String,
+    proof: String,
+}
+
+/// Performs the one-time bootstrap exchange and returns the session cookie
+/// and the session proof.
+async fn bootstrap_session(client: &reqwest::Client, bootstrap_url: &str) -> Session {
     let resp = client
         .get(bootstrap_url)
         .send()
@@ -263,21 +356,28 @@ async fn bootstrap_session(client: &reqwest::Client, bootstrap_url: &str) -> Str
         .expect("bootstrap GET must succeed");
     assert_eq!(
         resp.status(),
-        reqwest::StatusCode::SEE_OTHER,
-        "bootstrap exchange must redirect to /inbox"
+        reqwest::StatusCode::OK,
+        "bootstrap exchange must return the session bootstrap page"
     );
-    let set_cookie = resp
+    let cookie = resp
         .headers()
         .get(reqwest::header::SET_COOKIE)
         .expect("bootstrap must set a session cookie")
         .to_str()
-        .expect("cookie header is ASCII");
-    set_cookie
+        .expect("cookie header is ASCII")
         .split(';')
         .next()
         .expect("cookie header carries a name=value pair")
         .trim()
-        .to_owned()
+        .to_owned();
+    let page = resp.text().await.expect("bootstrap body is text");
+    let island = extract_json_island(&page, "session-bootstrap-data");
+    assert_eq!(island["next"], "/inbox");
+    let proof = island["proof"]
+        .as_str()
+        .expect("the bootstrap page carries the session proof")
+        .to_owned();
+    Session { cookie, proof }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -290,6 +390,10 @@ async fn bootstrap_session(client: &reqwest::Client, bootstrap_url: &str) -> Str
 #[tokio::test]
 #[serial]
 async fn t1_serve_approve_then_commit_on_testnet() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (payer_g, payer_seed) = fresh_keypair();
@@ -314,6 +418,9 @@ async fn t1_serve_approve_then_commit_on_testnet() {
     let mut server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     server.set_approval_dir_for_test(approval_dir.path().to_path_buf());
     server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine));
+    // A direct preparation queues a new payment approval only under a
+    // signed, verified policy; the synthetic engine above carries none.
+    server.set_payment_recovery_policy_for_test(payment_recovery_policy(&server));
 
     // ── 1. Simulate under RequireApproval: production persists the pending ──
     //    entry itself (WalletServer::persist_pay_pending_approval), exactly as
@@ -331,6 +438,7 @@ async fn t1_serve_approve_then_commit_on_testnet() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate must succeed against funded accounts");
@@ -360,8 +468,8 @@ async fn t1_serve_approve_then_commit_on_testnet() {
     let bootstrap_url = serve_handle.bootstrap_url();
     let client = http_client();
 
-    // ── 3. Bootstrap → session cookie ────────────────────────────────────────
-    let cookie = bootstrap_session(&client, &bootstrap_url).await;
+    // ── 3. Bootstrap → session cookie and session proof ─────────────────────
+    let Session { cookie, proof } = bootstrap_session(&client, &bootstrap_url).await;
 
     // Single-use: a second exchange of the same bootstrap token 404s.
     let replay = client
@@ -402,7 +510,7 @@ async fn t1_serve_approve_then_commit_on_testnet() {
         "the served pending.json carries amounts as decimal strings"
     );
 
-    // ── 5. Detail page → extract the per-nonce CSRF token ────────────────────
+    // ── 5. Detail page → extract the CSRF token and the view digest ─────────
     let detail_resp = client
         .get(format!("{base}/approval/{approval_nonce}"))
         .header(reqwest::header::COOKIE, &cookie)
@@ -417,6 +525,10 @@ async fn t1_serve_approve_then_commit_on_testnet() {
         .as_str()
         .expect("detail page surfaces the CSRF token")
         .to_owned();
+    let view_digest = data_island["view_digest"]
+        .as_str()
+        .expect("an approvable detail page carries its view digest")
+        .to_owned();
 
     // ── 6. Approve over HTTP: mints the attestation via the real attest path ─
     let origin = base.clone();
@@ -425,6 +537,9 @@ async fn t1_serve_approve_then_commit_on_testnet() {
         .header(reqwest::header::COOKIE, &cookie)
         .header(reqwest::header::ORIGIN, &origin)
         .header("X-Stellar-Approval-CSRF", &csrf)
+        .header("X-Session-Proof", &proof)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({ "view_digest": view_digest }).to_string())
         .send()
         .await
         .expect("approve POST must succeed");
@@ -449,6 +564,18 @@ async fn t1_serve_approve_then_commit_on_testnet() {
         .expect("attestation decodes as base64")
         .try_into()
         .expect("attestation is 32 bytes");
+    let stored = stellar_agent_core::approval::PendingApprovalStore::open(
+        approval_dir
+            .path()
+            .join(format!("{}.toml", server.profile_name_for_approval())),
+    )
+    .expect("open approval store")
+    .get(&approval_nonce)
+    .expect("the approved request is persisted")
+    .clone();
+    let scope = stored
+        .attestation_scope()
+        .expect("the approved request names a readable attestation layout");
     assert!(
         stellar_agent_core::approval::verify_attestation(
             &attestation_key,
@@ -459,6 +586,7 @@ async fn t1_serve_approve_then_commit_on_testnet() {
             &approval_nonce,
             &sha,
             &uid,
+            &scope,
             &attestation_bytes,
         ),
         "the HTTP-surfaced attestation must verify against the attestation key"
@@ -479,11 +607,12 @@ async fn t1_serve_approve_then_commit_on_testnet() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce,
-            expires_at_unix_ms,
-            envelope_xdr,
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: Some(approval_nonce),
             approval_attestation: Some(attestation_b64),
+            business_id: None,
         })
         .await
         .expect("commit must pass the gate and submit on-chain");
@@ -521,6 +650,10 @@ async fn t1_serve_approve_then_commit_on_testnet() {
 #[tokio::test]
 #[serial]
 async fn t2_serve_reject_then_commit_refused() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (payer_g, payer_seed) = fresh_keypair();
@@ -545,6 +678,9 @@ async fn t2_serve_reject_then_commit_refused() {
     let mut server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     server.set_approval_dir_for_test(approval_dir.path().to_path_buf());
     server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine));
+    // A direct preparation queues a new payment approval only under a
+    // signed, verified policy; the synthetic engine above carries none.
+    server.set_payment_recovery_policy_for_test(payment_recovery_policy(&server));
 
     // ── 1. Simulate under RequireApproval: parks the pending entry ───────────
     let sim = server
@@ -560,6 +696,7 @@ async fn t2_serve_reject_then_commit_refused() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate must succeed against funded accounts");
@@ -585,7 +722,7 @@ async fn t2_serve_reject_then_commit_refused() {
     let (serve_handle, base, _rx) = start_serve_for_profile(&server, &profile, &approval_dir).await;
     let bootstrap_url = serve_handle.bootstrap_url();
     let client = http_client();
-    let cookie = bootstrap_session(&client, &bootstrap_url).await;
+    let Session { cookie, proof } = bootstrap_session(&client, &bootstrap_url).await;
 
     let detail_resp = client
         .get(format!("{base}/approval/{approval_nonce}"))
@@ -605,6 +742,7 @@ async fn t2_serve_reject_then_commit_refused() {
         .header(reqwest::header::COOKIE, &cookie)
         .header(reqwest::header::ORIGIN, &base)
         .header("X-Stellar-Approval-CSRF", &csrf)
+        .header("X-Session-Proof", &proof)
         .send()
         .await
         .expect("reject POST must succeed");
@@ -658,11 +796,12 @@ async fn t2_serve_reject_then_commit_refused() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce,
-            expires_at_unix_ms,
-            envelope_xdr,
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: Some(approval_nonce),
             approval_attestation: Some(bogus_attestation_b64),
+            business_id: None,
         })
         .await
         .expect("a refused commit surfaces as a business-error result, not a protocol error");

@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use super::lock::AuditWriterLock;
+use super::tip_anchor::CarrierRecord;
 use super::{AuditEntry, AuditWriter, verify_log};
 
 /// Returns every row of the verified audit chain in chain order.
@@ -81,8 +83,8 @@ pub fn rotated_archives_newest_first(log_path: &Path) -> Vec<PathBuf> {
 ///
 /// The first archived row gets another `request_id`, so the row after it no
 /// longer names that row's hash. The active file and the archive's handoff
-/// row keep their bytes, so a writer and its tip anchor still accept the log;
-/// only a read that verifies the archive's own chain finds the break.
+/// row keep their bytes. A keyed open or acquisition, and a reader that reaches
+/// the archive, detect the broken chain.
 ///
 /// # Panics
 ///
@@ -115,6 +117,83 @@ pub fn break_newest_archive_link(log_path: &Path) {
     std::fs::write(&archive, rewritten).expect("the archive must be writable");
 }
 
+/// Appends `entry` to the active file at `log_path` as a process without the
+/// writer would: chained from the file's last entry, or from the hash the file
+/// chains from when it holds none, with the entry tag `tag` returns for the new
+/// entry's hash. Returns that hash.
+///
+/// The line is written through a handle of its own, so a writer holding the
+/// log keeps its own view of where the file ends.
+///
+/// # Panics
+///
+/// Panics if the log cannot be read, its last entry cannot be parsed or
+/// hashed, or the line cannot be written.
+#[expect(
+    clippy::expect_used,
+    reason = "a log that cannot be extended fails the calling test"
+)]
+pub fn append_forged_entry(
+    log_path: &Path,
+    mut entry: AuditEntry,
+    tag: impl FnOnce(&str) -> Option<String>,
+) -> String {
+    use std::io::Write as _;
+
+    let file = std::fs::File::open(log_path).expect("the active file must open");
+    let len = file.metadata().expect("the active file must stat").len();
+    let tip = match super::writer::read_last_line_before(&file, len)
+        .expect("the active file must be readable")
+    {
+        Some(line) => {
+            let last: AuditEntry =
+                serde_json::from_slice(&line).expect("the last entry must parse");
+            let body = last
+                .canonical_json_body()
+                .expect("the last entry must serialize");
+            super::chain::compute_entry_hash(&body, &last.previous_entry_hash)
+                .expect("the last entry must hash")
+        }
+        None => {
+            super::writer::initial_chain_seed(log_path)
+                .expect("the chain seed must read")
+                .hash
+        }
+    };
+    entry.previous_entry_hash = tip;
+    let body = entry
+        .canonical_json_body()
+        .expect("the entry must serialize");
+    let hash = super::chain::compute_entry_hash(&body, &entry.previous_entry_hash)
+        .expect("the entry must hash");
+    entry.entry_tag = tag(&hash);
+    let mut line = serde_json::to_vec(&entry).expect("the entry must serialize");
+    line.push(b'\n');
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(log_path)
+        .expect("the active file must open for append")
+        .write_all(&line)
+        .expect("the line must be written");
+    hash
+}
+
+/// The entry tag of the entry whose chain hash is `hash`, under the audit key
+/// `key`, as a keyed writer computes it.
+///
+/// # Panics
+///
+/// Panics if `hash` is not an entry hash.
+#[must_use]
+#[expect(
+    clippy::expect_used,
+    reason = "a malformed hash fails the calling test"
+)]
+pub fn entry_tag_under(key: &[u8; 32], hash: &str) -> String {
+    super::chain::compute_entry_tag(&super::chain::derive_entry_tag_key(key), hash)
+        .expect("an entry hash must tag")
+}
+
 /// Verifies the chain at `log_path`, then reads the non-empty rows of every
 /// verified file in verification order.
 #[expect(
@@ -145,6 +224,129 @@ fn parse_rows(rows: &[String]) -> Vec<AuditEntry> {
     rows.iter()
         .map(|row| serde_json::from_str(row).expect("audit row must parse"))
         .collect()
+}
+
+/// Adds a Reserved record expiring at `expires_at_ms` for each of
+/// `identities` to the committed consent evidence of `log`, under its
+/// ordinary authenticated successor commit, for a capacity fixture.
+///
+/// # Errors
+///
+/// Returns the carrier, evidence, key and storage refusals of the commit.
+pub fn seed_reserved_evidence(
+    log: &std::path::Path,
+    store: &dyn super::TipAnchorStore,
+    key: &[u8; 32],
+    identities: &[[u8; 32]],
+    expires_at_ms: u64,
+) -> Result<(), super::WriterError> {
+    use super::consent_evidence::{EvidenceRecord, RecordState};
+    super::outbox::OutboxBatch::read_locked(log, store)?.commit_evidence_change(
+        log,
+        store,
+        key,
+        false,
+        |image, _| {
+            image
+                .records
+                .extend(identities.iter().map(|identity| EvidenceRecord {
+                    identity: *identity,
+                    digest: [0; 32],
+                    expires_at_ms,
+                    generation: 0,
+                    sequence: 0,
+                    state: RecordState::Reserved,
+                }));
+            image.records.sort_by_key(|record| record.identity);
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// Records the current carriers of `log` as generation 1 when `store` holds
+/// no carrier record, for a fixture whose subject is not the enrollment.
+///
+/// Takes the three lock files at their paths, as `audit bind-carriers` does,
+/// and creates them when absent.
+///
+/// # Errors
+///
+/// Returns lock, identity, or store errors; [`super::WriterError::FileLocked`]
+/// when a live holder holds a carrier.
+pub fn enroll_carriers(
+    log: &std::path::Path,
+    store: &dyn super::TipAnchorStore,
+) -> Result<(), super::WriterError> {
+    if store.load_carrier_record()?.is_some() {
+        return Ok(());
+    }
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let writer = AuditWriterLock::acquire(&super::writer::lock_sidecar_path(log))?;
+    let drain = AuditWriterLock::acquire(&super::outbox::drain_lock_path(log))?;
+    let outbox = AuditWriterLock::acquire(&super::outbox::outbox_lock_path(log))?;
+    store.store_carrier_record(&CarrierRecord {
+        generation: 1,
+        writer: writer.identity()?,
+        drain: drain.identity()?,
+        outbox_lock: outbox.identity()?,
+        retired: None,
+    })?;
+    Ok(())
+}
+
+/// An audit lock file held at its path, as a running holder of a carrier holds
+/// it. Released when dropped.
+#[derive(Debug)]
+pub struct HeldAuditLock(AuditWriterLock);
+
+impl HeldAuditLock {
+    /// The identity of the held file.
+    ///
+    /// # Errors
+    ///
+    /// [`super::WriterError::CarrierIdentityUnavailable`] when the platform
+    /// cannot identify the file.
+    pub fn identity(&self) -> Result<crate::file_lock::FileIdentity, super::WriterError> {
+        self.0.identity()
+    }
+}
+
+/// Locks the audit lock file at `path` with one try-lock, creating it when
+/// absent, without consulting the carrier record.
+///
+/// # Errors
+///
+/// [`super::WriterError::FileLocked`] when another holder holds it, and
+/// [`super::WriterError::Io`] for any other failure.
+pub fn hold_audit_lock(path: &std::path::Path) -> Result<HeldAuditLock, super::WriterError> {
+    AuditWriterLock::acquire(path).map(HeldAuditLock)
+}
+
+/// A valid audit entry line whose `policy_decision` value the schema refuses.
+///
+/// `serde_json` quotes the refused variant in its error, so a parse failure
+/// that forwards the error carries `marker`.
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "a test fixture that cannot serialize fails the calling test"
+)]
+pub(crate) fn line_refused_by_the_schema(marker: &str) -> String {
+    let entry = crate::audit_log::entry::AuditEntry::new_tool_invocation(
+        crate::audit_log::entry::NewToolInvocation::new(
+            "tool".to_owned(),
+            "stellar:testnet",
+            vec![],
+            crate::audit_log::schema::PolicyDecision::Allow,
+            uuid::Uuid::new_v4().to_string(),
+        ),
+    );
+    let mut value = serde_json::to_value(entry).expect("an entry serializes");
+    value["policy_decision"] = serde_json::Value::String(marker.to_owned());
+    value.to_string()
 }
 
 #[cfg(test)]

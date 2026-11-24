@@ -55,6 +55,33 @@ impl MockPolicyEngine {
 }
 
 impl PolicyEngine for MockPolicyEngine {
+    fn record_confirmed_checked(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &stellar_agent_core::policy::v1::ValueClass,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.record_confirmed_checked(tool, profile, value)
+    }
+    fn size_unvalued_call(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        reason: stellar_agent_core::policy::v1::OpaqueReason,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine
+            .size_unvalued_call(tool, profile, reason, now_ms)
+    }
+    fn size_no_value(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::CheckedSizing, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.size_no_value(tool, profile, now_ms)
+    }
+
     fn evaluate(
         &self,
         _tool: &ToolDescriptor,
@@ -65,6 +92,7 @@ impl PolicyEngine for MockPolicyEngine {
         _counterparty_cache: Option<&dyn CounterpartyCacheView>,
         _sep10_sessions: Option<&dyn Sep10SessionView>,
         _sep45_sessions: Option<&dyn Sep45SessionView>,
+        _now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         self.result.clone()
     }
@@ -103,6 +131,33 @@ impl CapturingPolicyEngine {
 }
 
 impl PolicyEngine for CapturingPolicyEngine {
+    fn record_confirmed_checked(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &stellar_agent_core::policy::v1::ValueClass,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.record_confirmed_checked(tool, profile, value)
+    }
+    fn size_unvalued_call(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        reason: stellar_agent_core::policy::v1::OpaqueReason,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine
+            .size_unvalued_call(tool, profile, reason, now_ms)
+    }
+    fn size_no_value(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::CheckedSizing, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.size_no_value(tool, profile, now_ms)
+    }
+
     fn evaluate(
         &self,
         tool: &ToolDescriptor,
@@ -113,6 +168,7 @@ impl PolicyEngine for CapturingPolicyEngine {
         _counterparty_cache: Option<&dyn CounterpartyCacheView>,
         _sep10_sessions: Option<&dyn Sep10SessionView>,
         _sep45_sessions: Option<&dyn Sep45SessionView>,
+        _now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         self.evaluated
             .lock()

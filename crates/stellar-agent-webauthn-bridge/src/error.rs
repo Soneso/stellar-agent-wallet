@@ -1,7 +1,7 @@
 //! Error types for the WebAuthn bridge lifecycle.
 //!
 //! Provides [`BridgeStartError`] (returned by [`crate::start_bridge_register_only`] when the
-//! listener cannot be created) and [`BridgeShutdownError`] (returned by
+//! listeners cannot be created) and [`BridgeShutdownError`] (returned by
 //! [`crate::BridgeHandle::shutdown`] when the server task does not stop
 //! cleanly).
 
@@ -16,8 +16,8 @@
 /// - [`BridgeStartError::NonLoopbackBind`] — the caller supplied a non-loopback
 ///   address.  The bridge only accepts `127.0.0.1` (IPv4 loopback) or `::1`
 ///   (IPv6 loopback) as a runtime defence.
-/// - [`BridgeStartError::Bind`] — the OS rejected the `TcpListener::bind`
-///   call.
+/// - [`BridgeStartError::LoopbackPair`]: `127.0.0.1` and `[::1]` could not
+///   both be held on the bridge's port.
 ///
 /// `#[non_exhaustive]`: future failure modes (TLS bind, vendor-asset load,
 /// etc.) may be added, and existing match-arm callers must continue to compile
@@ -35,13 +35,13 @@ pub enum BridgeStartError {
         addr: std::net::SocketAddr,
     },
 
-    /// The OS rejected the `TcpListener::bind(bind_addr)` call.
-    #[error("tcp bind failed: {source}")]
-    Bind {
-        /// The underlying I/O error.
-        #[source]
-        source: std::io::Error,
-    },
+    /// The bridge could not hold both `127.0.0.1` and `[::1]` on its port.
+    /// The browser opens the bridge at `http://localhost:<port>`, so the
+    /// bridge does not start with one family.
+    ///
+    /// Display contains structured refusal details, never OS detail.
+    #[error("bridge cannot hold both loopback addresses: {0}")]
+    LoopbackPair(stellar_agent_loopback_http::PairBindError),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -56,12 +56,13 @@ pub enum BridgeStartError {
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum BridgeShutdownError {
-    /// The server task did not stop within the 5-second shutdown deadline.
+    /// The listener tasks did not stop within the 5-second shutdown
+    /// deadline; both are aborted.
     #[error("server task did not stop within shutdown deadline")]
     Timeout,
 
-    /// The server task's join handle returned an error (the task panicked).
-    #[error("server task panicked: {detail}")]
+    /// A listener task panicked or ended with an I/O error.
+    #[error("server task failed: {detail}")]
     JoinFailed {
         /// Diagnostic detail from the join failure.
         detail: String,

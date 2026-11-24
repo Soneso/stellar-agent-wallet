@@ -22,8 +22,45 @@
 //! Memo construction is a prerequisite for the `memo_present` flag passed to
 //! [`crate::sep29::check_memo_required`].
 
+use stellar_agent_core::envelope_decode::ClassicMemo;
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_xdr::{Hash, Memo, StringM};
+
+/// Parses the memo fields as [`parse_memo_fields`] does, and returns the
+/// XDR memo with the policy fact of the same memo.
+///
+/// The text fact is the parsed `&str`, so building the fact has no failing
+/// step.
+///
+/// # Errors
+///
+/// The refusals of [`parse_memo_fields`].
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::envelope_decode::ClassicMemo;
+/// use stellar_agent_network::memo::parse_memo_with_fact;
+///
+/// let (_, fact) = parse_memo_with_fact(Some("hello"), None, None, None).unwrap();
+/// assert_eq!(fact, ClassicMemo::Text("hello".to_owned()));
+/// ```
+pub fn parse_memo_with_fact(
+    memo_text: Option<&str>,
+    memo_id: Option<u64>,
+    memo_hash_hex: Option<&str>,
+    memo_return_hex: Option<&str>,
+) -> Result<(Memo, ClassicMemo), WalletError> {
+    let memo = parse_memo_fields(memo_text, memo_id, memo_hash_hex, memo_return_hex)?;
+    let fact = match &memo {
+        Memo::None => ClassicMemo::None,
+        Memo::Text(_) => ClassicMemo::Text(memo_text.unwrap_or_default().to_owned()),
+        Memo::Id(id) => ClassicMemo::Id(*id),
+        Memo::Hash(hash) => ClassicMemo::Hash(hash.0),
+        Memo::Return(hash) => ClassicMemo::Return(hash.0),
+    };
+    Ok((memo, fact))
+}
 
 /// Parses up to four optional memo fields into a single [`Memo`].
 ///
@@ -38,6 +75,11 @@ use stellar_xdr::{Hash, Memo, StringM};
 ///
 /// - [`WalletError::Validation`] wrapping [`ValidationError::MemoMutuallyExclusive`]
 ///   if more than one memo variant is supplied.
+/// - [`WalletError::Validation`] wrapping [`ValidationError::MemoControlCharacter`]
+///   when `memo_text` holds C0, DEL, C1, U+2028, U+2029 or a Unicode format
+///   character (category Cf), see
+///   [`stellar_agent_core::observability::redact::is_untrusted_format_character`].
+///   Every network refuses it.
 /// - [`WalletError::Validation`] wrapping [`ValidationError::MemoInvalidType`]
 ///   when:
 ///   - `memo_text` exceeds 28 bytes.
@@ -88,12 +130,17 @@ pub fn parse_memo_fields(
         let bytes = text.as_bytes();
         if bytes.len() > 28 {
             return Err(WalletError::Validation(ValidationError::MemoInvalidType {
-                memo_type: format!("TEXT (length {} exceeds 28-byte maximum)", bytes.len()),
+                memo_type: format!("TEXT (length {} exceeds 28-byte maximum)", bytes.len()).into(),
             }));
+        }
+        if let Some(code_point) = stellar_agent_core::amount::first_memo_control_character(text) {
+            return Err(WalletError::Validation(
+                ValidationError::MemoControlCharacter { code_point },
+            ));
         }
         let string_m: StringM<28> = bytes.to_vec().try_into().map_err(|_| {
             WalletError::Validation(ValidationError::MemoInvalidType {
-                memo_type: "TEXT (XDR StringM<28> conversion failed)".to_owned(),
+                memo_type: "TEXT (XDR StringM<28> conversion failed)".into(),
             })
         })?;
         return Ok(Memo::Text(string_m));
@@ -133,7 +180,7 @@ pub(crate) fn decode_32_hex_bytes(hex_str: &str, memo_type: &str) -> Result<[u8;
     // bytes; the mapped error never echoes attacker-supplied memo bytes.
     stellar_agent_core::hex::decode_hex32(hex_str).map_err(|_| {
         WalletError::Validation(ValidationError::MemoInvalidType {
-            memo_type: format!("{memo_type} (must be exactly 64 hex characters)"),
+            memo_type: format!("{memo_type} (must be exactly 64 hex characters)").into(),
         })
     })
 }
@@ -156,6 +203,27 @@ mod tests {
     use wiremock::{Mock, MockServer};
 
     use super::*;
+
+    #[test]
+    fn memo_seed_inputs_are_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+        let marker = seed_marker();
+        for args in [
+            (Some(marker.as_str()), None, None),
+            (None, Some(marker.as_str()), None),
+            (None, None, Some(marker.as_str())),
+        ] {
+            let error =
+                parse_memo_fields(args.0, None, args.1, args.2).expect_err("a seed is not a memo");
+            assert_no_marker(&error, &marker);
+            assert_eq!(error.code(), "validation.memo_invalid_type");
+            let json =
+                serde_json::to_string(&stellar_agent_core::envelope::Envelope::<()>::err(&error))
+                    .unwrap();
+            assert!(!json.contains(&marker));
+        }
+    }
+
     use crate::StellarRpcClient;
     use stellar_xdr::{Limits, WriteXdr};
 
@@ -301,6 +369,44 @@ mod tests {
     }
 
     #[test]
+    fn memo_text_control_and_bidi_characters_refused() {
+        for (c, code_point) in [
+            ('\u{0}', "U+0000"),
+            ('\u{1b}', "U+001B"),
+            ('\r', "U+000D"),
+            ('\u{7f}', "U+007F"),
+            ('\u{85}', "U+0085"),
+            ('\u{9b}', "U+009B"),
+            ('\u{202A}', "U+202A"),
+            ('\u{202E}', "U+202E"),
+            ('\u{2066}', "U+2066"),
+            ('\u{2069}', "U+2069"),
+        ] {
+            let text = format!("ab{c}cd");
+            let err = parse_memo_fields(Some(&text), None, None, None)
+                .expect_err("control character refused");
+            assert_eq!(err.code(), "validation.memo_control_character", "{c:?}");
+            assert!(err.message().contains(code_point), "{}", err.message());
+        }
+    }
+
+    #[test]
+    fn memo_text_ordinary_non_ascii_accepted() {
+        for text in [
+            "Zahlung f\u{fc}r M\u{e4}rz",
+            "\u{4e2d}\u{6587}",
+            "\u{a0}~",
+            "\u{202F}\u{2065}",
+        ] {
+            let memo = parse_memo_fields(Some(text), None, None, None).unwrap();
+            assert!(
+                matches!(&memo, Memo::Text(bytes) if bytes.as_slice() == text.as_bytes()),
+                "{memo:?}"
+            );
+        }
+    }
+
+    #[test]
     fn memo_id() {
         let m = parse_memo_fields(None, Some(42), None, None).unwrap();
         assert!(matches!(m, Memo::Id(42)));
@@ -388,5 +494,32 @@ mod tests {
     fn decode_32_hex_too_long_fails() {
         let hex = "0".repeat(66);
         assert!(decode_32_hex_bytes(&hex, "HASH").is_err());
+    }
+    #[test]
+    fn memo_builder_refuses_every_control_range() {
+        for &(first, last) in stellar_agent_core::approval::fixtures::MEMO_CONTROL_RANGES {
+            for point in first..=last {
+                let c = char::from_u32(point).unwrap();
+                let text = format!("a{c}b");
+                let err = parse_memo_fields(Some(&text), None, None, None).unwrap_err();
+                assert_eq!(
+                    err.code(),
+                    "validation.memo_control_character",
+                    "U+{point:04X}"
+                );
+                let mut builder = crate::builder::ClassicOpBuilder::new(
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                    1,
+                    stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                    100,
+                );
+                let memo = stellar_xdr::Memo::Text(text.into_bytes().try_into().unwrap());
+                assert_eq!(
+                    builder.memo(&memo).err().unwrap().code(),
+                    "validation.memo_control_character",
+                    "U+{point:04X}"
+                );
+            }
+        }
     }
 }

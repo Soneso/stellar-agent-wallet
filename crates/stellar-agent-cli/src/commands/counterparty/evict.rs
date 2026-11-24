@@ -26,6 +26,7 @@ pub(crate) struct EvictArgs {
     /// Profile name whose counterparty cache should be updated.
     ///
     /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    /// A mainnet profile must be named with this flag.
     #[arg(long = "profile", value_name = "NAME")]
     pub(crate) profile: Option<String>,
 }
@@ -59,8 +60,8 @@ pub async fn run(args: &EvictArgs) -> i32 {
     let _profile = match load_profile_reconciled(&resolved_profile) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e, &profile_name));
+            tracing::debug!(error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e));
             return 1;
         }
     };

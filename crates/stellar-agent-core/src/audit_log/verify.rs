@@ -13,7 +13,24 @@
 //! 4. The chain-root HMAC tag (in the `<file>.root_hmac` sidecar) verifies
 //!    against the chain root entry (if an HMAC key is supplied).
 //!    If `hmac_key` is `Some` and the sidecar is missing,
-//!    [`VerifyError::HmacSidecarMissing`] is returned.
+//!    [`VerifyError::HmacSidecarMissing`] is returned. The root tag covers
+//!    each file's first entry only.
+//! 5. With a key, the entry-tag walk: once tags are in force, every entry
+//!    carries a valid entry tag, or is covered by a valid keyed start or a
+//!    valid quarantine row after it. A failure is
+//!    [`VerifyError::EntryTagInvalid`].
+//!
+//! Without a `<log>.pruned` marker the first file starts from
+//! [`ZERO_BLOCK_HASH`]. With one, the first file starts from the seed the marker
+//! records for it as either boundary, the rule the prune applies too; a marker
+//! that names neither boundary fails with [`VerifyError::ChainBroken`] at line
+//! 1 of that file. A nonzero marker seed produces
+//! [`VerifyWarning::PrunedPrefix`]. With a key,
+//! the marker's tag must verify before the walk. Without a key it is untrusted
+//! bookkeeping. Every subsequent bridge, entry, sidecar, and anchor check holds.
+//!
+//! Each acknowledged outbox loss produces [`VerifyWarning::OutboxLossAcknowledged`].
+//! The warning records the file, line, and counts without changing the chain verdict.
 //!
 //! # Wire codes (closed set)
 //!
@@ -21,7 +38,8 @@
 //! `audit.rotation_gap`, `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`,
 //! `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`,
 //! `audit.parse_error`, `audit.path_contract`, `audit.io_error`,
-//! `audit.signer_set_canonical_body`, `audit.tip_anchor_mismatch`.  The line
+//! `audit.signer_set_canonical_body`, `audit.tip_anchor_mismatch`,
+//! `audit.tip_anchor_missing`, `audit.entry_tag_invalid`.  The line
 //! number / file basename is in
 //! the envelope `detail` field, not the wire code itself, ensuring cardinality
 //! stays bounded.
@@ -40,13 +58,21 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::redact::describe_json_error;
+
 use super::{
-    chain::{ZERO_BLOCK_HASH, compute_entry_hash, verify_chain_root},
+    binding::BindingHistory,
+    chain::{
+        EntryTagCheck, EntryTagKey, ZERO_BLOCK_HASH, check_entry_tag, compute_entry_hash,
+        derive_entry_tag_key, verify_chain_root,
+    },
     entry::AuditEntry,
-    schema::EventKind,
-    tip_anchor::TipAnchor,
+    reader::RowSettlement,
+    rotation::{MarkerNamesNoBoundary, oldest_retained_seed, read_prune_marker},
+    schema::{EntryTagsRekeyCause, EventKind},
+    tip_anchor::{PriorAnchoring, TipAnchor},
     writer::{
-        MAX_ROTATED_FILES, hmac_sidecar_path, is_rotated_sibling,
+        MAX_ROTATED_FILES, hmac_sidecar_path, is_rotated_sibling, prune_marker_path,
         wait_out_transient_rotation_window,
     },
 };
@@ -63,6 +89,11 @@ pub const BACKWARD_TS_WARN_THRESHOLD_MS: u64 = 60_000;
 /// Maximum number of rotated siblings `audit verify` will collect before
 /// rejecting the directory as polluted.
 const ROTATED_FILE_CHAIN_CAP: usize = MAX_ROTATED_FILES * 2 + 1;
+
+/// [`VerifyError::ChainBroken`] reason for a log whose oldest file is neither
+/// boundary its prune marker records, so nothing records what that file's
+/// first entry chains from. The prune stops at the same file.
+pub(super) const MARKER_NAMES_NO_BOUNDARY_REASON: &str = "prune_marker_names_neither_boundary";
 
 /// The outcome of a successful log verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +117,25 @@ pub struct VerifyOk {
     ///
     /// `None` only when no file was walked at all.
     pub active_tip: Option<VerifiedTip>,
+    /// Whether the entry tags verified: a key was supplied, tags are in force
+    /// in the walked chain, and every entry the rules require a tag of
+    /// carries a valid one.
+    pub entry_tags_verified: bool,
+    /// The newest keyed start with a valid tag in the walked chain, or `None`
+    /// when no such row was walked, for example because a prune removed it.
+    pub entry_tags_boundary: Option<EntryTagsBoundary>,
+}
+
+/// Where the newest keyed start with a valid entry tag sits in the walked
+/// chain: an `audit_entry_tags_started` or `audit_entry_tags_rekeyed` row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryTagsBoundary {
+    /// Basename of the file holding the row.
+    pub file: String,
+    /// One-based line of the row in that file.
+    pub line: usize,
+    /// The row's event kind.
+    pub kind: String,
 }
 
 /// The verified chain tip of the last file in a walk.
@@ -102,6 +152,10 @@ pub struct VerifiedTip {
     pub tip_hash: String,
     /// Byte offset just past the active file's last entry.
     pub end_offset: u64,
+    /// Whether the active file shows prior anchoring: it holds an
+    /// `audit_tip_anchored` row, an entry-tag row, or a row with an entry tag,
+    /// or the handoff it chains from carries `entry_tags`.
+    pub holds_anchoring_row: bool,
 }
 
 /// Verification metadata for one walked audit-log file.
@@ -129,6 +183,13 @@ pub struct FileVerifyResult {
 #[non_exhaustive]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VerifyWarning {
+    /// Retention removes a prefix whose boundary the prune marker records.
+    PrunedPrefix {
+        /// Basename of the first retained file in the walk.
+        first_file: String,
+        /// Number of archives the marker records as pruned.
+        pruned_files: u64,
+    },
     /// An entry timestamp moved backward beyond [`BACKWARD_TS_WARN_THRESHOLD_MS`].
     BackwardTimestampJump {
         /// Previous entry timestamp as it appeared in the log.
@@ -160,6 +221,50 @@ pub enum VerifyWarning {
         /// The I/O error kind.
         error_kind: String,
     },
+    /// An operator acknowledges missing or changed queued operator rows.
+    OutboxLossAcknowledged {
+        /// Basename of the file containing the acknowledgement.
+        file: String,
+        /// One-based line of the acknowledgement.
+        line: usize,
+        /// Number of rows committed in the keyring.
+        expected_rows: u64,
+        /// Number of complete lines found.
+        found_rows: u64,
+    },
+    /// The entry-tag boundary took in entries past the stored anchor without
+    /// tags, once, when the log first came under entry tags.
+    EntryTagsAbsorbed {
+        /// Basename of the file holding the boundary row.
+        file: String,
+        /// One-based line of the boundary row.
+        line: usize,
+        /// Entry count of the stored anchor the boundary found.
+        anchored_count: u64,
+        /// Entries the boundary took in without tags.
+        absorbed_count: u64,
+    },
+    /// An operator quarantined entries that carry no valid entry tag.
+    ///
+    /// Reported for a quarantine row that takes effect: under a key, one
+    /// whose own tag is valid, and in every walk one that no later quarantine
+    /// row of its file covers. A covered row reports nothing.
+    EntriesQuarantined {
+        /// Basename of the file holding the quarantine row.
+        file: String,
+        /// One-based line of the quarantine row.
+        line: usize,
+        /// Number of entries directly before the row that it covers.
+        quarantined_count: u64,
+    },
+    /// A keyed open re-keyed entry tags because entries after the newest
+    /// keyed start did not verify under the current key.
+    EntryTagsRekeyedAtOpen {
+        /// Basename of the file holding the rekey row.
+        file: String,
+        /// One-based line of the rekey row.
+        line: usize,
+    },
 }
 
 /// Verify a hash-chained audit log starting at `log_path`.
@@ -173,9 +278,13 @@ pub enum VerifyWarning {
 /// - `log_path` — path to the active log file (e.g.
 ///   `~/.local/share/stellar-agent/audit/default.jsonl`).
 /// - `hmac_key` — optional 32-byte key for verifying the chain-root HMAC tag
-///   on each file.  If `None`, HMAC verification is skipped (the hash chain
-///   is still verified).  If `Some` and the sidecar is missing, returns
+///   on each file and the entry tags.  If `None`, HMAC verification is skipped
+///   (the hash chain is still verified) and no entry tag is checked.  If
+///   `Some` and the sidecar is missing, returns
 ///   [`VerifyError::HmacSidecarMissing`].
+///
+/// With a key, the entry-tag walk runs over every walked entry; see
+/// [`VerifyError::EntryTagInvalid`] for when it fails.
 ///
 /// # Errors
 ///
@@ -195,6 +304,128 @@ pub enum VerifyWarning {
 /// # }
 /// ```
 pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<VerifyOk, VerifyError> {
+    verify_walk(
+        log_path,
+        hmac_key,
+        hmac_key.map(derive_entry_tag_key),
+        None,
+        None,
+    )
+}
+
+/// [`verify_log`] with the active file read only up to `active_end_offset`,
+/// the offset just past the last entry a writer holding the log verified.
+///
+/// Bytes past that offset are not part of the log the writer holds and do
+/// not change the result: every chain, sidecar, handoff and entry-tag check
+/// runs over the bounded log. A reader calls this under the writer's guard,
+/// with [`super::writer::AuditWriter::end_offset`].
+///
+/// # Errors
+///
+/// Every error of [`verify_log`] over the bounded log.
+pub(super) fn verify_log_within(
+    log_path: &Path,
+    hmac_key: Option<&[u8; 32]>,
+    active_end_offset: u64,
+) -> Result<VerifyOk, VerifyError> {
+    verify_walk(
+        log_path,
+        hmac_key,
+        hmac_key.map(derive_entry_tag_key),
+        Some(active_end_offset),
+        None,
+    )
+}
+
+/// [`verify_log_within`], also collecting the settlement rows of every walked
+/// file for the writer's settlement index.
+///
+/// The rows are those the walk parsed and checked; they come back only with a
+/// successful result, so a failed walk yields none.
+///
+/// # Errors
+///
+/// Every error of [`verify_log_within`].
+pub(super) fn verify_log_within_collecting(
+    log_path: &Path,
+    hmac_key: Option<&[u8; 32]>,
+    active_end_offset: u64,
+) -> Result<(VerifyOk, WalkedRows), VerifyError> {
+    let mut rows = WalkedRows {
+        files: Vec::new(),
+        exact: true,
+    };
+    let ok = verify_walk(
+        log_path,
+        hmac_key,
+        hmac_key.map(derive_entry_tag_key),
+        Some(active_end_offset),
+        Some(&mut rows),
+    )?;
+    Ok((ok, rows))
+}
+
+/// The settlement rows a verification walk read, oldest file first.
+pub(super) struct WalkedRows {
+    /// One entry per walked file, oldest first, the active file last.
+    pub(super) files: Vec<WalkedFile>,
+    /// `false` when a walked line holds bytes the settlement lookup reads
+    /// differently: a blank line with a non-ASCII space, or a bounded line
+    /// with no newline.
+    pub(super) exact: bool,
+}
+
+/// One walked file's settlement rows.
+pub(super) struct WalkedFile {
+    /// The file's path as the listing named it.
+    pub(super) path: PathBuf,
+    /// The hash the file's first entry chains from.
+    pub(super) initial_prev_hash: String,
+    /// The file's pending, submitted and failed rows that no quarantine row
+    /// of the file covers, oldest first.
+    pub(super) rows: Vec<WalkedRow>,
+}
+
+/// One settlement row of a walked file, with where it lies.
+pub(super) struct WalkedRow {
+    /// Byte offset of the row's first byte.
+    pub(super) offset: u64,
+    /// The row's length with its newline.
+    pub(super) len: u64,
+    /// What the row means to the settlement lookup.
+    pub(super) settlement: RowSettlement,
+}
+
+/// Verifies the chain and the entry tags of the log at `log_path` under
+/// `key`, without the chain-root sidecar and prune-marker tag checks.
+///
+/// The walk is [`verify_log`]'s. `profile rotate-audit-key` runs it under the
+/// old key before it replaces that key, while the sidecars may still be signed
+/// by a key an interrupted earlier run already replaced. The result's
+/// `hmac_verified` is `false`.
+///
+/// # Errors
+///
+/// Every error of [`verify_log`] except the sidecar and marker tag failures.
+pub fn verify_entry_tags(log_path: &Path, key: &[u8; 32]) -> Result<VerifyOk, VerifyError> {
+    verify_walk(log_path, None, Some(derive_entry_tag_key(key)), None, None)
+}
+
+/// The walk behind [`verify_log`], [`verify_log_within`] and
+/// [`verify_entry_tags`]: `sidecar_key` checks the chain-root sidecars and
+/// the prune marker, `tag_key` the entry tags, and `active_limit`, when
+/// given, is where the walk stops reading the active file. `collect`, when
+/// given, receives the settlement rows of every walked file.
+fn verify_walk(
+    log_path: &Path,
+    sidecar_key: Option<&[u8; 32]>,
+    tag_key: Option<EntryTagKey>,
+    active_limit: Option<u64>,
+    mut collect: Option<&mut WalkedRows>,
+) -> Result<VerifyOk, VerifyError> {
+    let hmac_key = sidecar_key;
+    let mut tag_walk = EntryTagWalk::new(tag_key);
     let mut total_entries = 0usize;
     let mut files_walked = 0usize;
 
@@ -228,18 +459,52 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
             detail: "log path has no UTF-8 file name".to_owned(),
         })?;
 
-    // `expected_prev_hash` threads the last_hash from one file into the next
-    // to verify the cross-file chain bridge.
-    // None means "this is the very first file — use ZERO_BLOCK_HASH internally".
-    let mut expected_prev_hash: Option<String> = None;
+    let marker = read_prune_marker(log_path)?;
+    if let (Some(marker), Some(key)) = (&marker, hmac_key)
+        && !marker.verify_tag(key)
+    {
+        return Err(VerifyError::HmacMismatch {
+            file: basename_lossy(&prune_marker_path(log_path)),
+        });
+    }
+    let first_file = file_chain.first().map(|path| basename_lossy(path));
+    // The first file chains from the start the prune reads too; every later
+    // bridge uses the walk's tip. A first file that does not exist is reported
+    // by the walk.
+    let mut expected_prev_hash = match first_file
+        .as_deref()
+        .map(|file| oldest_retained_seed(marker.as_ref(), file))
+    {
+        Some(Ok(seed)) => Some(seed.to_owned()),
+        Some(Err(MarkerNamesNoBoundary)) if file_chain.first().is_some_and(|p| p.exists()) => {
+            return Err(VerifyError::ChainBroken {
+                line: 1,
+                file: first_file.unwrap_or_default(),
+                reason: MARKER_NAMES_NO_BOUNDARY_REASON,
+            });
+        }
+        Some(Err(MarkerNamesNoBoundary)) | None => None,
+    };
     let mut previous_timestamp: Option<(String, u64)> = None;
     let mut warnings = Vec::new();
+    if expected_prev_hash
+        .as_deref()
+        .is_some_and(|seed| seed != ZERO_BLOCK_HASH)
+        && let (Some(marker), Some(first_file)) = (&marker, first_file)
+    {
+        warnings.push(VerifyWarning::PrunedPrefix {
+            first_file,
+            pruned_files: marker.data.pruned_files,
+        });
+    }
     let mut per_file = Vec::new();
     // Tracks whether every per-file `SingleFileResult.sidecar_verified` was
     // true. AND-combined into `VerifyOk.hmac_verified` on success.
     let mut all_sidecars_verified = true;
     // Chain tip of the last file walked, for tip-anchor comparison.
     let mut active_tip: Option<VerifiedTip> = None;
+    // Whether the handoff the next file chains from carries `entry_tags`.
+    let mut seed_handoff_entry_tags = false;
 
     for (file_idx, path) in file_chain.iter().enumerate() {
         if !path.exists() {
@@ -248,9 +513,7 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
                 // log is a user-actionable condition (nothing logged yet, or a
                 // wrong path), not an ambient I/O failure — surface it via the
                 // dedicated `LogNotFound` variant so it classifies distinctly.
-                return Err(VerifyError::LogNotFound {
-                    path: path.display().to_string(),
-                });
+                return Err(VerifyError::LogNotFound);
             }
             // A rotated file referenced by the chain does not exist.
             let basename = path
@@ -274,16 +537,21 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
         };
 
         let is_last_file = file_idx + 1 == file_chain.len();
-        let result = verify_single_file(VerifySingleFileContext {
-            path,
-            hmac_key,
-            expected_initial_prev_hash: expected_prev_hash.as_deref(),
-            next_file_basename: current_file_basename,
-            is_last_file,
-            active_stem,
-            file_index: file_idx,
-            previous_timestamp: previous_timestamp.as_ref(),
-        })?;
+        let result = verify_single_file(
+            VerifySingleFileContext {
+                path,
+                hmac_key,
+                expected_initial_prev_hash: expected_prev_hash.as_deref(),
+                next_file_basename: current_file_basename,
+                is_last_file,
+                active_stem,
+                file_index: file_idx,
+                previous_timestamp: previous_timestamp.as_ref(),
+                byte_limit: if is_last_file { active_limit } else { None },
+            },
+            &mut tag_walk,
+            collect.as_deref_mut(),
+        )?;
 
         let SingleFileResult {
             entries,
@@ -292,6 +560,8 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
             warnings: file_warnings,
             sidecar_verified,
             end_offset,
+            holds_anchoring_row,
+            handoff_entry_tags,
         } = result;
 
         if is_last_file {
@@ -299,8 +569,10 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
                 entry_count: entries as u64,
                 tip_hash: last_hash.clone(),
                 end_offset,
+                holds_anchoring_row: holds_anchoring_row || seed_handoff_entry_tags,
             });
         }
+        seed_handoff_entry_tags = handoff_entry_tags;
 
         total_entries += entries;
         files_walked += 1;
@@ -321,6 +593,18 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
         previous_timestamp = last_timestamp;
     }
 
+    tag_walk.finish();
+    if tag_walk.checks_tags()
+        && tag_walk.in_force()
+        && let Some(failure) = tag_walk.failure()
+    {
+        return Err(VerifyError::EntryTagInvalid {
+            file: failure.file.clone(),
+            line: failure.line,
+            reason: failure.reason,
+        });
+    }
+
     Ok(VerifyOk {
         entries_verified: total_entries,
         files_walked,
@@ -328,6 +612,8 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
         warnings,
         hmac_verified: hmac_key.is_some() && all_sidecars_verified,
         active_tip,
+        entry_tags_verified: tag_walk.checks_tags() && tag_walk.in_force(),
+        entry_tags_boundary: tag_walk.boundary().cloned(),
     })
 }
 
@@ -348,11 +634,12 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
 /// - `hmac_key` — same as [`verify_log`].
 /// - `anchor` — the keyring-held [`TipAnchor`] for this log PATH, when the
 ///   caller could establish that the path it was asked to verify is the one the
-///   anchor names. `Some` makes the walk fail with
-///   [`VerifyError::TipAnchorMismatch`] unless the last file's tip is exactly
-///   the anchored tip, which is what catches a restored older copy or a
-///   truncation that the chain walk alone accepts. `None` verifies the chain
-///   only, exactly as before.
+///   anchor names. `Some` applies [`check_anchor_against_walk`]: the walk fails
+///   with [`VerifyError::TipAnchorMismatch`] unless the anchored entry is
+///   intact at the anchored offset and the active file ends at or past it,
+///   which is what catches a restored older copy or a truncation that the
+///   chain walk alone accepts. Entries past the anchor are decided by the
+///   entry-tag walk. `None` verifies the chain and the tags only.
 /// - `health` — a live handle to the session-level
 ///   [`crate::audit_log::health::AuditWriterHealthHandle`].
 ///
@@ -413,9 +700,11 @@ pub fn verify_log_with_health(
 /// Before any of that, an anchor naming the newest archive's rotation handoff is
 /// accepted: it describes the generation this file succeeded, not this file.
 ///
-/// A file that moved FORWARD past an intact anchored entry is not an error:
-/// unkeyed writers append without touching the anchor, and the next keyed
-/// acquisition absorbs the gap.
+/// A file that moved FORWARD past an intact anchored entry is not an error
+/// here. Once entry tags are in force, the entry-tag walk of [`verify_log`]
+/// decides the entries past the anchor: each needs a valid tag. Before that,
+/// the next keyed acquisition absorbs the gap once and counts it in its
+/// `audit_entry_tags_started` row.
 ///
 /// The function reads the log at `log_path` and never reads or writes the
 /// keyring, so it neither adopts nor advances an anchor.
@@ -476,6 +765,38 @@ pub fn check_anchor_against_walk(
     Ok(())
 }
 
+/// Refuses a log with no stored anchor that shows it was anchored before.
+///
+/// The verifier's half of the writer's adoption rule, decided by the same
+/// [`PriorAnchoring::find`]: an audit binding recorded for the profile, a
+/// chain-root sidecar on the active file, or an `audit_tip_anchored` row in
+/// it, for a file with entries; the sidecar alone for an empty file. `binding`
+/// is what the caller read from the keyring without writing it. A log none of
+/// these facts describe was never anchored and passes, so a log written only by
+/// unkeyed writers verifies before its first keyed use.
+///
+/// Call this only when no anchor is stored for the path the walk verified.
+///
+/// # Errors
+///
+/// [`VerifyError::TipAnchorMissing`] naming the evidence.
+pub fn check_missing_anchor(
+    log_path: &Path,
+    binding: BindingHistory,
+    active_tip: Option<&VerifiedTip>,
+) -> Result<(), VerifyError> {
+    let (entry_count, holds_anchoring_row) =
+        active_tip.map_or((0, false), |tip| (tip.entry_count, tip.holds_anchoring_row));
+    match PriorAnchoring::find(binding, log_path, entry_count, holds_anchoring_row) {
+        None => Ok(()),
+        Some(evidence) => Err(VerifyError::TipAnchorMissing {
+            evidence,
+            actual_count: entry_count,
+            actual_offset: active_tip.map_or(0, |tip| tip.end_offset),
+        }),
+    }
+}
+
 /// Whether a stored anchor disagrees with the walked tip of the log at
 /// `log_path`.
 ///
@@ -517,7 +838,8 @@ pub fn stored_anchor_disagrees_with_walk(
 /// validated the cross-file bridge by this point, so a seed that cannot be read
 /// here is a reason to distrust the file, not to accept it.
 fn anchor_names_the_rotation_handoff(log_path: &Path, anchor: &TipAnchor) -> bool {
-    crate::audit_log::writer::initial_chain_seed(log_path).is_ok_and(|seed| seed == anchor.tip_hash)
+    crate::audit_log::writer::initial_chain_seed(log_path)
+        .is_ok_and(|seed| seed.hash == anchor.tip_hash)
 }
 
 /// Returns `true` when the last entry ending at or before the anchored offset
@@ -567,6 +889,11 @@ pub struct VerifyOkWithHealth {
 
 struct SingleFileResult {
     entries: usize,
+    /// Whether this file holds an `audit_tip_anchored` row, an entry-tag row,
+    /// or a row with an entry tag.
+    holds_anchoring_row: bool,
+    /// Whether this file's rotation handoff carries `entry_tags`.
+    handoff_entry_tags: bool,
     /// Hash of the last entry in this file (used for cross-file chain bridging).
     last_hash: String,
     /// Byte offset just past the last entry in this file — the length of the
@@ -593,6 +920,8 @@ struct VerifySingleFileContext<'a> {
     active_stem: &'a str,
     file_index: usize,
     previous_timestamp: Option<&'a (String, u64)>,
+    /// Where reading the file stops, when given; bytes past it are not read.
+    byte_limit: Option<u64>,
 }
 
 /// Collects the ordered list of files to verify.
@@ -680,22 +1009,50 @@ pub(super) fn collect_file_chain(log_path: &Path) -> Result<Vec<PathBuf>, Verify
 /// # Errors
 ///
 /// Returns a [`VerifyError`] on the first integrity violation.
-fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResult, VerifyError> {
+fn verify_single_file(
+    ctx: VerifySingleFileContext<'_>,
+    tag_walk: &mut EntryTagWalk,
+    mut collect: Option<&mut WalkedRows>,
+) -> Result<SingleFileResult, VerifyError> {
     let path = ctx.path;
+    let file_basename = basename_lossy(path);
+    #[cfg(test)]
+    super::reader::row_file_visits::record_open(
+        &file_basename,
+        super::reader::row_file_visits::VERIFY_WALK,
+    );
     let file = open_regular_file(path)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(file.take(ctx.byte_limit.unwrap_or(u64::MAX)));
 
     // For the very first file, the initial expected prev hash is ZERO_BLOCK_HASH.
     // For subsequent files, it is the last_hash of the preceding file.
     let initial_prev_hash = ctx.expected_initial_prev_hash.unwrap_or(ZERO_BLOCK_HASH);
     let mut prev_hash = initial_prev_hash.to_owned();
+    if let Some(collect) = collect.as_deref_mut() {
+        collect.files.push(WalkedFile {
+            path: path.to_path_buf(),
+            initial_prev_hash: initial_prev_hash.to_owned(),
+            rows: Vec::new(),
+        });
+    }
 
     let mut entries = 0usize;
     let mut end_offset = 0u64;
+    let mut holds_anchoring_row = false;
+    let mut handoff_entry_tags = false;
     let mut is_first_entry = true;
     let mut last_handoff_next_file: Option<String> = None;
     let mut previous_timestamp = ctx.previous_timestamp.cloned();
     let mut warnings = Vec::new();
+    // Each row's quarantine directive, when it is one that can take effect,
+    // and the warning each such directive reports with the position it takes
+    // in `warnings`; only a directive no later one covers reports it.
+    let mut directives: Vec<Option<u64>> = Vec::new();
+    let mut quarantine_warnings: Vec<(usize, usize, VerifyWarning)> = Vec::new();
+    // For the settlement lookup: every row's quarantine count, and the
+    // settlement rows with their row positions.
+    let mut lookup_quarantine: Vec<Option<u64>> = Vec::new();
+    let mut settlement_rows: Vec<(usize, WalkedRow)> = Vec::new();
 
     // Read through `read_until` rather than `BufRead::lines` so the byte offset
     // of the verified prefix stays exact: the tip anchor records where the chain
@@ -711,6 +1068,7 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
         if read == 0 {
             break;
         }
+        let row_start = consumed;
         consumed = consumed.saturating_add(read as u64);
         let line_number = line_index + 1;
         line_index += 1;
@@ -722,15 +1080,23 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             }
         })?;
 
+        if let Some(collect) = collect.as_deref_mut()
+            && ((ctx.byte_limit.is_some() && raw.last() != Some(&b'\n'))
+                || (line.trim().is_empty() && !raw.iter().all(u8::is_ascii_whitespace)))
+        {
+            collect.exact = false;
+        }
         if line.trim().is_empty() {
             continue;
         }
+        #[cfg(test)]
+        super::reader::row_file_visits::record_row();
 
         // Parse the entry.
         let entry: AuditEntry =
             serde_json::from_str(line).map_err(|e| VerifyError::ParseError {
                 line: line_number,
-                detail: e.to_string(),
+                detail: format!("the entry {}", describe_json_error(&e)),
             })?;
 
         let current_ts_ms =
@@ -784,30 +1150,25 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
         // Verify chain-root HMAC on the first entry of each file.
         if is_first_entry {
             if let Some(key) = ctx.hmac_key {
-                let sidecar = hmac_sidecar_path(path);
-                if sidecar.exists() {
-                    let tag = read_regular_file_to_string(&sidecar)?;
-                    let tag = tag.trim();
-                    verify_chain_root(key, &body, tag).map_err(|_| VerifyError::HmacMismatch {
-                        file: path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_owned(),
-                    })?;
-                } else {
-                    // HMAC key provided but sidecar missing — integrity violation.
-                    return Err(VerifyError::HmacSidecarMissing {
-                        file: path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_owned(),
-                    });
-                }
+                verify_root_sidecar(path, key, &body)?;
             }
             is_first_entry = false;
         }
+
+        holds_anchoring_row |= shows_anchoring(&entry);
+        let check = tag_walk.observe(&file_basename, line_number, &entry, &current_hash);
+        // A quarantine row takes part in coverage when it can take effect:
+        // with a key, only one whose own tag is valid.
+        let directive = match &entry.event_kind {
+            EventKind::AuditEntriesQuarantined { quarantined_count }
+                if check.is_none_or(|check| check == EntryTagCheck::Valid) =>
+            {
+                Some(*quarantined_count)
+            }
+            _ => None,
+        };
+        let row = directives.len();
+        directives.push(directive);
 
         // Track rotation handoff entries for cross-file validation.
         // `EventKind` is `#[non_exhaustive]` but we are in the same crate, so
@@ -826,7 +1187,9 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
                 // maintained by the surrounding hash check.
             }
             EventKind::SaContextRuleCreated { .. }
+            | EventKind::SaContextRuleCreatedV2 { .. }
             | EventKind::SaContextRulePinsUpdated { .. }
+            | EventKind::SaContextRulePinsUpdatedV2 { .. }
             | EventKind::SaContextRuleDeleted { .. } => {
                 // No rotation-handoff tracking needed; the hash-chain is
                 // maintained by the surrounding hash check.
@@ -965,6 +1328,7 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             }
             EventKind::ApprovalAttested { .. }
             | EventKind::ApprovalRejected { .. }
+            | EventKind::ApprovalRevoked { .. }
             | EventKind::ApprovalAttestedRemote { .. }
             | EventKind::ApprovalRejectedRemote { .. } => {
                 // Approval lifecycle events. No rotation-handoff tracking
@@ -974,6 +1338,9 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             EventKind::ValueActionSubmitted { .. }
             | EventKind::ValueActionPending { .. }
             | EventKind::ValueActionFailed { .. }
+            | EventKind::SubmissionAccountingExpired { .. }
+            | EventKind::OperationTransition { .. }
+            | EventKind::OperationEvidence { .. }
             | EventKind::SubmissionReceiptCleared { .. }
             | EventKind::X402PaymentAuthorized { .. }
             | EventKind::X402AuthorizationWithheld { .. }
@@ -983,17 +1350,74 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             | EventKind::MppReceiptObserved { .. }
             | EventKind::MppSettlementReconciled { .. }
             | EventKind::KeyringKeyWritten { .. }
+            | EventKind::SignerIdentityEnrolled { .. }
+            | EventKind::MainnetEnablementMinted { .. }
             | EventKind::MppStateAdopted { .. }
             | EventKind::MppStateReset { .. }
             | EventKind::PolicyWindowStateReset { .. }
             | EventKind::ProfileHalted { .. }
             | EventKind::ProfileResumed { .. }
+            | EventKind::AuditCarriersBound { .. }
             | EventKind::AuditTipAnchored { .. } => {
                 // Value-action, key-write, window-state-reset, halt, and
                 // tip-anchor forensic rows. No rotation-handoff tracking needed; the
                 // hash-chain is maintained by the surrounding hash check.
             }
-            EventKind::AuditRotationHandoff { next_file_name } => {
+            EventKind::AuditOutboxLossAcknowledged {
+                expected_rows,
+                found_rows,
+                ..
+            } => {
+                warnings.push(VerifyWarning::OutboxLossAcknowledged {
+                    file: path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    line: line_number,
+                    expected_rows: *expected_rows,
+                    found_rows: *found_rows,
+                });
+            }
+            EventKind::AuditEntryTagsStarted {
+                anchored_count,
+                absorbed_count,
+            } => {
+                if *absorbed_count > 0 {
+                    warnings.push(VerifyWarning::EntryTagsAbsorbed {
+                        file: file_basename.clone(),
+                        line: line_number,
+                        anchored_count: *anchored_count,
+                        absorbed_count: *absorbed_count,
+                    });
+                }
+            }
+            EventKind::AuditEntryTagsRekeyed { cause } => {
+                if *cause == EntryTagsRekeyCause::OpenRepair {
+                    warnings.push(VerifyWarning::EntryTagsRekeyedAtOpen {
+                        file: file_basename.clone(),
+                        line: line_number,
+                    });
+                }
+            }
+            EventKind::AuditEntriesQuarantined { quarantined_count } => {
+                if directive.is_some() {
+                    quarantine_warnings.push((
+                        row,
+                        warnings.len(),
+                        VerifyWarning::EntriesQuarantined {
+                            file: file_basename.clone(),
+                            line: line_number,
+                            quarantined_count: *quarantined_count,
+                        },
+                    ));
+                }
+            }
+            EventKind::AuditRotationHandoff {
+                next_file_name,
+                entry_tags,
+            } => {
+                handoff_entry_tags = *entry_tags;
                 if ctx.is_last_file {
                     return Err(VerifyError::ChainBroken {
                         line: line_number,
@@ -1009,9 +1433,49 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             }
         }
 
+        if collect.is_some() {
+            let settlement = RowSettlement::of(&entry);
+            lookup_quarantine.push(match settlement {
+                RowSettlement::Quarantine(count) => Some(count),
+                _ => None,
+            });
+            if matches!(
+                settlement,
+                RowSettlement::Pending(_) | RowSettlement::Settled(_)
+            ) {
+                settlement_rows.push((
+                    row,
+                    WalkedRow {
+                        offset: row_start,
+                        len: read as u64,
+                        settlement,
+                    },
+                ));
+            }
+        }
         prev_hash = current_hash;
         entries += 1;
         end_offset = consumed;
+    }
+
+    // A quarantine is reported only for a directive that takes effect: one
+    // that no later directive of the file covers. Inserted from the last so
+    // every earlier position stays where it was recorded.
+    // The settlement lookup drops the rows every quarantine row covers, tag
+    // or no tag, as the reader's walk does.
+    if let Some(file) = collect.and_then(|collect| collect.files.last_mut()) {
+        let lookup_covered = quarantine_coverage(&lookup_quarantine);
+        file.rows = settlement_rows
+            .into_iter()
+            .filter(|(row, _)| !lookup_covered[*row])
+            .map(|(_, walked)| walked)
+            .collect();
+    }
+    let covered = quarantine_coverage(&directives);
+    for (row, at, warning) in quarantine_warnings.into_iter().rev() {
+        if !covered[row] {
+            warnings.insert(at, warning);
+        }
     }
 
     // Validate the rotation handoff's `next_file_name` against the current
@@ -1046,6 +1510,8 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
 
     Ok(SingleFileResult {
         entries,
+        holds_anchoring_row,
+        handoff_entry_tags,
         last_hash: prev_hash,
         end_offset,
         last_timestamp: previous_timestamp,
@@ -1060,22 +1526,428 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
     })
 }
 
-fn open_regular_file(path: &Path) -> Result<File, VerifyError> {
-    let metadata = fs::symlink_metadata(path).map_err(VerifyError::Io)?;
-    if !metadata.file_type().is_file() {
-        return Err(VerifyError::NonRegularFileLogPath {
-            path: path.to_path_buf(),
-        });
-    }
-    File::open(path).map_err(VerifyError::Io)
+/// Whether `entry` shows that a keyed writer or an anchored writer reached the
+/// log: an `audit_tip_anchored` row, one of the entry-tag rows, or any row that
+/// carries an entry tag.
+pub(super) fn shows_anchoring(entry: &AuditEntry) -> bool {
+    entry.entry_tag.is_some()
+        || matches!(
+            entry.event_kind,
+            EventKind::AuditTipAnchored { .. }
+                | EventKind::AuditEntryTagsStarted { .. }
+                | EventKind::AuditEntryTagsRekeyed { .. }
+                | EventKind::AuditEntriesQuarantined { .. }
+        )
 }
 
-fn read_regular_file_to_string(path: &Path) -> Result<String, VerifyError> {
-    let mut file = open_regular_file(path)?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(VerifyError::Io)?;
-    Ok(contents)
+/// What a row means to the entry-tag walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TagRowClass {
+    /// `audit_entry_tags_started` or `audit_entry_tags_rekeyed`.
+    KeyedStart {
+        /// The row's event kind.
+        kind: &'static str,
+    },
+    /// A rotation handoff, with its `entry_tags` flag.
+    Handoff {
+        /// The handoff's `entry_tags` flag.
+        entry_tags: bool,
+    },
+    /// `audit_entries_quarantined`, with its count.
+    Quarantine {
+        /// The number of entries directly before the row it covers.
+        quarantined_count: u64,
+    },
+    /// Every other row.
+    Other,
+}
+
+impl TagRowClass {
+    /// The class of a row of kind `kind`.
+    pub(super) fn of(kind: &EventKind) -> Self {
+        match kind {
+            EventKind::AuditEntryTagsStarted { .. } => Self::KeyedStart {
+                kind: "audit_entry_tags_started",
+            },
+            EventKind::AuditEntryTagsRekeyed { .. } => Self::KeyedStart {
+                kind: "audit_entry_tags_rekeyed",
+            },
+            EventKind::AuditRotationHandoff { entry_tags, .. } => Self::Handoff {
+                entry_tags: *entry_tags,
+            },
+            EventKind::AuditEntriesQuarantined { quarantined_count } => Self::Quarantine {
+                quarantined_count: *quarantined_count,
+            },
+            _ => Self::Other,
+        }
+    }
+
+    /// Whether a row of this class puts entry tags in force for itself and
+    /// every row after it: a keyed start, or a handoff with `entry_tags`.
+    pub(super) fn starts_entry_tags(self) -> bool {
+        matches!(
+            self,
+            Self::KeyedStart { .. } | Self::Handoff { entry_tags: true }
+        )
+    }
+}
+
+/// Which rows of one file the quarantine rows in it cover, oldest first.
+///
+/// `quarantine[i]` is `Some(n)` when row `i` is an
+/// `audit_entries_quarantined { quarantined_count: n }` row that may take
+/// effect, and `None` for every other row. The walk runs from the last row to
+/// the first: a quarantine row that no later quarantine row covers takes
+/// effect and covers the `n` rows directly before it, and a covered row, a
+/// covered quarantine row included, starts no coverage. A quarantine row thus
+/// takes effect only when no later quarantine row that takes effect covers
+/// it, so a planted quarantine row that a genuine one covers hides nothing.
+///
+/// The bounded reader and the entry-tag walk both decide coverage here, so a
+/// row `audit verify` accepts as quarantined is the row every scan drops.
+pub(super) fn quarantine_coverage(quarantine: &[Option<u64>]) -> Vec<bool> {
+    let mut covered = vec![false; quarantine.len()];
+    let mut remaining = 0u64;
+    for (flag, count) in covered.iter_mut().zip(quarantine).rev() {
+        if remaining > 0 {
+            *flag = true;
+            remaining -= 1;
+        } else if let Some(count) = count {
+            remaining = *count;
+        }
+    }
+    covered
+}
+
+/// A row the entry-tag walk holds against the log: the first row of a run of
+/// rows whose tags failed and that nothing after them covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TagFailure {
+    /// Basename of the file holding the row.
+    pub(super) file: String,
+    /// One-based line of the row in that file.
+    pub(super) line: usize,
+    /// `missing` or `mismatch`.
+    pub(super) reason: &'static str,
+}
+
+/// One row the entry-tag walk has checked and not yet applied.
+#[derive(Debug, Clone, Copy)]
+struct CheckedRow {
+    line: usize,
+    class: TagRowClass,
+    check: EntryTagCheck,
+}
+
+/// The entry-tag walk over a chain of entries, oldest first.
+///
+/// A valid tag on an entry covers that entry and, through its chain hash,
+/// every entry before it. The walk keeps the first row of the run of failing
+/// rows that is still open, and the first failure that nothing covered.
+///
+/// The rows of one file are held until the walk moves to the next file or
+/// finishes. [`quarantine_coverage`] then decides which of them a valid
+/// `audit_entries_quarantined` row covers; a covered row opens and closes no
+/// run, and a covered keyed start or flagged handoff still puts tags in
+/// force. Every other row is applied in order:
+///
+/// - A keyed start (`audit_entry_tags_started`, `audit_entry_tags_rekeyed`)
+///   with a valid tag puts tags in force and clears the open run and the
+///   recorded failure; it is recorded as the boundary. With a failing tag it
+///   puts tags in force and opens a run.
+/// - A handoff with `entry_tags` puts tags in force from the start of the
+///   walk, and then counts as a row under the rules below.
+/// - Any other row with a valid tag, a quarantine row included, turns an open
+///   run into the recorded failure, keeping the first one recorded.
+/// - A row with a missing or mismatched tag opens a run unless one is open.
+/// - At the end of the walk an open run becomes the recorded failure.
+///
+/// The verdict belongs to the caller: a failure counts only while tags are in
+/// force. Without a key the walk checks nothing.
+pub(super) struct EntryTagWalk {
+    key: Option<EntryTagKey>,
+    in_force: bool,
+    open_run: Option<TagFailure>,
+    recorded: Option<TagFailure>,
+    boundary: Option<EntryTagsBoundary>,
+    /// The file whose rows `held` holds.
+    held_file: String,
+    /// The checked rows of `held_file` not yet applied, oldest first.
+    held: Vec<CheckedRow>,
+}
+
+impl EntryTagWalk {
+    /// A walk checking tags under `key`, or checking nothing when `None`.
+    pub(super) fn new(key: Option<EntryTagKey>) -> Self {
+        Self {
+            key,
+            in_force: false,
+            open_run: None,
+            recorded: None,
+            boundary: None,
+            held_file: String::new(),
+            held: Vec::new(),
+        }
+    }
+
+    /// Whether the walk holds a key and so checks tags.
+    pub(super) fn checks_tags(&self) -> bool {
+        self.key.is_some()
+    }
+
+    /// Whether tags are in force in the walked entries, once
+    /// [`Self::finish`] has applied every row.
+    pub(super) fn in_force(&self) -> bool {
+        self.in_force
+    }
+
+    /// The recorded failure, once [`Self::finish`] has closed the open run.
+    pub(super) fn failure(&self) -> Option<&TagFailure> {
+        self.recorded.as_ref()
+    }
+
+    /// The newest keyed start with a valid tag, once [`Self::finish`] has
+    /// applied every row.
+    pub(super) fn boundary(&self) -> Option<&EntryTagsBoundary> {
+        self.boundary.as_ref()
+    }
+
+    /// Feeds one entry whose chain hash is `hash`, at `line` of `file`.
+    /// Returns the tag check, or `None` without a key.
+    pub(super) fn observe(
+        &mut self,
+        file: &str,
+        line: usize,
+        entry: &AuditEntry,
+        hash: &str,
+    ) -> Option<EntryTagCheck> {
+        let key = self.key.as_ref()?;
+        let check = check_entry_tag(key, hash, entry.entry_tag.as_deref());
+        self.observe_check(file, line, TagRowClass::of(&entry.event_kind), check);
+        Some(check)
+    }
+
+    /// Feeds one row of `file` whose tag was already checked as `check`.
+    /// Rows of one file arrive consecutively, oldest first.
+    pub(super) fn observe_check(
+        &mut self,
+        file: &str,
+        line: usize,
+        class: TagRowClass,
+        check: EntryTagCheck,
+    ) {
+        if self.held_file != file {
+            self.apply_held();
+            file.clone_into(&mut self.held_file);
+        }
+        self.held.push(CheckedRow { line, class, check });
+    }
+
+    /// Applies every held row and closes an open run at the end of the walk.
+    pub(super) fn finish(&mut self) {
+        self.apply_held();
+        self.close_run();
+    }
+
+    /// Applies the held rows of one file, skipping the rows a valid
+    /// quarantine row covers.
+    fn apply_held(&mut self) {
+        let held = std::mem::take(&mut self.held);
+        let quarantine: Vec<Option<u64>> = held
+            .iter()
+            .map(|row| match row.class {
+                TagRowClass::Quarantine { quarantined_count }
+                    if row.check == EntryTagCheck::Valid =>
+                {
+                    Some(quarantined_count)
+                }
+                _ => None,
+            })
+            .collect();
+        let covered = quarantine_coverage(&quarantine);
+        for (row, covered) in held.into_iter().zip(covered) {
+            if covered {
+                self.in_force |= row.class.starts_entry_tags();
+            } else {
+                self.apply(row);
+            }
+        }
+    }
+
+    /// Applies one row no quarantine row covers.
+    fn apply(&mut self, row: CheckedRow) {
+        match row.class {
+            TagRowClass::KeyedStart { kind } => {
+                self.in_force = true;
+                if row.check == EntryTagCheck::Valid {
+                    self.open_run = None;
+                    self.recorded = None;
+                    self.boundary = Some(EntryTagsBoundary {
+                        file: self.held_file.clone(),
+                        line: row.line,
+                        kind: kind.to_owned(),
+                    });
+                } else {
+                    self.open(row);
+                }
+                return;
+            }
+            TagRowClass::Handoff { entry_tags: true } => self.in_force = true,
+            TagRowClass::Handoff { entry_tags: false }
+            | TagRowClass::Quarantine { .. }
+            | TagRowClass::Other => {}
+        }
+        if row.check == EntryTagCheck::Valid {
+            self.close_run();
+        } else {
+            self.open(row);
+        }
+    }
+
+    fn open(&mut self, row: CheckedRow) {
+        if self.open_run.is_none() {
+            self.open_run = Some(TagFailure {
+                file: self.held_file.clone(),
+                line: row.line,
+                reason: row.check.failure_reason().unwrap_or("missing"),
+            });
+        }
+    }
+
+    fn close_run(&mut self) {
+        if let Some(run) = self.open_run.take()
+            && self.recorded.is_none()
+        {
+            self.recorded = Some(run);
+        }
+    }
+}
+
+/// Verifies the chain-root tag in `log_file`'s `.root_hmac` sidecar over
+/// `first_body`, the canonical body of the file's first entry, under `key`.
+///
+/// The sidecar is opened with [`open_regular_file`] and read within
+/// [`SIDECAR_READ_CAP`]. An absent sidecar is
+/// [`VerifyError::HmacSidecarMissing`]. A tag that does not verify is
+/// [`VerifyError::HmacMismatch`], and so is a sidecar too long to hold one.
+pub(super) fn verify_root_sidecar(
+    log_file: &Path,
+    key: &[u8; 32],
+    first_body: &[u8],
+) -> Result<(), VerifyError> {
+    let file = || {
+        log_file
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let tag = match read_small_regular_file(&hmac_sidecar_path(log_file), SIDECAR_READ_CAP) {
+        Ok(Some(bytes)) => String::from_utf8(bytes).map_err(|e| {
+            VerifyError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?,
+        Ok(None) => return Err(VerifyError::HmacMismatch { file: file() }),
+        Err(VerifyError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(VerifyError::HmacSidecarMissing { file: file() });
+        }
+        Err(e) => return Err(e),
+    };
+    verify_chain_root(key, first_body, tag.trim())
+        .map_err(|_| VerifyError::HmacMismatch { file: file() })
+}
+
+/// Most bytes read from a sidecar: a `.root_hmac` tag or the `<log>.pruned`
+/// marker.
+///
+/// A tag is under a hundred bytes and a marker, which names two files of at
+/// most 255 bytes each with their seeds and a tag, under one kilobyte. The cap
+/// keeps a planted sidecar from making a reader allocate more than this.
+pub(super) const SIDECAR_READ_CAP: u64 = 16 * 1024;
+
+/// Reads the regular file at `path` whole when it holds at most `cap` bytes.
+///
+/// `Ok(None)` means the file is longer than `cap`; at most `cap + 1` bytes are
+/// read to find that out. The open is [`open_regular_file`].
+pub(super) fn read_small_regular_file(
+    path: &Path,
+    cap: u64,
+) -> Result<Option<Vec<u8>>, VerifyError> {
+    read_bounded(open_regular_file(path)?, cap).map_err(VerifyError::Io)
+}
+
+/// Reads `reader` to its end when it yields at most `cap` bytes, and returns
+/// `None` after reading `cap + 1` bytes otherwise.
+fn read_bounded(reader: impl Read, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    reader.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= cap).then_some(bytes))
+}
+
+/// Opens `path` for reading only when it is a regular file.
+///
+/// On Unix the open itself refuses a symlink (`O_NOFOLLOW`) and never waits
+/// (`O_NONBLOCK`), so a FIFO or device at the path cannot stall the caller. On
+/// Windows the open names the reparse point itself rather than its target
+/// (`FILE_FLAG_OPEN_REPARSE_POINT`), and a handle that carries the
+/// reparse-point attribute is refused. A `symlink_metadata` pre-check there
+/// refuses a non-regular file before the open, so a directory gets this
+/// refusal rather than the access error its open would return. On every
+/// platform the opened handle must then be a regular file. A refusal is
+/// [`VerifyError::NonRegularFileLogPath`].
+pub(super) fn open_regular_file(path: &Path) -> Result<File, VerifyError> {
+    let non_regular = || VerifyError::NonRegularFileLogPath;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(_) if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) => {
+                return Err(non_regular());
+            }
+            Err(e) => return Err(VerifyError::Io(e)),
+        }
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        let reparse_point = |metadata: &fs::Metadata| {
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        };
+        let metadata = fs::symlink_metadata(path).map_err(VerifyError::Io)?;
+        if !metadata.file_type().is_file() || reparse_point(&metadata) {
+            return Err(non_regular());
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(VerifyError::Io)?;
+        if reparse_point(&file.metadata().map_err(VerifyError::Io)?) {
+            return Err(non_regular());
+        }
+        file
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file = {
+        if !fs::symlink_metadata(path)
+            .map_err(VerifyError::Io)?
+            .file_type()
+            .is_file()
+        {
+            return Err(non_regular());
+        }
+        File::open(path).map_err(VerifyError::Io)?
+    };
+    if !file.metadata().map_err(VerifyError::Io)?.is_file() {
+        return Err(non_regular());
+    }
+    Ok(file)
 }
 
 /// Strips a trailing `\n`, and a `\r` before it, from a raw line.
@@ -1335,7 +2207,7 @@ pub enum VerifyError {
         file: String,
     },
 
-    /// The chain-root HMAC tag did not verify.
+    /// A chain-root or prune-marker HMAC tag did not verify.
     ///
     /// Wire code: `audit.hmac_mismatch`.  Detail: file basename.
     #[error("audit.hmac_mismatch: chain-root HMAC verification failed for {file}")]
@@ -1373,12 +2245,11 @@ pub enum VerifyError {
     ///
     /// Rejecting directories and symlinks before open closes the symlink-redirect
     /// attack surface where `audit verify` could be pointed at an arbitrary file.
-    /// Display emits the basename only to avoid leaking full filesystem paths.
-    #[error("audit.non_regular_file_log_path: {}", basename_lossy(path))]
-    NonRegularFileLogPath {
-        /// Rejected path. Display uses only the basename.
-        path: PathBuf,
-    },
+    #[error(
+        "audit.non_regular_file_log_path: log_path must name a regular audit log file; choose a \
+         regular file and retry audit verify."
+    )]
+    NonRegularFileLogPath,
 
     /// A JSON line could not be parsed.
     ///
@@ -1413,11 +2284,11 @@ pub enum VerifyError {
     /// than an internal invariant violation.
     ///
     /// Wire code: `audit.log_not_found`.
-    #[error("audit.log_not_found: audit log not found at {path}")]
-    LogNotFound {
-        /// Display path of the missing primary audit-log file.
-        path: String,
-    },
+    #[error(
+        "audit.log_not_found: log_path must name an existing audit log file; choose an existing \
+         file and retry audit verify."
+    )]
+    LogNotFound,
 
     /// An I/O error occurred while reading the log.
     ///
@@ -1511,6 +2382,54 @@ pub enum VerifyError {
         /// Stable diagnostic for which half of the check failed.
         reason: &'static str,
     },
+
+    /// No anchor is stored for the log path, and the log shows one was.
+    ///
+    /// The chain walk succeeded, and it verifies a prefix only. The evidence
+    /// is a fact that outlives the anchor: an audit binding recorded for the
+    /// profile, a chain-root sidecar on the active file, or an
+    /// `audit_tip_anchored` row in it. A log with its anchor deleted and its
+    /// tail truncated would otherwise verify as a log that was never anchored.
+    ///
+    /// Counts and offsets only: no digest appears in the message.
+    ///
+    /// Wire code: `audit.tip_anchor_missing`. Recovery:
+    /// `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`
+    /// after establishing why the anchor is gone. See
+    /// `docs/maintainers/audit-log-recovery.md`.
+    #[error(
+        "audit.tip_anchor_missing: anchor: missing; no tip anchor is stored for this log path, \
+         although {evidence}; file holds {actual_count} entries / {actual_offset} bytes"
+    )]
+    TipAnchorMissing {
+        /// What shows the log was anchored before.
+        evidence: PriorAnchoring,
+        /// Entry count the walk found in the active file.
+        actual_count: u64,
+        /// Byte offset the walk found for the active file's last entry.
+        actual_offset: u64,
+    },
+
+    /// Entry tags are in force and an entry carries no valid tag while no
+    /// valid keyed start or quarantine row after it covers it.
+    ///
+    /// Without the audit key, anyone who can write the log can append an
+    /// entry that chains correctly; the tag is what such an entry lacks. The
+    /// reason is `missing` or `mismatch`, and the message carries no digest.
+    ///
+    /// Wire code: `audit.entry_tag_invalid`. Recovery:
+    /// `stellar-agent audit reanchor --profile <name>
+    /// --acknowledge-unauthenticated-tail` after establishing where the
+    /// entries came from. See `docs/maintainers/audit-log-recovery.md`.
+    #[error("audit.entry_tag_invalid: entry tag {reason} at line {line} in {file}")]
+    EntryTagInvalid {
+        /// Basename of the file holding the entry.
+        file: String,
+        /// One-based line of the entry.
+        line: usize,
+        /// `missing` or `mismatch`.
+        reason: &'static str,
+    },
 }
 
 impl VerifyError {
@@ -1533,6 +2452,8 @@ impl VerifyError {
             Self::SignerSetCanonicalBody(_) => "audit.signer_set_canonical_body",
             Self::PartialRotation { .. } => "audit.partial_rotation",
             Self::TipAnchorMismatch { .. } => "audit.tip_anchor_mismatch",
+            Self::TipAnchorMissing { .. } => "audit.tip_anchor_missing",
+            Self::EntryTagInvalid { .. } => "audit.entry_tag_invalid",
         }
     }
 }
@@ -1552,7 +2473,7 @@ mod tests {
         entry::{AuditEntry, IntoOptionalChainId, NewToolInvocation},
         schema::{
             ContractKind, EVENT_KIND_VARIANT_COUNT, KeyPurpose, PinsUpdateReason, PolicyDecision,
-            TipAnchorReason, ValueActionKind, ValueLegRecord, VerifierAdvisoryKind,
+            TipAnchorReason, ValueActionKind, ValueLegRecord, VerifierAdvisoryKind, WasmHashPin,
         },
         writer::{
             AuditWriter, ROTATION_THRESHOLD_BYTES, ROTATION_WINDOW_RETRY_ATTEMPTS,
@@ -1563,11 +2484,13 @@ mod tests {
     use std::cell::RefCell;
     use std::fs;
     use std::rc::Rc;
+    use stellar_agent_test_support::rejected_value::assert_no_marker;
     use tempfile::TempDir;
     use zeroize::Zeroizing;
 
     fn verify_event_kind_explicit_arm_for_test(event_kind: &EventKind) -> &'static str {
         match event_kind {
+            EventKind::MainnetEnablementMinted { .. } => "mainnet_enablement_minted",
             EventKind::ToolInvocation => "tool_invocation",
             EventKind::PluginInvoked { .. } => "plugin_invoked",
             EventKind::WalletMlockFailed { .. } => "wallet_mlock_failed",
@@ -1575,6 +2498,8 @@ mod tests {
             EventKind::SmartAccountDeployed { .. } => "smart_account_deployed",
             EventKind::SaContextRuleCreated { .. } => "sa_context_rule_created",
             EventKind::SaContextRulePinsUpdated { .. } => "sa_context_rule_pins_updated",
+            EventKind::SaContextRuleCreatedV2 { .. } => "sa_context_rule_created_v2",
+            EventKind::SaContextRulePinsUpdatedV2 { .. } => "sa_context_rule_pins_updated_v2",
             EventKind::SaContextRuleDeleted { .. } => "sa_context_rule_deleted",
             EventKind::PasskeyRegistered { .. } => "passkey_registered",
             EventKind::PasskeyAssertion { .. } => "passkey_assertion",
@@ -1626,11 +2551,15 @@ mod tests {
             EventKind::SubmissionAuthMismatch { .. } => "submission_auth_mismatch",
             EventKind::ApprovalAttested { .. } => "approval_attested",
             EventKind::ApprovalRejected { .. } => "approval_rejected",
+            EventKind::ApprovalRevoked { .. } => "approval_revoked",
             EventKind::ApprovalAttestedRemote { .. } => "approval_attested_remote",
             EventKind::ApprovalRejectedRemote { .. } => "approval_rejected_remote",
             EventKind::ValueActionSubmitted { .. } => "value_action_submitted",
             EventKind::ValueActionPending { .. } => "value_action_pending",
             EventKind::ValueActionFailed { .. } => "value_action_failed",
+            EventKind::SubmissionAccountingExpired { .. } => "submission_accounting_expired",
+            EventKind::OperationTransition { .. } => "operation_transition",
+            EventKind::OperationEvidence { .. } => "operation_evidence",
             EventKind::SubmissionReceiptCleared { .. } => "submission_receipt_cleared",
             EventKind::X402PaymentAuthorized { .. } => "x402_payment_authorized",
             EventKind::X402AuthorizationWithheld { .. } => "x402_authorization_withheld",
@@ -1640,12 +2569,18 @@ mod tests {
             EventKind::MppReceiptObserved { .. } => "mpp_receipt_observed",
             EventKind::MppSettlementReconciled { .. } => "mpp_settlement_reconciled",
             EventKind::KeyringKeyWritten { .. } => "keyring_key_written",
+            EventKind::SignerIdentityEnrolled { .. } => "signer_identity_enrolled",
             EventKind::PolicyWindowStateReset { .. } => "policy_window_state_reset",
             EventKind::MppStateAdopted { .. } => "mpp_state_adopted",
             EventKind::MppStateReset { .. } => "mpp_state_reset",
             EventKind::ProfileHalted { .. } => "profile_halted",
             EventKind::ProfileResumed { .. } => "profile_resumed",
             EventKind::AuditTipAnchored { .. } => "audit_tip_anchored",
+            EventKind::AuditOutboxLossAcknowledged { .. } => "audit_outbox_loss_acknowledged",
+            EventKind::AuditCarriersBound { .. } => "audit_carriers_bound",
+            EventKind::AuditEntryTagsStarted { .. } => "audit_entry_tags_started",
+            EventKind::AuditEntryTagsRekeyed { .. } => "audit_entry_tags_rekeyed",
+            EventKind::AuditEntriesQuarantined { .. } => "audit_entries_quarantined",
         }
     }
 
@@ -1713,6 +2648,31 @@ mod tests {
                 rule_id: 1,
                 pinned_verifier_wasm_hashes_first8: vec!["aabbccdd00112233".to_owned()],
                 pinned_policy_wasm_hashes_first8: vec![],
+                mutable_override: false,
+                unknown_override: false,
+                pinned_verifier_executable_refs: vec![],
+                pinned_policy_executable_refs: vec![],
+                reason: PinsUpdateReason::SignerAdded,
+            },
+            EventKind::SaContextRuleCreatedV2 {
+                smart_account: "CDABC...12345".to_owned(),
+                rule_id: 1,
+                context_type: "default".to_owned(),
+                signers_count: 1,
+                policies_count: 1,
+                valid_until: None,
+                pinned_verifier_wasm_hashes: vec![WasmHashPin::new([0xaa; 32])],
+                pinned_policy_wasm_hashes: vec![],
+                mutable_override: false,
+                unknown_override: false,
+                pinned_verifier_executable_refs: vec![],
+                pinned_policy_executable_refs: vec![],
+            },
+            EventKind::SaContextRulePinsUpdatedV2 {
+                smart_account: "CDABC...12345".to_owned(),
+                rule_id: 1,
+                pinned_verifier_wasm_hashes: vec![WasmHashPin::new([0xaa; 32])],
+                pinned_policy_wasm_hashes: vec![],
                 mutable_override: false,
                 unknown_override: false,
                 pinned_verifier_executable_refs: vec![],
@@ -1866,6 +2826,7 @@ mod tests {
             },
             EventKind::AuditRotationHandoff {
                 next_file_name: "audit.jsonl.20260428T010203004".to_owned(),
+                entry_tags: false,
             },
             EventKind::SaVerifierMigrated {
                 rule_id: 5,
@@ -2051,11 +3012,18 @@ mod tests {
                 envelope_sha256_hex: Some("a".repeat(64)),
                 nonce_prefix: "AAAAAAAA".to_owned(),
                 origin: "cli".to_owned(),
+                mainnet_presence: None,
             },
             EventKind::ApprovalRejected {
                 approval_kind: "PaymentSimulated".to_owned(),
                 nonce_prefix: "BBBBBBBB".to_owned(),
                 origin: "cli".to_owned(),
+            },
+            EventKind::ApprovalRevoked {
+                approval_kind: "payment".to_owned(),
+                nonce_prefix: "BBBBBBBB".to_owned(),
+                origin: "cli".to_owned(),
+                operator_credential_id_redacted: None,
             },
             EventKind::ApprovalAttestedRemote {
                 approval_kind: "PaymentSimulated".to_owned(),
@@ -2077,6 +3045,7 @@ mod tests {
                     amount: Some(1_000_000),
                     asset: Some("native".to_owned()),
                     destination_redacted: Some("GAAAA...ZZZZZ".to_owned()),
+                    destination_sha256: None,
                 }],
                 opaque_reason: None,
                 transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
@@ -2090,10 +3059,13 @@ mod tests {
                     amount: Some(1_000_000),
                     asset: Some("native".to_owned()),
                     destination_redacted: Some("GAAAA...ZZZZZ".to_owned()),
+                    destination_sha256: None,
                 }],
                 transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
                 source_redacted: "GAAAA...ZZZZZ".to_owned(),
                 sequence: 7,
+                policy_digest: None,
+                rule_index: None,
             },
             EventKind::ValueActionFailed {
                 approval_nonce: None,
@@ -2102,18 +3074,60 @@ mod tests {
                     amount: Some(1_000_000),
                     asset: Some("native".to_owned()),
                     destination_redacted: Some("GAAAA...ZZZZZ".to_owned()),
+                    destination_sha256: None,
                 }],
                 transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
                 code: "ledger.insufficient_balance".to_owned(),
+            },
+            EventKind::SubmissionAccountingExpired {
+                decision_id: "ab".repeat(32),
+                generation: 3,
+                transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
+                observed_at_ms: 1_700_000_000_000,
+                accounting_until_ms: 1_699_999_999_000,
+                code: "submission.accounting_expired".to_owned(),
+                chain_outcome: "unknown".to_owned(),
+            },
+            EventKind::OperationTransition {
+                operation_id: "0a".repeat(16),
+                attempt_index: Some(1),
+                from_state: Some("authorized".to_owned()),
+                step: "sending".to_owned(),
+                commit_id: "0b".repeat(16),
+                evidence_digest: None,
+                primary_ledger: None,
+                witness_ledger: None,
+                release_code: None,
+            },
+            EventKind::OperationEvidence {
+                operation_id: "0a".repeat(16),
+                attempt_index: 1,
+                evidence_seqs: Some(crate::audit_log::schema::EvidenceSeqRange {
+                    first: 1,
+                    last: 1,
+                }),
+                rows: vec![crate::audit_log::schema::OperationEvidenceRow {
+                    evidence_seq: 1,
+                    digest: "0c".repeat(32),
+                    observed_ledger: 100,
+                    kind: None,
+                }],
+                sequence_released: false,
+                primary_ledger: None,
+                witness_ledger: None,
+                min_close_time_ms: None,
+                commit_id: "0d".repeat(16),
             },
             EventKind::SubmissionReceiptCleared {
                 transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
                 cleared_from: "ambiguous".to_owned(),
                 reservation_released: true,
+                unbounded_exposure: false,
                 evidence: Some("submission.sequence_consumed".to_owned()),
             },
             EventKind::X402PaymentAuthorized {
                 witness: None,
+                signature_expiration_ledger: None,
                 legs: vec![ValueLegRecord {
                     action: ValueActionKind::X402Payment,
                     amount: Some(2_500_000),
@@ -2121,9 +3135,14 @@ mod tests {
                         "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA".to_owned(),
                     ),
                     destination_redacted: Some("GBPXX...WIVL".to_owned()),
+                    destination_sha256: None,
                 }],
                 network: "stellar:testnet".to_owned(),
                 scheme: "exact".to_owned(),
+                policy_digest: None,
+                policy_sequence: None,
+                rule_index: None,
+                evaluated_at_ms: None,
             },
             EventKind::X402AuthorizationWithheld {
                 network: "stellar:testnet".to_owned(),
@@ -2135,6 +3154,7 @@ mod tests {
                 signer_redacted: crate::observability::RedactedStrkey::from_already_redacted(
                     "GBPXX...WIVL",
                 ),
+                legs: Vec::new(),
             },
             EventKind::MppChargeAuthorized {
                 authorization_id_hash: "a".repeat(64),
@@ -2146,6 +3166,7 @@ mod tests {
                         "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA".to_owned(),
                     ),
                     destination_redacted: Some("GAAAA...AAAWHF".to_owned()),
+                    destination_sha256: None,
                 }],
                 network: "stellar:testnet".to_owned(),
                 payer_redacted: RedactedStrkey::from_already_redacted("GABCD...VWXYZ"),
@@ -2178,6 +3199,12 @@ mod tests {
                 keyring_entry: "default".to_owned(),
                 public_address: None,
             },
+            EventKind::SignerIdentityEnrolled {
+                keyring_service: "stellar-agent-signer-default".to_owned(),
+                keyring_entry: "enrolled-identity".to_owned(),
+                public_address: RedactedStrkey::from_already_redacted("GABCD...VWXYZ"),
+                role: "agent".to_owned(),
+            },
             EventKind::ChannelPoolInitialised {
                 funder_redacted: "GABCD...12345".to_owned(),
                 channel_count: 4,
@@ -2193,6 +3220,12 @@ mod tests {
                 index: 0,
                 outcome: "success".to_owned(),
             },
+            EventKind::MainnetEnablementMinted {
+                profile: "operator".to_owned(),
+                endpoint_host: "rpc.example.invalid".to_owned(),
+                installation_nonce_sha256: "00".repeat(32),
+                rotated: false,
+            },
             EventKind::MppStateAdopted {
                 profile: "default".to_owned(),
                 generation: 1,
@@ -2200,12 +3233,22 @@ mod tests {
             EventKind::MppStateReset {
                 profile: "default".to_owned(),
                 discarded_generation: Some(7),
+                carried_generation: Some(6),
+                stale_carry: true,
                 reason: "recovery".to_owned(),
             },
             EventKind::PolicyWindowStateReset {
+                owner_authorization: None,
                 wiped: None,
                 profile: "default".to_owned(),
                 reason: "corrupt-file recovery".to_owned(),
+            },
+            EventKind::AuditOutboxLossAcknowledged {
+                expected_rows: 2,
+                found_rows: 1,
+                reason: "inspection".to_owned(),
+                revoked_approvals: 1,
+                revoked_grants: 1,
             },
             EventKind::ProfileHalted {
                 profile: "default".to_owned(),
@@ -2221,6 +3264,16 @@ mod tests {
                 entry_count: 12,
                 previous_anchor: None,
                 reanchor_count: None,
+            },
+            EventKind::AuditEntryTagsStarted {
+                anchored_count: 3,
+                absorbed_count: 2,
+            },
+            EventKind::AuditEntryTagsRekeyed {
+                cause: crate::audit_log::schema::EntryTagsRekeyCause::Rotation,
+            },
+            EventKind::AuditEntriesQuarantined {
+                quarantined_count: 2,
             },
         ]
     }
@@ -2247,20 +3300,22 @@ mod tests {
         AuditEntry::new_tool_invocation(params)
     }
 
+    fn tool_entry() -> AuditEntry {
+        new_tool_invocation(
+            "stellar_pay_commit",
+            "stellar:testnet",
+            vec!["destination".to_owned()],
+            None,
+            None,
+            PolicyDecision::Allow,
+            None,
+            uuid::Uuid::new_v4().to_string(),
+        )
+    }
     fn write_entries(path: &Path, count: usize) {
         let mut writer = AuditWriter::open(path.to_path_buf(), None).unwrap();
         for _ in 0..count {
-            let entry = new_tool_invocation(
-                "stellar_pay_commit",
-                "stellar:testnet",
-                vec!["destination".to_owned()],
-                None,
-                None,
-                PolicyDecision::Allow,
-                None,
-                uuid::Uuid::new_v4().to_string(),
-            );
-            writer.write_entry(entry).unwrap();
+            writer.write_entry(tool_entry()).unwrap();
         }
     }
 
@@ -2280,6 +3335,153 @@ mod tests {
             entry.ts = (*ts).to_owned();
             writer.write_entry(entry).unwrap();
         }
+    }
+
+    /// Payment rows without, with, and again without a destination hash chain
+    /// through the writer and verify together. Only the middle row carries
+    /// the field, and no row holds the complete M address.
+    #[test]
+    fn a_chain_mixing_rows_with_and_without_a_destination_hash_verifies() {
+        use crate::policy::v1::value::{ActionKind, ValueLeg};
+        let muxed = stellar_strkey::ed25519::MuxedAccount {
+            ed25519: [1; 32],
+            id: u64::MAX,
+        }
+        .to_string()
+        .to_string();
+        let leg = ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(1_000_000),
+            asset: Some("native".to_owned()),
+            destination: Some(muxed.clone()),
+        };
+        let historical = ValueLegRecord::from(&leg);
+        assert!(historical.destination_sha256.is_none());
+        let hashed = ValueLegRecord::from_payment_leg(&leg).unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+        for record in [&historical, &hashed, &historical] {
+            writer
+                .write_entry(AuditEntry::new_value_action_submitted(
+                    "stellar_pay",
+                    "stellar:testnet",
+                    vec![record.clone()],
+                    "abcd1234...5678efgh",
+                    42,
+                    PolicyDecision::Allow,
+                    None,
+                    None,
+                    None,
+                    uuid::Uuid::new_v4().to_string(),
+                    None,
+                ))
+                .unwrap();
+        }
+        drop(writer);
+
+        assert_eq!(verify_log(&path, None).unwrap().entries_verified, 3);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains(&muxed), "{text}");
+        let presence: Vec<bool> = text
+            .lines()
+            .map(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                row["legs"][0]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("destination_sha256")
+            })
+            .collect();
+        assert_eq!(presence, [false, true, false]);
+    }
+
+    /// A payment row that records the signature expiration ledger and one
+    /// that does not both chain and verify; the field is written only when
+    /// present.
+    #[test]
+    fn x402_rows_with_and_without_the_expiration_ledger_verify() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+        for ledger in [Some(1_060), None] {
+            writer
+                .write_entry(AuditEntry::new_x402_payment_authorized(
+                    "stellar_x402_create_payment",
+                    "stellar:mainnet",
+                    vec![],
+                    "stellar:mainnet",
+                    "exact",
+                    PolicyDecision::Allow,
+                    uuid::Uuid::new_v4().to_string(),
+                    None,
+                    ledger,
+                ))
+                .unwrap();
+        }
+        drop(writer);
+
+        assert_eq!(verify_log(&path, None).unwrap().entries_verified, 2);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["kind"], "x402_payment_authorized");
+        assert_eq!(rows[0]["signature_expiration_ledger"], 1_060);
+        assert_eq!(rows[1]["kind"], "x402_payment_authorized");
+        assert!(
+            rows[1]
+                .as_object()
+                .unwrap()
+                .get("signature_expiration_ledger")
+                .is_none(),
+            "{}",
+            rows[1]
+        );
+    }
+
+    /// The signature expiration ledger is part of a row's hash input: a
+    /// payment row whose ledger changes after a following row was written
+    /// breaks the chain.
+    #[test]
+    fn a_changed_expiration_ledger_breaks_the_chain() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+        writer
+            .write_entry(AuditEntry::new_x402_payment_authorized(
+                "stellar_x402_create_payment",
+                "stellar:mainnet",
+                vec![],
+                "stellar:mainnet",
+                "exact",
+                PolicyDecision::Allow,
+                uuid::Uuid::new_v4().to_string(),
+                None,
+                Some(1_060),
+            ))
+            .unwrap();
+        writer.write_entry(tool_entry()).unwrap();
+        drop(writer);
+        verify_log(&path, None).unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        let mut rows: Vec<serde_json::Value> = original
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        rows[0]["signature_expiration_ledger"] = serde_json::json!(1_061);
+        let tampered = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, tampered + "\n").unwrap();
+        assert!(matches!(
+            verify_log(&path, None),
+            Err(VerifyError::ChainBroken { .. })
+        ));
     }
 
     #[test]
@@ -2401,6 +3603,48 @@ mod tests {
     }
 
     #[test]
+    fn revocation_row_verifies_in_a_shared_log() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("revocation.jsonl");
+        let other = dir.path().join("other.jsonl");
+        for (path, label) in [(&path, "first"), (&other, "other")] {
+            let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+            writer
+                .write_entry(AuditEntry::new_approval_rejected(
+                    "PaymentSimulated",
+                    "abcdefgh-secret",
+                    "cli",
+                    label,
+                ))
+                .unwrap();
+            writer
+                .write_entry(AuditEntry::new_approval_revoked(
+                    "PaymentSimulated",
+                    "abcdefgh-secret",
+                    crate::approval::Surface::Cli,
+                    None,
+                    "revoke",
+                ))
+                .unwrap();
+            writer
+                .write_entry(AuditEntry::new_approval_rejected(
+                    "PaymentSimulated",
+                    "ijklmnop-secret",
+                    "serve",
+                    "last",
+                ))
+                .unwrap();
+        }
+        assert_eq!(verify_log(&path, None).unwrap().entries_verified, 3);
+        let original = fs::read_to_string(&path).unwrap();
+        let foreign = fs::read_to_string(&other).unwrap();
+        let mut lines: Vec<_> = original.lines().collect();
+        lines[1] = foreign.lines().nth(1).unwrap();
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        assert!(verify_log(&path, None).is_err());
+    }
+
+    #[test]
     fn verify_event_kind_policy_covers_all_current_variants() {
         let labels: Vec<&'static str> = current_event_kind_fixtures()
             .iter()
@@ -2417,6 +3661,8 @@ mod tests {
                 "smart_account_deployed",
                 "sa_context_rule_created",
                 "sa_context_rule_pins_updated",
+                "sa_context_rule_created_v2",
+                "sa_context_rule_pins_updated_v2",
                 "sa_context_rule_deleted",
                 "passkey_registered",
                 "passkey_assertion",
@@ -2459,11 +3705,15 @@ mod tests {
                 "sa_context_rule_valid_until_updated",
                 "approval_attested",
                 "approval_rejected",
+                "approval_revoked",
                 "approval_attested_remote",
                 "approval_rejected_remote",
                 "value_action_submitted",
                 "value_action_pending",
                 "value_action_failed",
+                "submission_accounting_expired",
+                "operation_transition",
+                "operation_evidence",
                 "submission_receipt_cleared",
                 "x402_payment_authorized",
                 "x402_authorization_withheld",
@@ -2473,15 +3723,21 @@ mod tests {
                 "mpp_receipt_observed",
                 "mpp_settlement_reconciled",
                 "keyring_key_written",
+                "signer_identity_enrolled",
                 "channel_pool_initialised",
                 "channel_acquired",
                 "channel_released",
+                "mainnet_enablement_minted",
                 "mpp_state_adopted",
                 "mpp_state_reset",
                 "policy_window_state_reset",
+                "audit_outbox_loss_acknowledged",
                 "profile_halted",
                 "profile_resumed",
                 "audit_tip_anchored",
+                "audit_entry_tags_started",
+                "audit_entry_tags_rekeyed",
+                "audit_entries_quarantined",
             ]
         );
         assert_eq!(
@@ -2555,20 +3811,48 @@ mod tests {
         );
     }
 
+    /// Once tags are in force, entries ahead of the anchor pass only with
+    /// valid tags: two tagged rows pass with the tags verified, two forged
+    /// untagged rows fail with `missing`.
     #[test]
-    fn verify_with_an_anchor_passes_on_a_file_ahead_of_it() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.jsonl");
-        write_entries(&path, 2);
-        let anchor = anchor_for(&path);
-
-        // Unkeyed writers append without moving the anchor; a log that is ahead
-        // of its anchor is the ordinary state, not an integrity failure.
-        write_entries(&path, 2);
-
+    fn verify_with_an_anchor_passes_on_a_file_ahead_of_it_only_with_valid_tags() {
         let health = crate::audit_log::health::AuditWriterHealth::new();
-        let ok = verify_log_with_health(&path, None, Some(&anchor), &health.handle()).unwrap();
-        assert_eq!(ok.verify_ok.entries_verified, 4);
+        for forged in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("test.jsonl");
+            let mut writer = keyed_writer(&path);
+            writer.write_entry(tool_entry()).unwrap();
+            let anchor = anchor_for(&path);
+            if forged {
+                drop(writer);
+                forge_untagged(&path);
+                forge_untagged(&path);
+            } else {
+                writer.write_entry(tool_entry()).unwrap();
+                writer.write_entry(tool_entry()).unwrap();
+                drop(writer);
+            }
+            let result =
+                verify_log_with_health(&path, Some(&TAG_TEST_KEY), Some(&anchor), &health.handle());
+            if forged {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        VerifyError::EntryTagInvalid {
+                            reason: "missing",
+                            line: 3,
+                            ..
+                        }
+                    ),
+                    "{err:?}"
+                );
+            } else {
+                let ok = result.unwrap();
+                assert_eq!(ok.verify_ok.entries_verified, 4);
+                assert!(ok.verify_ok.entry_tags_verified);
+            }
+        }
     }
 
     #[test]
@@ -2626,6 +3910,147 @@ mod tests {
              refuse, got {err:?}"
         );
         assert_eq!(err.wire_code(), "audit.tip_anchor_mismatch");
+    }
+
+    /// Keeps the first `entries` lines of the log at `path`.
+    fn truncate_to_entries(path: &Path, entries: usize) {
+        let content = fs::read_to_string(path).unwrap();
+        let kept: String = content.split_inclusive('\n').take(entries).collect();
+        fs::write(path, kept).unwrap();
+    }
+
+    /// Walks the log and applies the missing-anchor check, as `audit verify`
+    /// does for a profile whose anchor is absent.
+    fn verify_without_anchor(path: &Path, binding: BindingHistory) -> Result<(), VerifyError> {
+        let ok = verify_log(path, None).expect("the truncated log still passes the chain walk");
+        check_missing_anchor(path, binding, ok.active_tip.as_ref())
+    }
+
+    fn assert_anchor_missing(err: &VerifyError, evidence: PriorAnchoring, count: u64) {
+        assert!(
+            matches!(
+                err,
+                VerifyError::TipAnchorMissing {
+                    evidence: found,
+                    actual_count,
+                    ..
+                } if *found == evidence && *actual_count == count
+            ),
+            "expected a missing anchor naming {evidence:?} at {count} entries, got {err:?}"
+        );
+        assert_eq!(err.wire_code(), "audit.tip_anchor_missing");
+        assert!(err.to_string().contains("anchor: missing"), "{err}");
+        assert!(
+            !err.to_string().contains("sha256:"),
+            "the refusal must not carry a digest: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_reports_anchor_missing_under_a_recorded_binding() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        write_entries(&path, 3);
+        truncate_to_entries(&path, 2);
+
+        let err = verify_without_anchor(&path, BindingHistory::Recorded).unwrap_err();
+        assert_anchor_missing(&err, PriorAnchoring::BindingRecorded, 2);
+    }
+
+    #[test]
+    fn verify_reports_anchor_missing_when_a_chain_root_sidecar_exists() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        {
+            let mut writer = AuditWriter::open_keyed_unanchored_for_test(
+                path.clone(),
+                Zeroizing::new([0x3d_u8; 32]),
+            )
+            .unwrap();
+            for _ in 0..3 {
+                writer.write_entry(tool_entry()).unwrap();
+            }
+        }
+        truncate_to_entries(&path, 1);
+
+        let err = verify_without_anchor(&path, BindingHistory::NotRecorded).unwrap_err();
+        assert_anchor_missing(&err, PriorAnchoring::ChainRootSidecar, 1);
+    }
+
+    #[test]
+    fn verify_reports_anchor_missing_when_the_log_holds_an_adoption_row() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        write_entries(&path, 1);
+        let store =
+            std::sync::Arc::new(crate::audit_log::tip_anchor::InMemoryTipAnchorStore::new());
+        crate::audit_log::test_helpers::enroll_carriers(&path, store.as_ref()).unwrap();
+        {
+            let mut writer = AuditWriter::open_with_tip_anchor(
+                path.clone(),
+                None,
+                std::sync::Arc::clone(&store)
+                    as std::sync::Arc<dyn crate::audit_log::tip_anchor::TipAnchorStore>,
+                BindingHistory::NotRecorded,
+            )
+            .unwrap();
+            writer.write_entry(tool_entry()).unwrap();
+        }
+        // The kept prefix is the first entry and the adoption row after it.
+        truncate_to_entries(&path, 2);
+
+        let err = verify_without_anchor(&path, BindingHistory::NotRecorded).unwrap_err();
+        assert_anchor_missing(&err, PriorAnchoring::AnchoringRow, 2);
+    }
+
+    fn assert_anchoring_row_alone_reports_missing(
+        reason: crate::audit_log::schema::TipAnchorReason,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        {
+            let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+            writer
+                .write_entry(AuditEntry::new_audit_tip_anchored(
+                    reason,
+                    0,
+                    None,
+                    Some(1),
+                    uuid::Uuid::new_v4().to_string(),
+                ))
+                .unwrap();
+            writer.write_entry(tool_entry()).unwrap();
+        }
+        truncate_to_entries(&path, 1);
+        assert!(!crate::audit_log::writer::hmac_sidecar_path(&path).exists());
+        let err = verify_without_anchor(&path, BindingHistory::NotRecorded).unwrap_err();
+        assert_anchor_missing(&err, PriorAnchoring::AnchoringRow, 1);
+    }
+
+    #[test]
+    fn verify_reports_missing_anchor_from_a_rollback_acknowledged_row_alone() {
+        assert_anchoring_row_alone_reports_missing(
+            crate::audit_log::schema::TipAnchorReason::RollbackAcknowledged,
+        );
+    }
+
+    #[test]
+    fn verify_reports_missing_anchor_from_a_binding_changed_row_alone() {
+        assert_anchoring_row_alone_reports_missing(
+            crate::audit_log::schema::TipAnchorReason::BindingChanged,
+        );
+    }
+
+    /// Regression guard: a log written only by unkeyed writers, with no
+    /// recorded binding, verifies without an anchor.
+    #[test]
+    fn verify_passes_an_unanchored_quickstart_log() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        write_entries(&path, 3);
+
+        verify_without_anchor(&path, BindingHistory::NotRecorded)
+            .expect("a log that was never anchored verifies without an anchor");
     }
 
     /// Runs the walk with an anchor through the same entry point
@@ -2822,7 +4247,7 @@ mod tests {
         let result = verify_log(dir.path(), None);
 
         assert!(
-            matches!(result, Err(VerifyError::NonRegularFileLogPath { .. })),
+            matches!(result, Err(VerifyError::NonRegularFileLogPath)),
             "expected NonRegularFileLogPath for directory, got {result:?}"
         );
     }
@@ -2841,7 +4266,7 @@ mod tests {
         let result = verify_log(&link, None);
 
         assert!(
-            matches!(result, Err(VerifyError::NonRegularFileLogPath { .. })),
+            matches!(result, Err(VerifyError::NonRegularFileLogPath)),
             "expected NonRegularFileLogPath for symlink, got {result:?}"
         );
     }
@@ -2956,6 +4381,7 @@ mod tests {
                     "abcd1234...5678efgh",
                     "ambiguous",
                     true,
+                    false,
                     evidence,
                     None,
                     "evidence-request",
@@ -3057,10 +4483,7 @@ mod tests {
             "audit.too_many_rotated_files"
         );
         assert_eq!(
-            VerifyError::NonRegularFileLogPath {
-                path: PathBuf::from("/tmp/f.jsonl")
-            }
-            .wire_code(),
+            VerifyError::NonRegularFileLogPath.wire_code(),
             "audit.non_regular_file_log_path"
         );
         assert_eq!(
@@ -3519,7 +4942,8 @@ mod tests {
             ))
             .unwrap();
 
-        let mut handoff = AuditEntry::new_rotation_handoff("audit.jsonl.20260428T010203004", "req");
+        let mut handoff =
+            AuditEntry::new_rotation_handoff("audit.jsonl.20260428T010203004", "req", false);
         handoff.previous_entry_hash = writer.last_entry_hash().to_owned();
         let json = serde_json::to_string(&handoff).unwrap();
         drop(writer);
@@ -3894,6 +5318,8 @@ mod tests {
                 warnings: vec![],
                 hmac_verified: false,
                 active_tip: None,
+                entry_tags_verified: false,
+                entry_tags_boundary: None,
             },
             audit_writer_degraded: false,
         };
@@ -4347,16 +5773,11 @@ mod tests {
     }
 
     #[test]
-    fn verify_error_non_regular_file_log_path_display_basename_only() {
-        // Display must emit only the basename, not the full path.
-        let err = VerifyError::NonRegularFileLogPath {
-            path: PathBuf::from("/home/user/very/secret/path/audit.jsonl"),
-        };
-        let s = err.to_string();
-        assert!(s.contains("audit.jsonl"), "must contain basename: {s}");
-        assert!(
-            !s.contains("/home/user/very"),
-            "must NOT contain full path: {s}"
+    fn verify_error_non_regular_file_log_path_states_the_rule() {
+        assert_eq!(
+            VerifyError::NonRegularFileLogPath.to_string(),
+            "audit.non_regular_file_log_path: log_path must name a regular audit log file; \
+             choose a regular file and retry audit verify."
         );
     }
 
@@ -4465,13 +5886,71 @@ mod tests {
 
         let result = verify_log(&path, None);
         assert!(
-            matches!(result, Err(VerifyError::LogNotFound { .. })),
+            matches!(result, Err(VerifyError::LogNotFound)),
             "missing primary log file must return LogNotFound, got {result:?}"
         );
         assert_eq!(
             result.unwrap_err().wire_code(),
             "audit.log_not_found",
             "missing primary log must carry the audit.log_not_found wire code"
+        );
+    }
+
+    /// A log path that fails a check stays out of the refusal in every
+    /// rendering; each message states the rule and the remedy.
+    #[test]
+    fn refused_log_paths_stay_out_of_the_error() {
+        const MISSING: &str = "audit.log_not_found: log_path must name an existing audit log \
+                               file; choose an existing file and retry audit verify.";
+        const NON_REGULAR: &str = "audit.non_regular_file_log_path: log_path must name a regular \
+                                   audit log file; choose a regular file and retry audit verify.";
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("credmarker7-missing.jsonl");
+        let error = verify_log(&missing, None).unwrap_err();
+        assert_eq!(error.to_string(), MISSING);
+        assert_no_marker(&error, "credmarker7");
+
+        let directory = dir.path().join("credmarker7-directory.jsonl");
+        fs::create_dir(&directory).unwrap();
+        let error = verify_log(&directory, None).unwrap_err();
+        assert_eq!(error.to_string(), NON_REGULAR);
+        assert_no_marker(&error, "credmarker7");
+
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("target.jsonl");
+            fs::write(&target, b"").unwrap();
+            let link = dir.path().join("credmarker7-link.jsonl");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let error = verify_log(&link, None).unwrap_err();
+            assert_eq!(error.to_string(), NON_REGULAR);
+            assert_no_marker(&error, "credmarker7");
+        }
+    }
+
+    /// A stored line that fails its schema reports the category and position,
+    /// never the refused value.
+    #[test]
+    fn unparsable_entry_reports_category_and_position_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                crate::audit_log::test_helpers::line_refused_by_the_schema("credmarker7")
+            ),
+        )
+        .unwrap();
+        let error = verify_log(&path, None).unwrap_err();
+        assert_no_marker(&error, "credmarker7");
+        let text = error.to_string();
+        assert!(
+            text.starts_with(
+                "audit.parse_error: line 1: the entry has a missing field or a field of the \
+                 wrong type or value (line 1, column "
+            ),
+            "{text}"
         );
     }
 
@@ -4690,5 +6169,380 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["kind"], "backward_timestamp_jump");
         assert_eq!(v["drift_ms"], 180_000_u64);
+    }
+
+    // ── Regular-file open ─────────────────────────────────────────────────────
+
+    fn assert_refused_as_non_regular(result: &Result<File, VerifyError>) {
+        assert!(
+            matches!(result, Err(VerifyError::NonRegularFileLogPath)),
+            "expected a non-regular-file refusal, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn open_regular_file_opens_a_regular_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("regular");
+        fs::write(&path, b"bytes").unwrap();
+        let mut contents = String::new();
+        open_regular_file(&path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert_eq!(contents, "bytes");
+    }
+
+    #[test]
+    fn open_regular_file_refuses_a_directory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("directory");
+        fs::create_dir(&path).unwrap();
+        assert_refused_as_non_regular(&open_regular_file(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_file_refuses_a_symlink_to_a_regular_file() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"bytes").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_refused_as_non_regular(&open_regular_file(&link));
+    }
+
+    /// The refusal comes from the open, which never waits for a writer; a
+    /// blocking open would hang until the timeout releases it.
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_file_refuses_a_fifo_without_waiting() {
+        use crate::audit_log::test_fifo::{make_fifo, release_fifo};
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("fifo");
+        make_fifo(&fifo);
+        let (done, opened) = channel();
+        let opener = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                let _ = done.send(open_regular_file(&fifo));
+            })
+        };
+        match opened.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(result) => assert_refused_as_non_regular(&result),
+            Err(RecvTimeoutError::Disconnected) => match opener.join() {
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(()) => panic!("the open thread ended without reporting"),
+            },
+            Err(RecvTimeoutError::Timeout) => {
+                release_fifo(&fifo);
+                panic!("opening a FIFO waited for a writer");
+            }
+        }
+        opener.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn open_regular_file_refuses_a_file_symlink() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"bytes").unwrap();
+        let link = dir.path().join("link");
+        std::os::windows::fs::symlink_file(&target, &link).unwrap();
+        assert_refused_as_non_regular(&open_regular_file(&link));
+    }
+
+    /// Serves `len` bytes and counts how many a reader asked for.
+    struct CountingReader {
+        len: u64,
+        served: u64,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let left = self.len - self.served;
+            let n = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
+            buf[..n].fill(b' ');
+            self.served += n as u64;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_bounded_read_stops_one_byte_past_the_cap() {
+        let mut reader = CountingReader {
+            len: 10 * SIDECAR_READ_CAP,
+            served: 0,
+        };
+        assert!(
+            read_bounded(&mut reader, SIDECAR_READ_CAP)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(reader.served, SIDECAR_READ_CAP + 1);
+
+        let mut reader = CountingReader {
+            len: SIDECAR_READ_CAP,
+            served: 0,
+        };
+        let bytes = read_bounded(&mut reader, SIDECAR_READ_CAP)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes.len() as u64, SIDECAR_READ_CAP);
+    }
+    #[test]
+    fn verify_warns_for_an_acknowledged_loss() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+        writer
+            .write_entry(AuditEntry::new_audit_outbox_loss_acknowledged(
+                2,
+                1,
+                "inspection",
+                1,
+                1,
+            ))
+            .unwrap();
+        drop(writer);
+        let result = verify_log(&path, None).unwrap();
+        assert_eq!(
+            result.warnings,
+            vec![VerifyWarning::OutboxLossAcknowledged {
+                file: "audit.jsonl".to_owned(),
+                line: 1,
+                expected_rows: 2,
+                found_rows: 1,
+            }]
+        );
+    }
+
+    // ── entry tags ──────────────────────────────────────────────────────
+
+    /// The audit key the entry-tag tests write under.
+    const TAG_TEST_KEY: [u8; 32] = [0x2c; 32];
+
+    /// A key the log was not written under.
+    const OTHER_TAG_KEY: [u8; 32] = [0x3d; 32];
+
+    /// A keyed writer with an anchor store; its open appends the boundary row.
+    fn keyed_writer_with(path: &Path, key: [u8; 32]) -> AuditWriter {
+        let store: std::sync::Arc<dyn crate::audit_log::tip_anchor::TipAnchorStore> =
+            std::sync::Arc::new(crate::audit_log::tip_anchor::InMemoryTipAnchorStore::new());
+        AuditWriter::open(
+            path.to_path_buf(),
+            Some(crate::audit_log::tip_anchor::KeyedAuditAccess::new(
+                Zeroizing::new(key),
+                store,
+            )),
+        )
+        .unwrap()
+    }
+
+    fn keyed_writer(path: &Path) -> AuditWriter {
+        keyed_writer_with(path, TAG_TEST_KEY)
+    }
+
+    /// Appends an untagged row chained from the tip of `path`.
+    fn forge_untagged(path: &Path) -> String {
+        crate::audit_log::test_helpers::append_forged_entry(path, tool_entry(), |_| None)
+    }
+
+    #[test]
+    fn a_forged_untagged_suffix_fails_keyed_verify() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = keyed_writer(&path);
+        writer.write_entry(tool_entry()).unwrap();
+        writer.write_entry(tool_entry()).unwrap();
+        drop(writer);
+        verify_log(&path, Some(&TAG_TEST_KEY)).unwrap();
+        forge_untagged(&path);
+
+        let err = verify_log(&path, Some(&TAG_TEST_KEY)).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                VerifyError::EntryTagInvalid { file, line: 4, reason: "missing" }
+                    if file == "audit.jsonl"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.wire_code(), "audit.entry_tag_invalid");
+        assert_eq!(
+            err.to_string(),
+            "audit.entry_tag_invalid: entry tag missing at line 4 in audit.jsonl"
+        );
+        assert!(!err.to_string().contains("sha256:"));
+
+        let keyless = verify_log(&path, None).unwrap();
+        assert!(!keyless.entry_tags_verified);
+        assert_eq!(keyless.entries_verified, 4);
+    }
+
+    #[test]
+    fn a_forged_suffix_after_tagged_rows_fails_verify() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = keyed_writer(&path);
+        writer.write_entry(tool_entry()).unwrap();
+        writer.force_rotate_for_test().unwrap();
+        writer.write_entry(tool_entry()).unwrap();
+        writer.write_entry(tool_entry()).unwrap();
+        drop(writer);
+        assert!(
+            verify_log(&path, Some(&TAG_TEST_KEY))
+                .unwrap()
+                .entry_tags_verified
+        );
+        forge_untagged(&path);
+        let err = verify_log(&path, Some(&TAG_TEST_KEY)).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                VerifyError::EntryTagInvalid { file, line: 3, reason: "missing" }
+                    if file == "audit.jsonl"
+            ),
+            "{err:?}"
+        );
+
+        let random = dir.path().join("random").join("audit.jsonl");
+        let mut writer = keyed_writer(&random);
+        writer.write_entry(tool_entry()).unwrap();
+        drop(writer);
+        crate::audit_log::test_helpers::append_forged_entry(&random, tool_entry(), |_| {
+            Some(format!("sha256:{}", "ab".repeat(32)))
+        });
+        let err = verify_log(&random, Some(&TAG_TEST_KEY)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VerifyError::EntryTagInvalid {
+                    line: 3,
+                    reason: "mismatch",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_old_key_tag_after_the_rekey_row_refuses() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = keyed_writer(&path);
+        writer.write_entry(tool_entry()).unwrap();
+        writer
+            .switch_entry_tag_key(Zeroizing::new(OTHER_TAG_KEY), "rotation")
+            .unwrap();
+        drop(writer);
+        crate::audit_log::resign_chain_root_sidecars(&path, &OTHER_TAG_KEY).unwrap();
+        assert!(
+            verify_log(&path, Some(&OTHER_TAG_KEY))
+                .unwrap()
+                .entry_tags_verified
+        );
+        crate::audit_log::test_helpers::append_forged_entry(&path, tool_entry(), |hash| {
+            Some(crate::audit_log::test_helpers::entry_tag_under(
+                &TAG_TEST_KEY,
+                hash,
+            ))
+        });
+        let err = verify_log(&path, Some(&OTHER_TAG_KEY)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VerifyError::EntryTagInvalid {
+                    line: 4,
+                    reason: "mismatch",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A quarantine row covers exactly its count of entries directly before
+    /// it: covering one of two forged rows fails at the first, covering both
+    /// passes.
+    #[test]
+    fn a_quarantine_row_covers_only_its_count() {
+        for count in [1_u64, 2] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("audit.jsonl");
+            let mut writer = keyed_writer(&path);
+            writer.write_entry(tool_entry()).unwrap();
+            drop(writer);
+            forge_untagged(&path);
+            forge_untagged(&path);
+            crate::audit_log::test_helpers::append_forged_entry(
+                &path,
+                AuditEntry::new_audit_entries_quarantined(count, "quarantine"),
+                |hash| {
+                    Some(crate::audit_log::test_helpers::entry_tag_under(
+                        &TAG_TEST_KEY,
+                        hash,
+                    ))
+                },
+            );
+            let result = verify_log(&path, Some(&TAG_TEST_KEY));
+            if count == 1 {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        VerifyError::EntryTagInvalid {
+                            line: 3,
+                            reason: "missing",
+                            ..
+                        }
+                    ),
+                    "{err:?}"
+                );
+            } else {
+                let ok = result.unwrap();
+                assert!(ok.entry_tags_verified);
+                assert!(ok.warnings.contains(&VerifyWarning::EntriesQuarantined {
+                    file: "audit.jsonl".to_owned(),
+                    line: 5,
+                    quarantined_count: 2,
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn verify_reports_the_boundary_position() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = keyed_writer(&path);
+        writer.write_entry(tool_entry()).unwrap();
+        let ok = verify_log(&path, Some(&TAG_TEST_KEY)).unwrap();
+        assert_eq!(
+            ok.entry_tags_boundary,
+            Some(EntryTagsBoundary {
+                file: "audit.jsonl".to_owned(),
+                line: 1,
+                kind: "audit_entry_tags_started".to_owned(),
+            })
+        );
+        writer
+            .switch_entry_tag_key(Zeroizing::new(OTHER_TAG_KEY), "rotation")
+            .unwrap();
+        drop(writer);
+        crate::audit_log::resign_chain_root_sidecars(&path, &OTHER_TAG_KEY).unwrap();
+        let ok = verify_log(&path, Some(&OTHER_TAG_KEY)).unwrap();
+        assert_eq!(
+            ok.entry_tags_boundary,
+            Some(EntryTagsBoundary {
+                file: "audit.jsonl".to_owned(),
+                line: 3,
+                kind: "audit_entry_tags_rekeyed".to_owned(),
+            })
+        );
+        assert!(ok.entry_tags_verified);
     }
 }

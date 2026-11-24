@@ -32,6 +32,8 @@
 //! `FEDERATION_SERVER` and `WEB_AUTH_ENDPOINT` are the substrate for the
 //! SEP-10 server-key binding step.
 
+use stellar_agent_core::profile::toml_diagnostic::toml_error_position;
+
 use toml_edit::{DocumentMut, Item, Table, Value};
 use url::Url;
 
@@ -183,10 +185,7 @@ pub struct MinimalSep1 {
 ///     - [`InvalidValue`](CounterpartyKindParseError::InvalidValue) when a
 ///       kind-related field is present but malformed (non-string scalar where
 ///       a string is required, or an empty / whitespace-only required string).
-///       The `value` field on this variant is sanitised — control characters
-///       are replaced and the rendered length is capped — so the typed error
-///       is safe to render through `tracing` text-formatters and other
-///       operator-facing sinks.
+///       The variant names the field and never its value.
 /// - [`CounterpartyError::TomlInvalid`] if `SIGNING_KEY` or
 ///   `URI_REQUEST_SIGNING_KEY` is present but not a valid Stellar ed25519
 ///   G-strkey (rejects M-strkey muxed, C-strkey contract, S-strkey secret, and
@@ -233,7 +232,10 @@ pub fn parse_minimal_sep1(body: &str) -> Result<MinimalSep1, CounterpartyError> 
     let doc: DocumentMut =
         body.parse()
             .map_err(|e: toml_edit::TomlError| CounterpartyError::TomlInvalid {
-                detail: toml_error_position(body, e.span().map(|span| span.start)),
+                detail: format!(
+                    "not valid TOML: {}",
+                    toml_error_position(body, e.span().map(|span| span.start))
+                ),
             })?;
 
     log_unknown_top_level_fields(&doc);
@@ -390,10 +392,7 @@ fn validate_https_url(raw: &str, field: &str) -> Result<(), CounterpartyError> {
     })?;
     if parsed.scheme() != "https" {
         return Err(CounterpartyError::TomlInvalid {
-            detail: format!(
-                "{field}: must be an https:// URL (got '{}')",
-                parsed.scheme()
-            ),
+            detail: format!("{field}: must be an https:// URL"),
         });
     }
     let Some(host) = parsed.host_str() else {
@@ -425,29 +424,6 @@ fn validate_stellar_public_key(raw: &str, field: &str) -> Result<(), Counterpart
         .map_err(|_| CounterpartyError::TomlInvalid {
             detail: format!("{field}: must be a valid Stellar ed25519 public key (G-strkey)"),
         })
-}
-
-/// The detail of a TOML syntax error that starts at byte `start` of `body`.
-///
-/// The detail names the position and never the text: `TOML parse error at
-/// line {l}, column {c}`. The line is the number of newlines before `start`
-/// plus one, and the column is the number of characters after the last of
-/// them plus one. An error without a start, or with a start that is not a
-/// character boundary of `body`, gives `TOML parse error`. The `Display` of
-/// the parser's error prints the offending line, which is the server's text,
-/// so it is not used.
-fn toml_error_position(body: &str, start: Option<usize>) -> String {
-    let Some(prefix) = start.and_then(|start| body.get(..start)) else {
-        return "TOML parse error".to_owned();
-    };
-    let line = prefix.matches('\n').count() + 1;
-    let column = prefix
-        .rsplit_once('\n')
-        .map_or(prefix, |(_, tail)| tail)
-        .chars()
-        .count()
-        + 1;
-    format!("TOML parse error at line {line}, column {column}")
 }
 
 fn log_unknown_top_level_fields(doc: &DocumentMut) {
@@ -503,10 +479,7 @@ fn validate_counterparty_kind_fields(
     };
 
     if !ACCEPTED_COUNTERPARTY_KINDS.contains(&kind) {
-        return Err(CounterpartyKindParseError::UnknownKind {
-            kind: kind.to_owned(),
-        }
-        .into());
+        return Err(CounterpartyKindParseError::UnknownKind.into());
     }
 
     if kind == KNOWN_ISSUER_KIND {
@@ -533,38 +506,11 @@ fn require_kind_field(
     if value.trim().is_empty() {
         return Err(CounterpartyKindParseError::InvalidValue {
             field: field.to_owned(),
-            value: sanitize_invalid_value(value),
         }
         .into());
     }
 
     Ok(())
-}
-
-/// Sanitize an attacker-controlled TOML scalar before embedding it in a typed
-/// `CounterpartyKindParseError::InvalidValue.value` field.
-///
-/// Replaces ASCII / Unicode control characters with `?` and caps the rendered
-/// length to 64 chars (with a trailing `...` truncation marker if capped).
-/// The typed error flows through `tracing::warn!(error = %e, ...)` in the CLI
-/// counterparty refresh path, where a text-formatter subscriber would otherwise
-/// render attacker-controlled ANSI escapes / newlines / null bytes to the
-/// operator's terminal verbatim (terminal-injection / log-spoofing).
-fn sanitize_invalid_value(value: &str) -> String {
-    const MAX_LEN: usize = 64;
-    let mut out = String::with_capacity(value.len().min(MAX_LEN));
-    for (i, ch) in value.chars().enumerate() {
-        if i >= MAX_LEN {
-            out.push_str("...");
-            break;
-        }
-        if ch.is_control() {
-            out.push('?');
-        } else {
-            out.push(ch);
-        }
-    }
-    out
 }
 
 fn optional_item_str<'a>(
@@ -575,7 +521,6 @@ fn optional_item_str<'a>(
         item.as_str().map(Some).ok_or_else(|| {
             CounterpartyKindParseError::InvalidValue {
                 field: field.to_owned(),
-                value: sanitize_invalid_value(&item.to_string()),
             }
             .into()
         })
@@ -590,7 +535,6 @@ fn optional_value_str<'a>(
         value.as_str().map(Some).ok_or_else(|| {
             CounterpartyKindParseError::InvalidValue {
                 field: field.to_owned(),
-                value: sanitize_invalid_value(&value.to_string()),
             }
             .into()
         })
@@ -611,6 +555,7 @@ mod tests {
     )]
 
     use super::*;
+    use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
 
     const SAMPLE_TOML: &str = r#"
 FEDERATION_SERVER = "https://fed.example.com/federation"
@@ -1032,15 +977,19 @@ FUTURE_SEP1_FIELD = "forward-compatible"
     /// A syntax error in the middle of an ASCII line reports the line and the
     /// column toml_edit itself computes, and no part of the offending line.
     #[test]
-    fn toml_error_position_matches_the_display_line() {
+    fn counterparty_syntax_error_uses_the_core_position() {
         let body = "NETWORK_PASSPHRASE = \"x\"\nACCOUNTS = [\"a\"]\n\
                     SECRET_MARKER = TOMLSECRET here\n";
         let err = parse_minimal_sep1(body).unwrap_err();
         let CounterpartyError::TomlInvalid { detail } = &err else {
             panic!("expected TomlInvalid, got {err:?}");
         };
-        assert_eq!(detail, &toml_edit_first_line(body), "{err}");
-        assert_eq!(detail, "TOML parse error at line 3, column 17");
+        assert_eq!(
+            detail.replacen("not valid TOML: ", "TOML parse error at ", 1),
+            toml_edit_first_line(body),
+            "{err}"
+        );
+        assert_eq!(detail, "not valid TOML: line 3, column 17");
         let rendered = format!("{err} {err:?}");
         assert!(!rendered.contains("TOMLSECRET"), "{rendered}");
         assert!(!rendered.contains("SECRET_MARKER"), "{rendered}");
@@ -1049,7 +998,7 @@ FUTURE_SEP1_FIELD = "forward-compatible"
         // before the error start.
         assert_eq!(
             toml_error_position("a\n\u{e9}\u{e9}bc", Some(7)),
-            "TOML parse error at line 2, column 4"
+            "line 2, column 4"
         );
         // An error at the end of the body starts at its length and is placed
         // after its last character.
@@ -1065,7 +1014,7 @@ FUTURE_SEP1_FIELD = "forward-compatible"
             matches!(
                 err,
                 CounterpartyError::TomlInvalid { ref detail }
-                    if detail == "TOML parse error at line 2, column 5"
+                    if detail == "not valid TOML: line 2, column 5"
             ),
             "{err:?}"
         );
@@ -1084,21 +1033,22 @@ FUTURE_SEP1_FIELD = "forward-compatible"
         assert!(
             matches!(
                 err,
-                CounterpartyError::TomlInvalid { ref detail } if detail == "TOML parse error"
+                CounterpartyError::TomlInvalid { ref detail }
+                    if detail == "not valid TOML: position unknown"
             ),
             "{err:?}"
         );
 
-        assert_eq!(toml_error_position("abc", None), "TOML parse error");
-        assert_eq!(toml_error_position("a\u{e9}b", Some(2)), "TOML parse error");
-        assert_eq!(toml_error_position("abc", Some(4)), "TOML parse error");
+        assert_eq!(toml_error_position("abc", None), "position unknown");
+        assert_eq!(toml_error_position("a\u{e9}b", Some(2)), "position unknown");
+        assert_eq!(toml_error_position("abc", Some(4)), "position unknown");
     }
 
     #[test]
     fn counterparty_kind_parse_error_for_unknown_currency_kind() {
         let body = r#"
 [[CURRENCIES]]
-kind = "NOT_A_KIND"
+kind = "CREDMARKER7"
 code = "USDC"
 issuer = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
 "#;
@@ -1106,12 +1056,12 @@ issuer = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
         assert!(
             matches!(
                 err,
-                CounterpartyError::KindParseError(CounterpartyKindParseError::UnknownKind {
-                    ref kind
-                }) if kind == "NOT_A_KIND"
+                CounterpartyError::KindParseError(CounterpartyKindParseError::UnknownKind)
             ),
             "unknown CURRENCIES.kind must return UnknownKind, got: {err:?}"
         );
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        assert_eq!(err.to_string(), "unknown counterparty kind");
     }
 
     #[test]
@@ -1138,7 +1088,7 @@ code = "USDC"
     fn counterparty_kind_parse_error_for_non_string_kind_field() {
         let body = r#"
 [[CURRENCIES]]
-kind = 42
+kind = ["CREDMARKER7"]
 code = "USDC"
 issuer = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
 "#;
@@ -1148,11 +1098,12 @@ issuer = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
                 err,
                 CounterpartyError::KindParseError(CounterpartyKindParseError::InvalidValue {
                     ref field,
-                    ..
                 }) if field == "kind"
             ),
             "non-string CURRENCIES.kind must return InvalidValue, got: {err:?}"
         );
+        assert_eq!(err.to_string(), "invalid value for kind");
+        assert_no_marker(&err, CREDENTIAL_MARKER);
     }
 
     #[test]
@@ -1174,33 +1125,32 @@ CURRENCIES = [
 
     #[test]
     fn inline_table_currencies_unknown_kind_returns_typed_error() {
-        let body = r#"CURRENCIES = [{ code = "USDC", kind = "UNRECOGNISED" }]"#;
+        let body = r#"CURRENCIES = [{ code = "USDC", kind = "CREDMARKER7" }]"#;
         let err = parse_minimal_sep1(body).unwrap_err();
         assert!(
             matches!(
                 err,
-                CounterpartyError::KindParseError(CounterpartyKindParseError::UnknownKind {
-                    ref kind
-                }) if kind == "UNRECOGNISED"
+                CounterpartyError::KindParseError(CounterpartyKindParseError::UnknownKind)
             ),
             "inline-table unknown kind must return UnknownKind, got: {err:?}"
         );
+        assert_no_marker(&err, CREDENTIAL_MARKER);
     }
 
     #[test]
     fn inline_table_currencies_non_string_kind_returns_typed_error() {
-        let body = r#"CURRENCIES = [{ code = "USDC", kind = 42 }]"#;
+        let body = r#"CURRENCIES = [{ code = "USDC", kind = { CREDMARKER7 = 1 } }]"#;
         let err = parse_minimal_sep1(body).unwrap_err();
         assert!(
             matches!(
                 err,
                 CounterpartyError::KindParseError(CounterpartyKindParseError::InvalidValue {
                     ref field,
-                    ..
                 }) if field == "kind"
             ),
             "inline-table non-string kind must return InvalidValue, got: {err:?}"
         );
+        assert_no_marker(&err, CREDENTIAL_MARKER);
     }
 
     /// Symmetric counterpart to `missing_known_issuer_field_in_array_of_tables`
@@ -1302,6 +1252,23 @@ CURRENCIES = [
             matches!(err, CounterpartyError::TomlInvalid { .. }),
             "http:// FEDERATION_SERVER must return TomlInvalid, got: {err:?}"
         );
+    }
+
+    /// A refused scheme is named by the rule it breaks; the scheme the server
+    /// wrote is not repeated.
+    #[test]
+    fn a_refused_scheme_is_not_echoed() {
+        let body = r#"FEDERATION_SERVER = "credmarker7://fed.example.com/federation""#;
+        let err = parse_minimal_sep1(body).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CounterpartyError::TomlInvalid { ref detail }
+                    if detail == "FEDERATION_SERVER: must be an https:// URL"
+            ),
+            "{err:?}"
+        );
+        assert_no_marker(&err, "credmarker7");
     }
 
     /// FEDERATION_SERVER with https:// scheme must be accepted.
@@ -1521,64 +1488,26 @@ URI_REQUEST_SIGNING_KEY = "GBBHQ7H4V6RRORKYLHTCAWP6MOHNORRFJSDPXDFYDGJB2LPZUFPXU
         parse_minimal_sep1(body).unwrap();
     }
 
-    /// ANSI escape + control characters in an invalid kind-field value are
-    /// replaced with `?` before reaching the typed `InvalidValue.value` field,
-    /// defending the CLI tracing render path.
+    /// A whitespace-only required field is refused by its name; the value,
+    /// which holds control characters, is not part of the error.
     #[test]
-    fn sanitize_invalid_value_replaces_control_characters() {
-        let raw = "USDC\u{1b}[2J\u{1b}[H<spoofed>\nfaked-log";
-        let sanitised = sanitize_invalid_value(raw);
-        assert!(
-            !sanitised.contains('\u{1b}'),
-            "ANSI ESC must be stripped, got: {sanitised:?}"
-        );
-        assert!(
-            !sanitised.contains('\n'),
-            "newline must be stripped, got: {sanitised:?}"
-        );
-        assert!(
-            sanitised.contains("USDC"),
-            "non-control prefix must survive, got: {sanitised:?}"
-        );
-    }
-
-    /// Oversized values are capped at 64 chars with a trailing `...` truncation
-    /// marker, defending against display-spam / log-overflow via crafted TOML
-    /// scalar values.
-    #[test]
-    fn sanitize_invalid_value_caps_length_at_64_chars() {
-        let raw: String = "a".repeat(200);
-        let sanitised = sanitize_invalid_value(&raw);
-        assert!(
-            sanitised.len() <= 64 + 3,
-            "length cap (64 + '...' marker) must hold, got len={}: {sanitised:?}",
-            sanitised.len()
-        );
-        assert!(
-            sanitised.ends_with("..."),
-            "truncation marker must be present, got: {sanitised:?}"
-        );
-    }
-
-    /// End-to-end via `require_kind_field` whitespace-only path — confirms the
-    /// construction-site sanitisation wrap is in place.
-    /// `\t` and `\n` are both whitespace (so trim-to-empty fires) AND control
-    /// characters (so the sanitiser must replace them with `?`).
-    #[test]
-    fn require_kind_field_invalid_value_is_sanitised() {
+    fn require_kind_field_invalid_value_names_only_the_field() {
         let raw = "  \t\n  ";
-        let result = require_kind_field("KNOWN_ISSUER", "code", Some(raw));
-        let err = result.expect_err("whitespace-only value must be rejected");
-        let CounterpartyError::KindParseError(CounterpartyKindParseError::InvalidValue {
-            value,
-            ..
-        }) = err
-        else {
-            panic!("expected KindParseError::InvalidValue, got: {err:?}");
-        };
+        let err = require_kind_field("KNOWN_ISSUER", "code", Some(raw))
+            .expect_err("whitespace-only value must be rejected");
         assert!(
-            !value.contains('\t') && !value.contains('\n'),
-            "construction-site sanitisation must replace control chars, got: {value:?}"
+            matches!(
+                err,
+                CounterpartyError::KindParseError(CounterpartyKindParseError::InvalidValue {
+                    ref field,
+                }) if field == "code"
+            ),
+            "expected KindParseError::InvalidValue for code, got: {err:?}"
+        );
+        let rendered = format!("{err} {err:?}");
+        assert!(
+            !rendered.contains('\t') && !rendered.contains('\n') && !rendered.contains("\\t"),
+            "the refused value must not be rendered: {rendered:?}"
         );
     }
 

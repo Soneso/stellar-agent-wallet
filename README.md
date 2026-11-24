@@ -41,20 +41,25 @@ Public alpha, under active development. The
 [milestones](https://github.com/Soneso/stellar-agent-wallet/milestones) list
 the planned work per release.
 
-- testnet (`stellar:testnet`) is the default network: a command with no
-  named profile and no `default.toml` runs on the zero-config testnet profile.
-- mainnet (`stellar:mainnet`) is read-only in this alpha. Every write or
-  signing command refuses a mainnet profile, and the submit layer refuses a
-  mainnet endpoint after asking it which network it serves.
-  [Mainnet is refused for writes](docs/getting-started.md#mainnet-is-refused-for-writes)
+- testnet (`stellar:testnet`) is the default network: with no named profile and
+  no `default.toml`, `stellar-agent-mcp` and commands such as `pay`, `claim`, and
+  `accounts create` run on an in-memory zero-config testnet profile.
+- Default builds enable the `mainnet-write` feature. Configured CLI actions sign `Allow` without a passkey
+  ceremony; `RequireApproval` runs one. Setup, policy minimums, and sealed
+  authorization remain required. Configured MCP operations sign under
+  `Allow` and need a verified approval under `RequireApproval`.
+  [Mainnet configurations and scope](docs/getting-started.md#mainnet-configurations-and-scope)
   lists the commands, the layers, and the wire codes.
+- Mainnet writes move real funds. The wallet is alpha software and comes
+  without warranty under the Apache-2.0 license. Use mainnet at your own risk,
+  and start with small amounts and tight policy limits.
 - Friendbot funding is testnet/futurenet only; mainnet is structurally refused.
 
 Release archives are published on the
 [releases page](https://github.com/Soneso/stellar-agent-wallet/releases) for
 each tagged release, and the workspace crates are published to
-[crates.io](https://crates.io/crates/stellar-agent-cli) with each release
-(features merged since the last tag ship from source until the next one).
+[crates.io](https://crates.io/crates/stellar-agent-cli) with each release.
+A source build of the main branch includes unreleased changes.
 
 ## Highlights
 
@@ -104,20 +109,35 @@ crates on crates.io. While only prerelease (alpha) versions exist,
 `cargo install` and `cargo binstall` need the version spelled out, because a
 bare crate name matches stable versions only.
 
+One executable, `stellar-agent`, holds both the CLI and the MCP server. It
+runs the server as `stellar-agent mcp serve`, and also when it runs under the
+file name `stellar-agent-mcp`. The release archives hold both names as
+byte-equal files. A package install or a source build produces
+`stellar-agent` only; MCP client configurations that name `stellar-agent-mcp`
+need a copy of the executable under that name.
+
 ### cargo binstall (prebuilt binaries)
 
-`cargo binstall` downloads the prebuilt release archive for your platform:
+`cargo binstall` downloads the prebuilt release archive for your platform and
+installs `stellar-agent`:
 
 ```bash
-cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13
 ```
 
 ### cargo install (from crates.io)
 
-`cargo install` builds both binaries from the sources on crates.io:
+`cargo install` builds `stellar-agent` from the sources on crates.io:
 
 ```bash
-cargo install --locked stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
+cargo install --locked stellar-agent-cli@0.1.0-alpha.13
+```
+
+After either install, copy the executable for clients that start
+`stellar-agent-mcp`:
+
+```bash
+cp ~/.cargo/bin/stellar-agent ~/.cargo/bin/stellar-agent-mcp
 ```
 
 ### Build from source
@@ -128,6 +148,7 @@ Clone the release tag and build with its committed `Cargo.lock`:
 git clone --branch v0.1.0-alpha.13 https://github.com/Soneso/stellar-agent-wallet.git
 cd stellar-agent-wallet
 cargo build --release --locked
+cp target/release/stellar-agent target/release/stellar-agent-mcp
 ```
 
 The CLI is also discoverable as `stellar agent ...` through the `stellar-cli`
@@ -178,7 +199,8 @@ unset WALLET_SK
 PowerShell and the cleanup of a seed typed into a command line.
 
 By default, commands print one JSON envelope on stdout and exit `0` on success
-or `1` on any error. `stellar-agent profile init` creates a persistent profile,
+or `1` on an error. Four commands use more exit codes; see
+[Output envelope and exit codes](docs/cli-reference/index.md#output-envelope-and-exit-codes). `stellar-agent profile init` creates a persistent profile,
 which policies and MCP signing need, as
 [Set up a profile](docs/getting-started.md#set-up-a-profile) describes.
 
@@ -239,4 +261,4 @@ Apache-2.0. See [LICENSE](LICENSE).
 ---
 
 "Stellar" is a trademark of the Stellar Development Foundation.
-This is an independent project, not affiliated with, sponsored or endorsed by the Stellar Development Foundation.
+This is an independent project, not affiliated with, sponsored, or endorsed by the Stellar Development Foundation.

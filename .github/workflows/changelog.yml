@@ -1,0 +1,42 @@
+name: Changelog
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  changelog:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: Check changelog fragments
+        run: python3 .github/scripts/changelog.py check
+      - name: Test changelog fragments
+        run: python3 .github/scripts/test-changelog.py
+      - name: Fetch main for changelog protection
+        shell: bash
+        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+      - name: Protect integration changelog
+        if: github.event_name == 'pull_request' && github.base_ref == 'mainnet-write'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          GUARD_ENTRY=$(git ls-tree "$BASE_SHA" -- .github/scripts/changelog.py)
+          if [ -n "$GUARD_ENTRY" ]; then
+            git show "$BASE_SHA:.github/scripts/changelog.py" | python3 - guard --base "$BASE_SHA" --head "$HEAD_SHA" --main-ref refs/remotes/origin/main
+          else
+            python3 .github/scripts/changelog.py guard --base "$BASE_SHA" --head "$HEAD_SHA" --main-ref refs/remotes/origin/main
+          fi

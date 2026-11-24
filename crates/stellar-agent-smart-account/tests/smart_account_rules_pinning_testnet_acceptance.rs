@@ -10,8 +10,8 @@
 //!   Install a rule whose `policies` list references the deployed canonical OZ
 //!   v0.7.2 threshold-policy contract (wasm hash in `THRESHOLD_POLICY_WASM_HASHES`
 //!   allowlist). Expects `install_rule` to succeed, and the resulting
-//!   `SaContextRuleCreated` audit row to carry a non-empty
-//!   `pinned_policy_wasm_hashes_first8` and `mutable_override = false`.
+//!   `SaContextRuleCreatedV2` audit row to carry a non-empty
+//!   `pinned_policy_wasm_hashes` and `mutable_override = false`.
 //!
 //! - `install_rule_refuses_unknown_wasm_verifier_without_override` —
 //!   Install a rule referencing an External verifier whose on-chain wasm hash
@@ -21,8 +21,8 @@
 //!
 //! - `p3_policy_hash_drift_detection_at_signing_time` —
 //!   Install a rule with a threshold-policy, baseline the signer set, then inject
-//!   a fake `SaContextRuleCreated` row whose `pinned_policy_wasm_hashes_first8`
-//!   is `["0000000000000000"]` (a zero sentinel that will never match the real
+//!   a fake `SaContextRuleCreatedV2` row whose `pinned_policy_wasm_hashes`
+//!   holds the zero hash (a sentinel that will never match the real
 //!   on-chain policy wasm hash).  Call `sign_with_passkey_rule`; the drift-
 //!   detection re-fetch fires before any WebAuthn ceremony, detects the mismatch,
 //!   and returns `CredentialsError::WasmHashDrift` (wrapping
@@ -34,7 +34,7 @@
 //!   Install a rule with `accept_unknown_verifier = true` referencing the OZ
 //!   webauthn-verifier contract (whose wasm hash IS in `VERIFIER_ALLOWLIST` for
 //!   normal install, but here we simulate the unknown-override path by injecting a
-//!   fake `SaContextRuleCreated` row with `unknown_override = true`).  Assert that
+//!   fake `SaContextRuleCreatedV2` row with `unknown_override = true`).  Assert that
 //!   signing succeeds when the pinned hash matches the live hash, then inject a
 //!   zero-sentinel pin (simulating a post-upgrade hash change) and assert that
 //!   drift is detected.  Verifies that the real hash is stored at install time,
@@ -42,7 +42,7 @@
 //!
 //! - `p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drift` —
 //!   Install a rule with a threshold-policy and baseline the signer set, then
-//!   inject a `SaContextRuleCreated` row with TWO distinct policy hash entries
+//!   inject a `SaContextRuleCreatedV2` row with TWO distinct policy hash entries
 //!   (simulating a multi-hash rule outside the single-hash scope).  Call
 //!   `sign_with_passkey_rule`; the multi-hash guard in
 //!   `verify_pinned_policy_against_chain` fires `SaError::MultiplePinnedHashesUnsupported`
@@ -105,7 +105,7 @@ use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::{ContractKind, EventKind};
+use stellar_agent_core::audit_log::schema::{ContractKind, EventKind, WasmHashPin};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
@@ -119,6 +119,7 @@ use stellar_agent_smart_account::deployment::{
     deploy_smart_account, deploy_timelock_controller, derive_smart_account_address,
 };
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::auth_entry::test_helpers::partial_authorization_entry;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
@@ -196,14 +197,9 @@ fn fresh_deployer() -> (String, DeployerKeypair) {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 200 for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Opens a temporary `AuditWriter` and returns `(Arc<Mutex<writer>>, path, TempDir)`.
@@ -257,7 +253,7 @@ fn fresh_signers_manager(
 ) -> Arc<SignersManager> {
     signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         audit_writer,
         audit_log_path,
         Duration::from_secs(TIMEOUT_SECS),
@@ -277,7 +273,7 @@ fn fresh_pinning_rule_manager(
 ) -> ContextRuleManager {
     rule_manager_for_tests(
         TESTNET_RPC_URL,
-        None,
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
         signers_manager,
         audit_writer,
         Duration::from_secs(TIMEOUT_SECS),
@@ -543,8 +539,8 @@ fn encode_simple_threshold_params(threshold: u32) -> ScVal {
 ///
 /// The rule installation must:
 /// 1. Succeed (no `SaError` returned).
-/// 2. Produce a `SaContextRuleCreated` audit row with a non-empty
-///    `pinned_policy_wasm_hashes_first8` list (the hash was pinned).
+/// 2. Produce a `SaContextRuleCreatedV2` audit row with a non-empty
+///    `pinned_policy_wasm_hashes` list (the hash was pinned).
 /// 3. Have `mutable_override = false` (the canonical OZ policy has no admin key).
 ///
 /// # Reference cross-check
@@ -553,6 +549,7 @@ fn encode_simple_threshold_params(threshold: u32) -> ScVal {
 ///   `crates/stellar-agent-smart-account/src/signers/policy_identification.rs`.
 #[tokio::test]
 async fn pin_and_install_with_canonical_oz_threshold_policy_no_drift() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -623,31 +620,31 @@ async fn pin_and_install_with_canonical_oz_threshold_policy_no_drift() {
         "audit log must contain at least one entry after install_rule"
     );
 
-    // Find the SaContextRuleCreated row for this rule_id.
+    // Find the SaContextRuleCreatedV2 row for this rule_id.
     let created_entry = entries
         .iter()
         .find(|e| {
             matches!(
                 &e.event_kind,
-                EventKind::SaContextRuleCreated { rule_id: rid, .. } if *rid == rule_id
+                EventKind::SaContextRuleCreatedV2 { rule_id: rid, .. } if *rid == rule_id
             )
         })
-        .expect("install_rule must emit a SaContextRuleCreated row with the new rule_id");
+        .expect("install_rule must emit a SaContextRuleCreatedV2 row with the new rule_id");
 
-    // Extract the pinned_policy_wasm_hashes_first8 from the variant.
-    let EventKind::SaContextRuleCreated {
-        pinned_policy_wasm_hashes_first8,
+    // Extract the pinned_policy_wasm_hashes from the variant.
+    let EventKind::SaContextRuleCreatedV2 {
+        pinned_policy_wasm_hashes,
         mutable_override,
         unknown_override,
         ..
     } = &created_entry.event_kind
     else {
-        panic!("event_kind must be SaContextRuleCreated");
+        panic!("event_kind must be SaContextRuleCreatedV2");
     };
 
     assert!(
-        !pinned_policy_wasm_hashes_first8.is_empty(),
-        "SaContextRuleCreated must carry at least one pinned_policy_wasm_hashes_first8 \
+        !pinned_policy_wasm_hashes.is_empty(),
+        "SaContextRuleCreatedV2 must carry at least one pinned_policy_wasm_hashes \
          entry after install with canonical OZ threshold-policy; found empty list"
     );
     assert!(
@@ -664,7 +661,7 @@ async fn pin_and_install_with_canonical_oz_threshold_policy_no_drift() {
     // Verify request_id correlation.
     assert_eq!(
         created_entry.request_id, request_id,
-        "SaContextRuleCreated row must carry the request_id used in the call"
+        "SaContextRuleCreatedV2 row must carry the request_id used in the call"
     );
 }
 
@@ -764,9 +761,9 @@ async fn install_rule_refuses_unknown_wasm_verifier_without_override() {
 /// 1. Deploy a fresh smart-account + install a 1-of-1 rule with a threshold-policy.
 /// 2. Baseline the signer set (so `verify_signer_set_against_chain` does not
 ///    return `SignerSetMissingBaseline`).
-/// 3. Inject a fabricated `SaContextRuleCreated` audit row whose
-///    `pinned_policy_wasm_hashes_first8` is `["0000000000000000"]` — a zero
-///    sentinel that will never match the real on-chain policy wasm hash.
+/// 3. Inject a fabricated `SaContextRuleCreatedV2` audit row whose
+///    `pinned_policy_wasm_hashes` holds the zero hash, a sentinel that will
+///    never match the real on-chain policy wasm hash.
 ///    Because `find_latest_context_rule_pinned_hashes` picks the most-recent
 ///    matching row, this fabricated entry shadows the real install-time row.
 /// 4. Call `sign_with_passkey_rule` (with `signers_manager = Some(sm)`) and a
@@ -796,6 +793,7 @@ async fn install_rule_refuses_unknown_wasm_verifier_without_override() {
 ///   `crates/stellar-agent-smart-account/src/managers/credentials.rs`.
 #[tokio::test(flavor = "multi_thread")]
 async fn p3_policy_hash_drift_detection_at_signing_time() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -814,7 +812,7 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
     let sm = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
 
     // Install a 1-of-1 rule with the threshold-policy via the pinning manager.
-    // The real pin row (`SaContextRuleCreated` with the actual policy wasm hash)
+    // The real pin row (`SaContextRuleCreatedV2` with the actual policy wasm hash)
     // is written to the audit log by `install_rule`.
     let manager = fresh_pinning_rule_manager(Arc::clone(&audit_writer), Arc::clone(&sm));
 
@@ -868,20 +866,20 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
         .expect("list_signers after the install must succeed");
     assert_eq!(listed.baseline, PreviousBaseline::Matched);
 
-    // ── Inject fabricated SaContextRuleCreated row with wrong pinned hash ─────
+    // ── Inject fabricated SaContextRuleCreatedV2 row with wrong pinned hash ─────
     //
-    // The zero sentinel `"0000000000000000"` will never match the real on-chain
-    // policy wasm hash, guaranteeing a drift detection on every run.
+    // The zero-hash sentinel will never match the real on-chain policy wasm
+    // hash, guaranteeing a drift detection on every run.
     //
     // `find_latest_context_rule_pinned_hashes` picks the most-recent matching
     // row, so this fabricated row shadows the real install-time pin row.
     let smart_account_redacted = redact_strkey_first5_last5(&sa_strkey);
     {
         let mut writer = audit_writer.lock().expect("audit writer lock for inject");
-        // Construct a fake SaContextRuleCreated with zero-sentinel pinned hash.
+        // Construct a fake SaContextRuleCreatedV2 with zero-sentinel pinned hash.
         // `write_entry` sets `previous_entry_hash` automatically from the writer's
         // current chain-tip; the manually-constructed zero value is overwritten.
-        let fake_entry = AuditEntry::new_sa_context_rule_created(
+        let fake_entry = AuditEntry::new_sa_context_rule_created_v2(
             &smart_account_redacted,
             rule_id,
             "default",
@@ -890,8 +888,8 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
             None,
             CHAIN_ID,
             rid(),
-            vec![],                              // no verifier hashes (Delegated signer only)
-            vec!["0000000000000000".to_owned()], // wrong policy hash (zero sentinel)
+            vec![],                             // no verifier hashes (Delegated signer only)
+            vec![WasmHashPin::new([0x00; 32])], // wrong policy hash (zero sentinel)
             false,
             false,
             vec![],
@@ -899,7 +897,7 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
         );
         writer
             .write_entry(fake_entry)
-            .expect("fake SaContextRuleCreated inject must succeed");
+            .expect("fake SaContextRuleCreatedV2 inject must succeed");
     }
 
     // ── Call sign_with_passkey_rule ───────────────────────────────────────────
@@ -918,14 +916,18 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
 
     // Fake bridge address: drift fires before any bridge I/O.
     let bridge_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19907);
-    let auth_digest = [0u8; 32];
+    let entry = partial_authorization_entry(
+        parse_c_strkey_to_smart_account(&sa_strkey).expect("smart account strkey parses"),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(rule_id)],
+    )
+    .expect("auth entry builds");
 
     let outcome = creds_mgr
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "does-not-matter", // credential lookup never reached (drift fires first)
-            &sa_strkey,
-            &auth_digest,
-            vec![rule_id],
+            &entry,
             Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),
@@ -1024,7 +1026,7 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
 /// pin must detect drift.
 ///
 /// This test simulates the `accept_unknown_verifier=true` scenario by injecting
-/// fabricated `SaContextRuleCreated` rows directly (the actual
+/// fabricated `SaContextRuleCreatedV2` rows directly (the actual
 /// `pin_referenced_contracts` accept-unknown path requires a contract not in any
 /// allowlist, which is unavailable on public testnet without a custom deploy).
 /// The injected rows exercise the same audit-log-derived expectation lookup that
@@ -1045,6 +1047,7 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
 ///   (drift-detection re-fetch — policy path).
 #[tokio::test(flavor = "multi_thread")]
 async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -1107,9 +1110,9 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
     );
     drop(manager);
 
-    // ── Read the REAL live wasm hash first-8-hex from the install-time audit row ─
+    // ── Read the REAL live wasm hash from the install-time audit row ─────────
     //
-    // The install-time `SaContextRuleCreated` row carries the real pinned hash
+    // The install-time `SaContextRuleCreatedV2` row carries the real pinned hash
     // (already allowlist-checked by `pin_referenced_contracts`).  This is what
     // The real hash is read from the install-time pin row here.
     let smart_account_redacted = redact_strkey_first5_last5(&sa_strkey);
@@ -1119,27 +1122,28 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
         .find(|e| {
             matches!(
                 &e.event_kind,
-                EventKind::SaContextRuleCreated { rule_id: rid, .. } if *rid == rule_id
+                EventKind::SaContextRuleCreatedV2 { rule_id: rid, .. } if *rid == rule_id
             )
         })
-        .expect("SaContextRuleCreated row must exist after install_rule");
+        .expect("SaContextRuleCreatedV2 row must exist after install_rule");
 
-    let real_hash_first8 = if let EventKind::SaContextRuleCreated {
-        pinned_policy_wasm_hashes_first8,
+    let real_hash = if let EventKind::SaContextRuleCreatedV2 {
+        pinned_policy_wasm_hashes,
         ..
     } = &install_pin_row.event_kind
     {
         assert!(
-            !pinned_policy_wasm_hashes_first8.is_empty(),
-            "install-time SaContextRuleCreated must carry at least one pinned policy hash"
+            !pinned_policy_wasm_hashes.is_empty(),
+            "install-time SaContextRuleCreatedV2 must carry at least one pinned policy hash"
         );
-        pinned_policy_wasm_hashes_first8[0].clone()
+        pinned_policy_wasm_hashes[0]
     } else {
-        panic!("expected SaContextRuleCreated event_kind");
+        panic!("expected SaContextRuleCreatedV2 event_kind");
     };
 
     assert_ne!(
-        real_hash_first8, "0000000000000000",
+        real_hash,
+        WasmHashPin::new([0u8; 32]),
         "real policy wasm hash from install-time row must be non-zero"
     );
 
@@ -1162,7 +1166,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
         let mut writer = audit_writer
             .lock()
             .expect("audit writer lock for real-hash inject");
-        let fake_entry = AuditEntry::new_sa_context_rule_created(
+        let fake_entry = AuditEntry::new_sa_context_rule_created_v2(
             &smart_account_redacted,
             rule_id,
             "default",
@@ -1171,16 +1175,16 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
             None,
             CHAIN_ID,
             rid(),
-            vec![],                         // no verifier hashes (Delegated signer only)
-            vec![real_hash_first8.clone()], // REAL hash (not a zero sentinel)
-            false,                          // mutable_override
-            true, // unknown_override = true (simulating accept-unknown path)
+            vec![],          // no verifier hashes (Delegated signer only)
+            vec![real_hash], // REAL hash (not a zero sentinel)
+            false,           // mutable_override
+            true,            // unknown_override = true (simulating accept-unknown path)
             vec![],
             vec![],
         );
         writer
             .write_entry(fake_entry)
-            .expect("real-hash SaContextRuleCreated inject must succeed");
+            .expect("real-hash SaContextRuleCreatedV2 inject must succeed");
     }
 
     let passkeys_tmpdir = tempfile::tempdir().expect("passkeys tempdir must succeed");
@@ -1192,17 +1196,21 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
     );
 
     let bridge_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19908);
-    let auth_digest = [0u8; 32];
+    let entry = partial_authorization_entry(
+        parse_c_strkey_to_smart_account(&sa_strkey).expect("smart account strkey parses"),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(rule_id)],
+    )
+    .expect("auth entry builds");
 
     // Signing attempt 1: real-hash pin row → drift check MUST NOT fire.
     // The approval store is None so we get ApprovalStoreUnavailable, but
     // that means drift did NOT fire (drift fires first, before store check).
     let outcome_real_hash = creds_mgr
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "does-not-matter",
-            &sa_strkey,
-            &auth_digest,
-            vec![rule_id],
+            &entry,
             Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),
@@ -1231,7 +1239,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
         let mut writer = audit_writer
             .lock()
             .expect("audit writer lock for zero-sentinel inject");
-        let bug_entry = AuditEntry::new_sa_context_rule_created(
+        let bug_entry = AuditEntry::new_sa_context_rule_created_v2(
             &smart_account_redacted,
             rule_id,
             "default",
@@ -1241,7 +1249,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
             CHAIN_ID,
             rid(),
             vec![],
-            vec!["0000000000000000".to_owned()], // zero sentinel (bug scenario)
+            vec![WasmHashPin::new([0x00; 32])], // zero sentinel (bug scenario)
             false,
             true, // unknown_override
             vec![],
@@ -1249,16 +1257,15 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
         );
         writer
             .write_entry(bug_entry)
-            .expect("zero-sentinel SaContextRuleCreated inject must succeed");
+            .expect("zero-sentinel SaContextRuleCreatedV2 inject must succeed");
     }
 
     // Signing attempt 2: zero-sentinel pin row → drift check MUST fire.
     let outcome_zero_pin = creds_mgr
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "does-not-matter",
-            &sa_strkey,
-            &auth_digest,
-            vec![rule_id],
+            &entry,
             Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),
@@ -1332,7 +1339,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
 ///    rule has a policy address that passes `fetch_verifier_and_policy_addresses`).
 /// 3. Refresh the signer-set baseline (so `verify_signer_set_against_chain`
 ///    passes in the signing pre-flight).
-/// 4. Inject a `SaContextRuleCreated` row into the audit log with **two** distinct
+/// 4. Inject a `SaContextRuleCreatedV2` row into the audit log with **two** distinct
 ///    policy hash entries for the same `(rule_id, smart_account_redacted)`.  This
 ///    simulates a multi-hash rule beyond the single-hash scope.
 /// 5. Call `sign_with_passkey_rule` with the rule_id.  The signing pre-flight
@@ -1351,6 +1358,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
 /// Infra failure routes to `DriftCheckUnavailable`, not drift.
 #[tokio::test]
 async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drift() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -1424,7 +1432,7 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
         .expect("list_signers after the install must succeed");
     assert_eq!(listed.baseline, PreviousBaseline::Matched);
 
-    // ── Inject fabricated SaContextRuleCreated row with TWO policy hashes ─────
+    // ── Inject fabricated SaContextRuleCreatedV2 row with TWO policy hashes ─────
     //
     // The two-hash inject simulates a multi-hash rule beyond single-hash scope.
     // `find_latest_context_rule_pinned_hashes` picks the most-recent matching
@@ -1439,7 +1447,7 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
         let mut writer = audit_writer
             .lock()
             .expect("audit writer lock for multi-hash inject");
-        let fake_entry = AuditEntry::new_sa_context_rule_created(
+        let fake_entry = AuditEntry::new_sa_context_rule_created_v2(
             &smart_account_redacted,
             rule_id,
             "default",
@@ -1450,8 +1458,8 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
             rid(),
             vec![], // no verifier hashes (Delegated signer only)
             vec![
-                "aabbccdd11223344".to_owned(), // hash[0] — first distinct policy hash
-                "99887766aabbccdd".to_owned(), // hash[1] — second distinct policy hash (multi-hash)
+                WasmHashPin::new([0xaa; 32]), // hash[0]: first distinct policy hash
+                WasmHashPin::new([0x99; 32]), // hash[1]: second distinct policy hash (multi-hash)
             ],
             false, // mutable_override
             false, // unknown_override
@@ -1460,7 +1468,7 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
         );
         writer
             .write_entry(fake_entry)
-            .expect("multi-hash SaContextRuleCreated inject must succeed");
+            .expect("multi-hash SaContextRuleCreatedV2 inject must succeed");
     }
 
     // ── Call sign_with_passkey_rule ───────────────────────────────────────────
@@ -1478,14 +1486,18 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
 
     // Fake bridge address: multi-hash guard fires before any bridge I/O.
     let bridge_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19909);
-    let auth_digest = [0u8; 32];
+    let entry = partial_authorization_entry(
+        parse_c_strkey_to_smart_account(&sa_strkey).expect("smart account strkey parses"),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(rule_id)],
+    )
+    .expect("auth entry builds");
 
     let outcome = creds_mgr
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "does-not-matter",
-            &sa_strkey,
-            &auth_digest,
-            vec![rule_id],
+            &entry,
             Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),
@@ -1917,7 +1929,7 @@ async fn accept_mutable_verifier_override_writes_no_row_for_a_failed_install() {
 /// - The pin check alone returns one pending unknown-hash override with
 ///   `contract_kind = "verifier"` and the real, non-zero observed hash.
 ///
-/// No `SaContextRuleCreated` row or override row is written when
+/// No `SaContextRuleCreatedV2` row or override row is written when
 /// `install_rule` fails at simulate phase; both are written only on success.
 ///
 /// # Reference cross-check

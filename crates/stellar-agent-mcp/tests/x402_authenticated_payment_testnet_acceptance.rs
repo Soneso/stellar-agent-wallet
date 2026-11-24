@@ -121,24 +121,13 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
     (g_strkey, seed)
 }
 
-/// Funds a testnet account via Friendbot.
-///
-/// Returns `Ok(())` if funding succeeded (2xx from Friendbot).
-/// Returns `Err(reason)` if the HTTP request failed or returned non-2xx.
-/// Does NOT panic — callers decide whether to skip or fail.
-async fn try_fund_via_friendbot(g_strkey: &str) -> Result<(), String> {
+/// Funds a testnet account via Friendbot and fails the test when Friendbot
+/// does not fund it.
+async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .map_err(|e| format!("Friendbot GET failed: {e}"))?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Friendbot returned {} for {g_strkey}",
-            resp.status()
-        ))
-    }
+        .expect("Friendbot funds the account");
 }
 
 /// Builds a `PaymentRequirements` JSON string for the given `pay_to` address.
@@ -185,6 +174,20 @@ fn build_test_server(
     entry
         .set_password(&s_strkey)
         .expect("keyring mock set_password must succeed");
+    // The identity record an enrollment stores beside the seed.
+    stellar_agent_network::keyring::write_keyring_string(
+        &stellar_agent_core::profile::schema::signer_identity_entry_ref(signer_ref),
+        &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .to_bytes(),
+            stellar_agent_core::profile::name::profile_name_for_approval(&profile),
+            profile.chain_id,
+        )
+        .render()
+        .expect("an agent record renders"),
+    )
+    .expect("set identity record");
 
     // Audit chain-root key. Signing verbs prove the keyed audit writer
     // acquirable before any signing (audit.chain_key_unavailable otherwise),
@@ -509,6 +512,10 @@ fn verify_auth_entry_signature(
 #[tokio::test]
 #[serial]
 async fn a6f_neg1_unreachable_domain_aborts_before_payment() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     // NOTE: No Friendbot funding — the gate aborts before any RPC call.
     let server = build_test_server(&g_strkey, &seed, "x402-auth-test-neg1");
@@ -521,6 +528,9 @@ async fn a6f_neg1_unreachable_domain_aborts_before_payment() {
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             home_domain: "unreachable.stellar.invalid".to_owned(),
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("dispatch_gate must not raise ErrorData for a valid chain_id");
@@ -575,6 +585,10 @@ async fn a6f_neg1_unreachable_domain_aborts_before_payment() {
 #[tokio::test]
 #[serial]
 async fn a6f_neg2_invalid_home_domain_aborts_before_payment() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     // NOTE: No Friendbot funding — the gate aborts before any network I/O.
     let server = build_test_server(&g_strkey, &seed, "x402-auth-test-neg2");
@@ -587,6 +601,9 @@ async fn a6f_neg2_invalid_home_domain_aborts_before_payment() {
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             home_domain: "UPPERCASE.COM".to_owned(), // uppercase LDH violation
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("dispatch_gate must not raise ErrorData for a valid chain_id");
@@ -650,14 +667,14 @@ async fn a6f_neg2_invalid_home_domain_aborts_before_payment() {
 #[tokio::test]
 #[serial]
 async fn a6f_positive_testanchor_sep10_authenticated_payment() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
     let (recipient, _recipient_seed) = fresh_keypair();
-    try_fund_via_friendbot(&g_strkey)
-        .await
-        .unwrap_or_else(|reason| panic!("[UNAVAILABLE] payer funding: {reason}"));
-    try_fund_via_friendbot(&recipient)
-        .await
-        .unwrap_or_else(|reason| panic!("[UNAVAILABLE] recipient funding: {reason}"));
+    fund_via_friendbot(&g_strkey).await;
+    fund_via_friendbot(&recipient).await;
     wait_until_visible(&g_strkey).await;
     wait_until_visible(&recipient).await;
 
@@ -670,6 +687,9 @@ async fn a6f_positive_testanchor_sep10_authenticated_payment() {
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             home_domain: TESTANCHOR_HOME_DOMAIN.to_owned(),
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("dispatch_gate must not raise ErrorData for a valid chain_id");

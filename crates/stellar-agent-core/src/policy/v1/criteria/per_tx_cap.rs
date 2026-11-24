@@ -33,7 +33,9 @@
 //!
 
 use crate::policy::v1::EvalContext;
+use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::criteria::Criterion;
+use crate::policy::v1::criteria::descriptor::{BucketDescriptor, BucketKind};
 use crate::policy::v1::value::{ValueGate, asset_normalise, classify_value};
 use crate::policy::{DenyReason, PolicyError};
 
@@ -107,6 +109,14 @@ impl Criterion for PerTxCapCriterion {
         "per_tx_cap"
     }
 
+    fn descriptors(&self) -> Vec<BucketDescriptor> {
+        vec![BucketDescriptor::per_call(
+            BucketKind::Transaction,
+            &self.asset,
+            self.max_stroops,
+        )]
+    }
+
     /// Evaluates the per-transaction cap against the current tool call.
     ///
     /// Returns `Ok(None)` when the criterion does not apply (tool not
@@ -119,7 +129,11 @@ impl Criterion for PerTxCapCriterion {
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when the required
     /// argument field is missing or cannot be parsed as a valid Stellar amount.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        let sum = match asset_debit_sum(ctx, &self.asset, self.kind())? {
+        let overflow = DenyReason::PerTxCapOverflow {
+            asset: self.asset.clone(),
+            max_stroops: self.max_stroops,
+        };
+        let sum = match checked_asset_debit_sum(ctx, &self.asset, self.kind(), &overflow)? {
             AssetDebitSum::NotApplicable => return Ok(None),
             AssetDebitSum::Deny(reason) => return Ok(Some(reason)),
             AssetDebitSum::Amount(sum) => sum,
@@ -144,11 +158,29 @@ pub(super) enum AssetDebitSum {
     Amount(i128),
 }
 
-/// Sums matching debit legs with saturation and preserves sizing failures.
-pub(super) fn asset_debit_sum(
+/// Sums matching debit legs with checked addition and preserves sizing
+/// failures.
+///
+/// # Errors
+///
+/// Returns sizing errors for missing assets or amounts. Overflow returns
+/// the caller's governing-limit denial without inventing a debit total.
+pub(super) fn checked_asset_debit_sum(
     ctx: &EvalContext<'_>,
     asset: &str,
     criterion: &str,
+    overflow: &DenyReason,
+) -> Result<AssetDebitSum, PolicyError> {
+    debit_sum(ctx, asset, criterion, |sum, amount| {
+        sum.checked_add(amount).ok_or_else(|| overflow.clone())
+    })
+}
+
+fn debit_sum(
+    ctx: &EvalContext<'_>,
+    asset: &str,
+    criterion: &str,
+    add: impl Fn(i128, i128) -> Result<i128, DenyReason>,
 ) -> Result<AssetDebitSum, PolicyError> {
     let tool_name = ctx.tool.name.as_str();
 
@@ -177,7 +209,7 @@ pub(super) fn asset_debit_sum(
                         "{criterion}: debit leg of tool '{tool_name}' carries no asset"
                     ),
                 })?;
-        if asset_normalise(leg_asset) != criterion_asset {
+        if !assets_equivalent(leg_asset, &criterion_asset, &ctx.profile.network_passphrase) {
             continue;
         }
         let amount = leg
@@ -188,7 +220,10 @@ pub(super) fn asset_debit_sum(
                 ),
             })?;
         matched = true;
-        sum = sum.saturating_add(amount);
+        sum = match add(sum, amount) {
+            Ok(sum) => sum,
+            Err(reason) => return Ok(AssetDebitSum::Deny(reason)),
+        };
     }
 
     // A call with no matching debit leaves this asset unconstrained.
@@ -261,11 +296,18 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: 1_700_000_000_000,
         }
     }
 
     #[test]
+    #[serial_test::serial]
     fn native_cap_not_exceeded_returns_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -277,7 +319,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn native_cap_exceeded_returns_deny() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -292,7 +338,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn wrong_asset_criterion_does_not_apply() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -326,7 +376,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn xlm_configured_cap_matches_native_tool_asset() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -342,7 +396,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn invalid_amount_returns_evaluation_failed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -357,7 +415,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn create_account_with_starting_balance_applies_native_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_create_account");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -372,7 +434,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn cap_at_exact_max_is_allowed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -387,7 +453,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn unknown_tool_criterion_does_not_apply() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_balances");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -402,7 +472,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn missing_amount_field_returns_evaluation_failed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -422,7 +496,11 @@ mod tests {
     /// Simulate-time `stellar_pay` args_value shape when the caller used
     /// `amount_in_stroops` (exact fields `stellar_pay`'s handler emits).
     #[test]
+    #[serial_test::serial]
     fn pay_simulate_amount_in_stroops_shape_cap_under_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -442,7 +520,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn pay_simulate_amount_in_stroops_shape_cap_over_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -469,7 +551,11 @@ mod tests {
     /// branch through the resolved `amount_stroops` key (not just the
     /// legacy-shape tests above, which only exercise the native path).
     #[test]
+    #[serial_test::serial]
     fn pay_simulate_non_native_asset_cap_over_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -497,7 +583,11 @@ mod tests {
     /// pay simulate args_value carrying a distinct asset — the asset mismatch
     /// branch is still reachable through the resolved key.
     #[test]
+    #[serial_test::serial]
     fn pay_simulate_non_native_asset_mismatch_does_not_apply() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -525,7 +615,11 @@ mod tests {
     /// `envelope_decode::decode_authoritative_args` emits it: no legacy
     /// "amount" key at all, `total_fee_stroops` numeric, `asset` present.
     #[test]
+    #[serial_test::serial]
     fn pay_commit_authoritative_args_shape_cap_under_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay_commit");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -544,7 +638,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn pay_commit_authoritative_args_shape_cap_over_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay_commit");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -570,7 +668,11 @@ mod tests {
     /// `starting_balance_stroops` is ever present — the legacy
     /// `starting_balance` key never appears in production args.
     #[test]
+    #[serial_test::serial]
     fn create_account_simulate_resolved_only_shape_cap_under_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_create_account");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -587,7 +689,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn create_account_simulate_resolved_only_shape_cap_over_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_create_account");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -609,7 +715,11 @@ mod tests {
 
     /// Commit-time `stellar_create_account_commit` authoritative_args shape.
     #[test]
+    #[serial_test::serial]
     fn create_account_commit_authoritative_args_shape_cap_over_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_create_account_commit");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -632,7 +742,11 @@ mod tests {
     /// at all) must still evaluate to the identical verdict as before this
     /// re-point.
     #[test]
+    #[serial_test::serial]
     fn legacy_amount_only_shape_still_evaluates_identically() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -649,7 +763,11 @@ mod tests {
     /// Version-crossing: a resolved key carrying a legacy JSON number (rather
     /// than the current decimal-string encoding) must still parse correctly.
     #[test]
+    #[serial_test::serial]
     fn version_crossing_numeric_amount_stroops_still_parses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -686,7 +804,11 @@ mod tests {
     /// its match arms) must deny fail-closed rather than passing silently —
     /// this is a forgotten/failed population, not a legitimate no-op.
     #[test]
+    #[serial_test::serial]
     fn moves_value_tool_with_unpopulated_effects_denies_unsizable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool_with_kind(
             "stellar_dex_trade",
             crate::policy::ToolValueKind::MovesValue,
@@ -707,7 +829,11 @@ mod tests {
     /// single-tx path must deny fail-closed: the wallet cannot size a value
     /// cap against material it does not decode.
     #[test]
+    #[serial_test::serial]
     fn opaque_sign_call_denies_unsizable_on_single_tx() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_sep43_sign_transaction");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -725,7 +851,11 @@ mod tests {
     /// legs individually under the cap must still deny when their sum exceeds
     /// it.
     #[test]
+    #[serial_test::serial]
     fn two_leg_native_value_aggregates_over_cap_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_multicall");
@@ -747,7 +877,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("GBBB".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::new(vec![leg_a, leg_b])));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -762,7 +892,11 @@ mod tests {
     /// the criterion denies and `attempted_stroops` carries the exact
     /// beyond-i64 value, not a saturated `i64::MAX`.
     #[test]
+    #[serial_test::serial]
     fn debit_leg_amount_beyond_i64_max_denies_without_clamp() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_multicall");
@@ -778,7 +912,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("GAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -790,7 +924,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn cap_aggregates_only_debit_legs_not_inflow_legs() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_dex_trade");
@@ -814,7 +952,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("CAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Value(ValueEffects::new(vec![outflow, inflow])));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -837,7 +975,11 @@ mod tests {
     /// A `per_tx_cap` on `native` at 55 XLM must DENY: the debit is the send
     /// side (60 XLM), not the destination side.
     #[test]
+    #[serial_test::serial]
     fn path_payment_send_asset_cap_binds_the_debit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay_commit");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -863,7 +1005,11 @@ mod tests {
     /// (USDC) must NOT bind — the destination-side leg carries no debit, so a
     /// USDC per_tx_cap is not applicable to this call at all.
     #[test]
+    #[serial_test::serial]
     fn path_payment_dest_asset_cap_does_not_bind_the_debit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay_commit");
         let profile = make_profile();
         let store = PolicyStateStore::new();

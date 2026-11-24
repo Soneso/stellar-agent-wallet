@@ -176,7 +176,7 @@ fn fresh_deployer_keypair() -> (String, DeployerKeypair) {
 fn fresh_rule_manager() -> (ContextRuleManager, Arc<SignersManager>, TempDir) {
     let (manager, signers_manager, _audit_log_path, dir) = managers_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Duration::from_secs(TIMEOUT_SECS),
     );
     (manager, signers_manager, dir)
@@ -268,6 +268,7 @@ async fn deploy_verifier_and_policy(registry_path: &Path) -> (String, String) {
 /// real on-chain auth requirement.
 #[tokio::test]
 async fn agent_delegation_full_flow_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
 
@@ -411,6 +412,9 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
     let rule_ids_ok = vec![ContextRuleId::new(rule_id)];
     let ok_result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(XLM_SAC_TESTNET)
             .auth_address(smart_account_strkey.as_str())
             .auth_rule_ids(&rule_ids_ok)
@@ -426,6 +430,7 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
                 verifier: verifier_sc_addr.clone(),
             })
             .primary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(Duration::from_secs(TIMEOUT_SECS))
@@ -458,6 +463,9 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
     let rule_ids_over = vec![ContextRuleId::new(rule_id)];
     let over_err = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(XLM_SAC_TESTNET)
             .auth_address(smart_account_strkey.as_str())
             .auth_rule_ids(&rule_ids_over)
@@ -473,6 +481,7 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
                 verifier: verifier_sc_addr.clone(),
             })
             .primary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(Duration::from_secs(TIMEOUT_SECS))
@@ -530,6 +539,9 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
     let rule_ids_scope = vec![ContextRuleId::new(rule_id)];
     let scope_err = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(smart_account_strkey.as_str())
             .auth_rule_ids(&rule_ids_scope)
             .host_function(self_call_host_function)
@@ -539,6 +551,7 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
                 verifier: verifier_sc_addr.clone(),
             })
             .primary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(Duration::from_secs(TIMEOUT_SECS))

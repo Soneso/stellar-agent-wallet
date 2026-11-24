@@ -8,8 +8,13 @@
 //!
 //! The bridge:
 //!
-//! - Binds exclusively to a loopback address (`127.0.0.1:0` by default; the
-//!   OS assigns a random port per session, preventing port-scan guessing).
+//! - Binds exclusively to loopback: `127.0.0.1` and `[::1]` on one port
+//!   (OS-assigned per session by default, preventing port-scan guessing),
+//!   both held before the bridge serves anything and closed together. The
+//!   browser opens the bridge at `http://localhost:<port>`, which may reach
+//!   either address, so a family the bridge left free could serve another
+//!   account's page under the bridge's origin; the bridge does not start
+//!   when it cannot hold both.
 //! - Enforces a layered defence stack (see below).
 //! - Exposes two public entry points: [`start_bridge_register_only`] for
 //!   registration-only sessions (no signing-time pubkey lookup wired) and
@@ -44,8 +49,9 @@
 //!    under 4 KiB.
 //! 5. **`DefaultBodyLimit::max(16 KiB)`** — axum-level body cap applied via
 //!    the router layer (same constant as above).
-//! 6. **`TraceLayer`** — path-only structured logging; query strings and body
-//!    bytes are never emitted. Innermost wrapper so the recorded span reflects
+//! 6. **`TraceLayer`**: structured logging of the matched route template
+//!    (`/register/{nonce}`), never the request path, its query string or
+//!    body bytes. Innermost wrapper so the recorded span reflects
 //!    only the surface area that survives the prior layers' admission
 //!    decisions.
 //!
@@ -88,8 +94,9 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{Router, extract::DefaultBodyLimit};
 use stellar_agent_core::approval::store::PendingApprovalStore;
+use stellar_agent_loopback_http::{LoopbackPair, PairServer};
 use stellar_agent_smart_account::managers::credentials::CredentialsManager;
-use tokio::{net::TcpListener, sync::Mutex, sync::oneshot, task::JoinHandle};
+use tokio::sync::Mutex;
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::instrument;
 
@@ -118,6 +125,7 @@ pub use stellar_agent_loopback_http::brand::PageIdentity;
 pub use stellar_agent_loopback_http::host_header::HostHeaderAllowlistLayer;
 pub use stellar_agent_loopback_http::origin_header::OriginHeaderAllowlistLayer;
 pub use stellar_agent_loopback_http::security_headers::SecurityHeadersLayer;
+pub use stellar_agent_loopback_http::{LoopbackFamily, PairBindError};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -229,6 +237,11 @@ pub(crate) struct BridgeState {
     /// The identity the two ceremony pages render, neutral unless the
     /// deployment configured one.
     pub(crate) identity: Arc<PageIdentity>,
+    /// The origin the registration page is served from,
+    /// `http://localhost:<bound port>`: the origin of the URL the credentials
+    /// manager hands the browser. A registration response's client data must
+    /// name exactly this origin.
+    pub(crate) expected_origin: Arc<str>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -244,13 +257,14 @@ pub(crate) struct BridgeState {
 ///
 /// # Drop behaviour
 ///
-/// Dropping the `BridgeHandle` without calling [`BridgeHandle::shutdown`]
-/// leaves the server task running.  Always call `shutdown` before the process
-/// exits to ensure the `tokio::JoinHandle` is resolved.
+/// Dropping the handle without calling [`BridgeHandle::shutdown`] drops its
+/// [`PairServer`], whose drop aborts both listener tasks at once: both
+/// addresses stop accepting without waiting for open connections. Call
+/// `shutdown` to let open connections finish and to wait for both
+/// listeners.
 pub struct BridgeHandle {
     local_addr: SocketAddr,
-    shutdown_tx: oneshot::Sender<()>,
-    join_handle: JoinHandle<()>,
+    server: PairServer,
 }
 
 impl std::fmt::Debug for BridgeHandle {
@@ -262,34 +276,33 @@ impl std::fmt::Debug for BridgeHandle {
 }
 
 impl BridgeHandle {
-    /// Return the actual bound socket address.
+    /// Return the IPv4 address of the listener pair, `127.0.0.1:<port>`.
     ///
-    /// When `bind_addr` was `127.0.0.1:0`, this returns the OS-assigned port.
-    /// Consumers call this to assemble the approval URL emitted to the agent.
+    /// When `bind_addr` named port `0`, this carries the OS-assigned port;
+    /// `[::1]` is bound on the same port. Consumers call this to assemble
+    /// the `http://localhost:<port>` URL emitted to the agent.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    /// Trigger graceful shutdown and wait for the server task to stop.
+    /// Trigger graceful shutdown and wait for both listeners to stop.
     ///
-    /// Sends a shutdown signal, then waits up to 5 seconds for the server task
-    /// to finish.  Returns [`BridgeShutdownError::Timeout`] if the task does
-    /// not stop within the deadline, or [`BridgeShutdownError::JoinFailed`] if
-    /// the task panicked.
+    /// Sends a shutdown signal, then waits up to 5 seconds for both listener
+    /// tasks to finish.  Returns [`BridgeShutdownError::Timeout`] if they do
+    /// not stop within the deadline, in which case both are aborted, or
+    /// [`BridgeShutdownError::JoinFailed`] if a task panicked or ended with an
+    /// I/O error.
     ///
     /// # Errors
     ///
-    /// - [`BridgeShutdownError::Timeout`] — the server task did not stop
-    ///   within 5 seconds.
-    /// - [`BridgeShutdownError::JoinFailed`] — the server task panicked.
+    /// - [`BridgeShutdownError::Timeout`]: the listeners did not stop within
+    ///   5 seconds.
+    /// - [`BridgeShutdownError::JoinFailed`]: a listener task panicked or
+    ///   ended with an I/O error.
     pub async fn shutdown(self) -> Result<(), BridgeShutdownError> {
-        // Signal the server to stop.  If the receiver has already dropped
-        // (e.g. the server task exited early), that is not an error.
-        let _ = self.shutdown_tx.send(());
-
-        // Wait for the server task to finish, with a timeout.
-        match tokio::time::timeout(SHUTDOWN_DEADLINE, self.join_handle).await {
+        self.server.shutdown();
+        match tokio::time::timeout(SHUTDOWN_DEADLINE, self.server.join()).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(join_err)) => Err(BridgeShutdownError::JoinFailed {
                 detail: join_err.to_string(),
@@ -305,13 +318,13 @@ impl BridgeHandle {
 
 /// Start the WebAuthn browser-handoff bridge HTTP server.
 ///
-/// Binds to `bind_addr` (typically `127.0.0.1:0` for a random loopback port),
-/// builds the axum router with the full middleware stack, and spawns a
-/// server task. IPv6 loopback binds are accepted by the runtime loopback
-/// guard; wallet-emitted browser URLs still use `localhost` to preserve
-/// WebAuthn RP-ID binding, and the Host-header allowlist also accepts
-/// `[::1]:<port>`. Returns a [`BridgeHandle`] giving the actual bound address
-/// and a graceful-shutdown handle.
+/// Uses only the port of `bind_addr` (typically `127.0.0.1:0` for a random
+/// loopback port) and binds `127.0.0.1` and `[::1]` on it, builds the axum
+/// router with the full middleware stack, and serves it on both listeners.
+/// Wallet-emitted browser URLs use `localhost` to preserve WebAuthn RP-ID
+/// binding, and a browser may reach either loopback address for that name,
+/// so both are held for the life of the bridge. Returns a [`BridgeHandle`]
+/// giving the IPv4 address and a graceful-shutdown handle.
 ///
 /// # State ownership
 ///
@@ -326,8 +339,9 @@ impl BridgeHandle {
 /// - [`BridgeStartError::NonLoopbackBind`] — `bind_addr.ip()` is not a
 ///   loopback address.  The bridge enforces loopback-only at runtime as a
 ///   defence-in-depth measure on top of the loopback-only bind invariant.
-/// - [`BridgeStartError::Bind`] — `TcpListener::bind(bind_addr)` failed (OS
-///   error, port already in use, etc.).
+/// - [`BridgeStartError::LoopbackPair`]: `127.0.0.1` and `[::1]` could not
+///   both be held on the port (port already in use on either family, a host
+///   without IPv6 loopback, etc.).
 ///
 /// # Examples
 ///
@@ -379,10 +393,14 @@ pub async fn start_bridge_register_only(
 /// `/approve/<nonce>/assertion` handler can resolve the registered credential
 /// public key before running `pre_verify_assertion`.
 ///
+/// Uses only the port of `bind_addr` and binds `127.0.0.1` and `[::1]` on
+/// it, as [`start_bridge_register_only`] describes.
+///
 /// # Errors
 ///
-/// Returns [`BridgeStartError`] when `bind_addr` is not loopback or the TCP
-/// listener cannot be bound.
+/// Returns [`BridgeStartError::NonLoopbackBind`] when `bind_addr` is not
+/// loopback and [`BridgeStartError::LoopbackPair`] when both loopback
+/// addresses cannot be held on its port.
 #[instrument(skip(approval_store, pubkey_lookup), fields(bind_addr = %bind_addr))]
 pub async fn start_bridge_with_pubkey_lookup(
     approval_store: Arc<Mutex<PendingApprovalStore>>,
@@ -395,15 +413,12 @@ pub async fn start_bridge_with_pubkey_lookup(
         return Err(BridgeStartError::NonLoopbackBind { addr: bind_addr });
     }
 
-    // Bind the TCP listener before spawning the task so bind errors surface
-    // immediately to the caller (before any async work).
-    let listener = TcpListener::bind(bind_addr)
+    // Hold both loopback families on the port before serving anything, so
+    // bind errors surface immediately to the caller.
+    let pair = LoopbackPair::bind(bind_addr.port())
         .await
-        .map_err(|source| BridgeStartError::Bind { source })?;
-
-    let local_addr = listener
-        .local_addr()
-        .map_err(|source| BridgeStartError::Bind { source })?;
+        .map_err(BridgeStartError::LoopbackPair)?;
+    let local_addr = pair.v4_addr();
 
     // Build the router with all Clone-capable middleware layers applied.
     let router = build_router(approval_store, pubkey_lookup, local_addr, page_identity);
@@ -412,37 +427,14 @@ pub async fn start_bridge_with_pubkey_lookup(
     // here: tower's `ConcurrencyLimit` / `RateLimit` services are not `Clone`
     // and cannot be applied at `Router::layer`; see the crate-level docs.
 
-    // Oneshot channel: sending () triggers graceful shutdown.
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
-    // Spawn the server task.
-    let join_handle = tokio::spawn(async move {
-        let serve_result = axum::serve(listener, router.into_make_service())
-            .with_graceful_shutdown(async move {
-                // Await the shutdown signal; if the sender drops without
-                // sending, treat that as a shutdown request too.
-                let _ = shutdown_rx.await;
-            })
-            .await;
-
-        if let Err(err) = serve_result {
-            tracing::error!(
-                error.message = %err,
-                "bridge server task exited with error"
-            );
-        }
-    });
+    let server = pair.serve(router);
 
     tracing::info!(
         local_addr = %local_addr,
         "bridge HTTP server started"
     );
 
-    Ok(BridgeHandle {
-        local_addr,
-        shutdown_tx,
-        join_handle,
-    })
+    Ok(BridgeHandle { local_addr, server })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -477,14 +469,15 @@ fn build_router(
     local_addr: SocketAddr,
     page_identity: PageIdentity,
 ) -> Router {
-    // TraceLayer: path-only logging (never full URI), so query strings and body
-    // bytes are never emitted.
+    // TraceLayer: records the matched route template, never the request path
+    // (which carries the registration or approval nonce), the query string or
+    // body bytes.
     let trace_layer = TraceLayer::new_for_http().make_span_with(
         |request: &axum::http::Request<axum::body::Body>| {
             tracing::info_span!(
                 "bridge_request",
                 method = %request.method(),
-                path = request.uri().path(),
+                path = stellar_agent_loopback_http::request_trace::route_label(request),
             )
         },
     );
@@ -504,6 +497,7 @@ fn build_router(
         approval_store,
         pubkey_lookup,
         identity: Arc::new(page_identity),
+        expected_origin: Arc::from(format!("http://localhost:{}", local_addr.port())),
     };
 
     routes::build_router()
@@ -636,25 +630,91 @@ mod tests {
         handle.shutdown().await.expect("shutdown should succeed");
     }
 
-    // IPv6 loopback address is_loopback() returns true; verify it is accepted
-    // by start_bridge_register_only (the bind itself may fail if IPv6 is unavailable).
+    /// `GET /healthz` over `addr` the way a browser at
+    /// `http://localhost:<port>` sends it.
+    async fn healthz_over(addr: SocketAddr) -> reqwest::Response {
+        reqwest::Client::builder()
+            .build()
+            .expect("reqwest client")
+            .get(format!("http://{addr}/healthz"))
+            .header("Host", format!("localhost:{}", addr.port()))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{addr} must answer: {error}"))
+    }
+
+    /// The registration and signing URLs name `localhost`, so the bridge
+    /// holds `127.0.0.1` and `[::1]` on one port: both answer, no other
+    /// socket can bind `[::1]` there, and shutdown releases both. An IPv6
+    /// bind address uses its port the same way.
     #[tokio::test]
-    async fn ipv6_loopback_is_accepted_if_available() {
-        let (store, _dir) = test_store();
-        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
-        match start_bridge_register_only(store, addr, PageIdentity::neutral()).await {
-            Ok(handle) => {
-                // IPv6 available: verify it is loopback.
-                assert!(handle.local_addr().ip().is_loopback());
-                handle.shutdown().await.expect("clean shutdown");
+    async fn the_bridge_binds_both_families_on_one_port() {
+        for bind_addr in [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        ] {
+            let (store, _dir) = test_store();
+            let handle = start_bridge_with_pubkey_lookup(
+                store,
+                bind_addr,
+                Arc::new(MissingApprovalPubkeyLookup),
+                PageIdentity::neutral(),
+            )
+            .await
+            .expect("both loopback families are available");
+            let port = handle.local_addr().port();
+            let ipv4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+            let ipv6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port);
+            assert_eq!(handle.local_addr(), ipv4);
+            for addr in [ipv4, ipv6] {
+                assert_eq!(healthz_over(addr).await.status().as_u16(), 200, "{addr}");
             }
-            Err(BridgeStartError::Bind { .. }) => {
-                // IPv6 unavailable on this host — acceptable.
-            }
-            Err(other) => {
-                panic!("unexpected error for IPv6 loopback: {other}");
+            assert_eq!(
+                std::net::TcpListener::bind(ipv6).unwrap_err().kind(),
+                std::io::ErrorKind::AddrInUse,
+                "no other socket can bind [::1]:{port}"
+            );
+            handle.shutdown().await.expect("clean shutdown");
+            for addr in [ipv4, ipv6] {
+                assert!(
+                    tokio::net::TcpStream::connect(addr).await.is_err(),
+                    "{addr} closed after shutdown"
+                );
             }
         }
+    }
+
+    /// A held port makes the bridge refuse with the pair's refusal as
+    /// `BridgeStartError::LoopbackPair`, unchanged.
+    ///
+    /// The test holds `127.0.0.1:<port>` for the whole call, and the pair
+    /// binds IPv4 first, so the refusal names IPv4 whatever other sockets
+    /// hold. The tests of `stellar_agent_loopback_http::loopback_pair` prove
+    /// the pair's IPv6 refusal and its release of the IPv4 listener.
+    #[tokio::test]
+    async fn the_bridge_refuses_when_its_port_is_held() {
+        let competitor = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = competitor.local_addr().unwrap().port();
+        let (store, _dir) = test_store();
+        let err = start_bridge_register_only(
+            store,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            PageIdentity::neutral(),
+        )
+        .await
+        .expect_err("the bridge must refuse while 127.0.0.1 is held");
+        match err {
+            BridgeStartError::LoopbackPair(pair) => assert_eq!(
+                pair,
+                PairBindError::PortUnavailable {
+                    port,
+                    family: LoopbackFamily::V4,
+                    kind: std::io::ErrorKind::AddrInUse,
+                }
+            ),
+            other => panic!("expected a loopback pair refusal, got: {other}"),
+        }
+        drop(competitor);
     }
 
     // ─── ApprovalPubkeyLookupError ────────────────────────────────────────────
@@ -704,5 +764,190 @@ mod tests {
             matches!(result, Ok(None)),
             "empty registry must return Ok(None), got: {result:?}"
         );
+    }
+
+    // ─── Request tracing ─────────────────────────────────────────────────────
+
+    /// Records every span and event field as one text line.
+    #[derive(Clone, Default)]
+    struct TraceLines {
+        lines: Arc<std::sync::Mutex<Vec<String>>>,
+        next_id: Arc<std::sync::Mutex<u64>>,
+    }
+
+    struct CollectFields<'a>(&'a mut String);
+
+    impl tracing::field::Visit for CollectFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!(" {}={value:?}", field.name()));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push_str(&format!(" {}={value}", field.name()));
+        }
+    }
+
+    impl tracing::Subscriber for TraceLines {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let mut line = span.metadata().name().to_owned();
+            span.record(&mut CollectFields(&mut line));
+            self.lines.lock().unwrap().push(line);
+            let mut next = self.next_id.lock().unwrap();
+            *next += 1;
+            tracing::span::Id::from_u64(*next)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            let mut line = String::from("record");
+            values.record(&mut CollectFields(&mut line));
+            self.lines.lock().unwrap().push(line);
+        }
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = event.metadata().name().to_owned();
+            event.record(&mut CollectFields(&mut line));
+            self.lines.lock().unwrap().push(line);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// The registration page and its credential POST record their route
+    /// templates: the nonce in the request path never reaches the trace.
+    ///
+    /// The bridge runs on this test's single-threaded runtime, so its request
+    /// spans reach the capture installed as this thread's default.
+    #[tokio::test(flavor = "current_thread")]
+    async fn registration_trace_redacts_nonce() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use stellar_agent_approval_ui::operator_enroll::test_support::SoftwareRegistrar;
+        use stellar_agent_core::approval::{
+            ApprovalKind, generate_csrf_token, store::PendingApproval,
+        };
+
+        let (store, _dir) = test_store();
+        let csrf = generate_csrf_token();
+        let entry = PendingApproval::new_register_passkey_pending(
+            "CAAAA...BBBBB".to_owned(),
+            vec![1_u32],
+            csrf,
+            "localhost".to_owned(),
+            [0xcc_u8; 32],
+            "test-proc-uid".to_owned(),
+            300_000,
+        )
+        .unwrap();
+        let nonce = entry.approval_nonce.clone();
+        let ApprovalKind::RegisterPasskey {
+            registration_challenge: Some(challenge),
+            ..
+        } = entry.kind
+        else {
+            panic!("a fresh registration entry carries a challenge");
+        };
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        store.lock().await.insert(entry, now_ms).unwrap();
+
+        // Registered before the capture and held while it is installed, so
+        // callsite interest is computed from every registered dispatcher.
+        let inert = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let capture = TraceLines::default();
+        let default = tracing::subscriber::set_default(capture.clone());
+        tracing::callsite::rebuild_interest_cache();
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let handle = start_bridge_register_only(Arc::clone(&store), addr, PageIdentity::neutral())
+            .await
+            .unwrap();
+        let local = handle.local_addr();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let page = client
+            .get(format!("http://{local}/register/{nonce}"))
+            .header("Host", local.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status().as_u16(), 200);
+
+        let registrar = SoftwareRegistrar::new([0x11; 32], vec![0x42; 16]);
+        let builder = registrar.builder(&challenge, &format!("http://localhost:{}", local.port()));
+        let credential_id = registrar.credential_id_b64url();
+        let payload = serde_json::json!({
+            "id": credential_id,
+            "rawId": credential_id,
+            "type": "public-key",
+            "response": {
+                "clientDataJSON": URL_SAFE_NO_PAD.encode(builder.client_data_json()),
+                "attestationObject": URL_SAFE_NO_PAD.encode(builder.attestation_object()),
+                "publicKeySec1B64": STANDARD.encode(registrar.public_key_sec1()),
+                "transports": ["internal"]
+            }
+        });
+        let posted = client
+            .post(format!("http://{local}/register/{nonce}/credential"))
+            .header("Host", local.to_string())
+            .header("Origin", format!("http://{local}"))
+            .header("X-Stellar-Approval-CSRF", hex::encode(csrf))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(posted.status().as_u16(), 200);
+
+        handle.shutdown().await.unwrap();
+        drop(default);
+        drop(inert);
+
+        let lines = capture.lines.lock().unwrap().clone();
+        let paths: Vec<&str> = lines
+            .iter()
+            .filter(|line| line.starts_with("bridge_request "))
+            .filter_map(|line| {
+                line.split(' ')
+                    .find_map(|field| field.strip_prefix("path="))
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            ["/register/{nonce}", "/register/{nonce}/credential"],
+            "{lines:?}"
+        );
+        for line in &lines {
+            assert!(!line.contains(&nonce), "nonce in trace: {line}");
+            assert!(
+                !line.contains(&format!("/register/{nonce}")),
+                "request path in trace: {line}"
+            );
+        }
     }
 }

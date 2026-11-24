@@ -1,6 +1,9 @@
 # Security policy
 
-This is the security policy for the Stellar Agent Wallet — a Stellar wallet for AI agents,
+See [Mainnet configurations and scope](docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
+This is the security policy for the Stellar Agent Wallet, a Stellar wallet for AI agents,
 shipping the `stellar-agent` CLI binary and the `stellar-agent-mcp` MCP stdio server.
 It covers which versions are supported, how to report a vulnerability, the scope of the
 current public alpha, and a high-level summary of the security model.
@@ -32,12 +35,22 @@ Please include:
 - A description of the vulnerability and its impact.
 - Steps to reproduce, including any required profile configuration or environment.
 - The affected version or commit (the `0.1.x` build, or the source commit you built from).
-- Any proof-of-concept input, log excerpt, or transaction envelope — with secrets redacted.
+- Any proof-of-concept input, log excerpt, or transaction envelope, with secrets redacted.
 
 Do not include real secret seeds, private keys, or keyring secrets in a report. The
 wallet never logs secret material or raw argument values, and reports should follow the same
 discipline; a redacted strkey or a SHA-256 digest is enough to identify an affected
 account or envelope.
+
+Errors, guidance, logs, MCP stderr and CLI output name the rejected argument,
+field, line, position or check and never repeat the rejected value. This rule
+covers policy semantics, credential names and registries, endpoint URLs and
+configuration values as well as validation, profile, migration and trust-set
+errors. A profile name that resolves to no profile and a policy key outside the
+policy schema are rejected values too: the refusal and its log event name the
+failure class, or the key's location and the keys accepted there. A seed or
+credential typed into the wrong place stays out of diagnostics.
+A profile, policy, halt-marker, or credential-registry syntax error reports its line and column.
 
 We handle reports under coordinated disclosure and aim to acknowledge and triage valid
 reports in good faith as promptly as we can. We will keep you informed as we
@@ -48,42 +61,145 @@ before any public disclosure.
 
 Keep the following properties of the current alpha in mind when assessing impact.
 
-- Writes and signing are testnet-only. Read-only commands accept both
-  `stellar:testnet` and `stellar:mainnet`, but every write and signing surface
-  structurally refuses `stellar:mainnet` with wire code `network.mainnet_write_forbidden`,
-  except MPP, which refuses with `mpp.network_forbidden`. There are no consent-gated
-  mainnet write exceptions. Commands that take `--network` refuse before any RPC call
-  or signing. The CLI write commands, including `vault deposit`, `vault withdraw`,
-  `trade`, `trustline`, and `pool init`, refuse a mainnet profile before signer access
-  and any RPC call. `smart-account rules verify-pins`, `smart-account signers list`, and
-  `smart-account signers refresh` keep their local audit writes but load no signer, sign
-  nothing, and write nothing on chain, so they accept a mainnet profile. The MCP DeFi,
-  sign-and-submit, commit, and rule-commit tools refuse it at entry, before the policy
-  gate and any RPC request. At the submit layer, which every write goes through
-  including the profile-driven flows, a declared mainnet network passphrase and a known
-  mainnet RPC URL are each refused at zero RPC cost. Beyond those two the endpoint is
-  asked which network it serves, that answer is authoritative over the declaration, and
-  every signature on the envelope must verify under that network's id.
-  Friendbot funding is scoped to
-  `testnet` and `futurenet` and structurally refuses `mainnet`
-  (`network.friendbot_mainnet_forbidden`).
+- Released binaries have `mainnet-write` on. With the feature on, only a typed
+  authorization issued for the action can satisfy the mainnet-write guard, and
+  the binary attests its feature state. A build with `--no-default-features`
+  has the feature off, and no code path in it can satisfy the guard.
+  The guarantee has one precondition: the claim holds only under the dependency
+  set pinned and verified by the release.
+  Feature-enabled builds admit only configured operations. An `allow` rule signs
+  under policy authority, and a `require_approval` rule needs a verified
+  per-action approval.
+  Policy evaluation alone grants no signing authority. Signing, submission, and
+  x402 payload release independently check sealed authorization.
+  Signing first claims the authorization in the window state. An authorization
+  invalidated or expired before its claim never reaches a signer. After the claim
+  its spend stays counted until it is consumed or leaves the spending windows,
+  because changing a local record cannot withdraw a produced signature.
+  A signature that returns after the authorization's lifetime is discarded.
+  A signer that refuses or fails after the claim leaves the spend counted, and
+  an identical retry waits for the record's expiry.
+  The wallet's own signing paths sign mainnet payloads only under mainnet
+  authorization. The library signers enforce it too: every `Signer`, the
+  public keyring handle included, signs a mainnet transaction or Soroban
+  authorization payload only under a mainnet authorization.
+  Code running as the same OS user with access to a keyring entry can read its
+  seed directly. The keyring entry is the custody boundary.
+  The endpoint's network binds each envelope signature.
+  Read-only commands accept both `stellar:testnet` and `stellar:mainnet`.
+  Every MPP tool refuses mainnet with `mpp.network_forbidden`.
+  `smart-account rules verify-pins`, `smart-account signers list`, and `smart-account signers refresh` retain
+  local audit writes without signing or writing on chain. Friendbot funding is
+  scoped to testnet and futurenet and refuses mainnet with
+  `network.friendbot_mainnet_forbidden`.
+
 - The threat model centers on an autonomous agent transacting under wallet guardrails:
   a policy engine, an out-of-band operator-approval spine, and a tamper-evident audit
-  log. Reports that demonstrate an agent escaping or bypassing these guardrails — for
-  example, executing a signing action that should have been denied, forced to approval,
-  or recorded — are in scope and of high interest.
-- A report that lets an autonomous agent reach `stellar:mainnet` for a write or signing
-  action, despite the structural refusal, is in scope.
+  log. Reports that demonstrate an agent escaping or bypassing these guardrails are in
+  scope and of high interest. An example is a signing action that runs when it should
+  have been denied, forced to approval, or recorded.
+- Unauthorized mainnet signing, payload release, or submission is a reportable
+  violation.
 
 Out of scope: defects in your own keyring backend, operating system, RPC endpoint, or
 anchor; and issues that require already holding the wallet's keyring secrets (the seed,
-nonce key, or HMAC keys), since custody of those secrets is the security boundary.
+nonce key, or HMAC keys), since custody of those secrets is the security boundary. On
+mainnet the attestation HMAC key alone mints no consent: a mainnet approval also needs
+a verified passkey assertion from an approval credential in the owner-signed policy.
+Two residues remain. A same-user process that holds the HMAC key can wrap a version 5 or version 6
+record around a user-verified assertion that its own localhost page obtained, so a
+misleading local page is a residue.
+Signed-origin receipts instead bind the verified policy, HTTPS origin and served leaf SPKI pin. The owner seed admits approval credentials, so
+signing the policy on a host where same-user code runs exposes that seed.
+
+For code running as the same OS user, the owner of an enabled mainnet profile
+changes only with a statement signed by the previous owner. A verified policy
+load requires that statement for a new owner; no public function of a build
+without the `test-helpers` feature writes a pin the caller composes. The policy
+pin and the enablement nonce that carry this continuity sit at the profile's
+default window-state entry, and a mainnet profile that names another entry is
+refused.
+Raw deletion or replacement of the pin, enablement, and owner entry outside
+the wallet rests on the platform keyring.
+
+The owner-signed policy of an enabled mainnet profile names both endpoints a
+mainnet signature trusts: the primary RPC host and the oracle host whose
+cross-check witness guards against a lying primary. Enablement refuses a
+profile whose stored or merged RPC or oracle URL names another host, and a
+mainnet signature accepts a witness only from the signed oracle host. A
+mainnet write builds its post-send oracle client only for the signed oracle
+host. On mainnet, a step that reconciles, recovers, releases or clears a submission
+runs only after the enablement verifies in the same process, with clients
+built from the verified profile. That covers the value verbs' reconcile
+pass, `tx status`, `tx receipt clear`, and an MCP server's status tool and
+gate pass, which add the per-call freshness check. A mainnet profile without
+an enablement record runs none of these steps, and `tx receipt clear`
+refuses on it. A same-user process that edits the profile file therefore
+cannot redirect either endpoint of a signature or a settlement without the
+owner's signature. Of the witness inputs, the
+owner signs the oracle host and the per-asset cross-check thresholds. For an
+asset the signed thresholds name, a profile threshold can only lower the
+amount that requires a witness. On mainnet, for an asset the signed thresholds
+do not name, XLM and its SAC use 1000 XLM, and every other asset has no
+threshold and refuses. The
+oracle URL's scheme, path, and credentials and the oracle provider record are
+unsigned profile fields.
+
+The identity record beside an enrolled signer's seed names the profile, chain
+and owner it serves, signed by that owner. On mainnet the wallet signs only
+for that profile under that owner, and message signing on any chain refuses
+a signer bound to another profile. Binding or rebinding a signer needs the
+owner's seed; the signer's own seed never proves its binding.
+
+Mainnet consent requires a fresh WebAuthn assertion with user presence and user
+verification from a credential in the owner-signed policy. The assertion binds the
+exact consent, request, profile, chain and policy. The wallet verifies it before
+recording consent and again before mainnet authorization. Terminal input and a
+same-user process identity provide no mainnet presence proof.
+
+A classic mainnet envelope carries an on-chain deadline. Consent to a payment,
+claim, trustline, or account creation covers the operation's stored intent, and
+the wallet then rebuilds the envelope with a deadline at most 120 seconds ahead.
+Consent to a stored envelope covers the deadline that envelope carries. The authorization expires no later than that deadline, and the
+network refuses the signed transaction after it. The authorization lifetime bounds
+when the wallet sends; the deadline bounds when the chain applies.
+
+User verification is the authenticator's signed statement that its configured
+verification ceremony succeeds. It does not prove that a human reads or understands
+the transaction. The browser displays the transaction; the authenticator need not
+display it. Credential enrollment verifies a registration response and a terminal code,
+and the owner admits the public key by signing the policy. The wallet does not certify
+authenticator hardware.
+Localhost ceremonies record counters without enforcing them.
+Signed-origin login and decisions enforce increasing counters, allowing zero after zero.
+This check does not guarantee clone detection.
+
+These checks constrain actions through the wallet. Same-user code with an extracted
+signing seed can sign outside those paths. Protection of authenticator private keys,
+user-verification prompts, browser integrity and platform keyring items rests on the
+platform. Raw deletion or restoration of keyring state outside wallet commands also
+rests on the platform. A compromised authenticator or browser, a misleading approval
+page outside the wallet, or an operator approving an unwanted request can defeat the
+intended consent. The wallet requires the signed proof and does not claim an
+operating-system security boundary against all same-user code.
+
+Without a signed approval origin, mainnet consent uses the localhost passkey page.
+Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+Without a display, mainnet consent needs `--open-by-operator`, which prints the localhost URL for the operator to open.
+With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
+The CLI prints the signed approval link without opening a browser or requiring a display.
+Ledger signing also requires this passkey ceremony and the enrolled signer identity.
+`profile enroll-signer` takes `--secret-env` only, so it cannot enroll a key that exists only on a Ledger.
+
+A localhost ceremony binds `127.0.0.1` and `[::1]` on one port before it
+creates any token, serves the same session on both, and closes both together.
+When either family cannot be held, the ceremony does not start.
 
 ## Security model summary
 
 For the full design see [docs/concepts.md](docs/concepts.md) and
-[docs/maintainers/security-internals.md](docs/maintainers/security-internals.md). Key
-properties:
+[docs/maintainers/security-internals.md](docs/maintainers/security-internals.md). The model has
+these properties:
 
 - Keyring custody. The signing seed, the nonce key, and the HMAC keys live in the
   platform keyring. A profile is a per-environment TOML config that names keyring entries
@@ -91,28 +207,56 @@ properties:
   URL can embed a credential in its path or query on any network. Mainnet refuses only
   a username or password in the URL. Profile TOML is safe to back up only when no
   endpoint URL embeds a credential.
-- Unlock window with zeroize and mlock. When a CLI command signs with a seed read from a
-  `--*-secret-env` variable, the 32-byte seed is loaded into an unlock window. The window
-  is a short, TTL-bounded period (default 30s, hard cap 600s) during which the seed is
-  resident in pinned, zeroize-on-drop memory (`mlock`). On every drop path (normal
-  return, error propagation, or panic) the seed is zeroized and the lock released.
+- Unlock window with zeroize and mlock. CLI environment signing copies the
+  borrowed seed into an isolated home after the configured lock attempt.
+  The clock bounds wallet seed access and transfer, default 30 seconds, cap 600.
+  When the lock succeeds, the seed and the signing key built from it stay in
+  one locked, zeroize-on-drop page while their wallet or signer holds them.
+  That page is not written to swap, but a hibernation image of the whole memory
+  still holds it. Drop zeroizes the key and seed before unlocking and freeing,
+  including during unwind. The owner ceremony clears its parsing buffer before
+  the signing operation runs. Copies that the strkey parser, signing library,
+  and compiler make while a key is built or read or a signature is computed are
+  not locked and are zeroized where those libraries allow. The wallet does not
+  claim that no copy of a seed reaches swap.
+  Testnet environment signers keep the seed for the command, which can outlast
+  the TTL.
+  An exported seed stays in the environment of the process and of every process
+  the shell starts, for their whole life; copying and dropping it inside the wallet
+  does not erase it. Mainnet transaction signing refuses `--secret-env` and signs with the
+  enrolled seed in the keyring or with a Ledger that holds the enrolled key. On Linux the CLI marks itself
+  non-dumpable before it starts any thread, so other processes of the same user
+  cannot read its memory or environment or attach to it; the shell that exported
+  the variable is not protected. On macOS and Windows the CLI sets no such flag.
   Keyring signers, the Ledger, and the MCP server never enter the window. A keyring
   signer loads its key for each signature into a zeroize-on-drop buffer without a
   memory lock.
 - Policy engine plus operator approval. The MCP dispatch gate and the CLI value-moving
   verbs evaluate each action to Allow, Deny, or RequireApproval. Read-only CLI commands
-  such as `balances` evaluate no policy. The Noop engine allows everything on testnet, allows read-only on
-  mainnet, and refuses mainnet destructive actions (`policy.engine_required`); the V1
-  engine evaluates signature-verified typed criteria with first-match default-deny. When
+  such as `balances` evaluate no policy. The Noop engine allows every testnet action except `smart-account multicall`, allows read-only
+  actions on mainnet, and refuses that command and mainnet destructive actions (`policy.engine_required`); the V1
+  engine evaluates signature-verified typed criteria with first-match default-deny.
+  A verified policy alone does not confer mainnet authorization. When
   approval is required, the action is recorded in a per-profile pending-approval store and
   released only when the operator runs `approve`, which mints an HMAC-SHA256 attestation
   proving the keyring holder approved it. The attestation is constant-time verified and
-  binds the approval nonce, the envelope SHA-256, and the OS process uid.
+  binds the profile, the chain, the approval nonce, the envelope SHA-256, and the OS
+  process uid. A mainnet approval is a version 5 attestation over the envelope, or a
+  version 6 attestation over the canonical intent digest. Both also bind a verified passkey assertion from
+  an approval credential in the owner-signed policy; terminal input and the HMAC key
+  alone record no mainnet consent.
+- Conservative submission accounting. Signed exposure occupies capacity through
+  its execution deadline and every affected spending window. Endpoint failure,
+  absence, and reported timestamps cannot refund possible spending. Untimed
+  exposure requires an explicit recorded acknowledgement before capacity clears.
 - Tamper-evident audit log. Approvals, submission lifecycle events, and explicit
   authorization, key-management, and lifecycle events are appended to a per-profile
   hash-chained JSONL audit log. A balance read writes no row.
   The raw argument map is recorded as key names only. Typed value events retain each
-  leg's amount, asset, and redacted destination. The chain is verified end-to-end with `audit verify`. The value-moving signing and
+  leg's amount, asset, and redacted destination. Once the log holds its
+  `audit_entry_tags_started` boundary row, every entry carries a keyed entry tag
+  derived from the profile's audit key. The chain is verified end-to-end with `audit verify`;
+  `audit verify --profile` checks the chain and the entry tags. The value-moving signing and
   submitting verbs are `pay`, `claim`, `accounts create`, `trustline`, `trade`,
   `vault`, the x402 payment tools, and the MPP charge commit. Each proves its audit writer
   is acquirable BEFORE the signing key is touched or a transaction is submitted. It refuses
@@ -121,14 +265,78 @@ properties:
   `pay`, `claim`, and `accounts create` fall back to the zero-config synthesized profile
   when no profile was named and no `default.toml` file exists. That profile stays
   fail-open for this check, matching its documented no-profile-required posture. The SEP-43 sign-only pair (`signTransaction`,
-  `signAuthEntry`) runs the same pre-flight and records an
+  `signAuthEntry`) and the SEP-43 and SEP-53 message-signing tools run the same pre-flight and record an
   `opaque_payload_signed` audit row when the signature is produced. The x402 tools
   write `x402_payment_authorized` before the signed authorization leaves the wallet in
   the RPC re-simulation, and withhold it when that row cannot be written. An approval or
   rejection takes effect only after its audit row is durable, in the log or in the
   log's outbox. A queued row reaches the log before the consumer of the approval loads
-  a signing key.
+  a signing key. A queue without owner state commits its rows by count and
+  SHA-256 chain head in the platform keyring, and only committed operator rows
+  drain. A removed, changed, or reordered committed row, a line past the
+  commitment, or a committed row of another kind refuses keyed acquisition until
+  `audit acknowledge-outbox-loss` records the loss. The command first removes
+  decided, unexpired approvals from the approval inbox and revokes toolset
+  grants. A queue under owner state authenticates each row by its tag and
+  commits delivered batches. A dropped tail of queued rows that carry no
+  reference, such as halt and resume rows, is not detected before delivery.
+  A queued mainnet consent row carries a reference, and a commit whose consent
+  row was not delivered refuses with `approval.consent_undelivered`. An absent outbox state reads as zero;
+  raw deletion or restore of that keyring entry shares the boundary below.
+  Every append, drain and keyed writer locks the lock files whose identities the
+  keyring records for the log, and refuses a lock file that is not the recorded
+  one, so a renamed or replaced lock file cannot admit a second holder.
+  `audit bind-carriers` records them and starts a new outbox generation; a holder
+  of an earlier generation cannot change the new generation's queue without the
+  change refusing keyed acquisition.
+  The queue commitment does not authenticate who appended a row.
+- Code running as the same OS user. Such code can write the audit log and the wallet's
+  files. The wallet detects an edited or removed entry in the active log or in any
+  retained archive, a removed or substituted archive, a removed or forged prune
+  marker, a log rolled back or truncated behind the tip anchor the keyring holds,
+  a deleted anchor on a log that shows it was anchored (`audit.tip_anchor_missing`),
+  and a changed audit binding.
+  For an empty active file, only a surviving sidecar establishes prior anchoring.
+  A keyed writer checks the whole retained history when it opens and at every
+  keyed acquisition, so these conditions refuse value-moving verbs. After investigation, `audit reanchor`
+  accepts an intact prefix and records the acknowledgement; it refuses a broken chain.
+  Profile verification checks the chain and HMAC sidecars before anchor agreement,
+  unless the missing-anchor rule applies after an unkeyed chain walk. Past the
+  boundary row, an appended entry without a valid entry tag is refused by keyed
+  writers (`audit.tip_anchor_mismatch`, reason `unauthenticated_tail`) and by
+  `audit verify --profile` (`audit.entry_tag_invalid`), and readers stop at the
+  writer's verified tip. Still open: code that can read the audit key can compute
+  valid tags, rows before the boundary row rest on the anchor alone, `audit verify`
+  without `--profile` checks no tag, and zero-config logs carry no tags. Under
+  owner state, a same-user process with file access and no audit key can drop
+  a tail of queued rows that carry no reference, such as halt and resume rows,
+  and the next drain and `audit verify --profile` do not detect it. Raw
+  deletion or restore of platform keyring items outside the wallet, together with a
+  matching log, rests on the platform keyring's own access control. A headless keyring
+  backend keeps those items in a file that same-user code can restore, so mainnet
+  readiness and `profile enable-mainnet` refuse it
+  (`network.mainnet_keyring_backend_unsupported`).
 
 The core library compiles under `#![forbid(unsafe_code)]`. Logging redaction is enforced
 throughout: secret material is never written to logs, and account, strkey, and
 transaction-hash fields are truncated at the output boundary.
+
+## Retained smart-account charges
+
+A bounded invocation charge closes when a later policy check or admission witnesses both profile endpoints above every authorization and envelope bound.
+
+Only the endpoints stored in the profile authorize charge closure. Endpoint overrides can bound signatures but cannot close charges.
+
+Environment variables and programmatic overlays do not change which endpoints authorize charge closure.
+
+A schedule charge closes when both endpoints, above every authorization expiration, report its operation done or unset.
+
+Intents without an authenticated purpose remain open. Calls whose authorization tree names `approve`, `increase_allowance` or `approve_for_all` retain their charges without closure by authorization expiry.
+
+Timelock envelopes carry an exact maximum ledger before signing. The maximum ledger is exclusive.
+
+Each queried window counts a closed charge through the later of its observation plus that window and its admitted accounting horizon.
+
+A closed intent record remains until more than one week has passed since its observation.
+
+Snapshots containing signed intents or intent links require version 9 or later, and every committed write uses version 18. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.

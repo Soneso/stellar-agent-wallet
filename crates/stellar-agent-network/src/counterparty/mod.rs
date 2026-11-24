@@ -9,7 +9,7 @@
 //! | [`parser`] | `toml_edit`-based extraction of SEP-1 fields into [`parser::MinimalSep1`] |
 //! | [`cache`]  | HMAC-protected per-profile cache; [`cache::StellarTomlResolver`] implements the trait |
 //! | [`validation`] | Shared lowercase LDH `home_domain` validation façade |
-//! | [`lock`]   | OFD-advisory single-writer flock (`std::fs::File::try_lock`) |
+//! | `lock`     | OFD-advisory single-writer flock (`std::fs::File::try_lock`) |
 //!
 //! # Threat model boundary
 //!
@@ -70,15 +70,13 @@ pub use validation::is_valid_ldh_home_domain;
 ///
 /// Callers can match these variants directly instead of inspecting
 /// free-form parser detail strings.
+/// No variant stores a rejected value read from the stellar.toml document.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CounterpartyKindParseError {
     /// The TOML kind field contained an unrecognised discriminator string.
-    #[error("unknown counterparty kind: {kind}")]
-    UnknownKind {
-        /// Unknown kind string from the TOML input.
-        kind: String,
-    },
+    #[error("unknown counterparty kind")]
+    UnknownKind,
 
     /// A recognised kind omitted a field required to interpret that kind.
     #[error("missing required field for kind '{kind}': {field}")]
@@ -90,18 +88,10 @@ pub enum CounterpartyKindParseError {
     },
 
     /// A kind-related TOML field was present but had an invalid value.
-    #[error("invalid field value for {field}: {value}")]
+    #[error("invalid value for {field}")]
     InvalidValue {
         /// TOML field name.
         field: String,
-        /// Sanitised representation of the offending value.  Control characters
-        /// are replaced with `?` and the rendered length is capped at 64 chars
-        /// (with a trailing `...` truncation marker if capped).  Safe to embed
-        /// in `tracing` text-formatter output and other operator-facing sinks
-        /// (prevents terminal-injection / log-spoofing via crafted TOML scalars).
-        /// Sanitisation is applied at the `parser.rs` construction sites via
-        /// `sanitize_invalid_value`.
-        value: String,
     },
 }
 
@@ -125,6 +115,7 @@ pub enum CounterpartyKindParseError {
 /// | [`CounterpartyError::HomeDomainInvalid`] | `counterparty.home_domain_invalid` |
 /// | [`CounterpartyError::KeyringUnavailable`] | `counterparty.keyring_unavailable` |
 /// | [`CounterpartyError::KeyMatchesOwnerPublicKey`] | `validation.key_matches_owner_public_key` |
+/// | [`CounterpartyError::InstallationKeyCoordinate`] | `validation.installation_key_coordinate` |
 /// | [`CounterpartyError::Io`] | `counterparty.io` |
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -198,6 +189,12 @@ pub enum CounterpartyError {
         "the key for `counterparty_cache_key` is an owner public key or sits in the owner key namespace"
     )]
     KeyMatchesOwnerPublicKey,
+
+    /// The profile key coordinate names the reserved installation service.
+    #[error(
+        "`counterparty_cache_key_id` names the reserved service `stellar-agent-toolsets` (validation.installation_key_coordinate)"
+    )]
+    InstallationKeyCoordinate,
 
     /// Underlying I/O failure during cache read or write.
     #[error("counterparty cache I/O failed: {kind}")]

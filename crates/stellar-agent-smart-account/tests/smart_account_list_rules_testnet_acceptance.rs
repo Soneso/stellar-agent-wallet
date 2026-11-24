@@ -79,14 +79,9 @@ fn rid() -> String {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 200 for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 fn fresh_signer() -> (String, Box<dyn Signer + Send + Sync>) {
@@ -135,14 +130,14 @@ fn fresh_manager_with_audit_writer(
 ) -> ContextRuleManager {
     let signers_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Arc::clone(&audit_writer),
         audit_log_path,
         TIMEOUT,
     );
     rule_manager_for_tests(
         TESTNET_RPC_URL,
-        None,
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
         signers_manager,
         audit_writer,
         TIMEOUT,
@@ -160,7 +155,7 @@ fn fresh_manager_uncapped_with_audit_writer(
 ) -> ContextRuleManager {
     let signers_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Arc::clone(&audit_writer),
         audit_log_path,
         TIMEOUT,
@@ -168,7 +163,7 @@ fn fresh_manager_uncapped_with_audit_writer(
     ContextRuleManager::new(
         rule_manager_config_for_tests(
             TESTNET_RPC_URL,
-            None,
+            Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
             signers_manager,
             audit_writer,
             TIMEOUT,
@@ -282,6 +277,7 @@ async fn install_rule_with_name_and_valid_until(
 ///     end-to-end at the live RPC for the deleted rule ID.
 #[tokio::test]
 async fn h1_list_rules_across_sparse_id_gap_on_testnet() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Setup: fresh signer + funded account ─────────────────────────────────
     let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
@@ -484,6 +480,7 @@ async fn h1_list_rules_across_sparse_id_gap_on_testnet() {
 /// `TryFromVal<E, Val> for Option<T>` conversion.
 #[tokio::test]
 async fn h2_valid_until_some_decoded_correctly_on_testnet() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // A far-future ledger sequence — large enough that it will not be reached
     // during testnet testing but representable as u32.
     const LARGE_FUTURE_LEDGER: u32 = 999_999_999;
@@ -596,6 +593,7 @@ async fn h2_valid_until_some_decoded_correctly_on_testnet() {
 ///
 #[tokio::test]
 async fn h3_cli_envelope_shape_on_testnet() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Locate the release binary ─────────────────────────────────────────────
     // CARGO_MANIFEST_DIR is the `crates/stellar-agent-smart-account` directory;
     // walk up two levels to reach the workspace root, then descend into the
@@ -691,6 +689,8 @@ async fn h3_cli_envelope_shape_on_testnet() {
     eprintln!("deleted rule {rule_1_id}; sparse-ID gap created");
 
     // ── Invoke the CLI binary ─────────────────────────────────────────────────
+    stellar_agent_test_support::sandbox::require_isolated_executable(&binary)
+        .expect("isolated acceptance child");
     let output = std::process::Command::new(&binary)
         .args([
             "smart-account",

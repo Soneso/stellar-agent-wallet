@@ -15,17 +15,40 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(test)]
+#[path = "../tests/cli/acceptance_storage.rs"]
+mod acceptance_child_fixture;
+#[cfg(all(test, feature = "live-platform-keyring"))]
+use acceptance_child_fixture::route as acceptance_storage;
+#[cfg(all(not(test), feature = "live-platform-keyring"))]
+mod acceptance_storage;
 mod advisory;
 mod commands;
 pub mod common;
+mod process_hardening;
 mod render;
+mod role;
 #[cfg(test)]
 mod test_rpc;
 
+use std::sync::{Arc, LazyLock, Mutex};
+
 use clap::{Parser, Subcommand};
+use stellar_agent_core::audit_log::AuditWriter;
 use stellar_agent_core::observability;
 
 use crate::common::resolve_profile_name;
+
+/// Version value clap prints after the binary name: the package version, then
+/// core's build-state marker on its own line. Built once at runtime because
+/// clap takes a `&'static str` and `concat!` accepts only literals.
+static VERSION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{}\n{}",
+        env!("CARGO_PKG_VERSION"),
+        stellar_agent_core::build_info::MAINNET_WRITE_MARKER
+    )
+});
 
 /// Stellar agent wallet command-line interface.
 ///
@@ -35,7 +58,7 @@ use crate::common::resolve_profile_name;
 #[command(
     name = "stellar-agent",
     author,
-    version,
+    version = VERSION.as_str(),
     about = "Self-custodial Stellar agent wallet CLI",
     long_about = None,
 )]
@@ -47,22 +70,28 @@ struct Cli {
 /// Top-level subcommands.
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Wallet-owned approval spine — interactive y/n for pending approvals.
+    /// Run the MCP stdio server.
+    Mcp(commands::mcp::McpArgs),
+
+    /// Approve a pending approval: a terminal prompt on testnet, a pinned passkey on mainnet.
     ///
     /// Provides:
     /// - `approve --id <nonce> --profile <name>`: read a pending approval from the store,
-    ///   render a wallet-controlled summary, prompt y/n, and on approval
-    ///   compute and record the HMAC attestation blob.
-    /// - `approve --id <nonce> --profile <name> --yes`: non-interactive auto-approve.
-    ///   Bypasses the tty prompt; use only in trusted automation flows.
-    /// - `approve gc`: evict all expired pending approvals for a profile.
+    ///   render a wallet-controlled summary, and record the approval. A testnet
+    ///   profile prompts y/n at the terminal. A mainnet profile approves with a
+    ///   passkey, in the local browser or at the signed approval origin.
+    /// - `approve --id <nonce> --profile <name> --yes`: approves without a prompt
+    ///   on testnet. A mainnet profile refuses it with
+    ///   `approve.yes_refused_on_mainnet`.
+    /// - Subcommands: `revoke`, `gc`, `list`, `status`, `serve`, `operator`, and
+    ///   `credential`.
     Approve(commands::approve::ApproveArgs),
 
     /// Submission-record subcommand group.
     ///
     /// Provides:
-    /// - `tx status <HASH>` — reconcile one submitted transaction against the
-    ///   chain and settle the wallet's record of it. This is the way out of
+    /// - `tx status <HASH>`: reconcile one submitted transaction against the
+    ///   chain and record a reported success. This is the way out of
     ///   `submission.tx_timeout`.
     /// - `tx receipt clear <ENVELOPE_HASH> --acknowledge`: close a submission
     ///   record after reconciling it against the chain.
@@ -74,11 +103,13 @@ enum Commands {
     /// - `audit verify <log-path>` — walk the hash-chained audit log at
     ///   `<log-path>` and verify the chain integrity from the oldest rotated
     ///   file to the current active file.
+    /// - `audit reanchor`, `audit acknowledge-outbox-loss`, and
+    ///   `audit bind-carriers`.
     Audit(commands::audit::AuditArgs),
 
     /// Account-management subcommand group.
     ///
-    /// Currently provides:
+    /// Provides:
     /// - `accounts create` — create a new Stellar account on-chain via
     ///   sponsored `CreateAccount` op or Friendbot (testnet only).
     /// - `accounts deploy-c` — deploy a new OZ smart-account (C-account)
@@ -98,6 +129,8 @@ enum Commands {
     /// - `counterparty refresh <home-domain> [--profile <name>]` — force-fetch
     ///   `https://<home-domain>/.well-known/stellar.toml`, HMAC-protect it, and
     ///   write to the per-profile cache.
+    /// - `counterparty evict`, `counterparty warm-up`, and
+    ///   `counterparty rotate-hmac-key`.
     Counterparty(commands::counterparty::CounterpartyArgs),
 
     /// Fund a testnet or futurenet account via the Stellar Friendbot endpoint.
@@ -111,8 +144,10 @@ enum Commands {
 
     /// Send a payment from source to destination.
     ///
-    /// Enforces SEP-29 memo-required destinations. Structurally refuses mainnet
-    /// (returns `network.mainnet_write_forbidden` before any RPC call).
+    /// Enforces SEP-29 memo-required destinations. On mainnet only the full
+    /// pipeline runs, under the mainnet authorization; the staged modes, and
+    /// every mainnet run of a build without `mainnet-write`, refuse with
+    /// `network.mainnet_write_forbidden` before any RPC call.
     /// Supports three-stage pipeline: `--build-only`, `--sign-only <xdr>`,
     /// `--submit-only <xdr>`. Default: build → sign → submit atomically.
     Pay(Box<commands::pay::PayArgs>),
@@ -148,6 +183,10 @@ enum Commands {
     ///   chain-root HMAC key.
     /// - `profile rotate-counterparty-key <name>` — rotate the stellar.toml
     ///   cache-integrity HMAC key.
+    /// - `profile init`, `policy`, `policy-check`, `apply-fragment`,
+    ///   `bind-signer`, `enable-mainnet`, `enroll-rpc-credential`,
+    ///   `add-counterparty`, `rotate-policy-state-key`, `reset-window-state`,
+    ///   `reset-mpp-state`, `halt`, and `resume`.
     Profile(commands::profile::ProfileArgs),
 
     /// WebAuthn passkey credential lifecycle.
@@ -167,14 +206,17 @@ enum Commands {
     ///
     /// Enforces the ordered trust gate: vault WASM-hash pin, upgradable-flag
     /// check, role disclosure.  Signs and submits via the wallet's
-    /// smart-account.
+    /// smart-account. Testnet only. A mainnet profile refuses with
+    /// `network.mainnet_write_forbidden` before any key access or RPC request.
     Vault(commands::vault::VaultArgs),
 
     /// Swap tokens via the Soroswap ROUTER-DIRECT path.
     ///
     /// Enforces the ordered trust gate: venue allowlist, router WASM-hash pin,
     /// on-chain slippage re-verify.  Requires absolute `amount_out_min` (not a
-    /// percent).  Signs and submits via the wallet's smart-account.
+    /// percent).  Signs and submits via the wallet's smart-account. Testnet
+    /// only. A mainnet profile refuses with `network.mainnet_write_forbidden`
+    /// before any key access or RPC request.
     Trade(commands::trade::TradeArgs),
 
     /// Create or remove a Stellar classic trustline (`ChangeTrust`).
@@ -191,13 +233,15 @@ enum Commands {
     /// Fetches the on-chain `ClaimableBalanceEntry`, renders a typed preview,
     /// then enforces the claim guards before signing: claimant membership,
     /// predicate satisfaction, non-native trustline state, and native-XLM fee
-    /// affordability. Structurally refuses mainnet (returns
-    /// `network.mainnet_write_forbidden` before any RPC call). Supports the
+    /// affordability. On mainnet only the full pipeline runs, under the
+    /// mainnet authorization; the staged modes, and every mainnet run of a
+    /// build without `mainnet-write`, refuse with
+    /// `network.mainnet_write_forbidden` before any RPC call. Supports the
     /// three-stage pipeline: `--build-only`, `--sign-only <xdr>`,
     /// `--submit-only <xdr>`. Default: build → sign → submit atomically.
     Claim(Box<commands::claim::ClaimArgs>),
 
-    /// Toolset install and uninstall.
+    /// Toolset install, uninstall, list, and capability check (`toolsets run`).
     ///
     /// Provides:
     /// - `toolsets install <pkg>@<version> --file <path> --shasum <hex>
@@ -205,6 +249,7 @@ enum Commands {
     ///   — install a toolset from a signed `.tar.gz` package with cryptographic
     ///   provenance verification (hash + ed25519 signature + trust set).
     /// - `toolsets uninstall <pkg>` — remove an installed toolset.
+    /// - `toolsets list` and `toolsets run`.
     ///
     /// No MCP tool or capability registration at install time.
     Toolsets(commands::toolsets::ToolsetsArgs),
@@ -218,28 +263,31 @@ enum Commands {
     ///
     /// Verbs:
     /// - `smart-account rules <create | get | set-name | set-valid-until |
-    ///   delete | add-policy | remove-policy | list>` — context-rule lifecycle.
+    ///   delete | add-policy | remove-policy | list>`: context-rule lifecycle.
     /// - `smart-account signers <list | refresh | add | remove |
-    ///   set-threshold>` — signer-set lifecycle.
-    /// - `smart-account multicall` — submit a batched invocation bundle.
-    /// - `smart-account deploy-webauthn-verifier` — deploy the OZ
+    ///   set-threshold | batch-add | set-weighted-threshold |
+    ///   set-signer-weight>`: signer-set lifecycle.
+    /// - `smart-account multicall`: submit a batched invocation bundle.
+    /// - `smart-account deploy-webauthn-verifier`: deploy the OZ
     ///   WebAuthn-verifier WASM and record its address.
-    /// - `smart-account deploy-ed25519-verifier` — deploy the OZ
+    /// - `smart-account deploy-ed25519-verifier`: deploy the OZ
     ///   Ed25519-verifier WASM and record its address.
-    /// - `smart-account deploy-spending-limit-policy` — deploy the OZ
+    /// - `smart-account deploy-spending-limit-policy`: deploy the OZ
     ///   spending-limit-policy WASM (per-network singleton) and record its
     ///   address.
-    /// - `smart-account migrate-verifier` — plan/execute External-signer
+    /// - `smart-account migrate-verifier`: plan/execute External-signer
     ///   verifier migration.
-    /// - `smart-account list-verifiers` — enumerate the verifier allowlist.
-    /// - `smart-account list-rules` — alias for `smart-account rules list`.
-    /// - `smart-account register-multicall` / `unregister-multicall` — manage
+    /// - `smart-account list-verifiers`: enumerate the verifier allowlist.
+    /// - `smart-account list-rules`: alias for `smart-account rules list`.
+    /// - `smart-account register-multicall` / `unregister-multicall`: manage
     ///   the local multicall-router registry.
-    /// - `smart-account timelock <schedule | cancel | execute | list-pending>`
-    ///   — OZ upgrade-timelock operations.
+    /// - `smart-account timelock <schedule | cancel | execute | list-pending>`:
+    ///   OZ upgrade-timelock operations.
+    /// - `smart-account deploy-policy`, `list-intents`, and `execute`.
     ///
-    /// All write subcommands invoke `Signer::sign_auth_digest` exclusively
-    /// and structurally refuse mainnet.
+    /// Every subcommand that signs refuses mainnet. `signers list`,
+    /// `signers refresh`, the read verbs, and the multicall registry verbs
+    /// accept a mainnet profile.
     #[command(visible_alias = "sa")]
     SmartAccount(commands::smart_account::SmartAccountArgs),
 }
@@ -258,6 +306,7 @@ impl Commands {
     /// parsed value through the same resolver.
     fn profile_flag(&self) -> Option<&str> {
         match self {
+            Self::Mcp(_) => None,
             Self::Approve(a) => a.profile_flag(),
             Self::Audit(a) => a.profile_flag(),
             Self::Tx(a) => a.profile_flag(),
@@ -282,8 +331,165 @@ impl Commands {
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// Stack size of the thread that runs the body of either role.
+///
+/// The main thread's stack is set by the platform: 1 MiB on Windows, 8 MiB on
+/// Linux and macOS. Parsing the command line and polling the command futures
+/// take more than 1 MiB in a debug build, whose frames and future state
+/// machines are not compacted. Each role therefore runs on a thread with this
+/// stack, the size the Linux and macOS main thread provides, so every
+/// platform and build profile runs the body with the same stack.
+const BODY_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Opens native storage only for the explicit live acceptance entry point.
+#[cfg(feature = "live-platform-keyring")]
+fn live_acceptance_entry(explicit: bool) -> Result<(), stellar_agent_core::error::WalletError> {
+    use stellar_agent_network::keyring::live::{
+        LivePlatformKeyring, init_platform_keyring_store_live,
+    };
+    let refusal = |detail: &str| {
+        stellar_agent_core::error::WalletError::Auth(
+            stellar_agent_core::error::AuthError::KeyringPlatformError {
+                detail: format!("STELLAR_AGENT_TEST_STORAGE_ISOLATED: {detail}"),
+            },
+        )
+    };
+    acceptance_storage::dispatch(
+        explicit,
+        cfg!(feature = "live-platform-keyring"),
+        std::env::var("STELLAR_AGENT_TEST_KEYRING").ok().as_deref(),
+        std::env::var("STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING")
+            .ok()
+            .as_deref(),
+        || {
+            if explicit {
+                Err(refusal(
+                    "live child entry requires platform acceptance selection",
+                ))
+            } else {
+                Ok(())
+            }
+        },
+        || {
+            init_platform_keyring_store_live(
+                LivePlatformKeyring::acknowledge_real_platform_keyring(),
+            )
+        },
+    )
+    .map_err(refusal)?
+}
+
+/// Selects the process role before either role initializes its runtime.
+///
+/// Both roles harden on the initial thread before spawning any other thread.
+/// The tool role sets non-dumpable and exits on failure; the server role sets
+/// non-dumpable and no-new-privs so every server thread inherits both.
+/// Each role's body then runs on a thread of [`BODY_STACK_SIZE`] bytes.
+fn main() {
+    #[allow(unused_mut)]
+    let mut args = std::env::args_os().collect::<Vec<_>>();
+    #[cfg(feature = "live-platform-keyring")]
+    {
+        let explicit = args
+            .get(1)
+            .is_some_and(|arg| arg == "--test-live-platform-keyring");
+        if explicit {
+            args.remove(1);
+        }
+        if let Err(error) = live_acceptance_entry(explicit) {
+            common::render::render_json(&stellar_agent_core::envelope::Envelope::<()>::err_raw(
+                "auth.keyring_platform_error",
+                error.to_string(),
+            ));
+            std::process::exit(1);
+        }
+    }
+    match role::select(&args, cfg!(windows)) {
+        role::Role::Server { skip, display_name } => {
+            stellar_agent_mcp::entry::harden_process();
+            #[allow(
+                clippy::expect_used,
+                reason = "no thread means no server, as no runtime does in run_server_process"
+            )]
+            let code = on_body_thread(move || -> i32 {
+                #[cfg(not(feature = "live-platform-keyring"))]
+                let server_args = std::env::args().skip(skip);
+                #[cfg(feature = "live-platform-keyring")]
+                let server_args = args
+                    .into_iter()
+                    .skip(skip)
+                    .map(|arg| arg.into_string().expect("Unicode argument"));
+                stellar_agent_mcp::entry::run_server_process(display_name, server_args)
+            })
+            .expect("Failed starting the server thread");
+            std::process::exit(code)
+        }
+        role::Role::Tool => std::process::exit(process_hardening::guarded_start(
+            process_hardening::harden_process,
+            || {
+                on_body_thread(move || run(args))
+                    .unwrap_or_else(|err| render_runtime_unavailable(&err))
+            },
+        )),
+    }
+}
+
+/// Runs `body` on a thread with a [`BODY_STACK_SIZE`] stack and returns its
+/// result once the thread ends.
+///
+/// The thread is named `main`, so a panic or stack-overflow report names the
+/// thread as it would on the main thread. A panic in `body` resumes on the
+/// calling thread without a second report, and the process ends with the
+/// panic exit code. A `std::process::exit` inside `body` ends the process
+/// directly.
+///
+/// # Errors
+///
+/// The operating system's error when the thread cannot be created.
+fn on_body_thread<T: Send + 'static>(
+    body: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<T> {
+    let thread = std::thread::Builder::new()
+        .name("main".to_owned())
+        .stack_size(BODY_STACK_SIZE)
+        .spawn(body)?;
+    Ok(thread
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload)))
+}
+
+/// Renders the refusal for a command whose runtime could not be started and
+/// returns the exit code `1`.
+fn render_runtime_unavailable(err: &dyn std::fmt::Display) -> i32 {
+    common::render::render_json(&stellar_agent_core::envelope::Envelope::<()>::err_raw(
+        "wallet.runtime_unavailable",
+        format!("the async runtime could not be started ({err}); the command did not run"),
+    ));
+    1
+}
+
+/// Builds the multi-thread runtime and runs [`async_main`] on it, returning
+/// the command's exit code.
+///
+/// The runtime is shut down without waiting for its remaining tasks, so a
+/// task still blocked on a terminal or socket read does not hold the exit.
+fn run(args: Vec<std::ffi::OsString>) -> i32 {
+    stellar_agent_core::test_trace::record("runtime");
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => {
+            let exit_code = runtime.block_on(async_main(args));
+            runtime.shutdown_background();
+            exit_code
+        }
+        Err(err) => render_runtime_unavailable(&err),
+    }
+}
+
+/// Runs the parsed command and returns its exit code.
+async fn async_main(args: Vec<std::ffi::OsString>) -> i32 {
     // Install the subscriber first so any subsequent `tracing::*` call
     // participates in the redaction pipeline.
     let init_result = observability::init_subscriber(None);
@@ -299,9 +505,9 @@ async fn main() {
         }
     }
 
-    let cli = match Cli::try_parse() {
+    let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
-        Err(error) => std::process::exit(report_parse_error(&error)),
+        Err(error) => return report_parse_error(&error),
     };
 
     // ── Startup advisory ────────────────────────────────────────────────────
@@ -314,12 +520,24 @@ async fn main() {
     // through the same resolver the subcommand uses. The advisory therefore
     // scans the audit log of the profile the command uses.
     //
+    // `profile init` and `profile enable-mainnet` skip the scan. Each shows
+    // its spending preview on stderr before its first write. The scan may
+    // append an audit row and write to stderr ahead of that preview.
+    //
     // `run_startup_advisory` accepts no `StellarRpcClient`: the advisory scan is
     // strictly local and issues no network calls.
-    let _ =
-        run_profile_startup_advisory(cli.command.profile_flag(), advisory::run_startup_advisory);
+    let _ = startup_advisory_for(&cli.command, |path, open_writer| {
+        advisory::run_startup_advisory(path, open_writer)
+    });
 
-    let exit_code = match cli.command {
+    match cli.command {
+        Commands::Mcp(_) => {
+            common::render::render_json(&stellar_agent_core::envelope::Envelope::<()>::err_raw(
+                "validation.usage_error",
+                "use stellar-agent mcp serve [--profile <NAME>]",
+            ));
+            1
+        }
         Commands::Vault(args) => commands::vault::run(&args).await,
         Commands::Trade(args) => commands::trade::run(&args).await,
         Commands::Trustline(args) => commands::trustline::run(&args).await,
@@ -339,9 +557,7 @@ async fn main() {
         Commands::Profile(args) => commands::profile::run(&args).await,
         Commands::Toolsets(args) => commands::toolsets::run(&args).await,
         Commands::SmartAccount(args) => commands::smart_account::run(&args).await,
-    };
-
-    std::process::exit(exit_code);
+    }
 }
 
 /// Reports an argument-parsing outcome that ends the process and returns the
@@ -362,18 +578,65 @@ fn report_parse_error(error: &clap::Error) -> i32 {
     }
 }
 
-/// The error envelope for a parse failure: code `validation.usage_error`,
-/// with clap's unstyled rendering, trimmed and without its leading `error: `,
-/// as the message.
-///
-/// A flag parser that refuses a value never echoes it in its own error text
-/// (see `EndpointUrlFlag`), so a rejected credential does not reach the
-/// message.
+/// Builds a usage refusal from the error class and schema-defined argument names.
+/// Parser renderings and rejected values never enter the envelope.
 fn usage_error_envelope(error: &clap::Error) -> stellar_agent_core::envelope::Envelope<()> {
-    let rendered = error.render().to_string();
-    let trimmed = rendered.trim();
-    let message = trimmed.strip_prefix("error: ").unwrap_or(trimmed);
+    use clap::CommandFactory;
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+
+    // Match the parser's argument context against the schema before using it.
+    // Unknown flags and subcommands are caller input, even in this context.
+    let reported = match error.get(ContextKind::InvalidArg) {
+        Some(ContextValue::String(name)) => vec![name.as_str()],
+        Some(ContextValue::Strings(names)) => names.iter().map(String::as_str).collect(),
+        _ => Vec::new(),
+    };
+    let mut command = Cli::command();
+    command.build();
+    let names: Vec<String> = reported
+        .into_iter()
+        .filter_map(|name| schema_argument_name(&command, name))
+        .collect();
+    let message = if names.is_empty() {
+        "command-line arguments are not valid; run the command with --help for the accepted arguments".to_owned()
+    } else {
+        let class = match error.kind() {
+            ErrorKind::MissingRequiredArgument => "a required argument is missing",
+            ErrorKind::ArgumentConflict => "arguments conflict",
+            ErrorKind::TooManyValues => "too many values",
+            ErrorKind::TooFewValues | ErrorKind::WrongNumberOfValues => {
+                "the number of values is not valid"
+            }
+            ErrorKind::InvalidValue | ErrorKind::ValueValidation => {
+                "the argument value is not valid"
+            }
+            _ => "command-line arguments are not valid",
+        };
+        format!(
+            "{class}: {}; run the command with --help for the accepted arguments",
+            names.join(", ")
+        )
+    };
     stellar_agent_core::envelope::Envelope::<()>::err_raw("validation.usage_error", message)
+}
+
+/// Returns only a name defined by the command schema, never the supplied text.
+fn schema_argument_name(command: &clap::Command, reported: &str) -> Option<String> {
+    for argument in command.get_arguments() {
+        if reported == argument.to_string()
+            || argument
+                .get_long()
+                .is_some_and(|long| reported == format!("--{long}"))
+        {
+            return Some(argument.get_long().map_or_else(
+                || argument.get_id().as_str().to_owned(),
+                |long| format!("--{long}"),
+            ));
+        }
+    }
+    command
+        .get_subcommands()
+        .find_map(|subcommand| schema_argument_name(subcommand, reported))
 }
 
 /// Loads the selected profile locally before scanning its configured audit log.
@@ -385,14 +648,27 @@ fn usage_error_envelope(error: &clap::Error) -> stellar_agent_core::envelope::En
 /// failure and none for a profile that does not exist yet.
 fn run_profile_startup_advisory(
     profile_flag: Option<&str>,
-    scan: impl FnOnce(&std::path::Path) -> advisory::AdvisoryResult,
+    scan: impl FnOnce(
+        &std::path::Path,
+        Box<dyn FnOnce() -> Result<Arc<Mutex<AuditWriter>>, String> + '_>,
+    ) -> advisory::AdvisoryResult,
 ) -> advisory::AdvisoryResult {
     let resolved = resolve_profile_name(profile_flag);
     match common::profile_access::load_profile_reconciled(&resolved) {
-        Ok(profile) => scan(&profile.audit_log_path),
+        Ok(profile) => scan(
+            &profile.audit_log_path,
+            Box::new(|| {
+                commands::value_audit::open_best_effort_audit_writer(
+                    &profile,
+                    &resolved.name,
+                    common::profile_access::ProfileOrigin::Persisted,
+                )
+                .map(|writer| Arc::new(Mutex::new(writer)))
+                .map_err(|error| error.to_string())
+            }),
+        ),
         Err(error) => {
             tracing::debug!(
-                profile = %resolved.name,
                 code = error.code(),
                 "startup advisory: profile not loaded; advisory skipped"
             );
@@ -401,17 +677,219 @@ fn run_profile_startup_advisory(
     }
 }
 
+/// Whether `command` skips the startup advisory.
+///
+/// `profile init`, `profile enable-mainnet`, and the `profile policy` verbs
+/// write their spending preview to stderr before their first write. An
+/// advisory scan ahead of them could write an audit row and stderr text
+/// first, so they skip it.
+fn defers_startup_advisory(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Profile(args)
+            if matches!(
+                args.subcommand,
+                commands::profile::ProfileSubcommand::Init(_)
+                    | commands::profile::ProfileSubcommand::EnableMainnet(_)
+                    | commands::profile::ProfileSubcommand::Policy(_)
+            )
+    )
+}
+
+/// Runs the startup advisory for `command`: nothing for a command that
+/// defers it (see [`defers_startup_advisory`]), and otherwise the scan of the
+/// audit log of the profile the command operates on.
+fn startup_advisory_for(
+    command: &Commands,
+    scan: impl FnOnce(
+        &std::path::Path,
+        Box<dyn FnOnce() -> Result<Arc<Mutex<AuditWriter>>, String> + '_>,
+    ) -> advisory::AdvisoryResult,
+) -> advisory::AdvisoryResult {
+    if defers_startup_advisory(command) {
+        return advisory::AdvisoryResult::default();
+    }
+    run_profile_startup_advisory(command.profile_flag(), scan)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, reason = "test-only")]
 
     use super::*;
 
+    #[cfg(feature = "live-platform-keyring")]
+    #[test]
+    #[serial_test::serial]
+    fn live_acceptance_entry_requires_its_named_permit() {
+        use stellar_agent_test_support::env_guard::ScopedEnvVar;
+        let _selection = ScopedEnvVar::new(
+            "STELLAR_AGENT_TEST_KEYRING",
+            Some(std::ffi::OsStr::new("platform")),
+        );
+        for permit in [None, Some(std::ffi::OsStr::new("invalid"))] {
+            let _env = ScopedEnvVar::new("STELLAR_AGENT_TEST_LIVE_PLATFORM_KEYRING", permit);
+            let error = live_acceptance_entry(true).expect_err("missing live permit must refuse");
+            assert!(error.to_string().contains("exact permit"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("STELLAR_AGENT_TEST_STORAGE_ISOLATED")
+            );
+        }
+    }
+
+    /// The release proof matrix, read from beside its checker.
+    const PROOF_MATRIX: &str = include_str!("../../../.github/scripts/proof-matrix.toml");
+
+    /// Every CLI name of the release proof matrix, a row's verb or an excluded
+    /// entry's, is a subcommand path of the CLI's definition.
+    #[test]
+    fn every_proof_matrix_cli_name_is_a_subcommand() {
+        use clap::CommandFactory as _;
+
+        let matrix: toml::Table = toml::from_str(PROOF_MATRIX).expect("the matrix parses");
+        let mut names = Vec::new();
+        for table in ["row", "excluded"] {
+            let entries = matrix
+                .get(table)
+                .and_then(toml::Value::as_array)
+                .expect("the matrix holds the table");
+            for entry in entries {
+                if entry.get("surface").and_then(toml::Value::as_str) == Some("cli") {
+                    let name = entry.get("name").and_then(toml::Value::as_str);
+                    names.push(name.expect("a CLI entry has a name").to_owned());
+                }
+            }
+        }
+        assert!(!names.is_empty(), "the matrix names CLI entries");
+        let cli = Cli::command();
+        let unknown: Vec<&String> = names
+            .iter()
+            .filter(|name| {
+                let mut command = &cli;
+                for word in name.split(' ') {
+                    match command.find_subcommand(word) {
+                        Some(subcommand) => command = subcommand,
+                        None => return true,
+                    }
+                }
+                false
+            })
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "matrix CLI names that are no subcommand: {unknown:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn startup_refusal_log_omits_the_requested_profile() {
+        use stellar_agent_test_support::log_capture::{CaptureWriter, inert_dispatcher};
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("test home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let capture = CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = inert_dispatcher();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            run_profile_startup_advisory(Some("CREDMARKER7"), |_, _| {
+                unreachable!("an absent profile cannot be scanned")
+            });
+        });
+        let logs = capture.captured_str();
+        assert!(logs.contains("startup advisory: profile not loaded; advisory skipped"));
+        assert!(logs.contains("code="));
+        assert!(!logs.contains("CREDMARKER7"));
+        assert!(!logs.contains("profile="));
+    }
+
+    #[test]
+    fn startup_advisory_writer_failure_keeps_stderr() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "advisory::tests::advisory_writer_open_failure_warns_once_and_keeps_findings",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .expect("run advisory failure fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("test result: ok. 1 passed"), "{stdout}");
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(lines.len(), 2, "{stderr}");
+        for (line, byte) in lines.iter().zip(["ab", "cd"]) {
+            assert_eq!(
+                *line,
+                format!(
+                    "[advisory] rule 4 references revoked verifier {}; \
+                     run 'stellar-agent smart-account migrate-verifier' to remediate",
+                    byte.repeat(32),
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn startup_advisory_production_writer_failure_keeps_stderr() {
+        let output = common::test_support::child_command(
+            "advisory::tests::startup_advisory_production_open_failure_warns_once_and_keeps_findings",
+            &[],
+        )
+            .arg("--exact")
+            .output()
+            .expect("run production advisory failure fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("test result: ok. 1 passed"), "{stdout}");
+        assert_eq!(
+            stderr.trim_end(),
+            format!(
+                "[advisory] rule 4 references revoked verifier {}; \
+                 run 'stellar-agent smart-account migrate-verifier' to remediate",
+                "ab".repeat(32),
+            ),
+        );
+    }
+
     /// Parses an argument vector the way `main` does and returns the profile
     /// the startup advisory would scan.
     fn advisory_profile_flag(argv: &[&str]) -> Option<String> {
         let cli = Cli::try_parse_from(argv).expect("argv must parse");
         cli.command.profile_flag().map(str::to_owned)
+    }
+
+    /// `profile policy add-counterparty` requires its flag and reports it.
+    #[test]
+    fn profile_policy_reports_its_flag() {
+        assert_eq!(
+            advisory_profile_flag(&[
+                "stellar-agent",
+                "profile",
+                "policy",
+                "add-counterparty",
+                "--profile",
+                "alice",
+                "--recipient",
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+            ]),
+            Some("alice".to_owned())
+        );
     }
 
     /// A verb that resolves the environment variable reports no flag when none

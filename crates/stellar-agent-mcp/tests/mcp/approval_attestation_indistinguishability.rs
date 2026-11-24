@@ -131,6 +131,33 @@ async fn run_captured<F: Future>(
 struct RequireApprovalEngine;
 
 impl PolicyEngine for RequireApprovalEngine {
+    fn record_confirmed_checked(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &stellar_agent_core::policy::v1::ValueClass,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.record_confirmed_checked(tool, profile, value)
+    }
+    fn size_unvalued_call(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        reason: stellar_agent_core::policy::v1::OpaqueReason,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::SizingOutcome, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine
+            .size_unvalued_call(tool, profile, reason, now_ms)
+    }
+    fn size_no_value(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        now_ms: u64,
+    ) -> Result<stellar_agent_core::policy::v1::CheckedSizing, PolicyError> {
+        stellar_agent_core::policy::NoopPolicyEngine.size_no_value(tool, profile, now_ms)
+    }
+
     fn evaluate(
         &self,
         _tool: &ToolDescriptor,
@@ -141,6 +168,7 @@ impl PolicyEngine for RequireApprovalEngine {
         _counterparty_cache: Option<&dyn CounterpartyCacheView>,
         _sep10_sessions: Option<&dyn Sep10SessionView>,
         _sep45_sessions: Option<&dyn Sep45SessionView>,
+        _now_ms: u64,
     ) -> Result<Decision, PolicyError> {
         Ok(Decision::RequireApproval(ApprovalRequest::new(
             "test-nonce".into(),
@@ -298,6 +326,9 @@ async fn build_scaffold(
 #[tokio::test]
 #[serial]
 async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     // Seed the nonce key used by all three invocations.
@@ -344,12 +375,13 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce: nonce_a,
-            expires_at_unix_ms: expiry_a,
-            envelope_xdr: envelope_a,
+            nonce: Some(nonce_a),
+            expires_at_unix_ms: Some(expiry_a),
+            envelope_xdr: Some(envelope_a),
             // Both absent.
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("case a: absent attestation must return Ok(is_error) envelope");
@@ -378,14 +410,15 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce: nonce_b,
-            expires_at_unix_ms: expiry_b,
-            envelope_xdr: envelope_b,
+            nonce: Some(nonce_b),
+            expires_at_unix_ms: Some(expiry_b),
+            envelope_xdr: Some(envelope_b),
             // Present but not in the store → entry-not-found → approval_required.
             approval_nonce: Some("some-nonce-not-in-store-b4se6".to_owned()),
             approval_attestation: Some(
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xFFu8; 32]),
             ),
+            business_id: None,
         })
         .await
         .expect("case b: forged attestation must return Ok(is_error) envelope");
@@ -449,12 +482,13 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce: nonce_c,
-            expires_at_unix_ms: expiry_c,
-            envelope_xdr: envelope_c,
+            nonce: Some(nonce_c),
+            expires_at_unix_ms: Some(expiry_c),
+            envelope_xdr: Some(envelope_c),
             // Reference the expired entry.
             approval_nonce: Some(approval_nonce_id),
             approval_attestation: Some(fake_attestation),
+            business_id: None,
         })
         .await
         .expect("case c: expired entry must return Ok(is_error) envelope");
@@ -522,6 +556,9 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
 #[tokio::test]
 #[serial]
 async fn property4a_absent_attestation_returns_approval_required() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let nonce_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xABu8; 32]);
@@ -565,11 +602,12 @@ async fn property4a_absent_attestation_returns_approval_required() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce: nonce_b64,
-            expires_at_unix_ms: expiry_ms,
-            envelope_xdr,
+            nonce: Some(nonce_b64),
+            expires_at_unix_ms: Some(expiry_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         }),
     )
     .await
@@ -597,6 +635,9 @@ async fn property4a_absent_attestation_returns_approval_required() {
 #[tokio::test]
 #[serial]
 async fn property4b_forged_attestation_returns_approval_required() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let nonce_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xABu8; 32]);
@@ -640,14 +681,15 @@ async fn property4b_forged_attestation_returns_approval_required() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce: nonce_b64,
-            expires_at_unix_ms: expiry_ms,
-            envelope_xdr,
+            nonce: Some(nonce_b64),
+            expires_at_unix_ms: Some(expiry_ms),
+            envelope_xdr: Some(envelope_xdr),
             // Nonce ID not in store → entry-not-found → approval_required.
             approval_nonce: Some("some-nonce-not-in-store-b4se6".to_owned()),
             approval_attestation: Some(
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xFFu8; 32]),
             ),
+            business_id: None,
         }),
     )
     .await
@@ -675,6 +717,9 @@ async fn property4b_forged_attestation_returns_approval_required() {
 #[tokio::test]
 #[serial]
 async fn property4c_expired_approval_entry_returns_approval_required() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let nonce_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xABu8; 32]);
@@ -747,11 +792,12 @@ async fn property4c_expired_approval_entry_returns_approval_required() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce: nonce_b64,
-            expires_at_unix_ms: expiry_ms,
-            envelope_xdr,
+            nonce: Some(nonce_b64),
+            expires_at_unix_ms: Some(expiry_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: Some(approval_nonce_id),
             approval_attestation: Some(fake_attestation),
+            business_id: None,
         }),
     )
     .await
@@ -785,11 +831,13 @@ async fn property4c_expired_approval_entry_returns_approval_required() {
 /// `PaymentSimulated` entry, computes the HMAC blob the operator's `approve`
 /// surfaces, and asserts the commit proceeds *past* the attestation gate. The
 /// audit key is seeded and the nonce verifies, so the commit reaches the
-/// signer load, which refuses because no signer key is seeded. That refusal,
-/// three stages past the gate, is the proof the surfaced blob was accepted.
+/// signer load. The signer's identity record is stored and its seed is not,
+/// so the load refuses at the seed read. That refusal, three stages past the
+/// gate, is the proof the surfaced blob was accepted.
 #[tokio::test]
 #[serial]
 async fn valid_attestation_passes_gate() {
+    let _root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
     // Seed the nonce key used by `NonceMint` in the scaffold.
@@ -809,6 +857,7 @@ async fn valid_attestation_passes_gate() {
         .expect("Entry::new for attestation key")
         .set_password(&attestation_key_b64)
         .expect("set_password for attestation key");
+    crate::common::store_signer_identity("svc", "acct", [0x5c; 32]);
 
     let temp = TempDir::new().expect("TempDir::new");
     let mock = MockServer::start().await;
@@ -847,26 +896,37 @@ async fn valid_attestation_passes_gate() {
     )
     .expect("new_payment_pending");
     let approval_nonce_id = entry.approval_nonce.clone();
-    {
-        let store_path = temp.path().join("acct.toml");
-        let mut store = PendingApprovalStore::open(store_path).expect("open store");
-        let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("now");
-        store.insert(entry, now_ms).expect("insert live entry");
-        // Store dropped here: file lock released so the server can open it.
-    }
 
     // Compute the VALID attestation blob exactly as `stellar-agent approve`
-    // surfaces it: HMAC over (nonce, envelope SHA-256, process uid) keyed by the
-    // attestation key, URL-safe base64 no-pad.
+    // surfaces it: HMAC over (nonce, envelope SHA-256, process uid, lifetime,
+    // approver) keyed by the attestation key, URL-safe base64 no-pad.
     let sha = stellar_agent_core::approval::envelope_sha256(envelope_xdr.as_bytes());
-    let blob = stellar_agent_core::approval::compute_attestation(
+    let blob = stellar_agent_core::approval::compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new("acct", "stellar:testnet"),
         &approval_nonce_id,
         &sha,
         &uid,
+        &entry.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
+    {
+        // `stellar-agent approve` records the blob with its approver; the
+        // commit gate verifies against that record.
+        let store_path = temp.path().join("acct.toml");
+        let mut store = PendingApprovalStore::open(store_path).expect("open store");
+        let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("now");
+        store.insert(entry, now_ms).expect("insert live entry");
+        store
+            .record_attestation(
+                &approval_nonce_id,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
+            .expect("record the local approval");
+        // Store dropped here: file lock released so the server can open it.
+    }
 
     let result = server
         .call_stellar_pay_commit(StellarPayCommitArgs {
@@ -880,11 +940,12 @@ async fn valid_attestation_passes_gate() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce: nonce_b64,
-            expires_at_unix_ms: expiry_ms,
-            envelope_xdr,
+            nonce: Some(nonce_b64),
+            expires_at_unix_ms: Some(expiry_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: Some(approval_nonce_id),
             approval_attestation: Some(blob_b64),
+            business_id: None,
         })
         .await;
 
@@ -913,6 +974,7 @@ async fn valid_attestation_passes_gate() {
 #[tokio::test]
 #[serial]
 async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
+    let _root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let nonce_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xABu8; 32]);
     keyring_core::Entry::new("n-svc", "n-acct")
@@ -924,15 +986,10 @@ async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
     // 32 bytes, the owner entry in the older form.
     let owner_key = [0x22u8; 32];
     let older_form = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner_key);
-    for (service, account) in [
-        ("stellar-agent-attestation-acct", "default"),
-        ("stellar-agent-owner-acct", "default"),
-    ] {
-        keyring_core::Entry::new(service, account)
-            .expect("Entry::new")
-            .set_password(&older_form)
-            .expect("set_password");
-    }
+    keyring_core::Entry::new("stellar-agent-attestation-acct", "default")
+        .expect("Entry::new")
+        .set_password(&older_form)
+        .expect("set_password");
 
     let temp = TempDir::new().expect("TempDir::new");
     let mock = MockServer::start().await;
@@ -949,6 +1006,10 @@ async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
     profile.rpc_url = mock.uri();
     let (server, envelope_xdr, nonce_b64, expiry_ms) =
         build_scaffold(profile, temp.path().to_path_buf()).await;
+    keyring_core::Entry::new("stellar-agent-owner-acct", "default")
+        .expect("Entry::new")
+        .set_password(&older_form)
+        .expect("set_password");
 
     let uid =
         stellar_agent_core::approval::user_id::process_uid_for_attestation().expect("process uid");
@@ -966,19 +1027,30 @@ async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
     )
     .expect("new_payment_pending");
     let approval_nonce_id = entry.approval_nonce.clone();
-    {
-        let mut store =
-            PendingApprovalStore::open(temp.path().join("acct.toml")).expect("open store");
-        let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("now");
-        store.insert(entry, now_ms).expect("insert live entry");
-    }
-    let blob = stellar_agent_core::approval::compute_attestation(
+    let blob = stellar_agent_core::approval::compute_attestation_v4(
         &owner_key,
         &stellar_agent_core::approval::AttestationBinding::new("acct", "stellar:testnet"),
         &approval_nonce_id,
         &stellar_agent_core::approval::envelope_sha256(envelope_xdr.as_bytes()),
         &uid,
+        &entry.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
+    {
+        // The record carries the blob and approver `stellar-agent approve`
+        // writes, so the refusal comes from the key check alone.
+        let mut store =
+            PendingApprovalStore::open(temp.path().join("acct.toml")).expect("open store");
+        let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("now");
+        store.insert(entry, now_ms).expect("insert live entry");
+        store
+            .record_attestation(
+                &approval_nonce_id,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
+            .expect("record the local approval");
+    }
 
     let logs = CaptureWriter::new();
     let subscriber = capture_subscriber(logs.clone());
@@ -995,13 +1067,14 @@ async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce: nonce_b64,
-            expires_at_unix_ms: expiry_ms,
-            envelope_xdr,
+            nonce: Some(nonce_b64),
+            expires_at_unix_ms: Some(expiry_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: Some(approval_nonce_id),
             approval_attestation: Some(
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob),
             ),
+            business_id: None,
         }),
     )
     .await

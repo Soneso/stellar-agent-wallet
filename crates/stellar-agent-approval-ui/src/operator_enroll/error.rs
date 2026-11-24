@@ -3,6 +3,8 @@
 
 use std::net::SocketAddr;
 
+use stellar_agent_loopback_http::PairBindError;
+
 /// Error returned by [`super::start_operator_enroll_server`] when the server
 /// cannot be started.
 ///
@@ -13,28 +15,24 @@ use std::net::SocketAddr;
 pub enum OperatorEnrollStartError {
     /// The requested bind address is not a loopback address.
     ///
-    /// A WebAuthn credential created against this server is bound to the
-    /// hard-coded rp-id `"localhost"` at creation time — only a loopback
-    /// origin can claim it. Binding non-loopback would also expose the
-    /// one-shot enrollment ceremony off-host.
+    /// A WebAuthn credential created against a loopback server is bound to
+    /// the rp-id `"localhost"` at creation time, and only a loopback origin
+    /// can claim it. Binding non-loopback would also expose the one-shot
+    /// enrollment ceremony off-host. A signed-origin ceremony binds through
+    /// its own TLS listener instead.
     #[error("operator-enroll server refused non-loopback bind address: {addr}")]
     NonLoopbackBind {
         /// The rejected bind address.
         addr: SocketAddr,
     },
 
-    /// Binding the TCP listener failed (port in use, permission, etc.).
+    /// The server could not hold both `127.0.0.1` and `[::1]` on its port.
+    /// The enrollment page runs at `http://localhost:<port>`, so the ceremony
+    /// does not start with one family.
     ///
-    /// Display exposes only [`std::io::ErrorKind`] so any OS path embedded in
-    /// the platform error string does not leak.
-    #[error("operator-enroll server failed to bind: {kind:?}")]
-    Bind {
-        /// The I/O error kind, safe to display without OS detail.
-        kind: std::io::ErrorKind,
-        /// The original source error, retained for chaining, not shown in Display.
-        #[source]
-        source: std::io::Error,
-    },
+    /// Display contains structured refusal details, never OS detail.
+    #[error("operator-enroll server cannot hold both loopback addresses: {0}")]
+    LoopbackPair(PairBindError),
 }
 
 /// Error returned by [`super::OperatorEnrollHandle::await_completion`].
@@ -56,9 +54,16 @@ pub enum OperatorEnrollAwaitError {
     #[error("operator-enroll server exited before an enrollment completed")]
     SenderDropped,
 
-    /// No enrollment completed within the caller-supplied timeout.
+    /// No enrollment completes within the caller-supplied timeout, or the
+    /// enrollment code of a signed-origin ceremony runs out before a session
+    /// opens.
     #[error("timed out waiting for the operator-enrollment ceremony to complete")]
     Timeout,
+
+    /// The enrollment code of a signed-origin ceremony has no attempt left;
+    /// no session opens and nothing is staged.
+    #[error("the enrollment code attempt limit is exhausted")]
+    CodeExhausted,
 }
 
 /// Error returned by [`super::OperatorEnrollHandle::shutdown`].

@@ -50,8 +50,20 @@
 //!   the wallet-controlled summary, reads y/n from tty, calls
 //!   [`PendingApprovalStore::record_attestation`] on approval.
 //! - **MCP `_commit` verifier**: calls [`verify_attestation`] with the
-//!   caller-supplied `attestation_blob`, then collapses any error to
-//!   `policy.approval_required`.
+//!   caller-supplied `attestation_blob` under the layout the record stores,
+//!   then collapses any error to `policy.approval_required`.
+//! - **Mainnet consent**: [`presence`](crate::approval::presence) issues a WebAuthn challenge for a
+//!   pending entry and verifies the assertion against the credential keys of
+//!   the owner-signed mainnet policy. The attester records a version 5
+//!   attestation on an envelope-text record and a version 6 attestation on
+//!   an intent-digest record, each bound to the retained receipt.
+//! - **Mainnet proof**: [`witness::verify_approval`](crate::approval::witness::verify_approval)
+//!   accepts only a version 5 attestation, and
+//!   [`witness::verify_intent_approval`](crate::approval::witness::verify_intent_approval)
+//!   only a version 6 attestation, each with a mainnet passkey approver.
+//!   Each loads the record and the key itself, reads the current signed
+//!   policy through [`presence_policy`](crate::approval::presence_policy), and verifies the stored assertion
+//!   again under it.
 //! - **Bridge POST handler**: calls
 //!   [`PendingApprovalStore::record_passkey_assertion`] after verifying the
 //!   WebAuthn assertion from the browser ceremony.
@@ -61,47 +73,132 @@ pub mod attest;
 pub mod attestation;
 mod context;
 pub mod error;
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod fixtures;
+pub mod inspection;
+pub mod intent;
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod mainnet_fixtures;
+pub mod mpp;
 pub mod operator_credentials;
+pub mod presence;
+pub mod presence_policy;
+pub mod publication;
 pub mod registration_input;
+pub mod remote_authorization;
 pub mod retry;
 pub mod rule_proposal;
+pub mod spent;
 pub mod store;
+pub mod subject;
 pub mod toolset_grant;
 pub mod user_id;
 pub mod view;
+pub mod webauthn;
+pub mod webauthn_registration;
+pub mod witness;
 
 pub use assertion_input::AssertionInput;
 pub use attest::{
-    ConsentAudit, Surface, ToolsetGrantRequest, attest_and_persist, decode_sha256_hex,
-    load_and_validate_entry, load_attestation_key,
+    ConsentAudit, ConsentAuthorization, Surface, ToolsetGrantRequest, attest_and_persist,
+    attest_mainnet_confirmation, classic_entry_summary, decode_sha256_hex, load_and_validate_entry,
+    load_attestation_key,
 };
 pub use attestation::AttestationBinding;
 pub use attestation::{
-    RULE_PROPOSAL_DOMAIN_TAG, TOOLSET_GATE_DOMAIN_TAG, TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG,
-    compute_attestation, compute_rule_proposal_digest, compute_toolset_gate_digest,
-    compute_trustline_clawback_opt_in_digest, envelope_sha256, verify_attestation,
-    verify_toolset_gate_attestation,
+    ATTESTATION_VERSION, ATTESTATION_VERSION_V2, AttestationScope, AttestedApprover,
+    AttestedLifetime, MAINNET_ATTESTATION_VERSION, MAINNET_INTENT_ATTESTATION_VERSION,
+    PENDING_ATTESTATION_VERSION, TOOLSET_GATE_DOMAIN_TAG, TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG,
+    compute_attestation, compute_attestation_v4, compute_attestation_v5, compute_attestation_v6,
+    compute_toolset_gate_digest, compute_trustline_clawback_opt_in_digest, envelope_sha256,
+    mainnet_attestation_version, verify_attestation, verify_toolset_gate_attestation,
 };
 pub use context::{ApprovalContext, approve_hint};
 pub use error::ApprovalError;
+pub use intent::{
+    CLASSIC_INTENT_DIGEST_LABEL, ClassicIntent, IntentAsset, IntentBase, IntentDigest, IntentError,
+    IntentPayload, MemoFact,
+};
 pub use operator_credentials::{
-    OperatorApprovalCredential, OperatorApprovalCredentialStore,
+    OperatorApprovalCredential, OperatorApprovalCredentialStore, OperatorCredentialSource,
     default_operator_approval_credentials_path,
 };
+pub use presence::{
+    ApprovalCredentialError, INTENT_CHALLENGE_DOMAIN, ListenerIdentity, MAINNET_APPROVAL_RP_ID,
+    MainnetApprovalCredential, MainnetAssertionWire, MainnetPresenceOptions,
+    MainnetPresenceReceipt, PendingMainnetPresence, PresenceListener, VerifiedMainnetPresence,
+    approval_view_digest, approval_view_subject, issue_mainnet_intent_presence,
+    issue_mainnet_presence, mainnet_consent_subject, mainnet_consent_view_digest,
+    mainnet_intent_consent_view_digest, mainnet_presence_origin, verify_mainnet_presence,
+};
+pub use presence_policy::{CurrentMainnetApprovalPolicy, MainnetApprovalAuthority};
+pub use publication::{
+    CONSENT_PUBLICATION_DOMAIN, ConsentPublicationV1, VerifiedConsentPublication,
+    verify_consent_publication,
+};
 pub use registration_input::RegistrationInput;
+pub use remote_authorization::{RemoteApprovalAuthority, RemoteApprovalAuthorization};
 pub use retry::{DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry};
 pub use rule_proposal::{
     CONTEXT_RULE_PROPOSAL_SNAPSHOT_VERSION, ContextRuleProposalSnapshot,
     DecodedSpendingLimitParams, RuleProposalContextType, RuleProposalPolicy, RuleProposalSigner,
-    RuleProposalSignerKind, try_decode_spending_limit_params,
+    RuleProposalSignerKind, rule_proposal_digest, try_decode_spending_limit_params,
+    verify_rule_proposal_entry_terms,
+};
+#[cfg(any(test, feature = "test-helpers"))]
+pub use spent::InMemoryRuleApprovalSpentStore;
+pub use spent::{
+    MAX_SPENT_RULE_APPROVALS, RuleApprovalSpentStore, SpentSet, SpentSetError,
+    rule_approval_spent_marker,
 };
 pub use store::{
-    ApprovalKind, ConsumedOutcome, DEFAULT_TTL_MS, EXPECTED_NONCE_LEN, PendingApproval,
-    PendingApprovalStore, RuleProposalGateError, generate_csrf_token,
+    ApprovalKind, ConsumedOutcome, DEFAULT_TTL_MS, EXPECTED_NONCE_LEN,
+    MAINNET_POLICY_AUTHORITY_TTL_SECONDS, PendingApproval, PendingApprovalStore,
+    RuleProposalGateError, generate_csrf_token, governing_ttl_ms,
 };
 pub use toolset_grant::{
-    TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrant, ToolsetGrantStore, build_attested_grant,
-    default_toolset_grants_path,
+    GrantQuery, TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrant, ToolsetGrantStore,
+    build_attested_grant, default_toolset_grants_path,
 };
 pub use user_id::{ApproverIdentity, VerifiedPasskeyAssertion, process_uid_for_attestation};
-pub use view::{ApprovalSummaryView, PendingApprovalView};
+pub use view::{ApprovalSummaryView, IntentPayloadView, IntentView, PendingApprovalView};
+
+/// Checks that displayed approval terms agree with their authorization binding.
+///
+/// # Errors
+///
+/// Returns `approval.entry_inconsistent` when a stored binding disagrees, or
+/// when a `sign-payment` request destination is not a canonical G account or
+/// M address. A payment summary destination is not read here: a payment's
+/// consent terms come from its envelope, and approval and use check the
+/// stored summary through [`verify_stored_destination`].
+pub fn verify_entry_terms(kind: &ApprovalKind) -> Result<(), crate::error::WalletError> {
+    mpp::verify_mpp_entry_terms(kind)?;
+    verify_rule_proposal_entry_terms(kind)?;
+    toolset_grant::verify_toolset_gate_entry_terms(kind)
+}
+
+/// Checks the stored payment destination before a use reads it.
+///
+/// A stored payment summary must name a canonical G account or M address,
+/// or a canonical C contract when it records a contract payment context. A
+/// `sign-payment` request must name a canonical G account or M address.
+/// Every other kind passes.
+///
+/// # Errors
+///
+/// Returns `approval.entry_inconsistent` for any other stored destination.
+pub fn verify_stored_destination(kind: &ApprovalKind) -> Result<(), crate::error::WalletError> {
+    if store::holds_refused_destination(kind) {
+        return Err(inconsistent(
+            "its payment destination is not the canonical form its record admits",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn inconsistent(reason: &str) -> crate::error::WalletError {
+    crate::error::WalletError::Approval(crate::error::ApprovalFailure::EntryInconsistent {
+        detail: format!("this pending approval cannot be approved: {reason}"),
+    })
+}

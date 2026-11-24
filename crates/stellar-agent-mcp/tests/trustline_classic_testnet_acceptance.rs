@@ -87,14 +87,9 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 2xx for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Polls RPC until the freshly-funded account is queryable, tolerating
@@ -131,6 +126,20 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>) {
         .expect("signer keyring entry")
         .set_password(&s_strkey)
         .expect("set signing key");
+    // The identity record an enrollment stores beside the seed.
+    stellar_agent_network::keyring::write_keyring_string(
+        &stellar_agent_core::profile::schema::signer_identity_entry_ref(signer_ref),
+        &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .to_bytes(),
+            stellar_agent_core::profile::name::profile_name_for_approval(profile),
+            profile.chain_id,
+        )
+        .render()
+        .expect("an agent record renders"),
+    )
+    .expect("set identity record");
 
     // Nonce key.
     let nonce_ref = &profile.mcp_nonce_key_alias;
@@ -140,8 +149,8 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>) {
         .set_password(&nonce_key_b64)
         .expect("set nonce key");
 
-    // Audit-log chain-root HMAC key, so the commit's post-submit
-    // `value_action_submitted` row is signed and lands.
+    // Audit-log chain-root HMAC key, so the commit's pre-send
+    // `value_action_pending` row is signed and lands.
     let audit_ref = &profile.audit_log_hash_chain_key_id;
     let audit_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x54u8; 32]);
     keyring_core::Entry::new(&audit_ref.service, &audit_ref.account)
@@ -196,6 +205,10 @@ fn minimum_reserve_document(tools: &[&str], margin_stroops: i64) -> PolicyDocume
 #[tokio::test]
 #[serial]
 async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rule() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (source_g, source_seed) = fresh_keypair();
@@ -229,6 +242,7 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
             asset: "USDC".to_owned(),
             limit_stroops: Some(LIMIT_STROOPS.to_owned()),
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -257,11 +271,12 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
         .call_stellar_trustline_commit(StellarTrustlineCommitArgs {
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             from: source_g.clone(),
-            nonce,
-            expires_at_unix_ms,
-            envelope_xdr,
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must not error");
@@ -294,7 +309,7 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
         .expect("source account fetch after commit");
     let usdc_present = |account: &stellar_agent_network::AccountView| {
         account.balances.iter().any(|b| {
-            b.asset.asset_type == "USDC"
+            b.asset.code.as_deref() == Some("USDC")
                 && b.asset.issuer.as_deref()
                     == Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
         })
@@ -312,7 +327,7 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
         .balances
         .iter()
         .find(|b| {
-            b.asset.asset_type == "USDC"
+            b.asset.code.as_deref() == Some("USDC")
                 && b.asset.issuer.as_deref()
                     == Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
         })
@@ -333,7 +348,7 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
         "the on-chain trustline limit must equal the requested limit_stroops"
     );
 
-    // The confirmed commit must have recorded a `value_action_submitted` row
+    // The confirmed commit must have recorded a `value_action_pending` row
     // for `stellar_trustline_commit`.
     let audit_rows: Vec<serde_json::Value> = std::io::BufRead::lines(std::io::BufReader::new(
         std::fs::File::open(audit_dir.path().join("audit.jsonl")).expect("audit log after commit"),
@@ -341,9 +356,14 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
     .map(|line| serde_json::from_str(&line.expect("audit line")).expect("audit JSON row"))
     .collect();
     assert!(
+        audit_rows
+            .iter()
+            .all(|row| row["kind"] != "value_action_submitted")
+    );
+    assert!(
         audit_rows.iter().any(|row| {
-            row["kind"] == "value_action_submitted" && row["tool"] == "stellar_trustline_commit"
+            row["kind"] == "value_action_pending" && row["tool"] == "stellar_trustline_commit"
         }),
-        "trustline commit must record a value_action_submitted row: {audit_rows:?}"
+        "trustline commit must record a value_action_pending row: {audit_rows:?}"
     );
 }

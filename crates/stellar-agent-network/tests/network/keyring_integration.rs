@@ -122,7 +122,7 @@ async fn happy_path_sign_and_verify() {
     });
 
     // sign a known payload and verify the signature.
-    let payload = [0x01_u8; 32];
+    let payload = crate::payload_fixtures::tx_payload(0x01);
     let sig_bytes = handle
         .sign_tx_payload(&payload)
         .await
@@ -131,7 +131,8 @@ async fn happy_path_sign_and_verify() {
 
     let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk.0).expect("valid verifying key");
     let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    vk.verify(&payload, &sig).expect("signature must verify");
+    vk.verify(payload.as_bytes(), &sig)
+        .expect("signature must verify");
 }
 
 /// 2. Pubkey mismatch: stored seed does not match `expected_source_g`.
@@ -245,7 +246,7 @@ async fn lazy_load_delete_then_sign_returns_error() {
 
     // Now try to sign — must fail because the entry is gone.
     // This proves the secret is NOT cached in the handle.
-    let payload = [0xDD_u8; 32];
+    let payload = crate::payload_fixtures::tx_payload(0xDD);
     let result = handle.sign_tx_payload(&payload).await;
     assert!(result.is_err(), "signing after entry deletion must fail");
     let err = match result {
@@ -365,7 +366,7 @@ fn panic_unwinds_through_zeroizing_scope() {
         }
     }
 
-    let payload = [0xBE_u8; 32];
+    let payload = crate::payload_fixtures::tx_payload(0xBE);
     // Enter the runtime context manually so block_on works inside catch_unwind.
     let _guard = rt.enter();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -410,7 +411,7 @@ async fn sign_tx_payload_returns_64_bytes() {
     let handle = signer_from_keyring(&entry_ref, &expected_g)
         .await
         .expect("handle construction");
-    let payload = [0x42_u8; 32];
+    let payload = crate::payload_fixtures::tx_payload(0x42);
     let sig = handle
         .sign_tx_payload(&payload)
         .await
@@ -500,7 +501,7 @@ async fn host_swap_detected_as_signer_key_mismatch() {
 
     // Now try to sign — the freshly-loaded seed's pubkey differs from the
     // cached pubkey.  The host-swap defence must catch this.
-    let payload = [0x33_u8; 32];
+    let payload = crate::payload_fixtures::tx_payload(0x33);
     let result = handle.sign_tx_payload(&payload).await;
     assert!(result.is_err(), "host-swap must be detected");
     let err = match result {

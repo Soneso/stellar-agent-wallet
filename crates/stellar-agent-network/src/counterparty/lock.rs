@@ -3,7 +3,7 @@
 //! # What this module does
 //!
 //! Provides [`CacheLock`] — a thin wrapper around a [`std::fs::File`] whose
-//! [`File::try_lock`] (Rust 1.89 stable) holds an OFD-advisory exclusive lock
+//! [`std::fs::File::try_lock`] (Rust 1.89 stable) holds an OFD-advisory exclusive lock
 //! for the duration of a counterparty cache write.  The lock file lives at
 //! `<cache_dir>/.lock`.
 //!
@@ -19,15 +19,16 @@
 //!
 //! # Drop discipline
 //!
-//! Dropping the [`CacheLock`] releases the OS-level lock.  The [`File`] is
-//! closed on drop; the advisory lock is automatically released by the kernel
-//! when the file descriptor is closed.
+//! Dropping the [`CacheLock`] explicitly releases the advisory lock before
+//! closing the file descriptor.
 //!
 //! Enforces the single-writer flock invariant for the per-profile counterparty
 //! cache directory.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::Path;
+
+use stellar_agent_core::file_lock::HeldFileLock;
 
 use crate::counterparty::CounterpartyError;
 
@@ -37,15 +38,13 @@ use crate::counterparty::CounterpartyError;
 
 /// An exclusive OFD-advisory lock over the counterparty cache directory.
 ///
-/// Acquired via [`CacheLock::acquire`]; held until dropped.  The underlying
-/// lock file is kept open — the kernel releases the advisory lock when the
-/// file descriptor closes (i.e. when [`CacheLock`] drops).
+/// Acquired via [`CacheLock::acquire`]; explicitly unlocked when the guard drops.
 ///
 /// Visibility: `pub(crate)` in production; `pub` under `test-helpers` feature
 /// so integration tests can hold the lock manually to simulate race conditions.
 pub struct CacheLock {
-    /// The open lock file.  Closing it (on drop) releases the OFD lock.
-    _file: File,
+    /// The guard explicitly releases the lock on drop.
+    _file: HeldFileLock,
 }
 
 impl std::fmt::Debug for CacheLock {
@@ -108,7 +107,7 @@ impl CacheLock {
         // `try_lock()` is stabilised in Rust 1.89.  It acquires an exclusive
         // advisory lock without blocking.  `TryLockError::WouldBlock` maps to
         // `WriterLocked`; `TryLockError::Error(io_err)` maps to `Io`.
-        file.try_lock().map_err(|e| match e {
+        let file = HeldFileLock::try_lock(file).map_err(|e| match e {
             std::fs::TryLockError::WouldBlock => CounterpartyError::WriterLocked,
             std::fs::TryLockError::Error(io_err) => CounterpartyError::Io {
                 kind: io_err.kind(),
@@ -151,6 +150,26 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_cache_unlocks_with_a_duplicate_descriptor_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.lock");
+        let guard = CacheLock::acquire(&path).unwrap();
+        let duplicate = guard._file.try_clone_file().unwrap();
+        assert!(matches!(
+            CacheLock::acquire(&path),
+            Err(CounterpartyError::WriterLocked)
+        ));
+        drop(guard);
+        let _next = CacheLock::acquire(&path).unwrap();
+        drop(duplicate);
+        assert!(matches!(
+            CacheLock::acquire(&path),
+            Err(CounterpartyError::WriterLocked)
+        ));
+    }
 
     #[test]
     fn acquire_creates_lock_file() {

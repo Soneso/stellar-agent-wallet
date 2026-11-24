@@ -37,6 +37,7 @@
 //! When `ctx.bundle` is `None`, the criterion passes unconditionally.
 
 use crate::policy::v1::EvalContext;
+use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::bundle::InnerOpDescriptor;
 use crate::policy::v1::criteria::Criterion;
 use crate::policy::v1::value::asset_normalise;
@@ -137,7 +138,11 @@ impl Criterion for BundlePerTxCapCriterion {
             };
 
             let inner_asset = asset_normalise(asset);
-            if inner_asset != criterion_asset {
+            if !assets_equivalent(
+                &inner_asset,
+                &criterion_asset,
+                &ctx.profile.network_passphrase,
+            ) {
                 continue;
             }
 
@@ -224,12 +229,19 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: view,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: 1_700_000_000_000,
         }
     }
 
     /// Single-tx path passes unconditionally.
     #[test]
+    #[serial_test::serial]
     fn single_tx_bundle_none_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -240,7 +252,11 @@ mod tests {
 
     /// Inner under cap passes.
     #[test]
+    #[serial_test::serial]
     fn inner_under_cap_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -257,7 +273,11 @@ mod tests {
 
     /// Inner exactly at cap passes (strict > boundary).
     #[test]
+    #[serial_test::serial]
     fn inner_exactly_at_cap_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -277,7 +297,11 @@ mod tests {
 
     /// First over-cap inner is denied at correct index.
     #[test]
+    #[serial_test::serial]
     fn first_over_cap_inner_denied_at_correct_index() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -314,7 +338,11 @@ mod tests {
 
     /// Asset mismatch inners are skipped.
     #[test]
+    #[serial_test::serial]
     fn asset_mismatch_inners_skipped() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool();
         let profile = make_profile();
         let store = PolicyStateStore::new();

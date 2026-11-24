@@ -48,8 +48,10 @@
     reason = "test-only; panics and unwraps are acceptable in testnet acceptance tests"
 )]
 
+#[path = "cli/acceptance_storage.rs"]
+mod acceptance_storage;
+
 use std::error::Error;
-use std::process::Command;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -97,14 +99,9 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 2xx for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Polls RPC until the freshly-funded account is queryable, tolerating
@@ -185,6 +182,8 @@ async fn submit_testnet_signed_xdr(
 /// subprocess invocation and reaches ledger inclusion on testnet.
 #[tokio::test]
 async fn t3_cli_single_shot_happy_path() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("acceptance home");
     let (creator_g, creator_seed) = fresh_keypair();
     let (claimant_g, claimant_seed) = fresh_keypair();
     fund_via_friendbot(&creator_g).await;
@@ -230,7 +229,7 @@ async fn t3_cli_single_shot_happy_path() {
             .to_owned();
 
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
-    let output = Command::new(bin_path)
+    let output = acceptance_storage::command(bin_path, storage_sandbox.path(), None)
         .args([
             "claim",
             &balance_id_hex72,

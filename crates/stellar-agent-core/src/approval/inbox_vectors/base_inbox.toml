@@ -1,0 +1,2988 @@
+[[pending]]
+approval_nonce = "baseinboxnonce00000000"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAABAAAABGJhc2UAAAABAAAAAAAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAAAAAAAAAAAAoAAAAAAAAAAA=="
+envelope_sha256_hex = "b74c51c3291c3a342573a332701658da10b5ec92e088f1e0fe91412969816cc1"
+summary_to = "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA"
+summary_amount_stroops = 10
+summary_asset = "XLM"
+summary_memo = "base"
+summary_simulated_fee_stroops = 100
+summary_simulated_seq_num = 7
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000001"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 2
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAABAAAABGJhc2UAAAABAAAAAAAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAAAAAAAAAAAAoAAAAAAAAAAA=="
+envelope_sha256_hex = "b74c51c3291c3a342573a332701658da10b5ec92e088f1e0fe91412969816cc1"
+summary_to = "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA"
+summary_amount_stroops = 10
+summary_asset = "XLM"
+summary_memo = "base"
+summary_simulated_fee_stroops = 100
+summary_simulated_seq_num = 7
+attestation_blob_b64 = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000002"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 3
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAABAAAABGJhc2UAAAABAAAAAAAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAAAAAAAAAAAAoAAAAAAAAAAA=="
+envelope_sha256_hex = "b74c51c3291c3a342573a332701658da10b5ec92e088f1e0fe91412969816cc1"
+summary_to = "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA"
+summary_amount_stroops = 10
+summary_asset = "XLM"
+summary_memo = "base"
+summary_simulated_fee_stroops = 100
+summary_simulated_seq_num = 7
+attestation_blob_b64 = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000003"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAABAAAABGJhc2UAAAABAAAAAAAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAAAAAAAAAAAAoAAAAAAAAAAA=="
+envelope_sha256_hex = "b74c51c3291c3a342573a332701658da10b5ec92e088f1e0fe91412969816cc1"
+summary_to = "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA"
+summary_amount_stroops = 10
+summary_asset = "XLM"
+summary_memo = "base"
+summary_simulated_fee_stroops = 100
+summary_simulated_seq_num = 7
+attestation_blob_b64 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+
+[pending.attested_approver]
+kind = "local"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000004"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAABAAAABGJhc2UAAAABAAAAAAAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAAAAAAAAAAAAoAAAAAAAAAAA=="
+envelope_sha256_hex = "b74c51c3291c3a342573a332701658da10b5ec92e088f1e0fe91412969816cc1"
+summary_to = "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA"
+summary_amount_stroops = 10
+summary_asset = "XLM"
+summary_memo = "base"
+summary_simulated_fee_stroops = 100
+summary_simulated_seq_num = 7
+attestation_blob_b64 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+
+[pending.attested_approver]
+kind = "remote"
+credential_id_b64url = "AAECAw"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000005"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 5
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAABAAAABGJhc2UAAAABAAAAAAAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAAAAAAAAAAAAoAAAAAAAAAAA=="
+envelope_sha256_hex = "b74c51c3291c3a342573a332701658da10b5ec92e088f1e0fe91412969816cc1"
+summary_to = "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA"
+summary_amount_stroops = 10
+summary_asset = "XLM"
+summary_memo = "base"
+summary_simulated_fee_stroops = 100
+summary_simulated_seq_num = 7
+attestation_blob_b64 = "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"
+
+[pending.attested_approver]
+kind = "mainnet_passkey"
+credential_id_b64url = "WlpaWlpaWlpaWlpaWlpaWg"
+
+[pending.mainnet_presence]
+version = 1
+request_id = "00000000-0000-4000-8000-000000000001"
+random_b64url = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+policy_sequence = 7
+policy_digest_hex = "abababababababababababababababababababababababababababababababab"
+policy_owner_hex = "0909090909090909090909090909090909090909090909090909090909090909"
+expected_origin = "http://localhost:4100"
+issued_at_unix_ms = 1700000005000
+expires_at_unix_ms = 1700000065000
+verified_at_unix_ms = 1700000006000
+
+[pending.mainnet_presence.assertion]
+credential_id = [
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+]
+authenticator_data = [
+    73,
+    150,
+    13,
+    229,
+    136,
+    14,
+    140,
+    104,
+    116,
+    52,
+    23,
+    15,
+    100,
+    118,
+    96,
+    91,
+    143,
+    228,
+    174,
+    185,
+    162,
+    134,
+    50,
+    199,
+    153,
+    92,
+    243,
+    186,
+    131,
+    29,
+    151,
+    99,
+    5,
+    0,
+    0,
+    0,
+    1,
+]
+client_data_json = [
+    123,
+    34,
+    99,
+    104,
+    97,
+    108,
+    108,
+    101,
+    110,
+    103,
+    101,
+    34,
+    58,
+    34,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    34,
+    44,
+    34,
+    99,
+    114,
+    111,
+    115,
+    115,
+    79,
+    114,
+    105,
+    103,
+    105,
+    110,
+    34,
+    58,
+    102,
+    97,
+    108,
+    115,
+    101,
+    44,
+    34,
+    111,
+    114,
+    105,
+    103,
+    105,
+    110,
+    34,
+    58,
+    34,
+    104,
+    116,
+    116,
+    112,
+    58,
+    47,
+    47,
+    108,
+    111,
+    99,
+    97,
+    108,
+    104,
+    111,
+    115,
+    116,
+    58,
+    52,
+    49,
+    48,
+    48,
+    34,
+    44,
+    34,
+    116,
+    121,
+    112,
+    101,
+    34,
+    58,
+    34,
+    119,
+    101,
+    98,
+    97,
+    117,
+    116,
+    104,
+    110,
+    46,
+    103,
+    101,
+    116,
+    34,
+    125,
+]
+signature_compact = [
+    238,
+    214,
+    76,
+    215,
+    82,
+    35,
+    85,
+    137,
+    210,
+    69,
+    45,
+    43,
+    111,
+    89,
+    146,
+    26,
+    126,
+    69,
+    205,
+    146,
+    118,
+    244,
+    150,
+    86,
+    37,
+    62,
+    143,
+    50,
+    208,
+    232,
+    115,
+    251,
+    33,
+    95,
+    41,
+    208,
+    156,
+    255,
+    238,
+    190,
+    252,
+    249,
+    203,
+    151,
+    140,
+    179,
+    139,
+    63,
+    9,
+    181,
+    143,
+    144,
+    48,
+    56,
+    42,
+    152,
+    0,
+    93,
+    229,
+    90,
+    6,
+    50,
+    234,
+    193,
+]
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000006"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+
+[pending.claim_simulated]
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAAAAAAAAQAAAAAAAAAPAAAAAAkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJAAAAAAAAAAA="
+envelope_sha256_hex = "2bcf339df368e2ca1703d07811d2f362c0b8a1f6f62d21fe4b1280124cdf2b97"
+summary_balance_id_hex72 = "000000000909090909090909090909090909090909090909090909090909090909090909"
+summary_balance_id_strkey = "BAAASCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCPLWY"
+summary_asset = "XLM"
+summary_amount_stroops = 5
+summary_source = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H"
+summary_simulated_fee_stroops = 100
+summary_simulated_seq_num = 7
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000007"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 2
+attestation_blob_b64 = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"
+
+[pending.claim_simulated]
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAAAAAAAAQAAAAAAAAAPAAAAAAkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJAAAAAAAAAAA="
+envelope_sha256_hex = "2bcf339df368e2ca1703d07811d2f362c0b8a1f6f62d21fe4b1280124cdf2b97"
+summary_balance_id_hex72 = "000000000909090909090909090909090909090909090909090909090909090909090909"
+summary_balance_id_strkey = "BAAASCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCPLWY"
+summary_asset = "XLM"
+summary_amount_stroops = 5
+summary_source = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H"
+summary_simulated_fee_stroops = 100
+summary_simulated_seq_num = 7
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000008"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 3
+attestation_blob_b64 = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"
+
+[pending.claim_simulated]
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAAAAAAAAQAAAAAAAAAPAAAAAAkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJAAAAAAAAAAA="
+envelope_sha256_hex = "2bcf339df368e2ca1703d07811d2f362c0b8a1f6f62d21fe4b1280124cdf2b97"
+summary_balance_id_hex72 = "000000000909090909090909090909090909090909090909090909090909090909090909"
+summary_balance_id_strkey = "BAAASCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCPLWY"
+summary_asset = "XLM"
+summary_amount_stroops = 5
+summary_source = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H"
+summary_simulated_fee_stroops = 100
+summary_simulated_seq_num = 7
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000009"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+attestation_blob_b64 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+
+[pending.attested_approver]
+kind = "local"
+
+[pending.claim_simulated]
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAAAAAAAAQAAAAAAAAAPAAAAAAkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJAAAAAAAAAAA="
+envelope_sha256_hex = "2bcf339df368e2ca1703d07811d2f362c0b8a1f6f62d21fe4b1280124cdf2b97"
+summary_balance_id_hex72 = "000000000909090909090909090909090909090909090909090909090909090909090909"
+summary_balance_id_strkey = "BAAASCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCPLWY"
+summary_asset = "XLM"
+summary_amount_stroops = 5
+summary_source = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H"
+summary_simulated_fee_stroops = 100
+summary_simulated_seq_num = 7
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000010"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+attestation_blob_b64 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+
+[pending.attested_approver]
+kind = "remote"
+credential_id_b64url = "AAECAw"
+
+[pending.claim_simulated]
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAAAAAAAAQAAAAAAAAAPAAAAAAkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJAAAAAAAAAAA="
+envelope_sha256_hex = "2bcf339df368e2ca1703d07811d2f362c0b8a1f6f62d21fe4b1280124cdf2b97"
+summary_balance_id_hex72 = "000000000909090909090909090909090909090909090909090909090909090909090909"
+summary_balance_id_strkey = "BAAASCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCPLWY"
+summary_asset = "XLM"
+summary_amount_stroops = 5
+summary_source = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H"
+summary_simulated_fee_stroops = 100
+summary_simulated_seq_num = 7
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000011"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 5
+attestation_blob_b64 = "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"
+
+[pending.attested_approver]
+kind = "mainnet_passkey"
+credential_id_b64url = "WlpaWlpaWlpaWlpaWlpaWg"
+
+[pending.mainnet_presence]
+version = 1
+request_id = "00000000-0000-4000-8000-000000000001"
+random_b64url = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+policy_sequence = 7
+policy_digest_hex = "abababababababababababababababababababababababababababababababab"
+policy_owner_hex = "0909090909090909090909090909090909090909090909090909090909090909"
+expected_origin = "http://localhost:4100"
+issued_at_unix_ms = 1700000005000
+expires_at_unix_ms = 1700000065000
+verified_at_unix_ms = 1700000006000
+
+[pending.mainnet_presence.assertion]
+credential_id = [
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+]
+authenticator_data = [
+    73,
+    150,
+    13,
+    229,
+    136,
+    14,
+    140,
+    104,
+    116,
+    52,
+    23,
+    15,
+    100,
+    118,
+    96,
+    91,
+    143,
+    228,
+    174,
+    185,
+    162,
+    134,
+    50,
+    199,
+    153,
+    92,
+    243,
+    186,
+    131,
+    29,
+    151,
+    99,
+    5,
+    0,
+    0,
+    0,
+    1,
+]
+client_data_json = [
+    123,
+    34,
+    99,
+    104,
+    97,
+    108,
+    108,
+    101,
+    110,
+    103,
+    101,
+    34,
+    58,
+    34,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    34,
+    44,
+    34,
+    99,
+    114,
+    111,
+    115,
+    115,
+    79,
+    114,
+    105,
+    103,
+    105,
+    110,
+    34,
+    58,
+    102,
+    97,
+    108,
+    115,
+    101,
+    44,
+    34,
+    111,
+    114,
+    105,
+    103,
+    105,
+    110,
+    34,
+    58,
+    34,
+    104,
+    116,
+    116,
+    112,
+    58,
+    47,
+    47,
+    108,
+    111,
+    99,
+    97,
+    108,
+    104,
+    111,
+    115,
+    116,
+    58,
+    52,
+    49,
+    48,
+    48,
+    34,
+    44,
+    34,
+    116,
+    121,
+    112,
+    101,
+    34,
+    58,
+    34,
+    119,
+    101,
+    98,
+    97,
+    117,
+    116,
+    104,
+    110,
+    46,
+    103,
+    101,
+    116,
+    34,
+    125,
+]
+signature_compact = [
+    238,
+    214,
+    76,
+    215,
+    82,
+    35,
+    85,
+    137,
+    210,
+    69,
+    45,
+    43,
+    111,
+    89,
+    146,
+    26,
+    126,
+    69,
+    205,
+    146,
+    118,
+    244,
+    150,
+    86,
+    37,
+    62,
+    143,
+    50,
+    208,
+    232,
+    115,
+    251,
+    33,
+    95,
+    41,
+    208,
+    156,
+    255,
+    238,
+    190,
+    252,
+    249,
+    203,
+    151,
+    140,
+    179,
+    139,
+    63,
+    9,
+    181,
+    143,
+    144,
+    48,
+    56,
+    42,
+    152,
+    0,
+    93,
+    229,
+    90,
+    6,
+    50,
+    234,
+    193,
+]
+
+[pending.claim_simulated]
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAAAAAAAAQAAAAAAAAAPAAAAAAkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJAAAAAAAAAAA="
+envelope_sha256_hex = "2bcf339df368e2ca1703d07811d2f362c0b8a1f6f62d21fe4b1280124cdf2b97"
+summary_balance_id_hex72 = "000000000909090909090909090909090909090909090909090909090909090909090909"
+summary_balance_id_strkey = "BAAASCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCPLWY"
+summary_asset = "XLM"
+summary_amount_stroops = 5
+summary_source = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H"
+summary_simulated_fee_stroops = 100
+summary_simulated_seq_num = 7
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000012"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+
+[pending.trustline_simulated]
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAAAAAAAAQAAAAAAAAAGAAAAAVVTREMAAAAAQj59BfLsr7/sGSshWj8b6WrtuNjnAlSr40E+AgfeVrIAAAAAAAAAZAAAAAAAAAAA"
+envelope_sha256_hex = "9925655313a14348bf6fc4e629b6131eadb331afc7c1e7245f0ae7d999f3f415"
+holder = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H"
+asset_code = "USDC"
+asset_issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+limit_stroops = 100
+simulated_fee_stroops = 100
+simulated_seq_num = 7
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000013"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 2
+attestation_blob_b64 = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"
+
+[pending.trustline_simulated]
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAAAAAAAAQAAAAAAAAAGAAAAAVVTREMAAAAAQj59BfLsr7/sGSshWj8b6WrtuNjnAlSr40E+AgfeVrIAAAAAAAAAZAAAAAAAAAAA"
+envelope_sha256_hex = "9925655313a14348bf6fc4e629b6131eadb331afc7c1e7245f0ae7d999f3f415"
+holder = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H"
+asset_code = "USDC"
+asset_issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+limit_stroops = 100
+simulated_fee_stroops = 100
+simulated_seq_num = 7
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000014"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 3
+attestation_blob_b64 = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"
+
+[pending.trustline_simulated]
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAAAAAAAAQAAAAAAAAAGAAAAAVVTREMAAAAAQj59BfLsr7/sGSshWj8b6WrtuNjnAlSr40E+AgfeVrIAAAAAAAAAZAAAAAAAAAAA"
+envelope_sha256_hex = "9925655313a14348bf6fc4e629b6131eadb331afc7c1e7245f0ae7d999f3f415"
+holder = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H"
+asset_code = "USDC"
+asset_issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+limit_stroops = 100
+simulated_fee_stroops = 100
+simulated_seq_num = 7
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000015"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+attestation_blob_b64 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+
+[pending.attested_approver]
+kind = "local"
+
+[pending.trustline_simulated]
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAAAAAAAAQAAAAAAAAAGAAAAAVVTREMAAAAAQj59BfLsr7/sGSshWj8b6WrtuNjnAlSr40E+AgfeVrIAAAAAAAAAZAAAAAAAAAAA"
+envelope_sha256_hex = "9925655313a14348bf6fc4e629b6131eadb331afc7c1e7245f0ae7d999f3f415"
+holder = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H"
+asset_code = "USDC"
+asset_issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+limit_stroops = 100
+simulated_fee_stroops = 100
+simulated_seq_num = 7
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000016"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+attestation_blob_b64 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+
+[pending.attested_approver]
+kind = "remote"
+credential_id_b64url = "AAECAw"
+
+[pending.trustline_simulated]
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAAAAAAAAQAAAAAAAAAGAAAAAVVTREMAAAAAQj59BfLsr7/sGSshWj8b6WrtuNjnAlSr40E+AgfeVrIAAAAAAAAAZAAAAAAAAAAA"
+envelope_sha256_hex = "9925655313a14348bf6fc4e629b6131eadb331afc7c1e7245f0ae7d999f3f415"
+holder = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H"
+asset_code = "USDC"
+asset_issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+limit_stroops = 100
+simulated_fee_stroops = 100
+simulated_seq_num = 7
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000017"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 5
+attestation_blob_b64 = "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"
+
+[pending.attested_approver]
+kind = "mainnet_passkey"
+credential_id_b64url = "WlpaWlpaWlpaWlpaWlpaWg"
+
+[pending.mainnet_presence]
+version = 1
+request_id = "00000000-0000-4000-8000-000000000001"
+random_b64url = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+policy_sequence = 7
+policy_digest_hex = "abababababababababababababababababababababababababababababababab"
+policy_owner_hex = "0909090909090909090909090909090909090909090909090909090909090909"
+expected_origin = "http://localhost:4100"
+issued_at_unix_ms = 1700000005000
+expires_at_unix_ms = 1700000065000
+verified_at_unix_ms = 1700000006000
+
+[pending.mainnet_presence.assertion]
+credential_id = [
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+]
+authenticator_data = [
+    73,
+    150,
+    13,
+    229,
+    136,
+    14,
+    140,
+    104,
+    116,
+    52,
+    23,
+    15,
+    100,
+    118,
+    96,
+    91,
+    143,
+    228,
+    174,
+    185,
+    162,
+    134,
+    50,
+    199,
+    153,
+    92,
+    243,
+    186,
+    131,
+    29,
+    151,
+    99,
+    5,
+    0,
+    0,
+    0,
+    1,
+]
+client_data_json = [
+    123,
+    34,
+    99,
+    104,
+    97,
+    108,
+    108,
+    101,
+    110,
+    103,
+    101,
+    34,
+    58,
+    34,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    34,
+    44,
+    34,
+    99,
+    114,
+    111,
+    115,
+    115,
+    79,
+    114,
+    105,
+    103,
+    105,
+    110,
+    34,
+    58,
+    102,
+    97,
+    108,
+    115,
+    101,
+    44,
+    34,
+    111,
+    114,
+    105,
+    103,
+    105,
+    110,
+    34,
+    58,
+    34,
+    104,
+    116,
+    116,
+    112,
+    58,
+    47,
+    47,
+    108,
+    111,
+    99,
+    97,
+    108,
+    104,
+    111,
+    115,
+    116,
+    58,
+    52,
+    49,
+    48,
+    48,
+    34,
+    44,
+    34,
+    116,
+    121,
+    112,
+    101,
+    34,
+    58,
+    34,
+    119,
+    101,
+    98,
+    97,
+    117,
+    116,
+    104,
+    110,
+    46,
+    103,
+    101,
+    116,
+    34,
+    125,
+]
+signature_compact = [
+    238,
+    214,
+    76,
+    215,
+    82,
+    35,
+    85,
+    137,
+    210,
+    69,
+    45,
+    43,
+    111,
+    89,
+    146,
+    26,
+    126,
+    69,
+    205,
+    146,
+    118,
+    244,
+    150,
+    86,
+    37,
+    62,
+    143,
+    50,
+    208,
+    232,
+    115,
+    251,
+    33,
+    95,
+    41,
+    208,
+    156,
+    255,
+    238,
+    190,
+    252,
+    249,
+    203,
+    151,
+    140,
+    179,
+    139,
+    63,
+    9,
+    181,
+    143,
+    144,
+    48,
+    56,
+    42,
+    152,
+    0,
+    93,
+    229,
+    90,
+    6,
+    50,
+    234,
+    193,
+]
+
+[pending.trustline_simulated]
+envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAABwAAAAAAAAAAAAAAAQAAAAAAAAAGAAAAAVVTREMAAAAAQj59BfLsr7/sGSshWj8b6WrtuNjnAlSr40E+AgfeVrIAAAAAAAAAZAAAAAAAAAAA"
+envelope_sha256_hex = "9925655313a14348bf6fc4e629b6131eadb331afc7c1e7245f0ae7d999f3f415"
+holder = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H"
+asset_code = "USDC"
+asset_issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+limit_stroops = 100
+simulated_fee_stroops = 100
+simulated_seq_num = 7
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000018"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+
+[pending.x402_payment]
+intent_digest = "475f55b4485773675cc0b84d4c31c6200b5a503f609d3ff390bbc37acdc8c133"
+root_invocation_xdr = "AAAAAAAAAAEHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwAAAAh0cmFuc2ZlcgAAAAMAAAASAAAAAAAAAAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAAABIAAAAAAAAAAAUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFAAAACgAAAAAAAAAAAAAAAAAAAAwAAAAA"
+payee = "GACQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKG7N"
+amount = "12"
+asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000019"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 2
+attestation_blob_b64 = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"
+
+[pending.x402_payment]
+intent_digest = "475f55b4485773675cc0b84d4c31c6200b5a503f609d3ff390bbc37acdc8c133"
+root_invocation_xdr = "AAAAAAAAAAEHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwAAAAh0cmFuc2ZlcgAAAAMAAAASAAAAAAAAAAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAAABIAAAAAAAAAAAUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFAAAACgAAAAAAAAAAAAAAAAAAAAwAAAAA"
+payee = "GACQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKG7N"
+amount = "12"
+asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000020"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 3
+attestation_blob_b64 = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"
+
+[pending.x402_payment]
+intent_digest = "475f55b4485773675cc0b84d4c31c6200b5a503f609d3ff390bbc37acdc8c133"
+root_invocation_xdr = "AAAAAAAAAAEHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwAAAAh0cmFuc2ZlcgAAAAMAAAASAAAAAAAAAAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAAABIAAAAAAAAAAAUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFAAAACgAAAAAAAAAAAAAAAAAAAAwAAAAA"
+payee = "GACQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKG7N"
+amount = "12"
+asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000021"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+attestation_blob_b64 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+
+[pending.attested_approver]
+kind = "local"
+
+[pending.x402_payment]
+intent_digest = "475f55b4485773675cc0b84d4c31c6200b5a503f609d3ff390bbc37acdc8c133"
+root_invocation_xdr = "AAAAAAAAAAEHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwAAAAh0cmFuc2ZlcgAAAAMAAAASAAAAAAAAAAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAAABIAAAAAAAAAAAUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFAAAACgAAAAAAAAAAAAAAAAAAAAwAAAAA"
+payee = "GACQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKG7N"
+amount = "12"
+asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000022"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+attestation_blob_b64 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+
+[pending.attested_approver]
+kind = "remote"
+credential_id_b64url = "AAECAw"
+
+[pending.x402_payment]
+intent_digest = "475f55b4485773675cc0b84d4c31c6200b5a503f609d3ff390bbc37acdc8c133"
+root_invocation_xdr = "AAAAAAAAAAEHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwAAAAh0cmFuc2ZlcgAAAAMAAAASAAAAAAAAAAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAAABIAAAAAAAAAAAUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFAAAACgAAAAAAAAAAAAAAAAAAAAwAAAAA"
+payee = "GACQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKG7N"
+amount = "12"
+asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000023"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 5
+attestation_blob_b64 = "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"
+
+[pending.attested_approver]
+kind = "mainnet_passkey"
+credential_id_b64url = "WlpaWlpaWlpaWlpaWlpaWg"
+
+[pending.mainnet_presence]
+version = 1
+request_id = "00000000-0000-4000-8000-000000000001"
+random_b64url = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+policy_sequence = 7
+policy_digest_hex = "abababababababababababababababababababababababababababababababab"
+policy_owner_hex = "0909090909090909090909090909090909090909090909090909090909090909"
+expected_origin = "http://localhost:4100"
+issued_at_unix_ms = 1700000005000
+expires_at_unix_ms = 1700000065000
+verified_at_unix_ms = 1700000006000
+
+[pending.mainnet_presence.assertion]
+credential_id = [
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+]
+authenticator_data = [
+    73,
+    150,
+    13,
+    229,
+    136,
+    14,
+    140,
+    104,
+    116,
+    52,
+    23,
+    15,
+    100,
+    118,
+    96,
+    91,
+    143,
+    228,
+    174,
+    185,
+    162,
+    134,
+    50,
+    199,
+    153,
+    92,
+    243,
+    186,
+    131,
+    29,
+    151,
+    99,
+    5,
+    0,
+    0,
+    0,
+    1,
+]
+client_data_json = [
+    123,
+    34,
+    99,
+    104,
+    97,
+    108,
+    108,
+    101,
+    110,
+    103,
+    101,
+    34,
+    58,
+    34,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    34,
+    44,
+    34,
+    99,
+    114,
+    111,
+    115,
+    115,
+    79,
+    114,
+    105,
+    103,
+    105,
+    110,
+    34,
+    58,
+    102,
+    97,
+    108,
+    115,
+    101,
+    44,
+    34,
+    111,
+    114,
+    105,
+    103,
+    105,
+    110,
+    34,
+    58,
+    34,
+    104,
+    116,
+    116,
+    112,
+    58,
+    47,
+    47,
+    108,
+    111,
+    99,
+    97,
+    108,
+    104,
+    111,
+    115,
+    116,
+    58,
+    52,
+    49,
+    48,
+    48,
+    34,
+    44,
+    34,
+    116,
+    121,
+    112,
+    101,
+    34,
+    58,
+    34,
+    119,
+    101,
+    98,
+    97,
+    117,
+    116,
+    104,
+    110,
+    46,
+    103,
+    101,
+    116,
+    34,
+    125,
+]
+signature_compact = [
+    238,
+    214,
+    76,
+    215,
+    82,
+    35,
+    85,
+    137,
+    210,
+    69,
+    45,
+    43,
+    111,
+    89,
+    146,
+    26,
+    126,
+    69,
+    205,
+    146,
+    118,
+    244,
+    150,
+    86,
+    37,
+    62,
+    143,
+    50,
+    208,
+    232,
+    115,
+    251,
+    33,
+    95,
+    41,
+    208,
+    156,
+    255,
+    238,
+    190,
+    252,
+    249,
+    203,
+    151,
+    140,
+    179,
+    139,
+    63,
+    9,
+    181,
+    143,
+    144,
+    48,
+    56,
+    42,
+    152,
+    0,
+    93,
+    229,
+    90,
+    6,
+    50,
+    234,
+    193,
+]
+
+[pending.x402_payment]
+intent_digest = "475f55b4485773675cc0b84d4c31c6200b5a503f609d3ff390bbc37acdc8c133"
+root_invocation_xdr = "AAAAAAAAAAEHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwAAAAh0cmFuc2ZlcgAAAAMAAAASAAAAAAAAAAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAAABIAAAAAAAAAAAUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFAAAACgAAAAAAAAAAAAAAAAAAAAwAAAAA"
+payee = "GACQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKG7N"
+amount = "12"
+asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000024"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+
+[pending.trustline_clawback_opt_in]
+network = "stellar:mainnet"
+code = "USDC"
+issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000025"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 2
+attestation_blob_b64 = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"
+
+[pending.trustline_clawback_opt_in]
+network = "stellar:mainnet"
+code = "USDC"
+issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000026"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 3
+attestation_blob_b64 = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"
+
+[pending.trustline_clawback_opt_in]
+network = "stellar:mainnet"
+code = "USDC"
+issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000027"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+attestation_blob_b64 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+
+[pending.attested_approver]
+kind = "local"
+
+[pending.trustline_clawback_opt_in]
+network = "stellar:mainnet"
+code = "USDC"
+issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000028"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+attestation_blob_b64 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+
+[pending.attested_approver]
+kind = "remote"
+credential_id_b64url = "AAECAw"
+
+[pending.trustline_clawback_opt_in]
+network = "stellar:mainnet"
+code = "USDC"
+issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000029"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 5
+attestation_blob_b64 = "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"
+
+[pending.attested_approver]
+kind = "mainnet_passkey"
+credential_id_b64url = "WlpaWlpaWlpaWlpaWlpaWg"
+
+[pending.mainnet_presence]
+version = 1
+request_id = "00000000-0000-4000-8000-000000000001"
+random_b64url = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+policy_sequence = 7
+policy_digest_hex = "abababababababababababababababababababababababababababababababab"
+policy_owner_hex = "0909090909090909090909090909090909090909090909090909090909090909"
+expected_origin = "http://localhost:4100"
+issued_at_unix_ms = 1700000005000
+expires_at_unix_ms = 1700000065000
+verified_at_unix_ms = 1700000006000
+
+[pending.mainnet_presence.assertion]
+credential_id = [
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+]
+authenticator_data = [
+    73,
+    150,
+    13,
+    229,
+    136,
+    14,
+    140,
+    104,
+    116,
+    52,
+    23,
+    15,
+    100,
+    118,
+    96,
+    91,
+    143,
+    228,
+    174,
+    185,
+    162,
+    134,
+    50,
+    199,
+    153,
+    92,
+    243,
+    186,
+    131,
+    29,
+    151,
+    99,
+    5,
+    0,
+    0,
+    0,
+    1,
+]
+client_data_json = [
+    123,
+    34,
+    99,
+    104,
+    97,
+    108,
+    108,
+    101,
+    110,
+    103,
+    101,
+    34,
+    58,
+    34,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    34,
+    44,
+    34,
+    99,
+    114,
+    111,
+    115,
+    115,
+    79,
+    114,
+    105,
+    103,
+    105,
+    110,
+    34,
+    58,
+    102,
+    97,
+    108,
+    115,
+    101,
+    44,
+    34,
+    111,
+    114,
+    105,
+    103,
+    105,
+    110,
+    34,
+    58,
+    34,
+    104,
+    116,
+    116,
+    112,
+    58,
+    47,
+    47,
+    108,
+    111,
+    99,
+    97,
+    108,
+    104,
+    111,
+    115,
+    116,
+    58,
+    52,
+    49,
+    48,
+    48,
+    34,
+    44,
+    34,
+    116,
+    121,
+    112,
+    101,
+    34,
+    58,
+    34,
+    119,
+    101,
+    98,
+    97,
+    117,
+    116,
+    104,
+    110,
+    46,
+    103,
+    101,
+    116,
+    34,
+    125,
+]
+signature_compact = [
+    238,
+    214,
+    76,
+    215,
+    82,
+    35,
+    85,
+    137,
+    210,
+    69,
+    45,
+    43,
+    111,
+    89,
+    146,
+    26,
+    126,
+    69,
+    205,
+    146,
+    118,
+    244,
+    150,
+    86,
+    37,
+    62,
+    143,
+    50,
+    208,
+    232,
+    115,
+    251,
+    33,
+    95,
+    41,
+    208,
+    156,
+    255,
+    238,
+    190,
+    252,
+    249,
+    203,
+    151,
+    140,
+    179,
+    139,
+    63,
+    9,
+    181,
+    143,
+    144,
+    48,
+    56,
+    42,
+    152,
+    0,
+    93,
+    229,
+    90,
+    6,
+    50,
+    234,
+    193,
+]
+
+[pending.trustline_clawback_opt_in]
+network = "stellar:mainnet"
+code = "USDC"
+issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000030"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+
+[pending.rule_proposal_simulated]
+smart_account = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+smart_account_redacted = "CAAAA...AAAAA"
+network_passphrase = "Test SDF Network ; September 2015"
+chain_id = "stellar:testnet"
+proposal_sha256 = [
+    227,
+    12,
+    14,
+    209,
+    247,
+    239,
+    91,
+    245,
+    156,
+    58,
+    202,
+    223,
+    6,
+    64,
+    217,
+    31,
+    62,
+    130,
+    88,
+    81,
+    178,
+    45,
+    164,
+    147,
+    62,
+    19,
+    81,
+    116,
+    93,
+    172,
+    233,
+    65,
+]
+summary_line = 'CallContract rule "spend-daily"'
+
+[pending.rule_proposal_simulated.definition]
+snapshot_version = 1
+name = "spend-daily"
+policies = []
+auth_rule_ids = [0]
+accept_mutable_verifier = false
+accept_unknown_verifier = false
+
+[pending.rule_proposal_simulated.definition.context_type]
+type = "default"
+
+[[pending.rule_proposal_simulated.definition.signers]]
+kind = "delegated"
+address = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+is_proposer = true
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000031"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+attestation_blob_b64 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+
+[pending.attested_approver]
+kind = "local"
+
+[pending.rule_proposal_simulated]
+smart_account = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+smart_account_redacted = "CAAAA...AAAAA"
+network_passphrase = "Test SDF Network ; September 2015"
+chain_id = "stellar:testnet"
+proposal_sha256 = [
+    227,
+    12,
+    14,
+    209,
+    247,
+    239,
+    91,
+    245,
+    156,
+    58,
+    202,
+    223,
+    6,
+    64,
+    217,
+    31,
+    62,
+    130,
+    88,
+    81,
+    178,
+    45,
+    164,
+    147,
+    62,
+    19,
+    81,
+    116,
+    93,
+    172,
+    233,
+    65,
+]
+summary_line = 'CallContract rule "spend-daily"'
+
+[pending.rule_proposal_simulated.definition]
+snapshot_version = 1
+name = "spend-daily"
+policies = []
+auth_rule_ids = [0]
+accept_mutable_verifier = false
+accept_unknown_verifier = false
+
+[pending.rule_proposal_simulated.definition.context_type]
+type = "default"
+
+[[pending.rule_proposal_simulated.definition.signers]]
+kind = "delegated"
+address = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+is_proposer = true
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000032"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+
+[pending.mpp_charge_simulated]
+authorization_fingerprint = [
+    14,
+    118,
+    25,
+    151,
+    65,
+    47,
+    114,
+    44,
+    136,
+    190,
+    84,
+    176,
+    38,
+    140,
+    79,
+    117,
+    90,
+    222,
+    138,
+    73,
+    244,
+    67,
+    127,
+    82,
+    159,
+    84,
+    160,
+    40,
+    144,
+    140,
+    144,
+    181,
+]
+prepared_artifact_hash = [
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+]
+profile = "a"
+chain_id = "stellar:testnet"
+payer = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+transport = "mcp"
+authority = "merchant"
+target = "tools/charge"
+amount = "1000000"
+currency = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+recipient = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+challenge_expires_at_unix = 1700003600
+simulated_fee_stroops = 1100
+
+[pending.mpp_charge_simulated.authorization_context]
+context_digest = [
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+]
+network_passphrase_hash = [
+    206,
+    224,
+    48,
+    45,
+    89,
+    132,
+    77,
+    50,
+    189,
+    202,
+    145,
+    92,
+    130,
+    3,
+    221,
+    68,
+    179,
+    63,
+    187,
+    126,
+    220,
+    25,
+    5,
+    30,
+    163,
+    122,
+    190,
+    223,
+    40,
+    236,
+    212,
+    114,
+]
+challenge_digest = [
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+]
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000033"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+attestation_blob_b64 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+
+[pending.attested_approver]
+kind = "local"
+
+[pending.mpp_charge_simulated]
+authorization_fingerprint = [
+    14,
+    118,
+    25,
+    151,
+    65,
+    47,
+    114,
+    44,
+    136,
+    190,
+    84,
+    176,
+    38,
+    140,
+    79,
+    117,
+    90,
+    222,
+    138,
+    73,
+    244,
+    67,
+    127,
+    82,
+    159,
+    84,
+    160,
+    40,
+    144,
+    140,
+    144,
+    181,
+]
+prepared_artifact_hash = [
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+]
+profile = "a"
+chain_id = "stellar:testnet"
+payer = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+transport = "mcp"
+authority = "merchant"
+target = "tools/charge"
+amount = "1000000"
+currency = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+recipient = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+challenge_expires_at_unix = 1700003600
+simulated_fee_stroops = 1100
+
+[pending.mpp_charge_simulated.authorization_context]
+context_digest = [
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+    49,
+]
+network_passphrase_hash = [
+    206,
+    224,
+    48,
+    45,
+    89,
+    132,
+    77,
+    50,
+    189,
+    202,
+    145,
+    92,
+    130,
+    3,
+    221,
+    68,
+    179,
+    63,
+    187,
+    126,
+    220,
+    25,
+    5,
+    30,
+    163,
+    122,
+    190,
+    223,
+    40,
+    236,
+    212,
+    114,
+]
+challenge_digest = [
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+    50,
+]
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000034"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+
+[pending.sign_with_passkey]
+auth_digest = [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+]
+credential_id = [
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+    171,
+]
+smart_account_redacted = "CAAAA...BBBBB"
+rule_ids = [
+    1,
+    2,
+]
+csrf_token = [
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+]
+rp_id = "localhost"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000035"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+
+[pending.register_passkey]
+smart_account_redacted = "CAAAA...BBBBB"
+rule_ids = [
+    1,
+    2,
+]
+csrf_token = [
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+]
+rp_id = "localhost"
+user_handle = [
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+]
+registration_challenge = [
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+]
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000036"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+
+[pending.toolset_first_invoke_gate]
+toolset_name = "my-toolset"
+install_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+package_version = "1.0.0"
+package_shasum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+capability = "sign-payment"
+destination = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+asset = "XLM"
+amount_min_stroops = 0
+amount_max_stroops = 10000000
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000037"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 5
+attestation_blob_b64 = "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"
+
+[pending.attested_approver]
+kind = "mainnet_passkey"
+credential_id_b64url = "WlpaWlpaWlpaWlpaWlpaWg"
+
+[pending.mainnet_presence]
+version = 1
+request_id = "00000000-0000-4000-8000-000000000001"
+random_b64url = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+policy_sequence = 7
+policy_digest_hex = "abababababababababababababababababababababababababababababababab"
+policy_owner_hex = "0909090909090909090909090909090909090909090909090909090909090909"
+expected_origin = "http://localhost:4100"
+issued_at_unix_ms = 1700000005000
+expires_at_unix_ms = 1700000065000
+verified_at_unix_ms = 1700000006000
+
+[pending.mainnet_presence.assertion]
+credential_id = [
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+    90,
+]
+authenticator_data = [
+    73,
+    150,
+    13,
+    229,
+    136,
+    14,
+    140,
+    104,
+    116,
+    52,
+    23,
+    15,
+    100,
+    118,
+    96,
+    91,
+    143,
+    228,
+    174,
+    185,
+    162,
+    134,
+    50,
+    199,
+    153,
+    92,
+    243,
+    186,
+    131,
+    29,
+    151,
+    99,
+    5,
+    0,
+    0,
+    0,
+    1,
+]
+client_data_json = [
+    123,
+    34,
+    99,
+    104,
+    97,
+    108,
+    108,
+    101,
+    110,
+    103,
+    101,
+    34,
+    58,
+    34,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    72,
+    66,
+    119,
+    99,
+    34,
+    44,
+    34,
+    99,
+    114,
+    111,
+    115,
+    115,
+    79,
+    114,
+    105,
+    103,
+    105,
+    110,
+    34,
+    58,
+    102,
+    97,
+    108,
+    115,
+    101,
+    44,
+    34,
+    111,
+    114,
+    105,
+    103,
+    105,
+    110,
+    34,
+    58,
+    34,
+    104,
+    116,
+    116,
+    112,
+    58,
+    47,
+    47,
+    108,
+    111,
+    99,
+    97,
+    108,
+    104,
+    111,
+    115,
+    116,
+    58,
+    52,
+    49,
+    48,
+    48,
+    34,
+    44,
+    34,
+    116,
+    121,
+    112,
+    101,
+    34,
+    58,
+    34,
+    119,
+    101,
+    98,
+    97,
+    117,
+    116,
+    104,
+    110,
+    46,
+    103,
+    101,
+    116,
+    34,
+    125,
+]
+signature_compact = [
+    238,
+    214,
+    76,
+    215,
+    82,
+    35,
+    85,
+    137,
+    210,
+    69,
+    45,
+    43,
+    111,
+    89,
+    146,
+    26,
+    126,
+    69,
+    205,
+    146,
+    118,
+    244,
+    150,
+    86,
+    37,
+    62,
+    143,
+    50,
+    208,
+    232,
+    115,
+    251,
+    33,
+    95,
+    41,
+    208,
+    156,
+    255,
+    238,
+    190,
+    252,
+    249,
+    203,
+    151,
+    140,
+    179,
+    139,
+    63,
+    9,
+    181,
+    143,
+    144,
+    48,
+    56,
+    42,
+    152,
+    0,
+    93,
+    229,
+    90,
+    6,
+    50,
+    234,
+    193,
+]
+
+[pending.consumed]
+original_kind_name = "PaymentSimulated"
+tx_hash = "abababababababababababababababababababababababababababababababab"
+outcome = "confirmed"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000038"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+attestation_blob_b64 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+
+[pending.attested_approver]
+kind = "local"
+
+[pending.consumed]
+original_kind_name = "ClaimSimulated"
+tx_hash = "abababababababababababababababababababababababababababababababab"
+outcome = "unknown"
+
+[[pending]]
+approval_nonce = "baseinboxnonce00000039"
+process_uid = "1000"
+created_at_unix_ms = 1700000000000
+expires_at_unix_ms = 1700086400000
+attestation_version = 4
+
+[pending.rejected]
+original_kind_name = "TrustlineSimulated"

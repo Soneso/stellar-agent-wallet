@@ -25,7 +25,6 @@
 //! WebAuthn error reason discriminators.
 
 use axum::{
-    Json,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -37,6 +36,7 @@ use sha2::{Digest, Sha256};
 use stellar_agent_core::approval::{ApprovalKind, AssertionInput};
 use stellar_agent_smart_account::webauthn::{normalize_der_to_compact_low_s, pre_verify_assertion};
 
+use super::JsonBody;
 use super::register::current_unix_ms;
 use crate::{BridgeState, CsrfToken, templates, wire::AuthenticationResponseJSON};
 
@@ -195,6 +195,8 @@ pub(crate) async fn approve_get(
 ///
 /// # Errors
 ///
+/// - `{"error":"invalid_body"}` with the status of the JSON extractor's refusal:
+///   the body is not the expected JSON.
 /// - `403 Forbidden` — CSRF absent, non-hex, or mismatch.
 /// - `400 Bad Request` — nonce not found / expired / wrong kind; or assertion
 ///   failed pre-verification; or store record failed.
@@ -203,7 +205,7 @@ pub(crate) async fn approve_assertion_post(
     Path(nonce): Path<String>,
     State(state): State<BridgeState>,
     headers: HeaderMap,
-    Json(payload): Json<AuthenticationResponseJSON>,
+    JsonBody(payload): JsonBody<AuthenticationResponseJSON>,
 ) -> impl IntoResponse {
     // ── CSRF header read + decode ─────────────────────────────────────────
     let csrf_header = match headers.get("x-stellar-approval-csrf") {

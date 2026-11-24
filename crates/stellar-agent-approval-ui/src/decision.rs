@@ -23,19 +23,87 @@
 //! or a poisoned writer mutex, answers [`Outcome::Unavailable`] with the store
 //! unchanged. A poisoned mutex keeps refusing every decision until the
 //! inbox restarts.
+//!
+//! # Remote authorization
+//!
+//! A [`RequestIdentity::Remote`] decision reads the profile's current
+//! remote-approval authorization from disk through its
+//! [`RemoteApprovalAuthority`]: once when the request is resolved, and an
+//! approve again after the attestation key is loaded, immediately before its
+//! consent row and attestation are persisted, so a credential removed while
+//! the keyring prompt waits cannot approve. A credential the current files do
+//! not admit answers [`Outcome::Unauthorized`] with the store unchanged.
+//!
+//! # Mainnet
+//!
+//! A mainnet consent needs a verified WebAuthn assertion from an approval
+//! credential in the owner-signed policy, which neither a local session nor
+//! a remote listener's allowlist supplies. A remote approve on mainnet
+//! refuses before any read with `approval.mainnet_remote_unsupported`. A
+//! local approve reaches the shared attester, which refuses the standard
+//! authorization on a mainnet binding with `approval.presence_required`
+//! before any row or attestation. Both answer [`Outcome::PresenceRefused`]
+//! with the store unchanged. A loopback reject needs no presence.
+//!
+//! The listener of an owner-signed approval origin decides as
+//! [`RequestIdentity::SignedOrigin`]. Its approve carries verified presence
+//! as authorization, attributed to [`Surface::ServeRemote`] with a mainnet
+//! passkey approver. Its reject carries verified presence for the same entry.
+//! The entry binding is the
+//! process UID, as for the local inbox.
+//!
+//! A mainnet payment, claim, trustline or x402 approval also needs durable
+//! consent, which the context's [`ConsentRecording`] completes. A context
+//! without one refuses such an approve with [`Outcome::Unavailable`] before
+//! any row. A mainnet approve takes the shared policy guard before the
+//! pending store. After the attestation persists, it releases the audit
+//! writer mutex and verifies the stored proof under that guard. It then
+//! releases the pending store and the guard before it calls
+//! [`ConsentRecording::complete`]. It reports
+//! [`Outcome::Attested`] only after that succeeds. A failed completion
+//! answers [`Outcome::Unavailable`] and keeps the attested entry. An approve
+//! that finds the entry attested, before or after its keyring wait,
+//! completes the consent the same way before its existing answer. Other
+//! kinds and other chains never call the recording.
+//!
+//! For a kind the recording publishes, the approve reacquires the record's
+//! evidence reservation through [`ConsentRecording::precheck`] before the
+//! row, and attests through the strict attester, which stores a publication
+//! handoff. Every completion verifies that handoff under the guard and
+//! passes it to [`ConsentRecording::complete`] in [`VerifiedConsent`].
+//!
+//! # What the page showed
+//!
+//! An approve attests only the terms its page rendered. Every approval page
+//! carries the [`approval_view_digest`] of the entry it renders, and
+//! [`Decision::Approve`] carries the digest the request returned. After the
+//! entry is validated, the approve compares that digest with the digest of
+//! the entry it holds and refuses with `approval.presence_changed`
+//! ([`consent_changed`]) when the request named none or another one. The
+//! attester then refuses an entry that changed between that comparison and
+//! the persist. A reject attests nothing and carries no digest.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::approval::error::ApprovalError;
+use stellar_agent_core::approval::presence::{MAINNET_CHAIN_ID, MainnetPresenceReceipt};
+use stellar_agent_core::approval::presence_policy::PolicyAdmission;
+use stellar_agent_core::approval::witness::{
+    ApprovalExpectation, ApprovalWitness, ApprovedKind, verify_approval_admitted,
+};
 use stellar_agent_core::approval::{
-    ApprovalKind, ApproverIdentity, ConsentAudit, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF,
-    PendingApprovalStore, Surface, attest_and_persist, load_and_validate_entry,
-    load_attestation_key, open_with_retry, process_uid_for_attestation,
+    ApprovalKind, ApproverIdentity, AttestedApprover, ConsentAudit, ConsentAuthorization,
+    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApproval, PendingApprovalStore,
+    RemoteApprovalAuthority, Surface, VerifiedConsentPublication, approval_view_digest,
+    attest::attest_and_persist_with_row, attest_and_persist, decode_sha256_hex,
+    load_and_validate_entry, load_attestation_key, open_with_retry, process_uid_for_attestation,
+    verify_consent_publication,
 };
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::error::WalletError;
+use stellar_agent_core::profile::caip2::Caip2;
 use stellar_agent_core::profile::owner_key::OwnerKeyContext;
 use stellar_agent_core::profile::schema::KeyringEntryRef;
 use stellar_agent_core::timefmt;
@@ -53,23 +121,44 @@ pub const REJECT_TOMBSTONE_TTL_MS: u64 = 3_600_000;
 /// [`apply_decision`] is authentication-agnostic per the module docs; this
 /// type is the narrow seam a caller uses to say WHO is deciding, without
 /// `apply_decision` itself knowing how that identity was established.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the mainnet arm owns its single-use sealed proof"
+)]
 #[non_exhaustive]
 pub enum RequestIdentity {
+    /// Verified consent from the owner-signed mainnet policy.
+    Mainnet(stellar_agent_core::approval::VerifiedMainnetPresence),
+    /// Verified consent from the owner-signed mainnet policy, at the listener
+    /// of its signed approval origin. The decision is attributed to
+    /// [`Surface::ServeRemote`] with a mainnet passkey approver; the entry
+    /// binding is `ApproverIdentity::OsUid(process_uid_for_attestation())`.
+    /// A reject requires the presence to name the rejected entry.
+    SignedOrigin(stellar_agent_core::approval::VerifiedMainnetPresence),
     /// The loopback approval-inbox server: derive
-    /// `ApproverIdentity::OsUid(process_uid_for_attestation())` internally,
-    /// exactly as before this type existed. Byte-identical to the
-    /// pre-remote-approval behaviour; the allowlist is never consulted.
+    /// `ApproverIdentity::OsUid(process_uid_for_attestation())` internally.
+    /// The remote-approval allowlist is never consulted, and the attestation
+    /// names [`AttestedApprover::Local`].
     Local,
     /// A passkey-authenticated identity from the remote-approval HTTP
     /// surface, already verified by the caller (see
-    /// `ApproverIdentity::from_verified_passkey_assertion`), plus the
-    /// profile's operator-approval credential allowlist to check it against.
+    /// `ApproverIdentity::from_verified_passkey_assertion`), plus where the
+    /// profile's current authorization lives.
+    ///
+    /// The identity must be an `ApproverIdentity::PasskeyCredential`; any
+    /// other identity answers [`Outcome::Unauthorized`]. The attestation
+    /// names [`AttestedApprover::Remote`] with its credential ID.
     Remote {
         /// The verified `PasskeyCredential` identity.
         identity: ApproverIdentity,
-        /// The profile's `RemoteApprovalConfig::allowed_credentials`.
-        allowed_credentials: Vec<String>,
+        /// The serving profile's remote-approval authority, read again at
+        /// every check.
+        authority: Arc<RemoteApprovalAuthority>,
+        /// The chain the listener serves.
+        chain: Caip2,
+        /// The relying-party ID the listener verifies assertions for.
+        rp_id: String,
     },
 }
 
@@ -81,12 +170,415 @@ pub enum Decision {
     Approve {
         /// The approval nonce from the URL path.
         nonce: String,
+        /// The [`approval_view_digest`] the approving page rendered, as its
+        /// request returned it; `None` when the request carried none or a
+        /// malformed one (see [`shown_view_digest`]). The approve refuses
+        /// unless it is the digest of the entry being attested.
+        shown_view_digest: Option<[u8; 32]>,
     },
     /// Reject the approval with this nonce (write a tombstone).
     Reject {
         /// The approval nonce from the URL path.
         nonce: String,
     },
+    /// Revoke the existing durable approval selected by this nonce.
+    Revoke {
+        /// The approval nonce from the URL path.
+        nonce: String,
+    },
+}
+
+/// A secret-free projection of an authenticated durable approval.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RevocationView {
+    /// The displayed state; revocation takes precedence over expiry.
+    pub state: String,
+    /// Whether the applicable exclusive window has ended.
+    pub expired: bool,
+    /// The exclusive waiting boundary.
+    pub waiting_expires_at_ms: u64,
+    /// The exclusive execution boundary, when consent exists.
+    pub execution_expires_at_ms: Option<u64>,
+    /// The immutable consent time.
+    pub consent_at_ms: Option<u64>,
+    /// The revocation time, when revoked.
+    pub revoked_at_ms: Option<u64>,
+    /// The durable record's closure time, when closed.
+    pub closed_at_ms: Option<u64>,
+}
+
+impl RevocationView {
+    /// Whether an eligible inbox entry can change this durable record: a live,
+    /// unconsented, pending record. A record the inbox admitted on this test
+    /// is still revoked when its waiting expiry passes before the adapter
+    /// reads it again.
+    #[must_use]
+    pub fn permits_inbox_revocation(&self) -> bool {
+        self.state == "pending"
+            && !self.expired
+            && self.consent_at_ms.is_none()
+            && self.closed_at_ms.is_none()
+    }
+
+    /// Whether the view shows a revoked, expired or closed record. The inbox
+    /// returns such a view without another write. The owner's revocation
+    /// decides on the stored record instead: it revokes a pending record at
+    /// any time and a consumed record inside its window, and returns the view
+    /// without a write for a revoked record and a consumed one whose window
+    /// ended.
+    #[must_use]
+    pub fn is_noop(&self) -> bool {
+        self.state == "revoked" || self.expired || self.closed_at_ms.is_some()
+    }
+}
+
+/// A surface refusal with no consent material or underlying storage diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevocationFailure {
+    /// The mapped error code.
+    pub code: String,
+    /// A secret-free diagnostic, including whether revocation succeeds before an audit failure.
+    pub message: String,
+}
+
+/// Access to authenticated durable approvals, supplied by the serving binary.
+pub trait RevocationAccess: Send + Sync {
+    /// Reads an existing record through its nonce.
+    ///
+    /// # Errors
+    /// Returns a mapped lookup refusal, including `approval.not_found`.
+    fn lookup(&self, nonce: &str) -> Result<RevocationView, RevocationFailure>;
+
+    /// Revokes an existing record and appends its surface audit row.
+    ///
+    /// # Errors
+    /// Returns a mapped facade refusal or an audit failure stating that the record is revoked.
+    fn revoke(
+        &self,
+        nonce: &str,
+        origin: Surface,
+        attribution: Option<&str>,
+    ) -> Result<RevocationView, RevocationFailure>;
+
+    /// [`Self::revoke`] for a request that holds `lock`, the exclusive
+    /// policy-state guard. An adapter whose write takes that lock writes
+    /// under `lock` instead. The default suits an adapter that takes no
+    /// policy-state lock.
+    ///
+    /// # Errors
+    /// As [`Self::revoke`].
+    fn revoke_held(
+        &self,
+        nonce: &str,
+        origin: Surface,
+        attribution: Option<&str>,
+        lock: &stellar_agent_core::policy::state_lock::WindowStoreLock,
+    ) -> Result<RevocationView, RevocationFailure> {
+        let _ = lock;
+        self.revoke(nonce, origin, attribution)
+    }
+}
+
+/// Where the consent audit row of a completed inbox consent went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentRowSource {
+    /// The approve that attested the entry wrote the row to the audit log.
+    Written,
+    /// The entry was attested before this request, which writes no row.
+    Recovered,
+}
+
+/// The stored consent of an attested value entry, verified under the policy
+/// guard of the request while it held the pending store.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct VerifiedConsent {
+    /// The witness of the verified attestation.
+    pub witness: ApprovalWitness,
+    /// The stored attestation bytes.
+    pub attestation: [u8; 32],
+    /// The stored presence receipt.
+    pub receipt: MainnetPresenceReceipt,
+    /// The entry's signed process identifier.
+    pub process_uid: String,
+    /// The entry's verified publication handoff. It is present exactly when
+    /// the recording publishes the entry's kind.
+    pub publication: Option<VerifiedConsentPublication>,
+}
+
+/// Durable consent of mainnet value approvals, supplied by the serving binary.
+///
+/// A mainnet payment, claim, trustline or x402 approval reports its
+/// attestation only after [`Self::complete`] succeeds.
+pub trait ConsentRecording: Send + Sync {
+    /// Checks that a durable record names this value entry before presence,
+    /// and for a published kind again before the row and before
+    /// [`Self::complete`], there through [`Self::precheck_completion`]. For a
+    /// kind the recording publishes, it also reacquires the record's consent
+    /// evidence reservation. The caller holds the inbox;
+    /// implementations inspect state without taking the window lock.
+    ///
+    /// # Errors
+    /// Returns `approval.not_found` without a record, the store refusal, and
+    /// for a published kind the scope readiness, evidence and capacity
+    /// refusals.
+    fn precheck(&self, entry: &PendingApproval) -> Result<(), WalletError>;
+
+    /// Checks a published entry before [`Self::complete`]: [`Self::precheck`]
+    /// while its durable record holds no consent, and nothing more once the
+    /// record holds it, since the commit is already durable. The default runs
+    /// [`Self::precheck`].
+    ///
+    /// # Errors
+    /// The refusals of [`Self::precheck`].
+    fn precheck_completion(&self, entry: &PendingApproval) -> Result<(), WalletError> {
+        self.precheck(entry)
+    }
+
+    /// Whether consent to `kind` is published with its verified delivery.
+    /// Such a consent uses the strict attester, and [`Self::complete`]
+    /// receives its verified publication handoff.
+    fn publishes(&self, kind: ApprovedKind) -> bool;
+
+    /// Records `consent` in the durable record that names its nonce. The
+    /// request holds neither the pending store nor the policy guard, so the
+    /// implementation may take the window lock.
+    ///
+    /// # Errors
+    /// Returns the refusal of the durable read or commit.
+    fn complete(&self, consent: VerifiedConsent, row: ConsentRowSource) -> Result<(), WalletError>;
+}
+
+/// Authenticated intent lookup supplied by the serving binary.
+pub trait IntentLookup: Send + Sync {
+    /// Reads the nonce's durable approval and operation under the current policy.
+    /// The caller holds no inbox lock. Missing canonical records must refuse.
+    ///
+    /// # Errors
+    /// Returns the typed refusal of the authenticated lookup.
+    fn lookup(
+        &self,
+        nonce: &str,
+        current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
+    ) -> Result<Option<stellar_agent_core::approval::ClassicIntent>, WalletError>;
+}
+
+/// Whether consent to `kind` needs a durable record on this context's chain:
+/// a mainnet payment, claim, trustline or x402 approval.
+pub(crate) fn needs_durable_consent(ctx: &DecisionContext, kind: &ApprovalKind) -> bool {
+    ctx.context.chain_id == MAINNET_CHAIN_ID
+        && matches!(
+            kind,
+            ApprovalKind::PaymentSimulated { .. }
+                | ApprovalKind::ClaimSimulated { .. }
+                | ApprovalKind::TrustlineSimulated { .. }
+                | ApprovalKind::X402Payment { .. }
+        )
+}
+
+/// The durable record kind of a value approval kind.
+fn approved_kind(kind: &ApprovalKind) -> Option<ApprovedKind> {
+    match kind {
+        ApprovalKind::PaymentSimulated { .. } => Some(ApprovedKind::Payment),
+        ApprovalKind::ClaimSimulated { .. } => Some(ApprovedKind::Claim),
+        ApprovalKind::TrustlineSimulated { .. } => Some(ApprovedKind::Trustline),
+        ApprovalKind::X402Payment { .. } => Some(ApprovedKind::X402Payment),
+        _ => None,
+    }
+}
+
+/// Whether the context's recording publishes consent to `kind`.
+fn publishes_consent(ctx: &DecisionContext, kind: &ApprovalKind) -> bool {
+    needs_durable_consent(ctx, kind)
+        && ctx
+            .consent
+            .as_ref()
+            .zip(approved_kind(kind))
+            .is_some_and(|(recording, kind)| recording.publishes(kind))
+}
+
+/// Checks the inbox's durable prerequisite without taking a window lock.
+pub(crate) fn precheck_consent(
+    ctx: &DecisionContext,
+    entry: &PendingApproval,
+) -> Result<(), WalletError> {
+    if needs_durable_consent(ctx, &entry.kind) {
+        ctx.consent
+            .as_ref()
+            .ok_or(WalletError::Approval(
+                stellar_agent_core::ApprovalFailure::PresenceUnavailable,
+            ))?
+            .precheck(entry)?;
+    }
+    Ok(())
+}
+
+/// Verifies the stored attestation of the value entry `nonce` in `store`
+/// under `admission`, which the request took before the store. The check
+/// takes no lock of its own.
+///
+/// # Errors
+/// `approval.presence_invalid` for an entry without a decodable stored
+/// attestation and receipt or of another kind, and the refusals of
+/// [`verify_approval_admitted`].
+pub(crate) fn verified_consent(
+    context: &stellar_agent_core::approval::ApprovalContext,
+    store: &PendingApprovalStore,
+    current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
+    nonce: &str,
+    admission: &PolicyAdmission,
+    intent: Option<&stellar_agent_core::approval::ClassicIntent>,
+) -> Result<VerifiedConsent, WalletError> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let invalid = || WalletError::Approval(stellar_agent_core::ApprovalFailure::PresenceInvalid);
+    let entry = store.get(nonce).ok_or_else(invalid)?;
+    let attestation: [u8; 32] = entry
+        .attestation_blob_b64
+        .as_deref()
+        .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded).ok())
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(invalid)?;
+    let receipt = entry.mainnet_presence.clone().ok_or_else(invalid)?;
+    let kind = approved_kind(&entry.kind).ok_or_else(invalid)?;
+    let expected = ApprovalExpectation {
+        kind,
+        subject: stellar_agent_core::approval::mainnet_consent_subject(entry, &context.binding())?,
+    };
+    let now = timefmt::now_unix_ms().map_err(|_| {
+        WalletError::Approval(stellar_agent_core::ApprovalFailure::PresenceUnavailable)
+    })?;
+    let witness = if let Some(intent) = intent {
+        stellar_agent_core::approval::witness::verify_intent_consent_admitted(
+            store,
+            current.profile(),
+            &context.profile_name,
+            nonce,
+            &attestation,
+            intent,
+            current.policy(),
+            now,
+            admission,
+        )?
+    } else {
+        verify_approval_admitted(
+            store,
+            current.profile(),
+            &context.profile_name,
+            nonce,
+            &attestation,
+            &expected,
+            current.policy(),
+            now,
+            admission,
+        )?
+    };
+    Ok(VerifiedConsent {
+        witness,
+        attestation,
+        receipt,
+        process_uid: entry.process_uid.clone(),
+        publication: None,
+    })
+}
+
+/// Completes the durable consent of the attested value entry `nonce` before
+/// its attestation is shown. It releases `store` for the context's intent
+/// lookup, which opens the inbox itself, and reopens the inbox after it. It
+/// verifies the stored proof under `admission`, as a consent to the looked-up
+/// intent when there is one.
+/// For a published kind it then runs [`ConsentRecording::precheck_completion`],
+/// which for a consent not yet committed proves the scope ready and
+/// reacquires the record's reservation, and verifies the entry's publication
+/// handoff. It then releases `store` and `admission` in that order and calls
+/// the context's [`ConsentRecording`].
+///
+/// # Errors
+/// The refusals of [`verified_consent`], for a published kind those of
+/// [`ConsentRecording::precheck_completion`], the attestation key's refusals and
+/// `approval.attestation_invalid` for a missing, edited or foreign handoff,
+/// `approval.presence_unavailable` on a context without a
+/// [`ConsentRecording`], and the refusals of [`ConsentRecording::complete`].
+pub(crate) fn complete_consent(
+    ctx: &DecisionContext,
+    store: PendingApprovalStore,
+    current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
+    nonce: &str,
+    admission: PolicyAdmission,
+    row: ConsentRowSource,
+) -> Result<(), WalletError> {
+    drop(store);
+    let intent = ctx.lookup_intent(nonce, current)?;
+    let store = open_with_retry(
+        &ctx.store_path,
+        DEFAULT_RETRY_ATTEMPTS,
+        DEFAULT_RETRY_BACKOFF,
+    )
+    .map_err(|error| stellar_agent_core::approval::attest::record_error(&error))?;
+    let consent = verified_consent(
+        &ctx.context,
+        &store,
+        current,
+        nonce,
+        &admission,
+        intent.as_ref(),
+    )
+    .and_then(|mut consent| {
+        if let Some(entry) = store
+            .get(nonce)
+            .filter(|entry| publishes_consent(ctx, &entry.kind))
+        {
+            if let Some(recording) = &ctx.consent {
+                recording.precheck_completion(entry)?;
+            }
+            let key = load_attestation_key(&ctx.attestation_key_entry_ref, &ctx.owner)?;
+            consent.publication = Some(verify_consent_publication(
+                entry,
+                &key,
+                &ctx.context.binding(),
+            )?);
+        }
+        Ok(consent)
+    });
+    drop(store);
+    drop(admission);
+    let recording = ctx.consent.as_ref().ok_or(WalletError::Approval(
+        stellar_agent_core::ApprovalFailure::PresenceUnavailable,
+    ))?;
+    recording.complete(consent?, row)
+}
+
+/// [`complete_consent`] under the request's policy guard `admission`, which a
+/// mainnet approve always holds.
+///
+/// # Errors
+/// `approval.presence_policy_unavailable` without a guard, the refusals of
+/// the policy read, and those of [`complete_consent`].
+fn complete_admitted(
+    ctx: &DecisionContext,
+    store: PendingApprovalStore,
+    nonce: &str,
+    admission: Option<PolicyAdmission>,
+    row: ConsentRowSource,
+) -> Result<(), WalletError> {
+    let admission = admission.ok_or(WalletError::Approval(
+        stellar_agent_core::ApprovalFailure::PresencePolicyUnavailable,
+    ))?;
+    let current = current_policy(ctx, Some(&admission))?;
+    complete_consent(ctx, store, &current, nonce, admission, row)
+}
+
+/// The current policy, read through `admission` when the request holds one.
+fn current_policy(
+    ctx: &DecisionContext,
+    admission: Option<&PolicyAdmission>,
+) -> Result<stellar_agent_core::approval::CurrentMainnetApprovalPolicy, WalletError> {
+    let authority = ctx.mainnet_authority.as_ref().ok_or(WalletError::Approval(
+        stellar_agent_core::ApprovalFailure::PresencePolicyUnavailable,
+    ))?;
+    match admission {
+        Some(admission) => authority.load_admitted(admission),
+        None => authority.load_current_compare_only(),
+    }
 }
 
 /// The immutable inputs [`apply_decision`] needs to act on the store.
@@ -96,6 +588,11 @@ pub enum Decision {
 /// mock) before the first [`apply_decision`] call.
 #[non_exhaustive]
 pub struct DecisionContext {
+    revocation: Option<Arc<dyn RevocationAccess>>,
+    consent: Option<Arc<dyn ConsentRecording>>,
+    intent_lookup: Option<Arc<dyn IntentLookup>>,
+    /// Current signed authority for mainnet consent.
+    pub mainnet_authority: Option<stellar_agent_core::approval::MainnetApprovalAuthority>,
     /// Serving profile context: the store name, the chain id, the endpoint host and
     /// the enrolled signer; its binding enters every attestation.
     pub context: stellar_agent_core::approval::ApprovalContext,
@@ -120,6 +617,58 @@ pub struct DecisionContext {
 }
 
 impl DecisionContext {
+    /// Installs the authenticated intent source used before opening the inbox.
+    #[must_use]
+    pub fn with_intent_lookup(mut self, lookup: Arc<dyn IntentLookup>) -> Self {
+        self.intent_lookup = Some(lookup);
+        self
+    }
+
+    pub(crate) fn lookup_intent(
+        &self,
+        nonce: &str,
+        current: &stellar_agent_core::approval::CurrentMainnetApprovalPolicy,
+    ) -> Result<Option<stellar_agent_core::approval::ClassicIntent>, WalletError> {
+        self.intent_lookup
+            .as_ref()
+            .map_or(Ok(None), |lookup| lookup.lookup(nonce, current))
+    }
+
+    /// Installs authenticated durable approval access for inbox revocation.
+    #[must_use]
+    pub fn with_revocation_access(mut self, access: Arc<dyn RevocationAccess>) -> Self {
+        self.revocation = Some(access);
+        self
+    }
+
+    /// Whether an authenticated pending page offers revocation.
+    #[must_use]
+    pub fn permits_revocation(&self, nonce: &str) -> bool {
+        self.revocation.as_ref().is_some_and(|access| {
+            access
+                .lookup(nonce)
+                .is_ok_and(|view| view.permits_inbox_revocation())
+        })
+    }
+
+    /// Installs the durable consent of mainnet value approvals. A context
+    /// without it refuses their consent.
+    #[must_use]
+    pub fn with_consent_recording(mut self, recording: Arc<dyn ConsentRecording>) -> Self {
+        self.consent = Some(recording);
+        self
+    }
+
+    /// Supplies the authority that mainnet decisions reload before persistence.
+    #[must_use]
+    pub fn with_mainnet_authority(
+        mut self,
+        authority: stellar_agent_core::approval::MainnetApprovalAuthority,
+    ) -> Self {
+        self.mainnet_authority = Some(authority);
+        self
+    }
+
     /// Construct a decision context. Production callers pass `None` for
     /// `grant_store_path_override`, and build `owner` with
     /// [`OwnerKeyContext::for_profile`] from the serving profile and its name.
@@ -133,6 +682,10 @@ impl DecisionContext {
         grant_store_path_override: Option<PathBuf>,
     ) -> Self {
         Self {
+            revocation: None,
+            consent: None,
+            intent_lookup: None,
+            mainnet_authority: None,
             context,
             store_path,
             attestation_key_entry_ref,
@@ -151,6 +704,10 @@ impl DecisionContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Outcome {
+    /// The durable record's secret-free revocation result, including a successful no-op.
+    Revocation(RevocationView),
+    /// A durable revocation or audit refusal.
+    RevocationRefused(RevocationFailure),
     /// The approval was attested (or, for gate/consent kinds, consent was
     /// recorded). `attestation` is `Some` for payment-style kinds and `None`
     /// for `ToolsetFirstInvokeGate` / `TrustlineClawbackOptIn`.
@@ -184,6 +741,186 @@ pub enum Outcome {
     /// The entry's kind is not one the attest path supports (for example a
     /// passkey kind, whose interactive flow lives in the WebAuthn bridge).
     WrongKind,
+    /// The entry's stored digest is not the digest of what it shows, or its
+    /// envelope does not decode, so no surface can show what an attestation
+    /// would approve. Nothing is attested and no row is written.
+    Inconsistent,
+    /// A remote requester the profile's current authorization does not
+    /// admit: its credential is absent from `allowed_credentials` or from the
+    /// operator-credential store, remote approval is disabled, or the
+    /// authorization cannot be read. Nothing was attested and no row written.
+    Unauthorized,
+    /// A mainnet consent this surface cannot record, or an approve on any
+    /// chain whose page showed other terms than the current entry holds
+    /// (`approval.presence_changed`, see [`consent_changed`]). `code` is the
+    /// stable `approval.*` code and `message` its fixed text, both from the
+    /// fixed presence refusal table. Nothing was attested and no row written.
+    PresenceRefused {
+        /// The stable `approval.*` code.
+        code: &'static str,
+        /// The fixed operator-facing message of the code.
+        message: &'static str,
+    },
+}
+
+/// The mainnet presence refusal of `error`, when it is one: its stable code
+/// and fixed message.
+///
+/// The table is fixed text, so a refusal carries no detail of the failure
+/// and needs no `Clone` or `Eq` on the error.
+#[must_use]
+pub(crate) fn presence_refusal(error: &WalletError) -> Option<Outcome> {
+    use stellar_agent_core::ApprovalFailure as F;
+    let WalletError::Approval(failure) = error else {
+        return None;
+    };
+    let message = match failure {
+        F::PresenceRequired => {
+            "Mainnet consent requires a verified assertion from an approval credential in the \
+             owner-signed policy; use the local passkey approval page."
+        }
+        F::PresenceInvalid => {
+            "The mainnet presence assertion is invalid; start a new approval ceremony."
+        }
+        F::PresenceChanged => {
+            "The consent details have changed; reload the approval page and review them again."
+        }
+        F::PresenceExpired => {
+            "The mainnet presence challenge has expired; start a new approval ceremony."
+        }
+        F::PresenceConsumed => {
+            "The mainnet presence challenge is unavailable or already used; start a new \
+             approval ceremony."
+        }
+        F::PresencePolicyUnavailable => {
+            "The current owner-signed mainnet approval policy cannot be verified; restore a \
+             valid policy and start a new approval ceremony."
+        }
+        F::PresencePolicyBusy => {
+            "The owner-signed mainnet approval policy is in use by another request; retry the \
+             request."
+        }
+        F::PresenceBrowserRequired => {
+            "Mainnet consent requires a local browser with WebAuthn user verification; no \
+             approval is recorded."
+        }
+        F::PresenceUnavailable => {
+            "The mainnet presence ceremony cannot start or complete; no approval is recorded."
+        }
+        F::PresenceCanceled => "Mainnet consent is canceled; no approval is recorded.",
+        F::MainnetRemoteUnsupported => {
+            "Mainnet consent uses the local passkey page; remote approval is \
+             unavailable for mainnet."
+        }
+        F::ListenerPolicyStale => {
+            "The approval listener serves an earlier owner-signed mainnet policy; restart it \
+             under the current policy."
+        }
+        F::OriginSignedRemote => {
+            "The owner-signed policy serves mainnet consent at its approval origin; approve \
+             there."
+        }
+        _ => return None,
+    };
+    Some(Outcome::PresenceRefused {
+        code: failure.code(),
+        message,
+    })
+}
+
+/// The refusal of an approve whose page showed other terms than the entry
+/// it would attest: `approval.presence_changed`, with its fixed text.
+///
+/// Both inboxes answer it, before any keyring read, row or store write, for
+/// a view digest that is absent, malformed, or not the digest of the
+/// current entry. Reloading the page renders the current entry and its
+/// digest.
+#[must_use]
+pub fn consent_changed() -> Outcome {
+    tracing::warn!("approve: the page showed other terms than the pending entry holds");
+    presence_refusal(&WalletError::Approval(
+        stellar_agent_core::ApprovalFailure::PresenceChanged,
+    ))
+    .unwrap_or(Outcome::Unavailable)
+}
+
+/// The body of an approve request: the digest its page rendered.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShownViewDigest {
+    view_digest: String,
+}
+
+/// The view digest an approve request body names: the JSON object
+/// `{"view_digest":"<64 hex>"}`.
+///
+/// Any other body, including an empty one, a `null` digest, an unknown
+/// member or a digest that is not 64 hex characters, is `None`, which the
+/// approve refuses.
+#[must_use]
+pub fn shown_view_digest(body: &[u8]) -> Option<[u8; 32]> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    let request: ShownViewDigest = serde_json::from_value(value).ok()?;
+    decode_sha256_hex(&request.view_digest).ok()
+}
+
+/// The mainnet presence refusals, each with the stable code
+/// [`presence_refusal`] answers it with.
+fn presence_refusals() -> [stellar_agent_core::ApprovalFailure; 13] {
+    use stellar_agent_core::ApprovalFailure as F;
+    [
+        F::PresenceRequired,
+        F::PresenceInvalid,
+        F::PresenceChanged,
+        F::PresenceExpired,
+        F::PresenceConsumed,
+        F::PresencePolicyUnavailable,
+        F::PresencePolicyBusy,
+        F::PresenceBrowserRequired,
+        F::PresenceUnavailable,
+        F::PresenceCanceled,
+        F::MainnetRemoteUnsupported,
+        F::ListenerPolicyStale,
+        F::OriginSignedRemote,
+    ]
+}
+
+/// The presence refusal whose stable code is `code`, or `None` for a code
+/// that is not one.
+#[must_use]
+pub(crate) fn presence_refusal_failure(code: &str) -> Option<stellar_agent_core::ApprovalFailure> {
+    presence_refusals()
+        .into_iter()
+        .find(|failure| failure.code() == code)
+}
+
+/// The outcome of an entry check that refused a mainnet presence request, as
+/// the inbox decision routes answer it.
+///
+/// An unknown, expired, rejected, spent, mismatched or inconsistent entry
+/// keeps its decision outcome; an entry that already holds a consent cannot
+/// take another ceremony; any other failure is unavailable.
+#[must_use]
+pub(crate) fn entry_outcome(error: &WalletError) -> Outcome {
+    use stellar_agent_core::ApprovalFailure as F;
+    let WalletError::Approval(failure) = error else {
+        return Outcome::Unavailable;
+    };
+    match failure {
+        F::NotFound { .. } => Outcome::NotFound,
+        F::Expired { .. } => Outcome::Expired,
+        F::Rejected { .. } | F::Consumed { .. } => Outcome::AlreadyResolved { attestation: None },
+        F::UserMismatch { .. } => Outcome::UserMismatch,
+        F::BindingMismatch { .. } => Outcome::BindingMismatch,
+        F::WrongKind { .. } => Outcome::WrongKind,
+        F::EntryInconsistent { .. } => Outcome::Inconsistent,
+        F::AlreadyAttested { .. } => presence_refusal(&WalletError::Approval(F::PresenceConsumed))
+            .unwrap_or(Outcome::Unavailable),
+        _ => Outcome::Unavailable,
+    }
 }
 
 /// Apply one operator [`Decision`] against the profile's approval store, on
@@ -202,71 +939,315 @@ pub enum Outcome {
 pub fn apply_decision(
     ctx: &DecisionContext,
     decision: Decision,
-    requester: &RequestIdentity,
+    requester: RequestIdentity,
 ) -> Outcome {
     match decision {
-        Decision::Approve { nonce } => apply_approve(ctx, &nonce, requester),
-        Decision::Reject { nonce } => apply_reject(ctx, &nonce, requester),
+        Decision::Approve {
+            nonce,
+            shown_view_digest,
+        } => apply_approve(ctx, &nonce, shown_view_digest, requester, None),
+        Decision::Reject { nonce } => apply_reject(ctx, &nonce, &requester, None),
+        Decision::Revoke { nonce } => apply_revoke(ctx, &nonce, &requester, None),
     }
 }
 
-/// Resolves `requester` into the `ApproverIdentity` and allowlist to gate
-/// with, plus the `Surface` and optional redacted-audit credential id to
-/// attribute the action to.
+/// [`apply_decision`] for a request that holds `admission`, from
+/// [`stellar_agent_core::approval::MainnetApprovalAuthority::admit`] or,
+/// for a revocation,
+/// [`stellar_agent_core::approval::MainnetApprovalAuthority::admit_exclusive`].
 ///
-/// For [`RequestIdentity::Local`] this derives
-/// `ApproverIdentity::OsUid(process_uid_for_attestation())`, exactly as
-/// `apply_approve` / `apply_reject` did before remote approval existed.
+/// Every policy read of the decision runs through the guard, and a
+/// revocation writes its durable record under the exclusive guard. An
+/// approve releases the guard before its durable consent commit, which
+/// takes the window lock. The decision takes no other policy-state lock.
+pub(crate) fn apply_admitted_decision(
+    ctx: &DecisionContext,
+    decision: Decision,
+    requester: RequestIdentity,
+    admission: PolicyAdmission,
+) -> Outcome {
+    match decision {
+        Decision::Approve {
+            nonce,
+            shown_view_digest,
+        } => apply_approve(ctx, &nonce, shown_view_digest, requester, Some(admission)),
+        Decision::Reject { nonce } => apply_reject(ctx, &nonce, &requester, Some(&admission)),
+        Decision::Revoke { nonce } => apply_revoke(ctx, &nonce, &requester, Some(&admission)),
+    }
+}
+
+/// Revokes `nonce` under one exclusive policy-state guard, taken before the
+/// pending store. A request that holds `admission` passes it; otherwise a
+/// mainnet decision takes its own. The policy read and the durable write both
+/// run under that guard, so the lock is taken once and held throughout.
+fn apply_revoke(
+    ctx: &DecisionContext,
+    nonce: &str,
+    requester: &RequestIdentity,
+    admission: Option<&PolicyAdmission>,
+) -> Outcome {
+    let Some(access) = &ctx.revocation else {
+        return Outcome::Unavailable;
+    };
+    if !matches!(
+        requester,
+        RequestIdentity::Local | RequestIdentity::SignedOrigin(_)
+    ) {
+        return Outcome::Unauthorized;
+    }
+    let resolved = match resolve_requester(requester) {
+        Ok(value) => value,
+        Err(outcome) => return outcome,
+    };
+    #[cfg(any(test, feature = "test-helpers"))]
+    revoke_hook::fire();
+    let owned;
+    let admission = match (admission, &ctx.mainnet_authority) {
+        (Some(admission), _) => Some(admission),
+        (None, Some(authority)) => match authority.admit_exclusive() {
+            Ok(admission) => {
+                owned = admission;
+                Some(&owned)
+            }
+            Err(error) => return presence_refusal(&error).unwrap_or(Outcome::Unavailable),
+        },
+        (None, None) => None,
+    };
+    let lock = match admission.map(PolicyAdmission::exclusive) {
+        Some(Some(lock)) => Some(lock),
+        Some(None) => return Outcome::Unavailable,
+        None => None,
+    };
+    let store = match open_store(ctx, "revoke") {
+        Ok(store) => store,
+        Err(outcome) => return outcome,
+    };
+    // The inbox entry gates authority; only the adapter selects the durable record.
+    let entry = match load_and_validate_entry(&store, nonce, &resolved.identity, &[]) {
+        Ok(entry) => entry,
+        Err(error) => return entry_outcome(&error),
+    };
+    if matches!(
+        entry.kind,
+        ApprovalKind::Consumed { .. } | ApprovalKind::Rejected { .. }
+    ) {
+        return Outcome::Unauthorized;
+    }
+    let attribution = if let RequestIdentity::SignedOrigin(presence) = requester {
+        if ctx.context.chain_id != MAINNET_CHAIN_ID || presence.approval_nonce() != nonce {
+            return Outcome::BindingMismatch;
+        }
+        let checked = current_policy(ctx, admission).and_then(|current| {
+            presence.revalidate_rejection(&store, &ctx.context.binding(), current.policy())
+        });
+        if let Err(error) = checked {
+            return presence_refusal(&error).unwrap_or_else(|| entry_outcome(&error));
+        }
+        Some(presence.credential_id_b64url())
+    } else {
+        None
+    };
+    let view = match access.lookup(nonce) {
+        Ok(view) => view,
+        Err(error) => return Outcome::RevocationRefused(error),
+    };
+    if view.is_noop() {
+        return Outcome::Revocation(view);
+    }
+    if !view.permits_inbox_revocation() {
+        return Outcome::Unauthorized;
+    }
+    let revoked = match lock {
+        Some(lock) => access.revoke_held(nonce, resolved.surface, attribution.as_deref(), lock),
+        None => access.revoke(nonce, resolved.surface, attribution.as_deref()),
+    };
+    match revoked {
+        Ok(view) => Outcome::Revocation(view),
+        Err(error) => Outcome::RevocationRefused(error),
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod revoke_hook {
+    //! Runs a test action inside a revocation, after a signed-origin route
+    //! consumed the challenge and recorded the counter, before the decision
+    //! opens the pending store, reads the policy, and writes the durable
+    //! record. The action runs on the thread that serves the request, so it
+    //! is process-wide.
+
+    use std::sync::Mutex;
+
+    type Action = Box<dyn FnOnce() + Send>;
+
+    static HOOK: Mutex<Option<Action>> = Mutex::new(None);
+
+    /// Installs `action` for the next revocation that reaches that point.
+    ///
+    /// # Panics
+    ///
+    /// When a previous action panicked while the hook was locked.
+    #[allow(clippy::unwrap_used, reason = "test seam")]
+    pub fn install(action: impl FnOnce() + Send + 'static) {
+        *HOOK.lock().unwrap() = Some(Box::new(action));
+    }
+
+    #[allow(clippy::unwrap_used, reason = "test seam")]
+    pub(super) fn fire() {
+        let action = HOOK.lock().unwrap().take();
+        if let Some(action) = action {
+            action();
+        }
+    }
+}
+
+/// A requester resolved against the current authorization.
+struct Resolved {
+    /// The identity the entry binding is checked against.
+    identity: ApproverIdentity,
+    /// The allowlist as read for this decision; empty for a local requester.
+    allowed_credentials: Vec<String>,
+    /// The surface the decision is attributed to.
+    surface: Surface,
+    /// The approver the attestation authenticates.
+    approver: AttestedApprover,
+}
+
+impl Resolved {
+    /// The operator credential ID the audit row redacts, for a remote
+    /// requester.
+    fn operator_credential_id(&self) -> Option<&str> {
+        match &self.approver {
+            AttestedApprover::Remote {
+                credential_id_b64url,
+            } => Some(credential_id_b64url),
+            _ => None,
+        }
+    }
+}
+
+/// Resolves `requester` into the identity and allowlist to gate with, the
+/// surface to attribute the action to, and the approver to attest.
+///
+/// For [`RequestIdentity::Local`] and [`RequestIdentity::Mainnet`] this
+/// derives `ApproverIdentity::OsUid(process_uid_for_attestation())`, on the
+/// loopback surface. [`RequestIdentity::SignedOrigin`] derives the same
+/// identity on [`Surface::ServeRemote`] with the presence's mainnet passkey
+/// approver; its verified presence is the authorization. For
+/// [`RequestIdentity::Remote`] it reads the current authorization through
+/// [`authorize_remote`].
 ///
 /// # Errors
 ///
 /// Returns `Err(Outcome::Unavailable)` if process-UID derivation fails for
-/// `RequestIdentity::Local`.
+/// a requester bound by it, and `Err(Outcome::Unauthorized)` for a remote
+/// requester the current authorization does not admit.
 #[allow(
     clippy::result_large_err,
     reason = "the Err variant is the ready-to-return Outcome for a derivation failure"
 )]
-fn resolve_requester(
-    requester: &RequestIdentity,
-) -> Result<(ApproverIdentity, Vec<String>, Surface, Option<String>), Outcome> {
-    match requester {
-        RequestIdentity::Local => {
-            let uid = process_uid_for_attestation().map_err(|e| {
+fn resolve_requester(requester: &RequestIdentity) -> Result<Resolved, Outcome> {
+    let process_identity = || {
+        process_uid_for_attestation()
+            .map(ApproverIdentity::OsUid)
+            .map_err(|e| {
                 tracing::warn!(error = %e, "decision: process uid derivation failed");
                 Outcome::Unavailable
-            })?;
-            Ok((
-                ApproverIdentity::OsUid(uid),
-                Vec::new(),
-                Surface::Serve,
-                None,
-            ))
+            })
+    };
+    match requester {
+        RequestIdentity::Local | RequestIdentity::Mainnet(_) => Ok(Resolved {
+            identity: process_identity()?,
+            allowed_credentials: Vec::new(),
+            surface: Surface::Serve,
+            approver: AttestedApprover::Local,
+        }),
+        RequestIdentity::SignedOrigin(presence) => Ok(Resolved {
+            identity: process_identity()?,
+            allowed_credentials: Vec::new(),
+            surface: Surface::ServeRemote,
+            approver: AttestedApprover::MainnetPasskey {
+                credential_id_b64url: presence.credential_id_b64url(),
+            },
+        }),
+        RequestIdentity::Remote { identity, .. } => {
+            let (credential_id, allowed_credentials) = authorize_remote(requester)?;
+            Ok(Resolved {
+                identity: identity.clone(),
+                allowed_credentials,
+                surface: Surface::ServeRemote,
+                approver: AttestedApprover::Remote {
+                    credential_id_b64url: credential_id,
+                },
+            })
         }
-        RequestIdentity::Remote {
-            identity,
-            allowed_credentials,
-        } => {
-            let credential_id = match identity {
-                ApproverIdentity::PasskeyCredential {
-                    credential_id_b64url,
-                    ..
-                } => credential_id_b64url.clone(),
-                // `ApproverIdentity` is `#[non_exhaustive]` and defined in a
-                // different crate, so this match needs a wildcard arm. A
-                // caller passing an `OsUid` (or a future variant) inside
-                // `RequestIdentity::Remote` is a caller error, not a security
-                // gap: `is_authorized_for_entry` still fails closed against a
-                // passkey-only allowlist regardless of what this placeholder
-                // string is; there is simply no operator credential id to
-                // attribute in that case.
-                _ => "non-passkey-identity".to_owned(),
-            };
-            Ok((
-                identity.clone(),
-                allowed_credentials.clone(),
-                Surface::ServeRemote,
-                Some(credential_id),
-            ))
+    }
+}
+
+/// Reads a remote requester's authorization from disk now and returns its
+/// credential ID and the current allowlist. A local requester needs none and
+/// returns an empty ID and list.
+///
+/// # Errors
+///
+/// `Err(Outcome::Unauthorized)` when the identity is not a passkey
+/// credential, or when the current profile and operator-credential store do
+/// not admit it for the listener's chain and relying-party ID.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err variant is the ready-to-return Outcome"
+)]
+fn authorize_remote(requester: &RequestIdentity) -> Result<(String, Vec<String>), Outcome> {
+    let RequestIdentity::Remote {
+        identity,
+        authority,
+        chain,
+        rp_id,
+    } = requester
+    else {
+        return Ok((String::new(), Vec::new()));
+    };
+    let ApproverIdentity::PasskeyCredential {
+        credential_id_b64url,
+        ..
+    } = identity
+    else {
+        tracing::warn!("decision: a remote requester carries no passkey identity");
+        return Err(Outcome::Unauthorized);
+    };
+    let authorization = authority
+        .require_credential(credential_id_b64url, *chain, Some(rp_id))
+        .map_err(|e| {
+            tracing::warn!(code = %e.code(), "decision: remote requester is not authorized");
+            Outcome::Unauthorized
+        })?;
+    Ok((
+        credential_id_b64url.clone(),
+        authorization.allowed_credentials().to_vec(),
+    ))
+}
+
+#[cfg(test)]
+pub(crate) mod wait_hook {
+    //! Runs a test action where a decision waits: right after approve's
+    //! attestation key loads, standing in for an interactive keyring prompt,
+    //! and after reject prepares its audit row, before its final authorization
+    //! read. A revocation during writer acquisition, drain, or rotation must
+    //! refuse the rejection.
+
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Installs `action` for the next decision wait on this thread.
+    pub(crate) fn install(action: impl FnOnce() + 'static) {
+        HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(action)));
+    }
+
+    pub(super) fn fire() {
+        if let Some(action) = HOOK.with(|hook| hook.borrow_mut().take()) {
+            action();
         }
     }
 }
@@ -296,19 +1277,58 @@ fn approval_code_is(err: &WalletError, code: &str) -> bool {
     err.code() == code
 }
 
-fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity) -> Outcome {
+fn apply_approve(
+    ctx: &DecisionContext,
+    nonce: &str,
+    shown_view_digest: Option<[u8; 32]>,
+    requester: RequestIdentity,
+    admission: Option<PolicyAdmission>,
+) -> Outcome {
+    if ctx.context.chain_id == MAINNET_CHAIN_ID
+        && matches!(requester, RequestIdentity::Remote { .. })
+    {
+        return presence_refusal(&WalletError::Approval(
+            stellar_agent_core::ApprovalFailure::MainnetRemoteUnsupported,
+        ))
+        .unwrap_or(Outcome::Unavailable);
+    }
+    let presence_bearing = matches!(
+        requester,
+        RequestIdentity::Mainnet(_) | RequestIdentity::SignedOrigin(_)
+    );
+    if ctx.context.chain_id == MAINNET_CHAIN_ID && !presence_bearing {
+        return presence_refusal(&WalletError::Approval(
+            stellar_agent_core::ApprovalFailure::PresenceRequired,
+        ))
+        .unwrap_or(Outcome::Unavailable);
+    }
+    // A mainnet approve reads the policy and verifies consent under one
+    // shared guard, taken before the pending store.
+    let admission = match (admission, &ctx.mainnet_authority) {
+        (None, Some(authority)) if ctx.context.chain_id == MAINNET_CHAIN_ID => {
+            match authority.admit() {
+                Ok(admission) => Some(admission),
+                Err(error) => return presence_refusal(&error).unwrap_or(Outcome::Unavailable),
+            }
+        }
+        (admission, _) => admission,
+    };
     let store = match open_store(ctx, "approve") {
         Ok(s) => s,
         Err(outcome) => return outcome,
     };
 
-    let (identity, allowed_credentials, surface, operator_credential_id) =
-        match resolve_requester(requester) {
-            Ok(resolved) => resolved,
-            Err(outcome) => return outcome,
-        };
+    let resolved = match resolve_requester(&requester) {
+        Ok(resolved) => resolved,
+        Err(outcome) => return outcome,
+    };
 
-    let entry = match load_and_validate_entry(&store, nonce, &identity, &allowed_credentials) {
+    let entry = match load_and_validate_entry(
+        &store,
+        nonce,
+        &resolved.identity,
+        &resolved.allowed_credentials,
+    ) {
         Ok(e) => e,
         Err(e) => {
             if approval_code_is(&e, "approval.user_mismatch") {
@@ -321,6 +1341,30 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
                 return Outcome::NotFound;
             }
             if approval_code_is(&e, "approval.already_attested") {
+                if ctx.context.chain_id == MAINNET_CHAIN_ID {
+                    // A repeated approve of a value entry completes the
+                    // durable consent an earlier approve may have left.
+                    if store
+                        .get(nonce)
+                        .is_some_and(|entry| needs_durable_consent(ctx, &entry.kind))
+                    {
+                        let completed = complete_admitted(
+                            ctx,
+                            store,
+                            nonce,
+                            admission,
+                            ConsentRowSource::Recovered,
+                        );
+                        if let Err(error) = completed {
+                            tracing::warn!(code = %error.code(), "approve: consent completion failed");
+                            return Outcome::Unavailable;
+                        }
+                    }
+                    return presence_refusal(&WalletError::Approval(
+                        stellar_agent_core::ApprovalFailure::PresenceConsumed,
+                    ))
+                    .unwrap_or(Outcome::Unavailable);
+                }
                 // Recoverable lost-response re-show: return the already-stored
                 // blob without re-attesting.
                 let attestation = store
@@ -333,15 +1377,30 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
         }
     };
 
+    // The approve attests only what the page rendered: the digest the request
+    // returned must be the digest of the entry validated above. No digest
+    // refuses as a stale one does.
+    match approval_view_digest(&entry, &ctx.context.binding()) {
+        Ok(current) if shown_view_digest == Some(current) => {}
+        Ok(_) => return consent_changed(),
+        Err(error) => return entry_outcome(&error),
+    }
+    // Without a recording, a value consent could not become durable: refuse
+    // it before any row or attestation.
+    if ctx.consent.is_none() && needs_durable_consent(ctx, &entry.kind) {
+        tracing::warn!("approve: no durable consent recording for a mainnet value approval");
+        return Outcome::Unavailable;
+    }
+
     // Release the store lock BEFORE the keyring read: `load_attestation_key`
     // can block on an interactive platform-keychain prompt, and holding the
     // advisory file lock across that wait would starve the agent's own
     // simulate/insert calls on this profile's store for the prompt's
-    // duration. The entry is already validated and cloned above; a
-    // concurrent mutation of this exact nonce between here and the re-open
-    // below (attest, reject, or removal by another process) is caught by
-    // `attest_and_persist`'s own store-level re-check, never silently
-    // overwritten.
+    // duration. The entry is already validated, compared with the page and
+    // cloned above; a concurrent mutation of this exact nonce between here
+    // and the re-open below (attest, reject, replacement or removal by
+    // another process) is caught by `attest_and_persist`'s own store-level
+    // re-check, never silently overwritten.
     drop(store);
 
     let key = match load_attestation_key(&ctx.attestation_key_entry_ref, &ctx.owner) {
@@ -355,11 +1414,20 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
             return Outcome::Unavailable;
         }
     };
+    #[cfg(test)]
+    wait_hook::fire();
 
     let mut store = match open_store(ctx, "approve-persist") {
         Ok(s) => s,
         Err(outcome) => return outcome,
     };
+    // A published consent attests only while its evidence reservation still
+    // holds: the precheck reacquires it before the row.
+    let publishes = publishes_consent(ctx, &entry.kind);
+    if publishes && let Err(error) = precheck_consent(ctx, &entry) {
+        tracing::warn!(code = %error.code(), "approve: consent admission refused");
+        return entry_outcome(&error);
+    }
 
     // The consent row is written before the attestation is persisted, so a
     // writer that cannot be used refuses the decision. A poisoned mutex may
@@ -367,27 +1435,71 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
     // decision refuses until the inbox restarts.
     let Ok(mut writer) = ctx.audit_writer.lock() else {
         tracing::error!(
-            event_kind = audit_event_kind(operator_credential_id.as_deref(), true),
+            event_kind = audit_event_kind(resolved.operator_credential_id(), true),
             "approve: audit writer mutex poisoned; refusing the decision until the inbox \
              restarts"
         );
         return Outcome::Unavailable;
     };
 
+    // The key load above may have waited on a keyring prompt, and the writer
+    // lock on other decisions: read the authorization again, immediately
+    // before the row and the attestation are persisted.
+    if let Err(outcome) = authorize_remote(&requester) {
+        return outcome;
+    }
+
     let grant_override = ctx.grant_store_path_override.clone();
     let profile_name = ctx.context.profile_name.as_str();
-    let result = attest_and_persist(
+    let current = if presence_bearing {
+        match current_policy(ctx, admission.as_ref()) {
+            Ok(current) => Some(current),
+            Err(error) => return presence_refusal(&error).unwrap_or(Outcome::Unavailable),
+        }
+    } else {
+        None
+    };
+    let authorization = match requester {
+        RequestIdentity::Mainnet(presence) | RequestIdentity::SignedOrigin(presence) => {
+            let Some(current) = &current else {
+                return Outcome::Unavailable;
+            };
+            match &admission {
+                Some(admission) => ConsentAuthorization::MainnetAdmitted {
+                    presence,
+                    policy: current.policy(),
+                    admission,
+                },
+                None => ConsentAuthorization::Mainnet {
+                    presence,
+                    policy: current.policy(),
+                },
+            }
+        }
+        _ => ConsentAuthorization::Standard(&resolved.approver),
+    };
+    // A published consent needs the strict attester's anchored row and its
+    // publication handoff.
+    let attester = if publishes {
+        attest_strictly
+    } else {
+        attest_and_persist
+    };
+    let result = attester(
         &mut store,
         &entry,
         &key,
         &ctx.context.binding(),
-        surface,
+        resolved.surface,
         ConsentAudit::Writer(&mut writer),
-        operator_credential_id.as_deref(),
-        |req, grant_key| {
+        authorization,
+        |req: &stellar_agent_core::approval::ToolsetGrantRequest<'_>, grant_key: &[u8; 32]| {
             stellar_agent_toolsets_runtime::record_first_invoke_grant(
                 profile_name,
                 req.toolset_name,
+                req.install_id,
+                req.package_version,
+                req.package_shasum,
                 req.capability,
                 req.destination,
                 req.asset,
@@ -405,16 +1517,35 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
     );
 
     match result {
-        Ok(attestation) => Outcome::Attested {
-            attestation,
-            expires_at_unix_ms: entry.expires_at_unix_ms,
-        },
+        Ok(attestation) => {
+            drop(writer);
+            if needs_durable_consent(ctx, &entry.kind) {
+                let completed =
+                    complete_admitted(ctx, store, nonce, admission, ConsentRowSource::Written);
+                if let Err(error) = completed {
+                    // The entry stays attested; a repeated approve or the
+                    // stored page completes the consent.
+                    tracing::warn!(code = %error.code(), "approve: consent completion failed");
+                    return Outcome::Unavailable;
+                }
+            }
+            Outcome::Attested {
+                attestation,
+                expires_at_unix_ms: entry.expires_at_unix_ms,
+            }
+        }
         Err(e) => {
+            if let Some(refusal) = presence_refusal(&e) {
+                return refusal;
+            }
             if approval_code_is(&e, "approval.binding_mismatch") {
                 return Outcome::BindingMismatch;
             }
             if approval_code_is(&e, "approval.wrong_kind") {
                 return Outcome::WrongKind;
+            }
+            if approval_code_is(&e, "approval.entry_inconsistent") {
+                return Outcome::Inconsistent;
             }
             if approval_code_is(&e, "approval.not_found") {
                 return Outcome::NotFound;
@@ -432,10 +1563,24 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
             if approval_code_is(&e, "approval.already_attested") {
                 // Another handle attested this entry since it was validated:
                 // no row was written here, and the stored attestation is the
-                // one to re-show.
+                // one to re-show once a value entry's consent is durable.
                 let attestation = store
                     .get(nonce)
                     .and_then(|e| e.attestation_blob_b64.clone());
+                if needs_durable_consent(ctx, &entry.kind) {
+                    drop(writer);
+                    let completed = complete_admitted(
+                        ctx,
+                        store,
+                        nonce,
+                        admission,
+                        ConsentRowSource::Recovered,
+                    );
+                    if let Err(error) = completed {
+                        tracing::warn!(code = %error.code(), "approve: consent completion failed");
+                        return Outcome::Unavailable;
+                    }
+                }
                 return Outcome::AlreadyResolved { attestation };
             }
             // A refused consent row lands here: nothing was persisted.
@@ -443,6 +1588,29 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
             Outcome::Unavailable
         }
     }
+}
+
+/// [`attest_and_persist_with_row`] answering with the surfaced attestation;
+/// a direct writer returns no queued reference.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the signature of attest_and_persist, which this attester replaces"
+)]
+fn attest_strictly(
+    store: &mut PendingApprovalStore,
+    entry: &PendingApproval,
+    key: &[u8],
+    binding: &stellar_agent_core::approval::AttestationBinding<'_>,
+    surface: Surface,
+    audit: ConsentAudit<'_>,
+    auth: ConsentAuthorization<'_>,
+    grant: impl FnOnce(
+        &stellar_agent_core::approval::ToolsetGrantRequest<'_>,
+        &[u8; 32],
+    ) -> Result<(), String>,
+) -> Result<Option<String>, WalletError> {
+    attest_and_persist_with_row(store, entry, key, binding, surface, audit, auth, grant)
+        .map(|(attestation, _)| attestation)
 }
 
 /// The audit event kind a decision writes, for the `error` log of a decision
@@ -456,7 +1624,22 @@ fn audit_event_kind(operator_credential_id: Option<&str>, approve: bool) -> &'st
     }
 }
 
-fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity) -> Outcome {
+fn apply_reject(
+    ctx: &DecisionContext,
+    nonce: &str,
+    requester: &RequestIdentity,
+    admission: Option<&PolicyAdmission>,
+) -> Outcome {
+    // A signed-origin reject stands on the assertion that verified for this
+    // entry; one for another entry or off mainnet decides nothing.
+    if let RequestIdentity::SignedOrigin(presence) = requester {
+        if ctx.context.chain_id != MAINNET_CHAIN_ID {
+            return Outcome::BindingMismatch;
+        }
+        if presence.approval_nonce() != nonce {
+            return Outcome::BindingMismatch;
+        }
+    }
     let mut store = match open_store(ctx, "reject") {
         Ok(s) => s,
         Err(outcome) => return outcome,
@@ -492,22 +1675,22 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
     // just because it carries no attestation. Threaded symmetrically with
     // `apply_approve` via `is_authorized_for_entry`, so a `RequestIdentity::Remote`
     // reject is gated by the same allowlist + entry-binding checks as an
-    // approve.
-    let (identity, allowed_credentials, surface, operator_credential_id) =
-        match resolve_requester(requester) {
-            Ok(resolved) => resolved,
-            Err(outcome) => return outcome,
-        };
+    // approve. A remote requester's authorization is read here, after the
+    // store lock is held, and again once the audit-writer lock is held.
+    let resolved = match resolve_requester(requester) {
+        Ok(resolved) => resolved,
+        Err(outcome) => return outcome,
+    };
     // `entry` is `Some` here: `already_resolved` is `true` for every arm
     // above where it is `None`.
     let Some(entry) = entry else {
         tracing::warn!("reject: entry unexpectedly absent after not-already-resolved check");
         return Outcome::Unavailable;
     };
-    if !identity.is_authorized_for_entry(
+    if !resolved.identity.is_authorized_for_entry(
         &entry.process_uid,
         &entry.approval_nonce,
-        &allowed_credentials,
+        &resolved.allowed_credentials,
     ) {
         return Outcome::UserMismatch;
     }
@@ -525,7 +1708,8 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
     // from this store, which holds its lock until it drops, so it is still the
     // entry being rejected. A poisoned mutex is never recovered: every later
     // decision refuses until the inbox restarts.
-    let event_kind = audit_event_kind(operator_credential_id.as_deref(), false);
+    let operator_credential_id = resolved.operator_credential_id();
+    let event_kind = audit_event_kind(operator_credential_id, false);
     let Ok(mut writer) = ctx.audit_writer.lock() else {
         tracing::error!(
             event_kind,
@@ -533,8 +1717,37 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
         );
         return Outcome::Unavailable;
     };
+
+    let prepared = match writer.prepare_entry() {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                event_kind,
+                "reject: the rejection row was not written; the entry stays pending"
+            );
+            return Outcome::Unavailable;
+        }
+    };
+
+    // Writer acquisition, drain, anchor repair, and rotation precede revalidation.
+    // Current authorization, listener pin, credential, and both signed-presence
+    // deadlines must hold before the row, with no intervening drain or rotation.
+    #[cfg(test)]
+    wait_hook::fire();
+    if let Err(outcome) = authorize_remote(requester) {
+        return outcome;
+    }
+    if let RequestIdentity::SignedOrigin(presence) = requester {
+        let checked = current_policy(ctx, admission).and_then(|current| {
+            presence.revalidate_rejection(&store, &ctx.context.binding(), current.policy())
+        });
+        if let Err(error) = checked {
+            return presence_refusal(&error).unwrap_or_else(|| entry_outcome(&error));
+        }
+    }
     let kind_name = original_kind_name.unwrap_or_else(|| "unknown".to_owned());
-    let audit_entry = match &operator_credential_id {
+    let audit_entry = match operator_credential_id {
         Some(cred_id) => AuditEntry::new_approval_rejected_remote(
             kind_name,
             nonce,
@@ -544,11 +1757,11 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
         None => AuditEntry::new_approval_rejected(
             kind_name,
             nonce,
-            surface.as_str(),
+            resolved.surface.as_str(),
             uuid::Uuid::new_v4().to_string(),
         ),
     };
-    if let Err(e) = writer.write_entry(audit_entry) {
+    if let Err(e) = prepared.write(audit_entry) {
         tracing::warn!(
             error = %e,
             event_kind,
@@ -587,12 +1800,18 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use keyring_core::Entry as KeyringEntry;
     use serial_test::serial;
-    use stellar_agent_core::approval::attestation::{compute_attestation, verify_attestation};
+    use stellar_agent_core::approval::attestation::{compute_attestation_v4, verify_attestation};
+    use stellar_agent_core::approval::operator_credentials::{
+        OperatorApprovalCredential, OperatorApprovalCredentialStore,
+    };
     use stellar_agent_core::approval::{
-        DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, decode_sha256_hex,
+        DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, decode_sha256_hex, fixtures,
         process_uid_for_attestation,
     };
     use tempfile::TempDir;
+
+    const SOURCE_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+    const DEST_G: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
 
     struct Fixture {
         _dir: TempDir,
@@ -642,6 +1861,50 @@ mod tests {
         process_uid_for_attestation().expect("uid available on test host")
     }
 
+    #[test]
+    #[serial]
+    fn revocation_adapter_default_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let f = fixture("revocation-default");
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            10,
+            None,
+            100,
+            7,
+            uid(),
+            DEFAULT_TTL_MS,
+        );
+        let nonce = insert(&f.ctx, entry);
+        let before = std::fs::read(&f.ctx.store_path).unwrap();
+        let audit = std::fs::read(f._dir.path().join("audit.log")).unwrap();
+        assert!(!f.ctx.permits_revocation(&nonce));
+        let page = "<body>pending</body>".to_owned();
+        assert_eq!(
+            crate::templates::with_revocation_control(
+                page.clone(),
+                &f.ctx,
+                &nonce,
+                &serde_json::json!({})
+            ),
+            page
+        );
+        assert_eq!(
+            apply_decision(&f.ctx, Decision::Revoke { nonce }, RequestIdentity::Local),
+            Outcome::Unavailable
+        );
+        assert_eq!(std::fs::read(&f.ctx.store_path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(f._dir.path().join("audit.log")).unwrap(),
+            audit
+        );
+    }
+
     fn insert(ctx: &DecisionContext, entry: PendingApproval) -> String {
         let nonce = entry.approval_nonce.clone();
         let mut store = PendingApprovalStore::open(ctx.store_path.clone()).unwrap();
@@ -651,39 +1914,53 @@ mod tests {
         nonce
     }
 
+    /// The approve a freshly loaded page sends: the view digest of the entry
+    /// the store holds for `nonce` now, or none when no digest exists (an
+    /// absent, unreadable or inconsistent entry).
+    fn approve_shown(ctx: &DecisionContext, nonce: impl Into<String>) -> Decision {
+        let nonce = nonce.into();
+        let shown_view_digest = PendingApprovalStore::open(ctx.store_path.clone())
+            .ok()
+            .and_then(|store| {
+                store
+                    .get(&nonce)
+                    .and_then(|entry| approval_view_digest(entry, &ctx.context.binding()).ok())
+            });
+        Decision::Approve {
+            nonce,
+            shown_view_digest,
+        }
+    }
+
     fn payment_entry(ttl_ms: u64) -> PendingApproval {
-        PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             2_500_000,
-            "XLM".to_owned(),
             None,
             100,
             1_234_567,
             uid(),
             ttl_ms,
         )
-        .unwrap()
     }
 
     /// A payment entry stamped with a `process_uid` that can never equal the
     /// test host's real uid, simulating an entry parked by a different OS
     /// user's agent process.
     fn foreign_payment_entry(ttl_ms: u64) -> PendingApproval {
-        PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             2_500_000,
-            "XLM".to_owned(),
             None,
             100,
             1_234_567,
             "99999999".to_owned(),
             ttl_ms,
         )
-        .unwrap()
     }
 
     #[test]
@@ -738,6 +2015,12 @@ mod tests {
                 },
                 "approval.consumed",
             ),
+            (
+                ApprovalFailure::EntryInconsistent {
+                    detail: "plain diagnostic".to_owned(),
+                },
+                "approval.entry_inconsistent",
+            ),
         ];
         for (failure, code) in cases {
             let error = WalletError::Approval(failure);
@@ -757,6 +2040,7 @@ mod tests {
             "approval.wrong_kind",
             "approval.rejected",
             "approval.consumed",
+            "approval.entry_inconsistent",
         ] {
             let unrelated =
                 WalletError::Internal(stellar_agent_core::InternalError::UnexpectedState {
@@ -766,9 +2050,41 @@ mod tests {
         }
     }
 
+    /// An entry whose stored digest is not its envelope's is refused as
+    /// inconsistent: nothing is attested and the entry stays pending.
+    #[test]
+    #[serial]
+    fn approve_inconsistent_entry_is_refused() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("inconsistent");
+        let mut entry = payment_entry(DEFAULT_TTL_MS);
+        let ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64, ..
+        } = &mut entry.kind
+        else {
+            unreachable!()
+        };
+        *envelope_xdr_b64 = fixtures::payment_envelope(SOURCE_G, SOURCE_G, "XLM", 9, None, 100, 1);
+        let nonce = insert(&fx.ctx, entry);
+        let outcome = apply_decision(
+            &fx.ctx,
+            approve_shown(&fx.ctx, nonce.clone()),
+            RequestIdentity::Local,
+        );
+        assert_eq!(outcome, Outcome::Inconsistent);
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        assert!(store.get(&nonce).unwrap().attestation_blob_b64.is_none());
+    }
+
     #[test]
     #[serial]
     fn approve_payment_mints_verifiable_attestation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("payment");
         let entry = payment_entry(DEFAULT_TTL_MS);
@@ -780,14 +2096,13 @@ mod tests {
             } => envelope_sha256_hex.clone(),
             _ => unreachable!(),
         };
+        let attested = entry.clone();
         let nonce = insert(&fx.ctx, entry);
 
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce.clone()),
+            RequestIdentity::Local,
         );
         let attestation = match outcome {
             Outcome::Attested { attestation, .. } => attestation.expect("payment surfaces a blob"),
@@ -796,12 +2111,14 @@ mod tests {
 
         // Independently verify the surfaced blob against the attestation key.
         let sha = decode_sha256_hex(&envelope_sha256_hex).unwrap();
-        let expected = compute_attestation(
+        let expected = compute_attestation_v4(
             &fx.raw_key,
             &fx.ctx.context.binding(),
             &nonce,
             &sha,
             &process_uid,
+            &attested.attested_lifetime(),
+            &AttestedApprover::Local,
         );
         let blob: [u8; 32] = URL_SAFE_NO_PAD
             .decode(&attestation)
@@ -809,12 +2126,16 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(blob, expected);
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        let persisted = store.get(&nonce).unwrap();
+        assert!(persisted.attested_approver == Some(AttestedApprover::Local));
         assert!(verify_attestation(
             &fx.raw_key,
             &fx.ctx.context.binding(),
             &nonce,
             &sha,
             &process_uid,
+            &persisted.attestation_scope().unwrap(),
             &blob
         ));
     }
@@ -826,6 +2147,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_refuses_an_attestation_key_equal_to_the_owner_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("owner");
         let owner = KeyringEntryRef::default_owner_key("ui-test");
@@ -840,10 +2164,8 @@ mod tests {
         let logs = stellar_agent_test_support::with_captured_logs(|| {
             outcome = Some(apply_decision(
                 &fx.ctx,
-                Decision::Approve {
-                    nonce: nonce.clone(),
-                },
-                &RequestIdentity::Local,
+                approve_shown(&fx.ctx, nonce.clone()),
+                RequestIdentity::Local,
             ));
         });
         assert!(
@@ -861,84 +2183,156 @@ mod tests {
         assert!(entry.attestation_blob_b64.is_none(), "nothing is attested");
     }
 
+    /// An attestation key read refusal logs the closed missing cause, never
+    /// the keyring service, for a missing entry and for an absent store.
     #[test]
     #[serial]
-    fn approve_payment_mainnet_mints_verifiable_attestation() {
+    fn attestation_key_refusals_hold_no_coordinate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("credmarker7");
+        let coordinate = fx.ctx.attestation_key_entry_ref.clone();
+        let entry = KeyringEntry::new(&coordinate.service, &coordinate.account).unwrap();
+        entry.delete_credential().unwrap();
+        let approve = |nonce: &str| {
+            let mut outcome = None;
+            let logs = stellar_agent_test_support::with_captured_logs(|| {
+                outcome = Some(apply_decision(
+                    &fx.ctx,
+                    approve_shown(&fx.ctx, nonce),
+                    RequestIdentity::Local,
+                ));
+            });
+            assert!(
+                matches!(outcome, Some(Outcome::Unavailable)),
+                "expected Unavailable, got {outcome:?}"
+            );
+            logs
+        };
+
+        let logs = approve(&insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS)));
+        assert!(
+            logs.contains("approve: attestation key load failed"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("the configured keyring entry must exist"),
+            "{logs}"
+        );
+        assert!(!logs.contains("credmarker7"), "{logs}");
+
+        entry.set_password("placeholder").unwrap();
+        entry
+            .as_any()
+            .downcast_ref::<keyring_core::mock::Cred>()
+            .expect("mock credential")
+            .set_error(keyring_core::Error::NoDefaultStore);
+        let logs = approve(&insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS)));
+        assert!(
+            logs.contains("approve: attestation key load failed"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("a platform keychain must be available for this session"),
+            "{logs}"
+        );
+        assert!(!logs.contains("credmarker7"), "{logs}");
+    }
+
+    /// Every presence code maps to its own code and the exact core message,
+    /// and no other approval failure is a presence refusal.
+    #[test]
+    fn presence_refusals_carry_the_core_code_and_message() {
+        use stellar_agent_core::ApprovalFailure as F;
+        for failure in [
+            F::PresenceRequired,
+            F::PresenceInvalid,
+            F::PresenceChanged,
+            F::PresenceExpired,
+            F::PresenceConsumed,
+            F::PresencePolicyUnavailable,
+            F::PresenceBrowserRequired,
+            F::PresenceUnavailable,
+            F::PresenceCanceled,
+            F::MainnetRemoteUnsupported,
+            F::ListenerPolicyStale,
+            F::OriginSignedRemote,
+        ] {
+            let expected = Outcome::PresenceRefused {
+                code: failure.code(),
+                message: Box::leak(failure.to_string().into_boxed_str()),
+            };
+            assert_eq!(
+                presence_refusal(&WalletError::Approval(failure)),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            presence_refusal(&WalletError::Approval(F::UserMismatch {
+                detail: "x".to_owned()
+            })),
+            None
+        );
+    }
+
+    /// A local approve on mainnet reaches the shared attester, which refuses
+    /// the standard authorization: the decision answers the presence
+    /// refusal, and neither an attestation nor a row is persisted.
+    #[test]
+    #[serial]
+    fn a_local_mainnet_approve_is_refused_and_records_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut fx = fixture("payment-mainnet");
         fx.ctx.context.chain_id = "stellar:mainnet".to_owned();
-        let entry = payment_entry(DEFAULT_TTL_MS);
-        let process_uid = entry.process_uid.clone();
-        let envelope_sha256_hex = match &entry.kind {
-            ApprovalKind::PaymentSimulated {
-                envelope_sha256_hex,
-                ..
-            } => envelope_sha256_hex.clone(),
-            _ => unreachable!(),
-        };
-        let nonce = insert(&fx.ctx, entry);
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
 
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce.clone()),
+            RequestIdentity::Local,
         );
-        let attestation = match outcome {
-            Outcome::Attested { attestation, .. } => attestation.expect("payment surfaces a blob"),
-            other => panic!("expected Attested, got {other:?}"),
-        };
-
-        // Independently verify the surfaced blob against the attestation key.
-        let sha = decode_sha256_hex(&envelope_sha256_hex).unwrap();
-        let expected = compute_attestation(
-            &fx.raw_key,
-            &fx.ctx.context.binding(),
-            &nonce,
-            &sha,
-            &process_uid,
+        assert_eq!(
+            outcome,
+            Outcome::PresenceRefused {
+                code: "approval.presence_required",
+                message: "Mainnet consent requires a verified assertion from an approval \
+                          credential in the owner-signed policy; use the local passkey approval page.",
+            }
         );
-        let blob: [u8; 32] = URL_SAFE_NO_PAD
-            .decode(&attestation)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        assert_eq!(blob, expected);
-        assert!(verify_attestation(
-            &fx.raw_key,
-            &fx.ctx.context.binding(),
-            &nonce,
-            &sha,
-            &process_uid,
-            &blob
-        ));
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        let entry = store.get(&nonce).expect("the entry stays");
+        assert!(entry.attestation_blob_b64.is_none());
+        assert!(entry.attested_approver.is_none());
+        assert_eq!(rows_of_kind(&audit_path(&fx), "approval_attested"), 0);
     }
 
     #[test]
     #[serial]
     fn approve_claim_mints_attestation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("claim");
-        let entry = PendingApproval::new_claim_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "a".repeat(72),
-            "B".to_owned() + &"A".repeat(57),
-            "XLM".to_owned(),
-            500,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::claim_pending(
+            SOURCE_G,
+            [0x0a; 32],
+            Some(("XLM", 500)),
             100,
             1,
             uid(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         let nonce = insert(&fx.ctx, entry);
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
         );
         assert!(matches!(
             outcome,
@@ -952,12 +2346,18 @@ mod tests {
     #[test]
     #[serial]
     fn approve_toolset_gate_consumes_entry_and_surfaces_no_blob() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("toolset");
         let entry = PendingApproval::new_toolset_first_invoke_gate_pending(
             "my-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             "sign-payment".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
             "XLM".to_owned(),
             0,
             1_000_000,
@@ -968,10 +2368,8 @@ mod tests {
         let nonce = insert(&fx.ctx, entry);
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce.clone()),
+            RequestIdentity::Local,
         );
         assert!(matches!(
             outcome,
@@ -987,6 +2385,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_trustline_clawback_opt_in_attests_without_blob() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("trustline");
         let entry = PendingApproval::new_trustline_clawback_opt_in_pending(
@@ -1000,8 +2401,8 @@ mod tests {
         let nonce = insert(&fx.ctx, entry);
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
         );
         assert!(matches!(
             outcome,
@@ -1015,6 +2416,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_sign_with_passkey_is_wrong_kind() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("passkey");
         let entry = PendingApproval::new_passkey_pending(
@@ -1031,8 +2435,8 @@ mod tests {
         let nonce = insert(&fx.ctx, entry);
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::WrongKind);
     }
@@ -1040,6 +2444,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_expired_entry_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("expired");
         let entry = payment_entry(1);
@@ -1047,8 +2454,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Expired);
     }
@@ -1056,16 +2463,17 @@ mod tests {
     #[test]
     #[serial]
     fn approve_unknown_nonce_is_not_found() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("missing");
         // Open once so the store file exists but is empty.
         let _ = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, "AAAAAAAAAAAAAAAAAAAAAA".to_owned()),
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::NotFound);
     }
@@ -1073,15 +2481,16 @@ mod tests {
     #[test]
     #[serial]
     fn approve_already_attested_reshows_blob() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("reshow");
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
         let first = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce.clone()),
+            RequestIdentity::Local,
         );
         let first_blob = match first {
             Outcome::Attested {
@@ -1092,8 +2501,8 @@ mod tests {
         };
         let second = apply_decision(
             &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
         );
         match second {
             Outcome::AlreadyResolved {
@@ -1103,9 +2512,60 @@ mod tests {
         }
     }
 
+    /// A stored payment summary whose destination fails its checksum is an
+    /// ordinary entry: approving it refuses with `approval.entry_inconsistent`
+    /// and changes nothing, and rejecting it writes the tombstone.
+    #[test]
+    #[serial]
+    fn a_refused_destination_refuses_approval_and_accepts_rejection() {
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("refused-destination");
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        let bad = format!("{}A", &DEST_G[..55]);
+        let text = std::fs::read_to_string(&fx.ctx.store_path).unwrap();
+        let line = format!("summary_to = \"{DEST_G}\"");
+        assert_eq!(text.matches(&line).count(), 1);
+        let edited = text.replace(&line, &format!("summary_to = \"{bad}\""));
+        std::fs::write(&fx.ctx.store_path, &edited).unwrap();
+
+        let outcome = apply_decision(
+            &fx.ctx,
+            approve_shown(&fx.ctx, nonce.clone()),
+            RequestIdentity::Local,
+        );
+        assert_eq!(outcome, Outcome::Inconsistent);
+        assert_eq!(std::fs::read_to_string(&fx.ctx.store_path).unwrap(), edited);
+
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Reject {
+                nonce: nonce.clone(),
+            },
+            RequestIdentity::Local,
+        );
+        assert_eq!(outcome, Outcome::Rejected);
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        assert!(matches!(
+            store.get(&nonce).unwrap().kind,
+            ApprovalKind::Rejected { .. }
+        ));
+    }
+
     #[test]
     #[serial]
     fn reject_creates_tombstone_and_is_idempotent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("reject");
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
@@ -1114,7 +2574,7 @@ mod tests {
             Decision::Reject {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Rejected);
 
@@ -1124,13 +2584,16 @@ mod tests {
         drop(store);
 
         // Second reject is idempotent.
-        let again = apply_decision(&fx.ctx, Decision::Reject { nonce }, &RequestIdentity::Local);
+        let again = apply_decision(&fx.ctx, Decision::Reject { nonce }, RequestIdentity::Local);
         assert_eq!(again, Outcome::AlreadyResolved { attestation: None });
     }
 
     #[test]
     #[serial]
     fn approve_rejected_tombstone_is_already_resolved_not_panic() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("reject-then-approve");
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
@@ -1140,14 +2603,14 @@ mod tests {
                 Decision::Reject {
                     nonce: nonce.clone()
                 },
-                &RequestIdentity::Local
+                RequestIdentity::Local
             ),
             Outcome::Rejected
         );
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::AlreadyResolved { attestation: None });
     }
@@ -1155,6 +2618,9 @@ mod tests {
     #[test]
     #[serial]
     fn reject_unknown_nonce_is_already_resolved() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("reject-missing");
         let _ = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
@@ -1163,7 +2629,7 @@ mod tests {
             Decision::Reject {
                 nonce: "BBBBBBBBBBBBBBBBBBBBBB".to_owned(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::AlreadyResolved { attestation: None });
     }
@@ -1171,15 +2637,16 @@ mod tests {
     #[test]
     #[serial]
     fn approve_foreign_process_uid_is_user_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("approve-mismatch");
         let nonce = insert(&fx.ctx, foreign_payment_entry(DEFAULT_TTL_MS));
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce.clone()),
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::UserMismatch);
 
@@ -1192,6 +2659,9 @@ mod tests {
     #[test]
     #[serial]
     fn reject_foreign_process_uid_is_user_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("reject-mismatch");
         let nonce = insert(&fx.ctx, foreign_payment_entry(DEFAULT_TTL_MS));
@@ -1200,7 +2670,7 @@ mod tests {
             Decision::Reject {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::UserMismatch);
 
@@ -1221,15 +2691,16 @@ mod tests {
     #[test]
     #[serial]
     fn approve_with_corrupt_store_file_is_unavailable_not_busy() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("corrupt-store");
         std::fs::write(&fx.ctx.store_path, b"this is not valid toml {{{").unwrap();
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, "AAAAAAAAAAAAAAAAAAAAAA".to_owned()),
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
     }
@@ -1237,6 +2708,9 @@ mod tests {
     #[test]
     #[serial]
     fn reject_with_corrupt_store_file_is_unavailable_not_busy() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("corrupt-store-reject");
         std::fs::write(&fx.ctx.store_path, b"this is not valid toml {{{").unwrap();
@@ -1245,13 +2719,16 @@ mod tests {
             Decision::Reject {
                 nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
     }
     #[test]
     #[serial]
     fn approve_refuses_another_chain_with_binding_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("binding-mismatch");
         let definition = stellar_agent_core::approval::ContextRuleProposalSnapshot::new(
@@ -1272,7 +2749,6 @@ mod tests {
             "Public Global Stellar Network ; September 2015".to_owned(),
             "stellar:mainnet".to_owned(),
             definition,
-            [1; 32],
             "rule".to_owned(),
             uid(),
             DEFAULT_TTL_MS,
@@ -1282,10 +2758,8 @@ mod tests {
         assert_eq!(
             apply_decision(
                 &fx.ctx,
-                Decision::Approve {
-                    nonce: nonce.clone()
-                },
-                &RequestIdentity::Local
+                approve_shown(&fx.ctx, nonce.clone()),
+                RequestIdentity::Local
             ),
             Outcome::BindingMismatch
         );
@@ -1299,10 +2773,52 @@ mod tests {
 
     /// An in-process anchor store, so a test writer refuses an append on a log
     /// rolled back underneath it.
+    type MemAnchorState = (
+        Option<TipAnchor>,
+        u64,
+        std::collections::BTreeMap<u64, stellar_agent_core::audit_log::OutboxState>,
+        Option<stellar_agent_core::audit_log::tip_anchor::CarrierRecord>,
+    );
+
     #[derive(Debug, Default)]
-    struct MemAnchor(Mutex<(Option<TipAnchor>, u64)>);
+    struct MemAnchor(Mutex<MemAnchorState>);
 
     impl TipAnchorStore for MemAnchor {
+        fn reads_audit_key(&self) -> bool {
+            false
+        }
+        fn load_carrier_record(
+            &self,
+        ) -> Result<
+            Option<stellar_agent_core::audit_log::tip_anchor::CarrierRecord>,
+            TipAnchorStoreError,
+        > {
+            Ok(self.0.lock().unwrap().3.clone())
+        }
+        fn store_carrier_record(
+            &self,
+            record: &stellar_agent_core::audit_log::tip_anchor::CarrierRecord,
+        ) -> Result<(), TipAnchorStoreError> {
+            self.0.lock().unwrap().3 = Some(record.clone());
+            Ok(())
+        }
+
+        fn load_outbox_state(
+            &self,
+            generation: u64,
+        ) -> Result<Option<stellar_agent_core::audit_log::OutboxState>, TipAnchorStoreError>
+        {
+            Ok(self.0.lock().unwrap().2.get(&generation).cloned())
+        }
+        fn store_outbox_state(
+            &self,
+            generation: u64,
+            state: &stellar_agent_core::audit_log::OutboxState,
+        ) -> Result<(), TipAnchorStoreError> {
+            self.0.lock().unwrap().2.insert(generation, state.clone());
+            Ok(())
+        }
+
         fn load_anchor(&self) -> Result<Option<TipAnchor>, TipAnchorStoreError> {
             Ok(self.0.lock().unwrap().0.clone())
         }
@@ -1367,6 +2883,7 @@ mod tests {
             path.clone(),
             None,
             Arc::new(MemAnchor::default()) as Arc<dyn TipAnchorStore>,
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
         .unwrap();
         writer
@@ -1388,12 +2905,85 @@ mod tests {
             && entry.attestation_blob_b64.is_none()
     }
 
+    /// The rejection revalidates only after the queued row is durable and the outbox is empty.
+    #[test]
+    #[serial]
+    fn reject_drains_the_outbox_before_revalidation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
+        use stellar_agent_core::audit_log::{AuditOutbox, BindingHistory, inspect_outbox};
+
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut fx = fixture("reject-drain");
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        let path = fx.ctx.store_path.parent().unwrap().join("draining.log");
+        let anchor = Arc::new(MemAnchor::default()) as Arc<dyn TipAnchorStore>;
+        let writer = AuditWriter::open_with_tip_anchor(
+            path.clone(),
+            None,
+            Arc::clone(&anchor),
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        fx.ctx.audit_writer = Arc::new(Mutex::new(writer));
+        let outbox = AuditOutbox::for_log(&path, anchor);
+        outbox
+            .append(&AuditEntry::new_approval_attested(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                "AAAAAAAAAAAAAAAAAAAAAA",
+                "serve",
+                "queued-consent",
+            ))
+            .unwrap();
+        assert_eq!(inspect_outbox(&path).unwrap().pending, 1);
+        assert_eq!(rows_of_kind(&path, "approval_rejected"), 0);
+
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let hook_fired = std::rc::Rc::clone(&fired);
+        let hook_path = path.clone();
+        wait_hook::install(move || {
+            hook_fired.set(true);
+            assert_eq!(inspect_outbox(&hook_path).unwrap().pending, 0);
+            let rows = verified_audit_entries_from_path(&hook_path);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].request_id, "queued-consent");
+        });
+        assert_eq!(
+            apply_decision(
+                &fx.ctx,
+                Decision::Reject {
+                    nonce: nonce.clone(),
+                },
+                RequestIdentity::Local,
+            ),
+            Outcome::Rejected
+        );
+        assert!(fired.get());
+        assert_eq!(inspect_outbox(&path).unwrap().pending, 0);
+        let rows = verified_audit_entries_from_path(&path);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].request_id, "queued-consent");
+        assert_eq!(rows_of_kind(&path, "approval_attested"), 1);
+        assert_eq!(rows_of_kind(&path, "approval_rejected"), 1);
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        let entry = store.get(&nonce).unwrap();
+        assert!(matches!(entry.kind, ApprovalKind::Rejected { .. }));
+        assert!(entry.attestation_blob_b64.is_none());
+    }
+
     /// Another handle attests the entry after the inbox validated it and
     /// before it attests: the inbox answers with the stored attestation and
     /// writes no row.
     #[test]
     #[serial]
     fn approving_an_entry_attested_by_another_handle_reshows_the_stored_blob_with_no_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let store_path = Arc::new(Mutex::new(None::<std::path::PathBuf>));
         let nonce_slot = Arc::new(Mutex::new(None::<String>));
@@ -1412,7 +3002,9 @@ mod tests {
                     return;
                 }
                 let mut other = PendingApprovalStore::open(path).unwrap();
-                other.record_attestation(&nonce, [0x01; 32]).unwrap();
+                other
+                    .record_attestation(&nonce, [0x01; 32], AttestedApprover::Local)
+                    .unwrap();
             }) as Arc<dyn Fn() + Send + Sync>
         };
         stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
@@ -1430,8 +3022,8 @@ mod tests {
 
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
         );
         assert!(
             fired.load(std::sync::atomic::Ordering::SeqCst),
@@ -1484,8 +3076,8 @@ mod tests {
 
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce),
+            RequestIdentity::Local,
         );
         assert!(
             fired.load(std::sync::atomic::Ordering::SeqCst),
@@ -1499,9 +3091,14 @@ mod tests {
     #[test]
     #[serial]
     fn approving_an_entry_consumed_since_validation_is_already_resolved_with_no_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (fx, outcome) =
             approve_an_entry_resolved_by_another_handle("raced-consumed", |store, nonce| {
-                store.record_attestation(nonce, [0x01; 32]).unwrap();
+                store
+                    .record_attestation(nonce, [0x01; 32], AttestedApprover::Local)
+                    .unwrap();
                 store
                     .consume(
                         nonce,
@@ -1519,6 +3116,9 @@ mod tests {
     #[test]
     #[serial]
     fn approving_an_entry_rejected_since_validation_is_already_resolved_with_no_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (fx, outcome) =
             approve_an_entry_resolved_by_another_handle("raced-rejected", |store, nonce| {
                 store
@@ -1532,26 +3132,25 @@ mod tests {
     #[test]
     #[serial]
     fn approve_with_a_poisoned_writer_mutex_is_unavailable_and_changes_no_store() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("poison-approve");
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
         poison(&fx.ctx.audit_writer);
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce.clone()),
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
         assert!(still_pending(&fx, &nonce));
         // A poisoned mutex keeps refusing until the inbox restarts.
         let again = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce.clone()),
+            RequestIdentity::Local,
         );
         assert_eq!(again, Outcome::Unavailable);
         assert!(still_pending(&fx, &nonce));
@@ -1560,6 +3159,9 @@ mod tests {
     #[test]
     #[serial]
     fn reject_with_a_poisoned_writer_mutex_is_unavailable_and_changes_no_store() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("poison-reject");
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
@@ -1569,7 +3171,7 @@ mod tests {
             Decision::Reject {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
         assert!(still_pending(&fx, &nonce));
@@ -1578,6 +3180,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_reject_whose_row_cannot_be_written_leaves_the_entry_pending() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut fx = fixture("reject-row-refused");
         refusing_writer(&mut fx);
@@ -1587,7 +3192,7 @@ mod tests {
             Decision::Reject {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
         assert!(
@@ -1599,16 +3204,17 @@ mod tests {
     #[test]
     #[serial]
     fn an_approve_whose_row_cannot_be_written_persists_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut fx = fixture("approve-row-refused");
         refusing_writer(&mut fx);
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
         let outcome = apply_decision(
             &fx.ctx,
-            Decision::Approve {
-                nonce: nonce.clone(),
-            },
-            &RequestIdentity::Local,
+            approve_shown(&fx.ctx, nonce.clone()),
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
         assert!(
@@ -1620,6 +3226,9 @@ mod tests {
     #[test]
     #[serial]
     fn approve_and_reject_write_their_rows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("rows");
         let approved = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
@@ -1627,8 +3236,8 @@ mod tests {
         assert!(matches!(
             apply_decision(
                 &fx.ctx,
-                Decision::Approve { nonce: approved },
-                &RequestIdentity::Local
+                approve_shown(&fx.ctx, approved),
+                RequestIdentity::Local
             ),
             Outcome::Attested { .. }
         ));
@@ -1636,11 +3245,899 @@ mod tests {
             apply_decision(
                 &fx.ctx,
                 Decision::Reject { nonce: rejected },
-                &RequestIdentity::Local
+                RequestIdentity::Local
             ),
             Outcome::Rejected
         );
         assert_eq!(rows_of_kind(&audit_path(&fx), "approval_attested"), 1);
         assert_eq!(rows_of_kind(&audit_path(&fx), "approval_rejected"), 1);
+    }
+
+    const RP_ID: &str = "wallet.test.internal";
+
+    fn credential_id(seed: u8) -> String {
+        URL_SAFE_NO_PAD.encode([seed; 16])
+    }
+
+    fn profile_dir(fx: &Fixture) -> std::path::PathBuf {
+        fx.ctx.store_path.parent().unwrap().join("profiles")
+    }
+
+    fn credentials_path(fx: &Fixture) -> std::path::PathBuf {
+        fx.ctx
+            .store_path
+            .parent()
+            .unwrap()
+            .join("operator-credentials.toml")
+    }
+
+    /// Writes the fixture's profile to disk with remote approval enabled for
+    /// `ids`.
+    fn allow(fx: &Fixture, ids: &[String]) {
+        let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "default", "nonce", "default",
+        )
+        .build();
+        profile.remote_approval = Some(
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "bind": "127.0.0.1:8443",
+                "rp_id": RP_ID,
+                "allowed_credentials": ids,
+            }))
+            .unwrap(),
+        );
+        stellar_agent_core::profile::loader::save_to_dir("ui-test", &profile, &profile_dir(fx))
+            .unwrap();
+    }
+
+    fn enroll(fx: &Fixture, id: &str) {
+        let mut key = vec![0x04u8; 65];
+        key[1] = 7;
+        OperatorApprovalCredentialStore::new(credentials_path(fx))
+            .enroll(OperatorApprovalCredential {
+                credential_id_b64url: id.to_owned(),
+                public_key_sec1_b64: URL_SAFE_NO_PAD.encode(key),
+                rp_id: RP_ID.to_owned(),
+                label: "device".to_owned(),
+                registered_at_unix_ms: 1,
+                sign_count: None,
+                source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
+            })
+            .unwrap();
+    }
+
+    /// A remote requester whose assertion for `nonce` was verified for the
+    /// credential `id`, reading its authorization from the fixture's files.
+    fn remote_requester(fx: &Fixture, id: &str, nonce: &str) -> RequestIdentity {
+        let witness = stellar_agent_core::approval::VerifiedPasskeyAssertion::new_verified(
+            nonce,
+            Ok::<(), ()>(()),
+        )
+        .unwrap();
+        RequestIdentity::Remote {
+            identity: ApproverIdentity::from_verified_passkey_assertion(id, witness),
+            authority: Arc::new(
+                RemoteApprovalAuthority::from_paths(
+                    "ui-test".to_owned(),
+                    profile_dir(fx),
+                    credentials_path(fx),
+                )
+                .unwrap(),
+            ),
+            chain: Caip2::Testnet,
+            rp_id: RP_ID.to_owned(),
+        }
+    }
+
+    /// An authorized remote approval persists a version 4 attestation that
+    /// names the verified credential and writes the remote consent row.
+    #[test]
+    #[serial]
+    fn remote_approve_attests_the_verified_credential() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("remote-approve");
+        allow(&fx, &[credential_id(1)]);
+        enroll(&fx, &credential_id(1));
+        let entry = payment_entry(DEFAULT_TTL_MS);
+        let nonce = insert(&fx.ctx, entry);
+        let outcome = apply_decision(
+            &fx.ctx,
+            approve_shown(&fx.ctx, nonce.clone()),
+            remote_requester(&fx, &credential_id(1), &nonce),
+        );
+        assert!(matches!(outcome, Outcome::Attested { .. }), "{outcome:?}");
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        let record = store.get(&nonce).unwrap();
+        assert_eq!(record.attestation_version, 4);
+        assert!(
+            record.attested_approver
+                == Some(AttestedApprover::Remote {
+                    credential_id_b64url: credential_id(1),
+                })
+        );
+        assert_eq!(
+            rows_of_kind(&audit_path(&fx), "approval_attested_remote"),
+            1
+        );
+    }
+
+    /// A remote approve on mainnet refuses as unsupported before the store,
+    /// the authorization or the key is read, even for an admitted
+    /// credential, and records nothing. A remote reject stays available.
+    #[test]
+    #[serial]
+    fn a_remote_mainnet_approve_is_refused_as_unsupported() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut fx = fixture("remote-mainnet");
+        fx.ctx.context.chain_id = "stellar:mainnet".to_owned();
+        allow(&fx, &[credential_id(1)]);
+        enroll(&fx, &credential_id(1));
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        let outcome = apply_decision(
+            &fx.ctx,
+            approve_shown(&fx.ctx, nonce.clone()),
+            remote_requester(&fx, &credential_id(1), &nonce),
+        );
+        assert_eq!(
+            outcome,
+            Outcome::PresenceRefused {
+                code: "approval.mainnet_remote_unsupported",
+                message: "Mainnet consent uses the local passkey page; remote \
+                          approval is unavailable for mainnet.",
+            }
+        );
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        let entry = store.get(&nonce).expect("the entry stays");
+        assert!(entry.attestation_blob_b64.is_none());
+        assert_eq!(
+            rows_of_kind(&audit_path(&fx), "approval_attested_remote"),
+            0
+        );
+        drop(store);
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Reject {
+                nonce: nonce.clone(),
+            },
+            remote_requester(&fx, &credential_id(1), &nonce),
+        );
+        assert_eq!(outcome, Outcome::Rejected);
+    }
+
+    /// The credential is removed from the allowlist while the attestation key
+    /// loads: the approval refuses after the wait, and neither the
+    /// attestation nor the consent row is persisted. Removing the enrollment
+    /// instead refuses the same way.
+    #[test]
+    #[serial]
+    fn revocation_during_keyring_wait_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for revoke in ["allowlist", "enrollment"] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let fx = fixture(&format!("remote-wait-{revoke}"));
+            allow(&fx, &[credential_id(1), credential_id(2)]);
+            enroll(&fx, &credential_id(1));
+            enroll(&fx, &credential_id(2));
+            let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+            let profiles = profile_dir(&fx);
+            let credentials = credentials_path(&fx);
+            let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+            let hook_fired = std::rc::Rc::clone(&fired);
+            wait_hook::install(move || {
+                hook_fired.set(true);
+                revoke_first_credential(&profiles, &credentials, revoke);
+            });
+            let outcome = apply_decision(
+                &fx.ctx,
+                approve_shown(&fx.ctx, nonce.clone()),
+                remote_requester(&fx, &credential_id(1), &nonce),
+            );
+            assert!(fired.get());
+            assert_eq!(outcome, Outcome::Unauthorized);
+            assert!(still_pending(&fx, &nonce));
+            assert_eq!(
+                rows_of_kind(&audit_path(&fx), "approval_attested_remote"),
+                0
+            );
+
+            // The credential the edit left authorized still approves.
+            let outcome = apply_decision(
+                &fx.ctx,
+                approve_shown(&fx.ctx, nonce.clone()),
+                remote_requester(&fx, &credential_id(2), &nonce),
+            );
+            assert!(matches!(outcome, Outcome::Attested { .. }), "{outcome:?}");
+        }
+    }
+
+    /// Revokes `credential_id(1)` the way `revoke` names: by editing the
+    /// profile's allowlist or by removing its enrollment.
+    fn revoke_first_credential(
+        profiles: &std::path::Path,
+        credentials: &std::path::Path,
+        revoke: &str,
+    ) {
+        if revoke == "allowlist" {
+            let mut profile = stellar_agent_core::profile::loader::load_from_dir_without_overlays(
+                "ui-test", profiles, None,
+            )
+            .unwrap();
+            profile
+                .remote_approval
+                .as_mut()
+                .unwrap()
+                .allowed_credentials
+                .retain(|id| *id != credential_id(1));
+            stellar_agent_core::profile::loader::save_to_dir("ui-test", &profile, profiles)
+                .unwrap();
+        } else {
+            assert!(
+                OperatorApprovalCredentialStore::new(credentials.to_path_buf())
+                    .remove(&credential_id(1))
+                    .unwrap()
+            );
+        }
+    }
+
+    /// The credential is revoked while the reject waits for the audit-writer
+    /// lock: the rejection refuses after the wait, and neither the rejection
+    /// row nor the tombstone is written. The credential the edit left
+    /// authorized still rejects.
+    #[test]
+    #[serial]
+    fn revocation_while_reject_waits_for_the_writer_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for revoke in ["allowlist", "enrollment"] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let fx = fixture(&format!("remote-reject-wait-{revoke}"));
+            allow(&fx, &[credential_id(1), credential_id(2)]);
+            enroll(&fx, &credential_id(1));
+            enroll(&fx, &credential_id(2));
+            let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+            let profiles = profile_dir(&fx);
+            let credentials = credentials_path(&fx);
+            let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+            let hook_fired = std::rc::Rc::clone(&fired);
+            wait_hook::install(move || {
+                hook_fired.set(true);
+                revoke_first_credential(&profiles, &credentials, revoke);
+            });
+            let outcome = apply_decision(
+                &fx.ctx,
+                Decision::Reject {
+                    nonce: nonce.clone(),
+                },
+                remote_requester(&fx, &credential_id(1), &nonce),
+            );
+            assert!(fired.get(), "{revoke}");
+            assert_eq!(outcome, Outcome::Unauthorized, "{revoke}");
+            assert!(still_pending(&fx, &nonce), "{revoke}");
+            assert_eq!(
+                rows_of_kind(&audit_path(&fx), "approval_rejected_remote"),
+                0
+            );
+
+            let outcome = apply_decision(
+                &fx.ctx,
+                Decision::Reject {
+                    nonce: nonce.clone(),
+                },
+                remote_requester(&fx, &credential_id(2), &nonce),
+            );
+            assert_eq!(outcome, Outcome::Rejected, "{revoke}");
+            assert_eq!(
+                rows_of_kind(&audit_path(&fx), "approval_rejected_remote"),
+                1
+            );
+            let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+            assert!(matches!(
+                store.get(&nonce).unwrap().kind,
+                ApprovalKind::Rejected { .. }
+            ));
+        }
+    }
+
+    /// A remote requester the current files do not admit can neither approve
+    /// nor reject, and a remote requester without a passkey identity is
+    /// refused the same way; nothing is persisted and no row is written.
+    #[test]
+    #[serial]
+    fn unauthorized_remote_requester_decides_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("remote-unauthorized");
+        allow(&fx, &[credential_id(2)]);
+        enroll(&fx, &credential_id(1));
+        enroll(&fx, &credential_id(2));
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        for decision in [
+            approve_shown(&fx.ctx, nonce.clone()),
+            Decision::Reject {
+                nonce: nonce.clone(),
+            },
+        ] {
+            assert_eq!(
+                apply_decision(
+                    &fx.ctx,
+                    decision,
+                    remote_requester(&fx, &credential_id(1), &nonce)
+                ),
+                Outcome::Unauthorized
+            );
+        }
+        let RequestIdentity::Remote {
+            authority,
+            chain,
+            rp_id,
+            ..
+        } = remote_requester(&fx, &credential_id(2), &nonce)
+        else {
+            unreachable!()
+        };
+        let os_identity = || RequestIdentity::Remote {
+            identity: ApproverIdentity::OsUid(uid()),
+            authority: authority.clone(),
+            chain,
+            rp_id: rp_id.clone(),
+        };
+        for decision in [
+            approve_shown(&fx.ctx, nonce.clone()),
+            Decision::Reject {
+                nonce: nonce.clone(),
+            },
+        ] {
+            assert_eq!(
+                apply_decision(&fx.ctx, decision, os_identity()),
+                Outcome::Unauthorized
+            );
+        }
+        assert!(still_pending(&fx, &nonce));
+        let log = std::fs::read_to_string(audit_path(&fx)).unwrap_or_default();
+        assert!(!log.contains("approval_"), "{log}");
+    }
+
+    // ── What the page showed ───────────────────────────────────────────────
+
+    /// One approvable entry of every kind an inbox approves, requested by
+    /// this user on the fixture's network.
+    fn every_inbox_kind() -> Vec<(&'static str, PendingApproval)> {
+        let own = |mut entry: PendingApproval| {
+            entry.process_uid = uid();
+            entry
+        };
+        vec![
+            ("PaymentSimulated", payment_entry(DEFAULT_TTL_MS)),
+            (
+                "TrustlineSimulated",
+                fixtures::trustline_pending(
+                    SOURCE_G,
+                    "USDC",
+                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                    None,
+                    100,
+                    42,
+                    uid(),
+                    DEFAULT_TTL_MS,
+                ),
+            ),
+            (
+                "ClaimSimulated",
+                fixtures::claim_pending(
+                    SOURCE_G,
+                    [0x0a; 32],
+                    Some(("XLM", 500)),
+                    100,
+                    1,
+                    uid(),
+                    DEFAULT_TTL_MS,
+                ),
+            ),
+            (
+                "RuleProposalSimulated",
+                own(fixtures::rule_proposal_pending()),
+            ),
+            ("MppChargeSimulated", own(fixtures::mpp_pending())),
+            (
+                "ToolsetFirstInvokeGate",
+                PendingApproval::new_toolset_first_invoke_gate_pending(
+                    "my-toolset".to_owned(),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                    "1.0.0".to_owned(),
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+                    "sign-payment".to_owned(),
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
+                    "XLM".to_owned(),
+                    0,
+                    1_000_000,
+                    uid(),
+                    DEFAULT_TTL_MS,
+                )
+                .unwrap(),
+            ),
+            (
+                "TrustlineClawbackOptIn",
+                PendingApproval::new_trustline_clawback_opt_in_pending(
+                    "stellar:testnet".to_owned(),
+                    "USDC".to_owned(),
+                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+                    uid(),
+                    DEFAULT_TTL_MS,
+                )
+                .unwrap(),
+            ),
+        ]
+    }
+
+    /// Approves every inbox kind with `shown` as the page's digest and
+    /// asserts the refusal: `approval.presence_changed`, the entry pending
+    /// and unattested, no row and no grant.
+    fn assert_every_kind_refuses_with(tag: &str, shown: Option<[u8; 32]>) {
+        for (kind, entry) in every_inbox_kind() {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let fx = fixture(&format!("{tag}-{kind}"));
+            let current = approval_view_digest(&entry, &fx.ctx.context.binding())
+                .unwrap_or_else(|e| panic!("{kind}: {e}"));
+            assert_ne!(shown, Some(current), "{kind}");
+            let nonce = insert(&fx.ctx, entry.clone());
+            let outcome = apply_decision(
+                &fx.ctx,
+                Decision::Approve {
+                    nonce: nonce.clone(),
+                    shown_view_digest: shown,
+                },
+                RequestIdentity::Local,
+            );
+            assert_eq!(
+                outcome,
+                Outcome::PresenceRefused {
+                    code: "approval.presence_changed",
+                    message: "The consent details have changed; reload the approval page and \
+                              review them again.",
+                },
+                "{kind}"
+            );
+            let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+            let stored = store.get(&nonce).expect("the entry stays");
+            assert_eq!(stored.kind, entry.kind, "{kind}");
+            assert!(stored.attestation_blob_b64.is_none(), "{kind}: unattested");
+            drop(store);
+            assert_eq!(
+                rows_of_kind(&audit_path(&fx), "approval_attested"),
+                0,
+                "{kind}: no row"
+            );
+            assert!(
+                !fx.ctx.grant_store_path_override.as_ref().unwrap().exists(),
+                "{kind}: no grant"
+            );
+        }
+    }
+
+    /// An approve whose page rendered other terms than the entry holds now
+    /// attests nothing, for every kind an inbox approves.
+    #[test]
+    #[serial]
+    fn a_stale_view_digest_refuses_and_attests_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        assert_every_kind_refuses_with("stale", Some([0x11; 32]));
+    }
+
+    /// An approve that names no view digest refuses as a stale one does.
+    #[test]
+    #[serial]
+    fn an_approve_that_names_no_view_digest_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        assert_every_kind_refuses_with("no-digest", None);
+    }
+
+    /// The entry is replaced while the approve waits for the attestation key,
+    /// after the page's digest matched: the attest compares the replacement
+    /// with the copy it compared, and attests nothing.
+    #[test]
+    #[serial]
+    fn a_swap_during_the_key_wait_attests_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let rule_d1 = {
+            let (_, definition) = fixtures::rule_proposal_mutations()
+                .into_iter()
+                .find(|(label, _)| *label == "name")
+                .unwrap();
+            PendingApproval::new_rule_proposal_pending(
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
+                "stellar:testnet".to_owned(),
+                definition,
+                "fixture summary".to_owned(),
+                uid(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap()
+        };
+        let mut rule_d2 = fixtures::rule_proposal_pending();
+        rule_d2.process_uid = uid();
+        let payment_d1 = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            90_000_000,
+            None,
+            100,
+            1_234_567,
+            uid(),
+            DEFAULT_TTL_MS,
+        );
+        for (kind, shown_entry, swapped_in) in [
+            (
+                "PaymentSimulated",
+                payment_entry(DEFAULT_TTL_MS),
+                payment_d1,
+            ),
+            ("RuleProposalSimulated", rule_d2, rule_d1),
+        ] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let fx = fixture(&format!("key-wait-swap-{kind}"));
+            let nonce = insert(&fx.ctx, shown_entry.clone());
+            let mut swapped_in = swapped_in;
+            swapped_in.approval_nonce.clone_from(&nonce);
+            swapped_in.created_at_unix_ms = shown_entry.created_at_unix_ms;
+            swapped_in.expires_at_unix_ms = shown_entry.expires_at_unix_ms;
+            assert!(
+                approval_view_digest(&swapped_in, &fx.ctx.context.binding()).is_ok(),
+                "{kind}: the swapped-in entry holds a valid digest"
+            );
+            let store_path = fx.ctx.store_path.clone();
+            let swap = swapped_in.clone();
+            let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+            let hook_fired = std::rc::Rc::clone(&fired);
+            let hook_nonce = nonce.clone();
+            wait_hook::install(move || {
+                hook_fired.set(true);
+                let mut store = PendingApprovalStore::open(store_path).unwrap();
+                assert!(store.remove(&hook_nonce).unwrap());
+                store.insert(swap, timefmt::now_unix_ms().unwrap()).unwrap();
+            });
+            let outcome = apply_decision(
+                &fx.ctx,
+                approve_shown(&fx.ctx, nonce.clone()),
+                RequestIdentity::Local,
+            );
+            assert!(fired.get(), "{kind}: the swap ran after the comparison");
+            assert_eq!(
+                outcome,
+                Outcome::PresenceRefused {
+                    code: "approval.presence_changed",
+                    message: "The consent details have changed; reload the approval page and review them again.",
+                },
+                "{kind}"
+            );
+            let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+            let stored = store.get(&nonce).unwrap();
+            assert_eq!(stored.kind, swapped_in.kind, "{kind}");
+            assert!(stored.attestation_blob_b64.is_none(), "{kind}: unattested");
+            drop(store);
+            assert_eq!(
+                rows_of_kind(&audit_path(&fx), "approval_attested"),
+                0,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_digest_is_read_only_from_its_exact_body() {
+        let hex = "ab".repeat(32);
+        let digest = decode_sha256_hex(&hex).unwrap();
+        assert_eq!(
+            shown_view_digest(format!(r#"{{"view_digest":"{hex}"}}"#).as_bytes()),
+            Some(digest)
+        );
+        for body in [
+            String::new(),
+            "{}".to_owned(),
+            r#"{"view_digest":null}"#.to_owned(),
+            format!(r#"{{"view_digest":"{}"}}"#, "zz".repeat(32)),
+            format!(r#"{{"view_digest":"{}"}}"#, &hex[..63]),
+            format!(r#"{{"view_digest":"{hex}","nonce":"x"}}"#),
+            format!(r#"["{hex}"]"#),
+        ] {
+            assert_eq!(shown_view_digest(body.as_bytes()), None, "{body}");
+        }
+    }
+
+    use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
+
+    /// The decision context of a mainnet inbox over `fixture`, without a
+    /// consent recording.
+    fn mainnet_context(fixture: &MainnetConsentFixture) -> DecisionContext {
+        DecisionContext::new(
+            stellar_agent_core::approval::ApprovalContext::from_profile(
+                fixture.name(),
+                fixture.profile(),
+            ),
+            fixture.store_path(),
+            fixture.profile().attestation_key_id.clone(),
+            OwnerKeyContext::for_profile(fixture.name(), fixture.profile()),
+            Arc::new(Mutex::new(fixture.audit_writer())),
+            None,
+        )
+        .with_mainnet_authority(fixture.authority())
+    }
+
+    /// Approves `entry` under a fresh verified presence of the fixture
+    /// credential, as the loopback inbox's assertion route does.
+    fn mainnet_approve(
+        ctx: &DecisionContext,
+        fixture: &MainnetConsentFixture,
+        entry: &PendingApproval,
+    ) -> Outcome {
+        apply_decision(
+            ctx,
+            Decision::Approve {
+                nonce: entry.approval_nonce.clone(),
+                shown_view_digest: Some(
+                    approval_view_digest(entry, &ctx.context.binding()).unwrap(),
+                ),
+            },
+            RequestIdentity::Mainnet(fixture.presence(entry, &fixture.current_policy())),
+        )
+    }
+
+    fn presence_consumed() -> Outcome {
+        presence_refusal(&WalletError::Approval(
+            stellar_agent_core::ApprovalFailure::PresenceConsumed,
+        ))
+        .unwrap()
+    }
+
+    /// A mainnet context without a consent recording refuses a value approve
+    /// before any row or attestation: the store and the audit log keep their
+    /// bytes.
+    #[test]
+    #[serial]
+    fn context_without_an_adapter_refuses_mainnet_value_consent() {
+        let fixture = MainnetConsentFixture::new("no-recording");
+        let ctx = mainnet_context(&fixture);
+        let entry = fixture.payment(600_000);
+        insert(&ctx, entry.clone());
+        let store = std::fs::read(&ctx.store_path).unwrap();
+        let audit = std::fs::read(fixture.audit_path()).unwrap_or_default();
+        assert_eq!(
+            mainnet_approve(&ctx, &fixture, &entry),
+            Outcome::Unavailable
+        );
+        assert_eq!(std::fs::read(&ctx.store_path).unwrap(), store);
+        assert_eq!(
+            std::fs::read(fixture.audit_path()).unwrap_or_default(),
+            audit
+        );
+    }
+
+    /// A repeated mainnet approve of an attested value entry completes its
+    /// consent as recovered, then keeps its `approval.presence_consumed`
+    /// refusal. A refused completion answers unavailable.
+    #[test]
+    #[serial]
+    fn inbox_repeated_approve_recovers_consent() {
+        let fixture = MainnetConsentFixture::new("repeated");
+        let entry = fixture.payment(600_000);
+        drop(fixture.consent(&entry));
+        let recording = Arc::new(crate::tests::RecordingConsent::default());
+        let ctx = mainnet_context(&fixture).with_consent_recording(recording.clone());
+        assert_eq!(mainnet_approve(&ctx, &fixture, &entry), presence_consumed());
+        assert_eq!(
+            recording.calls(),
+            [(entry.approval_nonce.clone(), ConsentRowSource::Recovered)]
+        );
+        recording
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            mainnet_approve(&ctx, &fixture, &entry),
+            Outcome::Unavailable
+        );
+    }
+
+    /// Another handle attests the entry while the approve waits on the
+    /// keyring. The approve then completes the durable consent as recovered
+    /// before it answers: a refused completion answers unavailable with no
+    /// attestation, and a completed one keeps the re-shown stored blob.
+    #[test]
+    #[serial]
+    fn a_raced_approve_completes_consent_before_it_reshows_the_blob() {
+        use stellar_agent_core::approval::{
+            AttestationBinding, ConsentAuthorization, mainnet_fixtures::ATTESTATION_KEY,
+        };
+        for (refuse, publish) in [(true, false), (false, false), (true, true), (false, true)] {
+            let fixture = MainnetConsentFixture::new("raced");
+            let entry = fixture.payment(600_000);
+            let recording = Arc::new(crate::tests::RecordingConsent::default());
+            recording
+                .refuse
+                .store(refuse, std::sync::atomic::Ordering::SeqCst);
+            recording
+                .publish
+                .store(publish, std::sync::atomic::Ordering::SeqCst);
+            let ctx = mainnet_context(&fixture).with_consent_recording(recording.clone());
+            insert(&ctx, entry.clone());
+            let policy = fixture.current_policy();
+            let presence = fixture.presence(&entry, &policy);
+            let (path, name, writer, raced) = (
+                ctx.store_path.clone(),
+                fixture.name().to_owned(),
+                ctx.audit_writer.clone(),
+                entry.clone(),
+            );
+            // A published competitor attests strictly and stores its handoff.
+            wait_hook::install(move || {
+                let mut store = PendingApprovalStore::open(path).unwrap();
+                let binding = AttestationBinding::new(&name, MAINNET_CHAIN_ID);
+                let mut writer = writer.lock().unwrap();
+                let audit = ConsentAudit::Writer(&mut writer);
+                let authorization = ConsentAuthorization::Mainnet {
+                    presence,
+                    policy: &policy,
+                };
+                let grant = |_: &stellar_agent_core::approval::ToolsetGrantRequest<'_>,
+                             _: &[u8; 32]| {
+                    Err("no toolset grant in a mainnet consent".to_owned())
+                };
+                if publish {
+                    attest_and_persist_with_row(
+                        &mut store,
+                        &raced,
+                        &ATTESTATION_KEY,
+                        &binding,
+                        Surface::Serve,
+                        audit,
+                        authorization,
+                        grant,
+                    )
+                    .unwrap();
+                } else {
+                    attest_and_persist(
+                        &mut store,
+                        &raced,
+                        &ATTESTATION_KEY,
+                        &binding,
+                        Surface::Serve,
+                        audit,
+                        authorization,
+                        grant,
+                    )
+                    .unwrap();
+                }
+            });
+            let outcome = mainnet_approve(&ctx, &fixture, &entry);
+            let stored = PendingApprovalStore::open(ctx.store_path.clone())
+                .unwrap()
+                .get(&entry.approval_nonce)
+                .unwrap()
+                .attestation_blob_b64
+                .clone();
+            assert!(stored.is_some(), "{refuse}");
+            assert_eq!(
+                outcome,
+                if refuse {
+                    Outcome::Unavailable
+                } else {
+                    Outcome::AlreadyResolved {
+                        attestation: stored,
+                    }
+                },
+                "{refuse}"
+            );
+            assert_eq!(
+                recording.calls(),
+                [(entry.approval_nonce.clone(), ConsentRowSource::Recovered)],
+                "{refuse}"
+            );
+            assert_eq!(
+                recording.published(),
+                [publish],
+                "a published race completes the winner's verified handoff"
+            );
+        }
+    }
+
+    /// Off mainnet, an approve and its repeat never call the consent
+    /// recording and keep their outcomes.
+    #[test]
+    #[serial]
+    fn testnet_consent_calls_no_facade() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let Fixture { _dir, ctx, .. } = fixture("testnet-recording");
+        let recording = Arc::new(crate::tests::RecordingConsent::default());
+        let ctx = ctx.with_consent_recording(recording.clone());
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            10,
+            None,
+            100,
+            7,
+            uid(),
+            DEFAULT_TTL_MS,
+        );
+        let nonce = insert(&ctx, entry);
+        let outcome = apply_decision(
+            &ctx,
+            approve_shown(&ctx, nonce.clone()),
+            RequestIdentity::Local,
+        );
+        let Outcome::Attested {
+            attestation: Some(blob),
+            ..
+        } = outcome
+        else {
+            panic!("a testnet payment attests: {outcome:?}")
+        };
+        assert_eq!(
+            apply_decision(&ctx, approve_shown(&ctx, nonce), RequestIdentity::Local),
+            Outcome::AlreadyResolved {
+                attestation: Some(blob)
+            }
+        );
+        assert!(recording.calls().is_empty());
+    }
+
+    /// A mainnet trustline clawback opt-in keeps its consent path with and
+    /// without a recording: it attests without a blob, a repeat refuses as
+    /// consumed, and the recording is never called.
+    #[test]
+    #[serial]
+    fn excluded_entries_keep_their_consent_path() {
+        for recorded in [false, true] {
+            let fixture = MainnetConsentFixture::new("excluded");
+            let entry = PendingApproval::new_trustline_clawback_opt_in_pending(
+                "stellar:mainnet".to_owned(),
+                "USDC".to_owned(),
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+                uid(),
+                600_000,
+            )
+            .unwrap();
+            let recording = Arc::new(crate::tests::RecordingConsent::default());
+            let mut ctx = mainnet_context(&fixture);
+            if recorded {
+                ctx = ctx.with_consent_recording(recording.clone());
+            }
+            insert(&ctx, entry.clone());
+            let outcome = mainnet_approve(&ctx, &fixture, &entry);
+            assert!(
+                matches!(
+                    outcome,
+                    Outcome::Attested {
+                        attestation: None,
+                        ..
+                    }
+                ),
+                "{recorded}: {outcome:?}"
+            );
+            assert_eq!(mainnet_approve(&ctx, &fixture, &entry), presence_consumed());
+            assert!(recording.calls().is_empty(), "{recorded}");
+        }
     }
 }

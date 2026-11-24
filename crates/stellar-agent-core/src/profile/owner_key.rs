@@ -4,21 +4,19 @@
 //! `profile enroll-owner-key` stores the owner public key at
 //! [`KeyringEntryRef::default_owner_key`] as its G-strkey. A G-strkey decodes
 //! as URL-safe base64 to 42 bytes, so no 32-byte symmetric-key loader accepts
-//! it. Entries written in the older form, URL-safe base64 of the 32 key bytes,
-//! are read by every owner reader and rewritten as the G-strkey, best effort.
+//! it. Owner readers accept only the G-strkey. An older base64 entry is refused
+//! until the owner public key is enrolled again. Symmetric-key loaders compare
+//! both forms.
 //!
 //! Every symmetric-key loader refuses a coordinate in the owner namespace
 //! before any keyring read ([`refuse_owner_key_coordinate`]) and a loaded key
 //! equal to the profile's own owner public key
-//! ([`refuse_owner_public_key`]). Under `headless-dpapi` an owner entry still
-//! in the older form can be moved to another coordinate until a V1 verb or
-//! `enroll-owner-key` rewrites it.
-
-use std::path::Path;
+//! ([`refuse_owner_public_key`]).
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use keyring_core::Entry as KeyringEntry;
+use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 
 use crate::error::{ValidationError, WalletError};
@@ -26,29 +24,97 @@ use crate::keyring_errors::{KeyringOperation, map_keyring_operation_error};
 use crate::profile::name::OWNER_KEY_SERVICE_PREFIX;
 use crate::profile::schema::{KeyringEntryRef, Profile};
 
-/// The form an owner entry's value is stored in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why an owner entry cannot supply a public key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum OwnerKeyForm {
-    /// The G-strkey `enroll-owner-key` writes.
-    Strkey,
-    /// URL-safe base64 of the 32 key bytes, the older form.
-    OlderBase64,
+pub enum OwnerKeyDecodeError {
+    /// The entry holds ambiguous 32-byte URL-safe base64.
+    #[error("owner key is in the older base64 form; enroll the owner public key again")]
+    OlderForm,
+    /// The entry is neither a G-strkey nor the older form.
+    #[error("owner key is neither a G-strkey nor the older form")]
+    Undecodable,
 }
 
-/// Decodes an owner entry value in either stored form.
+/// Decodes only a G-strkey owner entry.
 ///
-/// Returns `None` for a value that is neither a G-strkey nor URL-safe base64
-/// of exactly 32 bytes.
-#[must_use]
-pub fn decode_owner_public_key(raw: &str) -> Option<([u8; 32], OwnerKeyForm)> {
+/// # Errors
+/// Returns [`OwnerKeyDecodeError::OlderForm`] for 32-byte URL-safe base64,
+/// or [`OwnerKeyDecodeError::Undecodable`] for any other value.
+pub fn decode_owner_public_key(raw: &str) -> Result<[u8; 32], OwnerKeyDecodeError> {
     let trimmed = raw.trim();
     if let Ok(strkey) = stellar_strkey::ed25519::PublicKey::from_string(trimmed) {
-        return Some((strkey.0, OwnerKeyForm::Strkey));
+        return Ok(strkey.0);
     }
-    let bytes = URL_SAFE_NO_PAD.decode(trimmed).ok()?;
-    let key: [u8; 32] = bytes.as_slice().try_into().ok()?;
-    Some((key, OwnerKeyForm::OlderBase64))
+    let bytes = zeroize::Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(trimmed)
+            .map_err(|_| OwnerKeyDecodeError::Undecodable)?,
+    );
+    if bytes.len() == 32 {
+        return Err(OwnerKeyDecodeError::OlderForm);
+    }
+    Err(OwnerKeyDecodeError::Undecodable)
+}
+
+/// Reads an enrolled owner, distinguishing absence from unusable state.
+///
+/// No registered keyring backend reads as absent; a registered backend's failures refuse.
+///
+/// Reset callers hold the window guard across this read.
+///
+/// # Errors
+/// Refuses entry construction, access errors, and malformed owner keys.
+pub fn read_enrolled_owner(profile: &Profile) -> Result<Option<[u8; 32]>, WalletError> {
+    let coordinate = &profile.policy_owner_key_id;
+    let entry = match KeyringEntry::new(&coordinate.service, &coordinate.account) {
+        Ok(entry) => entry,
+        Err(keyring_core::Error::NoDefaultStore) if keyring_core::get_default_store().is_none() => {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(map_keyring_operation_error(
+                &error,
+                KeyringOperation::Construct,
+                &coordinate.service,
+            ));
+        }
+    };
+    let raw = match entry.get_password() {
+        Ok(raw) => zeroize::Zeroizing::new(raw),
+        Err(keyring_core::Error::NoEntry) => return Ok(None),
+        Err(error) => {
+            return Err(map_keyring_operation_error(
+                &error,
+                KeyringOperation::Read,
+                &coordinate.service,
+            ));
+        }
+    };
+    decode_owner_public_key(&raw).map(Some).map_err(|error| {
+        WalletError::WalletState(crate::error::WalletStateError::KeyringCorrupted {
+            detail: error.to_string(),
+        })
+    })
+}
+
+/// Reads either form for symmetric-key comparisons.
+fn owner_key_bytes_in_either_form(raw: &str) -> Option<[u8; 32]> {
+    let trimmed = raw.trim();
+    if let Ok(strkey) = stellar_strkey::ed25519::PublicKey::from_string(trimmed) {
+        return Some(strkey.0);
+    }
+    let bytes = zeroize::Zeroizing::new(URL_SAFE_NO_PAD.decode(trimmed).ok()?);
+    bytes.as_slice().try_into().ok()
+}
+
+/// Identifies stored owner bytes without rendering a reversible encoding.
+#[must_use]
+pub fn owner_key_fingerprint(key: &[u8; 32]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"stellar-agent-owner-key-fingerprint:v1");
+    hash.update(key);
+    format!("sha256:{}", crate::hex::encode(&hash.finalize()[..16]))
 }
 
 /// Renders the stored form of an owner public key: its G-strkey.
@@ -57,160 +123,6 @@ pub fn encode_owner_public_key(key: &[u8; 32]) -> String {
     stellar_strkey::ed25519::PublicKey(*key)
         .to_string()
         .to_string()
-}
-
-/// What [`rewrite_older_form_owner_entry`] found and did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum OwnerEntryRewrite {
-    /// The entry is already a G-strkey; nothing was written.
-    AlreadyStrkey,
-    /// The older-form entry was rewritten as its G-strkey.
-    Rewritten,
-    /// No entry exists at the coordinate.
-    Absent,
-    /// The value is in neither form; nothing was written.
-    Undecodable,
-    /// The entry could not be read; carries the keyring code.
-    Unreadable {
-        /// The wire code of the classified keyring error.
-        code: &'static str,
-    },
-    /// The rewrite failed; carries the keyring code. The entry keeps its older
-    /// form and the next attempt retries.
-    WriteFailed {
-        /// The wire code of the classified keyring error.
-        code: &'static str,
-    },
-}
-
-/// Rewrites an older-form owner entry as its G-strkey, best effort.
-///
-/// A G-strkey entry, an absent entry, and a value in neither form are left
-/// as they are. Never fails: every outcome is reported in the return value,
-/// and the caller decides how to log it. The value is never logged.
-#[must_use]
-pub fn rewrite_older_form_owner_entry(entry_ref: &KeyringEntryRef) -> OwnerEntryRewrite {
-    let entry = match KeyringEntry::new(&entry_ref.service, &entry_ref.account) {
-        Ok(entry) => entry,
-        Err(e) => {
-            return OwnerEntryRewrite::Unreadable {
-                code: map_keyring_operation_error(
-                    &e,
-                    KeyringOperation::Construct,
-                    &entry_ref.service,
-                )
-                .code(),
-            };
-        }
-    };
-    let raw = match entry.get_password() {
-        Ok(raw) => zeroize::Zeroizing::new(raw),
-        Err(keyring_core::Error::NoEntry) => return OwnerEntryRewrite::Absent,
-        Err(e) => {
-            return OwnerEntryRewrite::Unreadable {
-                code: map_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service)
-                    .code(),
-            };
-        }
-    };
-    rewrite_value(&entry, &entry_ref.service, &raw)
-}
-
-/// Rewrites an owner entry the caller already read, so an owner reader does
-/// not read the entry twice.
-#[must_use]
-pub fn rewrite_owner_value_if_older(entry_ref: &KeyringEntryRef, raw: &str) -> OwnerEntryRewrite {
-    match KeyringEntry::new(&entry_ref.service, &entry_ref.account) {
-        Ok(entry) => rewrite_value(&entry, &entry_ref.service, raw),
-        Err(e) => OwnerEntryRewrite::WriteFailed {
-            code: map_keyring_operation_error(&e, KeyringOperation::Construct, &entry_ref.service)
-                .code(),
-        },
-    }
-}
-
-fn rewrite_value(entry: &KeyringEntry, service: &str, raw: &str) -> OwnerEntryRewrite {
-    match decode_owner_public_key(raw) {
-        None => OwnerEntryRewrite::Undecodable,
-        Some((_, OwnerKeyForm::Strkey)) => OwnerEntryRewrite::AlreadyStrkey,
-        Some((key, OwnerKeyForm::OlderBase64)) => {
-            match entry.set_password(&encode_owner_public_key(&key)) {
-                Ok(()) => OwnerEntryRewrite::Rewritten,
-                Err(e) => OwnerEntryRewrite::WriteFailed {
-                    code: map_keyring_operation_error(&e, KeyringOperation::Write, service).code(),
-                },
-            }
-        }
-    }
-}
-
-/// Logs an owner-entry rewrite outcome at `warn` when it needs attention.
-///
-/// A failed or skipped rewrite is logged with the keyring code and the
-/// profile name, never the value. The other outcomes are silent.
-pub fn log_owner_entry_rewrite(profile_name: &str, outcome: &OwnerEntryRewrite) {
-    match outcome {
-        OwnerEntryRewrite::WriteFailed { code } => tracing::warn!(
-            profile = %profile_name,
-            code = %code,
-            "owner key entry kept its older form; the rewrite as a G-strkey failed and the next \
-             engine build retries"
-        ),
-        OwnerEntryRewrite::Unreadable { code } => tracing::warn!(
-            profile = %profile_name,
-            code = %code,
-            "owner key entry could not be read; its rewrite as a G-strkey was skipped"
-        ),
-        OwnerEntryRewrite::Absent => tracing::warn!(
-            profile = %profile_name,
-            "no owner key entry; its rewrite as a G-strkey was skipped"
-        ),
-        OwnerEntryRewrite::Undecodable => tracing::warn!(
-            profile = %profile_name,
-            "owner key entry is in neither stored form; its rewrite was skipped"
-        ),
-        OwnerEntryRewrite::AlreadyStrkey | OwnerEntryRewrite::Rewritten => {}
-    }
-}
-
-/// Rewrites the older-form owner entry of every profile in `profile_dir`
-/// except `skip`, best effort.
-///
-/// Reads [`KeyringEntryRef::default_owner_key`] of each profile listed by
-/// [`crate::profile::loader::list_profiles_in_dir`]. A missing or unreadable
-/// entry is skipped with a `warn`, and nothing here fails the caller.
-pub fn rewrite_older_form_owner_entries_in_dir(profile_dir: &Path, skip: Option<&str>) {
-    let names = match crate::profile::loader::list_profiles_in_dir(profile_dir) {
-        Ok(names) => names,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "owner key rewrite: the profile directory could not be listed; skipped"
-            );
-            return;
-        }
-    };
-    for name in names.iter().filter(|name| Some(name.as_str()) != skip) {
-        let outcome = rewrite_older_form_owner_entry(&KeyringEntryRef::default_owner_key(name));
-        log_owner_entry_rewrite(name, &outcome);
-    }
-}
-
-/// Runs [`rewrite_older_form_owner_entries_in_dir`] over the default profile
-/// directory once per process.
-///
-/// The first V1 engine build in a process calls this; later builds return at
-/// once. A directory that cannot be resolved is skipped with a `warn`.
-pub fn rewrite_older_form_owner_entries_once(skip: Option<&str>) {
-    static SWEPT: std::sync::Once = std::sync::Once::new();
-    SWEPT.call_once(|| match crate::profile::schema::default_profile_dir() {
-        Ok(dir) => rewrite_older_form_owner_entries_in_dir(&dir, skip),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "owner key rewrite: no profile directory; skipped"
-        ),
-    });
 }
 
 /// Refuses a symmetric-key coordinate in the owner key namespace.
@@ -228,6 +140,60 @@ pub fn refuse_owner_key_coordinate(
     if entry_ref.service.starts_with(OWNER_KEY_SERVICE_PREFIX) {
         return Err(WalletError::Validation(
             ValidationError::KeyMatchesOwnerPublicKey { field },
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a profile field in the installation's toolset pin-key namespace.
+///
+/// Callers check this before opening the keyring, on every chain.
+/// The service comparison follows the case-insensitive key-scope classifier.
+///
+/// # Errors
+///
+/// Returns [`ValidationError::InstallationKeyCoordinate`] naming `field` and
+/// the reserved service.
+pub fn refuse_installation_key_coordinate(
+    entry_ref: &KeyringEntryRef,
+    field: &'static str,
+) -> Result<(), WalletError> {
+    if entry_ref
+        .service
+        .eq_ignore_ascii_case(super::schema::TOOLSET_PIN_KEY_SERVICE)
+    {
+        return Err(WalletError::Validation(
+            ValidationError::InstallationKeyCoordinate { field },
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a coordinate reserved for a policy pin.
+///
+/// The account suffix comparison is ASCII case-insensitive. Dotted aliases
+/// also refuse because some stores join the account and service with a dot.
+/// Callers check this before opening the keyring.
+///
+/// # Errors
+///
+/// Returns [`ValidationError::PolicyPinCoordinate`] naming `field`.
+pub fn refuse_policy_pin_coordinate(
+    entry_ref: &KeyringEntryRef,
+    field: &'static str,
+) -> Result<(), WalletError> {
+    let account = entry_ref.account.to_ascii_lowercase();
+    let service = entry_ref.service.to_ascii_lowercase();
+    let names_pin = |part: &str| part.ends_with(super::schema::POLICY_PIN_SUFFIX);
+    // A wallet service ends in a profile id. Its alias reaches only a pin of a
+    // non-default window, which a mainnet profile refuses.
+    let service_alias = !service.starts_with(super::schema::WALLET_SERVICE_NAMESPACE)
+        && service
+            .rsplit_once('.')
+            .is_some_and(|(head, _)| head.split('.').any(names_pin));
+    if account.split('.').any(names_pin) || service_alias {
+        return Err(WalletError::Validation(
+            ValidationError::PolicyPinCoordinate { field },
         ));
     }
     Ok(())
@@ -317,7 +283,7 @@ pub fn refuse_owner_public_key(
                 ));
             }
         };
-        let Some((owner_key, _)) = decode_owner_public_key(&raw) else {
+        let Some(owner_key) = owner_key_bytes_in_either_form(&raw) else {
             continue;
         };
         if key.len() == owner_key.len() && bool::from(key.ct_eq(&owner_key)) {
@@ -360,74 +326,41 @@ mod tests {
     }
 
     #[test]
-    fn both_forms_decode_to_the_same_key() {
-        let strkey = encode_owner_public_key(&OWNER);
-        assert!(strkey.starts_with('G'));
+    fn only_the_strkey_form_decodes() {
         assert_eq!(
-            decode_owner_public_key(&strkey),
-            Some((OWNER, OwnerKeyForm::Strkey))
+            decode_owner_public_key(&encode_owner_public_key(&OWNER)),
+            Ok(OWNER)
         );
         assert_eq!(
             decode_owner_public_key(&URL_SAFE_NO_PAD.encode(OWNER)),
-            Some((OWNER, OwnerKeyForm::OlderBase64))
+            Err(OwnerKeyDecodeError::OlderForm)
         );
-        assert_eq!(decode_owner_public_key("not a key"), None);
-        assert_eq!(
-            URL_SAFE_NO_PAD.decode(&strkey).map(|b| b.len()).ok(),
-            Some(42),
-            "a G-strkey decodes as URL-safe base64 to 42 bytes"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn an_older_form_entry_is_rewritten_and_a_strkey_entry_is_left() {
-        install();
-        let coordinate = KeyringEntryRef::default_owner_key("owner-rewrite");
-        put(&coordinate, &URL_SAFE_NO_PAD.encode(OWNER));
-        assert_eq!(
-            rewrite_older_form_owner_entry(&coordinate),
-            OwnerEntryRewrite::Rewritten
-        );
-        assert!(
-            get(&coordinate) == Some(encode_owner_public_key(&OWNER)),
-            "rewritten as the G-strkey"
-        );
-        assert_eq!(
-            rewrite_older_form_owner_entry(&coordinate),
-            OwnerEntryRewrite::AlreadyStrkey
-        );
-        assert_eq!(
-            rewrite_older_form_owner_entry(&KeyringEntryRef::default_owner_key("absent")),
-            OwnerEntryRewrite::Absent
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn a_directory_sweep_rewrites_every_other_profile() {
-        install();
-        let dir = tempfile::tempdir().unwrap();
-        for name in ["sweep-a", "sweep-b", "sweep-c"] {
-            std::fs::write(dir.path().join(format!("{name}.toml")), "").unwrap();
-            put(
-                &KeyringEntryRef::default_owner_key(name),
-                &URL_SAFE_NO_PAD.encode(OWNER),
+        for raw in [URL_SAFE_NO_PAD.encode([0x5a; 31]), "not a key".to_owned()] {
+            assert_eq!(
+                decode_owner_public_key(&raw),
+                Err(OwnerKeyDecodeError::Undecodable)
             );
         }
-        rewrite_older_form_owner_entries_in_dir(dir.path(), Some("sweep-a"));
+    }
+
+    /// The 39-character length excludes every full G-strkey, S-strkey, hex,
+    /// and base64 encoding of the 32-byte key.
+    #[test]
+    fn the_fingerprint_is_one_way_and_domain_separated() {
+        let fingerprint = owner_key_fingerprint(&OWNER);
+        assert!(fingerprint.starts_with("sha256:"));
+        assert_eq!(fingerprint.len(), 39);
         assert!(
-            get(&KeyringEntryRef::default_owner_key("sweep-a"))
-                == Some(URL_SAFE_NO_PAD.encode(OWNER)),
-            "the skipped profile is left to its own reader"
+            fingerprint[7..]
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
         );
-        for name in ["sweep-b", "sweep-c"] {
-            assert!(
-                get(&KeyringEntryRef::default_owner_key(name))
-                    == Some(encode_owner_public_key(&OWNER)),
-                "every other profile is rewritten"
-            );
-        }
+        assert_eq!(fingerprint, owner_key_fingerprint(&OWNER));
+        assert_ne!(fingerprint, owner_key_fingerprint(&[0x11; 32]));
+        assert_ne!(
+            fingerprint[7..],
+            crate::hex::encode(&Sha256::digest(OWNER)[..16])
+        );
     }
 
     #[test]
@@ -473,6 +406,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_profile_coordinate_is_compared_when_it_differs() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         install();
         let mut profile = Profile::builder_testnet_named("owner-two", "s", "a", "n", "a").build();
         profile.policy_owner_key_id = KeyringEntryRef::new("stellar-agent-owner-owner-two", "x");
@@ -516,5 +452,87 @@ mod tests {
         .unwrap_err();
         assert_ne!(err.code(), "validation.key_matches_owner_public_key");
         assert_eq!(err.category(), crate::error::ErrorCategory::Auth);
+    }
+
+    #[test]
+    fn policy_pin_coordinate_refusal_covers_aliases_and_names_the_field() {
+        for alias in [
+            "default-policy-pin.stellar-agent-policy-window.test",
+            "default-policy-pin.stellar-agent-policy-window-team-policy-pin.v2",
+            "default-policy-pin.stellar-agent-policy-window-team-policy-pin",
+            "CUSTOM.POLICY-PIN-POLICY-PIN.CUSTOM.SERVICE",
+            "default-PoLiCy-PiN.custom",
+        ] {
+            for (split, _) in alias.match_indices('.') {
+                let entry = KeyringEntryRef::new(&alias[split + 1..], &alias[..split]);
+                let error = refuse_policy_pin_coordinate(&entry, "keyring_coordinate").unwrap_err();
+                assert_eq!(error.code(), "validation.policy_pin_coordinate");
+                assert!(error.to_string().contains("keyring_coordinate"));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("a policy pin changes only through a verified policy load")
+                );
+            }
+        }
+        for entry in [
+            KeyringEntryRef::default_policy_window_state_key("pin-refusal"),
+            KeyringEntryRef::default_policy_window_state_key("team-policy-pin.v2"),
+            KeyringEntryRef::default_policy_window_state_key("team-policy-pin"),
+            KeyringEntryRef::toolset_pin_key(),
+            KeyringEntryRef::new("custom", "default-policy-pin-other"),
+            KeyringEntryRef::new("service-policy-pin", "default"),
+        ] {
+            refuse_policy_pin_coordinate(&entry, "keyring_coordinate").unwrap();
+        }
+    }
+
+    #[test]
+    fn default_profile_coordinates_with_policy_pin_suffixes_stay_allowed() {
+        type Constructor = fn(&str) -> KeyringEntryRef;
+        let constructors: [Constructor; 10] = [
+            KeyringEntryRef::default_signer,
+            KeyringEntryRef::default_nonce,
+            KeyringEntryRef::default_audit_key,
+            KeyringEntryRef::default_owner_key,
+            KeyringEntryRef::default_attestation_key,
+            KeyringEntryRef::default_pool_master_key,
+            KeyringEntryRef::default_counterparty_key,
+            KeyringEntryRef::default_policy_window_state_key,
+            KeyringEntryRef::default_mpp_state_key,
+            KeyringEntryRef::default_audit_binding,
+        ];
+        for name in ["team-policy-pin", "team-policy-pin.v2"] {
+            for constructor in constructors {
+                let entry = constructor(name);
+                refuse_policy_pin_coordinate(&entry, "keyring_coordinate").unwrap();
+            }
+        }
+    }
+
+    /// The installation namespace is case-insensitive and covers every account.
+    #[test]
+    fn installation_coordinate_refusal_names_the_field_and_reserved_key() {
+        for service in ["stellar-agent-toolsets", "StElLaR-AgEnT-ToOlSeTs"] {
+            for account in ["pin-key", "another-account"] {
+                let error = refuse_installation_key_coordinate(
+                    &KeyringEntryRef::new(service, account),
+                    "attestation_key_id",
+                )
+                .unwrap_err();
+                assert_eq!(error.code(), "validation.installation_key_coordinate");
+                assert!(error.to_string().contains("attestation_key_id"));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("reserved service `stellar-agent-toolsets`")
+                );
+            }
+        }
+        refuse_installation_key_coordinate(
+            &KeyringEntryRef::default_owner_key("test"),
+            "policy_owner_key_id",
+        )
+        .unwrap();
     }
 }

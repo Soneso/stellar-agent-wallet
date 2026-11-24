@@ -68,6 +68,7 @@ pub(crate) struct RefreshArgs {
     /// Profile name whose counterparty cache should be updated.
     ///
     /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    /// A mainnet profile must be named with this flag.
     #[arg(long = "profile", value_name = "NAME")]
     pub(crate) profile: Option<String>,
 }
@@ -109,8 +110,8 @@ pub async fn run(args: &RefreshArgs) -> i32 {
     let profile = match load_profile_reconciled(&resolved_profile) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e, &profile_name));
+            tracing::debug!(error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e));
             return 1;
         }
     };
@@ -182,7 +183,6 @@ pub async fn run(args: &RefreshArgs) -> i32 {
         }
         Err(e) => {
             tracing::warn!(
-                home_domain = %args.home_domain,
                 profile = %profile_name,
                 error = %e,
                 "counterparty refresh failed"
@@ -207,13 +207,19 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn refresh_nonexistent_profile_returns_exit_1() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let args = RefreshArgs {
             home_domain: "example.com".to_owned(),
             profile: Some("__nonexistent_refresh_cpty__".to_owned()),
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
+        fixture.assert_refusal(
+            Some("validation.profile_not_found"),
+            &["the requested profile was not found"],
+        );
     }
 }

@@ -18,7 +18,8 @@ use crate::error::SimulationDivergenceSubCode;
 pub struct SimulationContext {
     /// Rule IDs returned or selected during simulation, in auth-context order.
     pub context_rule_ids: Vec<ContextRuleId>,
-    /// Redacted per-auth-context fingerprints, in invocation order.
+    /// Redacted per-node fingerprints of the simulated invocation tree, in
+    /// depth-first order.
     pub auth_contexts: Vec<AuthContextFingerprint>,
     /// Redacted network identity for the simulation view.
     pub network: NetworkContext,
@@ -37,7 +38,8 @@ pub struct SimulationContext {
 pub struct EnvelopeContext {
     /// Rule IDs embedded into the envelope-to-be-signed, in auth-context order.
     pub context_rule_ids: Vec<ContextRuleId>,
-    /// Redacted per-auth-context fingerprints, in invocation order.
+    /// Redacted per-node fingerprints of the invocation tree the wallet
+    /// signs, in depth-first order.
     pub auth_contexts: Vec<AuthContextFingerprint>,
     /// Redacted network identity for the envelope view.
     pub network: NetworkContext,
@@ -49,8 +51,10 @@ pub struct EnvelopeContext {
 
 /// Redacted fingerprint of one Soroban auth context.
 ///
-/// The value is an operator-safe attribution token, not raw auth-context XDR.
-/// Callers should pass a first-8-last-8 hash or equivalent short label.
+/// The value is an operator-safe token, not raw auth-context XDR. The submit
+/// path passes one `node:<sha256>:<children>` entry per node of an invocation
+/// tree: the SHA-256 of the node's function XDR and its number of direct
+/// sub-invocations, so equal lists mean equal trees.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthContextFingerprint(String);
 
@@ -330,6 +334,55 @@ mod tests {
             network: simulation.network.clone(),
             sequence: simulation.sequence.clone(),
             fee_envelope: simulation.fee_envelope.clone(),
+        }
+    }
+
+    /// The node fingerprints of a simulated tree with a substituted root or
+    /// an extra node under the wallet's root refuse against the node
+    /// fingerprints of the tree the wallet signs.
+    #[test]
+    fn the_divergence_check_refuses_a_substituted_tree() {
+        use stellar_xdr::{
+            ContractId, Hash, InvokeContractArgs, ScAddress, ScSymbol, ScVal,
+            SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+        };
+
+        use crate::managers::rules::fingerprint_invocation_nodes;
+
+        let call = |byte: u8, function: &str| InvokeContractArgs {
+            contract_address: ScAddress::Contract(ContractId(Hash([byte; 32]))),
+            function_name: ScSymbol::try_from(function).unwrap(),
+            args: vec![ScVal::U32(5)].try_into().unwrap(),
+        };
+        let invocation =
+            |root: InvokeContractArgs, subs: Vec<InvokeContractArgs>| SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(root),
+                sub_invocations: subs
+                    .into_iter()
+                    .map(|sub| SorobanAuthorizedInvocation {
+                        function: SorobanAuthorizedFunction::ContractFn(sub),
+                        sub_invocations: Default::default(),
+                    })
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap(),
+            };
+        let signed = invocation(call(0x57, "swap"), vec![]);
+        let (mut simulation, mut envelope) = base_contexts();
+        envelope.auth_contexts = fingerprint_invocation_nodes(&signed);
+
+        simulation.auth_contexts = fingerprint_invocation_nodes(&signed);
+        detect_simulation_divergence(&simulation, &envelope).unwrap();
+
+        for simulated in [
+            invocation(call(0xAA, "swap"), vec![]),
+            invocation(call(0x57, "swap"), vec![call(0x70, "transfer")]),
+        ] {
+            simulation.auth_contexts = fingerprint_invocation_nodes(&simulated);
+            assert_sub_code(
+                detect_simulation_divergence(&simulation, &envelope),
+                &SimulationDivergenceSubCode::AuthContexts,
+            );
         }
     }
 

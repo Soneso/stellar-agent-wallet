@@ -14,15 +14,16 @@ use stellar_xdr::Memo;
 
 use crate::server::WalletServer;
 use crate::tools::common::{
-    APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
+    CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
     commit_envelope_and_verify_nonce, commit_path_error_result, hash_to_lower_hex,
-    ledger_err_result, nonce_id_prefix, redacted_wallet_error_envelope,
-    resolve_classic_fee_per_op_stroops, submit_timeout, total_classic_fee_stroops,
-    validate_g_strkey, verify_attestation_gate,
+    ledger_err_result, nonce_id_prefix, redacted_wallet_error_envelope, total_classic_fee_stroops,
+    validate_g_strkey, validate_payment_destination, verify_attestation_gate,
 };
 use stellar_agent_core::amount::McpMemoTextArgument;
 use stellar_agent_core::amount::StellarAmount;
-use stellar_agent_core::approval::store::PendingApproval;
+use stellar_agent_core::approval::ApprovalError;
+use stellar_agent_core::approval::store::{PaymentRecoveryContext, PendingApproval};
+use stellar_agent_core::approval::subject::SubjectKind;
 use stellar_agent_core::approval::user_id::process_uid_for_attestation;
 use stellar_agent_core::approval::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry,
@@ -30,15 +31,9 @@ use stellar_agent_core::approval::{
 use stellar_agent_core::envelope_decode::decode_authoritative_args;
 use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt::now_unix_ms;
-use stellar_agent_core::wallet::Wallet;
 use stellar_agent_network::{
-    Asset, BASE_RESERVE_STROOPS, ClassicOpBuilder, check_classic_fee_cap, classic_fee_source,
-    fetch_account,
-    keyring::enrolled_keyring_signer,
-    parse_classic_fee_choice, parse_memo_fields, resolve_classic_fee_selection,
-    sep29::check_memo_required,
-    signing::envelope_signing::attach_signature,
-    submit::{SubmissionResult, SubmissionSignerKind, submit_transaction_and_wait},
+    Asset, BASE_RESERVE_STROOPS, ClassicOpBuilder, fetch_account, parse_memo_fields,
+    policy_state::FloorSource, sep29::check_memo_required, submit::SubmissionResult,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,15 +90,16 @@ pub struct StellarPayArgs {
 
     /// G-strkey of the source (funding) account.
     ///
-    /// Must exist on the network and hold sufficient XLM to cover the payment
-    /// amount plus the transaction fee.
+    /// Must exist on the network. For a native payment, the source holds the
+    /// amount plus the fee above its reserve. For an issued asset, it holds
+    /// the fee above its reserve and a trustline balance that covers the amount.
     pub source: String,
 
-    /// G-strkey of the recipient account.
+    /// G-strkey or M-strkey of the recipient account.
     ///
-    /// Must be a valid G-strkey.  The account does not need to exist on-chain
-    /// for non-native payments (but a CreateAccount op is needed for new
-    /// native-XLM accounts).
+    /// An M-strkey keeps its mux ID in the payment; ledger reads use its G
+    /// base account. The destination's base account must exist. Creating an
+    /// account is a separate operation.
     pub destination: String,
 
     /// Payment amount with explicit unit suffix.
@@ -117,9 +113,9 @@ pub struct StellarPayArgs {
     /// Payment amount as a raw stroop integer, decimal-string encoded.
     ///
     /// Mutually exclusive with `amount`. When set, the value is a decimal
-    /// string of a non-negative stroop-typed integer with no unit suffix
-    /// (e.g. `"10000000"`). Stellar wire amounts are i64 stroops; this value
-    /// is rejected if it is negative, malformed, or exceeds `i64::MAX`. A raw
+    /// string of a positive stroop integer with no unit suffix, such as
+    /// `"10000000"`. Stellar wire amounts are i64 stroops. Zero, a negative
+    /// value, a malformed value, and a value above `i64::MAX` are rejected. A raw
     /// JSON number is rejected by the schema: a JSON number backed by `f64`
     /// cannot represent a stroop amount exactly once it exceeds `2^53`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,7 +127,9 @@ pub struct StellarPayArgs {
     /// - `"CODE:G…ISSUER"` for non-native assets.
     pub asset: String,
 
-    /// Optional UTF-8 text memo (at most 28 bytes).
+    /// Optional UTF-8 text memo (at most 28 bytes). A control character or a
+    /// bidirectional override or isolate is refused with
+    /// `validation.memo_control_character`.
     ///
     /// Mutually exclusive with `memo_id`, `memo_hash_hex`, `memo_return_hex`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,6 +156,12 @@ pub struct StellarPayArgs {
     /// Classic fee per operation: `<stroops>`, `auto`, or `auto:pNN`.
     #[serde(default, rename = "fee", skip_serializing_if = "Option::is_none")]
     pub classic_base: Option<String>,
+    /// Business id naming this value operation: 1 to 64 printable ASCII
+    /// characters, no space. Required on `stellar:mainnet`, where a retry
+    /// with the same id returns the stored operation instead of new work;
+    /// on another chain it is validated and echoed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_id: Option<String>,
 }
 
 /// Arguments for the `stellar_pay_commit` (commit) MCP tool.
@@ -173,9 +177,11 @@ pub struct StellarPayArgs {
 /// 2. **Envelope divergence check:** the envelope is re-built from the
 ///    presented args + current source account state.  Divergence returns
 ///    `simulation.divergence`.
-/// 3. **Replay prevention:** the nonce salt is recorded in the in-memory
-///    `ReplayWindow` after verification.
-/// 4. **Mainnet refusal:** `destructive_hint = true`.
+/// 3. **Replay prevention:** the full 48-byte nonce (salt and tag) is
+///    recorded in the in-memory `ReplayWindow` after verification.
+/// 4. **Mainnet admission:** a mainnet commit needs the V1 engine, a verified
+///    mainnet policy, and verified enablement. A missing requirement refuses
+///    with `network.mainnet_write_forbidden`.
 ///
 /// # SEP-29 re-check at commit time
 ///
@@ -197,7 +203,7 @@ pub struct StellarPayArgs {
 ///   "envelope_xdr": "<base64 from simulate>"
 /// }
 /// ```
-#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(crate = "rmcp::serde")]
 pub struct StellarPayCommitArgs {
     /// CAIP-2 chain identifier: `stellar:testnet` or `stellar:mainnet`.
@@ -206,7 +212,7 @@ pub struct StellarPayCommitArgs {
     /// G-strkey of the source (funding) account (same as simulate step).
     pub source: String,
 
-    /// G-strkey of the recipient account (same as simulate step).
+    /// G-strkey or M-strkey of the recipient account (same as simulate step).
     pub destination: String,
 
     /// Payment amount with explicit unit suffix (same as simulate step).
@@ -217,9 +223,9 @@ pub struct StellarPayCommitArgs {
     /// Payment amount as a raw stroop integer (same as simulate step).
     ///
     /// Mutually exclusive with `amount`. When set, the value is a decimal
-    /// string of a non-negative stroop-typed integer with no unit suffix.
-    /// Stellar wire amounts are i64 stroops; this value is rejected if it is
-    /// negative, malformed, or exceeds `i64::MAX`.
+    /// string of a positive stroop integer with no unit suffix.
+    /// Stellar wire amounts are i64 stroops. Zero, a negative value, a
+    /// malformed value, and a value above `i64::MAX` are rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount_in_stroops: Option<String>,
 
@@ -245,71 +251,135 @@ pub struct StellarPayCommitArgs {
     /// Base64-url-no-pad nonce returned by the simulate step.
     ///
     /// HMAC-verified against `envelope_xdr`, `expires_at_unix_ms`, and the
-    /// registered commit tool name before signing.
-    pub nonce: String,
+    /// registered commit tool name before signing. A mainnet operation whose
+    /// preparation stored its lasting intent needs none of the three fields;
+    /// every other commit requires all three.
+    #[serde(default)]
+    pub nonce: Option<String>,
 
     /// Unix timestamp (milliseconds) at which the nonce expires.
     ///
     /// Must match the value returned by the simulate step exactly.
-    pub expires_at_unix_ms: u64,
+    #[serde(default)]
+    pub expires_at_unix_ms: Option<u64>,
 
     /// Base64 XDR envelope returned by the simulate step.
     ///
     /// Compared byte-for-byte to a freshly re-built envelope; mismatch returns
     /// `simulation.divergence`.  Passed verbatim to HMAC verification.
-    pub envelope_xdr: String,
+    #[serde(default)]
+    pub envelope_xdr: Option<String>,
 
     /// Wallet-issued approval nonce from the simulate-step `approval` block.
     ///
-    /// Required only when the simulate step returned a `policy.approval_required`
-    /// outcome (i.e. the policy engine emitted `Decision::RequireApproval`).
-    /// When present, the commit handler verifies the HMAC-SHA256 attestation blob
-    /// and confirms the envelope hash matches before proceeding.
+    /// Required when the simulate step returned an `approval` block. On
+    /// mainnet a supplied nonce is verified under `Allow` too.
+    /// Off mainnet, the commit handler verifies the HMAC-SHA256 attestation
+    /// blob and confirms the envelope hash matches before proceeding. On
+    /// mainnet it verifies the proof against the approval's durable record.
     #[serde(default)]
     pub approval_nonce: Option<String>,
 
     /// HMAC-SHA256 attestation blob, URL-safe base64 no-pad encoded (32 bytes).
     ///
     /// Written to the pending-approvals store by `stellar-agent approve --id
-    /// <approval_nonce> --profile <name>` after the user confirms on their own tty.  The commit
-    /// handler re-computes and constant-time-compares the HMAC against the stored
-    /// attestation key before proceeding to signing.
+    /// <approval_nonce> --profile <name>` after the operator approves. On
+    /// testnet the operator confirms at a terminal or in the `approve serve`
+    /// page. On mainnet the operator approves with a verified passkey
+    /// assertion, in the local browser or at the signed approval origin. Off
+    /// mainnet, the commit handler re-computes and constant-time-compares the
+    /// HMAC against the stored attestation key before proceeding to signing.
+    /// On mainnet it verifies the blob against the approval's durable record
+    /// and its presence receipt instead.
     ///
     /// Required alongside `approval_nonce` when the policy engine requires
-    /// approval.  Absent or invalid → `policy.approval_required` (byte-identical
-    /// wire code for all failure modes, for indistinguishability).
+    /// approval. An absent, invalid, or expired proof returns
+    /// `policy.approval_required`. A rejected, consumed, or inconsistent
+    /// approval returns its own code.
     #[serde(default)]
     pub approval_attestation: Option<String>,
+    /// The business id the preparation named. Required on
+    /// `stellar:mainnet`; an id other than the preparation's refuses with
+    /// `operation.business_id_mismatch`.
+    #[serde(default)]
+    pub business_id: Option<String>,
+}
+
+/// Prints every field but the attestation, which shows only whether it is
+/// set: the attestation is the operator's approval credential.
+impl std::fmt::Debug for StellarPayCommitArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StellarPayCommitArgs")
+            .field("chain_id", &self.chain_id)
+            .field("source", &self.source)
+            .field("destination", &self.destination)
+            .field("amount", &self.amount)
+            .field("amount_in_stroops", &self.amount_in_stroops)
+            .field("asset", &self.asset)
+            .field("memo_text", &self.memo_text)
+            .field("memo_id", &self.memo_id)
+            .field("memo_hash_hex", &self.memo_hash_hex)
+            .field("memo_return_hex", &self.memo_return_hex)
+            .field("nonce", &self.nonce)
+            .field("expires_at_unix_ms", &self.expires_at_unix_ms)
+            .field("envelope_xdr", &self.envelope_xdr)
+            .field("approval_nonce", &self.approval_nonce)
+            .field("business_id", &self.business_id)
+            .field(
+                "approval_attestation",
+                &crate::tools::common::AttestationPresence(&self.approval_attestation),
+            )
+            .finish()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Free helpers used by the simulate handler
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Returns a JSON representation of a [`Memo`] suitable for the approval
-/// summary block.
-///
-/// `Memo::None` → `null`.  Text → string.  Id → number.  Hash/Return → hex string.
-fn memo_summary_for_json(memo: &Memo) -> serde_json::Value {
+/// The approval response's facts, decoded from its retained envelope.
+fn payment_approval_summary(envelope: &str) -> Result<serde_json::Value, rmcp::ErrorData> {
+    use stellar_agent_core::envelope_decode::{
+        ClassicOperation, ClassicTransactionKind, classic_summary,
+    };
+    let summary = classic_summary(envelope, ClassicTransactionKind::Payment).map_err(|e| {
+        rmcp::ErrorData::internal_error(format!("approval.envelope_invalid: {e}"), None)
+    })?;
+    let ClassicOperation::Payment {
+        destination,
+        asset,
+        amount_stroops,
+    } = summary.operation
+    else {
+        return Err(rmcp::ErrorData::internal_error(
+            "approval envelope must contain one payment",
+            None,
+        ));
+    };
+    Ok(json!({
+        "to": destination,
+        "amount_stroops": amount_stroops.to_string(),
+        "asset": asset,
+        "memo": memo_summary_for_json(&summary.memo),
+        "memo_details": summary.memo,
+        "simulated_fee_stroops": summary.fee_stroops.to_string(),
+        "simulated_seq_num": summary.seq_num,
+    }))
+}
+
+/// The legacy memo projection beside the complete tagged memo.
+fn memo_summary_for_json(
+    memo: &stellar_agent_core::envelope_decode::ClassicMemo,
+) -> serde_json::Value {
+    use stellar_agent_core::envelope_decode::ClassicMemo;
     match memo {
-        Memo::None => serde_json::Value::Null,
-        Memo::Text(t) => {
-            // Invariant: memo_text was constructed from a valid UTF-8 JSON string
-            // by the caller. `from_utf8` (not `from_utf8_lossy`) is used here so a
-            // forged non-UTF-8 memo surfaces a visible "<invalid-utf8>" marker
-            // rather than silently substituting U+FFFD.
-            let s = std::str::from_utf8(t.as_slice()).unwrap_or("<invalid-utf8>");
-            serde_json::Value::String(s.to_owned())
+        ClassicMemo::None => serde_json::Value::Null,
+        ClassicMemo::Text(text) => json!(text),
+        ClassicMemo::Id(id) => json!(id),
+        ClassicMemo::Hash(bytes) | ClassicMemo::Return(bytes) => {
+            json!(stellar_agent_core::hex::encode(bytes))
         }
-        Memo::Id(id) => serde_json::json!(id),
-        Memo::Hash(h) => {
-            let hex = hash_to_lower_hex(h);
-            serde_json::Value::String(hex)
-        }
-        Memo::Return(h) => {
-            let hex = hash_to_lower_hex(h);
-            serde_json::Value::String(hex)
-        }
+        _ => serde_json::Value::Null,
     }
 }
 
@@ -339,20 +409,6 @@ fn memo_json(memo: &Memo) -> serde_json::Value {
     }
 }
 
-/// Returns the human-readable approval summary representation for a [`Memo`].
-fn memo_summary(memo: &Memo) -> Option<String> {
-    match memo {
-        Memo::Text(t) => Some(
-            std::str::from_utf8(t.as_slice())
-                .unwrap_or("<invalid-utf8>")
-                .to_owned(),
-        ),
-        Memo::Id(id) => Some(id.to_string()),
-        Memo::None => None,
-        _ => Some("<binary memo>".to_owned()),
-    }
-}
-
 /// Parses the caller's asset descriptor and resolves the payment amount
 /// against it.
 ///
@@ -363,7 +419,8 @@ fn memo_summary(memo: &Memo) -> Option<String> {
 ///
 /// # Errors
 ///
-/// Returns `invalid asset: <code>` for an unparseable descriptor, and the
+/// Returns `invalid asset: <code>` for an unparseable descriptor, with the
+/// base-account reason appended for a muxed issuer, and the
 /// refusals of [`resolve_payment_amount`] for the amount.
 pub(crate) fn parse_asset_and_amount(
     asset: &str,
@@ -371,13 +428,61 @@ pub(crate) fn parse_asset_and_amount(
     amount_in_stroops: Option<String>,
 ) -> Result<(Asset, StellarAmount), rmcp::ErrorData> {
     let asset = Asset::parse(asset).map_err(|error| {
-        rmcp::ErrorData::invalid_params(format!("invalid asset: {}", error.code()), None)
+        rmcp::ErrorData::invalid_params(
+            crate::tools::common::asset_refusal_text("invalid asset", &error),
+            None,
+        )
     })?;
     let amount = resolve_payment_amount(amount, amount_in_stroops, &asset)?;
     Ok((asset, amount))
 }
 
+/// Refuses a payment to a canonical C or W contract before any account read,
+/// approval, nonce, hold, or signing.
+///
+/// A contract transfer `envelope_xdr` refuses first, proven for `asset` on
+/// `chain`: `validation.contract_payment_invalid` without a valid `asset`,
+/// otherwise `validation.contract_payment_memo_unsupported` for an envelope
+/// memo, `validation.contract_payment_unavailable` once proven, and
+/// `validation.contract_payment_invalid` when not proven. A C or W
+/// `destination` then refuses with
+/// `validation.contract_payment_memo_unsupported` when `memo` is set, and
+/// otherwise with `validation.contract_payment_unavailable`.
+pub(crate) fn contract_payment_refusal(
+    chain: stellar_agent_core::profile::caip2::Caip2,
+    destination: &str,
+    memo: bool,
+    envelope_xdr: Option<&str>,
+    asset: Option<&Asset>,
+) -> Option<CallToolResult> {
+    use stellar_agent_core::sac_payment::{
+        SacPaymentContext, refuse_contract_destination, refuse_contract_transfer,
+    };
+    let context = asset.and_then(|asset| {
+        SacPaymentContext::new(
+            chain,
+            stellar_agent_network::operation_entry::intent_asset(asset),
+        )
+        .ok()
+    });
+    envelope_xdr
+        .map_or(Ok(()), |envelope| {
+            refuse_contract_transfer(envelope, context.as_ref())
+        })
+        .and_then(|()| refuse_contract_destination(destination, memo))
+        .err()
+        .map(|reason| super::common::ledger_err_result(&reason.into()))
+}
+
 impl StellarPayCommitArgs {
+    /// Whether the caller supplied any memo argument.
+    fn has_memo(&self) -> bool {
+        self.memo_text.is_some()
+            || self.memo_id.is_some()
+            || self.memo_hash_hex.is_some()
+            || self.memo_return_hex.is_some()
+    }
+
     /// Validates the caller's asset and amount through [`parse_asset_and_amount`].
     fn parse_asset_and_amount(&self) -> Result<(Asset, StellarAmount), rmcp::ErrorData> {
         parse_asset_and_amount(
@@ -386,6 +491,48 @@ impl StellarPayCommitArgs {
             self.amount_in_stroops.clone(),
         )
     }
+}
+
+/// The signed interval of a payment approval queued over the decision's
+/// `(created, policy_end)` for the operation `handle`. The entry ends no
+/// later than the operation's waiting window. Consent to a canonical intent
+/// must span the decision's whole lifetime, so an entry a canonical record
+/// queues after its window opened keeps that lifetime and ends with the
+/// window.
+fn payment_entry_interval(
+    handle: Option<&stellar_agent_network::policy_state::OperationHandle>,
+    (created, policy_end): (u64, u64),
+) -> (u64, u64) {
+    let Some(handle) = handle else {
+        return (created, policy_end);
+    };
+    let end = handle.waiting_expires_at_ms();
+    if handle.intent().kind() == stellar_agent_network::policy_state::SlotKind::Canonical
+        && end < policy_end
+    {
+        (end.saturating_sub(policy_end - created), end)
+    } else {
+        (created, policy_end.min(end))
+    }
+}
+
+/// Whether the commit `args`, with their parsed `asset`, `amount` and
+/// `memo`, name the stored payment `intent`: the same source, memo,
+/// destination as supplied, asset and amount.
+fn names_intent(
+    intent: &stellar_agent_core::approval::ClassicIntent,
+    args: &StellarPayCommitArgs,
+    (asset, amount): (&Asset, StellarAmount),
+    memo: &Memo,
+) -> bool {
+    intent.base().source() == args.source
+        && *intent.base().memo() == stellar_agent_network::operation_entry::memo_fact(memo)
+        && *intent.payload()
+            == stellar_agent_core::approval::IntentPayload::Pay {
+                destination: args.destination.clone(),
+                asset: stellar_agent_network::operation_entry::intent_asset(asset),
+                amount_stroops: amount.as_stroops(),
+            }
 }
 
 fn resolve_payment_amount(
@@ -433,82 +580,493 @@ fn resolve_payment_amount(
 // WalletServer — approval-spine helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The internal-error prefix of a direct payment queueing failure.
+const STORE: &str = "approval.store_error";
+
+/// The internal-error prefix of a toolset payment queueing failure.
+const GATED_CREATE: &str = "toolset.gated_approval_create";
+
+/// Maps a queueing failure to its wire result; an error without a wire code
+/// is an internal error under the caller's `prefix`.
+fn payment_recovery_refusal(
+    error: &ApprovalError,
+    profile: &str,
+    prefix: &str,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    super::common::payment_recovery_wire_error(error, profile)
+        .ok_or_else(|| rmcp::ErrorData::internal_error(format!("{prefix}: {error}"), None))
+}
+
+/// Maps a direct payment queueing failure to its wire result. A full store
+/// names how retained bindings release their capacity.
+fn payment_store_refusal(
+    error: &ApprovalError,
+    profile: &str,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    if matches!(error, ApprovalError::PendingStoreFull { .. }) {
+        return Err(rmcp::ErrorData::internal_error(
+            format!(
+                "{STORE}: {error}; retained payment bindings occupy capacity until their \
+                 retention ends, and `stellar-agent approve gc --profile {profile}` frees \
+                 them afterward"
+            ),
+            None,
+        ));
+    }
+    payment_recovery_refusal(error, profile, STORE)
+}
+
+/// The recovery binding a queued payment approval receives.
+#[derive(Clone, Copy)]
+pub(crate) enum PaymentQueue {
+    /// Direct preparation requires a verified policy; the winning operation
+    /// ID and waiting end are present on mainnet.
+    Direct(Option<([u8; 16], u64)>),
+    /// A toolset payment binds under a verified policy and otherwise queues
+    /// an unbound entry.
+    Toolset(Option<([u8; 16], u64)>),
+}
+
+/// Process-local preparation facts used before approval queueing. The full
+/// issued nonce keys this lookup; normal commit verification still runs.
+pub(crate) struct PreparedPaymentNonce {
+    handle: stellar_agent_network::policy_state::OperationHandle,
+    subject: [u8; 32],
+    expires: u64,
+    consumed: bool,
+}
+
+/// A verified proposal route's raw invocation and provisional outer outcome.
+/// It conveys no signing authority; commit resolves its own grant.
+pub(crate) struct ToolsetPreparationContext {
+    pub(super) toolset: String,
+    pub(super) action: String,
+    pub(super) outer: Option<DispatchOutcome>,
+}
+
+/// The toolset invocation a payment commit runs for.
+///
+/// It holds the raw toolset and action names, the grant the gated resolver
+/// verified for them, and, on a server without a mainnet context, the
+/// outcome of the invocation's outer `stellar_toolset_invoke` gate. The
+/// public dispatcher builds one only from a verified `Resolved` outcome.
+pub(crate) struct ToolsetPaymentContext {
+    pub(super) toolset: String,
+    pub(super) action: String,
+    pub(super) grant: Box<stellar_agent_toolsets_runtime::VerifiedToolsetGrant>,
+    pub(super) outer: Option<DispatchOutcome>,
+}
+
+fn approval_storage_error(error: impl std::error::Error + Send + Sync + 'static) -> ApprovalError {
+    let source = std::io::Error::other(error);
+    ApprovalError::Io {
+        kind: source.kind(),
+        source,
+    }
+}
+
 impl WalletServer {
-    /// Persists a [`PendingApproval`] entry for a `stellar_pay` simulate call.
-    ///
-    /// Opens (or creates) the profile-scoped approval store at
-    /// `~/.local/share/stellar-agent/approvals/<profile_name>.toml`, constructs
-    /// an unattested entry from the payment arguments, inserts it, and returns
-    /// the entry for nonce / expiry extraction by the caller.
+    /// Persists the retained payment envelope with its signed interval, from
+    /// `payment_entry_interval` on a preparation, in the profile's approval
+    /// store, under one lock and one clock observation.
+    /// A verified policy binds the entry for recovery; without one, only the
+    /// toolset path queues, as an unbound entry. A new bound entry records
+    /// `subject_kind`, which is the intent digest for a canonical operation.
     ///
     /// # Errors
     ///
-    /// Returns a string error description on any I/O, store-lock, or clock
-    /// failure.  The caller maps this to an `internal_error` MCP response.
-    ///
-    /// # Feature gate
-    ///
-    /// Exposed as `pub` when the `test-helpers` feature is enabled, for use in
-    /// integration tests.  `pub(crate)` otherwise. Under that same gate, this
-    /// honours [`WalletServer::set_approval_dir_for_test`] so a test-isolated
-    /// `stellar_pay` simulate call under a `RequireApproval` policy never
-    /// writes into the real `default_approval_dir()`, mirroring the override
-    /// already applied in `invoke_stellar_pay_commit_toolset_gated`.
-    #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
+    /// Returns typed storage, binding, and lifecycle refusals.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the operation and signed interval bind recovery"
+    )]
     pub(crate) fn persist_pay_pending_approval(
         &self,
         envelope_xdr: &str,
-        summary_to: &str,
-        summary_stroops: i64,
-        summary_asset: &str,
-        summary_memo: Option<String>,
-        summary_simulated_total_stroops: u32,
-        summary_simulated_seq_num: i64,
+        created_at_ms: u64,
+        expires_at_ms: u64,
         profile_name: &str,
         request: &stellar_agent_core::policy::ApprovalRequest,
-    ) -> Result<PendingApproval, String> {
+        queue: PaymentQueue,
+        subject_kind: SubjectKind,
+    ) -> Result<PendingApproval, ApprovalError> {
+        let policy = match (self.verified_policy.as_deref(), queue) {
+            (Some(policy), _) => Some(policy),
+            (None, PaymentQueue::Toolset(_)) => None,
+            (None, PaymentQueue::Direct(_)) => {
+                return Err(ApprovalError::InvalidEntry {
+                    detail: "payment recovery requires a verified policy".to_owned(),
+                });
+            }
+        };
+        let operation = match queue {
+            PaymentQueue::Direct(operation) | PaymentQueue::Toolset(operation) => operation,
+        };
         #[cfg(any(test, feature = "test-helpers"))]
         let approvals_dir = match self.approval_dir_override {
             Some(ref override_dir) => override_dir.clone(),
-            None => default_approval_dir()
-                .map_err(|e| format!("approval dir resolution failed: {e}"))?,
+            None => default_approval_dir().map_err(approval_storage_error)?,
         };
         #[cfg(not(any(test, feature = "test-helpers")))]
-        let approvals_dir =
-            default_approval_dir().map_err(|e| format!("approval dir resolution failed: {e}"))?;
+        let approvals_dir = default_approval_dir().map_err(approval_storage_error)?;
         // Create the directory if it does not exist.
-        std::fs::create_dir_all(&approvals_dir)
-            .map_err(|e| format!("approval dir create_all failed: {e}"))?;
+        std::fs::create_dir_all(&approvals_dir).map_err(approval_storage_error)?;
         let store_path = approvals_dir.join(format!("{profile_name}.toml"));
-        let mut store = open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
-            .map_err(|e| format!("approval store open failed: {e}"))?;
+        let mut store =
+            open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)?;
 
-        let uid =
-            process_uid_for_attestation().map_err(|e| format!("process UID unavailable: {e}"))?;
-        let entry = PendingApproval::new_payment_pending(
-            envelope_xdr.to_owned(),
-            envelope_xdr.as_bytes(),
-            summary_to.to_owned(),
-            summary_stroops,
-            summary_asset.to_owned(),
-            summary_memo,
-            summary_simulated_total_stroops,
-            summary_simulated_seq_num,
+        let uid = process_uid_for_attestation()?;
+        let now_ms = self.clock.now_unix_ms().map_err(approval_storage_error)?;
+        let Some(policy) = policy else {
+            let entry = PendingApproval::new_payment_pending_until(
+                envelope_xdr.to_owned(),
+                uid,
+                created_at_ms,
+                expires_at_ms,
+                now_ms,
+                request.reason.clone(),
+            )?;
+            store.insert(entry.clone(), now_ms)?;
+            return Ok(entry);
+        };
+        store.recover_payment(
+            PaymentRecoveryContext {
+                profile: profile_name,
+                chain: self.context.chain_id,
+                policy,
+                operation,
+            },
+            envelope_xdr,
             uid,
-            APPROVAL_TTL_MS,
+            created_at_ms,
+            expires_at_ms,
+            now_ms,
+            request,
+            subject_kind,
         )
-        .map_err(|e| format!("PendingApproval::new_payment_pending failed: {e}"))?;
+    }
 
-        let entry = entry.with_policy_request(request);
+    /// Queues the approval `outcome` requires for a toolset payment of
+    /// `envelope_xdr`, over the outcome's captured interval, and answers
+    /// `policy.approval_required`. The approval store's recovery reuses an
+    /// earlier approval of the same envelope. On mainnet the queue opens the
+    /// durable approval record of the operation this process prepared for
+    /// `nonce` and `expires_at_unix_ms`, as a direct preparation does.
+    async fn queue_toolset_payment(
+        &self,
+        (envelope_xdr, nonce, expires_at_unix_ms): (&str, &str, u64),
+        outcome: &DispatchOutcome,
+        request: &stellar_agent_core::policy::ApprovalRequest,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (created_at_ms, expires_at_ms) = match outcome.captured_interval() {
+            Ok(interval) => interval,
+            Err(error) => return error.into_result(),
+        };
+        let handle = if self.context.chain_id.is_mainnet() {
+            let nonce = match stellar_agent_nonce::Nonce::from_base64(nonce) {
+                Ok(nonce) => nonce,
+                Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
+            };
+            let now = now_unix_ms()
+                .map_err(|error| rmcp::ErrorData::internal_error(error.to_string(), None))?;
+            let prepared = self.prepared_payments.lock().await;
+            let Some(prepared) = prepared.get(&nonce.to_base64()).filter(|entry| {
+                entry.subject
+                    == stellar_agent_core::approval::subject::approval_subject_classic(envelope_xdr)
+                    && entry.expires == expires_at_unix_ms
+                    && now < entry.expires
+            }) else {
+                return Ok(commit_path_error_result("payment nonce lookup failed"));
+            };
+            if prepared.consumed {
+                return Ok(super::common::nonce_replayed_error_result());
+            }
+            Some(prepared.handle.clone())
+        } else {
+            None
+        };
+        let operation = handle
+            .as_ref()
+            .map(|handle| (*handle.id().as_bytes(), handle.waiting_expires_at_ms()));
+        let expires_at_ms = operation.map_or(expires_at_ms, |(_, end)| expires_at_ms.min(end));
+        let profile = self.profile_name_for_approval();
+        let write = PaymentWrite {
+            server: self,
+            envelope_xdr,
+            interval: (created_at_ms, expires_at_ms),
+            profile_name: &profile,
+            request,
+            queue: PaymentQueue::Toolset(operation),
+        };
+        let entry = match handle {
+            Some(handle) => match self.payment_pending_approval(
+                Some(&handle),
+                outcome.audit_decision(),
+                (created_at_ms, expires_at_ms),
+                write,
+            ) {
+                Ok(Ok(entry)) => entry,
+                Ok(Err(error)) => return payment_store_refusal(&error, &profile),
+                Err(error) => return Ok(super::common::ledger_err_result(&error)),
+            },
+            None => match super::business_entry::InboxWrite::persist(write, None) {
+                Ok(entry) => entry,
+                Err(error) => return payment_recovery_refusal(&error, &profile, GATED_CREATE),
+            },
+        };
+        tracing::debug!(
+            nonce = %entry.approval_nonce,
+            "toolset payment approval queued"
+        );
+        Ok(super::common::approval_required_indistinguishable(&profile))
+    }
 
-        let now_ms = now_unix_ms()
-            .map_err(|e| format!("approval store insert: current time unavailable: {e}"))?;
-        store
-            .insert(entry.clone(), now_ms)
-            .map_err(|e| format!("approval store insert failed: {e}"))?;
+    /// The commit of the canonical payment under `business_id`: the
+    /// arguments and the endpoint are checked as on the envelope route, the
+    /// record is looked up, then the envelope is rebuilt from the stored
+    /// intent and signed. The destination's base account feeds the policy
+    /// gate and the oracle witness, as on the envelope route.
+    async fn pay_canonical(
+        &self,
+        guard: &crate::server::MainnetWriteGuard<'_>,
+        args: &StellarPayCommitArgs,
+        (asset, amount): (&Asset, StellarAmount),
+        business_id: stellar_agent_network::policy_state::BusinessId,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        validate_g_strkey(&args.source, "source")?;
+        let destination = validate_payment_destination(&args.destination, "destination")?;
+        let memo = match parse_memo_fields(
+            args.memo_text.as_ref().map(McpMemoTextArgument::as_str),
+            args.memo_id,
+            args.memo_hash_hex.as_deref(),
+            args.memo_return_hex.as_deref(),
+        ) {
+            Ok(memo) => memo,
+            Err(err) => return Ok(commit_path_error_result(err)),
+        };
+        let entry = self.canonical_entry(guard, business_id, &args.source, |intent| {
+            names_intent(intent, args, (asset, amount), &memo)
+        });
+        let (client, target) = match entry.await {
+            Ok(entry) => entry,
+            Err(answer) => return answer,
+        };
+        let facts = match PaymentLedgerFacts::read(
+            &client,
+            &args.source,
+            &destination,
+            asset,
+            !matches!(memo, Memo::None),
+        )
+        .await
+        {
+            Ok(facts) => facts,
+            Err(result) => return Ok(result),
+        };
+        let witness_inputs = facts.witness_inputs(
+            crate::tools::canonical_commit::placeholder_source(&target.intent),
+            &destination,
+        );
+        let dest_adapter = facts
+            .destination
+            .as_ref()
+            .map(crate::policy_adapter::AccountViewAdapter::new);
+        self.canonical_commit(
+            guard,
+            &client,
+            &target,
+            crate::tools::canonical_commit::CanonicalCommit {
+                consumer: stellar_agent_network::mainnet::MainnetConsumer::McpPay,
+                prepare_tool: "stellar_pay",
+                commit_tool: "stellar_pay_commit",
+                chain_id: &args.chain_id,
+                proof: crate::tools::common::SuppliedProof {
+                    nonce: args.approval_nonce.clone(),
+                    attestation: args.approval_attestation.clone(),
+                },
+                witness_inputs: witness_inputs.into(),
+                identity_view: dest_adapter
+                    .as_ref()
+                    .map(|a| a as &dyn stellar_agent_core::policy::v1::AccountIdentityView),
+                payment: true,
+            },
+        )
+        .await
+    }
+}
 
+/// The ledger facts both commit routes of a payment read for its policy gate
+/// and its oracle witness.
+struct PaymentLedgerFacts {
+    /// The destination's base account; `None` for an account that does not
+    /// exist.
+    destination: Option<stellar_agent_network::AccountView>,
+    /// The destination's memo requirement as the witness compares it.
+    memo: stellar_agent_network::cross_check::MemoObservation,
+    /// The source's trustline of the sent asset; `None` for native.
+    trustline: Option<stellar_agent_network::cross_check::TrustlineObservation>,
+}
+
+impl PaymentLedgerFacts {
+    /// Reads the facts through `client` for a payment of `asset` from `source`
+    /// to `destination`, whose base account it reads.
+    ///
+    /// # Errors
+    ///
+    /// The call's whole answer: a destination read that fails other than
+    /// for an absent account and a failed trustline read refuse with their
+    /// ledger codes, a failed memo read with its endpoint code.
+    async fn read(
+        client: &stellar_agent_network::StellarRpcClient,
+        source: &str,
+        destination: &stellar_agent_core::payment_accounts::PaymentAccount,
+        asset: &Asset,
+        memo_present: bool,
+    ) -> Result<Self, CallToolResult> {
+        let view = match fetch_account(client, destination.base_account(), &[]).await {
+            Ok(view) => Some(view),
+            Err(stellar_agent_core::WalletError::Network(
+                stellar_agent_core::error::NetworkError::AccountNotFound { .. },
+            )) => None,
+            Err(err) => return Err(ledger_err_result(&err)),
+        };
+        let memo = check_memo_required(client, destination.canonical(), memo_present)
+            .await
+            .map_err(|error| crate::tools::common::endpoint_refusal_result(&error))?;
+        let trustline = stellar_agent_network::cross_check::TrustlineObservation::read_send_asset(
+            client, source, asset,
+        )
+        .await
+        .map_err(|err| ledger_err_result(&err))?;
+        Ok(Self {
+            destination: view,
+            memo,
+            trustline,
+        })
+    }
+
+    /// The oracle inputs of the payment with the `source` observation.
+    fn witness_inputs(
+        &self,
+        source: stellar_agent_network::cross_check::AccountObservation,
+        destination: &stellar_agent_core::payment_accounts::PaymentAccount,
+    ) -> stellar_agent_network::cross_check::PayWitnessInputs {
+        stellar_agent_network::cross_check::PayWitnessInputs {
+            source,
+            destination: stellar_agent_network::cross_check::DestinationObservation::from_view(
+                destination.base_account(),
+                self.destination.as_ref(),
+            ),
+            memo: self.memo,
+            trustline: self.trustline.clone(),
+        }
+    }
+}
+
+/// The inbox write of a payment approval, direct or toolset as `queue` names.
+/// Its persist reuses or creates the entry with the recovery binding `queue`
+/// selects. A published consent, which runs only on mainnet under a verified
+/// policy, builds the entry first and binds it only after its
+/// record reserves. A retained recovery binding of the same payment without
+/// a durable record is therefore found only after the new record opens and
+/// reserves: the bind refuses, the call answers `approval.entry_inconsistent`,
+/// and the new record keeps its reservation.
+pub(crate) struct PaymentWrite<'a> {
+    pub(crate) server: &'a WalletServer,
+    pub(crate) envelope_xdr: &'a str,
+    pub(crate) interval: (u64, u64),
+    pub(crate) profile_name: &'a str,
+    pub(crate) request: &'a stellar_agent_core::policy::ApprovalRequest,
+    pub(crate) queue: PaymentQueue,
+}
+
+impl super::business_entry::InboxWrite for PaymentWrite<'_> {
+    type Error = ApprovalError;
+
+    fn build(
+        &self,
+        intent: Option<&stellar_agent_core::approval::ClassicIntent>,
+    ) -> Result<PendingApproval, ApprovalError> {
+        let now_ms = self
+            .server
+            .clock
+            .now_unix_ms()
+            .map_err(approval_storage_error)?;
+        let mut entry = PendingApproval::new_payment_pending_until(
+            self.envelope_xdr.to_owned(),
+            process_uid_for_attestation()?,
+            self.interval.0,
+            self.interval.1,
+            now_ms,
+            self.request.reason.clone(),
+        )?;
+        stellar_agent_network::operation_entry::stage_pending(
+            &mut entry,
+            intent,
+            u64::from(self.request.ttl_seconds) * 1000,
+        )
+        .map_err(approval_storage_error)?;
         Ok(entry)
+    }
+
+    fn insert(self, entry: PendingApproval) -> Result<PendingApproval, ApprovalError> {
+        let policy =
+            self.server
+                .verified_policy
+                .as_deref()
+                .ok_or_else(|| ApprovalError::InvalidEntry {
+                    detail: "payment recovery requires a verified policy".to_owned(),
+                })?;
+        let directory = self
+            .server
+            .resolve_approval_dir()
+            .map_err(approval_storage_error)?;
+        std::fs::create_dir_all(&directory).map_err(approval_storage_error)?;
+        let mut store = open_with_retry(
+            &directory.join(format!("{}.toml", self.profile_name)),
+            DEFAULT_RETRY_ATTEMPTS,
+            DEFAULT_RETRY_BACKOFF,
+        )?;
+        let now_ms = self
+            .server
+            .clock
+            .now_unix_ms()
+            .map_err(approval_storage_error)?;
+        store.bind_payment(
+            PaymentRecoveryContext {
+                profile: self.profile_name,
+                chain: self.server.context.chain_id,
+                policy,
+                operation: match self.queue {
+                    PaymentQueue::Direct(operation) | PaymentQueue::Toolset(operation) => operation,
+                },
+            },
+            entry,
+            now_ms,
+        )
+    }
+
+    fn persist(
+        self,
+        intent: Option<&stellar_agent_core::approval::ClassicIntent>,
+    ) -> Result<PendingApproval, ApprovalError> {
+        // The store builds a new entry under its lock, or reuses the one its
+        // recovery binding names, so the entry cannot be staged here; the
+        // store records the subject kind on a new entry.
+        let subject_kind = if intent.is_some() {
+            SubjectKind::IntentDigest
+        } else {
+            SubjectKind::EnvelopeText
+        };
+        self.server.persist_pay_pending_approval(
+            self.envelope_xdr,
+            self.interval.0,
+            self.interval.1,
+            self.profile_name,
+            self.request,
+            self.queue,
+            subject_kind,
+        )
     }
 }
 
@@ -552,7 +1110,11 @@ impl WalletServer {
     /// Returns a tool-level error (not a JSON-RPC error) when:
     /// - The policy engine denies the call.
     /// - `chain_id` does not match the profile's configured chain.
-    /// - `source` or `destination` are not valid G-strkeys.
+    /// - `source` is not a valid G-strkey or `destination` is not a valid G or
+    ///   M strkey.
+    /// - `destination` is a canonical C contract or W muxed contract
+    ///   (`validation.contract_payment_unavailable`, or
+    ///   `validation.contract_payment_memo_unsupported` with a memo).
     /// - `asset` cannot be parsed.
     /// - Multiple memo variants are provided simultaneously.
     /// - The SEP-29 check fails (`validation.memo_required`).
@@ -590,8 +1152,17 @@ impl WalletServer {
         name = "stellar_pay",
         description = "Build a Payment transaction envelope and mint a single-use nonce \
                        (simulate step). Supports native XLM and non-native assets. \
-                       Runs SEP-29 memo-required enforcement at simulate time on the primary RPC. \
+                       The destination is a G or M address; an M address keeps its mux ID \
+                       and ledger reads use its G base account. \
+                       A canonical C contract or W muxed contract destination refuses with \
+                       validation.contract_payment_unavailable, or \
+                       validation.contract_payment_memo_unsupported with any memo, before any \
+                       request; on mainnet the commit's admission refusals come first. \
+                       Runs SEP-29 memo-required enforcement at simulate time on the primary RPC \
+                       for a G destination; an M destination skips it. \
                        Returns {envelope_xdr, nonce, expires_at_unix_ms, simulation}. \
+                       The result carries operational {latest_ledger, close_time_unix, \
+                       close_lag_seconds}, the endpoint ledger the readiness check observed. \
                        The approval response includes profile and chain_id. \
                        Pass all three to stellar_pay_commit to sign and submit. \
                        destructive_hint=false; read_only_hint=false.",
@@ -601,9 +1172,21 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<StellarPayArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // Starting at entry bounds the primary identity check by the action budget.
-        let pay_deadline: tokio::time::Instant =
-            tokio::time::Instant::now() + submit_timeout(&self.profile);
+        self.stellar_pay_impl(args, None).await
+    }
+
+    /// Prepares through the ordinary payment gates, composing the verified
+    /// proposal route's outer rule before exposing consent or a nonce.
+    pub(crate) async fn stellar_pay_impl(
+        &self,
+        args: StellarPayArgs,
+        toolset: Option<ToolsetPreparationContext>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Starting at entry bounds the primary identity check, the readiness
+        // check and the reads before the send by one pre-send budget; the
+        // profile's submit timeout bounds only the send and the confirmation
+        // poll.
+        let pay_deadline = stellar_agent_network::operational::readiness_deadline();
         // ── Parse asset and amount ────────────────────────────────────────────
         let (asset, payment_amount) = parse_asset_and_amount(
             &args.asset,
@@ -612,7 +1195,7 @@ impl WalletServer {
         )?;
 
         // ── Dispatch gate ─────────────────────────────────────────────────────
-        let args_value = json!({
+        let mut args_value = json!({
             "chain_id": &args.chain_id,
             "source": &args.source,
             "destination": &args.destination,
@@ -621,18 +1204,31 @@ impl WalletServer {
             "amount_stroops": payment_amount.as_stroops().to_string(),
             "asset": &args.asset,
         });
-        // ── Validate G-strkeys ────────────────────────────────────────────────
+        // ── Validate strkeys: a G source and a G or M destination ────────────
         validate_g_strkey(&args.source, "source")?;
-        validate_g_strkey(&args.destination, "destination")?;
+        let memo_argument = args.memo_text.is_some()
+            || args.memo_id.is_some()
+            || args.memo_hash_hex.is_some()
+            || args.memo_return_hex.is_some();
+        if let Some(refusal) = contract_payment_refusal(
+            self.context.chain_id,
+            &args.destination,
+            memo_argument,
+            None,
+            None,
+        ) {
+            return Ok(refusal);
+        }
+        let destination = validate_payment_destination(&args.destination, "destination")?;
 
         // ── Parse memo (mutual exclusivity check) ─────────────────────────────
-        let memo = match parse_memo_fields(
+        let (memo, policy_memo) = match stellar_agent_network::memo::parse_memo_with_fact(
             args.memo_text.as_ref().map(McpMemoTextArgument::as_str),
             args.memo_id,
             args.memo_hash_hex.as_deref(),
             args.memo_return_hex.as_deref(),
         ) {
-            Ok(m) => m,
+            Ok(parsed) => parsed,
             Err(err) => {
                 let envelope = stellar_agent_core::envelope::Envelope::<()>::err(&err);
                 let json = envelope
@@ -643,12 +1239,13 @@ impl WalletServer {
                 return Ok(result);
             }
         };
+        policy_memo.insert_policy_fields(&mut args_value);
         let memo_present = !matches!(memo, Memo::None);
 
         // ── Fetch source account state ────────────────────────────────────────
         // For non-native payments, also fetch the source trustline in the SAME
         // batched getLedgerEntries call (one RPC round-trip for account + trustline).
-        let client = match self.context.primary_client() {
+        let client = match self.write_primary_client() {
             Ok(c) => c,
             Err(err) => return crate::tools::common::rpc_client_failure(&err),
         };
@@ -657,12 +1254,81 @@ impl WalletServer {
         // on this client. The values read here feed the envelope the commit
         // signs and the policy gate, so an endpoint serving another network
         // answers none of them.
-        if let Err(e) = client
-            .endpoint_identity(self.context.network_passphrase(), pay_deadline)
-            .await
-        {
+        if let Err(e) = self.probe_write_endpoint(&client, pay_deadline).await {
             return Ok(crate::tools::common::endpoint_refusal_result(&e));
         }
+
+        // ── Business id ───────────────────────────────────────────────────────
+        // A mainnet call names its operation; the id is checked after the
+        // argument and endpoint refusals above, so their codes stay.
+        let business_id = match self.entry_business_id(&args.chain_id, args.business_id.as_deref())
+        {
+            Ok(id) => id,
+            Err(result) => return Ok(result),
+        };
+
+        // A retained operation answers here with its stored state, once
+        // the endpoint is known to serve the profile's network and before
+        // any account read.
+        let mut operation = match business_id
+            .clone()
+            .filter(|_| self.context.chain_id.is_mainnet())
+        {
+            Some(id) => {
+                let fee_choice =
+                    stellar_agent_network::parse_classic_fee_choice(args.classic_base.as_deref())
+                        .map_err(|err| {
+                        rmcp::ErrorData::invalid_params(
+                            format!("invalid fee: {}", err.code()),
+                            None,
+                        )
+                    })?;
+                // The first preparation of a business id decides its record:
+                // a direct payment stores its lasting intent, a toolset
+                // payment an envelope record whose protocol nonce, lease and
+                // routed policies its commit verifies. Either route resumes
+                // the record the other opened.
+                let lookup = if toolset.is_some() {
+                    Self::toolset_prepare_entry
+                } else {
+                    Self::canonical_prepare_entry
+                };
+                match lookup(
+                    self,
+                    id,
+                    stellar_agent_network::mainnet::MainnetConsumer::McpPay,
+                    &args.source,
+                    fee_choice,
+                    &memo,
+                    stellar_agent_network::operation_entry::IdentityFacts::Intent(
+                        stellar_agent_core::approval::IntentPayload::Pay {
+                            destination: args.destination.clone(),
+                            asset: stellar_agent_network::operation_entry::intent_asset(&asset),
+                            amount_stroops: payment_amount.as_stroops(),
+                        },
+                    ),
+                ) {
+                    Ok(operation) => Some(operation),
+                    Err(result) => return Ok(result),
+                }
+            }
+            None => None,
+        };
+
+        // The endpoint must be healthy and current before the first account
+        // read: the account state read below comes through the same client
+        // after this check and under its deadline, so the sequence the
+        // envelope is built against is at least as fresh as the ledger the
+        // check observed.
+        let operational = match stellar_agent_network::operational::operational_check(
+            &client,
+            pay_deadline,
+        )
+        .await
+        {
+            Ok(report) => report,
+            Err(e) => return Ok(crate::tools::common::endpoint_refusal_result(&e)),
+        };
 
         let trustline_request: Vec<Asset> = if matches!(asset, Asset::Native) {
             Vec::new()
@@ -670,11 +1336,12 @@ impl WalletServer {
             vec![asset.clone()]
         };
 
-        let account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
+        let account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup_within(
             &self.sequence_floor,
             &client,
             &args.source,
             &trustline_request,
+            pay_deadline,
         )
         .await
         {
@@ -692,11 +1359,43 @@ impl WalletServer {
 
         // ── Dispatch gate (with policy views) ─────────────────────────────────
         // The source AccountView feeds the `minimum_reserve` criterion; the
-        // destination's on-chain `home_domain` feeds `home_domain_resolved`. The
-        // destination fetch is non-fatal: a not-yet-created destination has no
-        // home_domain, so `identity_view` is simply `None`.
-        let dest_view = fetch_account(&client, &args.destination, &[]).await.ok();
+        // destination's on-chain `home_domain` feeds `home_domain_resolved`. A
+        // not-yet-created destination has no home_domain, so `identity_view`
+        // is `None`. Any other read error refuses with its own code before the
+        // gate, so no nonce, approval, hold, or send exists. A retained record
+        // that the mainnet lookup above settled stays settled. An M
+        // destination reads its G base account.
+        let dest_view = match fetch_account(&client, destination.base_account(), &[]).await {
+            Ok(view) => Some(view),
+            Err(stellar_agent_core::WalletError::Network(
+                stellar_agent_core::error::NetworkError::AccountNotFound { .. },
+            )) => None,
+            Err(err) => return Ok(ledger_err_result(&err)),
+        };
+        let fee_selection = match self
+            .resolve_classic_policy_fee(&client, args.classic_base.as_deref())
+            .await
+        {
+            Ok(selection) => selection,
+            Err(error) => return error.into_result(),
+        };
+        let fee_per_op_stroops = fee_selection.per_op_stroops;
+        let total_fee_stroops =
+            total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
+        args_value["total_fee_stroops"] = json!(total_fee_stroops);
+        let floor = match self
+            .classic_floor_source(
+                &client,
+                &args.source,
+                &["stellar_pay", "stellar_pay_commit"],
+            )
+            .await
+        {
+            Ok(floor) => floor,
+            Err(error) => return error.into_result(),
+        };
         let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
+        let source_view = FloorSource::view_or(floor.as_ref(), &source_adapter);
         let dest_adapter = dest_view
             .as_ref()
             .map(crate::policy_adapter::AccountViewAdapter::new);
@@ -705,7 +1404,7 @@ impl WalletServer {
                 "stellar_pay",
                 &args_value,
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 dest_adapter
                     .as_ref()
                     .map(|a| a as &dyn stellar_agent_core::policy::v1::AccountIdentityView),
@@ -720,7 +1419,7 @@ impl WalletServer {
         let native_balance_stroops = account_view
             .balances
             .first()
-            .filter(|b| b.asset.asset_type == "native")
+            .filter(|b| b.asset.asset_type == stellar_agent_network::AssetType::Native)
             .map(|b| b.balance_stroops())
             .transpose()
             .map_err(|e| {
@@ -729,40 +1428,7 @@ impl WalletServer {
             .unwrap_or(0_i64);
 
         let amount_stroops_i64 = payment_amount.as_stroops();
-        let fee_choice = parse_classic_fee_choice(args.classic_base.as_deref()).map_err(|err| {
-            rmcp::ErrorData::invalid_params(format!("invalid fee: {}", err.code()), None)
-        })?;
-        let fee_selection = match resolve_classic_fee_selection(
-            &client,
-            resolve_classic_fee_per_op_stroops(&self.profile),
-            fee_choice,
-        )
-        .await
-        {
-            Ok(selection) => selection,
-            Err(err @ stellar_agent_core::WalletError::Network(_)) => {
-                return Ok(ledger_err_result(&err));
-            }
-            Err(err) => {
-                return Err(rmcp::ErrorData::invalid_params(
-                    format!("invalid fee: {}", err.code()),
-                    None,
-                ));
-            }
-        };
-        if let Err(err) = check_classic_fee_cap(
-            fee_selection.per_op_stroops,
-            classic_fee_source(
-                fee_choice,
-                stellar_agent_core::error::FeeSource::ProfileDefault,
-            ),
-            &self.profile,
-        ) {
-            return Ok(ledger_err_result(&err));
-        }
-        let fee_per_op_stroops = fee_selection.per_op_stroops;
-        let total_fee_stroops =
-            total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
+
         let fee_stroops = i64::from(total_fee_stroops);
 
         // ── Unified native/non-native pre-flight ─────────────────────────────
@@ -875,64 +1541,151 @@ impl WalletServer {
         // `Account::increment_sequence_number` internally.
         // An explicit +1 here would produce CURRENT+2 → TxBadSeq.
         // `amount_stroops_i64` is captured earlier in the pre-flight block.
-        let mut builder = ClassicOpBuilder::new(
-            &args.source,
-            source_sequence,
-            self.context.network_passphrase(),
-            fee_per_op_stroops,
-        );
-        if let Err(err) = builder.payment(&args.destination, payment_amount, &asset) {
-            return Err(rmcp::ErrorData::internal_error(
-                format!("envelope_build_error: {err}"),
-                None,
-            ));
-        }
-        if let Err(err) = builder.memo(&memo) {
-            return Err(rmcp::ErrorData::internal_error(
-                format!("envelope_build_error: {err}"),
-                None,
-            ));
-        }
-        let envelope_xdr = match builder.build() {
-            Ok(xdr) => xdr,
-            Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    format!("envelope_build_error: {err}"),
-                    None,
-                ));
+        // `deadline` replaces the mainnet deadline when it is given.
+        let build = |deadline: Option<u64>| -> Result<String, rmcp::ErrorData> {
+            let build_error = |err: &dyn std::fmt::Display| {
+                rmcp::ErrorData::internal_error(format!("envelope_build_error: {err}"), None)
+            };
+            let mut builder = ClassicOpBuilder::new(
+                &args.source,
+                source_sequence,
+                self.context.network_passphrase(),
+                fee_per_op_stroops,
+            );
+            builder
+                .payment(&args.destination, payment_amount, &asset)
+                .map_err(|err| build_error(&err))?;
+            builder.memo(&memo).map_err(|err| build_error(&err))?;
+            match deadline {
+                Some(max_time) => {
+                    builder.with_presented_deadline(max_time);
+                }
+                None => {
+                    builder
+                        .with_mainnet_deadline()
+                        .map_err(|err| build_error(&err))?;
+                }
             }
+            builder.build().map_err(|err| build_error(&err))
+        };
+        let stored_envelope = operation
+            .as_ref()
+            .and_then(crate::tools::business_entry::ClassicOperation::stored_envelope)
+            .map(str::to_owned);
+        let built = stored_envelope.is_none();
+        let envelope_xdr = match stored_envelope {
+            Some(stored) => stored,
+            None => build(None)?,
         };
 
-        // ── Mint nonce ────────────────────────────────────────────────────────
-        let now_ms = now_unix_ms()
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
-        let expiry_unix_ms = now_ms.saturating_add(DEFAULT_NONCE_TTL_MS);
+        // The governing decision of this preparation and its commit is the
+        // one the record keeps, so it is evaluated before the record opens.
+        let dispatch_outcome = match self
+            .paired_commit_outcome(
+                dispatch_outcome,
+                &envelope_xdr,
+                "stellar_pay_commit",
+                &args.chain_id,
+                Some(source_view),
+                dest_adapter
+                    .as_ref()
+                    .map(|a| a as &dyn stellar_agent_core::policy::v1::AccountIdentityView),
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return error.into_result(),
+        };
 
-        let nonce = match self.nonce_mint.mint(
-            self.tool_catalogue.as_ref(),
-            envelope_xdr.as_bytes(),
-            now_ms,
-            expiry_unix_ms,
-            "stellar_pay_commit",
-            &args.chain_id,
+        let is_toolset = toolset.is_some();
+        let dispatch_outcome = if let Some(context) = toolset {
+            let mut authoritative =
+                match decode_authoritative_args(&envelope_xdr, "stellar_pay_commit") {
+                    Ok(args) => args,
+                    Err(error) => {
+                        return Ok(super::common::business_error_result(
+                            "simulation.divergence",
+                            error.to_string(),
+                        ));
+                    }
+                };
+            authoritative["chain_id"] = args.chain_id.clone().into();
+            // The context is consumed exactly once, after the retained envelope
+            // and routed pair have selected the facts and frame.
+            match self
+                .toolset_governing_outcome(
+                    dispatch_outcome,
+                    context.outer,
+                    &context.toolset,
+                    &context.action,
+                    &authoritative,
+                    &args.chain_id,
+                    Some(&source_adapter),
+                    dest_adapter
+                        .as_ref()
+                        .map(|a| a as &dyn stellar_agent_core::policy::v1::AccountIdentityView),
+                )
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => return error.into_result(),
+            }
+        } else {
+            dispatch_outcome
+        };
+        if let Err(result) = self.stage_canonical(
+            operation.as_mut(),
+            stellar_agent_core::approval::IntentPayload::Pay {
+                destination: args.destination.clone(),
+                asset: stellar_agent_network::operation_entry::intent_asset(&asset),
+                amount_stroops: payment_amount.as_stroops(),
+            },
+            &dispatch_outcome,
         ) {
-            Ok(n) => n,
-            Err(err) => {
-                return Ok(crate::tools::common::business_error_result(
-                    "nonce.mint_failed",
-                    err.to_string(),
-                ));
+            return Ok(result);
+        }
+        // A canonical record stores the envelope its commit would build: its
+        // deadline lies strictly before this decision's end, the earliest end
+        // of the authority a commit resolves that is known here, as the
+        // resolver requires. Only the deadline changes, which no decision
+        // reads.
+        let envelope_xdr = match (built, operation.as_ref()) {
+            (true, Some(operation)) if operation.stages_canonical() => {
+                let (_, end) = match dispatch_outcome.captured_interval() {
+                    Ok(interval) => interval,
+                    Err(error) => return error.into_result(),
+                };
+                let now_ms = stellar_agent_network::mainnet::clock::now_ms()
+                    .map_err(|error| rmcp::ErrorData::internal_error(error.to_string(), None))?;
+                let cap = stellar_agent_network::operation_entry::canonical_max_time_s(now_ms, end);
+                match crate::tools::common::presented_classic_deadline(&envelope_xdr) {
+                    Ok(max_time) if max_time <= cap => envelope_xdr,
+                    Ok(_) => build(Some(cap))?,
+                    Err(result) => return Ok(result),
+                }
             }
+            _ => envelope_xdr,
         };
 
-        let nonce_b64 = nonce.to_base64();
-        let nonce_id_prefix = nonce_id_prefix(&nonce);
-        tracing::info!(
-            tool = "stellar_pay",
-            chain = %args.chain_id,
-            nonce_id = %nonce_id_prefix,
-            decision = "simulated",
-            "Payment simulation complete; nonce minted"
+        let prepared = match self.prepared_envelope(
+            operation.as_ref(),
+            stellar_agent_network::policy_state::OperationTool::StellarPay,
+            stellar_agent_network::policy_state::OperationKind::Pay,
+            envelope_xdr,
+        ) {
+            Ok(prepared) => prepared,
+            Err(result) => return Ok(result),
+        };
+        let envelope_xdr = prepared.xdr;
+        let (source_sequence, fee_per_op_stroops, total_fee_stroops) = prepared.stored.map_or(
+            (source_sequence, fee_per_op_stroops, total_fee_stroops),
+            |facts| {
+                (
+                    facts.source_sequence,
+                    facts.fee_per_op_stroops,
+                    facts.total_fee_stroops,
+                )
+            },
         );
 
         // ── Build asset wire representation ───────────────────────────────────
@@ -960,78 +1713,97 @@ impl WalletServer {
         let memo_json = memo_json(&memo);
 
         // ── Persist pending approval if policy requires it ────────────────────
-        let dispatch_outcome = self
-            .paired_commit_outcome(
-                dispatch_outcome,
-                &envelope_xdr,
-                "stellar_pay_commit",
-                &args.chain_id,
-                Some(&source_adapter),
-                dest_adapter
-                    .as_ref()
-                    .map(|a| a as &dyn stellar_agent_core::policy::v1::AccountIdentityView),
-            )
-            .await;
-
-        // `process_uid_for_attestation` at simulate time is the user running the
-        // MCP server process.  The CLI-side `stellar-agent approve` MUST run as
-        // the same user because the HMAC input binds `process_uid`; an
-        // attestation produced by a different UID fails HMAC verification at
-        // commit time.  This is the cross-account-on-host non-replay binding.
         let approval_block =
             if let DispatchOutcome::RequireApproval(ref approval) = dispatch_outcome {
-                // Derive asset string for summary.
-                let asset_str = match &asset {
-                    stellar_agent_network::Asset::Native => "XLM".to_owned(),
-                    stellar_agent_network::Asset::Credit { code, issuer } => {
-                        format!("{code}:{issuer}")
-                    }
-                    _ => "unknown".to_owned(),
+                let (created_at_ms, expires_at_ms) = match dispatch_outcome.captured_interval() {
+                    Ok(interval) => payment_entry_interval(prepared.handle.as_ref(), interval),
+                    Err(error) => return error.into_result(),
                 };
-                // Derive memo string for summary (None if Memo::None).
-                let memo_summary = memo_summary(&memo);
-
                 let profile_name = self.profile_name_for_approval();
-                match self.persist_pay_pending_approval(
-                    &envelope_xdr,
-                    &args.destination,
-                    amount_stroops_i64,
-                    &asset_str,
-                    memo_summary,
-                    total_fee_stroops,
-                    source_sequence.saturating_add(1),
-                    &profile_name,
-                    &approval.request,
+                let operation = prepared.operation_id.zip(prepared.waiting_end);
+                let queue = if is_toolset {
+                    PaymentQueue::Toolset(operation)
+                } else {
+                    PaymentQueue::Direct(operation)
+                };
+                let entry = match self.payment_pending_approval(
+                    prepared.handle.as_ref(),
+                    dispatch_outcome.audit_decision(),
+                    (created_at_ms, expires_at_ms),
+                    PaymentWrite {
+                        server: self,
+                        envelope_xdr: &envelope_xdr,
+                        interval: (created_at_ms, expires_at_ms),
+                        profile_name: &profile_name,
+                        request: &approval.request,
+                        queue,
+                    },
                 ) {
-                    Ok(entry) => {
-                        let approval_expires = entry.expires_at_unix_ms;
-                        let approval_nonce = entry.approval_nonce.clone();
-                        Some(json!({
-                            "approval_nonce": approval_nonce,
-                            "profile": &profile_name,
-                            "chain_id": self.context.chain_id.caip2_str(),
-                            "expires_at_unix_ms": approval_expires,
-                            "reason": entry.reason,
-                            "summary": {
-                                "to": &args.destination,
-                                "amount_stroops": amount_stroops_i64.to_string(),
-                                "asset": &asset_str,
-                                "memo": memo_summary_for_json(&memo),
-                                "simulated_fee_stroops": total_fee_stroops.to_string(),
-                                "simulated_seq_num": source_sequence + 1,
-                            }
-                        }))
-                    }
-                    Err(e) => {
-                        return Err(rmcp::ErrorData::internal_error(
-                            format!("approval.store_error: {e}"),
-                            None,
-                        ));
-                    }
-                }
+                    Ok(entry) => entry,
+                    Err(error) => return Ok(super::common::ledger_err_result(&error)),
+                };
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => return payment_store_refusal(&error, &profile_name),
+                };
+                Some(json!({
+                    "approval_nonce": entry.approval_nonce,
+                    "profile": &profile_name,
+                    "chain_id": self.context.chain_id.caip2_str(),
+                    "expires_at_unix_ms": entry.expires_at_unix_ms,
+                    "reason": entry.reason,
+                    "summary": payment_approval_summary(&envelope_xdr)?,
+                }))
             } else {
                 None
             };
+
+        // ── Mint nonce ────────────────────────────────────────────────────────
+        let now_ms = now_unix_ms()
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
+        let expiry_unix_ms = now_ms.saturating_add(DEFAULT_NONCE_TTL_MS);
+
+        let nonce = match self.nonce_mint.mint(
+            self.tool_catalogue.as_ref(),
+            envelope_xdr.as_bytes(),
+            now_ms,
+            expiry_unix_ms,
+            "stellar_pay_commit",
+            &args.chain_id,
+        ) {
+            Ok(n) => n,
+            Err(err) => {
+                return Ok(crate::tools::common::business_error_result(
+                    "nonce.mint_failed",
+                    err.to_string(),
+                ));
+            }
+        };
+
+        let nonce_b64 = nonce.to_base64();
+        if let Some(handle) = prepared.handle {
+            let mut issued = self.prepared_payments.lock().await;
+            issued.retain(|_, entry| now_ms < entry.expires);
+            issued.insert(
+                nonce_b64.clone(),
+                PreparedPaymentNonce {
+                    handle,
+                    subject: stellar_agent_core::approval::subject::approval_subject_classic(
+                        &envelope_xdr,
+                    ),
+                    expires: expiry_unix_ms,
+                    consumed: false,
+                },
+            );
+        }
+        let nonce_id_prefix = nonce_id_prefix(&nonce);
+        tracing::info!(
+            tool = "stellar_pay",
+            chain = %args.chain_id,
+            nonce_id = %nonce_id_prefix,
+            decision = "simulated",
+            "Payment simulation complete; nonce minted"
+        );
 
         // ── Build response ────────────────────────────────────────────────────
         let simulation = json!({
@@ -1054,11 +1826,13 @@ impl WalletServer {
             "nonce": &nonce_b64,
             "expires_at_unix_ms": expiry_unix_ms,
             "simulation": simulation,
+            "operational": operational,
         });
         // Inject approval block only for RequireApproval paths; omitted on Allow.
         if let Some(approval) = approval_block {
             view["approval"] = approval;
         }
+        crate::tools::business_entry::echo_business_id(&mut view, business_id.as_ref());
         let envelope = stellar_agent_core::envelope::Envelope::ok(view);
         let json_out = envelope
             .to_json_pretty()
@@ -1073,6 +1847,15 @@ impl WalletServer {
     /// `(nonce, expires_at_unix_ms, envelope_xdr)` triple returned by
     /// `stellar_pay`, plus the original call arguments.
     ///
+    /// A mainnet commit under a `business_id` whose record holds a stored
+    /// intent takes none of the three: the arguments must name that intent,
+    /// and after the destination, memo-requirement and trustline reads it
+    /// rebuilds the envelope from that intent with a fresh sequence and
+    /// deadline at the fee per operation of the prepared envelope, takes its
+    /// authority from the stored record, and verifies no nonce. A toolset
+    /// commit takes the envelope route. Invariants 1 to 4 below hold for
+    /// every envelope-route commit.
+    ///
     /// # Security invariants (same as `stellar_create_account_commit`)
     ///
     /// 1. **Policy re-evaluation on authoritative args:** before calling
@@ -1086,9 +1869,11 @@ impl WalletServer {
     /// 3. **Envelope divergence check:** the envelope is re-built from the
     ///    presented args + current source account state.  Divergence returns
     ///    `simulation.divergence`.
-    /// 4. **Replay prevention:** the nonce salt is recorded in the in-memory
-    ///    `ReplayWindow` after verification.
-    /// 5. **Mainnet refusal:** `destructive_hint = true`.
+    /// 4. **Replay prevention:** the full 48-byte nonce (salt and tag) is
+    ///    recorded in the in-memory `ReplayWindow` after verification.
+    /// 5. **Mainnet admission:** a mainnet commit needs the V1 engine, a
+    ///    verified mainnet policy, and verified enablement. A missing
+    ///    requirement refuses with `network.mainnet_write_forbidden`.
     ///
     /// # Policy-evaluation order
     ///
@@ -1125,10 +1910,10 @@ impl WalletServer {
     ///
     /// # Trustline re-fetch
     ///
-    /// Commit path does NOT re-fetch the trustline.  The HMAC + envelope rebuild
-    /// divergence check covers envelope-bytes drift; a trustline removed between
-    /// simulate and commit will surface as on-chain `op_no_trust`.  Re-fetching
-    /// here would add a round-trip without preventing the race.
+    /// Both commit routes read the source's trustline of the sent asset again,
+    /// on the primary, through `PaymentLedgerFacts::read`, and the oracle
+    /// witness compares that observation. A native payment reads no
+    /// trustline. A failed read refuses with its ledger code.
     ///
     /// # Errors
     ///
@@ -1138,7 +1923,13 @@ impl WalletServer {
     ///   (`simulation.divergence`).
     /// - The policy engine denies the call (mainnet + destructive).
     /// - `chain_id` does not match the profile.
-    /// - `source` or `destination` are invalid G-strkeys.
+    /// - `source` is not a valid G-strkey or `destination` is not a valid G or
+    ///   M strkey.
+    /// - `envelope_xdr` is a contract transfer or `destination` a
+    ///   canonical C contract or W muxed contract
+    ///   (`validation.contract_payment_unavailable`,
+    ///   `validation.contract_payment_memo_unsupported`, or
+    ///   `validation.contract_payment_invalid`; see `contract_payment_refusal`).
     /// - The nonce is expired, replayed, or HMAC-mismatched.
     /// - The re-built envelope diverges from `envelope_xdr`.
     /// - The signing key does not match the source account.
@@ -1153,9 +1944,14 @@ impl WalletServer {
     #[tool(
         name = "stellar_pay_commit",
         description = "Sign and submit a Payment transaction (commit step). \
-                       Requires the nonce, expires_at_unix_ms, and envelope_xdr returned \
-                       by stellar_pay. Verifies the nonce, re-builds the envelope, \
-                       re-checks SEP-29, \
+                       Takes the nonce, expires_at_unix_ms, and envelope_xdr returned \
+                       by stellar_pay. A mainnet commit of an intent stored under \
+                       business_id needs none of the three and rebuilds the envelope from \
+                       that intent at the fee per operation of the prepared envelope; \
+                       every other commit requires them and verifies the nonce. Also pass \
+                       approval_nonce and approval_attestation when the simulate step \
+                       returned an approval block. Pass business_id on mainnet. Re-builds \
+                       the envelope, re-checks SEP-29, \
                        obtains the cross-check witness, signs via keyring, and submits. \
                        Returns {tx_hash, ledger, cross_check}. \
                        On submission.tx_timeout the outcome is unknown: pass \
@@ -1171,40 +1967,115 @@ impl WalletServer {
         self.stellar_pay_commit_impl(args, None).await
     }
 
-    /// Inner implementation of `stellar_pay_commit`.
+    /// Commits a payment with an optional verified toolset invocation.
+    /// The routed and outer policies govern consent and the shortest end.
+    /// Proof verification precedes the lease; the lease precedes nonce use
+    /// and remains held until submission returns.
     ///
-    /// Separated from the public tool handler so the toolset-gated path
-    /// (`invoke_stellar_pay_commit_toolset_gated`) can supply a forced
-    /// `DispatchOutcome::RequireApproval` override.
-    ///
-    /// When `forced_dispatch_outcome` is `Some(outcome)`, the supplied outcome
-    /// replaces the policy-engine result AFTER the chain_id check still runs via
-    /// `dispatch_gate`.  The `Allow` no-op shortcut in `verify_attestation_gate`
-    /// is therefore bypassed unconditionally for toolset-routed
-    /// payments, making per-action approval cryptographically enforced regardless
-    /// of what the policy engine returns.
-    ///
-    /// When `forced_dispatch_outcome` is `None`, the behaviour is identical to
-    /// the original public handler (policy-engine outcome drives attestation gate).
-    ///
-    /// # Security
-    ///
-    /// The forced override is the load-bearing per-action-approval mechanism.
-    /// Do NOT pass `None` from the toolset-gated routing arm.
+    /// With a context, a required approval without a proof queues on both
+    /// chains before any nonce, hold, or key use. On mainnet it binds the
+    /// operation this process prepared for the nonce; a nonce without that
+    /// entry refuses `nonce.expired` before any queue write. Without a
+    /// context, admission, the routed gate and pair, proof or mainnet
+    /// authority, the nonce, signing, and submission still run; outer
+    /// composition, queueing, and the lease do not.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn stellar_pay_commit_impl(
         &self,
         args: StellarPayCommitArgs,
-        forced_dispatch_outcome: Option<super::common::DispatchOutcome>,
+        mut toolset: Option<ToolsetPaymentContext>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // Structural mainnet refusal, keyed on the server's profile context:
-        // before the policy gate, any key access, and any RPC request, on the
-        // tool route and the toolset route alike.
-        if self.context.chain_id.is_mainnet() {
-            return Ok(super::common::mainnet_write_forbidden_result());
-        }
+        let mainnet = if self.context.chain_id.is_mainnet() {
+            match self
+                .mainnet_write_admission(stellar_agent_network::mainnet::MainnetConsumer::McpPay)
+            {
+                Ok(guard) => Some(guard),
+                Err(result) => return Ok(result),
+            }
+        } else {
+            None
+        };
 
         let (asset, payment_amount) = args.parse_asset_and_amount()?;
+
+        if let Some(guard) = &mainnet
+            && let Err(result) = self.verify_mainnet_freshness(guard)
+        {
+            return Ok(result);
+        }
+        if let Some(refusal) = contract_payment_refusal(
+            self.context.chain_id,
+            &args.destination,
+            args.has_memo(),
+            args.envelope_xdr.as_deref(),
+            Some(&asset),
+        ) {
+            return Ok(refusal);
+        }
+        use crate::tools::business_entry::{CommitRoute, EnvelopeFields};
+        let fields = EnvelopeFields {
+            envelope_xdr: args.envelope_xdr.as_deref(),
+            nonce: args.nonce.as_deref(),
+            expires_at_unix_ms: args.expires_at_unix_ms,
+        };
+        // A toolset commit runs the envelope route, whose routed policies,
+        // lease and protocol nonce it needs.
+        let (envelope_xdr, nonce_b64, expires_at_unix_ms) = match self.commit_route(
+            "stellar_pay_commit",
+            mainnet.as_ref().filter(|_| toolset.is_none()),
+            &args.chain_id,
+            args.business_id.as_deref(),
+            fields,
+        ) {
+            CommitRoute::Canonical(guard, business_id) => {
+                return self
+                    .pay_canonical(guard, &args, (&asset, payment_amount), business_id)
+                    .await;
+            }
+            CommitRoute::Answer(result) => return Ok(result),
+            CommitRoute::Envelope {
+                envelope_xdr,
+                nonce,
+                expires_at_unix_ms,
+            } => (envelope_xdr, nonce, expires_at_unix_ms),
+        };
+        // A toolset commit continues a canonical record only for its stored
+        // intent, whose consent its proof then presents. A record that does
+        // no further work answers with its stored state, as the canonical
+        // lookup gives it. The arguments name the stored intent, and the
+        // presented envelope is one the record's preparation bound, so the
+        // envelope's intent is the stored one; the nonce check below proves
+        // that this server prepared it.
+        let stored_intent = match (&mainnet, &toolset) {
+            (Some(guard), Some(_)) => match self.canonical_slot_id(args.business_id.as_deref()) {
+                Some(id) => {
+                    let memo = match parse_memo_fields(
+                        args.memo_text.as_ref().map(McpMemoTextArgument::as_str),
+                        args.memo_id,
+                        args.memo_hash_hex.as_deref(),
+                        args.memo_return_hex.as_deref(),
+                    ) {
+                        Ok(memo) => memo,
+                        Err(err) => return Ok(commit_path_error_result(err)),
+                    };
+                    match self.canonical_commit_target(guard.policy, id, &args.source, |intent| {
+                        names_intent(intent, &args, (&asset, payment_amount), &memo)
+                    }) {
+                        Ok(target) => {
+                            if let Err(result) =
+                                self.canonical_envelope(&target.business_id, envelope_xdr)
+                            {
+                                return Ok(result);
+                            }
+                            Some(target.intent)
+                        }
+                        Err(result) => return Ok(result),
+                    }
+                }
+                None => None,
+            },
+            _ => None,
+        };
 
         // ── Re-derive authoritative args from HMAC-bound envelope_xdr ────────
         //
@@ -1217,16 +2088,14 @@ impl WalletServer {
         // Failure modes:
         // - XDR decode failure → `simulation.divergence` (covers base64 errors,
         //   malformed XDR, wrong op count, op-kind mismatch).
-        // - `Memo::Hash` / `Memo::Return` → decode succeeds with `memo: null`.
-        //   A tampered Hash memo XDR is caught by the envelope-rebuild divergence
-        //   check below instead (the re-built envelope uses `Memo::None`,
-        //   differing from the Hash-memo XDR).
+        // - Every memo kind keeps its exact signed value in policy facts.
+        //   The envelope rebuild also checks the caller's memo against the XDR.
         //
         // The `chain_id` field is not encoded in XDR; it is injected from
         // `args.chain_id` after the decode.  The CAIP-2 check in dispatch_gate
         // validates it against the profile.
         let mut authoritative_args =
-            match decode_authoritative_args(&args.envelope_xdr, "stellar_pay_commit") {
+            match decode_authoritative_args(envelope_xdr, "stellar_pay_commit") {
                 Ok(a) => a,
                 Err(e) => {
                     tracing::debug!(
@@ -1244,18 +2113,18 @@ impl WalletServer {
         // The call supplies chain_id because XDR contains no chain identifier.
         authoritative_args["chain_id"] = serde_json::Value::String(args.chain_id.clone());
 
-        // ── Validate G-strkeys ────────────────────────────────────────────────
+        // ── Validate strkeys: a G source and a G or M destination ────────────
         // Runs BEFORE the account fetch below: `fetch_account` itself parses
-        // `args.source`/`args.destination` via the same strkey check and would
-        // otherwise surface a malformed value as a redacted RPC-error business
-        // envelope instead of this dedicated `invalid_params` protocol error.
+        // `args.source` and the destination base via the same strkey check and
+        // would otherwise surface a malformed value as a redacted RPC-error
+        // business envelope instead of this dedicated `invalid_params` error.
         validate_g_strkey(&args.source, "source")?;
-        validate_g_strkey(&args.destination, "destination")?;
+        let destination = validate_payment_destination(&args.destination, "destination")?;
 
         // Policy evaluates the account state that also supplies the rebuild's
         // sequence number. No nonce consumption, approval write or signing
         // occurs before the gate.
-        let client = match self.context.primary_client() {
+        let client = match self.write_primary_client() {
             Ok(c) => c,
             Err(err) => return crate::tools::common::rpc_client_failure(&err),
         };
@@ -1265,15 +2134,37 @@ impl WalletServer {
         // rebuilt envelope that is signed, and the account views feed the
         // policy gate. A refusal here consumes no nonce, so the caller can
         // correct the endpoint and retry with the same approval.
-        if let Err(e) = crate::tools::common::probe_endpoint_network(
-            &client,
-            &self.context,
-            crate::tools::common::submit_timeout(&self.profile),
-        )
-        .await
+        if let Err(e) = self
+            .probe_write_endpoint(
+                &client,
+                tokio::time::Instant::now() + stellar_agent_network::PRE_SEND_BUDGET,
+            )
+            .await
         {
             return Ok(crate::tools::common::endpoint_refusal_result(&e));
         }
+
+        // ── Business id ───────────────────────────────────────────────────────
+        // A mainnet call names its operation; the id is checked after the
+        // argument and endpoint refusals above, so their codes stay. A
+        // retained operation answers here with its stored state, before the
+        // approval verification, the envelope rebuild and the nonce
+        // consumption. A commit retried after a lost reply thus does no new
+        // work.
+        let business_id = match self.entry_business_id(&args.chain_id, args.business_id.as_deref())
+        {
+            Ok(id) => id,
+            Err(result) => return Ok(result),
+        };
+        let admitted_operation = match self.classic_commit_lookup(
+            mainnet.as_ref().map(|guard| guard.policy),
+            stellar_agent_network::policy_state::OperationKind::Pay,
+            business_id.as_ref(),
+            envelope_xdr,
+        ) {
+            Ok(operation) => operation,
+            Err(result) => return Ok(result),
+        };
 
         let account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
             &self.sequence_floor,
@@ -1300,16 +2191,36 @@ impl WalletServer {
         // simulate phase): a not-yet-created destination has no
         // `home_domain`, so `identity_view` is `None`. Any other read error
         // refuses with its own code, so a transient primary failure is never
-        // taken for absence and compared against the oracle as such.
-        let dest_view = match fetch_account(&client, &args.destination, &[]).await {
-            Ok(view) => Some(view),
-            Err(stellar_agent_core::WalletError::Network(
-                stellar_agent_core::error::NetworkError::AccountNotFound { .. },
-            )) => None,
-            Err(err) => return Ok(ledger_err_result(&err)),
+        // taken for absence and compared against the oracle as such. An M
+        // destination reads its G base account. The memo requirement and the
+        // send-asset trustline feed the oracle witness.
+        let facts = match PaymentLedgerFacts::read(
+            &client,
+            &args.source,
+            &destination,
+            &asset,
+            args.has_memo(),
+        )
+        .await
+        {
+            Ok(facts) => facts,
+            Err(result) => return Ok(result),
+        };
+        let floor = match self
+            .classic_floor_source(
+                &client,
+                &args.source,
+                &["stellar_pay_commit", "stellar_pay"],
+            )
+            .await
+        {
+            Ok(floor) => floor,
+            Err(error) => return error.into_result(),
         };
         let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
-        let dest_adapter = dest_view
+        let source_view = FloorSource::view_or(floor.as_ref(), &source_adapter);
+        let dest_adapter = facts
+            .destination
             .as_ref()
             .map(crate::policy_adapter::AccountViewAdapter::new);
         let identity_view = dest_adapter
@@ -1320,126 +2231,150 @@ impl WalletServer {
         // destructive_hint = true → engine evaluates per profile.policy.engine;
         // Noop refuses on mainnet, V1 evaluates typed criteria.
         //
-        // When `forced_dispatch_outcome` is Some, the caller (toolset-gated path)
-        // has already computed a RequireApproval outcome that MUST be used
-        // instead of the policy-engine result.  We still call dispatch_gate to
-        // preserve the chain_id validation and Deny arm — but if
-        // forced_dispatch_outcome overrides Allow, the allow no-op in
-        // verify_attestation_gate is bypassed.
-        // Effects sized by the gate, retained even when the toolset-gated path
-        // overrides Allow with a forced RequireApproval: the post-submit audit
-        // row must carry the legs the gate sized (single-derivation invariant).
-        let mut overridden_gate_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
-            None;
-        let dispatch_outcome = match forced_dispatch_outcome {
-            Some(forced) => {
-                // Still run dispatch_gate for chain_id validation + Deny check;
-                // override Allow with the forced outcome if the gate does not deny.
-                let gate_outcome = match self
-                    .dispatch_gate_with_views(
-                        "stellar_pay_commit",
-                        &authoritative_args,
-                        &args.chain_id,
-                        Some(&source_adapter),
-                        identity_view,
-                    )
-                    .await
-                {
-                    Ok(o) => o,
-                    Err(e) => return e.into_result(),
-                };
-                match gate_outcome {
-                    super::common::DispatchOutcome::Allow(effects) => {
-                        // Override: policy said Allow but toolset-gated path forces RequireApproval.
-                        overridden_gate_effects = effects;
-                        tracing::debug!(
-                            tool = "stellar_pay_commit",
-                            "toolset_gated: overriding DispatchOutcome::Allow → forced RequireApproval"
-                        );
-                        forced
-                    }
-                    // Deny and RequireApproval from the engine are honoured as-is.
-                    other => other,
-                }
-            }
-            None => {
-                // Normal path: use the policy-engine outcome directly.
-                match self
-                    .dispatch_gate_with_views(
-                        "stellar_pay_commit",
-                        &authoritative_args,
-                        &args.chain_id,
-                        Some(&source_adapter),
-                        identity_view,
-                    )
-                    .await
-                {
-                    Ok(o) => o,
-                    Err(e) => return e.into_result(),
-                }
-            }
-        };
-
-        // ── Attestation verification gate ────────────────────────────────────
-        //
-        // Placed BEFORE nonce parse to:
-        //   (a) Ensure the attestation gate fires before nonce HMAC+replay.
-        //   (b) Avoid expensive nonce-HMAC operations when the attestation is
-        //       absent or forged (fail-fast principle). The source (+
-        //       optionally destination) account fetch runs before the policy
-        //       gate because the gate consumes its `account_view` /
-        //       `identity_view`.
-        //   (c) Make toolset-gated tests practical: the `forced_dispatch_outcome`
-        //       override causes this gate to ALWAYS run for toolset-routed payments
-        //       regardless of policy, so tests can verify the gate fires without
-        //       needing a live RPC.
-        //
-        // Ordering note: `stellar_create_account_commit` runs this gate AFTER its
-        // cross-check witness (there is no toolset-gated variant to test without
-        // RPC, so no motivation to hoist it above that work).  The ordering
-        // invariant is satisfied in both tools: this gate fires before nonce
-        // HMAC+replay either way.
-        //
-        // This is a no-op when `dispatch_outcome` is `DispatchOutcome::Allow`.
-        // For the toolset-gated path, `forced_dispatch_outcome = Some(RequireApproval)`
-        // makes it ALWAYS active.
-        if let Err(result) = verify_attestation_gate(
-            self,
-            &dispatch_outcome,
-            super::common::GatedApprovalKind::Payment,
-            &args.envelope_xdr,
-            args.approval_nonce.as_deref(),
-            args.approval_attestation.as_deref(),
-            "stellar_pay_commit",
-        )
-        .await
+        let dispatch_outcome = match self
+            .dispatch_gate_with_views(
+                "stellar_pay_commit",
+                &authoritative_args,
+                &args.chain_id,
+                Some(source_view),
+                identity_view,
+            )
+            .await
         {
-            return Ok(result);
+            Ok(outcome) => outcome,
+            Err(error) => return error.into_result(),
+        };
+        // On mainnet the stricter decision of this commit and its
+        // preparation governs.
+        let dispatch_outcome = match self
+            .commit_governing_outcome(
+                dispatch_outcome,
+                "stellar_pay",
+                &authoritative_args,
+                &args.chain_id,
+                Some(source_view),
+                identity_view,
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return error.into_result(),
+        };
+        let dispatch_outcome = match toolset.as_mut() {
+            Some(context) => match self
+                .toolset_governing_outcome(
+                    dispatch_outcome,
+                    context.outer.take(),
+                    &context.toolset,
+                    &context.action,
+                    &authoritative_args,
+                    &args.chain_id,
+                    Some(&source_adapter),
+                    identity_view,
+                )
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => return error.into_result(),
+            },
+            None => dispatch_outcome,
+        };
+        // A toolset payment that requires approval and carries no proof
+        // queues the envelope's approval before any nonce, hold, or key use.
+        if toolset.is_some()
+            && !(args.approval_nonce.is_some() && args.approval_attestation.is_some())
+            && let DispatchOutcome::RequireApproval(approval) = &dispatch_outcome
+        {
+            return self
+                .queue_toolset_payment(
+                    (envelope_xdr, nonce_b64, expires_at_unix_ms),
+                    &dispatch_outcome,
+                    &approval.request,
+                )
+                .await;
         }
 
-        // Extract the gate-sized legs for the post-submit audit row: the SAME
-        // ValueEffects the policy gate evaluated (single-derivation invariant),
-        // threaded from the dispatch outcome — or, on the toolset-gated forced
-        // path, from the Allow the override displaced. Empty when the engine
-        // sized no value (the row then records an unsized allow).
-        // Resolved once and reused for BOTH the audit row's legs and the
-        // pre-send window reservation, which confirmation settles.
-        let gate_value_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
-            match &dispatch_outcome {
-                super::common::DispatchOutcome::Allow(Some(effects)) => Some(effects.clone()),
-                super::common::DispatchOutcome::RequireApproval(approval) => approval
-                    .value_effects
-                    .clone()
-                    .or_else(|| overridden_gate_effects.clone()),
-                _ => overridden_gate_effects.clone(),
-            };
-        let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = gate_value_effects
+        // Policy-required consent verifies before nonce HMAC and replay use.
+        // Mainnet Allow obtains policy authority through the same wrapper.
+        let mut witness: Option<stellar_agent_core::approval::witness::ApprovalWitness> = None;
+        let expected = match &stored_intent {
+            Some(intent) => stellar_agent_core::approval::witness::ApprovalExpectation {
+                kind: intent.approved_kind(),
+                subject: *intent.digest().as_bytes(),
+            },
+            None => super::common::GatedApprovalKind::Payment.expectation(
+                stellar_agent_core::approval::subject::approval_subject_classic(envelope_xdr),
+            ),
+        };
+        let authority = if mainnet.is_some() {
+            match super::common::mainnet_authority(
+                self,
+                &dispatch_outcome,
+                expected,
+                stored_intent.as_ref(),
+                &super::common::SuppliedProof {
+                    nonce: args.approval_nonce.clone(),
+                    attestation: args.approval_attestation.clone(),
+                },
+                admitted_operation,
+                "stellar_pay_commit",
+                &mut witness,
+            )
+            .await
+            {
+                Ok(authority) => Some(authority),
+                Err(refusal) => {
+                    return Ok(super::common::authority_refusal_result(self, refusal));
+                }
+            }
+        } else {
+            match verify_attestation_gate(
+                self,
+                &dispatch_outcome,
+                super::common::GatedApprovalKind::Payment,
+                envelope_xdr,
+                args.approval_nonce.as_deref(),
+                args.approval_attestation.as_deref(),
+                "stellar_pay_commit",
+            )
+            .await
+            {
+                Ok(_) => None,
+                Err(result) => return Ok(result),
+            }
+        };
+        let provenance = dispatch_outcome
+            .mainnet_decision()
+            .map(stellar_agent_core::mainnet::decision::MainnetDecision::provenance);
+
+        // The routed effects feed both payment audit and hold sizing.
+        let gate_value_effects = match &dispatch_outcome {
+            DispatchOutcome::Allow(allowed) => allowed.value_effects.clone(),
+            DispatchOutcome::RequireApproval(approval) => approval.value_effects.clone(),
+        };
+        #[cfg(any(test, feature = "test-helpers"))]
+        let gate_value_effects = sized_effects_hook::take().or(gate_value_effects);
+        // A payment leg with a destination records the SHA-256 of the
+        // complete destination and its redaction, never the clear text.
+        let audit_legs = gate_value_effects
             .as_ref()
-            .map(|effects| effects.legs().iter().map(Into::into).collect())
-            .unwrap_or_default();
+            .map_or(&[][..], |effects| effects.legs())
+            .iter()
+            .map(|leg| {
+                if leg.destination.is_some() {
+                    stellar_agent_core::audit_log::ValueLegRecord::from_payment_leg(leg)
+                } else {
+                    Ok(leg.into())
+                }
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let audit_legs = match audit_legs {
+            Ok(legs) => legs,
+            Err(err) => return Ok(crate::tools::common::ledger_err_result(&err)),
+        };
 
         // Syntax parsing follows the policy gate; it consumes no nonce.
-        let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
+        let nonce = match stellar_agent_nonce::Nonce::from_base64(nonce_b64) {
             Ok(n) => n,
             Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
         };
@@ -1480,13 +2415,20 @@ impl WalletServer {
             .ok_or_else(|| {
                 rmcp::ErrorData::internal_error("internal_error: operation count is zero", None)
             })?;
-        if let Err(err) = check_classic_fee_cap(
+        if let Err(err) = self.check_write_fee(
             fee_per_op_stroops,
             stellar_agent_core::error::FeeSource::Envelope,
-            &self.profile,
         ) {
             return Ok(ledger_err_result(&err));
         }
+        let presented_deadline = if self.context.chain_id.is_mainnet() {
+            match crate::tools::common::presented_classic_deadline(envelope_xdr) {
+                Ok(max_time) => Some(max_time),
+                Err(result) => return Ok(result),
+            }
+        } else {
+            None
+        };
         let mut builder = ClassicOpBuilder::new(
             &args.source,
             source_sequence,
@@ -1499,13 +2441,16 @@ impl WalletServer {
         if let Err(err) = builder.memo(&memo) {
             return Ok(commit_path_error_result(err));
         }
+        if let Some(max_time) = presented_deadline {
+            builder.with_presented_deadline(max_time);
+        }
         let rebuilt_envelope_xdr = match builder.build() {
             Ok(xdr) => xdr,
             Err(err) => return Ok(commit_path_error_result(err)),
         };
 
         // ── Envelope divergence check ────────────────────────────────────────
-        if rebuilt_envelope_xdr != args.envelope_xdr {
+        if rebuilt_envelope_xdr != envelope_xdr {
             return Ok(crate::tools::common::business_error_result(
                 "simulation.divergence",
                 "re-built envelope does not match presented envelope_xdr; \
@@ -1513,16 +2458,6 @@ impl WalletServer {
             ));
         }
 
-        let memo_observation = match check_memo_required(
-            &client,
-            &args.destination,
-            !matches!(memo, stellar_xdr::Memo::None),
-        )
-        .await
-        {
-            Ok(observation) => observation,
-            Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
-        };
         // `Asset::parse` accepted the authoritative asset above under the same
         // code and issuer rules, so these refusals answer with its code.
         let unparseable_asset = || {
@@ -1540,37 +2475,18 @@ impl WalletServer {
                 Ok(observation) => observation,
                 Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
             };
-        let trustline =
-            match stellar_agent_network::cross_check::TrustlineObservation::read_send_asset(
-                &client,
-                &args.source,
-                &asset,
+        let witness_inputs = facts.witness_inputs(source_observation, &destination);
+        let cross_check = match self
+            .classic_witness(
+                stellar_agent_core::cross_check::CrossCheckValue::Amount {
+                    asset: &witness_asset,
+                    base_units: i128::from(payment_amount.as_stroops()),
+                },
+                witness_inputs,
+                envelope_xdr,
+                "stellar_pay_commit",
             )
             .await
-            {
-                Ok(trustline) => trustline,
-                Err(err) => return Ok(ledger_err_result(&err)),
-            };
-        let witness_inputs = stellar_agent_network::cross_check::PayWitnessInputs {
-            source: source_observation,
-            destination: stellar_agent_network::cross_check::DestinationObservation::from_view(
-                &args.destination,
-                dest_view.as_ref(),
-            ),
-            memo: memo_observation,
-            trustline,
-        };
-        let cross_check = match stellar_agent_network::cross_check::obtain_classic_witness(
-            &self.profile,
-            &self.context,
-            stellar_agent_core::cross_check::CrossCheckValue::Amount {
-                asset: &witness_asset,
-                base_units: i128::from(payment_amount.as_stroops()),
-            },
-            witness_inputs,
-            "stellar_pay_commit",
-        )
-        .await
         {
             Ok(outcome) => outcome,
             Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
@@ -1592,13 +2508,9 @@ impl WalletServer {
         // Proves the profile's audit chain-root key is acquirable BEFORE the
         // nonce below is consumed, the signer is loaded, or the transaction is
         // submitted — a refusal here burns no nonce/replay-window attestation.
-        // Reused (not re-acquired) for the post-confirm `value_action_submitted`
-        // row.
-        let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
-            &self.profile,
-            &self.profile_name_for_approval(),
-            self.audit_binding,
-        ) {
+        // The submission recorder reuses it (not re-acquired) for the
+        // `value_action_pending` row it writes before the send.
+        let (audit_writer, audit_readiness) = match self.write_audit() {
             Ok(w) => w,
             Err(err) => {
                 let envelope = stellar_agent_core::envelope::Envelope::<()>::err(&err);
@@ -1611,6 +2523,17 @@ impl WalletServer {
             }
         };
 
+        // The grant lease holds off every grant and installation writer from
+        // here until submission returns; the nonce helper checks the grant's
+        // end again under the replay mutex.
+        let restriction = match toolset {
+            Some(context) => match self.lease_toolset_grant(&context, &authoritative_args) {
+                Ok(lease) => Some(self.toolset_restriction(lease)),
+                Err(result) => return Ok(result),
+            },
+            None => None,
+        };
+
         // Delegates to `commit_envelope_and_verify_nonce` in `tools/common.rs`.
         // Same split-phase pattern as stellar_create_account_commit; all wire
         // codes and indistinguishability invariants are preserved inside the
@@ -1619,108 +2542,57 @@ impl WalletServer {
             &self.nonce_mint,
             &self.replay_window,
             &nonce,
-            &args.envelope_xdr,
-            args.expires_at_unix_ms,
+            envelope_xdr,
+            expires_at_unix_ms,
             &args.chain_id,
             "stellar_pay_commit",
             now_ms,
+            restriction.as_ref(),
         )
         .await
         {
             return e.into_result();
         }
 
-        // ── Load signer handle from keyring ───────────────────────────────────
-        let handle = match enrolled_keyring_signer(
-            &self.profile_name_for_approval(),
-            &self.profile,
-            &args.source,
-        )
-        .await
+        if let Some(prepared) = self
+            .prepared_payments
+            .lock()
+            .await
+            .get_mut(&nonce.to_base64())
         {
-            Ok(h) => h,
-            Err(err) => {
-                let envelope = stellar_agent_core::envelope::Envelope::<()>::err(&err);
-                let json = envelope
-                    .to_json_pretty()
-                    .unwrap_or_else(|_| String::from("{}"));
-                let mut result = CallToolResult::success(vec![Content::text(json)]);
-                result.is_error = Some(true);
-                return Ok(result);
-            }
-        };
-
-        // ── Wallet unlock for mlock-protected signing window ─────────────────
-        //
-        // `KeyringSignHandle` intentionally does not expose seed bytes — its
-        // design loads the secret per-call within `sign_tx_payload` and zeroes
-        // it immediately (per-call-handle discipline).  There is therefore no
-        // seed bytes to pass to `Wallet::unlock` at this integration stage.  The
-        // actual signing still runs via `handle`.
-        //
-        // Deeper integration would refactor the signing pipeline so the keyring
-        // secret is loaded once into a `Wallet`-held `LockedSeed` and then
-        // consumed by `attach_signature`, making the mlock-protected region
-        // genuinely cover the signing input.  This requires a new
-        // `signer_from_wallet(&Wallet)` entry point in stellar-agent-network.
-        //
-        // For now, log the mlock posture from the profile so the operator has
-        // visibility into what would happen when the deeper integration lands.
-        {
-            let mlock_req = self.profile.wallet.mlock_required;
-            tracing::debug!(
-                profile = %self.profile_name_for_approval(),
-                mlock_required = ?mlock_req,
-                "stellar_pay_commit: Wallet::unlock deferred pending signer-from-wallet \
-                 integration; signing proceeds via KeyringSignHandle"
-            );
+            prepared.consumed = true;
         }
-        // Declare _wallet_guard as None for now so the explicit drop below
-        // compiles and the audit trail is obvious.
-        let _wallet_guard: Option<Wallet> = None;
 
-        // ── Sign envelope (single SEP-23 call site) ──────────────────────────
-        let signed_xdr = match attach_signature(
-            &args.envelope_xdr,
-            &handle,
-            self.context.network_passphrase(),
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(err) => {
-                let envelope = stellar_agent_core::envelope::Envelope::<()>::err(&err);
-                let json = envelope
-                    .to_json_pretty()
-                    .unwrap_or_else(|_| String::from("{}"));
-                let mut result = CallToolResult::success(vec![Content::text(json)]);
-                result.is_error = Some(true);
-                return Ok(result);
-            }
+        // The record the preparation opened; a retained operation answers
+        // here with its stored state.
+        let operation = match self.classic_commit_entry(
+            mainnet.as_ref().map(|guard| guard.policy),
+            stellar_agent_network::policy_state::OperationKind::Pay,
+            business_id.as_ref(),
+            envelope_xdr,
+        ) {
+            Ok(operation) => operation,
+            Err(result) => return Ok(result),
         };
-
-        // Explicit dispose of wallet guard after signing (RAII also fires on
-        // scope exit, but explicit is clearer for auditability).
-        drop(_wallet_guard);
 
         let nonce_id_prefix = nonce_id_prefix(&nonce);
-
-        // ── Record before submit ──────────────────────────────────────────────
-        //
-        // The recorder writes the receipt, the pending audit row and the
-        // spending-window reservation immediately before the bytes leave, and
-        // settles all three against what the network answers. The window
-        // entries it reserves come from the gate_value_effects the audit rows
-        // carry. The recorder binds the descriptor the gate evaluated against.
         let value_class = gate_value_effects
             .clone()
             .map(stellar_agent_core::policy::v1::ValueClass::Value)
             .unwrap_or(stellar_agent_core::policy::v1::ValueClass::ReadOnly);
         let floor_hook = crate::sequence_floor::hook(&self.sequence_floor);
-        let recorder = match crate::tools::submission_record::build_recorder(
+        match crate::tools::submission_record::sign_and_submit_classic(
+            self,
+            mainnet.as_ref(),
+            authority.as_ref(),
+            audit_readiness,
+            stellar_agent_network::mainnet::MainnetConsumer::McpPay,
+            &client,
+            envelope_xdr,
+            &args.source,
             crate::tools::submission_record::CommitRecord {
                 policy_decision: dispatch_outcome.audit_decision(),
-                profile: &self.profile,
+                profile: self.security_profile(),
                 profile_name: self.profile_name_for_approval(),
                 tool: "stellar_pay_commit",
                 chain_id: args.chain_id.to_string(),
@@ -1733,26 +2605,12 @@ impl WalletServer {
                 approval_nonce: args.approval_nonce.clone(),
                 approval_dir: self.resolve_approval_dir().ok(),
                 now_ms,
+                provenance,
             },
+            cross_check.witness(),
             Some(&floor_hook),
-        ) {
-            Ok(r) => r.with_witness(cross_check.witness()),
-            Err(err) => {
-                return Ok(crate::tools::submission_record::submission_error_result(
-                    &err,
-                    &signed_xdr,
-                ));
-            }
-        };
-
-        // ── Submit ────────────────────────────────────────────────────────────
-        match submit_transaction_and_wait(
-            &client,
-            &signed_xdr,
-            submit_timeout(&self.profile),
-            self.context.network_passphrase(),
-            Some(SubmissionSignerKind::Keyring),
-            Some(&recorder),
+            operation.as_ref(),
+            restriction,
         )
         .await
         {
@@ -1767,246 +2625,32 @@ impl WalletServer {
                     "stellar_pay_commit: tx submitted"
                 );
 
-                let view = json!({
+                let mut view = json!({
                     "tx_hash": tx_hash,
                     "cross_check": cross_check.view(),
                     "ledger": ledger,
                 });
+                // The sent envelope equals the one rebuilt from the validated
+                // arguments, so its destination is the payment's complete one.
+                if let (Some(view), Ok(serde_json::Value::Object(fields))) = (
+                    view.as_object_mut(),
+                    serde_json::to_value(stellar_agent_core::profile::receipt::DestinationFields(
+                        stellar_agent_network::operation_entry::envelope_result_destinations(
+                            envelope_xdr,
+                        ),
+                    )),
+                ) {
+                    view.extend(fields);
+                }
+                crate::tools::business_entry::echo_business_id(&mut view, business_id.as_ref());
                 let envelope = stellar_agent_core::envelope::Envelope::ok(view);
                 let json_out = envelope
                     .to_json_pretty()
                     .unwrap_or_else(|_| String::from("{}"));
                 Ok(CallToolResult::success(vec![Content::text(json_out)]))
             }
-            Err(err) => Ok(crate::tools::submission_record::submission_error_result(
-                &err,
-                &signed_xdr,
-            )),
+            Err(result) => Ok(result),
         }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Toolset-dispatch helper
-// ─────────────────────────────────────────────────────────────────────────────
-
-impl WalletServer {
-    /// Invoke `stellar_pay` (simulate step) by value, bypassing the rmcp
-    /// transport layer.
-    ///
-    /// Used by the toolset-invocation routing path (`tools/toolsets.rs`).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`WalletServer::stellar_pay`].
-    pub(crate) async fn invoke_stellar_pay(
-        &self,
-        args: StellarPayArgs,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.stellar_pay(Parameters(args)).await
-    }
-
-    /// Invokes `stellar_pay_commit` for a toolset-gated signing-adjacent path
-    /// with the per-action `PaymentSimulated` approval FORCED ON unconditionally.
-    ///
-    /// The toolset resolver has validated the asset and amount through
-    /// [`parse_asset_and_amount`] before either gate, so an invalid amount
-    /// reaches no approval.
-    ///
-    /// Unlike direct `stellar_pay_commit` which is a no-op when policy returns
-    /// `Allow`, this wrapper FORCES the `RequireApproval` path by:
-    ///
-    /// 1. Running `decode_authoritative_args` on `args.envelope_xdr`.
-    /// 2. If `args.approval_nonce` and `args.approval_attestation` are absent,
-    ///    synthesise a `PaymentSimulated` `PendingApproval` queue entry and
-    ///    return `policy.approval_required`. The operator approves via
-    ///    `stellar-agent approve --id <nonce> --profile <profile>`.
-    ///    The error payload carries the approval nonce.
-    /// 3. If approval fields ARE present → delegate to the normal `stellar_pay_commit`
-    ///    handler which will verify the attestation.
-    ///
-    /// # Security
-    ///
-    /// A `DispatchOutcome::Allow` from the policy engine is NEVER a shortcut
-    /// for toolset-gated payments.  The per-action approval ALWAYS fires.
-    pub(crate) async fn invoke_stellar_pay_commit_toolset_gated(
-        &self,
-        args: StellarPayCommitArgs,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
-        use super::common::approval_required_indistinguishable;
-        use stellar_agent_core::approval::{
-            DEFAULT_TTL_MS, PendingApproval, process_uid_for_attestation,
-        };
-        use stellar_agent_core::profile::schema::default_approval_dir;
-
-        // ── Forced approval check ─────────────────────────────────────────────
-        //
-        // If approval_nonce + approval_attestation are ABSENT, the policy engine
-        // returned Allow (no approval was queued yet).  We MUST force the
-        // RequireApproval path: synthesise a PaymentSimulated pending approval,
-        // persist it, and return policy.approval_required.
-        //
-        // If they ARE present, delegate to the normal stellar_pay_commit flow
-        // which will verify the attestation (the approval was cleared by
-        // `stellar-agent approve --id <nonce> --profile <profile>`).
-        // approval_nonce + approval_attestation are expected to come from a
-        // previously-queued and operator-approved PaymentSimulated pending
-        // approval (synthesised by the `!has_approval` branch below on the prior
-        // invocation).  We MUST verify them against the stored entry — we CANNOT
-        // delegate to `stellar_pay_commit` with the normal dispatch flow because
-        // `verify_attestation_gate` is a no-op when the policy engine returns Allow.
-        //
-        // `stellar_pay_commit_impl` accepts a `forced_dispatch_outcome` parameter.
-        // When `Some(RequireApproval(...))` is supplied, it overrides any `Allow`
-        // result from the policy engine so that `verify_attestation_gate` ALWAYS
-        // runs the cryptographic HMAC check regardless of policy.  This is the
-        // load-bearing mechanism; field-presence alone CANNOT substitute.
-        let has_approval = args.approval_nonce.is_some() && args.approval_attestation.is_some();
-
-        if !has_approval {
-            // Force per-action approval unconditionally.
-            // Synthesise a PaymentSimulated pending approval from the authoritative
-            // envelope params.
-            let authoritative =
-                match decode_authoritative_args(&args.envelope_xdr, "stellar_pay_commit") {
-                    Ok(a) => a,
-                    Err(e) => {
-                        return Ok(crate::tools::common::business_error_result(
-                            "simulation.divergence",
-                            format!("toolset_gated envelope_xdr decode: {e}"),
-                        ));
-                    }
-                };
-
-            let summary_to = authoritative
-                .get("destination")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let summary_amount_stroops = authoritative
-                .get("amount_stroops")
-                .and_then(crate::tools::amount_wire::value_as_stroops_i64)
-                .unwrap_or(0_i64);
-            let summary_asset = authoritative
-                .get("asset")
-                .and_then(|v| v.as_str())
-                .unwrap_or("XLM")
-                .to_owned();
-
-            // The approval binds the envelope text supplied to the commit verifier.
-            let uid = process_uid_for_attestation().map_err(|e| {
-                rmcp::ErrorData::internal_error(format!("approval.uid_unavailable: {e}"), None)
-            })?;
-
-            let simulated_fee = authoritative
-                .get("total_fee_stroops")
-                .and_then(|v| v.as_u64())
-                .and_then(|f| u32::try_from(f).ok())
-                .unwrap_or(100_u32);
-            let simulated_seq = authoritative
-                .get("sequence_number")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0_i64);
-
-            let pending = PendingApproval::new_payment_pending(
-                args.envelope_xdr.clone(),
-                args.envelope_xdr.as_bytes(),
-                summary_to,
-                summary_amount_stroops,
-                summary_asset,
-                args.memo_text.as_ref().map(|m| m.as_str().to_owned()),
-                simulated_fee,
-                simulated_seq,
-                uid,
-                DEFAULT_TTL_MS,
-            )
-            .map_err(|e| {
-                rmcp::ErrorData::internal_error(format!("toolset.gated_approval_create: {e}"), None)
-            })?;
-
-            let approval_nonce = pending.approval_nonce.clone();
-
-            // Persist the pending approval.
-            #[cfg(any(test, feature = "test-helpers"))]
-            let approvals_dir = {
-                if let Some(ref override_dir) = self.approval_dir_override {
-                    override_dir.clone()
-                } else {
-                    default_approval_dir().map_err(|e| {
-                        rmcp::ErrorData::internal_error(format!("approval.dir_error: {e}"), None)
-                    })?
-                }
-            };
-            #[cfg(not(any(test, feature = "test-helpers")))]
-            let approvals_dir = default_approval_dir().map_err(|e| {
-                rmcp::ErrorData::internal_error(format!("approval.dir_error: {e}"), None)
-            })?;
-
-            let profile_name = self.profile_name_for_approval();
-            let store_path = approvals_dir.join(format!("{profile_name}.toml"));
-            let mut store =
-                open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
-                    .map_err(|e| {
-                        rmcp::ErrorData::internal_error(format!("approval.store_open: {e}"), None)
-                    })?;
-
-            let now_ms = now_unix_ms().map_err(|e| {
-                rmcp::ErrorData::internal_error(
-                    format!("approval.store_insert: current time unavailable: {e}"),
-                    None,
-                )
-            })?;
-            store.insert(pending, now_ms).map_err(|e| {
-                rmcp::ErrorData::internal_error(format!("approval.store_insert: {e}"), None)
-            })?;
-
-            tracing::debug!(
-                nonce = %approval_nonce,
-                "toolset_gated: forced per-action approval queued"
-            );
-
-            // Return indistinguishable approval_required (the nonce is in the
-            // tracing log for operator forensics; not in the wire error).
-            return Ok(approval_required_indistinguishable(
-                &self.profile_name_for_approval(),
-            ));
-        }
-
-        // The forced gate carries the persisted request. Before submission the
-        // attestation must verify against the nonce, envelope and user, and the
-        // pending approval must be unexpired under both its stored expiry and
-        // the rule's ttl.
-        let approvals_dir = match self.resolve_approval_dir() {
-            Ok(dir) => dir,
-            Err(_) => {
-                return Ok(approval_required_indistinguishable(
-                    &self.profile_name_for_approval(),
-                ));
-            }
-        };
-        let store_path = approvals_dir.join(format!("{}.toml", self.profile_name_for_approval()));
-        let store =
-            match open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF) {
-                Ok(store) => store,
-                Err(_) => {
-                    return Ok(approval_required_indistinguishable(
-                        &self.profile_name_for_approval(),
-                    ));
-                }
-            };
-        let Some(pending) = args
-            .approval_nonce
-            .as_deref()
-            .and_then(|nonce| store.get(nonce))
-        else {
-            return Ok(approval_required_indistinguishable(
-                &self.profile_name_for_approval(),
-            ));
-        };
-        let forced_outcome = DispatchOutcome::RequireApproval(pending.approval_request().into());
-        drop(store);
-        self.stellar_pay_commit_impl(args, Some(forced_outcome))
-            .await
     }
 }
 
@@ -2057,6 +2701,27 @@ impl WalletServer {
     }
 }
 
+/// A test seam that replaces the gate-sized effects one commit records,
+/// after the policy gate and before the audit leg constructor.
+#[cfg(any(test, feature = "test-helpers"))]
+mod sized_effects_hook {
+    use std::sync::{Mutex, PoisonError};
+    use stellar_agent_core::policy::v1::ValueEffects;
+
+    static NEXT: Mutex<Option<ValueEffects>> = Mutex::new(None);
+
+    /// Sets the effects the next commit records.
+    #[cfg(all(test, feature = "mainnet-write"))]
+    pub(super) fn set(effects: ValueEffects) {
+        *NEXT.lock().unwrap_or_else(PoisonError::into_inner) = Some(effects);
+    }
+
+    /// Takes the effects a test set, once.
+    pub(super) fn take() -> Option<ValueEffects> {
+        NEXT.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -2067,16 +2732,327 @@ mod tests {
     use super::*;
     use stellar_xdr::{Hash, StringM};
 
+    /// A full store keeps `approval.store_error` and names how retained
+    /// payment bindings release their capacity.
+    #[test]
+    fn payment_capacity_refusal_names_the_retention_release() {
+        let Err(refusal) =
+            payment_store_refusal(&ApprovalError::PendingStoreFull { max: 4096 }, "operator")
+        else {
+            panic!("a full store is an internal error");
+        };
+        assert_eq!(
+            refusal.message,
+            "approval.store_error: pending approval store full: maximum 4096 entries reached; \
+             retained payment bindings occupy capacity until their retention ends, and \
+             `stellar-agent approve gc --profile operator` frees them afterward",
+            "the capacity refusal names the retention release"
+        );
+        let Err(other) = payment_store_refusal(
+            &ApprovalError::InvalidEntry {
+                detail: "bad".to_owned(),
+            },
+            "operator",
+        ) else {
+            panic!("an unclassified error is an internal error");
+        };
+        assert_eq!(
+            other.message, "approval.store_error: invalid approval store entry: bad",
+            "an unclassified error keeps its text"
+        );
+    }
+
+    /// A payment approval without an operation record, as off mainnet,
+    /// keeps the decision's captured interval.
+    #[test]
+    fn an_entry_without_an_operation_keeps_the_decision_interval() {
+        assert_eq!(
+            super::payment_entry_interval(None, (1_000, 61_000)),
+            (1_000, 61_000)
+        );
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[allow(clippy::unwrap_used, reason = "test fixtures and assertions")]
+    #[serial_test::serial]
+    async fn pay_memo_policy_prepare_commit_parity() {
+        use crate::tools::common::tests::mainnet::{ClassicRun, Tool, authorizations, wire};
+        use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope, WriteXdr};
+        for muxed_id in [None, Some(0), Some(u64::MAX)] {
+            let run = ClassicRun::with(
+                Tool::Pay,
+                |raw| {
+                    let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+                    for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+                        if !matches!(rule["match"]["tool"].as_str(), Some("stellar_pay" | "stellar_pay_commit")) {
+                            continue;
+                        }
+                        let criteria = rule["criteria"].as_array_mut().unwrap();
+                        let destination = criteria.iter().filter_map(toml_edit::Value::as_inline_table)
+                            .find(|c| c.get("kind").and_then(toml_edit::Value::as_str) == Some("counterparty_allowlist"))
+                            .unwrap().get("allowlist").unwrap().as_array().unwrap().get(0).unwrap().as_str().unwrap().to_owned();
+                        criteria.push(format!("{{kind = \"memo_binding\", bindings = [{{destination = \"{destination}\", kind = \"id\", value = \"0\"}}]}}").parse::<toml_edit::Value>().unwrap());
+                    }
+                    doc.to_string()
+                },
+                |_| {},
+                |args| {
+                    args["memo_id"] = json!(0);
+                    if let Some(id) = muxed_id {
+                        let key = stellar_strkey::ed25519::PublicKey::from_string(args["destination"].as_str().unwrap()).unwrap().0;
+                        args["destination"] = json!(stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }.to_string().as_str());
+                    }
+                },
+            ).await;
+            let facts = decode_authoritative_args(
+                run.args["envelope_xdr"].as_str().unwrap(),
+                "stellar_pay_commit",
+            )
+            .unwrap();
+            assert_eq!(facts["memo_id"], "0");
+            assert_eq!(facts["destination"], run.args["destination"]);
+            for text in ["0", "支払"] {
+                let mut wrong = run.args.clone();
+                wrong["business_id"] = json!(crate::tools::common::tests::fresh_business_id());
+                wrong["memo_id"] = serde_json::Value::Null;
+                wrong["memo_text"] = json!(text);
+                let result = Tool::Pay.prepare(&run.f.server, &wrong).await;
+                assert_eq!(result.is_error, Some(true));
+                let result = wire(&result);
+                assert_eq!(
+                    result["error"]["code"], "policy.deny.memo_binding_mismatch",
+                    "{result}"
+                );
+                assert!(!result["error"]["message"].as_str().unwrap().contains(text));
+            }
+            assert_eq!(run.seed_reads(), 0);
+            assert!(run.control.sent().is_empty());
+            assert!(authorizations(&run.f).is_empty());
+
+            // The run's record stores the intent with its memo, so a commit
+            // naming another memo names another intent.
+            let mut forged = run.args.clone();
+            forged["memo_id"] = serde_json::Value::Null;
+            forged["memo_text"] = json!("0");
+            let refused = run.commit_with(forged).await;
+            assert_eq!(
+                refused["error"]["code"], "operation.business_id_conflict",
+                "the stored memo governs: {refused}"
+            );
+            assert_eq!(run.seed_reads(), 0);
+            assert!(run.control.sent().is_empty());
+
+            let TransactionEnvelope::Tx(mut changed) = TransactionEnvelope::from_xdr_base64(
+                run.args["envelope_xdr"].as_str().unwrap(),
+                Limits::none(),
+            )
+            .unwrap() else {
+                panic!("v1");
+            };
+            changed.tx.memo = Memo::Text(b"0".to_vec().try_into().unwrap());
+            let changed = TransactionEnvelope::Tx(changed)
+                .to_xdr_base64(Limits::none())
+                .unwrap();
+            let mut forged = run.args.clone();
+            forged["business_id"] = json!(run.bind_business_id_for(&changed));
+            forged["envelope_xdr"] = json!(changed);
+            let refused = run.commit_with(forged).await;
+            assert_eq!(
+                refused["error"]["code"], "policy.deny.memo_binding_mismatch",
+                "caller memo cannot replace signed facts: {refused}"
+            );
+            assert_eq!(run.seed_reads(), 0);
+            assert!(run.control.sent().is_empty());
+            assert!(authorizations(&run.f).is_empty());
+
+            let committed = run.commit().await;
+            assert_eq!(committed["ok"], true, "matching memo commit: {committed}");
+            assert_eq!(run.control.sent().len(), 1);
+        }
+
+        // A destination bound to a text memo accepts the bound text: the
+        // preparation's policy fact is the parsed text the envelope carries.
+        let run = ClassicRun::with(
+            Tool::Pay,
+            |raw| {
+                let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+                for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+                    if !matches!(rule["match"]["tool"].as_str(), Some("stellar_pay" | "stellar_pay_commit")) {
+                        continue;
+                    }
+                    let criteria = rule["criteria"].as_array_mut().unwrap();
+                    let destination = criteria.iter().filter_map(toml_edit::Value::as_inline_table)
+                        .find(|c| c.get("kind").and_then(toml_edit::Value::as_str) == Some("counterparty_allowlist"))
+                        .unwrap().get("allowlist").unwrap().as_array().unwrap().get(0).unwrap().as_str().unwrap().to_owned();
+                    criteria.push(format!("{{kind = \"memo_binding\", bindings = [{{destination = \"{destination}\", kind = \"text\", value = \"支払\"}}]}}").parse::<toml_edit::Value>().unwrap());
+                }
+                doc.to_string()
+            },
+            |_| {},
+            |args| {
+                args["memo_text"] = json!("支払");
+            },
+        )
+        .await;
+        let facts = decode_authoritative_args(
+            run.args["envelope_xdr"].as_str().unwrap(),
+            "stellar_pay_commit",
+        )
+        .unwrap();
+        assert_eq!(facts["memo"], "支払");
+        let committed = run.commit().await;
+        assert_eq!(committed["ok"], true, "bound text memo commit: {committed}");
+    }
+
+    /// A commit whose gate-sized leg carries a lowercase destination refuses
+    /// `validation.address_invalid` before the nonce, the hold, and the send,
+    /// and writes no audit row. The same commit then succeeds, so its nonce
+    /// stayed unconsumed.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[allow(clippy::unwrap_used, reason = "test assertions")]
+    #[serial_test::serial]
+    async fn a_malformed_payment_leg_refuses_before_exposure() {
+        use crate::tools::common::tests::mainnet::{ClassicRun, Tool, authorizations};
+        // The hook replaces the effects the envelope route's gate sized, so
+        // the run commits an envelope record.
+        let run = ClassicRun::allowed(Tool::Pay).await.envelope_route();
+        let destination = run.args["destination"].as_str().unwrap().to_lowercase();
+        sized_effects_hook::set(stellar_agent_core::policy::v1::ValueEffects::single(
+            stellar_agent_core::policy::v1::ValueLeg {
+                kind: stellar_agent_core::policy::v1::ActionKind::Payment,
+                amount: Some(11),
+                asset: Some("native".to_owned()),
+                destination: Some(destination),
+            },
+        ));
+        let refused = run.commit().await;
+        assert_eq!(
+            refused["error"]["code"], "validation.address_invalid",
+            "{refused}"
+        );
+        assert!(run.control.sent().is_empty(), "no send");
+        assert!(
+            authorizations(&run.f).is_empty(),
+            "no authorization or hold"
+        );
+        let log = std::fs::read_to_string(&run.f.server.profile.audit_log_path).unwrap_or_default();
+        assert!(!log.contains("value_action_pending"), "no row: {log}");
+        let committed = run.commit().await;
+        assert_eq!(
+            committed["ok"], true,
+            "the nonce stayed usable: {committed}"
+        );
+        assert_eq!(run.control.sent().len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[allow(clippy::expect_used, reason = "fixed test arguments")]
+    #[serial_test::serial]
+    async fn muxed_contract_pay_stages_refuse_before_state() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().expect("keyring");
+        let rpc = wiremock::MockServer::start().await;
+        let server = WalletServer::new(
+            stellar_agent_core::profile::schema::Profile::builder_testnet(
+                "svc",
+                "acct",
+                "nonce-svc",
+                "nonce-acct",
+            )
+            .with_noop_engine()
+            .rpc_url(rpc.uri())
+            .build(),
+        )
+        .expect("server");
+        let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+        let mut builder = stellar_agent_network::builder::ClassicOpBuilder::new(
+            source.as_str(),
+            1,
+            "Test SDF Network ; September 2015",
+            100,
+        );
+        builder
+            .payment(
+                source.as_str(),
+                stellar_agent_core::StellarAmount::from_stroops(1),
+                &stellar_agent_network::builder::Asset::Native,
+            )
+            .expect("operation");
+        let envelope = builder.build().expect("envelope");
+        let destination =
+            stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string();
+        let before = std::fs::read_dir(home.path()).expect("state").count();
+        for (with_memo, expected_code) in [
+            (false, "validation.contract_payment_unavailable"),
+            (true, "validation.contract_payment_memo_unsupported"),
+        ] {
+            let mut args = serde_json::json!({
+                "chain_id": "stellar:testnet",
+                "source": source.as_str(),
+                "destination": destination.as_str(),
+                "asset": "native", "amount": "1 XLM",
+                "nonce": "nonce", "expires_at_unix_ms": 1, "envelope_xdr": envelope
+            });
+            if with_memo {
+                args["memo_text"] = serde_json::json!("memo");
+            }
+            for (stage, result) in [
+                (
+                    "stellar_pay",
+                    server
+                        .call_stellar_pay(serde_json::from_value(args.clone()).expect("prepare"))
+                        .await,
+                ),
+                (
+                    "stellar_pay_commit",
+                    server
+                        .call_stellar_pay_commit(serde_json::from_value(args).expect("commit"))
+                        .await,
+                ),
+            ] {
+                let result = result.expect("business error envelope for W destination");
+                let (code, _, text) = crate::tools::common::assert_business_envelope(&result);
+                assert_eq!(
+                    code, expected_code,
+                    "{stage}, with_memo={with_memo}: {text}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_dir(home.path()).expect("state").count(),
+            before
+        );
+        assert!(
+            rpc.received_requests().await.expect("requests").is_empty(),
+            "no network request may be sent for W destination"
+        );
+    }
+
     #[test]
     fn memo_text_valid_utf8_round_trips() -> Result<(), stellar_xdr::Error> {
         let memo = Memo::Text(StringM::<28>::try_from("hello stellar")?);
-
-        assert_eq!(memo_summary(&memo), Some("hello stellar".to_owned()));
         assert_eq!(
             memo_json(&memo),
             json!({ "type": "text", "value": "hello stellar" })
         );
-        assert_eq!(memo_summary_for_json(&memo), json!("hello stellar"));
+        assert_eq!(
+            memo_summary_for_json(&stellar_agent_core::envelope_decode::ClassicMemo::Text(
+                "hello stellar".to_owned()
+            )),
+            json!("hello stellar")
+        );
 
         Ok(())
     }
@@ -2084,13 +3060,10 @@ mod tests {
     #[test]
     fn memo_text_invalid_utf8_renders_invalid_utf8_marker() -> Result<(), stellar_xdr::Error> {
         let memo = Memo::Text(StringM::<28>::try_from(vec![0xff, 0xfe])?);
-
-        assert_eq!(memo_summary(&memo), Some("<invalid-utf8>".to_owned()));
         assert_eq!(
             memo_json(&memo),
             json!({ "type": "text", "value": "<invalid-utf8>" })
         );
-        assert_eq!(memo_summary_for_json(&memo), json!("<invalid-utf8>"));
 
         Ok(())
     }
@@ -2099,35 +3072,42 @@ mod tests {
     fn memo_hash_round_trips() {
         let memo = Memo::Hash(Hash([0xab; 32]));
         let expected_hex = "ab".repeat(32);
-
-        assert_eq!(memo_summary(&memo), Some("<binary memo>".to_owned()));
         assert_eq!(
             memo_json(&memo),
             json!({ "type": "hash", "value": expected_hex })
         );
-        assert_eq!(memo_summary_for_json(&memo), json!(expected_hex));
+        assert_eq!(
+            memo_summary_for_json(&stellar_agent_core::envelope_decode::ClassicMemo::Hash(
+                [0xab; 32]
+            )),
+            json!(expected_hex)
+        );
     }
 
     #[test]
     fn memo_return_round_trips() {
         let memo = Memo::Return(Hash([0xcd; 32]));
         let expected_hex = "cd".repeat(32);
-
-        assert_eq!(memo_summary(&memo), Some("<binary memo>".to_owned()));
         assert_eq!(
             memo_json(&memo),
             json!({ "type": "return", "value": expected_hex })
         );
-        assert_eq!(memo_summary_for_json(&memo), json!(expected_hex));
+        assert_eq!(
+            memo_summary_for_json(&stellar_agent_core::envelope_decode::ClassicMemo::Return(
+                [0xcd; 32]
+            )),
+            json!(expected_hex)
+        );
     }
 
     #[test]
     fn memo_none_renders_empty() {
         let memo = Memo::None;
-
-        assert_eq!(memo_summary(&memo), None);
         assert_eq!(memo_json(&memo), json!({ "type": "none" }));
-        assert_eq!(memo_summary_for_json(&memo), serde_json::Value::Null);
+        assert_eq!(
+            memo_summary_for_json(&stellar_agent_core::envelope_decode::ClassicMemo::None),
+            serde_json::Value::Null
+        );
     }
 
     #[test]
@@ -2161,7 +3141,7 @@ mod tests {
                     assert_eq!(
                         error.message,
                         format!(
-                            "validation.amount_malformed: amount '100 {unit}' has unit '{unit}'; expected unit '{code}'"
+                            "validation.amount_malformed: the amount has the wrong unit; expected unit '{code}'"
                         )
                     );
                 }
@@ -2276,5 +3256,205 @@ mod tests {
             };
 
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    /// `Debug` shows whether the attestation is set and never its value; every
+    /// other field prints as usual.
+    #[test]
+    fn commit_args_debug_hides_the_attestation() {
+        let args: StellarPayCommitArgs = match serde_json::from_value(serde_json::json!({
+            "chain_id":"stellar:testnet", "source":"GSOURCE", "destination":"GDEST", "asset":"native", "amount_in_stroops":"10",
+            "nonce": "commit-nonce", "expires_at_unix_ms": 1, "envelope_xdr": "AAAA",
+            "approval_nonce": "approval-nonce", "approval_attestation": "SENTINEL-ATTESTATION"
+        })) {
+            Ok(args) => args,
+            Err(error) => panic!("{error}"),
+        };
+        let printed = format!("{args:?}");
+        assert!(!printed.contains("SENTINEL-ATTESTATION"), "{printed}");
+        assert!(
+            printed.contains("approval_attestation: Some(<set>)"),
+            "{printed}"
+        );
+        assert!(printed.contains("approval-nonce") && printed.contains("commit-nonce"));
+        let mut absent = args.clone();
+        absent.approval_attestation = None;
+        assert!(format!("{absent:?}").contains("approval_attestation: None"));
+    }
+
+    /// A commit envelope that is not base64 is refused as a divergence by
+    /// class, and neither the result nor the debug event of the refusal names
+    /// the symbol the base64 decoder stopped at.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn pay_commit_envelope_marker_is_not_echoed() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_test_support::CaptureWriter;
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        stellar_agent_test_support::keyring_mock::install().unwrap_or_else(|e| panic!("{e}"));
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "acct", "n-svc", "n-acct",
+        )
+        .with_noop_engine()
+        .build();
+        let server = WalletServer::new(profile).unwrap_or_else(|e| panic!("{e}"));
+        let args: StellarPayCommitArgs = match serde_json::from_value(serde_json::json!({
+            "chain_id": "stellar:testnet",
+            "source": "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+            "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+            "asset": "native",
+            "amount_in_stroops": "10",
+            "nonce": "commit-nonce",
+            "expires_at_unix_ms": 1,
+            // The invalid symbol leads, so the base64 decoder fails on the
+            // first read, before any XDR value is parsed.
+            "envelope_xdr": format!("~{CREDENTIAL_MARKER}"),
+        })) {
+            Ok(args) => args,
+            Err(error) => panic!("{error}"),
+        };
+        let capture = CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let result = server.call_stellar_pay_commit(args).await;
+        drop(guard);
+        drop(inert);
+
+        let result = result.unwrap_or_else(|e| panic!("{e:?}"));
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "simulation.divergence");
+        assert_eq!(
+            message,
+            "envelope_xdr re-derivation failed: envelope_xdr XDR decode failed: the envelope is \
+             not valid standard base64"
+        );
+        let captured = capture.captured_str();
+        assert!(
+            captured.contains("envelope_xdr re-derivation failed"),
+            "the test must reach the decode refusal; got: {captured}"
+        );
+        for output in [&text, &captured] {
+            assert_no_marker_in_text(output, CREDENTIAL_MARKER);
+            // The base64 decoder names the offending byte as "Invalid symbol".
+            assert_no_marker_in_text(output, "symbol");
+        }
+    }
+
+    /// An explicit `fee` above `classic_max_fee_per_op_stroops` on `stellar_pay`
+    /// refuses naming `fee` (not `--fee`).
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    #[allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test fixtures and assertions"
+    )]
+    async fn pay_explicit_fee_above_cap_names_mcp_fee_argument() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+
+        let source = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x21; 32]);
+        let dest = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x22; 32]);
+        let now_s = stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1_000;
+        let rpc = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "method": "getNetwork" }),
+            ))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                stellar_agent_test_support::signed_envelope::get_network_result(
+                    stellar_agent_test_support::signed_envelope::TESTNET_PASSPHRASE,
+                ),
+            ))
+            .mount(&rpc)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "method": "getHealth" }),
+            ))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(json!({
+                "status": "healthy",
+                "latestLedger": 100,
+                "oldestLedger": 1,
+                "ledgerRetentionWindow": 99,
+                "oldestLedgerCloseTime": 1,
+                "latestLedgerCloseTime": now_s,
+            })))
+            .mount(&rpc)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "method": "getLedgers" }),
+            ))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(json!({
+                "latestLedger": 100,
+                "oldestLedger": 1,
+                "latestLedgerCloseTime": now_s.to_string(),
+                "oldestLedgerCloseTime": 1,
+                "cursor": "100",
+                "ledgers": [],
+            })))
+            .mount(&rpc)
+            .await;
+        let mut ledger = stellar_agent_test_support::KeyedLedgerEntriesResponder::new();
+        for entry in stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[
+            source.as_str(),
+            dest.as_str(),
+        ])["entries"]
+            .as_array()
+            .unwrap()
+        {
+            ledger = ledger.with_entry(entry.clone());
+        }
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "method": "getLedgerEntries" }),
+            ))
+            .respond_with(ledger)
+            .mount(&rpc)
+            .await;
+
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "acct", "n-svc", "n-acct",
+        )
+        .with_noop_engine()
+        .rpc_url(rpc.uri())
+        .classic_max_fee_per_op_stroops(Some(150))
+        .build();
+        let server = WalletServer::new(profile).unwrap();
+        let args: StellarPayArgs = serde_json::from_value(json!({
+            "chain_id": "stellar:testnet",
+            "source": source,
+            "destination": dest,
+            "asset": "native",
+            "amount": "1 XLM",
+            "fee": "200",
+        }))
+        .unwrap();
+
+        let result = server.call_stellar_pay(args).await.unwrap();
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "fees.percentile_exceeds_cap");
+        assert_eq!(
+            message,
+            "fee must be a per-operation stroop amount within classic_max_fee_per_op_stroops; \
+             lower fee or raise classic_max_fee_per_op_stroops."
+        );
+        assert!(!message.contains("--fee"), "{message}");
     }
 }

@@ -1,0 +1,1971 @@
+//! Mainnet authorizations over directly assembled facts, and a mainnet
+//! profile with its ledger, receipt store, and keyed audit writer, for this
+//! crate's tests of the paths that consume them.
+//!
+//! The authorization types have no constructor outside this crate's
+//! resolvers, so these tests assemble the header themselves. A ledger-backed
+//! authorization is minted through
+//! [`crate::policy_state::PersistedWindowStore::mint_authorization`] and its
+//! header carries the minted identity, lifetime, reservation, and bindings
+//! digest, so its consumption is the production one.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test fixtures; a failed setup is a failed test"
+)]
+#![cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "outside this crate's tests only the test-support facade uses these fixtures"
+    )
+)]
+
+use std::sync::{Arc, Mutex};
+
+use stellar_agent_core::audit_log::AuditWriter;
+use stellar_agent_core::audit_log::PolicyDecision;
+use stellar_agent_core::audit_log::tip_anchor::{
+    InMemoryTipAnchorStore, KeyedAuditAccess, TipAnchorStore,
+};
+use stellar_agent_core::audit_log::writer::VerifiedTipFacts;
+use stellar_agent_core::policy::pin::{self, Pin, PinScope};
+use stellar_agent_core::policy::state_lock::WindowStoreLock;
+use stellar_agent_core::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
+use stellar_agent_core::profile::caip2::{Caip2, MAINNET_PASSPHRASE};
+use stellar_agent_core::profile::receipt::ReceiptStore;
+use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_test_support::signed_envelope::SignedTestEnvelope;
+use tempfile::TempDir;
+
+use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope};
+
+use super::audit_readiness::AuditReadiness;
+use super::authorization::{
+    ApprovalBinding, AuthorityBinding, ClaimTarget, EndpointBinding, Header,
+    MainnetSorobanIntentAuthorization, MainnetTxSignAuthorization, PolicyBinding, SignerBinding,
+    SorobanIntentInner, TxSignInner,
+};
+use super::clock::{TestClockGuard, set_now_ms_for_test};
+use super::digest::{BindingFacts, approval_subject_classic};
+use super::{AuthorizationDomain, AuthorizationId, MainnetConsumer, SignerRole};
+use crate::operation_entry;
+use crate::policy_state::{
+    BusinessId, DomainBinding, IntentSlot, MintRequest, OpenOutcome, OpenRequest, OperationHandle,
+    OperationKind, OperationLink, OperationRecorder, OperationTool, PersistedWindowStore,
+};
+use crate::submission_record::OperationAttempt;
+use crate::submission_record::{AuditWriterHandle, SubmissionIntent, WalletSubmissionRecorder};
+use crate::submit::envelope_hash_hex;
+
+/// The seed of the source account and agent signer every fixture uses.
+pub(crate) const SIGNER_SEED: [u8; 32] = [0x2a; 32];
+
+/// The sequence every fixture transaction consumes.
+pub(crate) const SEQUENCE: i64 = 42;
+
+/// The policy the fixtures pin and bind.
+const POLICY_SEQUENCE: i64 = 7;
+pub(crate) const POLICY_DIGEST: [u8; 32] = [0x71; 32];
+const POLICY_OWNER: [u8; 32] = [0x01; 32];
+
+/// The authorization lifetime and approval window, in milliseconds.
+pub(crate) const TTL_MS: u64 = 60_000;
+const APPROVAL_WINDOW_MS: u64 = 600_000;
+
+/// The public key of `seed`.
+pub(crate) fn public_key(seed: [u8; 32]) -> [u8; 32] {
+    stellar_agent_test_support::signed_envelope::public_key_for_seed(seed)
+}
+
+/// The G-strkey of `seed`.
+pub(crate) fn account(seed: [u8; 32]) -> String {
+    stellar_agent_test_support::signed_envelope::account_id_for_seed(seed)
+}
+
+/// A keyed, anchored audit writer over a fresh log at `path`, with the
+/// in-memory anchor store it writes to.
+pub(crate) fn keyed_writer(
+    path: &std::path::Path,
+) -> (AuditWriterHandle, Arc<InMemoryTipAnchorStore>) {
+    let store = Arc::new(InMemoryTipAnchorStore::new());
+    let access = KeyedAuditAccess::new(
+        zeroize::Zeroizing::new([0x5c; 32]),
+        Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+    );
+    let writer = AuditWriter::open(path.to_path_buf(), Some(access)).unwrap();
+    (Arc::new(Mutex::new(writer)), store)
+}
+
+/// The verified facts of `writer`'s tip.
+pub(crate) fn tip_facts(writer: &AuditWriterHandle) -> VerifiedTipFacts {
+    writer.lock().unwrap().verified_tip_facts().unwrap()
+}
+
+/// The facts a transaction authorization binds about its envelope.
+pub(crate) fn tx_binding(unsigned_xdr: &str, tx_hash_hex: &str) -> DomainBinding {
+    DomainBinding::Transaction {
+        unsigned_envelope_sha256: approval_subject_classic(unsigned_xdr),
+        tx_hash: stellar_agent_core::hex::decode_hex32(tx_hash_hex).unwrap(),
+        source: account(SIGNER_SEED),
+        sequence: SEQUENCE,
+    }
+}
+
+/// A store target for fixtures that check in-memory header facts.
+pub(crate) fn claim_target(dir: &std::path::Path, name: &str) -> ClaimTarget {
+    ClaimTarget {
+        store: PersistedWindowStore::at_path(dir.join("state.window")),
+        profile: Profile::builder_mainnet_named(
+            name,
+            "https://rpc.example",
+            "signer",
+            "account",
+            "nonce",
+            "nonce",
+        )
+        .build(),
+    }
+}
+
+/// The policy authority fixture ledgers mint under, evaluated at `now`.
+///
+/// Their subject is the submission, claim and consumption of a record, so
+/// no durable approval record backs them: an approval authority without one
+/// refuses at the mint.
+pub(crate) fn fixture_policy_authority(now: u64) -> crate::policy_state::PolicyAuthorityBinding {
+    crate::policy_state::PolicyAuthorityBinding {
+        policy_digest: POLICY_DIGEST,
+        policy_sequence: POLICY_SEQUENCE,
+        rule_index: 0,
+        evaluated_at_ms: now,
+        governing_until_ms: now + APPROVAL_WINDOW_MS,
+        scope: stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
+    }
+}
+
+/// Mints a fixture header's bound record in its own ledger, under
+/// [`fixture_policy_authority`] at the header's issue time.
+pub(crate) fn mint_header(header: &mut Header, binding: &DomainBinding, holds: &[WindowEntry]) {
+    let mut authority = fixture_policy_authority(header.issued_at_ms);
+    authority.policy_digest = header.policy.digest;
+    authority.policy_sequence = header.policy.sequence;
+    header.authority = AuthorityBinding::Policy(authority);
+    let target = &header.claim;
+    let lock = WindowStoreLock::acquire_for(
+        target.store.path(),
+        &target.profile.policy_window_state_key_id,
+    )
+    .unwrap();
+    pin::write_for_test(
+        &lock,
+        &PinScope::for_profile(target.store.path(), &target.profile),
+        &Pin::new(header.policy.sequence, header.policy.digest, POLICY_OWNER).unwrap(),
+    )
+    .unwrap();
+    drop(lock);
+    let minted = target
+        .store
+        .mint_authorization(
+            &target.profile,
+            &MintRequest {
+                intent_digest: None,
+                predecessor: None,
+                approval_operation: None,
+                chain: header.chain,
+                binding: binding.clone(),
+                consumer: header.consumer,
+                policy_sequence: header.policy.sequence,
+                policy_digest: header.policy.digest,
+                authority: header.authority.mint_authority(),
+                chain_deadline_ms: None,
+                restriction_end_ms: None,
+                authorization_ttl_ms: TTL_MS,
+                bindings: BindingFacts {
+                    endpoint: None,
+                    signer: [2; 32],
+                    policy: [3; 32],
+                    enablement: [4; 32],
+                    witness: None,
+                    reservation: None,
+                    authority: [5; 32],
+                    audit: [6; 32],
+                    restriction: None,
+                },
+                holds: holds.to_vec(),
+                parent: None,
+                operation: None,
+                floor: None,
+                native_reservation: None,
+            },
+        )
+        .unwrap();
+    header.id = minted.id;
+    header.reservation = minted.reservation;
+    header.issued_at_ms = minted.issued_at_ms;
+    header.expires_at_ms = minted.expires_at_ms;
+    header.bindings_digest = minted.bindings_digest;
+}
+
+/// A header with every fact valid at `now`: the mainnet chain, the
+/// `CliPay` consumer, `endpoint`, the fixture's agent signer, an audit proof
+/// over `facts` of `writer`, issued at `now` and expiring after [`TTL_MS`].
+pub(crate) fn header(
+    claim: ClaimTarget,
+    profile: &str,
+    endpoint: Option<(String, u64)>,
+    writer: &AuditWriterHandle,
+    facts: VerifiedTipFacts,
+    now: u64,
+) -> Header {
+    Header {
+        operation: None,
+        intent_digest: None,
+        predecessor: None,
+        claim,
+        id: AuthorizationId::from_bytes([0xab; 32]),
+        profile: profile.to_owned(),
+        chain: Caip2::Mainnet,
+        domain: AuthorizationDomain::Transaction,
+        consumer: MainnetConsumer::CliPay,
+        endpoint: endpoint.map(|(authority, client_id)| EndpointBinding {
+            authority,
+            client_id,
+        }),
+        signer: SignerBinding {
+            public_key: public_key(SIGNER_SEED),
+            role: SignerRole::AgentSigner,
+        },
+        policy: PolicyBinding {
+            sequence: POLICY_SEQUENCE,
+            digest: POLICY_DIGEST,
+        },
+        enablement_nonce_digest: [3; 32],
+        authority: AuthorityBinding::Approval(ApprovalBinding {
+            nonce: "fixture-approval".to_owned(),
+            expires_at_ms: now + APPROVAL_WINDOW_MS,
+        }),
+        reservation: None,
+        witness_subject: None,
+        submission_anchor: None,
+        audit: AuditReadiness::for_crate_tests(profile, facts, now, Arc::clone(writer)),
+        issued_at_ms: now,
+        expires_at_ms: now + TTL_MS,
+        bindings_digest: [0; 32],
+    }
+}
+
+/// [`header`] with the store access its expiry check reads, for a fixture
+/// that holds no keyring of its own. While any kind enforces delivery,
+/// the check of an Approval header reads [`ClaimTarget::store`], which
+/// needs its window key. The guard installs a fresh in-memory keyring as
+/// the process default, so the test that holds it never relies on a
+/// keyring another test installed, and it restores the previous default
+/// store when it drops. Keep it for as long as the header is checked.
+///
+/// # Panics
+///
+/// Panics when the in-memory store cannot be created.
+pub(crate) fn approval_header(
+    claim: ClaimTarget,
+    profile: &str,
+    endpoint: Option<(String, u64)>,
+    writer: &AuditWriterHandle,
+    facts: VerifiedTipFacts,
+    now: u64,
+) -> (
+    Header,
+    stellar_agent_test_support::keyring_mock::DefaultStoreGuard,
+) {
+    let store: Arc<keyring_core::CredentialStore> =
+        keyring_core::mock::Store::new().expect("in-memory keyring store");
+    let access = stellar_agent_test_support::keyring_mock::DefaultStoreGuard::install(store);
+    (header(claim, profile, endpoint, writer, facts, now), access)
+}
+
+/// A transaction authorization over `header` and `binding`.
+pub(crate) fn tx_authorization(
+    header: Header,
+    binding: DomainBinding,
+) -> MainnetTxSignAuthorization {
+    MainnetTxSignAuthorization::for_crate_tests(TxSignInner {
+        header,
+        binding,
+        entries: vec![],
+        _restriction: None,
+    })
+}
+
+/// A Soroban intent authorization for `X402Create` over `invocation` on
+/// mainnet, binding `nonce` and `signature_expiration_ledger`, with the
+/// fixture's agent signer and an audit proof of `writer`, valid at `now` for
+/// [`TTL_MS`].
+pub(crate) fn soroban_authorization(
+    claim: ClaimTarget,
+    writer: &AuditWriterHandle,
+    invocation: &stellar_xdr::SorobanAuthorizedInvocation,
+    nonce: i64,
+    signature_expiration_ledger: u32,
+    now: u64,
+) -> MainnetSorobanIntentAuthorization {
+    let header = header(claim, "fixture", None, writer, soroban_facts(), now);
+    soroban_over(header, invocation, nonce, signature_expiration_ledger)
+}
+
+/// [`soroban_authorization`] over the header of [`approval_header`], with
+/// the guard of its store access, for a fixture that holds no keyring of
+/// its own.
+pub(crate) fn soroban_approval(
+    claim: ClaimTarget,
+    writer: &AuditWriterHandle,
+    invocation: &stellar_xdr::SorobanAuthorizedInvocation,
+    nonce: i64,
+    signature_expiration_ledger: u32,
+    now: u64,
+) -> (
+    MainnetSorobanIntentAuthorization,
+    stellar_agent_test_support::keyring_mock::DefaultStoreGuard,
+) {
+    let (header, access) = approval_header(claim, "fixture", None, writer, soroban_facts(), now);
+    (
+        soroban_over(header, invocation, nonce, signature_expiration_ledger),
+        access,
+    )
+}
+
+/// The audit tip facts of the fixture's Soroban authorizations.
+fn soroban_facts() -> VerifiedTipFacts {
+    VerifiedTipFacts {
+        segment_start_hash: [0; 32],
+        entry_count: 0,
+        tip_hash: [0; 32],
+        log_path_sha256: [5; 32],
+        anchor_covers_tip: true,
+        entry_tags_in_force: true,
+    }
+}
+
+/// The Soroban intent authorization over `header`, made a Soroban
+/// `X402Create` header, binding `invocation`, `nonce` and
+/// `signature_expiration_ledger`.
+fn soroban_over(
+    mut header: Header,
+    invocation: &stellar_xdr::SorobanAuthorizedInvocation,
+    nonce: i64,
+    signature_expiration_ledger: u32,
+) -> MainnetSorobanIntentAuthorization {
+    use sha2::{Digest as _, Sha256};
+
+    header.domain = AuthorizationDomain::Soroban;
+    header.consumer = MainnetConsumer::X402Create;
+    let mainnet: [u8; 32] = Sha256::digest(MAINNET_PASSPHRASE.as_bytes()).into();
+    let intent_digest = super::digest::soroban_intent_digest(&mainnet, invocation).unwrap();
+    MainnetSorobanIntentAuthorization::for_crate_tests(SorobanIntentInner {
+        entries: vec![],
+        facts: BindingFacts {
+            endpoint: None,
+            signer: [0; 32],
+            policy: [0; 32],
+            enablement: [0; 32],
+            witness: None,
+            reservation: None,
+            authority: [0; 32],
+            audit: [0; 32],
+            restriction: None,
+        },
+        authorization_ttl_ms: TTL_MS,
+        header,
+        binding: DomainBinding::Soroban { intent_digest },
+        nonce,
+        signature_expiration_ledger,
+    })
+}
+
+/// An unsigned mainnet transaction envelope from the fixture's source.
+pub(crate) fn unsigned_envelope() -> SignedTestEnvelope {
+    SignedTestEnvelope::builder(SIGNER_SEED)
+        .network_passphrase(MAINNET_PASSPHRASE)
+        .time_bounds(0, super::clock::now_ms().unwrap() / 1000 + 120)
+        .sequence(SEQUENCE)
+        .unsigned()
+        .build()
+}
+
+/// A mainnet transaction envelope signed by the fixture's source.
+pub(crate) fn signed_envelope() -> SignedTestEnvelope {
+    SignedTestEnvelope::builder(SIGNER_SEED)
+        .network_passphrase(MAINNET_PASSPHRASE)
+        .time_bounds(0, super::clock::now_ms().unwrap() / 1000 + 120)
+        .sequence(SEQUENCE)
+        .build()
+}
+
+/// One window entry of `amount` stroops for `profile`, dated `now`.
+pub(crate) fn hold(profile: &str, now: u64, amount: i128) -> WindowEntry {
+    WindowEntry::new(
+        StateKey::new(profile, 1, "native", 86_400),
+        now,
+        amount,
+        WindowLimit::Amount {
+            asset: "native".to_owned(),
+            window: "1d".to_owned(),
+            max_stroops: 1_000_000_000,
+        },
+    )
+}
+
+/// The submission intent of `envelope`, recorded against ledger 100.
+pub(crate) fn intent(envelope: &SignedTestEnvelope) -> SubmissionIntent {
+    let decoded =
+        TransactionEnvelope::from_xdr_base64(envelope.envelope_xdr(), Limits::none()).unwrap();
+    SubmissionIntent {
+        chain_scope: crate::policy_state::ChainScope::for_chain(
+            stellar_agent_core::profile::caip2::Caip2::Mainnet,
+        ),
+        envelope_hash: envelope_hash_hex(envelope.envelope_xdr()),
+        tx_hash: envelope.tx_hash_hex().to_owned(),
+        source: envelope.source().to_owned(),
+        sequence: envelope.sequence(),
+        max_time: crate::idempotent_submit::extract_max_time(&decoded),
+        submission_ledger: 100,
+        submission_anchor: None,
+        send_by_ms: None,
+        destinations: Default::default(),
+    }
+}
+
+/// A mainnet profile with its window store, policy pin, receipt store, and
+/// keyed audit writer, in a temporary directory, with the mainnet clock fixed
+/// at the fixture's `now`.
+///
+/// Installs the in-memory keyring and fixes the process-wide clock; tests
+/// that use it run serially.
+pub(crate) struct LedgerFixture {
+    pub(crate) dir: TempDir,
+    pub(crate) name: String,
+    pub(crate) profile: Profile,
+    pub(crate) window: PersistedWindowStore,
+    pub(crate) receipts: ReceiptStore,
+    pub(crate) writer: AuditWriterHandle,
+    pub(crate) anchors: Arc<InMemoryTipAnchorStore>,
+    pub(crate) now: u64,
+    /// The guard of the fixed clock; tests move it with `set`.
+    pub(crate) clock: TestClockGuard,
+}
+
+impl LedgerFixture {
+    pub(crate) fn context(&self) -> crate::MainnetWriteContext {
+        let profiles = self.dir.path().join("profiles");
+        stellar_agent_core::profile::loader::save_to_dir(&self.name, &self.profile, &profiles)
+            .unwrap();
+        crate::NetworkContext::mainnet_write(
+            &self.profile,
+            &stellar_agent_core::profile::name::ResolvedProfileName::from_flag(&self.name),
+            &profiles,
+            crate::MainnetEndpointFlags::default(),
+        )
+        .unwrap()
+    }
+
+    pub(crate) fn assert_claimed_holds(&self, id: AuthorizationId, amount: i128) {
+        let bytes = std::fs::read(self.window.path()).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+        let id = serde_json::to_value(id).unwrap();
+        let auth = wire["authorizations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|auth| auth["id"] == id)
+            .unwrap();
+        assert_eq!(auth["state"], "claimed");
+        assert_eq!(auth["claimed_ms"], self.now);
+        let total: i128 = wire["holds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|hold| hold["authorization_id"] == id)
+            .map(|hold| hold["amount"].as_str().unwrap().parse::<i128>().unwrap())
+            .sum();
+        assert_eq!(total, amount);
+    }
+
+    /// Replaces the policy pin of the fixture's window store with one naming
+    /// `digest`.
+    pub(crate) fn repin(&self, digest: [u8; 32]) {
+        let lock = WindowStoreLock::acquire_for(
+            self.window.path(),
+            &self.profile.policy_window_state_key_id,
+        )
+        .unwrap();
+        pin::write_for_test(
+            &lock,
+            &PinScope::for_profile(self.window.path(), &self.profile),
+            &Pin::new(POLICY_SEQUENCE, digest, POLICY_OWNER).unwrap(),
+        )
+        .unwrap();
+    }
+
+    pub(crate) fn claim_target(&self) -> ClaimTarget {
+        ClaimTarget {
+            store: self.window.clone(),
+            profile: self.profile.clone(),
+        }
+    }
+
+    pub(crate) fn mint_soroban(
+        &self,
+        invocation: &stellar_xdr::SorobanAuthorizedInvocation,
+        nonce: i64,
+        expiration: u32,
+        amount: i128,
+    ) -> MainnetSorobanIntentAuthorization {
+        let mut auth = soroban_authorization(
+            self.claim_target(),
+            &self.writer,
+            invocation,
+            nonce,
+            expiration,
+            self.now,
+        );
+        auth.0.header.profile = self.name.clone();
+        auth.0.entries = vec![hold(&self.name, self.now, amount)];
+        mint_header(&mut auth.0.header, &auth.0.binding, &auth.0.entries);
+        auth
+    }
+
+    /// A fixture whose stores are fresh at `now`.
+    pub(crate) fn new(label: &str, now: u64) -> Self {
+        let clock = set_now_ms_for_test(now);
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut profile = Profile::builder_mainnet_named(
+            label,
+            "https://rpc.example",
+            "fixture-signer",
+            &account(SIGNER_SEED),
+            "fixture-nonce",
+            "nonce",
+        )
+        .build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let name = stellar_agent_core::profile::name::profile_name_for_approval(&profile);
+        let window_path = dir.path().join("state.window");
+        {
+            let lock =
+                WindowStoreLock::acquire_for(&window_path, &profile.policy_window_state_key_id)
+                    .unwrap();
+            pin::write_for_test(
+                &lock,
+                &PinScope::for_profile(&window_path, &profile),
+                &Pin::new(POLICY_SEQUENCE, POLICY_DIGEST, POLICY_OWNER).unwrap(),
+            )
+            .unwrap();
+        }
+        let window = PersistedWindowStore::at_path(window_path);
+        let receipts = ReceiptStore::open_at(dir.path(), &name).unwrap();
+        let (writer, anchors) = keyed_writer(&profile.audit_log_path);
+        Self {
+            dir,
+            name,
+            profile,
+            window,
+            receipts,
+            writer,
+            anchors,
+            now,
+            clock,
+        }
+    }
+
+    /// Mints a transaction authorization over `binding` holding `holds`, for
+    /// `endpoint`, under [`fixture_policy_authority`], and returns it with
+    /// its header built from the minted record and an audit proof of the
+    /// fixture's writer. `_label` names the caller's authorization and binds
+    /// nothing.
+    pub(crate) fn mint(
+        &self,
+        binding: DomainBinding,
+        holds: &[WindowEntry],
+        endpoint: Option<(String, u64)>,
+        _label: &str,
+    ) -> MainnetTxSignAuthorization {
+        self.mint_for(binding, holds, endpoint, tip_facts(&self.writer), None)
+    }
+
+    /// [`Self::mint`] with an audit proof over `facts`.
+    pub(crate) fn mint_with_facts(
+        &self,
+        binding: DomainBinding,
+        holds: &[WindowEntry],
+        endpoint: Option<(String, u64)>,
+        _label: &str,
+        facts: VerifiedTipFacts,
+    ) -> MainnetTxSignAuthorization {
+        self.mint_for(binding, holds, endpoint, facts, None)
+    }
+
+    /// An operation record binding the fixture's unsigned envelope under
+    /// `business_id`, as a mainnet verb sets it up before its signature. A
+    /// transaction authorization over `binding` holding `holds` links to the
+    /// record's first attempt, which is begun as `Sending`.
+    pub(crate) fn linked_attempt(
+        &self,
+        binding: DomainBinding,
+        holds: &[WindowEntry],
+        business_id: &str,
+    ) -> (OperationAttempt, MainnetTxSignAuthorization) {
+        let (handle, authorization) = self.linked_record(binding, holds, business_id);
+        let attempt = operation_entry::begin_classic_attempt(
+            &self.window,
+            &self.profile,
+            &self.writer,
+            "request",
+            &handle,
+            unsigned_envelope().envelope_xdr(),
+        )
+        .unwrap();
+        (attempt, authorization)
+    }
+
+    /// The `Prepared` record of [`Self::linked_attempt`] and the
+    /// authorization linked to its first attempt, before the attempt begins.
+    pub(crate) fn linked_record(
+        &self,
+        binding: DomainBinding,
+        holds: &[WindowEntry],
+        business_id: &str,
+    ) -> (OperationHandle, MainnetTxSignAuthorization) {
+        let unsigned = unsigned_envelope();
+        let xdr = unsigned.envelope_xdr();
+        let handle = {
+            let mut guard = self.writer.lock().unwrap();
+            let opened =
+                OperationRecorder::new(&self.window, &self.profile, &mut *guard, "request")
+                    .open(&OpenRequest {
+                        business_id: BusinessId::parse(business_id).unwrap(),
+                        tool: OperationTool::CliPay,
+                        kind: OperationKind::Pay,
+                        intent: IntentSlot::Envelope {
+                            unsigned_envelope_sha256: operation_entry::unsigned_envelope_sha256(
+                                xdr,
+                            ),
+                            intent_digest: [7; 32],
+                            max_time: operation_entry::envelope_max_time(xdr).unwrap(),
+                        },
+                        envelope_xdr: Some(xdr.to_owned()),
+                        prepared_decision: None,
+                        rule_ttl_ms: None,
+                    })
+                    .unwrap();
+            let OpenOutcome::New(handle) = opened else {
+                panic!("a new business id opens a record: {opened:?}")
+            };
+            handle
+        };
+        let authorization = self.mint_for(
+            binding,
+            holds,
+            None,
+            tip_facts(&self.writer),
+            Some(operation_entry::next_attempt_link(&handle)),
+        );
+        (handle, authorization)
+    }
+
+    /// The operation record `attempt` belongs to, as the window file holds
+    /// it.
+    pub(crate) fn operation_record(&self, attempt: OperationAttempt) -> serde_json::Value {
+        let bytes = std::fs::read(self.window.path()).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+        let id = serde_json::to_value(attempt.operation_id).unwrap();
+        wire["operations"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["id"] == id)
+            .unwrap()
+            .clone()
+    }
+
+    /// The authorization record `id` as the window file holds it.
+    pub(crate) fn authorization_record(&self, id: AuthorizationId) -> serde_json::Value {
+        let bytes = std::fs::read(self.window.path()).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+        let id = serde_json::to_value(id).unwrap();
+        wire["authorizations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["id"] == id)
+            .unwrap()
+            .clone()
+    }
+
+    /// [`Self::mint_with_facts`] linked to the operation attempt `operation`
+    /// names, when one is given.
+    fn mint_for(
+        &self,
+        binding: DomainBinding,
+        holds: &[WindowEntry],
+        endpoint: Option<(String, u64)>,
+        facts: VerifiedTipFacts,
+        operation: Option<OperationLink>,
+    ) -> MainnetTxSignAuthorization {
+        let mut header = header(
+            self.claim_target(),
+            &self.name,
+            endpoint,
+            &self.writer,
+            facts,
+            self.now,
+        );
+        let authority = fixture_policy_authority(self.now);
+        header.authority = AuthorityBinding::Policy(authority.clone());
+        let minted = self
+            .window
+            .mint_authorization(
+                &self.profile,
+                &MintRequest {
+                    intent_digest: None,
+                    predecessor: None,
+                    approval_operation: None,
+                    chain: Caip2::Mainnet,
+                    binding: binding.clone(),
+                    consumer: header.consumer,
+                    policy_sequence: POLICY_SEQUENCE,
+                    policy_digest: POLICY_DIGEST,
+                    authority: crate::policy_state::MintAuthority::Policy(authority),
+                    chain_deadline_ms: None,
+                    restriction_end_ms: None,
+                    authorization_ttl_ms: TTL_MS,
+                    bindings: BindingFacts {
+                        endpoint: Some([1; 32]),
+                        signer: [2; 32],
+                        policy: [3; 32],
+                        enablement: [4; 32],
+                        witness: None,
+                        reservation: None,
+                        authority: [5; 32],
+                        audit: [6; 32],
+                        restriction: None,
+                    },
+                    holds: holds.to_vec(),
+                    parent: None,
+                    operation,
+                    floor: None,
+                    native_reservation: None,
+                },
+            )
+            .unwrap();
+        header.id = minted.id;
+        header.operation = operation;
+        header.reservation = minted.reservation;
+        header.issued_at_ms = minted.issued_at_ms;
+        header.expires_at_ms = minted.expires_at_ms;
+        header.bindings_digest = minted.bindings_digest;
+        MainnetTxSignAuthorization::for_crate_tests(TxSignInner {
+            header,
+            binding,
+            entries: holds.to_vec(),
+            _restriction: None,
+        })
+    }
+
+    /// The wallet recorder of a `stellar_pay_commit` submission sizing
+    /// `entries`, writing through `writer`.
+    pub(crate) fn recorder(
+        &self,
+        entries: Vec<WindowEntry>,
+        writer: Option<AuditWriterHandle>,
+    ) -> WalletSubmissionRecorder<'_> {
+        WalletSubmissionRecorder::new(
+            &self.profile,
+            self.name.clone(),
+            "stellar_pay_commit",
+            Some("stellar:pubnet".to_owned()),
+            PolicyDecision::Allow,
+            vec![],
+            entries,
+            self.receipts.clone(),
+            self.window.clone(),
+            writer,
+            None,
+            "request",
+            self.now,
+        )
+    }
+
+    /// Whether the ledger still lists `id` as open.
+    pub(crate) fn is_open(&self, id: AuthorizationId) -> bool {
+        self.window
+            .open_authorizations(&self.profile, self.now)
+            .unwrap()
+            .iter()
+            .any(|open| open.id == id)
+    }
+
+    /// Asserts the durable consumption and the absence of authorization holds.
+    pub(crate) fn assert_used_without_holds(&self, id: AuthorizationId) {
+        // The store prefixes its JSON body with a 32-byte HMAC tag.
+        let bytes = std::fs::read(self.dir.path().join("state.window")).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+        let id = serde_json::to_value(id).unwrap();
+        let record = wire["authorizations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["id"] == id)
+            .unwrap();
+        assert_eq!(record["state"], "used");
+        assert!(!record["consumption"].is_null());
+        assert!(
+            wire["holds"]
+                .as_array()
+                .is_none_or(|holds| holds.iter().all(|hold| hold["authorization_id"] != id))
+        );
+    }
+
+    /// The audit rows the fixture's log holds after its entry-tag boundary
+    /// row, by kind.
+    ///
+    /// # Panics
+    ///
+    /// When the first row is not the boundary row the fixture's keyed writer
+    /// appends at open.
+    pub(crate) fn audit_kinds(&self) -> Vec<String> {
+        let mut kinds: Vec<String> = std::fs::read_to_string(&self.profile.audit_log_path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            kinds.first().map(String::as_str),
+            Some("audit_entry_tags_started"),
+            "the keyed writer opens the log with its boundary row"
+        );
+        kinds.remove(0);
+        kinds
+    }
+}
+
+/// Resolver inputs produced by the signed-policy, enrollment, approval, and audit verifiers.
+///
+/// The fixture's directory is the process `STELLAR_AGENT_HOME` while it
+/// lives: the signed policy and its pin sit where the approval authority
+/// reads them, so the witness producer loads the policy the resolver is
+/// handed. A test that uses it runs under `#[serial]`.
+pub(crate) struct ResolverFixture {
+    _home: stellar_agent_test_support::StellarAgentHomeGuard,
+    pub(crate) dir: stellar_agent_test_support::sandbox::StateSandbox,
+    pub(crate) profile: Profile,
+    pub(crate) context: crate::MainnetWriteContext,
+    pub(crate) policy: stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
+    pub(crate) enablement: stellar_agent_core::mainnet::enablement::EnablementRecord,
+    pub(crate) signer: crate::keyring::EnrolledSigner,
+    pub(crate) window: PersistedWindowStore,
+    pub(crate) envelope: String,
+    pub(crate) source: SignedTestEnvelope,
+    pub(crate) now: u64,
+    pub(crate) clock: TestClockGuard,
+    pub(crate) anchor_failure: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    decisions: Vec<stellar_agent_core::mainnet::decision::MainnetDecision>,
+    /// The operation link of each approval nonce [`Self::attested`] recorded.
+    links: std::cell::RefCell<Vec<(String, OperationLink)>>,
+    /// Whether [`Self::attested`] records the approval durably; a test of a
+    /// missing or unconsented record clears it.
+    pub(crate) record_approvals: std::cell::Cell<bool>,
+}
+
+/// A wall clock fixed at one instant.
+struct FixedWall(u64);
+
+impl stellar_agent_core::timefmt::Clock for FixedWall {
+    fn now_unix_ms(&self) -> Result<u64, stellar_agent_core::wallet::WalletLifecycleError> {
+        Ok(self.0)
+    }
+}
+
+/// An audit sink for the fixture's own durable record writes.
+struct FixtureRows;
+
+impl crate::policy_state::OperationAudit for FixtureRows {
+    fn append(&mut self, _: stellar_agent_core::audit_log::AuditEntry) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl ResolverFixture {
+    pub(crate) fn captured_decision(
+        &self,
+    ) -> stellar_agent_core::mainnet::decision::MainnetDecision {
+        self.decisions.last().unwrap().clone()
+    }
+
+    /// A bounded decision with the fixture's verified policy provenance.
+    pub(crate) fn approval_authority<'w>(
+        &self,
+        witness: &'w stellar_agent_core::approval::witness::ApprovalWitness,
+    ) -> super::authority::MainnetAuthority<'w> {
+        let decision = self.decisions.last().unwrap();
+        super::authority::MainnetAuthority::from_decision(decision, Some(witness)).unwrap()
+    }
+
+    pub(crate) fn new() -> Self {
+        Self::configured(|_| {}, str::to_owned)
+    }
+
+    pub(crate) fn configured(
+        profile_edit: impl FnOnce(&mut Profile),
+        policy_edit: impl FnOnce(&str) -> String,
+    ) -> Self {
+        use stellar_agent_core::{
+            policy::v1::{
+                canonical, signature,
+                verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+            },
+            profile::{
+                loader,
+                schema::{KeyringEntryRef, signer_identity_entry_ref},
+                signer_identity::SignerIdentityRecord,
+            },
+        };
+        use stellar_xdr::{Memo, WriteXdr as _};
+        #[cfg(feature = "test-helpers")]
+        stellar_agent_core::audit_log::writer::AuditWriterRegistry::remove_for_test("operator");
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() - 300_000;
+        let clock = set_now_ms_for_test(now);
+        // The served source account is at sequence 1, so its next
+        // transaction carries sequence 2.
+        let source = SignedTestEnvelope::builder(SIGNER_SEED)
+            .network_passphrase(MAINNET_PASSPHRASE)
+            .time_bounds(0, super::clock::now_ms().unwrap() / 1000 + 120)
+            .amount_stroops(10)
+            .sequence(2)
+            .unsigned()
+            .build();
+        let mut decoded =
+            TransactionEnvelope::from_xdr_base64(source.envelope_xdr(), Limits::none()).unwrap();
+        let TransactionEnvelope::Tx(tx) = &mut decoded else {
+            unreachable!()
+        };
+        tx.tx.memo = Memo::Text(b"approved".to_vec().try_into().unwrap());
+        let envelope = decoded.to_xdr_base64(Limits::none()).unwrap();
+        let mut profile = Profile::builder_mainnet_named(
+            "operator",
+            "https://rpc.example.invalid",
+            "stellar-agent-signer-operator",
+            source.source(),
+            "stellar-agent-nonce-operator",
+            "default",
+        )
+        .primary_provider(
+            stellar_agent_core::profile::schema::PrimaryProviderRecord::new(
+                "Fixture primary operator",
+                "rpc.example.invalid",
+            ),
+        )
+        .oracle_provider_url(url::Url::parse("https://oracle.example.invalid").unwrap())
+        .oracle_provider(stellar_agent_core::profile::schema::ProviderRecord::new(
+            "Fixture oracle operator",
+            "oracle.example.invalid",
+            true,
+        ))
+        .build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        profile_edit(&mut profile);
+        let anchor = crate::keyring::KeyringTipAnchorStore::new(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        )
+        .anchor_entry_ref()
+        .clone();
+        let anchor_failure =
+            stellar_agent_test_support::keyring_mock::install_with_write_failure_switch(
+                &anchor.service,
+                &anchor.account,
+            )
+            .unwrap();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let put = |entry: &KeyringEntryRef, text: &str| {
+            keyring_core::Entry::new(&entry.service, &entry.account)
+                .unwrap()
+                .set_password(text)
+                .unwrap();
+        };
+        put(
+            &profile.policy_owner_key_id,
+            &stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()).to_string(),
+        );
+        put(
+            &signer_identity_entry_ref(&profile.mcp_signer_default),
+            &SignerIdentityRecord::signed_for_test(
+                public_key(SIGNER_SEED),
+                "operator",
+                &profile,
+                &owner,
+            )
+            .render()
+            .unwrap(),
+        );
+        for key in [
+            &profile.policy_window_state_key_id,
+            &profile.audit_log_hash_chain_key_id,
+            &profile.attestation_key_id,
+        ] {
+            crate::keyring::rotate_keyring_secret_32(&key.service, &key.account).unwrap();
+        }
+        loader::save_to_dir("operator", &profile, &dir.path().join("profiles")).unwrap();
+        let nonce = "installation-nonce";
+        let digest = stellar_agent_core::hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(
+            nonce.as_bytes(),
+        ));
+        let raw = include_str!("../../../stellar-agent-core/tests/fixtures/policy-v2.toml")
+            .replace(&"0".repeat(64), &digest)
+            .replace(
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                source.destination(),
+            )
+            .replace("decision = \"require_approval\"", "decision = \"allow\"")
+            .replace("ttl_secs = 3600", "")
+            .replace("reason = \"review\"", "");
+        let raw = policy_edit(&raw);
+        let canonical = canonical::canonical_bytes(&raw).unwrap();
+        let signature = signature::sign(&signature::digest(&canonical), &owner);
+        let policy_path = Self::default_policy_path();
+        std::fs::create_dir_all(policy_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &policy_path,
+            format!(
+                "{raw}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()),
+                stellar_agent_core::hex::encode(&signature)
+            ),
+        )
+        .unwrap();
+        let window_path = Self::default_window_path();
+        std::fs::create_dir_all(window_path.parent().unwrap()).unwrap();
+        let policy = load_verified_policy(
+            &PolicyLoad {
+                path: &policy_path,
+                profile: &profile,
+                profile_name: "operator",
+                owner_pubkey: &owner.verifying_key().to_bytes(),
+                owner_source: OwnerKeySource::Keyring,
+                window_path: &window_path,
+            },
+            stellar_agent_core::policy::v1::criteria::state_store::PolicyStateStore::new(),
+            PinMode::Advance,
+        )
+        .unwrap();
+        put(
+            &stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
+                &profile.policy_window_state_key_id,
+            ),
+            nonce,
+        );
+        let enablement = stellar_agent_core::mainnet::enablement::verify_enablement(
+            &policy,
+            "operator",
+            stellar_agent_core::profile::name::ProfileNameSource::Flag,
+            &profile,
+            &dir.path().join("profiles"),
+            &|_| Ok(nonce.to_owned()),
+        )
+        .unwrap();
+        let signer = crate::keyring::enrolled_signer(
+            "operator",
+            &dir.path().join("profiles"),
+            &profile,
+            crate::keyring::EnrolledRole::Agent,
+            &public_key(SIGNER_SEED),
+            &policy.owner(),
+        )
+        .unwrap();
+        let context = crate::NetworkContext::mainnet_write(
+            &profile,
+            &stellar_agent_core::profile::name::ResolvedProfileName::from_flag("operator"),
+            &dir.path().join("profiles"),
+            crate::MainnetEndpointFlags::default(),
+        )
+        .unwrap();
+        // Capture permitting decisions before tests change observations or state.
+        use stellar_agent_core::mainnet::decision::{
+            EvaluationScope, MainnetEvaluationRequest, evaluate_mainnet,
+        };
+        use stellar_agent_core::policy::v1::{
+            AccountReserveLookupError, AccountReservesView, ActionKind, ValueClass, ValueLeg,
+        };
+        use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor, ToolValueKind};
+        /// A funded account observed at the fixture's instant, with no
+        /// reservations, so a floor rule decides as funded.
+        struct Funded(u64);
+        impl AccountReservesView for Funded {
+            fn reserves_stroops(&self, _: i64) -> i64 {
+                10_000_000
+            }
+            fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+                Ok(i64::MAX)
+            }
+            fn observation(&self) -> Option<stellar_agent_core::policy::v1::AccountObservation> {
+                Some(stellar_agent_core::policy::v1::AccountObservation {
+                    ledger_sequence: 100,
+                    observed_at_ms: self.0,
+                    close_time_floor_ms: self.0,
+                })
+            }
+            fn effective_native_reservations_stroops(&self) -> Option<u64> {
+                Some(0)
+            }
+        }
+        let doc: toml_edit::DocumentMut = raw.parse().unwrap();
+        let decisions = doc["rules"]
+            .as_array_of_tables()
+            .unwrap()
+            .iter()
+            .map(|rule| {
+                let tool = match rule["match"]["tool"].as_str().unwrap() {
+                    "stellar_pay" => "stellar_pay",
+                    "stellar_pay_commit" => "stellar_pay_commit",
+                    "stellar_claim" => "stellar_claim",
+                    "stellar_x402_create_payment" => "stellar_x402_create_payment",
+                    "stellar_x402_authenticated_payment" => "stellar_x402_authenticated_payment",
+                    name => panic!("unsupported fixture tool: {name}"),
+                };
+                let mut descriptor = ToolDescriptor::from_registration(&McpToolRegistration {
+                    name: tool,
+                    destructive_hint: true,
+                    read_only_hint: false,
+                    chain_id_required: true,
+                    value_kind: ToolValueKind::MovesValue,
+                });
+                descriptor.chain_id = profile.chain_id.caip2_str().to_owned();
+                let asset = rule["criteria"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find_map(|c| {
+                        c.as_inline_table()
+                            .and_then(|c| c.get("assets"))
+                            .and_then(toml_edit::Value::as_array)
+                            .and_then(|a| a.get(0))
+                            .and_then(toml_edit::Value::as_str)
+                    })
+                    .unwrap_or("native");
+                let scope = if tool == "stellar_x402_authenticated_payment" {
+                    EvaluationScope::X402Authenticated {
+                        home_domain: MESSAGE_HOME_DOMAIN.to_owned(),
+                        tool: tool.to_owned(),
+                    }
+                } else {
+                    EvaluationScope::Classic
+                };
+                let destination = rule["criteria"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find_map(|c| {
+                        c.as_inline_table()
+                            .and_then(|c| c.get("allowlist"))
+                            .and_then(toml_edit::Value::as_array)
+                            .and_then(|a| a.get(0))
+                            .and_then(toml_edit::Value::as_str)
+                    })
+                    .unwrap_or(source.destination());
+                evaluate_mainnet(
+                    &policy,
+                    scope,
+                    now,
+                    MainnetEvaluationRequest {
+                        chain_id: profile.chain_id.caip2_str(),
+                        tool: &descriptor,
+                        args: &serde_json::json!({ "total_fee_stroops": 0 }),
+                        profile: &profile,
+                        value: Some(ValueClass::single(ValueLeg {
+                            kind: if tool.starts_with("stellar_pay") {
+                                ActionKind::Payment
+                            } else if tool == "stellar_claim" {
+                                ActionKind::Claim
+                            } else {
+                                ActionKind::X402Payment
+                            },
+                            amount: Some(0),
+                            asset: Some(asset.to_owned()),
+                            destination: Some(destination.to_owned()),
+                        })),
+                        account_view: Some(&Funded(now)),
+                        identity_view: None,
+                        counterparty_cache: None,
+                        sep10_sessions: None,
+                        sep45_sessions: None,
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        Self {
+            decisions,
+            dir,
+            _home: home,
+            profile,
+            context,
+            policy,
+            enablement,
+            signer,
+            window: PersistedWindowStore::at_path(window_path),
+            envelope,
+            source,
+            now,
+            clock,
+            anchor_failure,
+            links: std::cell::RefCell::default(),
+            record_approvals: std::cell::Cell::new(true),
+        }
+    }
+
+    /// The operation link [`Self::attested`] recorded for `nonce`'s approval.
+    pub(crate) fn link(&self, nonce: &str) -> Option<OperationLink> {
+        self.links
+            .borrow()
+            .iter()
+            .find(|(recorded, _)| recorded == nonce)
+            .map(|(_, link)| *link)
+    }
+
+    /// The operation link of `authority`'s approval; `None` for a policy
+    /// authority or an approval without a fixture record.
+    pub(crate) fn link_of(
+        &self,
+        authority: &super::authority::MainnetAuthority<'_>,
+    ) -> Option<OperationLink> {
+        match authority {
+            super::authority::MainnetAuthority::Approval(approval) => {
+                self.link(approval.witness().nonce())
+            }
+            super::authority::MainnetAuthority::Policy(_) => None,
+        }
+    }
+
+    /// Opens an operation and the durable record of `witness` and records
+    /// its consent through the producer facades, as a value producer does
+    /// before the operator approves.
+    fn record(
+        &self,
+        witness: &stellar_agent_core::approval::witness::ApprovalWitness,
+        attestation: [u8; 32],
+        entry: &stellar_agent_core::approval::PendingApproval,
+    ) {
+        use crate::policy_state::{
+            ApprovalRecorder, BusinessId, ConsentPayload, ConsentRow, IntentSlot, OpenOutcome,
+            OpenRequest, OperationKind, OperationRecorder, OperationTool, PendingApprovalFacts,
+        };
+        if self.link(witness.nonce()).is_some() {
+            // Another witness of the same approval shares its record.
+            return;
+        }
+        let rule_ttl_ms = witness.expires_at_ms() - witness.created_at_ms();
+        let opened = OperationRecorder::new(&self.window, &self.profile, &mut FixtureRows, "open")
+            .open(&OpenRequest {
+                business_id: BusinessId::parse(witness.nonce()).unwrap(),
+                tool: OperationTool::CliPay,
+                kind: OperationKind::Pay,
+                // A placeholder canonical intent matches no envelope, and an
+                // unmatched canonical link refuses lineage; the holder slot
+                // binds an envelope digest without a signed end instead.
+                intent: IntentSlot::Envelope {
+                    intent_digest: [1; 32],
+                    unsigned_envelope_sha256: [1; 32],
+                    max_time: 0,
+                },
+                envelope_xdr: None,
+                prepared_decision: None,
+                rule_ttl_ms: Some(rule_ttl_ms),
+            })
+            .unwrap();
+        let OpenOutcome::New(handle) = opened else {
+            panic!("a fresh approval nonce opens a new operation: {opened:?}")
+        };
+        let mut rows = FixtureRows;
+        let mut recorder =
+            ApprovalRecorder::new(&self.window, &self.profile, &mut rows, "approval");
+        let view = recorder
+            .open_pending(
+                handle.id(),
+                &PendingApprovalFacts {
+                    nonce: witness.nonce().to_owned(),
+                    kind: witness.kind(),
+                    subject_kind: witness.subject_kind(),
+                    subject: witness.subject(),
+                    intent_digest: [1; 32],
+                    created_at_ms: witness.created_at_ms(),
+                    waiting_expires_at_ms: witness.expires_at_ms(),
+                    rule_ttl_ms,
+                },
+                PolicyDecision::RequireApproval,
+            )
+            .unwrap();
+        recorder
+            .record_consent(
+                view.record.id,
+                witness,
+                &ConsentPayload::new(
+                    attestation,
+                    entry.mainnet_presence.clone().unwrap(),
+                    entry.process_uid.clone(),
+                    ConsentRow::Written,
+                ),
+            )
+            .unwrap();
+        self.links.borrow_mut().push((
+            witness.nonce().to_owned(),
+            OperationLink {
+                operation_id: handle.id(),
+                attempt_index: 1,
+            },
+        ));
+    }
+
+    /// The signed policy file, where the approval authority reads it.
+    fn default_policy_path() -> std::path::PathBuf {
+        stellar_agent_core::profile::schema::default_policy_dir()
+            .unwrap()
+            .join("operator.toml")
+    }
+
+    /// The window-state file the policy pin and the ledger share, where the
+    /// approval authority reads the pin.
+    fn default_window_path() -> std::path::PathBuf {
+        stellar_agent_core::profile::schema::default_policy_window_state_path_for("operator")
+    }
+
+    /// The signed policy file of the fixture.
+    pub(crate) fn policy_path(&self) -> std::path::PathBuf {
+        Self::default_policy_path()
+    }
+
+    /// The window-state file of the fixture.
+    pub(crate) fn window_path(&self) -> std::path::PathBuf {
+        Self::default_window_path()
+    }
+
+    /// The classic payment approval of `envelope`, created at `created` and
+    /// expiring `ttl` later, consented and verified as [`Self::attested`]
+    /// describes.
+    pub(crate) fn approval(
+        &self,
+        envelope: &str,
+        created: u64,
+        ttl: u64,
+    ) -> stellar_agent_core::approval::witness::ApprovalWitness {
+        use stellar_agent_core::approval::PendingApproval;
+        let args = stellar_agent_core::envelope_decode::decode_authoritative_args(
+            envelope,
+            "stellar_pay_commit",
+        )
+        .unwrap();
+        let mut entry = PendingApproval::new_payment_pending(
+            envelope.to_owned(),
+            envelope.as_bytes(),
+            args["destination"].as_str().unwrap().to_owned(),
+            args["amount_stroops"].as_str().unwrap().parse().unwrap(),
+            "XLM".to_owned(),
+            Some("approved".to_owned()),
+            100,
+            1,
+            "1000".into(),
+            ttl,
+        )
+        .unwrap();
+        entry.created_at_unix_ms = created;
+        entry.expires_at_unix_ms = created + ttl;
+        self.attested(
+            &entry,
+            stellar_agent_core::approval::witness::ApprovedKind::Payment,
+            stellar_agent_core::approval::subject::approval_subject_classic(envelope),
+        )
+    }
+
+    /// The operator's witness of `entry` as `kind` over `subject`.
+    ///
+    /// The entry is inserted into its own store and consented through the
+    /// production attester with a presence the fixture credential signs over
+    /// a challenge issued under the current signed policy; the witness comes
+    /// from the production producer under the same policy. The attester and
+    /// the producer read the wall clock, so `entry`'s lifetime covers the
+    /// present; the resolver reads the fixture's clock.
+    pub(crate) fn attested(
+        &self,
+        entry: &stellar_agent_core::approval::PendingApproval,
+        kind: stellar_agent_core::approval::witness::ApprovedKind,
+        subject: [u8; 32],
+    ) -> stellar_agent_core::approval::witness::ApprovalWitness {
+        self.attested_subject(entry, kind, subject, None)
+    }
+
+    pub(crate) fn attested_intent(
+        &self,
+        entry: &stellar_agent_core::approval::PendingApproval,
+        intent: &stellar_agent_core::approval::intent::ClassicIntent,
+        decision: &stellar_agent_core::mainnet::decision::MainnetDecision,
+    ) -> stellar_agent_core::approval::witness::ApprovalWitness {
+        self.attested_subject(
+            entry,
+            intent.approved_kind(),
+            *intent.digest().as_bytes(),
+            Some((intent, decision)),
+        )
+    }
+
+    fn attested_subject(
+        &self,
+        entry: &stellar_agent_core::approval::PendingApproval,
+        kind: stellar_agent_core::approval::witness::ApprovedKind,
+        subject: [u8; 32],
+        intent: Option<(
+            &stellar_agent_core::approval::intent::ClassicIntent,
+            &stellar_agent_core::mainnet::decision::MainnetDecision,
+        )>,
+    ) -> stellar_agent_core::approval::witness::ApprovalWitness {
+        use base64::Engine as _;
+        use stellar_agent_core::approval::{
+            AttestationBinding, ConsentAudit, ConsentAuthorization, MainnetApprovalAuthority,
+            PendingApprovalStore, Surface, attest_and_persist, issue_mainnet_presence,
+            load_attestation_key,
+            mainnet_fixtures::MainnetConsentFixture,
+            verify_mainnet_presence,
+            witness::{ApprovalExpectation, verify_approval},
+        };
+        // The ceremony runs on the fixture clock, so the durable consent time
+        // is the resolver's present. A clock outside the first half of the
+        // entry's lifetime consents at that bound: an operator approves a
+        // live entry.
+        let created = entry.created_at_unix_ms;
+        let presence_at = super::clock::now_ms().unwrap().clamp(
+            created,
+            created + entry.expires_at_unix_ms.saturating_sub(created) / 2,
+        );
+        let _wall =
+            stellar_agent_core::timefmt::test_clock::install(Arc::new(FixedWall(presence_at)));
+        let wall = || stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        let path = self.dir.path().join(format!(
+            "{}-{}.toml",
+            entry.approval_nonce,
+            stellar_agent_core::hex::encode(&subject)
+        ));
+        let mut store = PendingApprovalStore::open(path).unwrap();
+        store.insert(entry.clone(), wall()).unwrap();
+        let key = load_attestation_key(
+            &self.profile.attestation_key_id,
+            &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
+                "operator",
+                &self.profile,
+            ),
+        )
+        .unwrap();
+        let binding = AttestationBinding::new("operator", self.profile.chain_id.caip2_str());
+        let policy = MainnetApprovalAuthority::for_profile("operator")
+            .unwrap()
+            .load_current()
+            .unwrap()
+            .into_policy();
+        let origin = MainnetConsentFixture::origin();
+        let challenge = if let Some((intent, _)) = intent {
+            stellar_agent_core::approval::issue_mainnet_intent_presence(
+                entry,
+                &binding,
+                &policy,
+                stellar_agent_core::approval::PresenceListener::Loopback(&origin),
+                Some(intent),
+                wall(),
+                std::time::Instant::now(),
+            )
+        } else {
+            issue_mainnet_presence(
+                entry,
+                &binding,
+                &policy,
+                &MainnetConsentFixture::origin(),
+                presence_at,
+                std::time::Instant::now(),
+            )
+        }
+        .unwrap();
+        let assertion = MainnetConsentFixture::sign(
+            &stellar_agent_test_support::webauthn::fixture_authenticator(),
+            &challenge,
+        );
+        let presence = verify_mainnet_presence(
+            challenge,
+            MainnetConsentFixture::input(&assertion),
+            presence_at,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        let audit = self.audit();
+        attest_and_persist(
+            &mut store,
+            entry,
+            &key,
+            &binding,
+            Surface::Cli,
+            ConsentAudit::Writer(&mut audit.writer().lock().unwrap()),
+            ConsentAuthorization::Mainnet {
+                presence,
+                policy: &policy,
+            },
+            |_, _| Err("unexpected grant".to_owned()),
+        )
+        .unwrap();
+        let approved = store.get(&entry.approval_nonce).unwrap().clone();
+        let blob: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(approved.attestation_blob_b64.as_ref().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        if let Some((intent, decision)) = intent {
+            return stellar_agent_core::approval::witness::verify_intent_approval(
+                &store,
+                &self.profile,
+                "operator",
+                &entry.approval_nonce,
+                &blob,
+                intent,
+                decision,
+                &policy,
+                wall(),
+            )
+            .unwrap();
+        }
+        let witness = verify_approval(
+            &store,
+            &self.profile,
+            "operator",
+            &entry.approval_nonce,
+            &blob,
+            &ApprovalExpectation { kind, subject },
+            &policy,
+            wall(),
+        )
+        .unwrap();
+        if self.record_approvals.get() {
+            self.record(&witness, blob, &approved);
+        }
+        witness
+    }
+
+    /// The fixture's signed policy with `edit` applied, signed by the same
+    /// owner and verified for `profile` under `name` with a pin of its own
+    /// for each distinct body.
+    pub(crate) fn alternate_policy(
+        &self,
+        edit: impl FnOnce(&mut toml_edit::DocumentMut),
+        profile: &Profile,
+        name: &str,
+    ) -> stellar_agent_core::mainnet::verified_policy::VerifiedPolicy {
+        use stellar_agent_core::policy::v1::{
+            canonical, signature,
+            verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+        };
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let mut raw = std::fs::read_to_string(self.policy_path())
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        raw.remove("signature");
+        edit(&mut raw);
+        let canonical = canonical::canonical_bytes(&raw.to_string()).unwrap();
+        let digest = signature::digest(&canonical);
+        let signature = signature::sign(&digest, &owner);
+        let label = stellar_agent_core::hex::encode(&digest[..8]);
+        let path = self.dir.path().join("alternate-policy.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "{raw}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()),
+                stellar_agent_core::hex::encode(&signature)
+            ),
+        )
+        .unwrap();
+        let mut profile = profile.clone();
+        profile
+            .policy_window_state_key_id
+            .account
+            .push_str(&format!("-alternate-{label}"));
+        load_verified_policy(
+            &PolicyLoad {
+                path: &path,
+                profile: &profile,
+                profile_name: name,
+                owner_pubkey: &owner.verifying_key().to_bytes(),
+                owner_source: OwnerKeySource::Keyring,
+                window_path: &self.dir.path().join(format!("alternate-{label}.window")),
+            },
+            stellar_agent_core::policy::v1::criteria::state_store::PolicyStateStore::new(),
+            PinMode::Advance,
+        )
+        .unwrap()
+    }
+
+    /// [`Self::alternate_policy`] for the operator with one rule bound
+    /// raised: the enablement facts, the sequence and every evaluation the
+    /// fixtures make are unchanged, and only the policy digest differs.
+    pub(crate) fn another_policy(
+        &self,
+    ) -> stellar_agent_core::mainnet::verified_policy::VerifiedPolicy {
+        let profile = self.profile.clone();
+        self.alternate_policy(
+            |doc| {
+                let raised = doc.to_string().replace("max_calls = 10", "max_calls = 11");
+                assert_ne!(
+                    raised,
+                    doc.to_string(),
+                    "the fixture policy has a rate limit"
+                );
+                *doc = raised.parse().unwrap();
+            },
+            &profile,
+            "operator",
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn context_with_routes(
+        &self,
+        routes: &[(&str, &str)],
+    ) -> crate::MainnetWriteContext {
+        crate::NetworkContext::mainnet_write(
+            &self.profile,
+            &stellar_agent_core::profile::name::ResolvedProfileName::from_flag("operator"),
+            &self.dir.path().join("profiles"),
+            crate::MainnetEndpointFlags::default(),
+        )
+        .unwrap()
+        .with_test_transport_routes(routes)
+    }
+
+    pub(crate) fn wire(&self) -> serde_json::Value {
+        let path = self.window_path();
+        if !path.exists() {
+            return serde_json::json!({});
+        }
+        let bytes = std::fs::read(path).unwrap();
+        serde_json::from_slice(&bytes[32..]).unwrap()
+    }
+
+    pub(crate) fn audit(&self) -> AuditReadiness {
+        super::audit_readiness::audit_readiness(&self.profile, "operator").unwrap()
+    }
+
+    pub(crate) async fn server(&self) -> wiremock::MockServer {
+        use stellar_agent_test_support::{EchoIdResponder, signed_envelope::get_network_result};
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "getNetwork"}),
+            ))
+            .respond_with(EchoIdResponder::new(get_network_result(MAINNET_PASSPHRASE)))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "getLedgerEntries"}),
+            ))
+            .respond_with(EchoIdResponder::new(self.source.ledger_entries_result()))
+            .mount(&server)
+            .await;
+        server
+    }
+}
+
+/// The home domain the message fixtures approve and challenge.
+pub(crate) const MESSAGE_HOME_DOMAIN: &str = "anchor.example.com";
+
+/// The token contract the x402 fixtures pay in.
+pub(crate) fn x402_token() -> String {
+    stellar_strkey::Contract([3; 32]).to_string().to_string()
+}
+
+/// `raw` with its rule moved to the two x402 tools over the fixture's token:
+/// the create tool's rule as it is, and the authenticated tool's rule after
+/// `authenticated` edits it.
+pub(crate) fn x402_policy(raw: &str, authenticated: impl FnOnce(String) -> String) -> String {
+    let token = x402_token();
+    let raw = raw
+        .replace("\"native\"", &format!("\"{token}\""))
+        .replace("native =", &format!("\"{token}\" ="));
+    let start = raw.find("[[rules]]").unwrap();
+    let rule = &raw[start..];
+    format!(
+        "{}{}\n{}",
+        &raw[..start],
+        rule.replace("stellar_pay", "stellar_x402_create_payment"),
+        authenticated(rule.replace("stellar_pay", "stellar_x402_authenticated_payment"))
+    )
+}
+
+/// A resolver fixture whose policy evaluates both x402 tools.
+pub(crate) fn x402_fixture() -> ResolverFixture {
+    ResolverFixture::configured(|_| {}, |raw| x402_policy(raw, |rule| rule))
+}
+
+/// The witness of the payment record `entry` builds, consented on the
+/// enabled mainnet profile `name` under that profile's own temporary home
+/// and keyring.
+///
+/// A resolver fixture and the authorization tests install their own keyring
+/// and home, so a test takes this witness before it builds them.
+pub(crate) fn witness_under_own_home(
+    name: &str,
+    entry: impl FnOnce(
+        &stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture,
+    ) -> stellar_agent_core::approval::PendingApproval,
+) -> stellar_agent_core::approval::witness::ApprovalWitness {
+    use base64::Engine as _;
+    use stellar_agent_core::approval::{
+        ApprovalKind,
+        mainnet_fixtures::MainnetConsentFixture,
+        subject::approval_subject_classic,
+        witness::{ApprovalExpectation, ApprovedKind, verify_approval},
+    };
+    let fixture = MainnetConsentFixture::new(name);
+    let entry = entry(&fixture);
+    let ApprovalKind::PaymentSimulated {
+        envelope_xdr_b64, ..
+    } = &entry.kind
+    else {
+        unreachable!("the record is a payment");
+    };
+    let subject = approval_subject_classic(envelope_xdr_b64);
+    let (store, surfaced) = fixture.consent(&entry);
+    let blob: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(surfaced.unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    verify_approval(
+        &store,
+        fixture.profile(),
+        name,
+        &entry.approval_nonce,
+        &blob,
+        &ApprovalExpectation {
+            kind: ApprovedKind::Payment,
+            subject,
+        },
+        &fixture.current_policy(),
+        stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+    )
+    .unwrap()
+}
+
+/// The witness of a payment consented on another enabled mainnet profile
+/// `name`, as [`witness_under_own_home`] produces it.
+pub(crate) fn foreign_profile_approval(
+    name: &str,
+) -> stellar_agent_core::approval::witness::ApprovalWitness {
+    witness_under_own_home(name, |fixture| fixture.payment(600_000))
+}
+
+/// The payment root of the x402 fixtures: a transfer of 10 of the token from
+/// the fixture's signer to its destination, with no sub-invocations.
+pub(crate) fn x402_root(f: &ResolverFixture) -> stellar_xdr::SorobanAuthorizedInvocation {
+    use stellar_xdr::{
+        AccountId, ContractId, Hash, Int128Parts, InvokeContractArgs, PublicKey, ScAddress, ScVal,
+        SorobanAuthorizedFunction, SorobanAuthorizedInvocation, Uint256,
+    };
+    SorobanAuthorizedInvocation {
+        function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+            contract_address: ScAddress::Contract(ContractId(Hash([3; 32]))),
+            function_name: "transfer".try_into().unwrap(),
+            args: vec![
+                ScVal::Address(ScAddress::Account(AccountId(
+                    PublicKey::PublicKeyTypeEd25519(Uint256(f.signer.public_key())),
+                ))),
+                ScVal::Address(ScAddress::Account(AccountId(
+                    PublicKey::PublicKeyTypeEd25519(Uint256(
+                        stellar_strkey::ed25519::PublicKey::from_string(f.source.destination())
+                            .unwrap()
+                            .0,
+                    )),
+                ))),
+                ScVal::I128(Int128Parts { hi: 0, lo: 10 }),
+            ]
+            .try_into()
+            .unwrap(),
+        }),
+        sub_invocations: vec![].try_into().unwrap(),
+    }
+}
+
+/// The mainnet intent of `root` for `consumer`.
+pub(crate) fn x402_intent(
+    root: &stellar_xdr::SorobanAuthorizedInvocation,
+    consumer: MainnetConsumer,
+) -> super::resolve::SorobanIntent<'_> {
+    use sha2::Digest as _;
+    super::resolve::SorobanIntent {
+        consumer,
+        root_invocation: root,
+        network_id: sha2::Sha256::digest(MAINNET_PASSPHRASE.as_bytes()).into(),
+    }
+}
+
+/// Message facts for the fixture's home domain, its web authentication
+/// domain and server key, with `content` and `key`.
+pub(crate) fn message_facts(content: [u8; 32], key: [u8; 32]) -> super::message::MessageFacts {
+    super::message::MessageFacts {
+        domain: super::MessageDomain {
+            home_domain: MESSAGE_HOME_DOMAIN.to_owned(),
+            web_auth_domain: "auth.anchor.example.com".to_owned(),
+            server_key: [0x5e; 32],
+        },
+        content_digest: content,
+        ephemeral_public_key: key,
+    }
+}
+
+impl ResolverFixture {
+    /// The operator's approval of the x402 payment `root`, for the
+    /// authenticated subject over `home_domain` or the plain subject without
+    /// one, created at `created` and expiring 600 seconds later, consented
+    /// and verified as [`Self::attested`] describes.
+    pub(crate) fn x402_approval(
+        &self,
+        root: &stellar_xdr::SorobanAuthorizedInvocation,
+        home_domain: Option<&str>,
+        created: u64,
+    ) -> stellar_agent_core::approval::witness::ApprovalWitness {
+        use stellar_agent_core::approval::subject::{
+            approval_subject_x402, approval_subject_x402_authenticated, soroban_intent_digest,
+        };
+        let intent = x402_intent(root, MainnetConsumer::X402Authenticated);
+        let mut entry = stellar_agent_core::approval::PendingApproval::new_x402_pending(
+            &intent.network_id,
+            root,
+            home_domain.map(str::to_owned),
+            "1000".into(),
+            600_000,
+        )
+        .unwrap();
+        entry.created_at_unix_ms = created;
+        entry.expires_at_unix_ms = created + 600_000;
+        let digest = soroban_intent_digest(&intent.network_id, root).unwrap();
+        self.attested(
+            &entry,
+            stellar_agent_core::approval::witness::ApprovedKind::X402Payment,
+            home_domain.map_or_else(
+                || approval_subject_x402(&digest),
+                |domain| approval_subject_x402_authenticated(&digest, domain),
+            ),
+        )
+    }
+
+    /// The message signing request over this fixture's proofs.
+    pub(crate) fn message_request<'a>(
+        &'a self,
+        intent: &'a super::resolve::SorobanIntent<'a>,
+        message: &'a super::message::MessageFacts,
+        authority: &'a super::authority::MainnetAuthority<'a>,
+    ) -> super::resolve::MessageSignRequest<'a> {
+        super::resolve::MessageSignRequest {
+            approval_operation: self.link_of(authority).map(|link| link.operation_id),
+            context: &self.context,
+            consumer: MainnetConsumer::X402Authenticated,
+            intent,
+            message,
+            policy: &self.policy,
+            enablement: &self.enablement,
+            authority,
+            audit: self.audit(),
+            store: &self.window,
+        }
+    }
+
+    /// The receipt of a message authorization for `message`, resolved and
+    /// consumed over a fresh approval of the payment `root` for the
+    /// message's home domain.
+    pub(crate) fn message_receipt(
+        &self,
+        root: &stellar_xdr::SorobanAuthorizedInvocation,
+        message: &super::message::MessageFacts,
+    ) -> super::message::MessageUseReceipt {
+        let approval = self.x402_approval(root, Some(&message.domain.home_domain), self.now);
+        self.message_receipt_for(root, message, &approval)
+    }
+
+    /// The receipt of a message authorization for `message`, resolved under
+    /// `approval` and consumed.
+    pub(crate) fn message_receipt_for(
+        &self,
+        root: &stellar_xdr::SorobanAuthorizedInvocation,
+        message: &super::message::MessageFacts,
+        approval: &stellar_agent_core::approval::witness::ApprovalWitness,
+    ) -> super::message::MessageUseReceipt {
+        use stellar_agent_core::mainnet::decision::{
+            AuthorityScope, EvaluationScope, MainnetEvaluationRequest, evaluate_mainnet,
+        };
+        use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor, ToolValueKind};
+        let mut decision = self.captured_decision();
+        if !matches!(decision.scope(), AuthorityScope::X402Authenticated { home_domain, .. } if home_domain == &message.domain.home_domain)
+        {
+            let mut tool = ToolDescriptor::from_registration(&McpToolRegistration {
+                name: "stellar_x402_authenticated_payment",
+                destructive_hint: true,
+                read_only_hint: false,
+                chain_id_required: true,
+                value_kind: ToolValueKind::MovesValue,
+            });
+            tool.chain_id = self.profile.chain_id.caip2_str().to_owned();
+            decision = evaluate_mainnet(
+                &self.policy,
+                EvaluationScope::X402Authenticated {
+                    home_domain: message.domain.home_domain.clone(),
+                    tool: tool.name.clone(),
+                },
+                self.now,
+                MainnetEvaluationRequest {
+                    chain_id: self.profile.chain_id.caip2_str(),
+                    tool: &tool,
+                    args: &serde_json::json!({}),
+                    profile: &self.profile,
+                    value: decision
+                        .value_effects()
+                        .cloned()
+                        .map(stellar_agent_core::policy::v1::ValueClass::Value),
+                    account_view: None,
+                    identity_view: None,
+                    counterparty_cache: None,
+                    sep10_sessions: None,
+                    sep45_sessions: None,
+                },
+            )
+            .unwrap();
+        }
+        let authority =
+            super::authority::MainnetAuthority::from_decision(&decision, Some(approval)).unwrap();
+        let intent = x402_intent(root, MainnetConsumer::X402Authenticated);
+        let authorization = super::resolve::resolve_message_sign(
+            self.message_request(&intent, message, &authority),
+        )
+        .unwrap();
+        super::resolve::consume_message_sign(&self.context, authorization, &self.window).unwrap()
+    }
+}

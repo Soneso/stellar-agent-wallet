@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Prefetches the prebuilt libsodium archive of the MSVC build into
-# $RUNNER_TEMP/sodium-dist and writes SODIUM_DIST_DIR to $GITHUB_ENV.
-# stellar-baselib links libsodium. On MSVC its build script fetches the
-# archive from download.libsodium.org over plain HTTP with no retry, which is
-# flaky from Windows runners. This script fetches the same archive over HTTPS
-# with retries, and the build script consumes the local copy. The build
-# script still verifies the archive's minisign signature against its pinned
-# upstream key, so integrity does not rest on this download.
+# Prefetches libsodium into $RUNNER_TEMP/sodium-dist. On MSVC the build
+# script of libsodium-sys-stable fetches the prebuilt archive over plain HTTP
+# with no retry, which is flaky from Windows runners; this script fetches it
+# over HTTPS with retries, and the build script consumes the local copy.
+# The build script reads both the prebuilt MSVC archive and the LATEST.tar.gz
+# source archive, plus their .minisig files, from this directory. It verifies
+# each archive against the minisign key embedded in the pinned
+# libsodium-sys-stable; an invalid signature fails the build. Upstream replaces
+# the stable archives in place, so this script pins no digest and logs the
+# SHA-256 of the prebuilt MSVC archive.
 #
-# check-workflow-invariants.py requires the body below to equal, line for
-# line, the run block of the release build job's step that writes
-# SODIUM_DIST_DIR.
+# The build jobs of release.yml and release-rehearsal.yml run this script by
+# path, once each, and check-workflow-invariants.py requires their build step
+# to follow the Perl and sodium setup steps immediately.
 set -euo pipefail
 DIST_DIR="$RUNNER_TEMP/sodium-dist"
 mkdir -p "$DIST_DIR"
@@ -20,4 +22,6 @@ for f in libsodium-1.0.22-stable-msvc.zip libsodium-1.0.22-stable-msvc.zip.minis
   curl --fail --silent --show-error --location --retry 5 --retry-all-errors \
     --output "$DIST_DIR/$f" "$BASE/$f"
 done
+actual=$(sha256sum < "$DIST_DIR/libsodium-1.0.22-stable-msvc.zip")
+echo "sodium: libsodium-1.0.22-stable-msvc.zip SHA-256 ${actual%% *}"
 echo "SODIUM_DIST_DIR=$DIST_DIR" >> "$GITHUB_ENV"

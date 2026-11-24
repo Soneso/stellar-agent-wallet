@@ -1,0 +1,2 @@
+- `approve list` puts `Consumed` and `Rejected` tombstones in `resolved`, with the same entry shape and `kind_name` distinction. `pending` holds only non-tombstones; table output groups tombstones under `Resolved`.
+- CLI `balances` and MCP `stellar_balances` report `asset_type` as `native`, `credit_alphanum4`, or `credit_alphanum12`. Credit assets carry `code` beside `issuer`.

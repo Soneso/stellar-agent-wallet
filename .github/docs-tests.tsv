@@ -1,0 +1,22 @@
+# The tests that read a documentation path, one per row: package, target,
+# and exact test name, separated by tabs. The target is lib, bin:<name>,
+# test:<name>, or doc for the doctests of a crate whose crate docs include a
+# documentation file; a doc row has - as its name.
+# .github/scripts/run-docs-tests.py runs these rows in the docs-tests job of
+# ci.yml. .github/scripts/check-docs-reads.py fails when a documentation read
+# in the workspace sources has no row.
+stellar-agent-core	lib	audit_log::consent_evidence::tests::documented_domains_reproduce_snapshot_vector
+stellar-agent-core	lib	audit_log::outbox::tests::consent_delivery_user_contract
+stellar-agent-core	lib	audit_log::outbox::tests::evidence_protocol_documents_lifetime
+stellar-agent-core	lib	audit_log::outbox::tests::maintainer_protocol_states_the_boundary
+stellar-agent-core	lib	audit_log::outbox::tests::storage_protocol_documents_owner_recovery
+stellar-agent-core	lib	audit_log::verify::tests::verify_error_partial_rotation_display_contains_recovery_hint
+stellar-agent-core	test:core	policy_grammar::extended_policy_canonical_bytes_match_literal
+stellar-agent-core	test:core	policy_v2::public_docs_cover_both_owner_ceremonies
+stellar-agent-network	lib	policy_state::approvals::admission_tests::publication_protocol_documents_commit_points
+stellar-agent-network	lib	policy_state::approvals::lifecycle_tests::lifecycle_protocol_states_activation_limits
+stellar-agent-mcp	lib	tools::x402_create_payment::approval_tests::review_tests::approval_public_text_names_the_contract
+stellar-agent-mcp	test:mcp	common::source_contracts::shutdown_documentation_names_events_limits_and_queued_recovery
+stellar-agent-mcp	test:mcp	x402_audit_gate_integration::x402_approval_docs_match_the_tool_contract
+stellar-agent-cli	bin:stellar-agent	commands::approve::credential::signed_tests::signed_enrollment_docs_cover_bootstrap_and_both_codes
+stellar-agent-approval-remote	test:signed_origin_listener	public_remote_approval_docs_cover_signed_origin_and_counters

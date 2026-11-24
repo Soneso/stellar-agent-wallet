@@ -1,5 +1,8 @@
 # CLI reference: DeFi and the channel pool
 
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This page documents the `stellar-agent` commands for DeFi venues (`vault` for DeFindex, `trade` for Soroswap) and the channel-account pool subcommands `pool init`, `pool list`, and `pool status`.
 
 The binary is `stellar-agent`. Under the `stellar-cli` external-binary plugin convention it is also reachable as `stellar agent ...`. See [the CLI reference index](index.md) for installation, the JSON envelope shape, and the global flags referenced below.
@@ -10,13 +13,13 @@ Every command emits a JSON envelope on stdout by default and returns exit code `
 
 `vault deposit`, `vault withdraw`, and `trade` are all signing commands. Each one, before it signs anything:
 
-1. Loads the named profile (`--profile`, else `STELLAR_AGENT_PROFILE`, else `default`) and resolves the CAIP-2 chain id, RPC endpoint, and network passphrase from it.
+1. Loads the named profile (`--profile`, else `STELLAR_AGENT_PROFILE`, else `default`) and resolves the CAIP-2 chain id, RPC endpoint, and network passphrase from it. A halted profile refuses after this load.
 2. Refuses a mainnet profile with `network.mainnet_write_forbidden`, before the keyring, the signer, and any RPC call.
-3. Pins the target contract by WASM hash (a two-RPC cross-check when `--secondary-rpc-url` or the profile's `secondary_rpc_url` supplies a secondary) so the address you name actually runs the code the wallet expects.
-4. Evaluates the operator policy engine for the corresponding tool descriptor. A `Deny` decision refuses with `policy.deny.<code>`. A `RequireApproval` decision refuses with `policy.approval_required`. Neither the CLI nor the MCP server has an approval path for these verbs: the MCP tools refuse the same decision with `policy.approval_required_unsupported`. A policy engine that is configured but cannot be built refuses with `policy.engine_unavailable` (fail closed: the value-moving operation does not run permissively).
-5. Loads the signing key from the OS keyring entry named by the profile, then signs and submits through the venue adapter.
+3. Pins the target contract by WASM hash (a two-RPC cross-check when `--secondary-rpc-url` or the profile's `secondary_rpc_url` supplies a secondary) so the address you name actually runs the code the wallet expects. `vault` verifies the vault WASM hash before policy evaluation. `trade` verifies the router WASM hash inside the adapter, after policy evaluation and the signer load.
+4. Evaluates the operator policy engine for the corresponding tool descriptor. A `Deny` decision refuses with `policy.deny.<code>`. A `RequireApproval` decision refuses with `policy.approval_required`. Neither the CLI nor the MCP server has an approval path for these verbs: the MCP tools refuse the same decision with `policy.approval_required_unsupported`. A policy engine that is configured but cannot be built refuses with its own code, such as `policy.engine_selection_unsigned`, or with `policy.engine_unavailable`. The value-moving operation never runs permissively. After the policy gate and before the signer load, each command acquires the audit writer.
+5. Loads the signing key from the OS keyring entry named by the profile, then signs and submits through the venue adapter. Signing requires a secondary endpoint on the same network and on a host other than the primary's; absence refuses with `smart_account.ledger_witness_unavailable`. Endpoint disagreement beyond two ledgers refuses with `simulation.divergence.ledger_skew`. The simulated ledger height must lie between the lower observation minus two and the higher observation plus two, inclusive. A height below this range permits one unsigned re-simulation against the same pair. A height above it, or a replacement outside it, refuses with `simulation.divergence.ledger_skew`. Recovery runs within the same pre-submit deadline.
 
-These commands do not accept `--output`; they always emit JSON. Only the `pool` subcommands offer `--output`.
+These commands do not accept `--output`; they always emit JSON. The `pool` subcommands accept `--output` (`json` or `table`) and emit JSON for both values.
 
 ### Network constraint
 
@@ -26,9 +29,9 @@ The default network is testnet (`stellar:testnet`). `vault deposit`, `vault with
 
 Deposit assets into a DeFindex vault through the wallet smart-account. Venue: DeFindex.
 
-The ordered trust gate is: (1) verify the vault WASM hash; (2) read the upgradable flag; (3) read the four vault role addresses and compute self-managed vs delegated management mode; (4) read the on-chain assets, validate the `--amounts-min` length against the pinned asset count (else `vault.asset_count_mismatch`), and detect Blend-backed strategies; (5) evaluate the upgradable flag in light of the management mode. By default a vault whose upgradable flag is `true` is refused with `vault.upgradable_refused`. Pass `--override-upgradable` to proceed; doing so emits a `vault.upgradable_override` audit event.
+The ordered trust gate is: (1) verify the vault WASM hash; (2) read the upgradable flag; (3) read the four vault role addresses and compute self-managed vs delegated management mode; (4) read the on-chain assets, validate the `--amounts-min` length against the pinned asset count (else `vault.asset_count_mismatch`), and detect Blend-backed strategies; (5) evaluate the upgradable flag in light of the management mode. By default a vault whose upgradable flag is `true` is refused with `vault.upgradable_refused`. Pass `--override-upgradable` to proceed; doing so logs a `vault.upgradable_override` warning on stderr. The override adds no audit-log row of its own.
 
-A self-managed vault, one where the depositor holds every fund-affecting role (Manager, with no separate third-party emergency or rebalance manager), is exempt from the upgradable refusal. The refusal guards against a third-party manager swapping the vault implementation under the depositor; when the depositor holds those roles, an upgrade requires their own key, so the guard does not apply. For a self-managed vault the refusal never fires and `--override-upgradable` is ignored. All other management modes are subject to the refusal and its override and audit path.
+A self-managed vault, one where the depositor holds every fund-affecting role (Manager, with no separate third-party emergency or rebalance manager), is exempt from the upgradable refusal. The refusal guards against a third-party manager swapping the vault implementation under the depositor; when the depositor holds those roles, an upgrade requires their own key, so the guard does not apply. For a self-managed vault the refusal never fires and `--override-upgradable` is ignored. All other management modes are subject to the refusal and its override.
 
 `--amounts-min` is required. Omitting it is a structural pre-sign refusal. There is no implicit "no minimum". A value of `0` per asset means no slippage protection on that asset, which you opt into explicitly.
 
@@ -40,14 +43,14 @@ A self-managed vault, one where the depositor holds every fund-affecting role (M
 | `--amounts-desired <i128>...` | Desired deposit amount per asset, in declaration order (one or more values) | Required | none |
 | `--amounts-min <i128>...` | Minimum accepted amount per asset (same length as `--amounts-desired`); `0` disables slippage protection on that asset | Required | none |
 | `--invest` | Auto-invest immediately after deposit | Optional | `false` |
-| `--override-upgradable` | Proceed on an `upgradable:true` vault; emits a `vault.upgradable_override` audit event | Optional | `false` |
-| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check | Optional | profile `secondary_rpc_url`, else none |
+| `--override-upgradable` | Proceed on an `upgradable:true` vault that is not self-managed; logs a `vault.upgradable_override` warning | Optional | `false` |
+| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check and the ledger observation of signing | Required to sign | profile `secondary_rpc_url`, else signing refuses |
 
 Example:
 
 ```bash
 stellar-agent vault deposit \
-  --vault CABC...WXYZ \
+  --vault CVLT...WXYZ \
   --from CABC...WXYZ \
   --amounts-desired 1000000000 \
   --amounts-min 900000000 \
@@ -67,14 +70,14 @@ Withdraw assets from a DeFindex vault by redeeming shares. Same venue, signing p
 | `--from <C-strkey>` | Wallet smart-account address submitting the withdrawal | Required | none |
 | `--shares <i128>` | Number of vault shares to redeem (raw on-chain value) | Required | none |
 | `--min-amounts-out <i128>...` | Minimum amount to receive per asset (one or more values) | Required | none |
-| `--override-upgradable` | Proceed on an `upgradable:true` vault | Optional | `false` |
-| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check | Optional | profile `secondary_rpc_url`, else none |
+| `--override-upgradable` | Proceed on an `upgradable:true` vault that is not self-managed | Optional | `false` |
+| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check and the ledger observation of signing | Required to sign | profile `secondary_rpc_url`, else signing refuses |
 
 Example:
 
 ```bash
 stellar-agent vault withdraw \
-  --vault CABC...WXYZ \
+  --vault CVLT...WXYZ \
   --from CABC...WXYZ \
   --shares 5000000 \
   --min-amounts-out 4500000 \
@@ -96,8 +99,8 @@ The router address and WASM hash are resolved per-network; a network with no pin
 | `--amount-in <i128>` | Exact input token amount in base units | Required | none |
 | `--amount-out-min <i128>` | Minimum output amount, as an absolute floor (not a percent) | Required | none |
 | `--path <ASSET>` | One swap-path element; repeat the flag to build the path. First element is the input token, last is the output token. The path is validated to have at least two and at most five elements before signing. Each value is a C-strkey, `native`, or `CODE:ISSUER` | Required | none |
-| `--deadline <UNIX_SECS>` | Swap deadline as a Unix timestamp in seconds; refused when more than 3600 seconds (1 hour) in the future | Optional | `now + 300s` |
-| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC router WASM-hash cross-check | Optional | profile `secondary_rpc_url`, else none |
+| `--deadline <UNIX_SECS>` | Swap deadline as a Unix timestamp in seconds; refused when at or before the current time or more than 3600 seconds (1 hour) in the future | Optional | `now + 300s` |
+| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC router WASM-hash cross-check and the ledger observation of signing | Required to sign | profile `secondary_rpc_url`, else signing refuses |
 
 Example:
 
@@ -106,8 +109,8 @@ stellar-agent trade \
   --from CABC...WXYZ \
   --amount-in 10000000 \
   --amount-out-min 9800000 \
-  --path CABC...WXYZ \
-  --path CABC...WXYZ \
+  --path native \
+  --path CTKN...WXYZ \
   --profile default
 ```
 
@@ -127,16 +130,18 @@ fee whose total does not fit the transaction's fee field refuses with
 `validation.fee_total_overflow` before anything is built, signed, or sent.
 Each account starts with zero balance, so initialization has no transferred-balance
 legs or spending-cap entries. A receipt and a pending audit row record the
-transaction before transmission. Confirmation writes its settled row and the
-`channel_pool_initialised` event.
+transaction before transmission. Confirmation records the receipt and writes
+the `channel_pool_initialised` event.
 
 The funder signer comes from the keyring. The profile's audit chain key must be minted with `profile rotate-audit-key`; the command acquires the audit writer before generating the pool seed or submitting the transaction. It persists the seed in the keyring and a public `[pool_initialization]` checkpoint in the profile before any send. The profile stores channel identities and submission hashes, never seed bytes. Persistence patches only the pool keys (`pool_master_key_id`, `[pool_initialization]`, `[pool_config]`); other stored values are preserved and environment overrides remain transient.
 
-`pool init --resume` loads the saved seed and verifies that it derives the recorded channels. When all channel accounts exist, it completes config and audit persistence without another send. With a failed receipt and no channel accounts, it retries the same creation with the same keys and a distinct attempt memo. An unknown outcome or a partial account observation remains pending and leaves the checkpoint unchanged. `pool status` names the transaction hash and completion command. A repeated resume of a completed pool returns its channel summary.
+`pool init --resume` loads the saved seed and verifies that it derives the recorded channels. When all channel accounts exist, it completes config and audit persistence without another send. An attempt the durable send barrier proves unsent is retired, with one `submission.not_transmitted` row when its `pool init` pending row is still open, and retried with the same keys and a distinct attempt memo. An endpoint failure report, an unknown outcome, or a partial account observation remains pending and leaves the checkpoint unchanged. `pool status` names the transaction hash and completion command. A repeated resume of a completed pool returns its channel summary.
 
-A creation whose receipt settles as ambiguous holds resume there, whether the endpoint's retention window closed or reconciliation released it on chain evidence with a `release_code`: that is the state where a second envelope could create the channels twice. Releasing it takes the operator's statement that the transaction did not apply, recorded by `tx receipt clear <ENVELOPE_HASH> --acknowledge`; `pool status` names that command in the pending checkpoint's `clear_with` field. The clear reconciles first, and for a release on chain evidence it writes the settled row before it clears. The creation envelope carries no time bound, so the clear does not wait on one. Resume then retries with the same channel keys and the next attempt memo. `--force` is not an escape from this state: it replaces the seed.
+A sent creation the endpoint reports as failed, or whose outcome is unknown, holds resume there: that is the state where a second envelope could create the channels twice. An endpoint failure report is unauthenticated, so it releases nothing. Releasing it takes the operator's decision, recorded by `tx receipt clear <ENVELOPE_HASH> --acknowledge`; clearing establishes no chain outcome. `pool status` names that command in the pending checkpoint's `clear_with` field. The clear reconciles first and writes its clear row before it marks the receipt. The creation envelope carries no time bound, so the clear does not wait on one. Resume retries, with the same channel keys and the next attempt memo, only when the verified audit history holds that clear row; a receipt status alone authorizes no send. `--force` is not an escape from this state: it replaces the seed.
 
 `--size` must be in `1..=19`; the funder plus the channels must fit the 20-signature cap. Size and existing-pool refusals use `internal.unexpected_state`, with the pool reason in the message. Recovery-checkpoint failures use `submission.record_unavailable`; keyring and network failures retain their typed codes when available.
+
+`pool init` keeps an advisory lock file `profiles/<name>.pool-init.lock`. The first run creates it, also when the run refuses, and nothing removes it. A second run while the lock is held refuses with `submission.record_unavailable` and `another pool initialization is running`.
 
 An existing pool seed requires `--force` for replacement. Replacing a completed pool's seed makes its funded channels unreachable through that seed. While initialization is pending, `--force` refuses: use `--resume` to complete it. An ambiguous keyring existence probe also refuses replacement.
 
@@ -147,7 +152,7 @@ An existing pool seed requires `--force` for replacement. Replacing a completed 
 | `--resume` | Complete pending initialization using the saved seed; excludes `--size` and `--force` | Optional | `false` |
 | `--profile <NAME>` | Profile for the funder key and RPC endpoint | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--force` | Replace a completed pool seed; refuses while pending | Optional | `false` |
-| `--output <FORMAT>` | Output format: `json` or `table` | Optional | `json` |
+| `--output <FORMAT>` | Output format: `json` or `table`; both emit JSON | Optional | `json` |
 
 Example:
 
@@ -182,14 +187,14 @@ no cap. The result has no `cross_check` field.
 
 ### `stellar-agent pool list`
 
-List every pool channel with its BIP-44 index, public G-strkey, and live on-chain sequence number (fetched per channel). Read-only. Requires an initialised pool; otherwise it refuses with `error.code` `internal.unexpected_state` and the message `pool.not_initialised:`. A channel whose sequence fetch fails omits the `sequence_number` field for that channel (no value emitted) rather than failing the whole command.
+List every pool channel with its BIP-44 index, public G-strkey, and live on-chain sequence number (fetched per channel). Read-only. Requires an initialized pool; otherwise it refuses with `error.code` `internal.unexpected_state` and the message `pool.not_initialised:`. A channel whose sequence fetch fails omits the `sequence_number` field for that channel (no value emitted) rather than failing the whole command.
 
 The output includes a note; see the `in_flight` caveat under `pool status` below.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
 | `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--output <FORMAT>` | Output format: `json` or `table` | Optional | `json` |
+| `--output <FORMAT>` | Output format: `json` or `table`; both emit JSON | Optional | `json` |
 
 Example:
 
@@ -199,12 +204,12 @@ stellar-agent pool list --profile default
 
 ### `stellar-agent pool status`
 
-Report pool utilisation: `initialised`, `pool_size`, `free`, and `in_flight`. Read-only and makes no network call; it reads the persisted pool config and initialization checkpoint. While initialization is pending, `initialised` is false and `pending` carries the channel count, seed readiness, transaction hash when recorded, and `resume_with` command. A pending checkpoint whose receipt is ambiguous also carries `clear_with`, the acknowledgement command resume requires before it will retry. In a fresh CLI invocation `free == pool_size` and `in_flight == 0`. The result carries a note that `free` and `in_flight` reflect the persisted config of a stateless process, not a live allocator; do not read `in_flight: 0` as "safe to flood".
+Report pool utilization: `initialised`, `pool_size`, `free`, and `in_flight`. Read-only and makes no network call; it reads the persisted pool config and initialization checkpoint. While initialization is pending, `initialised` is false and `pending` carries the channel count, seed readiness, transaction hash when recorded, and `resume_with` command. A pending checkpoint whose receipt is ambiguous or failed also carries `clear_with`, the acknowledgement command resume requires before it will retry. In a fresh CLI invocation `free == pool_size` and `in_flight == 0`. The result carries a note that `free` and `in_flight` reflect the persisted config of a stateless process, not a live allocator; do not read `in_flight: 0` as "safe to flood".
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
 | `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--output <FORMAT>` | Output format: `json` or `table` | Optional | `json` |
+| `--output <FORMAT>` | Output format: `json` or `table`; both emit JSON | Optional | `json` |
 
 Example:
 

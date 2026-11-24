@@ -46,6 +46,10 @@ pub const SIGNER_SECRET_ENV: &str = "V1_CEREMONY_SIGNER_SECRET";
 /// secret from. Set only on those children.
 pub const OWNER_SECRET_ENV: &str = "V1_CEREMONY_OWNER_SECRET";
 
+/// The variable the multicall child reads the signer secret from. Set only
+/// on the children that sign.
+pub const MULTICALL_SIGNER_ENV: &str = "MULTICALL_POLICY_SIGNER_SECRET";
+
 /// Variables removed from every child so the operator's environment cannot
 /// redirect a run.
 const REMOVED_ENV: &[&str] = &[
@@ -58,6 +62,7 @@ const REMOVED_ENV: &[&str] = &[
     "STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE",
     SIGNER_SECRET_ENV,
     OWNER_SECRET_ENV,
+    MULTICALL_SIGNER_ENV,
 ];
 
 /// An ed25519 keypair with its Stellar strkeys.
@@ -137,7 +142,7 @@ impl CliRun {
 
 /// A temporary data root with its own headless keyring.
 pub struct IsolatedHome {
-    dir: tempfile::TempDir,
+    dir: stellar_agent_test_support::sandbox::StateSandbox,
     key: Zeroizing<[u8; 32]>,
 }
 
@@ -148,7 +153,7 @@ impl IsolatedHome {
         let mut key = Zeroizing::new([0u8; 32]);
         OsRng.fill_bytes(key.as_mut());
         Self {
-            dir: tempfile::tempdir().unwrap(),
+            dir: stellar_agent_test_support::sandbox::StateSandbox::new().unwrap(),
             key,
         }
     }
@@ -232,7 +237,11 @@ impl IsolatedHome {
     /// The `stellar-agent` command with the isolated environment applied.
     #[must_use]
     pub fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+        let mut command = stellar_agent_test_support::cli_child::cli_command(
+            env!("CARGO_BIN_EXE_stellar-agent"),
+            self.path(),
+        )
+        .expect("isolated CLI child");
         command
             .args(args)
             .env("STELLAR_AGENT_HOME", self.path())

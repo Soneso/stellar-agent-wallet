@@ -8,7 +8,11 @@
 //!
 //! 1. The `[signature]` table is **excluded** from the output.
 //! 2. Included keys: `version` (top-level integer), `scope` (top-level string),
-//!    `[[rules]]` array (in original declaration order).
+//!    `[[rules]]` array (in original declaration order). Version 2 also signs
+//!    `sequence` and the optional mainnet binding before the rules. A present
+//!    `owner_rotation` table is signed in either version.
+//!    Both versions include a present root `contract_transfer_max_fee_stroops`
+//!    after `scope`, without inserting a default when it is absent.
 //! 3. Field order within each rule is fixed: `match`, `criteria`, `decision`,
 //!    then `reason`, `ttl_secs` and `allow_opaque_signing`. The last three are
 //!    emitted only when the rule carries them, so the canonical bytes of a rule
@@ -20,8 +24,14 @@
 //!    policy schema before it verifies the signature (see
 //!    [`crate::policy::v1::schema::validate_policy_keys`]), so every key the
 //!    loader reads, the `[signature]` table excepted, is in the signed bytes.
-//! 5. All comments stripped.
-//! 6. Whitespace normalised; no trailing whitespace; no BOM.
+//! 5. The mainnet binding's `approval_credentials` array is validated and
+//!    emitted sorted by raw credential ID, each entry an inline table with
+//!    `credential_id_b64url` then `public_key_sec1_b64url` in canonical
+//!    base64url, so reordering entries or their keys keeps the bytes and
+//!    changing an ID or a key changes them. A body without the array keeps
+//!    its bytes.
+//! 6. All comments stripped.
+//! 7. Whitespace normalised; no trailing whitespace; no BOM.
 //!
 //! ## Determinism guarantee
 //!
@@ -54,11 +64,15 @@ use crate::policy::PolicyError;
 /// The canonical form is the pre-image for the owner signature:
 /// `blake3(canonical_bytes(policy_toml))`.
 ///
-/// The `[signature]` table is excluded.  Only `version`, `scope`, and
-/// `[[rules]]` (in original declaration order) are included.  Each rule
+/// The `[signature]` table is excluded and a present `[owner_rotation]`
+/// table is included. Version 1 signs `version`, `scope`, and `[[rules]]` in
+/// declaration order. Version 2 also signs `sequence`, optional `engine`, and `[mainnet]`, and
+/// sorts keys in match and criterion tables.  Each rule
 /// carries `match`, `criteria` and `decision`, then whichever of `reason`,
 /// `ttl_secs` and `allow_opaque_signing` it holds, in that order.  All
 /// comments are stripped and whitespace is normalised.
+/// Both versions sign a present root `contract_transfer_max_fee_stroops` after
+/// `scope`. An absent cap adds no canonical field.
 ///
 /// # Errors
 ///
@@ -87,12 +101,26 @@ use crate::policy::PolicyError;
 /// assert!(!text.contains("owner_id"));
 /// ```
 pub fn canonical_bytes(toml_text: &str) -> Result<Vec<u8>, PolicyError> {
-    let doc = DocumentMut::from_str(toml_text).map_err(|e| PolicyError::PolicyFileParseFailed {
-        detail: e.to_string(),
-    })?;
+    let doc =
+        DocumentMut::from_str(toml_text).map_err(|e| PolicyError::toml_syntax(toml_text, &e))?;
 
     let output = build_canonical_document(&doc)?;
     Ok(output.into_bytes())
+}
+
+/// Canonical bytes bound by the previous owner's rotation statement.
+///
+/// Both `[signature]` and `[owner_rotation]` are excluded. Every other
+/// canonical field, including scope, sequence, and rules, remains signed.
+///
+/// # Errors
+/// Returns the same parsing errors as [`canonical_bytes`].
+pub fn owner_rotation_bytes(toml_text: &str) -> Result<Vec<u8>, PolicyError> {
+    let mut doc =
+        DocumentMut::from_str(toml_text).map_err(|e| PolicyError::toml_syntax(toml_text, &e))?;
+    doc.remove("signature");
+    doc.remove("owner_rotation");
+    Ok(build_canonical_document(&doc)?.into_bytes())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -115,6 +143,7 @@ pub(crate) const OPTIONAL_RULE_KEYS: [&str; 3] = ["reason", "ttl_secs", "allow_o
 /// their fixed order, then emits via `to_string()`.
 fn build_canonical_document(doc: &DocumentMut) -> Result<String, PolicyError> {
     let mut out = DocumentMut::new();
+    super::schema::signed_engine(doc)?;
 
     // ── version ──────────────────────────────────────────────────────────────
     let version_item = doc
@@ -134,6 +163,80 @@ fn build_canonical_document(doc: &DocumentMut) -> Result<String, PolicyError> {
     let scope_val = canonical_scalar(scope_item)?;
     out.insert("scope", Item::Value(scope_val));
 
+    if let Some(cap) = super::schema::contract_transfer_max_fee_stroops(doc)? {
+        out.insert(
+            "contract_transfer_max_fee_stroops",
+            toml_edit::value(i64::from(cap)),
+        );
+    }
+
+    let v2 = version_item.as_integer() == Some(2);
+    if v2 {
+        let sequence = doc
+            .get("sequence")
+            .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                detail: "policy v2 requires `sequence`".into(),
+            })?;
+        out.insert("sequence", Item::Value(canonical_scalar(sequence)?));
+        if let Some(engine) = doc.get("engine") {
+            out.insert("engine", Item::Value(canonical_scalar(engine)?));
+        }
+        if let Some(mainnet) = doc.get("mainnet") {
+            // The canonical form requires `mainnet` to be a table.
+            let mainnet =
+                mainnet
+                    .as_table_like()
+                    .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                        detail: "mainnet must be a table".into(),
+                    })?;
+            let mut table = Table::new();
+            for key in super::schema::MAINNET_KEYS {
+                if let Some(item) = mainnet.get(key) {
+                    if *key == "cross_check_thresholds" {
+                        let values = item.as_table_like().ok_or_else(|| {
+                            PolicyError::PolicyFileParseFailed {
+                                detail: "mainnet.cross_check_thresholds must be a table".into(),
+                            }
+                        })?;
+                        let mut thresholds = Table::new();
+                        let mut entries: Vec<_> = values.iter().collect();
+                        entries.sort_by_key(|(key, _)| *key);
+                        for (key, value) in entries {
+                            thresholds.insert(key, Item::Value(canonical_scalar(value)?));
+                        }
+                        table.insert(key, Item::Table(thresholds));
+                    } else if *key == "approval_credentials" {
+                        table.insert(
+                            key,
+                            Item::Value(
+                                super::approval_credentials::canonical_approval_credentials(item)?,
+                            ),
+                        );
+                    } else {
+                        table.insert(key, Item::Value(canonical_scalar(item)?));
+                    }
+                }
+            }
+            out.insert("mainnet", Item::Table(table));
+        }
+    }
+
+    if let Some(rotation) = doc.get("owner_rotation") {
+        let rotation =
+            rotation
+                .as_table_like()
+                .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                    detail: "`owner_rotation` must be a table".into(),
+                })?;
+        let mut table = Table::new();
+        for key in super::schema::OWNER_ROTATION_KEYS {
+            if let Some(item) = rotation.get(key) {
+                table.insert(key, Item::Value(canonical_scalar(item)?));
+            }
+        }
+        out.insert("owner_rotation", Item::Table(table));
+    }
+
     // ── [[rules]] ─────────────────────────────────────────────────────────────
     // Walk the document's array-of-tables and reconstruct without decor.
     if let Some(rules_item) = doc.get("rules") {
@@ -142,7 +245,7 @@ fn build_canonical_document(doc: &DocumentMut) -> Result<String, PolicyError> {
                 use toml_edit::ArrayOfTables;
                 let mut canonical_aot = ArrayOfTables::new();
                 for table in aot.iter() {
-                    canonical_aot.push(canonical_rule_table(table)?);
+                    canonical_aot.push(canonical_rule_table(table, v2)?);
                 }
                 out.insert("rules", Item::ArrayOfTables(canonical_aot));
             }
@@ -159,7 +262,7 @@ fn build_canonical_document(doc: &DocumentMut) -> Result<String, PolicyError> {
                             detail: "rules array element is not a table".into(),
                         }
                     })?;
-                    canonical_aot.push(canonical_table_from_inline_rule(inline)?);
+                    canonical_aot.push(canonical_table_from_inline_rule(inline, v2)?);
                 }
                 out.insert("rules", Item::ArrayOfTables(canonical_aot));
             }
@@ -256,7 +359,7 @@ fn strip_value_decor(val: &Value) -> Value {
 /// then `reason`, `ttl_secs` and `allow_opaque_signing`, each emitted only
 /// when the rule carries it. Values are emitted without decoration; an
 /// integer is re-emitted as plain decimal. Other rule keys are not emitted.
-fn canonical_rule_table(src: &Table) -> Result<Table, PolicyError> {
+fn canonical_rule_table(src: &Table, sorted: bool) -> Result<Table, PolicyError> {
     let mut out = Table::new();
 
     for key in REQUIRED_RULE_KEYS {
@@ -265,12 +368,18 @@ fn canonical_rule_table(src: &Table) -> Result<Table, PolicyError> {
             .ok_or_else(|| PolicyError::PolicyFileParseFailed {
                 detail: format!("rule missing required `{key}` key"),
             })?;
-        out.insert(key, Item::Value(canonical_item_as_value(item)?));
+        out.insert(
+            key,
+            Item::Value(sort_value(canonical_item_as_value(item)?, sorted)),
+        );
     }
 
     for key in OPTIONAL_RULE_KEYS {
         if let Some(item) = src.get(key) {
-            out.insert(key, Item::Value(canonical_item_as_value(item)?));
+            out.insert(
+                key,
+                Item::Value(sort_value(canonical_item_as_value(item)?, sorted)),
+            );
         }
     }
 
@@ -300,12 +409,12 @@ fn canonical_inline_rule(src: &InlineTable) -> Result<InlineTable, PolicyError> 
 ///
 /// The same field order as [`canonical_rule_table`]: a missing required key
 /// fails, a missing optional key emits nothing.
-fn canonical_table_from_inline_rule(src: &InlineTable) -> Result<Table, PolicyError> {
+fn canonical_table_from_inline_rule(src: &InlineTable, sorted: bool) -> Result<Table, PolicyError> {
     let inline = canonical_inline_rule(src)?;
     let mut out = Table::new();
     for key in REQUIRED_RULE_KEYS {
         if let Some(v) = inline.get(key) {
-            out.insert(key, Item::Value(strip_value_decor(v)));
+            out.insert(key, Item::Value(sort_value(strip_value_decor(v), sorted)));
         } else {
             return Err(PolicyError::PolicyFileParseFailed {
                 detail: format!("rule missing required `{key}` key"),
@@ -314,11 +423,37 @@ fn canonical_table_from_inline_rule(src: &InlineTable) -> Result<Table, PolicyEr
     }
     for key in OPTIONAL_RULE_KEYS {
         if let Some(v) = inline.get(key) {
-            out.insert(key, Item::Value(strip_value_decor(v)));
+            out.insert(key, Item::Value(sort_value(strip_value_decor(v), sorted)));
         }
     }
     out.decor_mut().clear();
     Ok(out)
+}
+
+/// Sorts nested tables in the v2 signature preimage.
+fn sort_value(value: Value, sorted: bool) -> Value {
+    if !sorted {
+        return value;
+    }
+    match value {
+        Value::InlineTable(table) => {
+            let mut entries: Vec<_> = table.iter().collect();
+            entries.sort_by_key(|(key, _)| *key);
+            let mut out = InlineTable::new();
+            for (key, value) in entries {
+                out.insert(key, sort_value(value.clone(), true));
+            }
+            Value::InlineTable(out)
+        }
+        Value::Array(array) => {
+            let mut out = Array::new();
+            for value in &array {
+                out.push(sort_value(value.clone(), true));
+            }
+            Value::Array(out)
+        }
+        other => other,
+    }
 }
 
 /// Extracts a canonical [`Value`] from an [`Item`], converting inline tables
@@ -399,6 +534,74 @@ mod tests {
 
     use super::*;
 
+    /// The canonical bytes carry every approval credential's ID and key:
+    /// changing either changes the bytes, while the entry order, the key
+    /// order inside an entry and the spacing do not.
+    #[test]
+    fn credential_canonicalization_signs_id_and_key() {
+        use stellar_agent_test_support::webauthn::TestAuthenticator;
+        let first = TestAuthenticator::from_seed([0x21; 32], vec![0x5a; 16]);
+        let second = TestAuthenticator::from_seed([0x33; 32], vec![0x44; 16]);
+        let entry = |id: &str, key: &str| {
+            format!("{{ credential_id_b64url = \"{id}\", public_key_sec1_b64url = \"{key}\" }}")
+        };
+        let document = |credentials: &str| {
+            format!(
+                "version = 2\nscope = \"profile:main\"\nsequence = 1\n[mainnet]\n\
+                 profile = \"main\"\napproval_credentials = {credentials}\nrules = []\n"
+            )
+        };
+        let bytes = |credentials: &str| canonical_bytes(&document(credentials)).unwrap();
+        let one = entry(
+            &first.credential_id_b64url(),
+            &first.public_key_sec1_b64url(),
+        );
+        let two = entry(
+            &second.credential_id_b64url(),
+            &second.public_key_sec1_b64url(),
+        );
+        let reference = bytes(&format!("[{one}, {two}]"));
+        let text = String::from_utf8(reference.clone()).unwrap();
+        assert!(text.contains(&first.credential_id_b64url()), "{text}");
+        assert!(text.contains(&first.public_key_sec1_b64url()), "{text}");
+        assert!(text.contains(&second.public_key_sec1_b64url()), "{text}");
+
+        assert_eq!(bytes(&format!("[{two}, {one}]")), reference, "entry order");
+        assert_eq!(
+            bytes(&format!(
+                "[ {{public_key_sec1_b64url=\"{}\",credential_id_b64url=\"{}\"}} , {two} ]",
+                first.public_key_sec1_b64url(),
+                first.credential_id_b64url()
+            )),
+            reference,
+            "key order and spacing"
+        );
+        let other_id = entry(
+            &TestAuthenticator::from_seed([0x21; 32], vec![0x5b; 16]).credential_id_b64url(),
+            &first.public_key_sec1_b64url(),
+        );
+        assert_ne!(
+            bytes(&format!("[{other_id}, {two}]")),
+            reference,
+            "another ID"
+        );
+        let other_key = entry(
+            &first.credential_id_b64url(),
+            &second.public_key_sec1_b64url(),
+        );
+        assert_ne!(
+            bytes(&format!("[{other_key}, {two}]")),
+            reference,
+            "another key"
+        );
+        assert_ne!(
+            bytes(&format!("[{one}]")),
+            reference,
+            "a removed credential"
+        );
+        assert!(canonical_bytes(&document("[{ credential_id_b64url = \"AA\" }]")).is_err());
+    }
+
     #[test]
     fn canonical_bytes_rejects_non_array_rules() {
         // `rules` present but neither an array-of-tables nor an inline array of
@@ -409,6 +612,41 @@ mod tests {
             matches!(err, PolicyError::PolicyFileParseFailed { .. }),
             "non-array `rules` must be rejected, got {err:?}"
         );
+    }
+
+    /// A version 2 `mainnet` value that is not a table is refused, never left
+    /// out of the signed bytes.
+    #[test]
+    fn canonical_bytes_rejects_non_table_mainnet() {
+        let toml = "version = 2\nscope = \"profile:default\"\nsequence = 1\nmainnet = 5\n";
+        let err = canonical_bytes(toml).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                PolicyError::PolicyFileParseFailed { detail } if detail == "mainnet must be a table"
+            ),
+            "a non-table mainnet value must be refused, got {err:?}"
+        );
+    }
+
+    /// An `owner_rotation` value that is not a table is refused in either
+    /// version, never left out of the signed bytes.
+    #[test]
+    fn canonical_bytes_rejects_non_table_owner_rotation() {
+        for toml in [
+            "version = 1\nscope = \"profile:default\"\nowner_rotation = 5\n",
+            "version = 2\nscope = \"profile:default\"\nsequence = 1\nowner_rotation = \"G\"\n",
+        ] {
+            let err = canonical_bytes(toml).unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    PolicyError::PolicyFileParseFailed { detail }
+                        if detail == "`owner_rotation` must be a table"
+                ),
+                "a non-table owner_rotation value must be refused, got {err:?}"
+            );
+        }
     }
 
     // ── canonical_bytes_strips_signature_table ────────────────────────────────
@@ -1171,6 +1409,198 @@ rules = [
             String::from_utf8(bytes).unwrap(),
             EXPECTED_WITH_OPTIONAL_KEYS
         );
+    }
+
+    // ── version 2 companions of the golden inputs ─────────────────────────────
+
+    /// Each golden input above as a version 2 document with `sequence = 1`.
+    /// Version 2 also signs `sequence` and sorts the keys of match and
+    /// criterion tables; array order and the rule key order stay. The
+    /// expected literals and their BLAKE3 digests are written by hand.
+    const V2_GOLDEN_ARRAY_OF_TABLES_FIXTURE: &str = r#"# Owner policy for alice.
+version = 2 # schema version
+sequence = 1
+scope = "profile:alice"
+
+[[rules]]
+# Dotted-key match.
+match.tool = "stellar_pay"
+match.chain = "stellar:testnet"
+criteria = [
+  # Per-transaction cap of 100 XLM.
+  { kind = "per_tx_cap", asset = "native", max_stroops = 1_000_000_000 },
+  { kind = "counterparty_allowlist", kinds = [ "G_ACCOUNT", "C_ACCOUNT" ], allowlist = ["GAAAA", "CBBBB"], gate_inflows = false },
+]
+decision = "allow"
+
+[[rules]]
+decision = "require_approval"
+criteria = [{ kind = "rate_limit", window = "1h", max_calls = 1_0 }]   # hourly
+match = { tool = "*", chain = "*" }
+
+[[rules]]
+criteria = []
+decision = "deny"
+
+[rules.match]
+tool = "stellar_create_account"
+chain = "*"
+
+[signature]
+owner_id = "GOWNER"
+sig = "00"
+"#;
+
+    const V2_GOLDEN_INLINE_RULES_FIXTURE: &str = r#"# Inline rules.
+version = 2
+sequence = 1
+scope = "profile:*"
+rules = [
+  # Daily cap.
+  { match = { tool = "stellar_pay", chain = "*" }, criteria = [{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 50_000_000 }], decision = "allow" },
+  { decision = "require_approval", criteria = [], match = { chain = "*", tool = "*" } }, # catch-all
+]
+"#;
+
+    const V2_OPTIONAL_KEYS_ARRAY_OF_TABLES: &str = r#"version = 2
+scope = "profile:alice"
+sequence = 1
+
+[[rules]]
+allow_opaque_signing = true
+ttl_secs = 3_600 # one hour
+reason = "manual review"
+decision = "require_approval"
+criteria = []
+match = { tool = "stellar_sep43_sign_transaction", chain = "*" }
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = []
+decision = "require_approval"
+allow_opaque_signing = false
+reason = ""
+
+[[rules]]
+match = { tool = "*", chain = "*" }
+criteria = []
+decision = "require_approval"
+ttl_secs = 86400
+
+[[rules]]
+match = { tool = "*", chain = "*" }
+criteria = []
+decision = "deny"
+"#;
+
+    const V2_OPTIONAL_KEYS_INLINE_RULES: &str = r#"version = 2
+scope = "profile:alice"
+sequence = 1
+rules = [
+  { allow_opaque_signing = true, ttl_secs = 0xe10, reason = 'manual review', decision = "require_approval", criteria = [], match = { tool = "stellar_sep43_sign_transaction", chain = "*" } },
+  { match = { tool = "stellar_pay", chain = "*" }, criteria = [], decision = "require_approval", allow_opaque_signing = false, reason = '' },
+  { match = { tool = "*", chain = "*" }, criteria = [], decision = "require_approval", ttl_secs = 86400 },
+  { match = { tool = "*", chain = "*" }, criteria = [], decision = "deny" },
+]
+"#;
+
+    const V2_EXPECTED_ARRAY_OF_TABLES: &str = r#"version = 2
+scope = "profile:alice"
+sequence = 1
+
+[[rules]]
+match = { chain = "stellar:testnet", tool = "stellar_pay" }
+criteria = [{ asset = "native", kind = "per_tx_cap", max_stroops = 1000000000 }, { allowlist = ["GAAAA", "CBBBB"], gate_inflows = false, kind = "counterparty_allowlist", kinds = ["G_ACCOUNT", "C_ACCOUNT"] }]
+decision = "allow"
+
+[[rules]]
+match = { chain = "*", tool = "*" }
+criteria = [{ kind = "rate_limit", max_calls = 10, window = "1h" }]
+decision = "require_approval"
+
+[[rules]]
+match = { chain = "*", tool = "stellar_create_account" }
+criteria = []
+decision = "deny"
+"#;
+
+    const V2_EXPECTED_INLINE_RULES: &str = r#"version = 2
+scope = "profile:*"
+sequence = 1
+
+[[rules]]
+match = { chain = "*", tool = "stellar_pay" }
+criteria = [{ asset = "native", kind = "per_period_cap", max_stroops = 50000000, window = "1d" }]
+decision = "allow"
+
+[[rules]]
+match = { chain = "*", tool = "*" }
+criteria = []
+decision = "require_approval"
+"#;
+
+    const V2_EXPECTED_WITH_OPTIONAL_KEYS: &str = r#"version = 2
+scope = "profile:alice"
+sequence = 1
+
+[[rules]]
+match = { chain = "*", tool = "stellar_sep43_sign_transaction" }
+criteria = []
+decision = "require_approval"
+reason = "manual review"
+ttl_secs = 3600
+allow_opaque_signing = true
+
+[[rules]]
+match = { chain = "*", tool = "stellar_pay" }
+criteria = []
+decision = "require_approval"
+reason = ""
+allow_opaque_signing = false
+
+[[rules]]
+match = { chain = "*", tool = "*" }
+criteria = []
+decision = "require_approval"
+ttl_secs = 86400
+
+[[rules]]
+match = { chain = "*", tool = "*" }
+criteria = []
+decision = "deny"
+"#;
+
+    #[test]
+    fn v2_legacy_canonical_companions_match_literals() {
+        for (input, expected, digest_hex) in [
+            (
+                V2_GOLDEN_ARRAY_OF_TABLES_FIXTURE,
+                V2_EXPECTED_ARRAY_OF_TABLES,
+                "b4cfca0beb8293f05d999c48ee44e20a984f3cf3f678881e0ae249ba9cfb1fc4",
+            ),
+            (
+                V2_GOLDEN_INLINE_RULES_FIXTURE,
+                V2_EXPECTED_INLINE_RULES,
+                "c619bb2e53d6c5063b2ab5aa7f14b49ccaae09c9d23b59fe0ef46b46270cc4b8",
+            ),
+            (
+                V2_OPTIONAL_KEYS_ARRAY_OF_TABLES,
+                V2_EXPECTED_WITH_OPTIONAL_KEYS,
+                "873e01622dfade431b672e6faa36b7dccf5b4a8c33c568d0b7af3fca9fbeab5a",
+            ),
+            (
+                V2_OPTIONAL_KEYS_INLINE_RULES,
+                V2_EXPECTED_WITH_OPTIONAL_KEYS,
+                "873e01622dfade431b672e6faa36b7dccf5b4a8c33c568d0b7af3fca9fbeab5a",
+            ),
+        ] {
+            let bytes = canonical_bytes(input).unwrap();
+            assert_eq!(String::from_utf8(bytes.clone()).unwrap(), expected);
+            assert_eq!(
+                crate::hex::encode(blake3::hash(&bytes).as_bytes()),
+                digest_hex
+            );
+        }
     }
 
     proptest! {

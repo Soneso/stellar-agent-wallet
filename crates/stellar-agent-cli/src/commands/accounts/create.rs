@@ -5,15 +5,28 @@
 //!
 //! ## Mode A — sponsored `CreateAccount`
 //!
-//! Required flags: `--sponsor <G-strkey>`, a signer source
-//! (`--secret-env <VAR>` or `--sign-with-ledger`), and
-//! `--starting-balance <amount>`.
+//! Required flags: `--sponsor <G-strkey>` and `--starting-balance <amount>`.
+//! On testnet a signer source (`--secret-env <VAR>` or `--sign-with-ledger`)
+//! is required; on a mainnet profile no signer flag signs with the enrolled
+//! seed in the keyring and `--secret-env` is refused.
 //!
 //! The new account public key is supplied as a positional `<new-G-strkey>`
 //! argument OR generated in-process with `--generate`. The sponsor's public
 //! key must match the signer-derived public key (same guard as the `pay`
 //! command). Submits a `CreateAccount` op via `ClassicOpBuilder` and the
 //! sign + submit pipeline.
+//!
+//! On a mainnet profile a build without the `mainnet-write` feature refuses
+//! with `network.mainnet_write_forbidden`. With the feature, `--generate` is
+//! refused with `accounts.create.generate_refused_on_mainnet`, and the run
+//! takes the stored profile of an explicit `--profile` selection, a verified
+//! signed policy with a `[mainnet]` table and its enablement, the enrolled
+//! sponsor signer, and the independent witness the effective witness rule
+//! requires. Under `allow` the run signs with policy authority and no passkey
+//! ceremony. An `approval_above` escalation or a `require_approval` rule runs
+//! the passkey ceremony, which records consent from an approval credential in
+//! the signed policy. The seed is
+//! read and the Ledger opened only after the authorization is minted.
 //!
 //! ## Mode B — Friendbot
 //!
@@ -47,7 +60,7 @@
 //!
 //! The `--secret-env` sponsored-mode path routes through the shared
 //! `resolve_software_signer_from_env` ceremony (`Wallet::unlock` →
-//! `LockedSeed` mlock-protected page → `signer_from_wallet` → dispose) →
+//! `LockedSeed` mlock-protected page → `signer_from_wallet`) →
 //! `attach_signature` → drop. The `--sign-with-ledger` path uses
 //! `signer_from_ledger` (hardware signer; no seed ever held in process memory).
 //!
@@ -89,8 +102,8 @@
 //! synthesized zero-config profile the pre-flight stays fail-open (warn-only,
 //! no refusal). Friendbot mode signs nothing and emits no audit row, so it is
 //! exempt (same rationale as the policy gate above). Where a writer was
-//! acquired, it is reused (not re-acquired) for the post-confirm
-//! `value_action_submitted` row.
+//! acquired, the submission recorder reuses it (not re-acquired) for the
+//! `value_action_pending` row it writes before the send.
 //!
 //! # Endpoint identity (sponsored mode)
 //!
@@ -108,21 +121,23 @@
 //! - The `--secret-env` path holds the seed only inside an mlock-protected
 //!   signing window.
 
-use std::time::Duration;
-
 use clap::{ArgGroup, Args};
 use rand_core::OsRng;
 use stellar_agent_core::StellarAmount;
 use stellar_agent_core::asset_id::CanonicalAsset;
 use stellar_agent_core::cross_check::CrossCheckValue;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
-use stellar_agent_core::error::{AuthError, NetworkError, ValidationError, WalletError};
+use stellar_agent_core::error::{AuthError, FeeSource, NetworkError, ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
-use stellar_agent_network::NetworkContext;
 use stellar_agent_network::cross_check::{
     AccountObservation, CreateAccountWitnessInputs, CrossCheckView, obtain_classic_witness,
+    obtain_classic_witness_bound,
 };
-use stellar_agent_network::fees::check_built_fee_cap;
+use stellar_agent_network::fees::{
+    check_built_fee_cap, check_classic_fee_cap_signed, classic_fee_source,
+};
+use stellar_agent_network::mainnet::MainnetConsumer;
+use stellar_agent_network::{MainnetEndpointFlags, NetworkContext};
 use zeroize::Zeroizing;
 
 use stellar_agent_network::builder::ClassicOpBuilder;
@@ -137,20 +152,33 @@ use stellar_agent_network::{
 use stellar_agent_network::{FriendbotResult, fund_with_friendbot};
 
 use crate::commands::policy_engine::{
-    build_v1_policy_engine, create_policy_args, evaluate_value_moving_policy,
+    build_v1_policy_engine, create_policy_args, effective_classic_fee_cap, envelope_total_fee,
+    evaluate_mainnet_policy, evaluate_value_moving_policy, load_mainnet_policy_engine,
+    mainnet_floor_source, reload_mainnet_policy_engine, with_total_fee,
+};
+use crate::common::business_entry::{
+    Bound, ClassicStart, Staging, bind_signing, classic_start, entry_business_id,
+    mainnet_business_id, print_replay,
+};
+use crate::common::mainnet_write::{
+    MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
+    mainnet_write_build_refusal, require_v1_engine,
 };
 use crate::common::network::{
-    EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity,
-    network_context_for_command,
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity, check_endpoint_ready,
+    network_context_for_command, submit_timeout,
 };
 use crate::common::profile_access::{
     ProfileOrigin, injected_profile_load, load_profile_or_synthesize_testnet_with,
 };
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::common::signer_ceremony::{
-    SignerCeremonyOutcome, require_enrolled_signer, resolve_software_signer_from_env,
+    MainnetSignerChoice, SignerCeremonyOutcome, require_enrolled_signer,
+    resolve_software_signer_from_env,
 };
 use crate::common::{ResolvedProfileName, resolve_profile_name};
+use stellar_agent_network::operational::read_within_readiness_deadline;
+use stellar_agent_network::policy_state::{FloorSource, OperationKind, OperationTool};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -158,9 +186,6 @@ use crate::common::{ResolvedProfileName, resolve_profile_name};
 
 /// Default fee per operation in stroops.
 const DEFAULT_FEE_STROOPS: u32 = 100;
-
-/// Default submission timeout in seconds.
-const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 
 /// Default Friendbot URL for testnet (SDF operated).
 const DEFAULT_FRIENDBOT_URL: &str = "https://friendbot.stellar.org";
@@ -271,6 +296,10 @@ pub struct CreateAccountResult {
     /// Transaction-specific cross-check outcome for sponsored creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_check: Option<CrossCheckView>,
+
+    /// The business id the run named. Absent when the run named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_id: Option<String>,
 }
 
 /// A failed sponsored create. `signed_xdr` is `Some` only once the envelope
@@ -343,6 +372,7 @@ pub struct CreateArgs {
     ///
     /// Returns both the G-strkey and S-strkey in the JSON envelope.
     /// Mutually exclusive with the positional `<new-G-strkey>` argument.
+    /// Refused on mainnet.
     #[arg(long, group = "account_group")]
     pub generate: bool,
 
@@ -362,7 +392,8 @@ pub struct CreateArgs {
 
     /// Name of the environment variable holding the sponsor's S-strkey.
     ///
-    /// The value is never logged.
+    /// The value is never logged. Refused on a mainnet profile, which signs
+    /// with the enrolled seed in the keyring.
     #[arg(long, value_name = "VAR", group = "signer_group")]
     pub secret_env: Option<String>,
 
@@ -402,10 +433,12 @@ pub struct CreateArgs {
     #[arg(long, default_value_t = OutputFormat::DEFAULT, value_name = "FORMAT")]
     pub output: OutputFormat,
 
-    /// Timeout in seconds for the endpoint check and, separately, for the
-    /// submission (sponsored mode). Default: 60.
-    #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS, value_name = "SECONDS")]
-    pub timeout_seconds: u64,
+    /// Timeout in seconds for the send and the confirmation poll (sponsored
+    /// mode). Default: the profile's `submit_timeout_seconds`, then 60.
+    /// The endpoint checks and the reads before the send run under a fixed
+    /// 30-second budget instead.
+    #[arg(long, value_name = "SECONDS")]
+    pub timeout_seconds: Option<u64>,
 
     /// The RPC endpoint comes from the profile when absent.
     /// On testnet, this flag overrides the profile endpoint.
@@ -413,6 +446,12 @@ pub struct CreateArgs {
     /// URL credentials are refused.
     #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub rpc_url: Option<String>,
+    /// Business id naming this value operation: 1 to 64 printable ASCII
+    /// characters, no space. Required on mainnet, where a retry with the
+    /// same id prints the stored operation instead of doing new work; on
+    /// another network it is validated and echoed.
+    #[arg(long = "business-id", value_name = "ID")]
+    pub business_id: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -470,10 +509,7 @@ where
     let (profile, origin) = match load_profile_or_synthesize_testnet_with(&resolved, load_profile) {
         Ok(loaded) => loaded,
         Err(e) => {
-            print_error(
-                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
-                args.output,
-            );
+            print_error(&Envelope::<()>::err_raw(e.code(), e.message()), args.output);
             return 1;
         }
     };
@@ -500,8 +536,18 @@ where
         }
     };
     tracing::debug!(profile = %resolved.name, profile_source = resolved.source.as_str(), "accounts create: profile resolved");
+    // Off mainnet a supplied business id is validated and echoed, and no
+    // record exists.
+    if !context.chain_id.is_mainnet()
+        && let Err(e) = entry_business_id(&profile, args.business_id.as_deref())
+    {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
     if args.fund_with_friendbot {
         run_friendbot(&context, args).await
+    } else if context.chain_id.is_mainnet() {
+        run_mainnet_pipeline(args, &resolved, &profile, init_keyring).await
     } else {
         run_sponsored(&context, args, &resolved, &profile, origin, init_keyring).await
     }
@@ -569,14 +615,12 @@ fn resolve_new_account(args: &CreateArgs) -> Result<NewAccount, WalletError> {
             secret: Some(s_strkey),
         })
     } else {
-        // Positional arg — validate it is a G-strkey.
+        // Positional arg: the created account is an AccountId, so it must be
+        // a plain G-strkey and an M input refuses with that reason.
         let addr = args.new_account.as_deref().unwrap_or(""); // clap enforces account_group required; empty is unreachable.
 
-        stellar_strkey::ed25519::PublicKey::from_string(addr).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: addr.to_owned(),
-            })
-        })?;
+        stellar_agent_core::classic_address::require_account_id(addr, "new_account")
+            .map_err(WalletError::Validation)?;
 
         Ok(NewAccount {
             g_strkey: addr.to_owned(),
@@ -622,7 +666,8 @@ async fn run_friendbot(context: &NetworkContext, args: &CreateArgs) -> i32 {
     .await
     {
         Ok(fb_result) => {
-            let result = build_friendbot_result(&new_account, &fb_result);
+            let mut result = build_friendbot_result(&new_account, &fb_result);
+            result.business_id.clone_from(&args.business_id);
             let envelope = Envelope::ok(result);
             print_success(&envelope, args.output);
             0
@@ -652,6 +697,7 @@ fn build_friendbot_result(new_account: &NewAccount, fb: &FriendbotResult) -> Cre
         selected_fee_per_op_stroops: None,
         selected_fee_percentile: None,
         cross_check: None,
+        business_id: None,
     }
 }
 
@@ -674,6 +720,10 @@ fn build_friendbot_result(new_account: &NewAccount, fb: &FriendbotResult) -> Cre
 /// `run_sponsored` initialised ahead of its origin-aware audit pre-flight
 /// therefore stays registered for the `build_v1_policy_engine` owner-key read
 /// below.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the gate inputs of sponsored mode, each read by a different earlier step"
+)]
 fn evaluate_create_policy(
     args: &CreateArgs,
     profile: &Profile,
@@ -682,6 +732,7 @@ fn evaluate_create_policy(
     new_account_g_strkey: &str,
     chain_id: &str,
     sponsor_account_view: &stellar_agent_network::AccountView,
+    total_fee: u32,
 ) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
     let policy_engine = match build_v1_policy_engine(
         "accounts create",
@@ -692,15 +743,20 @@ fn evaluate_create_policy(
         Ok(pe) => pe,
         Err(msg) => {
             print_error(
-                &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
+                &Envelope::<()>::err_raw(msg.code(), msg.to_string()),
                 args.output,
             );
             return Err(1);
         }
     };
-    // `derive_value_class` forces the asset to native for `stellar_create_account`
-    // — no "asset" key is needed here.
-    let policy_args = create_policy_args(starting_balance_stroops, new_account_g_strkey);
+    // `derive_value_class` forces the asset to native for
+    // `stellar_create_account`, so no "asset" key is needed here. The
+    // envelope's total fee is counted by `minimum_reserve` with the starting
+    // balance.
+    let policy_args = with_total_fee(
+        create_policy_args(starting_balance_stroops, new_account_g_strkey),
+        total_fee,
+    );
     // `account_view` feeds `minimum_reserve` on the SPONSOR (the source
     // account debited for the starting balance), mirroring the
     // `stellar_create_account` MCP twin. `identity_view` is `None`: the new
@@ -731,6 +787,45 @@ fn evaluate_create_policy(
 // Sponsored mode
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The sponsored-mode arguments that need no request.
+struct SponsoredInputs {
+    /// The sponsor G-strkey, the transaction source.
+    sponsor: String,
+    /// The new account's starting balance.
+    starting_balance: StellarAmount,
+}
+
+/// Reads `--sponsor` and `--starting-balance`.
+///
+/// # Errors
+///
+/// `validation.address_invalid` without `--sponsor`, and
+/// `validation.amount_malformed` for an absent or unitless starting balance.
+fn sponsored_inputs(args: &CreateArgs) -> Result<SponsoredInputs, WalletError> {
+    // clap mode_group enforces at least one of sponsor/fund_with_friendbot, so
+    // a missing sponsor here is a dispatch fault, refused rather than ignored.
+    let sponsor = args.sponsor.clone().ok_or_else(|| {
+        WalletError::Validation(ValidationError::address_check(
+            "--sponsor is required for sponsored mode",
+        ))
+    })?;
+    let starting_balance_str = args.starting_balance.as_deref().ok_or_else(|| {
+        WalletError::Validation(ValidationError::AmountMalformed {
+            field: "--starting-balance (required for sponsored mode)".into(),
+        })
+    })?;
+    // Starting balances use the native XLM unit at this CLI boundary.
+    let starting_balance = StellarAmount::parse_with_unit(starting_balance_str).map_err(|_| {
+        WalletError::Validation(ValidationError::AmountMalformed {
+            field: "--starting-balance".into(),
+        })
+    })?;
+    Ok(SponsoredInputs {
+        sponsor,
+        starting_balance,
+    })
+}
+
 async fn run_sponsored<InitKeyring>(
     context: &NetworkContext,
     args: &CreateArgs,
@@ -742,50 +837,13 @@ async fn run_sponsored<InitKeyring>(
 where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    // Sponsored mode — mainnet write forbidden.
-    if context.chain_id.is_mainnet() {
-        let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
-        let envelope = Envelope::<()>::err(&err);
-        print_error(&envelope, args.output);
-        return 1;
-    }
-
-    let sponsor = match &args.sponsor {
-        Some(s) => s.clone(),
-        None => {
-            // clap mode_group enforces at least one of sponsor/fund_with_friendbot;
-            // reaching this branch is structurally impossible at runtime. Surface as
-            // internal state rather than silently doing nothing.
-            let err = WalletError::Validation(ValidationError::AddressInvalid {
-                input: "--sponsor is required for sponsored mode".to_owned(),
-            });
-            let envelope = Envelope::<()>::err(&err);
-            print_error(&envelope, args.output);
-            return 1;
-        }
-    };
-
-    let starting_balance_str = match &args.starting_balance {
-        Some(s) => s.clone(),
-        None => {
-            let err = WalletError::Validation(ValidationError::AmountMalformed {
-                input: "--starting-balance is required for sponsored mode".to_owned(),
-            });
-            let envelope = Envelope::<()>::err(&err);
-            print_error(&envelope, args.output);
-            return 1;
-        }
-    };
-
-    // Starting balances use the native XLM unit at this CLI boundary.
-    let starting_balance = match StellarAmount::parse_with_unit(&starting_balance_str) {
-        Ok(a) => a,
-        Err(_) => {
-            let err = WalletError::Validation(ValidationError::AmountMalformed {
-                input: starting_balance_str.clone(),
-            });
-            let envelope = Envelope::<()>::err(&err);
-            print_error(&envelope, args.output);
+    let SponsoredInputs {
+        sponsor,
+        starting_balance,
+    } = match sponsored_inputs(args) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
             return 1;
         }
     };
@@ -847,8 +905,16 @@ where
             return 1;
         }
     };
-    if let Err(e) =
-        check_endpoint_identity(&client, context, Duration::from_secs(args.timeout_seconds)).await
+    let budget = stellar_agent_network::PRE_SEND_BUDGET;
+    if let Err(e) = check_endpoint_identity(&client, context, budget).await {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
+    if let Err(e) = check_endpoint_ready(
+        &client,
+        stellar_agent_network::operational::readiness_deadline(),
+    )
+    .await
     {
         print_error(&Envelope::<()>::err(&e), args.output);
         return 1;
@@ -881,13 +947,47 @@ where
         &resolved.name,
         origin,
         &client,
+        crate::commands::submission_record::settlement_oracle(profile).as_ref(),
         now_ms,
+        None,
     )
     .await;
+
+    // The fee is selected and the envelope built before the gate, so the
+    // policy counts the fee the envelope pays.
+    let (fee_choice, fee_selection) = match select_create_fee(&client, args).await {
+        Ok(selection) => selection,
+        Err(error) => {
+            print_error(&Envelope::<()>::err(&error), args.output);
+            return 1;
+        }
+    };
+    let envelope_xdr = match build_sponsored_unsigned_envelope(
+        context,
+        &sponsor,
+        sponsor_account_view.sequence_number,
+        &new_account.g_strkey,
+        starting_balance,
+        fee_selection.per_op_stroops,
+    ) {
+        Ok(xdr) => xdr,
+        Err(error) => {
+            print_error(&Envelope::<()>::err(&error), args.output);
+            return 1;
+        }
+    };
+    let total_fee = match envelope_total_fee(&envelope_xdr) {
+        Ok(fee) => fee,
+        Err(error) => {
+            print_error(&Envelope::<()>::err(&error), args.output);
+            return 1;
+        }
+    };
 
     // ── Operator policy evaluation (before signing/submission) ───────────────
     let chain_id = context.chain_id.caip2_str();
     let starting_balance_stroops = starting_balance.as_stroops();
+    crate::commands::submission_record::observe_intents(profile, &resolved.name).await;
     let create_effects = match evaluate_create_policy(
         args,
         profile,
@@ -896,18 +996,12 @@ where
         &new_account.g_strkey,
         chain_id,
         &sponsor_account_view,
+        total_fee,
     ) {
         Ok(effects) => effects,
         Err(code) => return code,
     };
 
-    let (fee_choice, fee_selection) = match select_create_fee(&client, args).await {
-        Ok(selection) => selection,
-        Err(error) => {
-            print_error(&Envelope::<()>::err(&error), args.output);
-            return 1;
-        }
-    };
     if let Err(error) = check_built_fee_cap(fee_selection.per_op_stroops, fee_choice, profile) {
         print_error(&Envelope::<()>::err(&error), args.output);
         return 1;
@@ -944,8 +1038,9 @@ where
     // comment. Proves the audit writer is acquirable AFTER the policy gate
     // (a denial is a clean refusal that signs nothing and needs no audit
     // setup) but BEFORE `sponsored_create` touches the signer or submits.
-    // Where `Some`, the writer is reused (not re-acquired) for the
-    // post-confirm `value_action_submitted` row.
+    // Where `Some`, the submission recorder reuses the writer (not
+    // re-acquired) for the `value_action_pending` row it writes before the
+    // send.
     let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
         profile,
         &resolved.name,
@@ -960,10 +1055,12 @@ where
 
     // Record, then sign and submit. The recorder writes the receipt, the
     // pending audit row and the spending-window reservation before the bytes
-    // leave, and settles all three against what the network answers.
+    // leave. It records a reported success on the receipt and in the
+    // reservation, and every other answer leaves all three standing.
     // Sponsored mode only: the Friendbot path is not policy-gated.
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
+            unvalued: None,
             policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
             profile,
             profile_name: resolved.name.clone(),
@@ -993,13 +1090,8 @@ where
             profile,
             profile_name: &resolved.name,
         },
-        SponsoredAccount {
-            sponsor: &sponsor,
-            new_account: &new_account.g_strkey,
-            starting_balance,
-            sequence_number: sponsor_account_view.sequence_number,
-            fee_per_op: fee_selection.per_op_stroops,
-        },
+        &sponsor,
+        &envelope_xdr,
         Some(&recorder),
     )
     .await
@@ -1017,6 +1109,7 @@ where
                 selected_fee_per_op_stroops: Some(fee_selection.per_op_stroops),
                 selected_fee_percentile: Some(fee_selection.selected_fee_percentile),
                 cross_check: Some(cross_check.view()),
+                business_id: args.business_id.clone(),
             };
             let envelope = Envelope::ok(result);
             print_success(&envelope, args.output);
@@ -1088,17 +1181,8 @@ struct SignedBy<'a> {
     profile_name: &'a str,
 }
 
-/// The account the sponsor creates, and with what balance.
-#[derive(Clone, Copy)]
-struct SponsoredAccount<'a> {
-    sponsor: &'a str,
-    new_account: &'a str,
-    starting_balance: StellarAmount,
-    sequence_number: i64,
-    fee_per_op: u32,
-}
-
-/// Builds, signs, and submits the `CreateAccount` transaction.
+/// Signs and submits the built `CreateAccount` transaction `envelope_xdr`,
+/// whose source is `sponsor`.
 ///
 /// `client` is the client whose endpoint the caller checked before the
 /// sponsor read; the send uses that checked client.
@@ -1107,10 +1191,11 @@ struct SponsoredAccount<'a> {
 ///
 /// - `--sign-with-ledger`: hardware signer; seed never in process memory.
 /// - `--secret-env VAR`: mlock-protected signing window. The S-strkey is
-///   parsed from the env var, moved into a `Wallet` (LockedSeed), and consumed
-///   by `signer_from_wallet`. Both the `SoftwareSigningKey` and the `Wallet`
-///   drop after `attach_signature`, triggering SecretBox zeroization and
-///   LockedSeed munlock.
+///   parsed from the env var and borrowed into a `Wallet`. `signer_from_wallet`
+///   transfers the stable seed home into the signer. Drop zeroizes before
+///   unlocking and freeing. Testnet keeps the signer for the command, which
+///   can outlast the unlock TTL. Mainnet transaction signing uses the
+///   enrolled keyring seed or a Ledger.
 ///
 /// # Errors
 ///
@@ -1120,48 +1205,66 @@ async fn sponsored_create(
     context: &NetworkContext,
     args: &CreateArgs,
     signed_by: SignedBy<'_>,
-    account: SponsoredAccount<'_>,
+    sponsor: &str,
+    envelope_xdr: &str,
     recorder: Option<&dyn stellar_agent_network::SubmissionRecorder>,
 ) -> Result<SubmissionResult, SponsoredCreateFailure> {
     let SignedBy {
         profile,
         profile_name,
     } = signed_by;
-    let SponsoredAccount {
-        sponsor,
-        new_account,
-        starting_balance,
-        sequence_number,
-        fee_per_op,
-    } = account;
-    let envelope_xdr = build_sponsored_unsigned_envelope(
-        context,
-        sponsor,
-        sequence_number,
-        new_account,
-        starting_balance,
-        fee_per_op,
-    )?;
-
     let signed_xdr =
-        sign_envelope(context, args, &envelope_xdr, sponsor, profile, profile_name).await?;
-    let passphrase = context.network_passphrase();
-
-    // Submit and wait for confirmation.
-    let timeout = Duration::from_secs(args.timeout_seconds);
-    submit_transaction_and_wait(
+        sign_envelope(context, args, envelope_xdr, sponsor, profile, profile_name).await?;
+    submit_signed(
         client,
+        context,
+        args,
+        profile,
         &signed_xdr,
-        timeout,
-        passphrase,
-        Some(SubmissionSignerKind::Software),
         recorder,
+        submit_transaction_and_wait,
     )
     .await
     .map_err(|error| SponsoredCreateFailure {
         error,
         signed_xdr: Some(signed_xdr),
     })
+}
+
+/// Submits the signed sponsored creation through `client` and waits for its
+/// confirmation, with the send and the poll under [`submit_timeout`].
+///
+/// `submit_and_wait` is the submission step, with the signature of
+/// [`submit_transaction_and_wait`], which production passes.
+async fn submit_signed<S>(
+    client: &StellarRpcClient,
+    context: &NetworkContext,
+    args: &CreateArgs,
+    profile: &Profile,
+    signed_xdr: &str,
+    recorder: Option<&dyn stellar_agent_network::SubmissionRecorder>,
+    submit_and_wait: S,
+) -> Result<SubmissionResult, WalletError>
+where
+    S: AsyncFnOnce(
+        &StellarRpcClient,
+        &str,
+        std::time::Duration,
+        &str,
+        Option<SubmissionSignerKind>,
+        Option<&dyn stellar_agent_network::SubmissionRecorder>,
+    ) -> Result<SubmissionResult, WalletError>,
+{
+    let timeout = submit_timeout(args.timeout_seconds, profile);
+    submit_and_wait(
+        client,
+        signed_xdr,
+        timeout,
+        context.network_passphrase(),
+        Some(SubmissionSignerKind::Software),
+        recorder,
+    )
+    .await
 }
 
 /// Resolves the command's fee choice before the cap and witness.
@@ -1193,6 +1296,7 @@ fn build_sponsored_unsigned_envelope(
         fee_per_op,
     );
     builder.create_account(new_account, starting_balance)?;
+    builder.with_mainnet_deadline()?;
     builder.build()
 }
 
@@ -1220,6 +1324,9 @@ fn sponsored_success_lines(result: &CreateAccountResult) -> Vec<String> {
     if let Some(cross_check) = &result.cross_check {
         lines.push(cross_check.text_line());
     }
+    if let Some(business_id) = &result.business_id {
+        lines.push(format!("business_id {business_id}"));
+    }
     lines
 }
 
@@ -1243,6 +1350,9 @@ fn print_success(envelope: &Envelope<CreateAccountResult>, format: OutputFormat)
                             "Account created (friendbot): {}  tx_hash {}",
                             result.account_id, hash
                         );
+                        if let Some(business_id) = &result.business_id {
+                            println!("business_id {business_id}");
+                        }
                         // secret_key is NEVER emitted in table mode.
                     } // `CreateMode` is `#[non_exhaustive]` but defined same-crate;
                       // the compiler enforces exhaustiveness here without a `_` arm.
@@ -1271,11 +1381,363 @@ fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Mainnet pipeline
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Runs sponsored mode on a mainnet profile.
+///
+/// A build without mainnet writes refuses first. The signer choice from the
+/// flags follows and refuses `--secret-env` before anything else runs. The
+/// stored profile of the explicit selection replaces the merged one at the
+/// write context, and every later step reads it from the context.
+/// `--generate` is refused: a mainnet account is created for a key the
+/// operator already holds. The verb's own steps run up to the bound witness,
+/// and [`authorize_and_submit`] runs the rest.
+async fn run_mainnet_pipeline<InitKeyring>(
+    args: &CreateArgs,
+    resolved: &ResolvedProfileName,
+    profile: &Profile,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
+    let fail = |envelope: &Envelope<()>| {
+        print_error(envelope, args.output);
+        1
+    };
+    if let Some(e) = mainnet_write_build_refusal() {
+        return fail(&Envelope::<()>::err(&e));
+    }
+    // The signer comes from the flags alone, before the write context, the
+    // keyring and any request, so a refused `--secret-env` writes and sends
+    // nothing.
+    let signer = match MainnetSignerChoice::from_flags(
+        args.sign_with_ledger,
+        args.account_index,
+        args.secret_env.as_deref(),
+    ) {
+        Ok(signer) => signer,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let context = match mainnet_context(
+        profile,
+        resolved,
+        MainnetEndpointFlags {
+            network: args.network.map(TargetNetwork::caip2),
+            rpc_url: args.rpc_url.is_some(),
+            secondary_rpc_url: false,
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let net_context = context.network_context();
+    let profile = context.profile();
+    let name = context.profile_name();
+    if args.generate {
+        return fail(&Envelope::<()>::err_raw(
+            "accounts.create.generate_refused_on_mainnet",
+            "accounts create --generate is refused on mainnet; pass the new account's public \
+             key (a G-strkey) as the positional argument",
+        ));
+    }
+    let SponsoredInputs {
+        sponsor,
+        starting_balance,
+    } = match sponsored_inputs(args) {
+        Ok(inputs) => inputs,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let new_account = match resolve_new_account(args) {
+        Ok(account) => account,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    if let Err(envelope) = require_v1_engine("accounts create", &context) {
+        return fail(&envelope);
+    }
+    if let Err(e) = init_keyring() {
+        return fail(&Envelope::<()>::err(&e));
+    }
+    let profiles_dir = match mainnet_profiles_dir() {
+        Ok(dir) => dir,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    // The reconcile pass below can settle, so the enablement verifies the
+    // snapshot's primary and oracle hosts before any client is built; the
+    // engine reloads after the pass, so the evaluation reads the window
+    // state the pass left.
+    let enabled = match load_mainnet_policy_engine(
+        "accounts create",
+        "policy.engine_unavailable",
+        &context,
+        resolved.source,
+        &profiles_dir,
+    ) {
+        Ok(policy) => policy,
+        Err(envelope) => return fail(&envelope),
+    };
+
+    // One client serves every read, the resolver and the send.
+    let client = match context.primary_client() {
+        Ok(client) => client,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let budget = stellar_agent_network::PRE_SEND_BUDGET;
+    if let Err(e) = check_endpoint_identity(&client, &net_context, budget).await {
+        return fail(&Envelope::<()>::err(&e));
+    }
+    // The check precedes the sponsor read, which runs under the check's
+    // deadline; the summary names the ledger the check observed.
+    let readiness_deadline = stellar_agent_network::operational::readiness_deadline();
+    let operational = match check_endpoint_ready(&client, readiness_deadline).await {
+        Ok(report) => report,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let sponsor_account_view = match read_within_readiness_deadline(
+        readiness_deadline,
+        stellar_agent_network::fetch_account(&client, &sponsor, &[]),
+    )
+    .await
+    {
+        Ok(view) => view,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            return fail(&Envelope::<()>::err_raw(
+                "wallet.clock_error",
+                e.to_string(),
+            ));
+        }
+    };
+    crate::commands::submission_record::reconcile_open_reservations(
+        profile,
+        name,
+        ProfileOrigin::Persisted,
+        &client,
+        crate::commands::submission_record::settlement_oracle_in(profile, &net_context).as_ref(),
+        now_ms,
+        args.business_id.as_deref(),
+    )
+    .await;
+
+    let (_, fee_selection) = match select_create_fee(&client, args).await {
+        Ok(selection) => selection,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    // The intent the business id binds needs the verified policy and the
+    // request facts only, so a retained operation answers before the
+    // envelope is built.
+    let policy = match reload_mainnet_policy_engine(
+        "accounts create",
+        "policy.engine_unavailable",
+        &context,
+        enabled,
+    ) {
+        Ok(policy) => policy,
+        Err(envelope) => return fail(&envelope),
+    };
+    let fee_choice = match parse_classic_fee_choice(args.fee.as_deref()) {
+        Ok(choice) => choice,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    // The id is checked where the run first needs it, after every refusal
+    // a run without one gives, so their codes stay.
+    let business_id = match mainnet_business_id(args.business_id.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let payload = stellar_agent_core::approval::IntentPayload::CreateAccount {
+        destination: new_account.g_strkey.clone(),
+        starting_balance_stroops: starting_balance.as_stroops(),
+    };
+    let operation = match classic_start(
+        &context,
+        &policy.verified,
+        business_id,
+        &sponsor,
+        fee_choice,
+        &stellar_xdr::Memo::None,
+        stellar_agent_network::operation_entry::IdentityFacts::Intent(payload.clone()),
+    ) {
+        Ok(ClassicStart::Proceed(operation)) => operation,
+        Ok(ClassicStart::Replay(view)) => return print_replay(&view, args.output),
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+
+    let envelope_xdr = match build_sponsored_unsigned_envelope(
+        &net_context,
+        &sponsor,
+        sponsor_account_view.sequence_number,
+        &new_account.g_strkey,
+        starting_balance,
+        fee_selection.per_op_stroops,
+    ) {
+        Ok(xdr) => xdr,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let candidate = operation.candidate(&envelope_xdr);
+    let total_fee = match envelope_total_fee(&candidate) {
+        Ok(fee) => fee,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let starting_balance_stroops = starting_balance.as_stroops();
+    let policy_args = with_total_fee(
+        create_policy_args(starting_balance_stroops, &new_account.g_strkey),
+        total_fee,
+    );
+    let floor = match mainnet_floor_source(
+        &context,
+        &client,
+        &policy.verified,
+        "stellar_create_account",
+        &sponsor_account_view.account_id,
+    )
+    .await
+    {
+        Ok(floor) => floor,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let sponsor_adapter =
+        stellar_agent_network::policy_view::AccountViewAdapter::new(&sponsor_account_view);
+    let evaluation = match evaluate_mainnet_policy(
+        &policy.verified,
+        profile,
+        "stellar_create_account",
+        stellar_agent_core::policy::ToolValueKind::MovesValue,
+        context.chain().caip2_str(),
+        &policy_args,
+        Some(FloorSource::view_or(floor.as_ref(), &sponsor_adapter)),
+        None,
+    ) {
+        Ok(evaluation) => evaluation,
+        Err(refusal) => {
+            return fail(&crate::common::mainnet_confirm::render_authority_refusal(
+                "accounts create",
+                refusal,
+            ));
+        }
+    };
+    let signing = match bind_signing(
+        &context,
+        operation,
+        Staging {
+            policy: &policy.verified,
+            tool: OperationTool::CliAccountsCreate,
+            kind: OperationKind::CreateAccount,
+            built: &envelope_xdr,
+            payload,
+            verdict: evaluation.verdict,
+        },
+    ) {
+        Ok(Bound::Sign(signing)) => signing,
+        Ok(Bound::Replay(view)) => return print_replay(&view, args.output),
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+
+    let body = &policy.body;
+    if let Err(e) = check_classic_fee_cap_signed(
+        signing.fee_per_op_stroops(),
+        classic_fee_source(fee_choice, FeeSource::CommandDefault),
+        profile,
+        Some(body.classic_max_fee_per_op_stroops),
+    ) {
+        return fail(&Envelope::<()>::err(&e));
+    }
+    let effective_cap = effective_classic_fee_cap(profile, body.classic_max_fee_per_op_stroops);
+    if let Err(e) = crate::commands::value_audit::require_value_audit_writer_for_origin(
+        profile,
+        name,
+        ProfileOrigin::Persisted,
+    ) {
+        return fail(&Envelope::<()>::err(&e));
+    }
+    let thresholds = stellar_agent_core::cross_check::ThresholdSet::from_profile_and_signed(
+        profile,
+        body.cross_check_thresholds.as_ref(),
+    );
+    let source = match AccountObservation::from_view(&sponsor_account_view) {
+        Ok(source) => source,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let cross_check = match obtain_classic_witness_bound(
+        profile,
+        &net_context,
+        CrossCheckValue::Amount {
+            asset: &CanonicalAsset::Native,
+            base_units: i128::from(starting_balance_stroops),
+        },
+        CreateAccountWitnessInputs {
+            source: source.clone(),
+        },
+        signing.checked(),
+        &thresholds,
+        "stellar_create_account",
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+
+    match authorize_and_submit(MainnetWriteRequest {
+        context: &context,
+        profiles_dir: &profiles_dir,
+        verb: "accounts create",
+        tool: "stellar_create_account",
+        consumer: MainnetConsumer::CliCreateAccount,
+        unsigned_xdr: signing.stored(),
+        client: &client,
+        probe_deadline: budget,
+        submit_timeout: submit_timeout(args.timeout_seconds, profile),
+        source: &sponsor,
+        source_flag: "--sponsor",
+        signer,
+        policy: &policy,
+        evaluation: &evaluation,
+        effective_cap,
+        witness: cross_check.witness(),
+        ledger: operational,
+        operation: Some(signing.handle()),
+        rebuild: signing.rebuild(
+            fee_choice,
+            (DEFAULT_FEE_STROOPS, FeeSource::CommandDefault),
+            CreateAccountWitnessInputs { source },
+            &thresholds,
+        ),
+    })
+    .await
+    {
+        Ok(submitted) => {
+            let result = CreateAccountResult {
+                account_id: new_account.g_strkey.clone(),
+                secret_key: None,
+                mode: CreateMode::Sponsored,
+                tx_hash: Some(submitted.result.tx_hash.clone()),
+                ledger: Some(submitted.result.ledger),
+                friendbot_url_used: None,
+                selected_fee_per_op_stroops: Some(
+                    submitted.fee_per_op_stroops(signing.fee_per_op_stroops()),
+                ),
+                selected_fee_percentile: Some(fee_selection.selected_fee_percentile),
+                cross_check: Some(submitted.cross_check(&cross_check).view()),
+                business_id: args.business_id.clone(),
+            };
+            print_success(&Envelope::ok(result), args.output);
+            0
+        }
+        Err(envelope) => fail(&envelope),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::panic, reason = "test spies reject keyring access")]
     #![allow(
         clippy::unwrap_used,
@@ -1289,8 +1751,8 @@ mod tests {
 
     use super::*;
     use crate::common::signer_ceremony::test_fixtures::{
-        EnrolledPin, assert_enrolled_outcome, enrolled_mainnet_profile, enrolled_test_g,
-        enrolled_test_secret,
+        EnrolledPin, assert_enrolled_mainnet_signing_outcome, enrolled_mainnet_profile,
+        enrolled_test_g, enrolled_test_secret,
     };
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
 
@@ -1350,7 +1812,8 @@ mod tests {
                         })
                     }
                 }
-                _ => serde_json::json!({}),
+                other => crate::test_rpc::operational_result(other)
+                    .unwrap_or_else(|| serde_json::json!({})),
             };
 
             ResponseTemplate::new(200)
@@ -1473,6 +1936,80 @@ mod tests {
         }
 
         TestCreate::try_parse_from(args).map(|t| t.args)
+    }
+
+    /// The timeout the verb's submit step hands the submission for `flag`,
+    /// with the profile's `submit_timeout_seconds` set to `configured`.
+    async fn forwarded_submit_timeout(
+        flag: Option<u64>,
+        configured: Option<u64>,
+    ) -> std::time::Duration {
+        let mut profile = Profile::builder_testnet("create-timeout", "s", "n", "a").build();
+        profile.submit_timeout_seconds = configured;
+        let mut args = minimal_sponsored_args();
+        args.timeout_seconds = flag;
+        let context = NetworkContext::from_profile(&profile);
+        let client = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+        let seen = std::sync::Mutex::new(None);
+        let outcome = submit_signed(
+            &client,
+            &context,
+            &args,
+            &profile,
+            "AAAA",
+            None,
+            async |_client: &StellarRpcClient,
+                   _envelope: &str,
+                   timeout: std::time::Duration,
+                   _passphrase: &str,
+                   _signer_kind: Option<SubmissionSignerKind>,
+                   _recorder: Option<&dyn stellar_agent_network::SubmissionRecorder>| {
+                *seen.lock().unwrap() = Some(timeout);
+                Err(WalletError::Network(
+                    stellar_agent_core::error::NetworkError::EndpointIdentityUnavailable {
+                        url: "http://127.0.0.1:9".to_owned(),
+                    },
+                ))
+            },
+        )
+        .await;
+        assert!(outcome.is_err(), "the submission step refused");
+        seen.into_inner()
+            .unwrap()
+            .expect("the submit step reaches the submission")
+    }
+
+    /// `--timeout-seconds` sets the timeout the submit step hands the
+    /// submission; without it the profile's `submit_timeout_seconds` applies,
+    /// then 60 seconds.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn timeout_flag_falls_back_to_the_profile_then_sixty() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        assert_eq!(
+            try_parse_create(&[sponsored_args(), vec!["--timeout-seconds", "5"]].concat())
+                .unwrap()
+                .timeout_seconds,
+            Some(5)
+        );
+        assert_eq!(
+            try_parse_create(&sponsored_args()).unwrap().timeout_seconds,
+            None
+        );
+        assert_eq!(
+            forwarded_submit_timeout(Some(5), Some(17)).await,
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            forwarded_submit_timeout(None, Some(17)).await,
+            std::time::Duration::from_secs(17)
+        );
+        assert_eq!(
+            forwarded_submit_timeout(None, None).await,
+            std::time::Duration::from_secs(60)
+        );
     }
 
     /// Helper: a minimal valid friendbot invocation arg list.
@@ -1621,9 +2158,10 @@ mod tests {
             // Non-routable, so no request leaves the host.
             friendbot_url: "http://127.0.0.1:1".to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: None,
             fee: None,
+            business_id: None,
         };
         let exit = run_with_dependencies(
             &args,
@@ -1663,7 +2201,14 @@ mod tests {
     #[serial_test::serial]
     async fn friendbot_mainnet_flag_without_profile_reaches_no_endpoint() {
         let guard_rpc = wiremock::MockServer::start().await;
-        let guard_home = tempfile::tempdir().expect("home");
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let args = CreateArgs {
@@ -1682,20 +2227,14 @@ mod tests {
             // Non-routable, so no request leaves the host.
             friendbot_url: "http://127.0.0.1:1".to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(guard_rpc.uri()),
             fee: None,
+            business_id: None,
         };
         let exit = run_with_dependencies(
             &args,
-            |name| {
-                Err(
-                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
-                        name: name.into(),
-                        path: std::path::PathBuf::from("absent"),
-                    },
-                )
-            },
+            |_| Err(stellar_agent_core::profile::loader::ProfileLoadError::NotFound),
             || panic!("network mismatch must not initialize the keyring"),
         )
         .await;
@@ -1709,10 +2248,18 @@ mod tests {
         );
     }
 
+    /// A mainnet profile is refused before the keyring initializer runs and
+    /// before any request reaches an endpoint. Without `mainnet-write` the
+    /// write context refuses the build; with it, the injected loader's `http`
+    /// endpoint differs from the stored profile's `https` one, so the write
+    /// context refuses the merged view. Both refuse with
+    /// `network.mainnet_write_forbidden`.
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn sponsored_mainnet_rejected_before_rpc_call() {
         crate::common::render::take_rendered_for_test();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let resolutions = crate::common::signer_ceremony::signer_resolutions_on_this_thread();
         let guard_rpc = wiremock::MockServer::start().await;
         let counter =
             stellar_agent_test_support::ConnectionCounter::start().expect("connection counter");
@@ -1728,16 +2275,17 @@ mod tests {
             generate: false,
             starting_balance: Some("5 XLM".to_owned()),
             sponsor: Some("GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned()),
-            secret_env: Some("SPONSOR_SECRET".to_owned()),
+            secret_env: None,
             sign_with_ledger: false,
             account_index: 0,
             fund_with_friendbot: false,
             network: Some(TargetNetwork::Mainnet),
             friendbot_url: "http://127.0.0.1:1".to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: None,
             fee: None,
+            business_id: None,
         };
         let exit = run_with_dependencies(
             &args,
@@ -1747,10 +2295,15 @@ mod tests {
                         .build(),
                 )
             },
-            || panic!("mainnet must not initialize the keyring"),
+            crate::test_rpc::counting_initializer(&calls),
         )
         .await;
         assert_eq!(exit, 1, "mainnet sponsored must exit with code 1");
+        assert_eq!(calls.get(), 0, "the keyring is never initialized");
+        assert_eq!(
+            crate::common::signer_ceremony::signer_resolutions_on_this_thread(),
+            resolutions
+        );
         assert!(
             guard_rpc
                 .received_requests()
@@ -1771,11 +2324,23 @@ mod tests {
         );
     }
 
+    /// `--network mainnet` against an absent profile, which synthesizes a
+    /// testnet profile, refuses as a network-flag mismatch before the keyring
+    /// initializer runs and before any request reaches `--rpc-url`. It is the
+    /// control for the flag check, which runs before any mainnet step.
     #[tokio::test]
     #[serial_test::serial]
     async fn sponsored_mainnet_rejected_before_rpc_call_network_flag_without_profile_refuses() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
         let guard_rpc = wiremock::MockServer::start().await;
-        let guard_home = tempfile::tempdir().expect("home");
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let args = CreateArgs {
@@ -1793,24 +2358,19 @@ mod tests {
             network: Some(TargetNetwork::Mainnet),
             friendbot_url: "http://127.0.0.1:1".to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(guard_rpc.uri()),
             fee: None,
+            business_id: None,
         };
         let exit = run_with_dependencies(
             &args,
-            |name| {
-                Err(
-                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
-                        name: name.into(),
-                        path: std::path::PathBuf::from("absent"),
-                    },
-                )
-            },
-            || panic!("network mismatch must not initialize the keyring"),
+            |_| Err(stellar_agent_core::profile::loader::ProfileLoadError::NotFound),
+            crate::test_rpc::counting_initializer(&calls),
         )
         .await;
         assert_eq!(exit, 1, "mainnet sponsored must exit with code 1");
+        assert_eq!(calls.get(), 0, "the keyring is never initialized");
         assert!(
             guard_rpc
                 .received_requests()
@@ -1818,6 +2378,98 @@ mod tests {
                 .expect("requests")
                 .is_empty()
         );
+    }
+
+    /// Sponsored-create arguments naming no profile, for the implicit
+    /// selection and generate tests.
+    fn mainnet_sponsored_args() -> CreateArgs {
+        CreateArgs {
+            profile: None,
+            new_account: Some(
+                "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
+            ),
+            generate: false,
+            starting_balance: Some("5 XLM".to_owned()),
+            sponsor: Some("GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned()),
+            secret_env: Some("SPONSOR_SECRET".to_owned()),
+            sign_with_ledger: false,
+            account_index: 0,
+            fund_with_friendbot: false,
+            network: None,
+            friendbot_url: "http://127.0.0.1:1".to_owned(),
+            output: OutputFormat::Json,
+            timeout_seconds: None,
+            rpc_url: None,
+            fee: None,
+            business_id: None,
+        }
+    }
+
+    /// A mainnet profile selected without `--profile` refuses before the
+    /// keyring, in both builds.
+    async fn assert_implicit_selection_refused(source: crate::test_rpc::ImplicitSource) {
+        crate::common::render::take_rendered_for_test();
+        let selection = crate::test_rpc::ImplicitSelection::new(source);
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let exit = run_with_dependencies(
+            &mainnet_sponsored_args(),
+            crate::test_rpc::ImplicitSelection::loader("https://rpc.example.invalid"),
+            crate::test_rpc::counting_initializer(&calls),
+        )
+        .await;
+        assert_eq!(exit, 1);
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(
+            rendered[0]["error"]["code"], "profile.mainnet_requires_explicit_profile",
+            "{}: {rendered:?}",
+            selection.name
+        );
+        assert_eq!(calls.get(), 0, "the keyring is never initialized");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn a_mainnet_profile_named_by_the_variable_refuses() {
+        assert_implicit_selection_refused(crate::test_rpc::ImplicitSource::Env).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn a_mainnet_profile_saved_as_default_refuses() {
+        assert_implicit_selection_refused(crate::test_rpc::ImplicitSource::Default).await;
+    }
+
+    /// Without `mainnet-write`, the build refusal precedes the signer choice,
+    /// write context and generate check. The run passes `--secret-env` and
+    /// receives `network.mainnet_write_forbidden`.
+    #[cfg(not(feature = "mainnet-write"))]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn generate_on_mainnet_refuses_in_a_build_without_mainnet_writes() {
+        crate::common::render::take_rendered_for_test();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (_guard_dir, _guard_home, _guard_env) =
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(
+                "https://rpc.example.invalid",
+            );
+        let mut args = mainnet_sponsored_args();
+        args.profile = Some("guard-mainnet".to_owned());
+        args.new_account = None;
+        args.generate = true;
+        let exit = run_with_dependencies(
+            &args,
+            crate::test_rpc::ImplicitSelection::loader("https://rpc.example.invalid"),
+            crate::test_rpc::counting_initializer(&calls),
+        )
+        .await;
+        assert_eq!(exit, 1);
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(
+            rendered[0]["error"]["code"],
+            "network.mainnet_write_forbidden"
+        );
+        assert!(!rendered[0].to_string().contains("secret_key"));
+        assert_eq!(calls.get(), 0, "the keyring is never initialized");
     }
 
     #[tokio::test]
@@ -1855,6 +2507,7 @@ mod tests {
             selected_fee_per_op_stroops: Some(selection.per_op_stroops),
             selected_fee_percentile: Some(selection.selected_fee_percentile),
             cross_check: None,
+            business_id: None,
         };
         let json = serde_json::to_value(result).expect("CreateAccountResult serialises");
         assert_eq!(json["selected_fee_per_op_stroops"], "250");
@@ -1878,6 +2531,7 @@ mod tests {
             selected_fee_per_op_stroops: None,
             selected_fee_percentile: None,
             cross_check: None,
+            business_id: None,
         };
         let json = serde_json::to_value(&result).expect("CreateAccountResult serialises");
         assert!(json.get("selected_fee_per_op_stroops").is_none());
@@ -1991,9 +2645,10 @@ mod tests {
             network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
+            business_id: None,
         };
         let acc = resolve_new_account(&args).expect("generate must succeed");
 
@@ -2037,9 +2692,10 @@ mod tests {
             network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
+            business_id: None,
         };
         let result = resolve_new_account(&args);
         assert!(result.is_err(), "invalid G-strkey must return an error");
@@ -2051,6 +2707,60 @@ mod tests {
             ),
             "expected AddressInvalid, got: {err:?}"
         );
+    }
+
+    /// The created account is an `AccountId`, so an M0 or M17
+    /// positional refuses with the field and the reason under the existing
+    /// code, and a secret-key-shaped input is not echoed.
+    #[test]
+    fn destination_plain_field_reason() {
+        let key = [0xA4; 32];
+        let with = |account: String| CreateArgs {
+            profile: None,
+            new_account: Some(account),
+            generate: false,
+            starting_balance: None,
+            sponsor: None,
+            secret_env: None,
+            sign_with_ledger: false,
+            account_index: 0,
+            fund_with_friendbot: true,
+            network: Some(TargetNetwork::Testnet),
+            friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
+            output: OutputFormat::Json,
+            timeout_seconds: None,
+            rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
+            fee: None,
+            business_id: None,
+        };
+        let g = format!("{}", stellar_strkey::ed25519::PublicKey(key));
+        assert_eq!(resolve_new_account(&with(g.clone())).unwrap().g_strkey, g);
+        for id in [0, 17] {
+            let m = format!(
+                "{}",
+                stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+            );
+            let Err(err) = resolve_new_account(&with(m.clone())) else {
+                panic!("M{id} must refuse");
+            };
+            assert_eq!(err.code(), "validation.address_invalid");
+            assert_eq!(
+                err.message(),
+                "new_account requires AccountId; a muxed ID cannot be encoded"
+            );
+            assert!(!err.message().contains(&m));
+        }
+        let secret = stellar_strkey::ed25519::PrivateKey(key)
+            .as_unredacted()
+            .to_string()
+            .as_str()
+            .to_owned();
+        let Err(err) = resolve_new_account(&with(secret.clone())) else {
+            panic!("a secret key must refuse");
+        };
+        assert_eq!(err.code(), "validation.address_invalid");
+        assert!(!err.message().contains(&secret));
+        assert!(!err.message().contains("muxed ID"));
     }
 
     /// When `--generate` is not set, the `NewAccount.secret` field is `None`,
@@ -2075,9 +2785,10 @@ mod tests {
             network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
+            business_id: None,
         };
         let acc = resolve_new_account(&args).expect("positional G-strkey must resolve");
         assert!(
@@ -2109,9 +2820,10 @@ mod tests {
             network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
+            business_id: None,
         };
         let acc = resolve_new_account(&args).expect("--generate must succeed");
         assert!(
@@ -2185,9 +2897,10 @@ mod tests {
             network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds: None,
             rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
+            business_id: None,
         }
     }
 
@@ -2220,7 +2933,13 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let profile_loaded = Arc::new(AtomicBool::new(false));
@@ -2258,7 +2977,7 @@ mod tests {
                 );
                 init_writer.store(true, Ordering::SeqCst);
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
-                    name: "keyring-order-test-sentinel".to_owned(),
+                    cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                 }))
             },
         )
@@ -2288,7 +3007,13 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let home = tempfile::tempdir().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let init_invoked = Arc::new(AtomicBool::new(false));
@@ -2317,7 +3042,7 @@ mod tests {
             move || {
                 init_writer.store(true, Ordering::SeqCst);
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
-                    name: "keyring-order-test-noop-sentinel".to_owned(),
+                    cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                 }))
             },
         )
@@ -2359,7 +3084,13 @@ mod tests {
         // neither the operator's audit log nor a host key that would let the
         // pre-flight succeed instead of exercising its fail-open branch.
         // Process-global, hence `#[serial]`.
-        let _dir = tempfile::TempDir::new().expect("tempdir");
+        let _dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            _dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(_dir.path());
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
@@ -2372,17 +3103,10 @@ mod tests {
         // names no profile, so the choke point synthesizes (zero-config group).
         let code = run_with_dependencies(
             &args,
-            |name| {
-                Err(
-                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
-                        name: name.to_owned(),
-                        path: std::path::PathBuf::from("/nonexistent"),
-                    },
-                )
-            },
+            |_| Err(stellar_agent_core::profile::loader::ProfileLoadError::NotFound),
             || {
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
-                    name: "create-zero-config-keyring-init-failure-sentinel".to_owned(),
+                    cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
                 }))
             },
         )
@@ -2409,7 +3133,10 @@ mod tests {
             crate::test_rpc::last_rendered()["error"]["code"],
             "validation.signer_source_required",
         );
-        assert_eq!(methods, ["getNetwork", "getLedgerEntries"]);
+        assert_eq!(
+            methods,
+            ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"]
+        );
     }
 
     #[allow(unsafe_code, reason = "serialized test seed variable")]
@@ -2450,24 +3177,33 @@ mod tests {
         unsafe {
             std::env::remove_var(var);
         }
-        assert_enrolled_outcome(pin, result);
+        assert_enrolled_mainnet_signing_outcome(pin, result);
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_signing_equal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_signing_case(EnrolledPin::Derived).await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_signing_placeholder() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_signing_case(EnrolledPin::Placeholder).await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_signing_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_signing_case(EnrolledPin::Other).await;
     }
 
@@ -2477,6 +3213,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn signer_key_mismatch_names_sponsor() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let g = enrolled_test_g();
         let other = stellar_strkey::ed25519::PublicKey([7; 32])
             .to_string()
@@ -2603,6 +3342,58 @@ mod tests {
             );
         }
     }
+
+    /// A sponsored creation checks the endpoint's identity, then its health
+    /// and the close time of its latest ledger, and reads the sponsor only
+    /// after both checks.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_sponsored_creation_checks_readiness_before_the_sponsor_read() {
+        let _zero_config = crate::test_rpc::zero_config();
+        let seed = [0x83; 32];
+        let sponsor = stellar_agent_test_support::signed_envelope::account_id_for_seed(seed);
+        let server = crate::test_rpc::ClassicRpc::testnet(&[&sponsor])
+            .serve()
+            .await;
+
+        let (code, _) = sponsored_run(seed, "CREATE_READINESS_ORDER_SK", &server, None).await;
+        let methods = crate::test_rpc::methods(&server).await;
+
+        assert_eq!(code, 0, "{methods:?}");
+        assert_eq!(
+            methods[..4],
+            ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"],
+            "identity, then readiness, then the sponsor read: {methods:?}"
+        );
+    }
+
+    /// An endpoint whose latest ledger closed beyond the readiness bound
+    /// refuses a sponsored creation with `network.endpoint_not_ready` before
+    /// the sponsor read.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_sponsored_creation_refuses_a_stale_endpoint_before_the_sponsor_read() {
+        let _zero_config = crate::test_rpc::zero_config();
+        let seed = [0x84; 32];
+        let sponsor = stellar_agent_test_support::signed_envelope::account_id_for_seed(seed);
+        let endpoint = crate::test_rpc::ClassicRpc::testnet(&[&sponsor]);
+        endpoint.close_ledgers_ago(120);
+        let server = endpoint.serve().await;
+
+        crate::common::render::take_rendered_for_test();
+        let (code, _) = sponsored_run(seed, "CREATE_READINESS_STALE_SK", &server, None).await;
+
+        assert_eq!(code, 1);
+        assert_eq!(
+            crate::test_rpc::last_rendered()["error"]["code"],
+            "network.endpoint_not_ready"
+        );
+        assert_eq!(
+            crate::test_rpc::methods(&server).await,
+            ["getNetwork", "getHealth", "getLedgers"],
+            "a stale endpoint answers no account read"
+        );
+    }
     #[test]
     fn sponsored_text_includes_the_witness() {
         let result: CreateAccountResult = serde_json::from_value(serde_json::json!({
@@ -2637,7 +3428,7 @@ mod tests {
     mod witness {
         use super::*;
         use crate::test_rpc::{
-            ClassicRpc, EnvSigner, account_key, account_xdr, assert_rows_carry_witness,
+            ClassicRpc, EnvSigner, account_key, account_xdr, assert_pending_row_carries_witness,
             last_rendered, methods, sent, signers_resolved_by, witness_profile, zero_config,
         };
 
@@ -2712,7 +3503,7 @@ mod tests {
                 args.secret_env = None;
             }
             if matches!(case, Case::Timeout) {
-                args.timeout_seconds = 1;
+                args.timeout_seconds = Some(1);
                 Mock::given(method("POST"))
                     .and(wiremock::matchers::body_partial_json(serde_json::json!({
                         "method": "getTransaction"
@@ -2748,11 +3539,11 @@ mod tests {
                 Case::Unsigned => Some("validation.signer_source_required"),
                 _ => None,
             };
-            // Before signing, the primary answers the endpoint check and one
-            // sponsor read, which feeds the policy, the witness and the
-            // builder. A run that signs then reaches the submit layer, which
-            // checks the endpoint again and reads the signer set to verify the
-            // signature binding before the send.
+            // Before signing, the primary answers the endpoint identity and
+            // readiness checks and one sponsor read, which feeds the policy,
+            // the witness and the builder. A run that signs then reaches the
+            // submit layer, which checks the endpoint again and reads the
+            // signer set to verify the signature binding before the send.
             let primary_methods = methods(&primary).await;
             let signed = matches!(
                 case,
@@ -2760,9 +3551,11 @@ mod tests {
             );
             if signed {
                 assert_eq!(
-                    primary_methods[..5],
+                    primary_methods[..7],
                     [
                         "getNetwork",
+                        "getHealth",
+                        "getLedgers",
                         "getLedgerEntries",
                         "getNetwork",
                         "getLedgerEntries",
@@ -2771,14 +3564,14 @@ mod tests {
                     "the sponsor is read once before signing: {primary_methods:?}"
                 );
                 assert!(
-                    primary_methods.len() > 5
-                        && primary_methods[5..].iter().all(|m| m == "getTransaction"),
+                    primary_methods.len() > 7
+                        && primary_methods[7..].iter().all(|m| m == "getTransaction"),
                     "{primary_methods:?}"
                 );
             } else {
                 assert_eq!(
                     primary_methods,
-                    ["getNetwork", "getLedgerEntries"],
+                    ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"],
                     "the sponsor is read once and nothing is sent"
                 );
             }
@@ -2817,7 +3610,9 @@ mod tests {
                         text.contains(if matches!(case, Case::DefaultCap) {
                             "default per-operation fee"
                         } else {
-                            "explicit per-operation fee"
+                            "--fee must be a per-operation stroop amount within \
+                             classic_max_fee_per_op_stroops; lower --fee or raise \
+                             classic_max_fee_per_op_stroops."
                         }),
                         "{text}"
                     );
@@ -2832,7 +3627,7 @@ mod tests {
                 };
                 assert_eq!(value["data"]["cross_check"]["status"], status, "{value}");
                 if status == "passed" {
-                    assert_rows_carry_witness(&profile, &oracle.uri());
+                    assert_pending_row_carries_witness(&profile, &oracle.uri());
                 } else {
                     assert!(methods(&oracle).await.is_empty());
                 }
@@ -2905,6 +3700,827 @@ mod tests {
         #[serial_test::serial]
         async fn unsigned_refusal_reports_no_envelope_hash() {
             exercise(Case::Unsigned).await;
+        }
+    }
+
+    /// The mainnet pipeline over the fixture's stored profile, ceremony and
+    /// routed endpoints.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) mod mainnet_full {
+        use super::*;
+        use std::rc::Rc;
+
+        use serde_json::Value;
+        use stellar_agent_test_support::WarningCapture;
+
+        use crate::common::mainnet_write::{
+            invalidations_on_this_thread, submission_kinds_on_this_thread,
+        };
+        use crate::common::mainnet_write_fixture::{
+            AGENT_SEED, AGENT_VAR, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, NEW_ACCOUNT,
+            Spec, balance_floor, create_rule, install_ledger_double, minimum_reserve,
+            open_authorizations_of, refusal_warnings,
+        };
+        use crate::common::signer_ceremony::signer_resolutions_on_this_thread;
+        use crate::test_rpc::{ClassicRpc, last_rendered};
+
+        /// The native balance the mocked endpoints report for every account.
+        const BALANCE: i64 = 100_000_000_000;
+        /// The protocol reserve of an account without subentries.
+        const RESERVE: i64 = 10_000_000;
+        /// The starting balance of [`mainnet_args`]: 2 XLM.
+        const STARTING_BALANCE: i64 = 20_000_000;
+
+        /// The fixture's default primary: an endpoint funding the agent, the
+        /// destination and the issuer.
+        fn sponsor_ledger() -> ClassicRpc {
+            let agent =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER])
+        }
+
+        /// A sponsored create of [`NEW_ACCOUNT`] with 2 XLM, sponsored by the
+        /// agent, with no signer flag: a mainnet profile signs with the
+        /// enrolled seed in the keyring.
+        pub(crate) fn mainnet_args(fixture: &MainnetFixture) -> CreateArgs {
+            CreateArgs {
+                profile: Some(fixture.name.to_owned()),
+                new_account: Some(NEW_ACCOUNT.to_owned()),
+                generate: false,
+                starting_balance: Some("2 XLM".to_owned()),
+                sponsor: Some(fixture.agent.g.clone()),
+                secret_env: None,
+                sign_with_ledger: false,
+                account_index: 0,
+                fund_with_friendbot: false,
+                network: None,
+                friendbot_url: "http://127.0.0.1:1".to_owned(),
+                output: OutputFormat::Json,
+                timeout_seconds: None,
+                rpc_url: None,
+                fee: None,
+                business_id: Some(crate::common::business_entry::fresh_business_id()),
+            }
+        }
+
+        pub(crate) struct Run {
+            pub(crate) code: i32,
+            pub(crate) envelope: Value,
+        }
+
+        impl Run {
+            fn code(&self) -> &str {
+                self.envelope["error"]["code"].as_str().unwrap_or("")
+            }
+        }
+
+        pub(crate) async fn run(fixture: &MainnetFixture, args: &CreateArgs) -> Run {
+            crate::common::render::take_rendered_for_test();
+            let code = run_with_dependencies(args, fixture.loader(), fixture.initializer()).await;
+            Run {
+                code,
+                envelope: last_rendered(),
+            }
+        }
+
+        /// Runs `args` on the fixture and returns the exit code alone, for a
+        /// run whose output is not one JSON envelope.
+        pub(crate) async fn run_code(fixture: &MainnetFixture, args: &CreateArgs) -> i32 {
+            run_with_dependencies(args, fixture.loader(), fixture.initializer()).await
+        }
+
+        /// A real browser listener gates the signer, authorization, and submission.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn direct_mainnet_confirmation_requires_uv_before_signing() {
+            for (name, flags, verdict) in [
+                ("create-browser-no-uv", 1, "allow"),
+                ("create-browser-uv", 5, "allow"),
+                ("create-browser-required-no-uv", 1, "require_approval"),
+                ("create-browser-required-uv", 5, "require_approval"),
+            ] {
+                let mut fixture = Spec::new(name)
+                    .rules(vec![create_rule(verdict, "")])
+                    .build()
+                    .await;
+                fixture.present_in_browser(flags);
+                let before = signer_resolutions_on_this_thread();
+                let result = run(&fixture, &mainnet_args(&fixture)).await;
+                if verdict == "require_approval" && flags == 1 {
+                    assert_eq!(
+                        result.code(),
+                        "approval.presence_invalid",
+                        "{}",
+                        result.envelope
+                    );
+                    assert!(records(&fixture).is_empty());
+                    assert!(fixture.sent_envelopes().await.is_empty());
+                    assert!(fixture.audit_rows("approval_attested").is_empty());
+                    assert_eq!(signer_resolutions_on_this_thread(), before);
+                } else {
+                    assert_eq!(result.code, 0, "{}", result.envelope);
+                    assert_eq!(fixture.sent_envelopes().await.len(), 1);
+                    assert_eq!(signer_resolutions_on_this_thread(), before + 1);
+                    crate::common::mainnet_authority_tests::assert_authorized(
+                        &fixture,
+                        verdict == "require_approval",
+                        0,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        fn now() -> u64 {
+            stellar_agent_core::timefmt::now_unix_ms().unwrap()
+        }
+
+        fn records(fixture: &MainnetFixture) -> Vec<Value> {
+            if !fixture.window_path().exists() {
+                return Vec::new();
+            }
+            fixture.window_body()["authorizations"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        async fn assert_refused_before_confirmation(
+            fixture: &MainnetFixture,
+            run: &Run,
+            code: &str,
+        ) {
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.code(), code, "{}", run.envelope);
+            assert!(records(fixture).is_empty(), "no authorization record");
+            assert!(
+                fixture.pending_entries().is_empty(),
+                "no confirmation entry"
+            );
+            assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+        }
+
+        /// The audit writer is acquired before the signing key loads, at the
+        /// business id lookup of `classic_start`. With the profile's keyed
+        /// audit writer held from the start by another handle, as a writer of
+        /// another process holds it, the mainnet create refuses with the
+        /// writer's refusal before the confirmation: no authorization record,
+        /// no confirmation entry, no signer resolution, no consent ceremony,
+        /// and nothing sent.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_writer_held_from_the_start_refuses_at_the_lookup_before_the_signer() {
+            let fixture = Spec::new("mainnet-create-held-writer")
+                .primary(sponsor_ledger())
+                .build()
+                .await;
+            let profile = fixture.profile();
+            // The enrollment ceremony left this process's registry holding the
+            // writer; dropping that entry leaves the log to the handle below.
+            stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(fixture.name);
+            let _held = crate::commands::value_audit::open_best_effort_audit_writer(
+                &profile,
+                fixture.name,
+                crate::common::profile_access::ProfileOrigin::Persisted,
+            )
+            .unwrap_or_else(|e| panic!("the test holds the keyed writer: {e}"));
+            let resolutions = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "audit.chain_key_unavailable").await;
+            assert!(
+                run.envelope.to_string().contains("audit.writer_locked"),
+                "{}",
+                run.envelope
+            );
+            assert_eq!(
+                signer_resolutions_on_this_thread(),
+                resolutions,
+                "no signer resolution"
+            );
+            fixture.assert_no_consent_ceremony();
+        }
+
+        /// The audit writer is acquired before the signing key loads, at the
+        /// create's own audit preflight. A matched balance floor makes the
+        /// run read its operating account between the lookup and the
+        /// preflight. A first run under a business id cancels its ceremony
+        /// and leaves the operation waiting. The rerun under the same id
+        /// resumes it, so the lookup in `classic_start` finds the record,
+        /// and another handle then takes the writer at the floor's account
+        /// read, which follows the lookup. The rerun
+        /// refuses with the writer's code at the preflight: it shows no
+        /// summary, runs no ceremony, leaves the waiting entry as it was,
+        /// resolves no signer and sends nothing.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_create_preflight_refuses_a_writer_taken_after_the_lookup() {
+            use stellar_agent_core::error::{ApprovalFailure, WalletError};
+            let late = crate::common::mainnet_write_fixture::LateWriter::default();
+            let mut fixture = Spec::new("mainnet-create-late-writer")
+                .primary(late.on(
+                    sponsor_ledger().entries_at_readiness_ledger(),
+                    "getLedgerEntries",
+                ))
+                .rules(vec![create_rule("require_approval", &balance_floor(1))])
+                .build()
+                .await;
+            fixture.cover_native_history();
+            let mut args = mainnet_args(&fixture);
+            args.business_id = Some("late-writer".to_owned());
+            fixture.present_with(|_: &crate::common::mainnet_presence::driver::Ceremony| {
+                Err(WalletError::Approval(ApprovalFailure::PresenceCanceled))
+            });
+            let first = run(&fixture, &args).await;
+            assert_eq!(first.code, 1, "canceled: {}", first.envelope);
+            let entries = fixture.pending_entries();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            let (summaries, ceremonies) = (fixture.summaries().len(), fixture.ceremonies().len());
+            stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(fixture.name);
+            // The rerun reads the sponsor before the lookup and the floor's
+            // operating account after it; the take runs at the second read.
+            late.arm_after(&fixture, 1);
+            let resolutions = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(late.held(), Ok(true), "the late handle holds the writer");
+            assert_eq!(run.code, 1, "late writer: {}", run.envelope);
+            assert_eq!(
+                run.code(),
+                "audit.chain_key_unavailable",
+                "late writer: {}",
+                run.envelope
+            );
+            assert!(
+                run.envelope.to_string().contains("audit.writer_locked"),
+                "late writer: {}",
+                run.envelope
+            );
+            assert_eq!(
+                fixture.summaries().len(),
+                summaries,
+                "late writer: no summary is shown"
+            );
+            assert_eq!(
+                fixture.ceremonies().len(),
+                ceremonies,
+                "late writer: no ceremony runs"
+            );
+            assert_eq!(
+                fixture.pending_entries(),
+                entries,
+                "late writer: the waiting entry stays as it was"
+            );
+            assert_eq!(
+                signer_resolutions_on_this_thread(),
+                resolutions,
+                "late writer: no signer resolution"
+            );
+            assert!(
+                fixture.sent_envelopes().await.is_empty(),
+                "late writer: nothing is sent"
+            );
+        }
+
+        /// Operational check: the build checks the primary's identity, then
+        /// its health and latest ledger, and reads the sponsor only after
+        /// both checks.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_endpoint_checks_precede_the_sponsor_read() {
+            let fixture = Spec::new("mainnet-create-readiness-order")
+                .primary(sponsor_ledger())
+                .build()
+                .await;
+
+            let _run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            let methods = fixture.primary_methods().await;
+            assert_eq!(
+                methods.get(..4),
+                Some(
+                    ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"]
+                        .map(str::to_owned)
+                        .as_slice()
+                ),
+                "identity, then readiness, then the sponsor read: {methods:?}"
+            );
+        }
+
+        /// Operational check: a primary whose latest ledger closed beyond the
+        /// readiness bound refuses with `network.endpoint_not_ready` before
+        /// any account read, before the summary is shown and before an entry
+        /// is parked.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_stale_endpoint_refuses_before_the_sponsor_read() {
+            let primary = sponsor_ledger();
+            let fixture = Spec::new("mainnet-create-readiness-stale")
+                .primary(primary.clone())
+                .build()
+                .await;
+            primary.close_ledgers_ago(120);
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "network.endpoint_not_ready").await;
+            assert_eq!(
+                fixture.primary_methods().await,
+                ["getNetwork", "getHealth", "getLedgers"],
+                "a stale endpoint answers no account read"
+            );
+            fixture.assert_no_consent_ceremony();
+        }
+
+        /// Signer choice: `--secret-env` on a mainnet profile refuses with
+        /// `validation.mainnet_secret_env_refused` before anything else
+        /// runs, with the variable set: no request, no keyring
+        /// initialization, no seed read, no signer, no pending entry, no
+        /// authorization record and no audit row.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_secret_env_refuses_before_any_request() {
+            let fixture = Spec::new("mainnet-create-secret-env").build().await;
+            assert!(
+                std::env::var_os(AGENT_VAR).is_some(),
+                "the seed is exported"
+            );
+            let mut args = mainnet_args(&fixture);
+            args.secret_env = Some(AGENT_VAR.to_owned());
+            let audit_rows = fixture.audit_row_count();
+            let resolutions = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &args).await;
+
+            assert_refused_before_confirmation(
+                &fixture,
+                &run,
+                "validation.mainnet_secret_env_refused",
+            )
+            .await;
+            let message = run.envelope["error"]["message"].as_str().unwrap();
+            assert!(!message.contains(AGENT_VAR), "{message}");
+            assert!(fixture.primary_methods().await.is_empty());
+            assert!(fixture.oracle_methods().await.is_empty());
+            assert_eq!(fixture.initializer_calls(), 0);
+            assert_eq!(signer_resolutions_on_this_thread(), resolutions);
+            assert_eq!(fixture.audit_row_count(), audit_rows);
+            fixture.assert_no_consent_ceremony();
+        }
+
+        /// Signer choice: no signer flag signs with the enrolled seed in the
+        /// keyring. With the agent's seed variable removed from the
+        /// environment, the create is sent once, signed by the agent, so the
+        /// seed came from the keyring. The submit call receives the keyring
+        /// signer kind, and the run resolves one signer, the mainnet signer,
+        /// and runs no environment ceremony.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_mainnet_create_without_a_signer_flag_signs_with_the_keyring() {
+            let fixture = Spec::new("mainnet-create-keyring").build().await;
+            let args = mainnet_args(&fixture);
+            assert!(args.secret_env.is_none() && !args.sign_with_ledger);
+            fixture.remove_agent_seed_variable();
+            assert!(std::env::var_os(AGENT_VAR).is_none());
+            let resolutions = signer_resolutions_on_this_thread();
+            let kinds = submission_kinds_on_this_thread().len();
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1);
+            fixture.assert_signed_by_agent(&sent[0]);
+            assert_eq!(
+                submission_kinds_on_this_thread()[kinds..],
+                [stellar_agent_network::SubmissionSignerKind::Keyring]
+            );
+            assert_eq!(
+                signer_resolutions_on_this_thread(),
+                resolutions + 1,
+                "one mainnet signer and no environment ceremony"
+            );
+        }
+
+        /// Accept: a sponsored create below the threshold needs no witness,
+        /// is sent once with the enrolled key's signature, and settles its
+        /// authorization and its confirmation entry.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
+        #[serial_test::serial]
+        async fn mainnet_time_bounds_sponsored_accounts_create() {
+            let fixture = Spec::new("mainnet-create-accept").build().await;
+
+            let built_at_ms =
+                stellar_agent_network::mainnet::clock::now_ms().unwrap() + CLOCK_LEAD_MS;
+            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(built_at_ms);
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1);
+            fixture.assert_signed_by_agent(&sent[0]);
+            crate::common::mainnet_write_fixture::assert_deadline_bound(&sent[0], built_at_ms);
+            let data = &run.envelope["data"];
+            assert_eq!(data["account_id"], NEW_ACCOUNT, "{}", run.envelope);
+            assert_eq!(data["mode"], "sponsored");
+            assert_eq!(data["ledger"], 1005);
+            assert_eq!(data["cross_check"]["status"], "not_required");
+            assert!(data.get("secret_key").is_none_or(Value::is_null));
+            assert_eq!(
+                fixture.oracle_methods().await,
+                ["getLatestLedger", "getLedgers"]
+            );
+            assert!(fixture.open_authorizations(now()).is_empty());
+            assert!(invalidations_on_this_thread().is_empty());
+            crate::common::mainnet_authority_tests::assert_consumption_owed(&fixture);
+        }
+
+        /// Elapsed bound: a confirmation one second past the prepared
+        /// envelope's on-chain deadline covers the stored intent, so the
+        /// verb rebuilds the envelope with a deadline from the confirmation
+        /// time and the Ledger signs it once; no refusal is logged and
+        /// nothing is invalidated.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
+        #[serial_test::serial]
+        async fn mainnet_time_bounds_sponsored_accounts_create_elapsed_rebuilds_after_consent() {
+            let mut fixture = Spec::new("mainnet-create-elapsed").build().await;
+            let clock = Rc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
+                now() + CLOCK_LEAD_MS,
+            ));
+            fixture.present_past_the_deadline(Rc::clone(&clock));
+            let (_ledger, calls) = install_ledger_double(|| Ok(()), || Ok(()));
+            let mut args = mainnet_args(&fixture);
+            args.sign_with_ledger = true;
+            let resolutions = signer_resolutions_on_this_thread();
+            let (capture, _guard) = WarningCapture::capture(None);
+
+            let run = run(&fixture, &args).await;
+
+            let confirmed_at_ms = stellar_agent_network::mainnet::clock::now_ms().unwrap();
+            drop(clock);
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert!(refusal_warnings(&capture, "resolve_canonical_tx_sign").is_empty());
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1, "signed once");
+            crate::common::mainnet_write_fixture::assert_deadline_bound(&sent[0], confirmed_at_ms);
+            assert!(invalidations_on_this_thread().is_empty());
+            assert!(calls.lock().unwrap().contains(&"sign_tx_payload"));
+            assert_eq!(signer_resolutions_on_this_thread(), resolutions + 1);
+        }
+
+        /// Engine kind: a Noop profile refuses at the engine check.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_noop_engine_refuses_before_the_keyring() {
+            let fixture = Spec::new("mainnet-create-noop").noop_engine().build().await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(
+                run.code(),
+                "network.mainnet_write_forbidden",
+                "{}",
+                run.envelope
+            );
+            assert!(
+                run.envelope["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Noop")
+            );
+            assert_eq!(fixture.initializer_calls(), 0);
+            assert!(fixture.primary_methods().await.is_empty());
+        }
+
+        /// Engine proofs: a signed policy without a `[mainnet]` table refuses
+        /// before the confirmation.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_policy_without_the_mainnet_table_refuses() {
+            let fixture = Spec::new("mainnet-create-pre-enable")
+                .pre_enable()
+                .build()
+                .await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "network.mainnet_write_forbidden")
+                .await;
+            let message = run.envelope["error"]["message"].as_str().unwrap();
+            assert!(message.contains("[mainnet]"), "{message}");
+            assert!(message.contains("profile enable-mainnet"), "{message}");
+        }
+
+        /// Enrollment: a placeholder pin refuses before the confirmation.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_placeholder_pin_refuses_before_the_confirmation() {
+            let fixture = Spec::new("mainnet-create-unpinned").build().await;
+            fixture.unpin_signer();
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "auth.enrolled_signer_unpinned")
+                .await;
+            fixture.assert_no_consent_ceremony();
+        }
+
+        /// Enrollment: a sponsor other than the enrolled key refuses with the
+        /// identity rule.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_sponsor_other_than_the_enrolled_key_refuses() {
+            let fixture = Spec::new("mainnet-create-other-sponsor").build().await;
+            let mut args = mainnet_args(&fixture);
+            args.sponsor = Some(DESTINATION.to_owned());
+
+            let run = run(&fixture, &args).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "auth.enrolled_identity_unusable")
+                .await;
+            let message = run.envelope["error"]["message"].as_str().unwrap();
+            assert!(message.contains("public_key_mismatch"), "{message}");
+            assert!(
+                message.contains(&format!(
+                    "the enrolled signer is `{}`; pass it as the source with `--sponsor`",
+                    fixture.agent.g
+                )),
+                "must name the enrolled signer address and `--sponsor`: {message}"
+            );
+            assert!(!message.contains("--repair-identity"), "{message}");
+            assert!(!message.contains("bind-signer"), "{message}");
+            fixture.assert_no_consent_ceremony();
+        }
+
+        /// A Ledger key mismatch names the flag that supplies the account.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn signer_key_mismatch_names_sponsor() {
+            let fixture = Spec::new("mainnet-create-signer-mismatch").build().await;
+            let _ledger = crate::common::mainnet_write_fixture::install_mismatched_ledger();
+            let mut args = mainnet_args(&fixture);
+            args.sign_with_ledger = true;
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code(), "auth.signer_key_mismatch", "{}", run.envelope);
+            assert_eq!(
+                run.envelope["error"]["message"],
+                format!(
+                    "signing key public key '{DESTINATION}' does not match --sponsor '{}'. \
+                     The signature was withheld and nothing was sent.",
+                    fixture.agent.g
+                )
+            );
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// `--generate`: refused on mainnet before the keyring, with no key
+        /// in the output.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn generate_is_refused_on_mainnet() {
+            let fixture = Spec::new("mainnet-create-generate").build().await;
+            let mut args = mainnet_args(&fixture);
+            args.new_account = None;
+            args.generate = true;
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(
+                run.code(),
+                "accounts.create.generate_refused_on_mainnet",
+                "{}",
+                run.envelope
+            );
+            assert!(
+                !run.envelope.to_string().contains("secret_key"),
+                "{}",
+                run.envelope
+            );
+            assert_eq!(fixture.initializer_calls(), 0);
+            assert!(fixture.primary_methods().await.is_empty());
+        }
+
+        /// Ledger order: the device is opened after the mint.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_ledger_is_opened_after_the_mint() {
+            let fixture = Spec::new("mainnet-create-ledger-order").build().await;
+            let open = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let seen = Rc::clone(&open);
+            let name = fixture.name;
+            let (_ledger, calls) = install_ledger_double(
+                move || {
+                    seen.borrow_mut().push(open_authorizations_of(name, now()));
+                    Ok(())
+                },
+                || Ok(()),
+            );
+            let mut args = mainnet_args(&fixture);
+            args.sign_with_ledger = true;
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let open = open.borrow();
+            assert_eq!(open[0].len(), 1);
+            assert_eq!(
+                open[0][0].consumer,
+                stellar_agent_network::mainnet::MainnetConsumer::CliCreateAccount
+            );
+            assert_eq!(
+                *calls.lock().unwrap(),
+                ["construct", "public_key", "sign_tx_payload"]
+            );
+        }
+
+        /// The margin at which the 2 XLM starting balance alone passes the
+        /// reserve and the debit plus any fee crosses it.
+        const FEE_CROSSING_MARGIN: i64 = BALANCE - STARTING_BALANCE - RESERVE;
+
+        /// Fee in the policy arguments, mainnet.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_fee_counts_toward_the_reserve_on_mainnet() {
+            let fixture = Spec::new("mainnet-create-fee-reserve")
+                .rules(vec![create_rule(
+                    "require_approval",
+                    &minimum_reserve(FEE_CROSSING_MARGIN),
+                )])
+                .build()
+                .await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(
+                &fixture,
+                &run,
+                "policy.deny.minimum_reserve_breached",
+            )
+            .await;
+        }
+
+        /// A matched balance floor reads the sponsoring operating account:
+        /// the starting balance and the fee take the observed balance below a
+        /// floor at that balance.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_floor_reads_the_observed_account_on_mainnet() {
+            let agent =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            let fixture = Spec::new("mainnet-create-floor")
+                .primary(
+                    ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER])
+                        .entries_at_readiness_ledger(),
+                )
+                .rules(vec![create_rule(
+                    "require_approval",
+                    &balance_floor(BALANCE),
+                )])
+                .build()
+                .await;
+            fixture.cover_native_history();
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "account.floor_refused").await;
+        }
+
+        /// Fee in the policy arguments, testnet.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_fee_counts_toward_the_reserve_on_testnet() {
+            let agent =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            let fixture = Spec::new("testnet-create-fee-reserve")
+                .testnet()
+                .primary(ClassicRpc::testnet(&[&agent, DESTINATION, ISSUER]))
+                .rules(vec![create_rule(
+                    "allow",
+                    &minimum_reserve(FEE_CROSSING_MARGIN),
+                )])
+                .build()
+                .await;
+            let mut args = mainnet_args(&fixture);
+            args.secret_env = Some(AGENT_VAR.to_owned());
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(
+                run.code(),
+                "policy.deny.minimum_reserve_breached",
+                "{}",
+                run.envelope
+            );
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// Mainnet `accounts create` echoes the run's `business_id` on success.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn mainnet_create_account_success_echoes_business_id() {
+            let fixture = Spec::new("mainnet-create-business-id").build().await;
+            let mut args = mainnet_args(&fixture);
+            args.business_id = Some("create-mainnet-bid-1".to_owned());
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(
+                run.envelope["data"]["business_id"], "create-mainnet-bid-1",
+                "{}",
+                run.envelope
+            );
+        }
+    }
+
+    use stellar_agent_test_support::rejected_value::assert_no_marker;
+    #[test]
+    fn a_seed_as_new_account_is_not_echoed() {
+        let marker = stellar_agent_test_support::rejected_value::seed_marker();
+        let args = CreateArgs {
+            // Zero-config group: `None` is "no profile named", the path that
+            // still synthesizes. `Some("default")` would be an explicitly
+            // named profile and would refuse instead.
+            profile: None,
+            new_account: Some(marker.clone()),
+            generate: false,
+            starting_balance: None,
+            sponsor: None,
+            secret_env: None,
+            sign_with_ledger: false,
+            account_index: 0,
+            fund_with_friendbot: true,
+            network: Some(TargetNetwork::Testnet),
+            friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
+            output: OutputFormat::Json,
+            timeout_seconds: None,
+            rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
+            fee: None,
+            business_id: None,
+        };
+        let result = resolve_new_account(&args);
+        assert!(result.is_err(), "invalid G-strkey must return an error");
+        let err = result.unwrap_err();
+        assert_no_marker(&err, &marker);
+        let json = serde_json::to_string(&Envelope::<()>::err(&err)).unwrap();
+        assert!(!json.contains(&marker));
+        assert!(json.contains("new_account"));
+        assert!(
+            matches!(
+                err,
+                WalletError::Validation(ValidationError::AddressInvalid { .. })
+            ),
+            "expected AddressInvalid, got: {err:?}"
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    async fn early_observation_precedes_window_gate() {
+        use crate::commands::submission_record::intent_gate_fixture::{IntentGateState, home};
+        let (_home, _guard) = home();
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(crate::test_rpc::ClassicRpc::testnet(&[SOURCE_G]))
+            .mount(&primary)
+            .await;
+        let name = "intent-create";
+        let mut profile = Profile::builder_testnet_named(name, "signer", SOURCE_G, "nonce", name)
+            .rpc_url(primary.uri())
+            .build();
+        let state = IntentGateState::seed(name, &mut profile).await;
+        let mut args = minimal_sponsored_args();
+        args.profile = Some(name.into());
+        args.rpc_url = Some(primary.uri());
+        args.fee = Some("100".into());
+        for after in [false, false, true] {
+            if after {
+                state.after_retention();
+            }
+            let before = state.bytes();
+            crate::common::render::take_rendered_for_test();
+            assert_eq!(
+                run_with_dependencies(&args, |_| Ok(profile.clone()), || Ok(())).await,
+                1
+            );
+            assert_eq!(
+                crate::test_rpc::last_rendered()["error"]["code"],
+                if after {
+                    "audit.chain_key_unavailable"
+                } else {
+                    "policy.deny.rate_limit_exceeded"
+                }
+            );
+            state.assert_closed(&profile, u32::from(!after)).await;
+            if after {
+                assert_eq!(state.bytes(), before);
+            }
         }
     }
 }

@@ -27,7 +27,9 @@
 //! on the already-signed envelope bytes.
 
 use stellar_agent_core::StellarAmount;
+use stellar_agent_core::classic_address::{MUXED_ISSUER_REASON, require_account_id};
 use stellar_agent_core::error::{InternalError, ProtocolError, ValidationError, WalletError};
+use stellar_agent_core::payment_accounts::PaymentAccount;
 use stellar_baselib::account::{Account, AccountBehavior};
 use stellar_baselib::asset::{Asset as BaselibAsset, AssetBehavior};
 use stellar_baselib::operation::Operation as BaselibOperation;
@@ -87,6 +89,25 @@ pub enum Asset {
     },
 }
 
+/// Validates a plain issuer G-strkey, naming `field` in the refusal.
+///
+/// An `M...` issuer refuses with the `AccountId` reason. Every refusal keeps
+/// the asset error code and never echoes the input.
+fn plain_issuer(issuer: &str, field: &'static str) -> Result<(), WalletError> {
+    if require_account_id(issuer, "issuer").is_ok() {
+        return Ok(());
+    }
+    // A valid M issuer gets the base-account reason; other input gets the field.
+    let text = if PaymentAccount::parse(issuer).is_ok() {
+        format!("{field} ({MUXED_ISSUER_REASON})").into()
+    } else {
+        field.into()
+    };
+    Err(WalletError::Validation(ValidationError::AssetInvalid {
+        field: text,
+    }))
+}
+
 impl Asset {
     /// Parses a human amount using the canonical asset's unit rules.
     ///
@@ -112,7 +133,7 @@ impl Asset {
             Self::Native => Ok(CanonicalAsset::Native),
             Self::Credit { code, issuer } => CanonicalAsset::classic(code, issuer).map_err(|_| {
                 WalletError::Validation(ValidationError::AssetInvalid {
-                    input: format!("{code}:{issuer}"),
+                    field: "asset".into(),
                 })
             }),
         }
@@ -147,23 +168,19 @@ impl Asset {
         // Must be CODE:ISSUER
         let Some((code, issuer)) = input.split_once(':') else {
             return Err(WalletError::Validation(ValidationError::AssetInvalid {
-                input: input.to_owned(),
+                field: "asset".into(),
             }));
         };
 
         let code_len = code.len();
         if code_len == 0 || code_len > 12 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
             return Err(WalletError::Validation(ValidationError::AssetInvalid {
-                input: input.to_owned(),
+                field: "asset".into(),
             }));
         }
 
-        // Validate issuer as a valid G-strkey.
-        stellar_strkey::ed25519::PublicKey::from_string(issuer).map_err(|_| {
-            WalletError::Validation(ValidationError::AssetInvalid {
-                input: input.to_owned(),
-            })
-        })?;
+        // The issuer is an AccountId, so it must be a plain G-strkey.
+        plain_issuer(issuer, "asset")?;
 
         Ok(Self::Credit {
             code: code.to_owned(),
@@ -198,18 +215,24 @@ impl Asset {
         let code_len = code.len();
         if code_len == 0 || code_len > 12 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
             return Err(WalletError::Validation(ValidationError::AssetInvalid {
-                input: code.to_owned(),
+                field: "code".into(),
             }));
         }
-        stellar_strkey::ed25519::PublicKey::from_string(issuer).map_err(|_| {
-            WalletError::Validation(ValidationError::AssetInvalid {
-                input: issuer.to_owned(),
-            })
-        })?;
+        plain_issuer(issuer, "issuer")?;
         Ok(Self::Credit {
             code: code.to_owned(),
             issuer: issuer.to_owned(),
         })
+    }
+
+    /// The trustlines an account read requests so its view tells whether the
+    /// account holds `code:issuer`: that asset, or none when it is not a
+    /// valid credit asset.
+    #[must_use]
+    pub fn trustline_request(code: &str, issuer: &str) -> Vec<Self> {
+        Self::from_code_and_issuer(code, issuer)
+            .into_iter()
+            .collect()
     }
 
     /// Converts to the `stellar-baselib` `Asset` type used for operation construction.
@@ -331,7 +354,9 @@ pub const SHORT_TIMEBOUNDS_DELTA_SECS: u64 = 30;
 /// By default the built transaction carries no time bounds
 /// (`Preconditions::None`). Callers that want mempool-replay protection should
 /// call [`ClassicOpBuilder::with_short_timebounds`] with the current ledger
-/// close time, which sets `max_time = close_time + 30s`.
+/// close time, which sets `max_time = close_time + 30s`. Classic mainnet writes
+/// call [`ClassicOpBuilder::with_mainnet_deadline`] before consent and carry
+/// its on-chain deadline.
 ///
 /// # Signing
 ///
@@ -418,7 +443,7 @@ impl ClassicOpBuilder {
     /// # Errors
     ///
     /// - [`WalletError::Validation`] wrapping [`ValidationError::AddressInvalid`]
-    ///   if the destination G-strkey is invalid.
+    ///   if the destination is not a valid G-strkey or is a muxed `M...` address.
     /// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`]
     ///   if XDR construction fails.
     ///
@@ -448,20 +473,18 @@ impl ClassicOpBuilder {
         destination: &str,
         starting_balance: StellarAmount,
     ) -> Result<&mut Self, WalletError> {
-        // Validate destination is a valid G-strkey.
-        stellar_strkey::ed25519::PublicKey::from_string(destination).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: destination.to_owned(),
-            })
-        })?;
+        // CreateAccountOp.destination is an AccountId, so an M input refuses.
+        require_account_id(destination, "destination")?;
 
         let stroops = starting_balance.as_stroops();
 
         let xdr_op = BaselibOperation::new()
             .create_account(destination, stroops)
-            .map_err(|e| {
+            .map_err(|_| {
                 WalletError::Protocol(ProtocolError::XdrCodecFailed {
-                    detail: format!("create_account op construction failed: {e:?}"),
+                    detail: "create_account op construction failed: starting_balance must be \
+                             nonnegative"
+                        .to_owned(),
                 })
             })?;
 
@@ -471,10 +494,13 @@ impl ClassicOpBuilder {
 
     /// Adds a payment operation.
     ///
+    /// The destination is a `G...` or `M...` strkey. An `M...` destination is
+    /// emitted unchanged in the `MuxedEd25519` arm with its key and ID.
+    ///
     /// # Errors
     ///
     /// - [`WalletError::Validation`] wrapping [`ValidationError::AddressInvalid`]
-    ///   if the destination is invalid.
+    ///   if the destination is not a valid G or M strkey.
     /// - [`WalletError::Protocol`] wrapping [`ProtocolError::XdrCodecFailed`]
     ///   if XDR construction fails.
     ///
@@ -506,21 +532,19 @@ impl ClassicOpBuilder {
         amount: StellarAmount,
         asset: &Asset,
     ) -> Result<&mut Self, WalletError> {
-        // Validate destination is a valid G-strkey.
-        stellar_strkey::ed25519::PublicKey::from_string(destination).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: destination.to_owned(),
-            })
+        // PaymentOp.destination is a MuxedAccount: G or M, with the ID kept.
+        let destination = PaymentAccount::parse(destination).map_err(|_| {
+            WalletError::Validation(ValidationError::address_argument("destination"))
         })?;
 
         let baselib_asset = asset.to_baselib()?;
         let stroops = amount.as_stroops();
 
         let xdr_op = BaselibOperation::new()
-            .payment(destination, &baselib_asset, stroops)
-            .map_err(|e| {
+            .payment(destination.canonical(), &baselib_asset, stroops)
+            .map_err(|_| {
                 WalletError::Protocol(ProtocolError::XdrCodecFailed {
-                    detail: format!("payment op construction failed: {e:?}"),
+                    detail: "payment op construction failed: amount must be nonnegative".to_owned(),
                 })
             })?;
 
@@ -582,15 +606,10 @@ impl ClassicOpBuilder {
         sponsored_id: &str,
     ) -> Result<&mut Self, WalletError> {
         // Validate both addresses as valid G-strkeys.
-        stellar_strkey::ed25519::PublicKey::from_string(op_source).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: op_source.to_owned(),
-            })
-        })?;
+        stellar_strkey::ed25519::PublicKey::from_string(op_source)
+            .map_err(|_| WalletError::Validation(ValidationError::address_argument("op_source")))?;
         stellar_strkey::ed25519::PublicKey::from_string(sponsored_id).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: sponsored_id.to_owned(),
-            })
+            WalletError::Validation(ValidationError::address_argument("sponsored_id"))
         })?;
 
         // Build with per-operation source.
@@ -642,15 +661,10 @@ impl ClassicOpBuilder {
         destination: &str,
     ) -> Result<&mut Self, WalletError> {
         // Validate both addresses.
-        stellar_strkey::ed25519::PublicKey::from_string(op_source).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: op_source.to_owned(),
-            })
-        })?;
+        stellar_strkey::ed25519::PublicKey::from_string(op_source)
+            .map_err(|_| WalletError::Validation(ValidationError::address_argument("op_source")))?;
         stellar_strkey::ed25519::PublicKey::from_string(destination).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: destination.to_owned(),
-            })
+            WalletError::Validation(ValidationError::address_argument("destination"))
         })?;
 
         // Starting balance is 0 (CAP-33 sponsored creation; base reserve paid by sponsor).
@@ -729,8 +743,7 @@ impl ClassicOpBuilder {
     ) -> Result<&mut Self, WalletError> {
         if matches!(asset, Asset::Native) {
             return Err(WalletError::Validation(ValidationError::AssetInvalid {
-                input: "native (XLM): trustlines can only be created for non-native assets"
-                    .to_owned(),
+                field: "native (XLM): trustlines can only be created for non-native assets".into(),
             }));
         }
 
@@ -922,11 +935,8 @@ impl ClassicOpBuilder {
         &mut self,
         op_source: &str,
     ) -> Result<&mut Self, WalletError> {
-        stellar_strkey::ed25519::PublicKey::from_string(op_source).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: op_source.to_owned(),
-            })
-        })?;
+        stellar_strkey::ed25519::PublicKey::from_string(op_source)
+            .map_err(|_| WalletError::Validation(ValidationError::address_argument("op_source")))?;
 
         let xdr_op = BaselibOperation::with_source(op_source)
             .map_err(|e| {
@@ -1023,21 +1033,48 @@ impl ClassicOpBuilder {
     /// # Errors
     ///
     /// - [`WalletError::Validation`] wrapping [`ValidationError::MemoInvalidType`]
-    ///   if a TEXT memo exceeds 28 bytes.
+    ///   if a TEXT memo exceeds 28 bytes or is not UTF-8.
+    /// - [`ValidationError::MemoControlCharacter`] if text contains a refused character.
     pub fn memo(&mut self, memo: &stellar_xdr::Memo) -> Result<&mut Self, WalletError> {
         use stellar_xdr::Memo as CurrMemo;
 
-        // Validate TEXT length.
-        if let CurrMemo::Text(ref t) = *memo
-            && t.len() > 28
-        {
-            return Err(WalletError::Validation(ValidationError::MemoInvalidType {
-                memo_type: format!("TEXT (length {} exceeds 28-byte maximum)", t.len()),
-            }));
+        if let CurrMemo::Text(text) = memo {
+            let text = std::str::from_utf8(text.as_slice()).map_err(|_| {
+                WalletError::Validation(ValidationError::MemoInvalidType {
+                    memo_type: "TEXT (invalid UTF-8)".into(),
+                })
+            })?;
+            crate::memo::parse_memo_fields(Some(text), None, None, None)?;
         }
 
         self.memo = Some(memo.clone());
         Ok(self)
+    }
+
+    /// On the mainnet passphrase, sets `min_time = 0` and `max_time` to the
+    /// mainnet clock's seconds plus
+    /// [`MAINNET_CLASSIC_DEADLINE_SECONDS`](crate::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS);
+    /// other passphrases keep their preconditions.
+    ///
+    /// # Errors
+    ///
+    /// Returns the mainnet clock error when the current time is unavailable.
+    pub fn with_mainnet_deadline(&mut self) -> Result<&mut Self, WalletError> {
+        if self.network_passphrase == stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE {
+            let now_ms = crate::mainnet::clock::now_ms()?;
+            self.with_time_bounds(
+                0,
+                (now_ms / 1000)
+                    .saturating_add(crate::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS),
+            );
+        }
+        Ok(self)
+    }
+
+    /// Sets the time bounds to `0..=max_time`, the deadline the presented
+    /// envelope carries.
+    pub fn with_presented_deadline(&mut self, max_time: u64) -> &mut Self {
+        self.with_time_bounds(0, max_time)
     }
 
     /// Sets explicit time bounds on the built transaction.
@@ -1340,6 +1377,35 @@ mod tests {
             .expect("must decode as a valid TransactionEnvelope");
     }
 
+    /// A negative amount is refused by the rule, without the amount or the
+    /// baselib error that holds it.
+    #[test]
+    fn negative_amounts_stay_out_of_the_error() {
+        use stellar_agent_test_support::rejected_value::assert_no_marker;
+        let mut builder =
+            ClassicOpBuilder::new(TEST_SOURCE, 101, "Test SDF Network ; September 2015", 100);
+        let negative = StellarAmount::from_stroops(-424_242);
+        let error = builder
+            .create_account(TEST_DEST, negative)
+            .err()
+            .expect("a negative starting balance must refuse");
+        assert_eq!(
+            error.to_string(),
+            "XDR codec operation failed: create_account op construction failed: starting_balance must be \
+             nonnegative"
+        );
+        assert_no_marker(&error, "424242");
+        let error = builder
+            .payment(TEST_DEST, negative, &Asset::Native)
+            .err()
+            .expect("a negative payment amount must refuse");
+        assert_eq!(
+            error.to_string(),
+            "XDR codec operation failed: payment op construction failed: amount must be nonnegative"
+        );
+        assert_no_marker(&error, "424242");
+    }
+
     #[test]
     fn builder_create_account_invalid_destination_returns_validation_error() {
         let mut builder =
@@ -1444,6 +1510,38 @@ mod tests {
                 assert_eq!(v1.signatures[0].signature.0.len(), 64);
             }
             other => panic!("expected Tx envelope, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    fn mainnet_time_bounds_builder_sets_the_window_on_mainnet_only() {
+        use stellar_agent_core::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
+        use stellar_xdr::{Limits, Preconditions, ReadXdr as _, TransactionEnvelope};
+        let now = 1_800_000_000_123;
+        let _clock = crate::mainnet::clock::set_now_ms_for_test(now);
+        for passphrase in [MAINNET_PASSPHRASE, TESTNET_PASSPHRASE] {
+            let mut builder = ClassicOpBuilder::new(TEST_SOURCE, 101, passphrase, 100);
+            builder
+                .payment(TEST_DEST, StellarAmount::from_stroops(10), &Asset::Native)
+                .unwrap();
+            builder.with_mainnet_deadline().unwrap();
+            let TransactionEnvelope::Tx(tx) =
+                TransactionEnvelope::from_xdr_base64(builder.build().unwrap(), Limits::none())
+                    .unwrap()
+            else {
+                panic!("classic envelope expected");
+            };
+            if passphrase == MAINNET_PASSPHRASE {
+                let Preconditions::Time(bounds) = tx.tx.cond else {
+                    panic!("deadline expected")
+                };
+                assert_eq!(bounds.min_time.0, 0);
+                assert_eq!(bounds.max_time.0, now / 1000 + 120);
+            } else {
+                assert_eq!(tx.tx.cond, Preconditions::None);
+            }
         }
     }
 
@@ -2728,5 +2826,20 @@ mod tests {
             }
             other => panic!("expected Payment op, got: {other:?}"),
         }
+    }
+
+    use stellar_agent_test_support::rejected_value::assert_no_marker;
+
+    #[test]
+    fn a_seed_as_payment_destination_is_not_echoed() {
+        let marker = stellar_agent_test_support::rejected_value::seed_marker();
+        let mut builder =
+            ClassicOpBuilder::new(TEST_SOURCE, 101, "Test SDF Network ; September 2015", 100);
+        let err = builder
+            .payment(&marker, StellarAmount::from_stroops(100), &Asset::Native)
+            .err()
+            .unwrap();
+        assert_no_marker(&err, &marker);
+        assert!(err.to_string().contains("destination"));
     }
 }

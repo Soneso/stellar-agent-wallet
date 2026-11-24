@@ -45,8 +45,10 @@
     reason = "test-only; panics and diagnostic output are acceptable in testnet acceptance tests"
 )]
 
+#[path = "cli/acceptance_storage.rs"]
+mod acceptance_storage;
+
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -140,14 +142,9 @@ fn random_bytes() -> [u8; 32] {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 2xx for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
     let client = StellarRpcClient::new(TESTNET_RPC_URL).expect("RPC client");
     for _ in 0..30 {
         if fetch_account(&client, g_strkey, &[]).await.is_ok() {
@@ -288,7 +285,7 @@ async fn invoke_beacon(
 }
 
 /// Runs the binary with `args`, `STELLAR_AGENT_HOME` and `HOME` under
-/// `home`, the headless keyring backend, and `envs`. Returns
+/// `home`, the selected acceptance store, and `envs`. Returns
 /// `(exit_code, last_stdout_line_as_json, stdout, stderr)`.
 fn run_cli(
     home: &Path,
@@ -296,16 +293,17 @@ fn run_cli(
     args: &[&str],
     envs: &[(&str, &str)],
 ) -> (i32, serde_json::Value, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    stellar_agent_test_support::sandbox::mark_sandbox(&home.join("agent"))
+        .expect("mark fixture directory");
+    let mut cmd = acceptance_storage::command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        &home.join("agent"),
+        Some(keyring_key),
+    );
     cmd.args(args)
         .env("STELLAR_AGENT_HOME", home.join("agent"))
         .env("HOME", home.join("home"))
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env(
-            stellar_agent_headless_keyring::BACKEND_ENV_VAR,
-            "headless-env",
-        )
-        .env(stellar_agent_headless_keyring::ENV_KEY_VAR, keyring_key);
+        .env_remove("STELLAR_AGENT_PROFILE");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -507,6 +505,8 @@ async fn rules_create_pins_the_reference_and_verify_pins_reports_the_repoint() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ];
         if accept_mutable {
             args.push("--accept-mutable-verifier");
@@ -554,8 +554,13 @@ async fn rules_create_pins_the_reference_and_verify_pins_reports_the_repoint() {
     );
     assert_eq!(pinned[0]["tag"].as_str(), Some(TAG));
     assert_eq!(
-        pinned[0]["resolved_hash_first8"].as_str(),
-        Some(hex::encode(&ed25519_hash[..8]).as_str())
+        pinned[0]["resolved_hash"].as_str(),
+        Some(hex::encode(ed25519_hash).as_str())
+    );
+    assert_eq!(
+        envelope["data"]["pinned_verifier_wasm_hashes"],
+        serde_json::json!([hex::encode(ed25519_hash)]),
+        "the full verifier pin: {envelope}"
     );
     assert_eq!(
         pinned[0]["owner_redacted"].as_str(),
@@ -624,6 +629,8 @@ async fn rules_create_pins_the_reference_and_verify_pins_reports_the_repoint() {
         "testnet",
         "--rpc-url",
         TESTNET_RPC_URL,
+        "--secondary-rpc-url",
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
     ];
     let (code, envelope, stdout, stderr) =
         run_cli(tmp.path(), &keyring_key, &execute_args, &execute_env);
@@ -660,11 +667,20 @@ async fn rules_create_pins_the_reference_and_verify_pins_reports_the_repoint() {
         Some("sa.verifier_hash_drift"),
         "execute must refuse with sa.verifier_hash_drift after the repoint: {envelope}"
     );
+    // The envelope message is the error's Display form, which prefixes the
+    // smart-account wire code to the refusal.
     let message = envelope["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        message,
+        format!(
+            "smart-account operation failed (sa.verifier_hash_drift): \
+             verifier executable must match the pinned executable for rule {rule_id}: pinned={}",
+            hex::encode(ed25519_hash)
+        )
+    );
     assert!(
-        message.contains(&format!("pinned={}", hex::encode(&ed25519_hash[..8])))
-            && message.contains(&format!("observed={}", hex::encode(&webauthn_hash[..8]))),
-        "the drift refusal must name the pinned and observed hashes: {message}"
+        !message.contains(&hex::encode(&webauthn_hash[..8])),
+        "the drift refusal must hold no part of the observed hash: {message}"
     );
     record("execute-after-repoint-code", "sa.verifier_hash_drift");
 
@@ -683,6 +699,8 @@ async fn rules_create_pins_the_reference_and_verify_pins_reports_the_repoint() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
         ],
         &[],
     );

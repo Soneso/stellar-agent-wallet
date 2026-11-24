@@ -44,7 +44,10 @@ use stellar_agent_core::{
 };
 use stellar_agent_network::{
     SoftwareSigningKey, fund_with_friendbot,
-    signing::{Signer, WebAuthnAssertion},
+    signing::{
+        MessagePayload, Signer, SmartAccountAuthDigest, SorobanAuthPayload, TxSigningPayload,
+        WebAuthnAssertion,
+    },
 };
 use stellar_agent_sep43::{Sep43Error, module::sign_auth_entry::dispatch};
 use stellar_xdr::{
@@ -197,27 +200,35 @@ impl CountingSigner {
 
 #[async_trait]
 impl Signer for CountingSigner {
-    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
         self.signatures.fetch_add(1, Ordering::SeqCst);
         self.inner.sign_tx_payload(payload).await
     }
 
-    async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_auth_digest(
+        &self,
+        digest: &SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
         self.signatures.fetch_add(1, Ordering::SeqCst);
         self.inner.sign_auth_digest(digest).await
     }
 
     async fn sign_soroban_address_auth_payload(
         &self,
-        payload: &[u8; 32],
+        payload: &SorobanAuthPayload,
     ) -> Result<[u8; 64], WalletError> {
         self.signatures.fetch_add(1, Ordering::SeqCst);
         self.inner.sign_soroban_address_auth_payload(payload).await
     }
 
+    async fn sign_message(&self, payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
+        self.signatures.fetch_add(1, Ordering::SeqCst);
+        self.inner.sign_message(payload).await
+    }
+
     async fn sign_webauthn_assertion(
         &self,
-        auth_digest: &[u8; 32],
+        auth_digest: &SmartAccountAuthDigest,
         credential_id: &[u8],
     ) -> Result<WebAuthnAssertion, WalletError> {
         self.signatures.fetch_add(1, Ordering::SeqCst);
@@ -254,6 +265,10 @@ fn prepared_preimage(prepared: &serde_json::Value) -> HashIdPreimage {
 #[tokio::test]
 #[serial]
 async fn sdk_v17_address_v2_entry_signed_through_sep43_settles_on_testnet() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let harness = harness_dir();
     prepare_harness(&harness);
 

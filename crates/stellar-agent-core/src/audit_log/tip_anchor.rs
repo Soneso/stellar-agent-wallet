@@ -15,6 +15,10 @@
 //! needs no key material. A deleted binding is recorded again from the
 //! profile file at the next keyed use.
 //!
+//! The same store holds the outbox commitment: its pending count and chain
+//! head are read and written under the outbox lock from any process.
+//! An absent outbox state reads as zero; an unparseable value refuses.
+//!
 //! # What the anchor is
 //!
 //! [`TipAnchor`] records three numbers about ONE log file:
@@ -35,19 +39,34 @@
 //! - File length equals `end_offset` and the entry ending there hashes to
 //!   `tip_hash`: current, accept.
 //! - File length exceeds `end_offset` and the anchored entry is intact: the
-//!   file moved forward (an unkeyed writer appended, or a crash landed between
-//!   the entry fsync and the anchor write). Accept, replay from `end_offset`,
-//!   and re-anchor to the new tip.
+//!   file moved forward (a crash landed between the entry fsync and the anchor
+//!   write, or, before entry tags are in force, an unkeyed writer appended).
+//!   Replay from `end_offset`. Once entry tags are in force, a keyed writer
+//!   accepts the tail only when every entry in it carries a valid entry tag,
+//!   and otherwise refuses with reason `unauthenticated_tail`. Before that,
+//!   the tail is absorbed once and counted in the `audit_entry_tags_started`
+//!   row. An accepted tail re-anchors to the new tip.
 //! - File length is below `end_offset`, or the entry ending at `end_offset` does
 //!   not hash to `tip_hash`: the file was rolled back, truncated, or replaced.
 //!   Refuse.
 //!
-//! An absent anchor is adopted: the chain is verified and the current tip is
-//! written as the anchor. A file with entries also gets an
-//! `audit_tip_anchored` row recording the adoption; an empty file gets neither
-//! an anchor nor a row, and its first append writes the first anchor. This is
-//! what an audit log written before the anchor existed does on its first keyed
-//! use, with no operator action.
+//! An absent anchor is adopted when nothing shows the log was anchored before:
+//! the chain is verified and the current tip is written as the anchor. A file
+//! with entries also gets an `audit_tip_anchored` row recording the adoption;
+//! an empty file gets neither an anchor nor a row, and its first append writes
+//! the first anchor. This is what an audit log written only by unkeyed writers
+//! does on its first keyed use, with no operator action.
+//!
+//! An absent anchor is refused with `audit.tip_anchor_missing` when the log
+//! holds entries and [`PriorAnchoring`] finds evidence that it was anchored
+//! before: the profile's audit binding was recorded before this use, the
+//! active file carries a chain-root sidecar, or the active file holds an
+//! `audit_tip_anchored` row. Deleting the anchor and truncating the log would
+//! otherwise remove rows without a trace. An empty active file that carries a
+//! chain-root sidecar is refused the same way, because the sidecar signs a
+//! first entry the file no longer holds. The way out is
+//! `audit reanchor --acknowledge-rollback`, which records the repair in a
+//! permanent row.
 //!
 //! # Only a file with entries is ever anchored
 //!
@@ -67,8 +86,12 @@
 //!
 //! The anchor detects rollback and truncation. It does not detect forgery: the
 //! chain hash is unkeyed, so an attacker who can write the file can append
-//! well-formed entries and move the tip forward legitimately. Detecting that
-//! requires a per-entry keyed tag, which this substrate does not have. See
+//! well-formed entries that chain from the tip. The keyed entry tag is what
+//! detects that: once a log holds its `audit_entry_tags_started` row, every
+//! entry carries a tag under a key derived from the audit key, and keyed
+//! writers and `audit verify --profile` refuse an entry without a valid one.
+//! Entries before that row, logs no keyed writer has reached, and code that
+//! can read the audit key are outside that check. See
 //! `docs/maintainers/security-internals.md`.
 //!
 //! # Scope: one path inside one profile's keyring namespace
@@ -88,11 +111,15 @@
 //! lagging one is absorbed there while the other refuses it. That configuration
 //! is unsupported; see `docs/maintainers/audit-log-recovery.md`.
 
+use super::outbox::OutboxState;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
+
+use super::binding::BindingHistory;
+use crate::profile::schema::KeyringEntryRef;
 
 /// Number of hex characters of the path digest carried in the anchor's keyring
 /// account name.
@@ -262,14 +289,17 @@ pub enum TipAnchorParseError {
 /// Failure reading or writing the anchor's backing store.
 ///
 /// The concrete backend lives outside this crate (the platform keyring), so the
-/// error carries a human-readable detail rather than a typed backend cause. The
-/// detail names the operation and the backend's own message; it never carries
-/// key material, since the anchor is not secret.
+/// error carries a human-readable detail alongside an optional typed
+/// [`AuthError`](crate::error::AuthError) when the failure came from a
+/// classified keyring operation. The detail names the operation and the
+/// backend's own message; it never carries key material, since the anchor is
+/// not secret.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("audit tip anchor store: {detail}")]
 pub struct TipAnchorStoreError {
     /// What failed, and the backend's message.
     pub detail: String,
+    auth: Option<crate::error::AuthError>,
 }
 
 impl TipAnchorStoreError {
@@ -278,17 +308,230 @@ impl TipAnchorStoreError {
     pub fn new(detail: impl Into<String>) -> Self {
         Self {
             detail: detail.into(),
+            auth: None,
         }
+    }
+
+    /// Constructs a store error that carries a classified keyring
+    /// [`AuthError`](crate::error::AuthError).
+    #[must_use]
+    pub fn from_auth(detail: impl Into<String>, auth: crate::error::AuthError) -> Self {
+        Self {
+            detail: detail.into(),
+            auth: Some(auth),
+        }
+    }
+
+    /// Returns the classified keyring error when the failure came from a
+    /// keyring operation.
+    #[must_use]
+    pub fn auth_error(&self) -> Option<&crate::error::AuthError> {
+        self.auth.as_ref()
     }
 }
 
-/// Read/write access to one log path's anchor and its re-anchor counter.
+/// The carrier identities and the outbox generation of a log, kept in the
+/// protected audit state.
+///
+/// Ordinary keyed acquisitions compare the locked handle's identity with the
+/// record. Enrollment and binding store carrier identities while holding all
+/// three carriers. Acknowledgement holds all three while updating only the
+/// retired watch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CarrierRecord {
+    /// Current outbox generation, at least 1.
+    pub generation: u64,
+    /// Identity of the writer sidecar `<log>.lock`.
+    pub writer: crate::file_lock::FileIdentity,
+    /// Identity of the drain lock `<log>.drain.lock`.
+    pub drain: crate::file_lock::FileIdentity,
+    /// Identity of the outbox lock `<log>.outbox.lock`.
+    pub outbox_lock: crate::file_lock::FileIdentity,
+    /// The generation the last binding retired, watched for writes from its
+    /// holders. `None` for a record from an initial enrollment.
+    pub retired: Option<RetiredOutbox>,
+}
+
+/// A retired generation, its commitment at retirement, and the file its outbox
+/// was retired to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetiredOutbox {
+    /// Retired outbox generation.
+    pub generation: u64,
+    /// Canonical v1 value, or the empty string for an absent v1 entry.
+    /// Owner watches use `owner:sha256:<hash>:<rows>` over the raw owner value.
+    /// The row count records the binding's selected rows.
+    pub state: String,
+    /// File name beside the log the retired outbox is renamed to, `None` when
+    /// the log had no outbox file. A plain file name, never a path.
+    pub file: Option<String>,
+}
+
+impl CarrierRecord {
+    /// Serializes the versioned protected record.
+    ///
+    /// # Errors
+    /// Returns an error if serialization fails.
+    pub fn to_keyring_value(&self) -> Result<String, TipAnchorStoreError> {
+        let mut value = serde_json::to_value(self)
+            .map_err(|_| TipAnchorStoreError::new("carrier record serialization failed"))?;
+        value["v"] = 1.into();
+        serde_json::to_string(&value)
+            .map_err(|_| TipAnchorStoreError::new("carrier record serialization failed"))
+    }
+
+    /// Parses the versioned record, refusing unknown fields.
+    ///
+    /// # Errors
+    /// Returns an error for invalid records or unsupported versions.
+    pub fn parse(raw: &str) -> Result<Self, TipAnchorStoreError> {
+        let invalid = || TipAnchorStoreError::new("invalid carrier record");
+        let mut value: serde_json::Value = serde_json::from_str(raw).map_err(|_| invalid())?;
+        let version = value.as_object_mut().ok_or_else(invalid)?.remove("v");
+        if version != Some(serde_json::Value::from(1)) {
+            return Err(invalid());
+        }
+        let record: Self = serde_json::from_value(value).map_err(|_| invalid())?;
+        if record.generation == 0
+            || record.retired.as_ref().is_some_and(|r| {
+                r.generation >= record.generation
+                    || r.file
+                        .as_deref()
+                        .is_some_and(|name| !is_plain_file_name(name))
+            })
+        {
+            return Err(invalid());
+        }
+        Ok(record)
+    }
+}
+
+/// Whether `name` names a file in the directory it is joined to: one normal
+/// path component, no separator, no `.` or `..`.
+fn is_plain_file_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(component)), None) if component == name
+    )
+}
+
+/// Read/write access to a log's anchor, re-anchor counter, and outbox commitment.
 ///
 /// Implemented over the platform keyring in `stellar-agent-network`; this crate
-/// owns the writer and the check semantics, and never links a keyring backend of
-/// its own. Every method is called with the writer's sidecar lock already held,
-/// so implementations need no locking beyond what the backend provides.
-pub trait TipAnchorStore: std::fmt::Debug + Send + Sync {
+/// owns the writer and check semantics. Anchor and counter methods run under the
+/// writer's sidecar lock. Outbox methods run under the outbox lock from any
+/// process, independently of the writer's sidecar lock.
+///
+/// `Any` is a supertrait so a holder of the trait object can establish which
+/// concrete store it is: the mainnet audit readiness accepts only the
+/// keyring-backed store at the profile's own coordinate, and an injected store
+/// of any other type never passes that check.
+pub trait TipAnchorStore: std::any::Any + std::fmt::Debug + Send + Sync {
+    /// Loads the carrier record. `Ok(None)` means the log has no carriers
+    /// recorded.
+    ///
+    /// # Errors
+    /// Returns an error for an unavailable backend or invalid record.
+    fn load_carrier_record(&self) -> Result<Option<CarrierRecord>, TipAnchorStoreError>;
+
+    /// Stores the carrier record. The caller holds all three carriers.
+    ///
+    /// # Errors
+    /// Returns an error when the backend rejects the record.
+    fn store_carrier_record(&self, record: &CarrierRecord) -> Result<(), TipAnchorStoreError>;
+
+    /// Reads the outbox commitment of `generation` under the outbox lock from
+    /// any process. An absent value means zero queued rows.
+    ///
+    /// Each generation's commitment is a separate entry: generation 0 is the
+    /// outbox state account itself, and generation G is that account with
+    /// `-g<G>` appended.
+    ///
+    /// # Errors
+    /// Returns an error for an unavailable backend or an unparseable value.
+    fn load_outbox_state(
+        &self,
+        generation: u64,
+    ) -> Result<Option<OutboxState>, TipAnchorStoreError>;
+
+    /// Stores the outbox commitment of `generation` under the outbox lock from
+    /// any process. The writer's sidecar lock need not be held.
+    ///
+    /// # Errors
+    /// Returns an error when the backend rejects the write.
+    fn store_outbox_state(
+        &self,
+        generation: u64,
+        state: &OutboxState,
+    ) -> Result<(), TipAnchorStoreError>;
+
+    /// Loads the owner state of one carrier generation.
+    ///
+    /// The default reports no owner state.
+    ///
+    /// # Errors
+    /// Returns an error when the backend cannot read the value.
+    fn load_outbox_owner_state(
+        &self,
+        carrier_generation: u64,
+    ) -> Result<Option<String>, TipAnchorStoreError> {
+        let _ = carrier_generation;
+        Ok(None)
+    }
+
+    /// Stores the owner state of one carrier generation.
+    ///
+    /// # Errors
+    /// Returns an error when owner state is unsupported or the backend rejects the write.
+    fn store_outbox_owner_state(
+        &self,
+        carrier_generation: u64,
+        value: &str,
+    ) -> Result<(), TipAnchorStoreError> {
+        let _ = (carrier_generation, value);
+        Err(TipAnchorStoreError::new(
+            "outbox owner state is unsupported",
+        ))
+    }
+
+    /// The scope that binds consent evidence images to this store's owner
+    /// coordinate. It never depends on the audit key or a carrier generation.
+    ///
+    /// # Errors
+    /// The default refuses: such a store never commits evidence.
+    fn outbox_evidence_scope(&self) -> Result<[u8; 32], TipAnchorStoreError> {
+        Err(TipAnchorStoreError::new("outbox evidence is unsupported"))
+    }
+
+    /// Reads the audit MAC key again from the coordinate the store was built
+    /// for, without writing anything.
+    ///
+    /// A keyed queue append calls this once when the queue's generation line
+    /// does not verify under the key it holds, because a key rotation re-signs
+    /// that line. Every keyed writer open calls it once to compare its key
+    /// with the stored key. The default reports no key.
+    ///
+    /// # Errors
+    /// Returns an error when the backend cannot read the key.
+    fn reload_audit_key(&self) -> Result<Option<Zeroizing<[u8; 32]>>, TipAnchorStoreError> {
+        Ok(None)
+    }
+
+    /// Whether [`Self::reload_audit_key`] reads the profile's stored audit
+    /// key.
+    ///
+    /// Every keyed writer open on such a store compares its key with that
+    /// read before its first write, and refuses a key that differs or a key
+    /// that is absent. The default is `true`, so a store that keeps the
+    /// default reload refuses every keyed open. Only a store without a key
+    /// coordinate, such as a test store, returns `false`.
+    fn reads_audit_key(&self) -> bool {
+        true
+    }
+
     /// Reads the anchor. `Ok(None)` means no anchor has ever been written for
     /// this path — the adoption path.
     ///
@@ -340,6 +583,97 @@ pub trait TipAnchorStore: std::fmt::Debug + Send + Sync {
     fn reanchor_count(&self) -> Result<Option<u64>, TipAnchorStoreError>;
 }
 
+// ── Prior anchoring ──────────────────────────────────────────────────────────
+
+/// Evidence that a log path was taken under anchor protection before, found
+/// while no anchor is stored for it.
+///
+/// The writer refuses to adopt such a log with `audit.tip_anchor_missing`, and
+/// `audit verify` fails on it with the same code. Each variant is a fact that
+/// outlives the deletion of the anchor itself: deleting the anchor and
+/// truncating the log leaves at least one of them in place unless the binding,
+/// the sidecar, and the rows are removed as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PriorAnchoring {
+    /// The profile's audit binding was recorded before the current keyed use.
+    BindingRecorded,
+    /// The active file carries a chain-root sidecar. Only a keyed writer writes
+    /// one, after the file's first entry. A regular file at the sidecar path
+    /// counts, and so does a path whose metadata cannot be read, since the
+    /// check cannot then rule a sidecar out; a directory or other non-file
+    /// there was not written by a writer and does not count.
+    ChainRootSidecar,
+    /// The active file holds an anchoring row or carries entry tags: an
+    /// `audit_tip_anchored` row (an adoption, an acknowledged rollback, or an
+    /// acknowledged binding change), an entry-tag row, a row with an entry
+    /// tag, or a seed handoff that carries `entry_tags`.
+    AnchoringRow,
+}
+
+impl PriorAnchoring {
+    /// Finds the evidence that the log at `log_path` was anchored before.
+    ///
+    /// `entry_count` and `holds_anchoring_row` describe the active file as a
+    /// full replay found it; `holds_anchoring_row` covers every anchoring row
+    /// and every sign of entry tags. A file with entries is checked for all three
+    /// facts, in the order of the variants. A file with no entries is checked
+    /// for the sidecar alone: a binding recorded before a keyed use that found
+    /// an empty log is the ordinary state, and an empty file holds no row.
+    ///
+    /// `None` means nothing shows the log was ever anchored, which is the state
+    /// a log written only by unkeyed writers is in before its first keyed use.
+    #[must_use]
+    pub fn find(
+        binding: BindingHistory,
+        log_path: &Path,
+        entry_count: u64,
+        holds_anchoring_row: bool,
+    ) -> Option<Self> {
+        let sidecar = sidecar_present(&super::writer::hmac_sidecar_path(log_path));
+        if entry_count == 0 {
+            return sidecar.then_some(Self::ChainRootSidecar);
+        }
+        if binding == BindingHistory::Recorded {
+            Some(Self::BindingRecorded)
+        } else if sidecar {
+            Some(Self::ChainRootSidecar)
+        } else if holds_anchoring_row {
+            Some(Self::AnchoringRow)
+        } else {
+            None
+        }
+    }
+
+    /// The evidence in words, for operator-facing refusals. Names no path, no
+    /// coordinate, and no digest.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::BindingRecorded => "an audit binding is recorded for the profile",
+            Self::ChainRootSidecar => "the active log file carries a chain-root sidecar",
+            Self::AnchoringRow => {
+                "the active log file holds an anchoring row or carries entry tags"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PriorAnchoring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.describe())
+    }
+}
+
+/// Whether a chain-root sidecar is present at `path`: a regular file, or a
+/// path whose metadata cannot be read for a reason other than its absence.
+fn sidecar_present(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(metadata) => metadata.is_file(),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 // ── Keyed access ─────────────────────────────────────────────────────────────
 
 /// The pair a KEYED audit-writer open needs: the chain-root HMAC key and the
@@ -357,6 +691,7 @@ pub trait TipAnchorStore: std::fmt::Debug + Send + Sync {
 pub struct KeyedAuditAccess {
     hmac_key: Zeroizing<[u8; 32]>,
     tip_anchor: Arc<dyn TipAnchorStore>,
+    binding: BindingHistory,
 }
 
 impl std::fmt::Debug for KeyedAuditAccess {
@@ -364,18 +699,42 @@ impl std::fmt::Debug for KeyedAuditAccess {
         // The key never reaches Debug output.
         f.debug_struct("KeyedAuditAccess")
             .field("tip_anchor", &self.tip_anchor)
+            .field("binding", &self.binding)
             .finish_non_exhaustive()
     }
 }
 
 impl KeyedAuditAccess {
     /// Pairs a chain-root key with the anchor store for the log it will write.
+    ///
+    /// The binding history starts as [`BindingHistory::NotRecorded`]; the
+    /// surface that checked the profile's audit binding sets it with
+    /// [`KeyedAuditAccess::with_binding_history`].
     #[must_use]
     pub fn new(hmac_key: Zeroizing<[u8; 32]>, tip_anchor: Arc<dyn TipAnchorStore>) -> Self {
         Self {
             hmac_key,
             tip_anchor,
+            binding: BindingHistory::NotRecorded,
         }
+    }
+
+    /// Records whether the profile's audit binding was already recorded when
+    /// this access was built.
+    ///
+    /// A writer opened with [`BindingHistory::Recorded`] refuses to adopt a log
+    /// with entries whose anchor is absent; see [`PriorAnchoring`].
+    #[must_use]
+    pub fn with_binding_history(mut self, binding: BindingHistory) -> Self {
+        self.binding = binding;
+        self
+    }
+
+    /// Whether the profile's audit binding was recorded before this access was
+    /// built.
+    #[must_use]
+    pub fn binding_history(&self) -> BindingHistory {
+        self.binding
     }
 
     /// Borrows the anchor store, for callers that attach it to a writer they
@@ -497,6 +856,85 @@ pub fn reanchor_count_account_for_digest(base_account: &str, path_sha256: &[u8; 
     )
 }
 
+/// Derives the account holding the outbox commitment for `log_path`.
+#[must_use]
+pub fn outbox_state_account(base_account: &str, log_path: &Path) -> String {
+    outbox_state_account_for_digest(base_account, &log_path_sha256(log_path))
+}
+
+/// Derives the outbox account from the log path's digest.
+#[must_use]
+pub fn outbox_state_account_for_digest(base_account: &str, path_sha256: &[u8; 32]) -> String {
+    format!(
+        "{}-outbox",
+        tip_anchor_account_for_digest(base_account, path_sha256)
+    )
+}
+
+pub(crate) const TIP_ANCHOR: &str = "audit_log_hash_chain_key_id (tip anchor)";
+pub(crate) const REANCHOR_COUNTER: &str = "audit_log_hash_chain_key_id (reanchor counter)";
+pub(crate) const OUTBOX_STATE: &str = "audit_log_hash_chain_key_id (outbox state)";
+pub(crate) const CARRIER_RECORD: &str = "audit_log_hash_chain_key_id (carrier record)";
+
+/// The path-scoped keyring entries derived beside an audit chain key.
+///
+/// The writer's keyring store and profile scope checks share these coordinates.
+pub struct AuditKeyringEntries {
+    /// The authenticated log tip.
+    pub tip_anchor: KeyringEntryRef,
+    /// The monotonic count of acknowledged reanchors.
+    pub reanchor_counter: KeyringEntryRef,
+    /// The pending outbox commitment.
+    pub outbox_state: KeyringEntryRef,
+    /// The protected carrier identities.
+    pub carrier_record: KeyringEntryRef,
+}
+
+impl AuditKeyringEntries {
+    /// Derives every companion entry from the audit key and log path digest.
+    #[must_use]
+    pub fn for_path_digest(audit_key: &KeyringEntryRef, path_sha256: &[u8; 32]) -> Self {
+        Self {
+            carrier_record: KeyringEntryRef::new(
+                &audit_key.service,
+                format!(
+                    "{}-carriers",
+                    tip_anchor_account_for_digest(&audit_key.account, path_sha256)
+                ),
+            ),
+            tip_anchor: KeyringEntryRef::new(
+                &audit_key.service,
+                tip_anchor_account_for_digest(&audit_key.account, path_sha256),
+            ),
+            reanchor_counter: KeyringEntryRef::new(
+                &audit_key.service,
+                reanchor_count_account_for_digest(&audit_key.account, path_sha256),
+            ),
+            outbox_state: KeyringEntryRef::new(
+                &audit_key.service,
+                outbox_state_account_for_digest(&audit_key.account, path_sha256),
+            ),
+        }
+    }
+
+    /// Enumerates every companion entry in profile scope order.
+    pub(crate) fn into_scope_entries(self) -> [(&'static str, KeyringEntryRef); 4] {
+        // Exhaustive destructuring requires each added coordinate to enter scope checks.
+        let Self {
+            tip_anchor,
+            reanchor_counter,
+            outbox_state,
+            carrier_record,
+        } = self;
+        [
+            (TIP_ANCHOR, tip_anchor),
+            (REANCHOR_COUNTER, reanchor_counter),
+            (OUTBOX_STATE, outbox_state),
+            (CARRIER_RECORD, carrier_record),
+        ]
+    }
+}
+
 // ── In-memory store for tests ────────────────────────────────────────────────
 
 /// An in-process [`TipAnchorStore`] for tests that exercise the writer's anchor
@@ -513,6 +951,25 @@ pub struct InMemoryTipAnchorStore {
 #[cfg(any(test, feature = "test-helpers"))]
 #[derive(Debug, Default)]
 struct InMemoryAnchorState {
+    outbox: std::collections::BTreeMap<u64, OutboxState>,
+    outbox_owner: std::collections::BTreeMap<u64, String>,
+    carriers: Option<CarrierRecord>,
+    carrier_writes: usize,
+    outbox_fail_reads: bool,
+    outbox_fail_writes: bool,
+    owner_fail_reads: bool,
+    owner_fail_writes: bool,
+    /// Refuses every commitment and owner-state call while set.
+    items_forbidden: bool,
+    /// Commitment and owner-state calls, refused ones included.
+    item_accesses: usize,
+    /// Successful commitment and owner-state writes, in order.
+    item_writes: Vec<(&'static str, u64)>,
+    /// The evidence scope a test sets; `None` is the fixture scope.
+    evidence_scope: Option<[u8; 32]>,
+    /// The scripted result of the next audit-key reloads.
+    reload: Option<Result<Option<[u8; 32]>, TipAnchorStoreError>>,
+    reloads: usize,
     anchor: Option<TipAnchor>,
     reanchors: u64,
     fail: bool,
@@ -524,11 +981,144 @@ struct InMemoryAnchorState {
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
+impl InMemoryAnchorState {
+    /// Counts one commitment or owner-state call and refuses it while items
+    /// are forbidden.
+    fn item_access(&mut self) -> Result<(), TipAnchorStoreError> {
+        self.item_accesses += 1;
+        if self.items_forbidden {
+            return Err(TipAnchorStoreError::new("outbox item access forbidden"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
 impl InMemoryTipAnchorStore {
     /// Constructs an empty store (no anchor, no re-anchors recorded).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets independent outbox read and write faults.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_outbox_failing(&self, reads: bool, writes: bool) {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.outbox_fail_reads = reads;
+        state.outbox_fail_writes = writes;
+    }
+
+    /// Sets independent owner-state read and write faults.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_owner_failing(&self, reads: bool, writes: bool) {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.owner_fail_reads = reads;
+        state.owner_fail_writes = writes;
+    }
+
+    /// Sets the evidence scope this store reports.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_evidence_scope(&self, scope: [u8; 32]) {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.evidence_scope = Some(scope);
+    }
+
+    /// Refuses every commitment and owner-state read and write while
+    /// `forbidden` holds. Refused calls still count as accesses.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn forbid_outbox_items(&self, forbidden: bool) {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.items_forbidden = forbidden;
+    }
+
+    /// Returns the number of commitment and owner-state calls so far.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn outbox_item_accesses(&self) -> usize {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        self.state
+            .lock()
+            .expect("in-memory anchor store mutex")
+            .item_accesses
+    }
+
+    /// Returns the successful item writes in order: `"legacy"` for a
+    /// commitment and `"owner"` for an owner state, with the carrier
+    /// generation.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn outbox_item_writes(&self) -> Vec<(&'static str, u64)> {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        self.state
+            .lock()
+            .expect("in-memory anchor store mutex")
+            .item_writes
+            .clone()
+    }
+
+    /// Returns the number of successful carrier-record writes.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn carrier_record_writes(&self) -> usize {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        self.state
+            .lock()
+            .expect("in-memory anchor store mutex")
+            .carrier_writes
+    }
+
+    /// Scripts every later audit-key reload: `Ok(Some(key))`, `Ok(None)` for
+    /// an absent key, or `Err(detail)` for a backend failure.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_reload(&self, result: Result<Option<[u8; 32]>, &str>) {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.reload = Some(result.map_err(TipAnchorStoreError::new));
+    }
+
+    /// Scripts every later audit-key reload to fail with `error`, such as a
+    /// store error that carries a classified keyring refusal.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_reload_error(&self, error: TipAnchorStoreError) {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.reload = Some(Err(error));
+    }
+
+    /// Returns the number of audit-key reloads so far.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn reload_count(&self) -> usize {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        self.state
+            .lock()
+            .expect("in-memory anchor store mutex")
+            .reloads
     }
 
     /// Returns the currently stored anchor, if any.
@@ -602,7 +1192,7 @@ impl InMemoryTipAnchorStore {
         state.writes_to_fail = count;
     }
 
-    /// Makes every subsequent operation fail, simulating an unavailable
+    /// Makes anchor and counter operations fail, simulating an unavailable
     /// backend.
     ///
     /// # Panics
@@ -617,6 +1207,118 @@ impl InMemoryTipAnchorStore {
 
 #[cfg(any(test, feature = "test-helpers"))]
 impl TipAnchorStore for InMemoryTipAnchorStore {
+    fn load_outbox_owner_state(
+        &self,
+        carrier_generation: u64,
+    ) -> Result<Option<String>, TipAnchorStoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
+        state.item_access()?;
+        if state.owner_fail_reads {
+            return Err(TipAnchorStoreError::new("owner read fault"));
+        }
+        Ok(state.outbox_owner.get(&carrier_generation).cloned())
+    }
+
+    fn store_outbox_owner_state(
+        &self,
+        carrier_generation: u64,
+        value: &str,
+    ) -> Result<(), TipAnchorStoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
+        state.item_access()?;
+        if state.owner_fail_writes {
+            return Err(TipAnchorStoreError::new("owner write fault"));
+        }
+        state
+            .outbox_owner
+            .insert(carrier_generation, value.to_owned());
+        state.item_writes.push(("owner", carrier_generation));
+        Ok(())
+    }
+
+    fn outbox_evidence_scope(&self) -> Result<[u8; 32], TipAnchorStoreError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
+        Ok(state
+            .evidence_scope
+            .unwrap_or_else(|| super::consent_evidence::evidence_scope("in-memory", "fixture")))
+    }
+
+    fn reload_audit_key(&self) -> Result<Option<Zeroizing<[u8; 32]>>, TipAnchorStoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
+        state.reloads += 1;
+        match state.reload.clone() {
+            None => Ok(None),
+            Some(Ok(key)) => Ok(key.map(Zeroizing::new)),
+            Some(Err(error)) => Err(error),
+        }
+    }
+
+    /// The store holds a key coordinate once a test scripts the reload with
+    /// [`Self::set_reload`]. A poisoned mutex counts as one.
+    fn reads_audit_key(&self) -> bool {
+        self.state
+            .lock()
+            .map_or(true, |state| state.reload.is_some())
+    }
+
+    fn load_carrier_record(&self) -> Result<Option<CarrierRecord>, TipAnchorStoreError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
+        Ok(state.carriers.clone())
+    }
+    fn store_carrier_record(&self, record: &CarrierRecord) -> Result<(), TipAnchorStoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TipAnchorStoreError::new("store mutex"))?;
+        state.carriers = Some(record.clone());
+        state.carrier_writes += 1;
+        Ok(())
+    }
+
+    fn load_outbox_state(
+        &self,
+        generation: u64,
+    ) -> Result<Option<OutboxState>, TipAnchorStoreError> {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.item_access()?;
+        if state.outbox_fail_reads {
+            return Err(TipAnchorStoreError::new("outbox read fault"));
+        }
+        Ok(state.outbox.get(&generation).cloned())
+    }
+
+    fn store_outbox_state(
+        &self,
+        generation: u64,
+        outbox: &OutboxState,
+    ) -> Result<(), TipAnchorStoreError> {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.item_access()?;
+        if state.outbox_fail_writes {
+            return Err(TipAnchorStoreError::new("outbox write fault"));
+        }
+        state.outbox.insert(generation, outbox.clone());
+        state.item_writes.push(("legacy", generation));
+        Ok(())
+    }
+
     fn load_anchor(&self) -> Result<Option<TipAnchor>, TipAnchorStoreError> {
         #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
         let state = self.state.lock().expect("in-memory anchor store mutex");
@@ -692,6 +1394,94 @@ mod tests {
     use super::*;
 
     const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[derive(Debug, Default)]
+    struct LegacyStore(InMemoryTipAnchorStore);
+
+    impl TipAnchorStore for LegacyStore {
+        fn reads_audit_key(&self) -> bool {
+            false
+        }
+        fn load_carrier_record(&self) -> Result<Option<CarrierRecord>, TipAnchorStoreError> {
+            self.0.load_carrier_record()
+        }
+        fn store_carrier_record(&self, value: &CarrierRecord) -> Result<(), TipAnchorStoreError> {
+            self.0.store_carrier_record(value)
+        }
+        fn load_outbox_state(
+            &self,
+            generation: u64,
+        ) -> Result<Option<OutboxState>, TipAnchorStoreError> {
+            self.0.load_outbox_state(generation)
+        }
+        fn store_outbox_state(
+            &self,
+            generation: u64,
+            value: &OutboxState,
+        ) -> Result<(), TipAnchorStoreError> {
+            self.0.store_outbox_state(generation, value)
+        }
+        fn load_anchor(&self) -> Result<Option<TipAnchor>, TipAnchorStoreError> {
+            self.0.load_anchor()
+        }
+        fn load_raw(&self) -> Result<Option<String>, TipAnchorStoreError> {
+            self.0.load_raw()
+        }
+        fn store_anchor(&self, value: &TipAnchor) -> Result<(), TipAnchorStoreError> {
+            self.0.store_anchor(value)
+        }
+        fn bump_reanchor_count(&self) -> Result<u64, TipAnchorStoreError> {
+            self.0.bump_reanchor_count()
+        }
+        fn reanchor_count(&self) -> Result<Option<u64>, TipAnchorStoreError> {
+            self.0.reanchor_count()
+        }
+    }
+
+    #[test]
+    fn default_owner_state_methods_keep_legacy_behavior() {
+        use crate::audit_log::{AuditEntry, AuditOutbox, AuditWriter};
+        let store = Arc::new(LegacyStore::default());
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), None);
+        assert_eq!(
+            store
+                .store_outbox_owner_state(1, "state")
+                .unwrap_err()
+                .detail,
+            "outbox owner state is unsupported"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = AuditWriter::open_with_tip_anchor(
+            path.clone(),
+            None,
+            store.clone(),
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&AuditEntry::new_profile_resumed("fixture", true, "queued"))
+            .unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert_eq!(writer.drain_outbox().unwrap(), 0);
+        assert_eq!(
+            store.load_outbox_state(1).unwrap(),
+            Some(OutboxState::default())
+        );
+        assert_eq!(store.load_outbox_owner_state(1).unwrap(), None);
+        store.0.store_outbox_owner_state(1, "first").unwrap();
+        store.0.store_outbox_owner_state(2, "second").unwrap();
+        store.0.store_outbox_owner_state(1, "replacement").unwrap();
+        assert_eq!(
+            store.0.load_outbox_owner_state(1).unwrap().as_deref(),
+            Some("replacement")
+        );
+        assert_eq!(
+            store.0.load_outbox_owner_state(2).unwrap().as_deref(),
+            Some("second")
+        );
+        assert_eq!(store.0.load_outbox_owner_state(3).unwrap(), None);
+    }
 
     #[test]
     fn round_trips_through_the_keyring_representation() {
@@ -821,5 +1611,47 @@ mod tests {
 
         store.set_failing(true);
         assert!(store.load_anchor().is_err());
+    }
+
+    /// A regular file at the sidecar path is evidence of a keyed writer; a
+    /// directory there is not, and an absent path is not.
+    #[test]
+    fn only_a_regular_file_at_the_sidecar_path_is_a_chain_root_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let sidecar = super::super::writer::hmac_sidecar_path(&log);
+        let find = || PriorAnchoring::find(BindingHistory::NotRecorded, &log, 1, false);
+
+        assert_eq!(find(), None, "no sidecar");
+        std::fs::create_dir(&sidecar).unwrap();
+        assert_eq!(find(), None, "a directory is not a sidecar");
+        std::fs::remove_dir(&sidecar).unwrap();
+        std::fs::write(&sidecar, b"sidecar").unwrap();
+        assert_eq!(find(), Some(PriorAnchoring::ChainRootSidecar));
+        assert_eq!(
+            PriorAnchoring::find(BindingHistory::NotRecorded, &log, 0, false),
+            Some(PriorAnchoring::ChainRootSidecar),
+            "an empty file with a sidecar was truncated"
+        );
+    }
+
+    #[test]
+    fn store_error_preserves_optional_auth_error() {
+        let plain = TipAnchorStoreError::new("anchor value is unusable");
+        assert_eq!(plain.auth_error(), None);
+        assert_eq!(
+            plain.to_string(),
+            "audit tip anchor store: anchor value is unusable"
+        );
+
+        let auth = crate::error::AuthError::KeyringPlatformError {
+            detail: "write Linux Secret Service: credential store operation failed".to_owned(),
+        };
+        let wrapped = TipAnchorStoreError::from_auth("carrier record write failed", auth.clone());
+        assert_eq!(wrapped.auth_error(), Some(&auth));
+        assert_eq!(
+            wrapped.to_string(),
+            "audit tip anchor store: carrier record write failed"
+        );
     }
 }

@@ -23,6 +23,12 @@ use stellar_agent_sep43::Sep43Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum X402Error {
+    /// A typed resolver or consumption refusal, with operator-only proof details.
+    #[error("mainnet payment authorization refused")]
+    MainnetAuthorization(#[from] stellar_agent_network::mainnet::MainnetAuthorizationError),
+    /// An authorization refusal already logged by the SEP-43 signing boundary.
+    #[error("mainnet payment authorization refused")]
+    MainnetAuthorizationRefused,
     /// The payment-required object could not be decoded.
     ///
     /// Emitted when `decode_payment_required` receives malformed base64 or
@@ -36,44 +42,25 @@ pub enum X402Error {
     /// The `scheme` field was not `"exact"`.
     ///
     /// Only the `exact` scheme is supported by this crate.
-    #[error("unsupported x402 scheme: {scheme}; only \"exact\" is supported")]
-    UnsupportedScheme {
-        /// The rejected scheme value, stored quoted, escaped, and bounded by
-        /// `stellar_agent_network::quote_server_text`.
-        scheme: String,
-    },
+    #[error("unsupported x402 scheme; only \"exact\" is supported")]
+    UnsupportedScheme,
 
     /// The `network` field is not one of the two supported x402 Stellar networks.
     ///
     /// Only `"stellar:pubnet"` and `"stellar:testnet"` are valid x402 Stellar
     /// network identifiers.
     #[error(
-        "unsupported x402 network: {network}; \
-         accepted values are \"stellar:pubnet\" and \"stellar:testnet\""
+        "unsupported x402 network; accepted values are \"stellar:pubnet\" and \"stellar:testnet\""
     )]
-    UnsupportedNetwork {
-        /// The rejected network value, stored quoted, escaped, and bounded by
-        /// `stellar_agent_network::quote_server_text`.
-        network: String,
-    },
+    UnsupportedNetwork,
 
     /// The x402 wire `network` does not match the caller-supplied profile
     /// passphrase.
     ///
     /// Prevents a payment intended for one network from being signed with a
     /// signer bound to a different network.
-    #[error(
-        "x402 network {network:?} resolves to passphrase {expected_passphrase:?}, \
-         but profile passphrase is {profile_passphrase:?}"
-    )]
-    NetworkPassphraseMismatch {
-        /// x402 wire network string (e.g. `"stellar:pubnet"`).
-        network: String,
-        /// Passphrase derived from the x402 network string.
-        expected_passphrase: &'static str,
-        /// Passphrase from the caller's profile / `create_payment` argument.
-        profile_passphrase: String,
-    },
+    #[error("the x402 network must match the profile passphrase")]
+    NetworkPassphraseMismatch,
 
     /// A payment-signing request targeted mainnet.
     ///
@@ -81,7 +68,7 @@ pub enum X402Error {
     /// wallet, so no submit-layer mainnet gate stands between it and mainnet.
     /// [`crate::exact::create_payment`] raises this variant for a mainnet
     /// passphrase or a mainnet-pattern RPC URL, before any key access and any
-    /// request. The MCP payment tools also refuse a mainnet profile at entry.
+    /// request. MCP payment tools require verified authority for mainnet.
     /// The `detail` carries the canonical `network.mainnet_write_forbidden`
     /// wire code, so this refusal correlates with the CLI, submit-layer, and
     /// SEP-43 signing guards.
@@ -112,11 +99,20 @@ pub enum X402Error {
         detail: String,
     },
 
-    /// The `pay_to` recipient is not a valid G-, C-, or M-strkey address.
+    /// The `pay_to` recipient is not a valid G-, C-, M-, or W-strkey address.
     #[error("invalid recipient address: {detail}")]
     InvalidRecipientAddress {
         /// Human-readable reason for the validation failure.
         detail: String,
+    },
+
+    /// The checked endpoint does not support a muxed contract payee.
+    #[error(
+        "a W (muxed contract) payee requires Stellar protocol 30 or later; the network reports protocol {protocol_version}"
+    )]
+    MuxedContractProtocolUnsupported {
+        /// The protocol version reported by the checked endpoint.
+        protocol_version: u32,
     },
 
     /// The payer (`from`) is not a valid G-strkey account address.
@@ -153,7 +149,6 @@ pub enum X402Error {
     #[error("auth-entry signing failed: {source}")]
     AuthEntrySignFailed {
         /// The underlying SEP-43 signing error.
-        #[from]
         source: Sep43Error,
     },
 
@@ -246,17 +241,38 @@ impl X402Error {
     /// surface. [`X402Error::EndpointIdentity`] and [`X402Error::CrossCheck`]
     /// return the code of the wallet error they carry, such as
     /// `network.endpoint_network_mismatch` or `simulation.divergence`, the code
-    /// every other signing path answers for the same refusal.
+    /// every other signing path answers for the same refusal. A total-budget
+    /// epoch refusal of the mainnet authorization keeps its
+    /// `policy.total_epoch_*` code.
     #[must_use]
     pub fn wire_code(&self) -> &'static str {
         match self {
+            X402Error::MainnetAuthorization(error) => match error {
+                stellar_agent_network::mainnet::MainnetAuthorizationError::PolicyDenied(reason) => {
+                    reason.wire_code()
+                }
+                stellar_agent_network::mainnet::MainnetAuthorizationError::FeatureDisabled => {
+                    "network.mainnet_write_forbidden"
+                }
+                stellar_agent_network::mainnet::MainnetAuthorizationError::TotalEpoch(refusal) => {
+                    refusal.code()
+                }
+                stellar_agent_network::mainnet::MainnetAuthorizationError::Accounting(refusal) => {
+                    refusal.validation_error().code()
+                }
+                _ => "network.mainnet_authorization_refused",
+            },
+            X402Error::MainnetAuthorizationRefused => "network.mainnet_authorization_refused",
             X402Error::InvalidPaymentRequired { .. } => "x402.invalid_payment_required",
-            X402Error::UnsupportedScheme { .. } => "x402.unsupported_scheme",
-            X402Error::UnsupportedNetwork { .. } => "x402.unsupported_network",
-            X402Error::NetworkPassphraseMismatch { .. } => "x402.network_passphrase_mismatch",
+            X402Error::UnsupportedScheme => "x402.unsupported_scheme",
+            X402Error::UnsupportedNetwork => "x402.unsupported_network",
+            X402Error::NetworkPassphraseMismatch => "x402.network_passphrase_mismatch",
             X402Error::MainnetSigningForbidden { .. } => "network.mainnet_write_forbidden",
             X402Error::InvalidAssetAddress { .. } => "x402.invalid_asset_address",
             X402Error::InvalidRecipientAddress { .. } => "x402.invalid_recipient_address",
+            X402Error::MuxedContractProtocolUnsupported { .. } => {
+                "x402.muxed_contract_protocol_unsupported"
+            }
             X402Error::InvalidPayerAddress { .. } => "x402.invalid_payer_address",
             X402Error::FeesNotSponsored => "x402.fees_not_sponsored",
             X402Error::AmountConversion { .. } => "x402.amount_conversion",
@@ -268,6 +284,16 @@ impl X402Error {
             X402Error::KeyringLoadFailed { .. } => "x402.keyring_load_failed",
             X402Error::TransmitGateRefused { .. } => "x402.transmit_gate_refused",
             X402Error::EndpointIdentity(inner) | X402Error::CrossCheck(inner) => inner.code(),
+        }
+    }
+}
+
+impl From<Sep43Error> for X402Error {
+    fn from(source: Sep43Error) -> Self {
+        if matches!(source, Sep43Error::MainnetAuthorizationRefused) {
+            Self::MainnetAuthorizationRefused
+        } else {
+            Self::AuthEntrySignFailed { source }
         }
     }
 }
@@ -289,22 +315,16 @@ pub mod test_helpers {
         }
     }
 
-    /// Constructs [`X402Error::UnsupportedScheme`] with the given scheme,
-    /// stored quoted the way the validation stores it.
+    /// Constructs [`X402Error::UnsupportedScheme`].
     #[must_use]
-    pub fn unsupported_scheme(scheme: impl AsRef<str>) -> X402Error {
-        X402Error::UnsupportedScheme {
-            scheme: stellar_agent_network::quote_server_text(scheme.as_ref()),
-        }
+    pub fn unsupported_scheme() -> X402Error {
+        X402Error::UnsupportedScheme
     }
 
-    /// Constructs [`X402Error::UnsupportedNetwork`] with the given network,
-    /// stored quoted the way the validation stores it.
+    /// Constructs [`X402Error::UnsupportedNetwork`].
     #[must_use]
-    pub fn unsupported_network(network: impl AsRef<str>) -> X402Error {
-        X402Error::UnsupportedNetwork {
-            network: stellar_agent_network::quote_server_text(network.as_ref()),
-        }
+    pub fn unsupported_network() -> X402Error {
+        X402Error::UnsupportedNetwork
     }
 
     /// Constructs [`X402Error::FeesNotSponsored`].
@@ -333,17 +353,33 @@ mod tests {
 
     use super::*;
 
+    /// An accounting refusal of the mainnet resolver keeps its typed code.
+    #[test]
+    fn wire_code_keeps_accounting_refusals() {
+        use stellar_agent_network::mainnet::{AccountingRefusal, MainnetAuthorizationError};
+        for (refusal, code) in [
+            (AccountingRefusal::Overflow, "policy.accounting_overflow"),
+            (AccountingRefusal::Invalid, "policy.accounting_invalid"),
+            (
+                AccountingRefusal::ApprovalRequired,
+                "policy.approval_required",
+            ),
+        ] {
+            let error =
+                X402Error::MainnetAuthorization(MainnetAuthorizationError::Accounting(refusal));
+            assert_eq!(error.wire_code(), code);
+        }
+    }
+
     // Display of all variants must not expose secret material.
     // We verify the display format does not contain known-sensitive patterns.
 
     #[test]
     fn display_unsupported_scheme_does_not_contain_key_material() {
-        let err = X402Error::UnsupportedScheme {
-            scheme: "bad".to_owned(),
-        };
+        let err = X402Error::UnsupportedScheme;
         let display = err.to_string();
-        // Must mention the scheme and say "exact"
-        assert!(display.contains("bad"));
+        // The detail names the accepted scheme.
+        assert!(!display.contains("bad"));
         assert!(display.contains("exact"));
         // Must not contain any S-strkey prefix pattern
         assert!(!display.starts_with('S'));
@@ -357,23 +393,19 @@ mod tests {
     }
 
     #[test]
-    fn display_unsupported_network_includes_network() {
-        let err = X402Error::UnsupportedNetwork {
-            network: "evm:1".to_owned(),
-        };
-        assert!(err.to_string().contains("evm:1"));
+    fn display_unsupported_network_names_accepted_networks() {
+        let err = X402Error::UnsupportedNetwork;
+        assert!(!err.to_string().contains("evm:1"));
     }
 
     #[test]
     fn display_network_passphrase_mismatch() {
-        let err = X402Error::NetworkPassphraseMismatch {
-            network: "stellar:pubnet".to_owned(),
-            expected_passphrase: "Public Global Stellar Network ; September 2015",
-            profile_passphrase: "Test SDF Network ; September 2015".to_owned(),
-        };
+        let err = X402Error::NetworkPassphraseMismatch;
         let display = err.to_string();
-        // Must mention the network
-        assert!(display.contains("stellar:pubnet"));
+        assert_eq!(
+            display,
+            "the x402 network must match the profile passphrase"
+        );
     }
 
     #[test]
@@ -469,6 +501,25 @@ mod tests {
     }
 
     #[test]
+    fn a_total_epoch_refusal_carries_its_own_wire_code() {
+        use stellar_agent_network::mainnet::{MainnetAuthorizationError, TotalEpochRefusal};
+        for (refusal, code) in [
+            (
+                TotalEpochRefusal::Unavailable {
+                    detail: "pin unreadable".to_owned(),
+                },
+                "policy.total_epoch_unavailable",
+            ),
+            (TotalEpochRefusal::Stale, "policy.total_epoch_stale"),
+            (TotalEpochRefusal::Retired, "policy.total_epoch_retired"),
+        ] {
+            let err =
+                X402Error::MainnetAuthorization(MainnetAuthorizationError::TotalEpoch(refusal));
+            assert_eq!(err.wire_code(), code);
+        }
+    }
+
+    #[test]
     fn transmit_gate_refused_carries_its_own_wire_code() {
         let err = X402Error::TransmitGateRefused {
             detail: "audit row not written".to_owned(),
@@ -561,10 +612,34 @@ mod tests {
         let e = test_helpers::fees_not_sponsored();
         assert!(matches!(e, X402Error::FeesNotSponsored));
 
-        let e = test_helpers::unsupported_scheme("upto");
-        assert!(matches!(e, X402Error::UnsupportedScheme { scheme } if scheme == "\"upto\""));
+        let e = test_helpers::unsupported_scheme();
+        assert!(matches!(e, X402Error::UnsupportedScheme));
 
-        let e = test_helpers::unsupported_network("evm:1");
-        assert!(matches!(e, X402Error::UnsupportedNetwork { network } if network == "\"evm:1\""));
+        let e = test_helpers::unsupported_network();
+        assert!(matches!(e, X402Error::UnsupportedNetwork));
+    }
+    #[test]
+    fn mainnet_authorization_errors_preserve_codes_without_preconditions() {
+        use stellar_agent_network::mainnet::{
+            MainnetAuthorizationError as A, MainnetPrecondition as P,
+        };
+        for precondition in [P::ApprovalTtlExceedsRule, P::NotOpen, P::WitnessRequired] {
+            let error = X402Error::from(A::Refused(precondition));
+            assert_eq!(error.wire_code(), "network.mainnet_authorization_refused");
+            assert_eq!(error.to_string(), "mainnet payment authorization refused");
+            assert!(!error.to_string().contains(precondition.label()));
+        }
+        let error = X402Error::from(A::PolicyDenied(Box::new(
+            stellar_agent_core::policy::DenyReason::NoMatchingRule,
+        )));
+        assert_eq!(error.wire_code(), "policy.deny.no_matching_rule");
+        assert_eq!(
+            X402Error::from(A::FeatureDisabled).wire_code(),
+            "network.mainnet_write_forbidden"
+        );
+        let error = X402Error::from(Sep43Error::MainnetAuthorizationRefused);
+        assert!(matches!(error, X402Error::MainnetAuthorizationRefused));
+        assert_eq!(error.wire_code(), "network.mainnet_authorization_refused");
+        assert_eq!(error.to_string(), "mainnet payment authorization refused");
     }
 }

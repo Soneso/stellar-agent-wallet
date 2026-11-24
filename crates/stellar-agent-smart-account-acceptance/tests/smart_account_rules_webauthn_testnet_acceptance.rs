@@ -102,6 +102,7 @@ use chromiumoxide::cdp::browser_protocol::web_authn::{
     AddVirtualAuthenticatorParams, AuthenticatorProtocol, AuthenticatorTransport, EnableParams,
     VirtualAuthenticatorOptions,
 };
+use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use ed25519_dalek::SigningKey;
 use futures::StreamExt as _;
 use rand_core::OsRng;
@@ -117,6 +118,7 @@ use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, ResolvedFeePerOp, deploy_smart_account,
     deploy_webauthn_verifier,
 };
+use stellar_agent_smart_account::managers::auth_entry::test_helpers::partial_authorization_entry;
 use stellar_agent_smart_account::managers::credentials::{
     AddPasskeyOutcome, CredentialsManager, SignWithPasskeyOutcome,
 };
@@ -153,14 +155,9 @@ fn rid() -> String {
 /// Funds an account via testnet Friendbot.
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 200 for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Generates a fresh ed25519 keypair.
@@ -357,6 +354,37 @@ impl Drop for BrowserGuard {
 // Browser launch helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Reads the confirmation code the registration page shows once the bridge
+/// accepted the browser's response, retrying for up to ten seconds.
+async fn read_confirmation_code(page: &chromiumoxide::Page) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let code: String = page
+            .evaluate(
+                EvaluateParams::builder()
+                    .expression(
+                        "(function(){var el = document.getElementById('confirmation-code'); \
+                         return el && !el.hidden ? el.textContent : '';})()",
+                    )
+                    .return_by_value(true)
+                    .build()
+                    .expect("EvaluateParams must build"),
+            )
+            .await
+            .expect("evaluate must not error")
+            .into_value()
+            .expect("evaluate result must deserialise as String");
+        if !code.is_empty() {
+            return code;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the registration page did not show a confirmation code within ten seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Launches a headless Chromium browser for the WebAuthn ceremony.
 ///
 /// The sandbox is disabled via the builder's `no_sandbox()` (which passes
@@ -547,6 +575,7 @@ async fn goto_loopback(page: &chromiumoxide::Page, url: &str) -> Result<(), Goto
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires testnet, chromium, and explicit --ignored flag"]
 async fn webauthn_passkey_signing_testnet_acceptance() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Temporary directories ─────────────────────────────────────────────────
     let tmp = TempDir::new().expect("tempdir must be created");
     let passkeys_dir = tmp.path().join("passkeys");
@@ -656,9 +685,11 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
     // approval entry.  The virtual authenticator generates the P-256 keypair
     // internally and returns the attestation object to the page.  The page's
     // fetch POST to `/register/<nonce>/credential` delivers the credential ID
-    // and uncompressed SEC1 public key to the bridge, which records them in the
-    // approval store.  `poll_registration` then picks up the `RegistrationInput`
-    // and writes `CredentialMetadata` to the passkeys registry.
+    // and uncompressed SEC1 public key to the bridge, which verifies the
+    // response against the entry's challenge and records it in the approval
+    // store.  `poll_registration` then picks up the `RegistrationInput`, and
+    // `confirm_registration` with the code the page shows writes
+    // `CredentialMetadata` to the passkeys registry.
     //
     // Private-key bytes NEVER cross the CDP wire.
     let creds_manager = CredentialsManager::new(
@@ -695,14 +726,18 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
             credential_name,
             &reg_handle.nonce,
             reg_deadline,
-            Some(&mut reg_audit),
+            &mut reg_audit,
         )
         .await
         .expect("poll_registration must not error");
-    let metadata = match reg_outcome {
-        AddPasskeyOutcome::Registered { metadata } => metadata,
-        other => panic!("W-REG: expected Registered; got {other:?}"),
+    let pending = match reg_outcome {
+        AddPasskeyOutcome::AwaitingConfirmation { pending } => pending,
+        other => panic!("W-REG: expected AwaitingConfirmation; got {other:?}"),
     };
+    let code = read_confirmation_code(&page).await;
+    let metadata = creds_manager
+        .confirm_registration(pending, &code, Instant::now(), &mut reg_audit)
+        .expect("W-REG: the code the page shows must confirm the registration");
     assert_eq!(
         metadata.rp_id, TEST_RP_ID,
         "registered credential rp_id must match TEST_RP_ID"
@@ -750,7 +785,11 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
     // rule's baseline, and the passkey path compares the chain with it before
     // the ceremony.
     let (rule_manager, signers_manager, signers_audit_log_path, _signers_audit_dir) =
-        managers_for_tests(TESTNET_RPC_URL, TESTNET_RPC_URL, Duration::from_secs(120));
+        managers_for_tests(
+            TESTNET_RPC_URL,
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
+            Duration::from_secs(120),
+        );
     let signer_addr =
         parse_g_strkey_to_signer_address(&signer_g).expect("signer G-strkey must parse");
 
@@ -795,11 +834,15 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
 
     // ── Drive signing ceremony ────────────────────────────────────────────────
     //
-    // Build a synthetic 32-byte auth digest for the test.  In production this
-    // comes from `compute_auth_digest` (stellar-agent-core), but the signing
-    // manager accepts any 32-byte value.
-    let mut auth_digest = [0u8; 32];
-    rand_core::RngCore::fill_bytes(&mut OsRng, &mut auth_digest);
+    // The auth entry the ceremony signs, for the deployed smart account and the
+    // installed rule; its digest is derived from the entry's facts, which the
+    // signing manager validates before the ceremony.
+    let entry = partial_authorization_entry(
+        smart_account.clone(),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(webauthn_rule_id)],
+    )
+    .expect("auth entry builds");
 
     // Intercept the approval URL so we can navigate the browser to it.
     let (url_tx, url_rx) = tokio::sync::oneshot::channel::<String>();
@@ -816,21 +859,30 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
     // install ran through, so its divergence check compares the chain with
     // the baseline the install recorded, and its PasskeyAssertion row lands in
     // the same log.
+    let signing_gate = {
+        use sha2::Digest as _;
+        stellar_agent_smart_account::signing::intent_test_helpers::partial_gate(
+            &entry,
+            vec![stellar_agent_network::SignerDescriptor::External {
+                verifier: verifier_address.clone(),
+                key_data_sha256: sha2::Sha256::digest(&pubkey_data).into(),
+            }],
+            false,
+        )
+    };
     let signing_task = {
         let creds_manager = creds_manager.clone();
         let signers_manager = Arc::clone(&signers_manager);
         let bridge_addr_clone = bridge_addr;
-        // Clone the smart account strkey so it can be moved into the
-        // `'static` async task closure.
-        let smart_account_strkey_clone = smart_account_strkey.clone();
+        // Move a copy of the entry into the `'static` async task closure; its
+        // real smart account keeps the audit trail meaningful.
+        let entry = entry.clone();
         tokio::spawn(async move {
             creds_manager
                 .sign_with_passkey_rule(
+                    &signing_gate,
                     credential_name,
-                    // Supply real smart account so the audit trail is meaningful.
-                    &smart_account_strkey_clone,
-                    &auth_digest,
-                    vec![webauthn_rule_id],
+                    &entry,
                     signers_manager,
                     bridge_addr_clone,
                     signing_deadline,

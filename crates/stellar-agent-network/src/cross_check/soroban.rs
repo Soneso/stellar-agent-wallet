@@ -69,6 +69,8 @@ fn divergence(field: WitnessField) -> WalletError {
 ///    several ledgers after the primary's simulation.
 /// 6. Its ledger lies before the signature expiration ledger.
 ///
+/// Checks 5 and 6 are [`compare_ledger`].
+///
 /// # Errors
 /// `simulation.divergence` naming the Soroban simulation and the field of the
 /// failed check; `network.witness_unavailable` with `InvalidAnswer` for an
@@ -115,11 +117,38 @@ pub(super) fn compare(
     if oracle.min_resource_fee == 0 || oracle.min_resource_fee > inputs.resource_fee_ceiling {
         return Err(divergence(F::ResourceFee));
     }
-    if oracle.latest_ledger.saturating_add(MAX_ORACLE_LAG_LEDGERS) < inputs.primary.latest_ledger {
-        return Err(divergence(F::LedgerSkew));
+    compare_ledger(
+        inputs.primary.latest_ledger,
+        oracle.latest_ledger,
+        inputs.expiration_ledger,
+    )
+}
+
+/// Compares the oracle's ledger with the primary's simulation ledger and the
+/// signature expiration ledger derived from it, and refuses at the first
+/// disagreement.
+///
+/// 1. `oracle_ledger` trails `primary_ledger` by at most two ledgers. An
+///    oracle ahead of the primary is bounded by check 2 alone: a retried
+///    answer arrives several ledgers after the primary's simulation.
+/// 2. `oracle_ledger` lies before `expiration_ledger`.
+///
+/// A primary that reports an inflated ledger fails check 1, so the signed
+/// window stays bounded by the oracle's view of the network.
+///
+/// # Errors
+/// `simulation.divergence` naming the Soroban simulation and
+/// [`WitnessField::LedgerSkew`] or [`WitnessField::Expiration`].
+pub(super) fn compare_ledger(
+    primary_ledger: u32,
+    oracle_ledger: u32,
+    expiration_ledger: u32,
+) -> Result<(), WalletError> {
+    if oracle_ledger.saturating_add(MAX_ORACLE_LAG_LEDGERS) < primary_ledger {
+        return Err(divergence(WitnessField::LedgerSkew));
     }
-    if oracle.latest_ledger >= inputs.expiration_ledger {
-        return Err(divergence(F::Expiration));
+    if oracle_ledger >= expiration_ledger {
+        return Err(divergence(WitnessField::Expiration));
     }
     Ok(())
 }
@@ -367,7 +396,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_passes_with_the_oracle_ledger_and_the_simulated_envelope() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle_answering(EchoIdResponder::new(answer(&[entry()], 1001))).await;
         let envelope = envelope(100);
         let primary = primary();
@@ -399,7 +432,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_refuses_two_primary_results_before_any_oracle_request() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle_answering(EchoIdResponder::new(answer(&[entry()], 1001))).await;
         let envelope = envelope(100);
         let mut answer = answer(&[entry()], PRIMARY_LEDGER);
@@ -419,7 +456,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_identity_mismatch_is_witness_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for passphrase in ["Test SDF Future Network ; October 2022", MAINNET_PASSPHRASE] {
             let server = oracle_with_network(passphrase).await;
             let error = witness_from(&server).await.unwrap_err();
@@ -431,7 +472,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_identity_timeout_is_identity_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method": "getNetwork"})))
@@ -459,7 +504,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_credential_refusal_keeps_its_code_after_one_attempt() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for status in [401, 403] {
             let server = oracle_answering(ResponseTemplate::new(status)).await;
             let error = witness_from(&server).await.unwrap_err();
@@ -480,7 +529,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_retries_two_transport_failures_then_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server =
             oracle_answering(FailingThen::new(2, 503, answer(&[entry()], PRIMARY_LEDGER))).await;
         let outcome = witness_from(&server).await.unwrap();
@@ -500,7 +553,11 @@ mod tests {
     /// oracle four ledgers ahead of the primary passes while the signature
     /// window allows it.
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_retried_answer_ahead_of_the_primary_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle_answering(FailingThen::new(
             1,
             503,
@@ -519,7 +576,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_three_transport_failures_are_witness_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server =
             oracle_answering(FailingThen::new(3, 503, answer(&[entry()], PRIMARY_LEDGER))).await;
         let error = witness_from(&server).await.unwrap_err();
@@ -537,7 +598,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_never_retries_a_divergence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The first answer disagrees on the authorization count and every
         // later answer agrees, so a retry after the divergence would pass.
         let server = oracle_with_network(TESTNET_PASSPHRASE).await;
@@ -572,7 +637,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_never_retries_an_invalid_answer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for body in [
             ResponseTemplate::new(200).set_body_string("hostile-body"),
             ResponseTemplate::new(404),
@@ -591,7 +660,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_witness_undecodable_oracle_results_are_invalid_answers() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut bad_auth = answer(&[entry()], PRIMARY_LEDGER);
         bad_auth["results"][0]["auth"][0] = json!("AAAA");
         let mut bad_value = answer(&[entry()], PRIMARY_LEDGER);
@@ -642,7 +715,11 @@ mod tests {
     /// reach neither the refusal nor the wallet's log at any filter value.
     /// The wallet's own event about the failed read stays.
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn soroban_witness_renders_no_oracle_text() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let hostile =
             "https://user:credential-marker@example.invalid/private-path?token=secret-marker";
         let mut with_error = answer(&[entry()], PRIMARY_LEDGER);
@@ -689,7 +766,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn soroban_prepare_logs_the_skip_and_the_shared_host() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use super::super::log_capture::capture_logs;
         let unconfigured =
             Profile::builder_testnet("signer", "witness", "nonce", "witness").build();
@@ -756,7 +837,11 @@ mod tests {
     /// The rule decides from the profile's thresholds and oracle, and only a
     /// required witness builds a client.
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn soroban_prepare_applies_the_rule_before_building_a_client() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = oracle_with_network(TESTNET_PASSPHRASE).await;
         let token = CanonicalAsset::contract(TOKEN).unwrap();
         let native_sac = CanonicalAsset::contract(NATIVE_SAC).unwrap();
@@ -816,7 +901,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn soroban_prepare_refuses_an_oracle_client_that_cannot_be_built() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = Profile::builder_testnet("signer", "witness", "nonce", "witness")
             .oracle_provider_url(
                 url::Url::parse("ftp://user:credential-marker@example.invalid/private-path")
@@ -854,8 +943,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn soroban_prepare_keeps_the_oracle_credential_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::{
             KeyringEntryRef, ProviderRecord, Providers, RpcCredentialPlacement,
         };
@@ -981,5 +1073,52 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    /// The `simulation.divergence` field of a refused ledger comparison.
+    fn ledger_divergence(result: Result<(), WalletError>) -> WitnessField {
+        match result {
+            Err(WalletError::Network(NetworkError::WitnessDivergence {
+                entry: WitnessEntry::SorobanSimulation,
+                field,
+                sequence_delta: None,
+            })) => field,
+            other => panic!("expected a Soroban simulation divergence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compare_ledger_accepts_an_oracle_two_ledgers_behind() {
+        compare_ledger(PRIMARY_LEDGER, PRIMARY_LEDGER - 2, EXPIRATION).unwrap();
+        compare_ledger(PRIMARY_LEDGER, PRIMARY_LEDGER, EXPIRATION).unwrap();
+    }
+
+    #[test]
+    fn compare_ledger_refuses_an_oracle_three_ledgers_behind() {
+        assert_eq!(
+            ledger_divergence(compare_ledger(
+                PRIMARY_LEDGER,
+                PRIMARY_LEDGER - 3,
+                EXPIRATION
+            )),
+            WitnessField::LedgerSkew
+        );
+    }
+
+    #[test]
+    fn compare_ledger_accepts_an_oracle_ahead_of_the_primary() {
+        compare_ledger(PRIMARY_LEDGER, PRIMARY_LEDGER + 5, EXPIRATION).unwrap();
+        compare_ledger(PRIMARY_LEDGER, EXPIRATION - 1, EXPIRATION).unwrap();
+    }
+
+    #[test]
+    fn compare_ledger_refuses_an_oracle_at_or_past_the_expiration() {
+        for oracle in [EXPIRATION, EXPIRATION + 1] {
+            assert_eq!(
+                ledger_divergence(compare_ledger(PRIMARY_LEDGER, oracle, EXPIRATION)),
+                WitnessField::Expiration,
+                "oracle at {oracle}"
+            );
+        }
     }
 }

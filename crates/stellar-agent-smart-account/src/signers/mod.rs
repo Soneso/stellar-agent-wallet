@@ -11,8 +11,8 @@
 //! - [`verifier_identification`] — `VERIFIER_WASM_FIXTURE` vendored bytes +
 //!   [`crate::VERIFIER_ALLOWLIST`] typed allowlist entries
 //!   (`verifier_allowlist.rs`).
-//! - [`types`] — `FrozenChainStateTuple` (TOCTOU anchor), `WasmHashSummary`,
-//!   `ThresholdAffectingOp` (`AtomicBundleAlternative` removed — CAP-46).
+//! - [`types`]: `FrozenChainStateTuple` (TOCTOU anchor) and
+//!   `ThresholdAffectingOp`.
 //!
 //! # Re-exports from `stellar-agent-core`
 //!
@@ -22,7 +22,7 @@
 //!
 //! ```ignore
 //! use crate::signers::{
-//!     FrozenChainStateTuple, WasmHashSummary, ThresholdAffectingOp,
+//!     FrozenChainStateTuple, ThresholdAffectingOp,
 //!     THRESHOLD_POLICY_WASM_HASHES, THRESHOLD_POLICY_WASM,
 //!     ObservedSignerSet, SignerPubkey, SignerSetStatePayload, BaselineReason,
 //!     SignerEntryV2, SignerIdentityV2, SignerSetSnapshotV2, SignerSetView,
@@ -50,10 +50,7 @@ pub mod verifier_identification;
 pub use policy_identification::THRESHOLD_POLICY_WASM;
 pub use policy_identification::THRESHOLD_POLICY_WASM_HASHES;
 
-pub use types::{
-    FrozenChainStateTuple, PolicyIdentifiedKind, ThresholdAffectingOp, WasmHashSummary,
-    WasmHashSummaryError,
-};
+pub use types::{FrozenChainStateTuple, PolicyIdentifiedKind, ThresholdAffectingOp};
 
 /// Re-exports of signer-set value types from `stellar-agent-core`.
 ///

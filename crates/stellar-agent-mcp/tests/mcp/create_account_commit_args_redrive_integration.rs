@@ -194,6 +194,9 @@ async fn recording_server() -> (
 #[tokio::test]
 #[serial]
 async fn create_account_commit_with_payment_xdr_returns_simulation_divergence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
     let server = WalletServer::new(testnet_profile()).expect("WalletServer::new");
 
@@ -205,11 +208,12 @@ async fn create_account_commit_with_payment_xdr_returns_simulation_divergence() 
         source: SOURCE_G.to_owned(),
         destination: G_REAL_DEST.to_owned(),
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
-        nonce: "dGVzdA".to_owned(),
-        expires_at_unix_ms: u64::MAX,
-        envelope_xdr,
+        nonce: Some("dGVzdA".to_owned()),
+        expires_at_unix_ms: Some(u64::MAX),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let result = server
@@ -240,6 +244,9 @@ async fn create_account_commit_with_payment_xdr_returns_simulation_divergence() 
 #[tokio::test]
 #[serial]
 async fn create_account_commit_policy_engine_sees_xdr_destination_not_caller_destination() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
     let (server, engine, _endpoint) = recording_server().await;
 
@@ -251,11 +258,12 @@ async fn create_account_commit_policy_engine_sees_xdr_destination_not_caller_des
         source: SOURCE_G.to_owned(),
         destination: G_ATTACKER.to_owned(), // attacker-controlled field
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
-        nonce: "dGVzdA".to_owned(), // invalid stub → nonce.expired after policy gate
-        expires_at_unix_ms: u64::MAX,
-        envelope_xdr,
+        nonce: Some("dGVzdA".to_owned()), // invalid stub → nonce.expired after policy gate
+        expires_at_unix_ms: Some(u64::MAX),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let result = server
@@ -295,6 +303,9 @@ async fn create_account_commit_policy_engine_sees_xdr_destination_not_caller_des
 #[tokio::test]
 #[serial]
 async fn create_account_commit_policy_engine_sees_xdr_balance_not_caller_balance() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
     let (server, engine, _endpoint) = recording_server().await;
 
@@ -307,11 +318,12 @@ async fn create_account_commit_policy_engine_sees_xdr_balance_not_caller_balance
         source: SOURCE_G.to_owned(),
         destination: G_REAL_DEST.to_owned(),
         starting_balance: serde_json::from_str(r#""999 XLM""#).unwrap(), // attacker-inflated
-        nonce: "dGVzdA".to_owned(), // invalid stub → nonce.expired after policy gate
-        expires_at_unix_ms: u64::MAX,
-        envelope_xdr,
+        nonce: Some("dGVzdA".to_owned()), // invalid stub → nonce.expired after policy gate
+        expires_at_unix_ms: Some(u64::MAX),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
+        business_id: None,
     };
 
     let result = server

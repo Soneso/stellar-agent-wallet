@@ -74,6 +74,49 @@ use crate::policy::v1::proptest_strategies::{
 };
 use crate::policy::{Decision, DenyReason, PolicyEngine};
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+    #[test]
+    #[serial_test::serial]
+    fn address_check_lists_selected_kind_with_exact_or_base_entry(
+        bytes in any::<[u8; 32]>(),
+        form in 0u8..3,
+        kinds in 0u8..4,
+        entries in 0u8..32,
+        id in any::<u64>(),
+    ) {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use crate::policy::v1::criteria::counterparty_allowlist::{
+            CounterpartyAllowlistCriterion, CounterpartyKind, RecipientClass,
+        };
+        let g = format!("{}", stellar_strkey::ed25519::PublicKey(bytes));
+        let c = format!("{}", stellar_strkey::Contract(bytes));
+        let m = format!("{}", stellar_strkey::ed25519::MuxedAccount { ed25519: bytes, id });
+        let other_m = format!("{}", stellar_strkey::ed25519::MuxedAccount { ed25519: bytes, id: id.wrapping_add(1) });
+        let destination = [&g, &m, &c][usize::from(form)];
+        let mut selected = Vec::new();
+        if kinds & 1 != 0 { selected.push(CounterpartyKind::GAccount); }
+        if kinds & 2 != 0 { selected.push(CounterpartyKind::CAccount); }
+        let list: Vec<_> = [g.clone(), m.clone(), c.clone(), other_m, format!(" {g}")].into_iter()
+            .enumerate().filter(|(index, _)| entries & (1 << index) != 0).map(|(_, entry)| entry).collect();
+        let expected = (if form == 2 { kinds & 2 != 0 } else { kinds & 1 != 0 })
+            && (list.contains(destination) || (form == 1 && list.contains(&g)));
+        let criterion = CounterpartyAllowlistCriterion::new(selected, list);
+        let tool = crate::policy::ToolDescriptor::from_registration(&crate::policy::McpToolRegistration {
+            name: "registry_read", destructive_hint: false, read_only_hint: true,
+            chain_id_required: false, value_kind: crate::policy::ToolValueKind::ReadOnly,
+        });
+        let profile = crate::profile::schema::Profile::builder_testnet("svc", "acct", "nonce", "acct").build();
+        let store = crate::policy::v1::PolicyStateStore::new();
+        let args = serde_json::Value::Null;
+        let ctx = crate::policy::v1::EvalContext::new(&tool, &args, "operator", &profile, &store, 1_700_000_000_000);
+        let class = criterion.address_class_for_test(&ctx, destination).unwrap();
+        prop_assert_eq!(class == RecipientClass::Listed, expected);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Decision equivalence helper
 // ─────────────────────────────────────────────────────────────────────────────
@@ -115,12 +158,15 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(10_000))]
 
     #[test]
+    #[serial_test::serial]
     fn prop_approval_above_bounds_and_determinism(
         (rule, threshold, cap) in arb_approval_above_rule(),
         amount in 1_i128..=300_000_000_000,
         tool in arb_tool_descriptor_for_payment_tools(),
         (profile, profile_name) in arb_profile(),
     ) {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let engine = PolicyEngineV1::new(single_rule_document(rule), profile_name);
         for amount in [amount, threshold / 2, threshold, threshold + 1,
             cap.unwrap_or(threshold), cap.unwrap_or(threshold) + 1] {
@@ -129,8 +175,8 @@ proptest! {
                 "starting_balance_stroops": amount.to_string(),
                 "asset": "native",
             });
-            let first = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
-            let second = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
+            let first = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
+            let second = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
             prop_assert!(decisions_equiv(&first, &second));
             let expected = if let Some(cap) = cap.filter(|cap| amount > *cap) {
                 Decision::Deny(DenyReason::PerTxCapExceeded {
@@ -161,16 +207,19 @@ proptest! {
     /// Instead we evaluate the same engine twice, which is the stronger claim:
     /// the engine has no hidden mutation between calls.
     #[test]
+    #[serial_test::serial]
     fn prop_per_tx_cap_evaluate_is_deterministic(
         rule in arb_per_tx_cap_rule(),
         tool in arb_tool_descriptor(),
         args in arb_payment_args(),
         (profile, profile_name) in arb_profile(),
     ) {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let doc = single_rule_document(rule);
         let engine = PolicyEngineV1::new(doc, profile_name);
-        let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
-        let r2 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
+        let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
+        let r2 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
         prop_assert!(
             decisions_equiv(&r1, &r2),
             "per_tx_cap determinism failed: first={r1:?} repeat={r2:?}"
@@ -181,16 +230,19 @@ proptest! {
     ///
     /// Same-engine re-evaluation must return the same `Decision`.
     #[test]
+    #[serial_test::serial]
     fn prop_counterparty_allowlist_evaluate_is_deterministic(
         rule in arb_counterparty_allowlist_rule(),
         tool in arb_tool_descriptor(),
         args in arb_payment_args(),
         (profile, profile_name) in arb_profile(),
     ) {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let doc = single_rule_document(rule);
         let engine = PolicyEngineV1::new(doc, profile_name);
-        let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
-        let r2 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
+        let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
+        let r2 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
         prop_assert!(
             decisions_equiv(&r1, &r2),
             "counterparty_allowlist determinism failed: first={r1:?} second={r2:?}"
@@ -206,17 +258,20 @@ proptest! {
     /// is `None`.  The property test exercises this correctly by omitting the
     /// view — both evaluations return identical errors.
     #[test]
+    #[serial_test::serial]
     fn prop_minimum_reserve_evaluate_is_deterministic(
         rule in arb_minimum_reserve_rule(),
         tool in arb_tool_descriptor(),
         args in arb_payment_args(),
         (profile, profile_name) in arb_profile(),
     ) {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let doc = single_rule_document(rule);
         let engine = PolicyEngineV1::new(doc, profile_name);
         // Evaluate without account_view (fail-closed path).
-        let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
-        let r2 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
+        let r1 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
+        let r2 = engine.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
         prop_assert!(
             decisions_equiv(&r1, &r2),
             "minimum_reserve determinism failed: first={r1:?} second={r2:?}"
@@ -249,6 +304,7 @@ proptest! {
     /// stroops (at minimum 2 stroops), so the strict deny rule (cap = 1 stroop)
     /// always fires for `stellar_pay` and `stellar_create_account`.
     #[test]
+    #[serial_test::serial]
     fn prop_adding_deny_rule_cannot_turn_allow_into_allow(
         base_rule in prop_oneof![arb_per_tx_cap_rule(), arb_approval_above_rule().prop_map(|(rule, _, _)| rule)],
         strict_deny_rule in arb_strict_deny_per_tx_rule(),
@@ -256,17 +312,19 @@ proptest! {
         args in arb_native_payment_args(),
         (profile, profile_name) in arb_profile(),
     ) {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // Step 1: evaluate with base rule only.
         let doc_base = single_rule_document(base_rule);
         let mut engine_base = PolicyEngineV1::new(doc_base, profile_name.clone());
-        let r_base = engine_base.evaluate(&tool, &args, &profile, None, None, None, None, None);
+        let r_base = engine_base.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
 
         // Step 2: if base allowed, prepend a strict deny rule.
         if matches!(r_base, Ok(Decision::Allow)) {
             let base_rule = engine_base.document.rules.remove(0);
             let doc_with_deny = two_rule_document(strict_deny_rule, base_rule);
             let engine_with_deny = PolicyEngineV1::new(doc_with_deny, profile_name.clone());
-            let r_with_deny = engine_with_deny.evaluate(&tool, &args, &profile, None, None, None, None, None);
+            let r_with_deny = engine_with_deny.evaluate(&tool, &args, &profile, None, None, None, None, None, 1_700_000_000_000);
 
             prop_assert!(
                 !matches!(r_with_deny, Ok(Decision::Allow)),
@@ -301,13 +359,20 @@ fn enumerate_deny_reason_for_test(v: &DenyReason) -> &'static str {
     // Exhaustive match with no `_` arm: the compiler will reject any new
     // `DenyReason` variant added to the enum until this helper is updated.
     match v {
-        DenyReason::PerTxCapExceeded { .. } => "per_tx_cap_exceeded",
-        DenyReason::ApprovalAboveExceeded { .. } => "approval_above_exceeded",
-        DenyReason::PerPeriodCapExceeded { .. } => "per_period_cap_exceeded",
+        DenyReason::PerTxCapExceeded { .. } | DenyReason::PerTxCapOverflow { .. } => {
+            "per_tx_cap_exceeded"
+        }
+        DenyReason::ApprovalAboveExceeded { .. } | DenyReason::ApprovalAboveOverflow { .. } => {
+            "approval_above_exceeded"
+        }
+        DenyReason::PerPeriodCapExceeded { .. } | DenyReason::PerPeriodCapOverflow { .. } => {
+            "per_period_cap_exceeded"
+        }
         DenyReason::RateLimitExceeded { .. } => "rate_limit_exceeded",
         DenyReason::CounterpartyDenied { .. } => "counterparty_denied",
         DenyReason::MinimumReserveBreached { .. } => "minimum_reserve_breached",
         DenyReason::OwnerSignatureStale { .. } => "owner_signature_stale",
+        DenyReason::AssetNotAllowlisted => "asset_not_allowlisted",
         DenyReason::NoMatchingRule => "no_matching_rule",
         DenyReason::ExplicitRuleDeny => "explicit_rule_deny",
         DenyReason::CounterpartyKindUnsupported { .. } => "counterparty_kind_unsupported",
@@ -321,6 +386,14 @@ fn enumerate_deny_reason_for_test(v: &DenyReason) -> &'static str {
         DenyReason::HomeDomainNotResolved { .. } => "home_domain_not_resolved",
         DenyReason::Sep10SessionMissing { .. } => "sep10.session_missing",
         DenyReason::Sep45SessionMissing { .. } => "sep45.session_missing",
+        DenyReason::TotalBudgetExhausted { .. } => "total_budget_exhausted",
+        DenyReason::UnlistedBudgetExceeded { .. } | DenyReason::UnlistedBudgetOverflow { .. } => {
+            "unlisted_budget_exceeded"
+        }
+        DenyReason::MemoBindingMismatch { .. } => "memo_binding_mismatch",
+        DenyReason::AccountFloorRefused { .. } => "account.floor_refused",
+        DenyReason::AccountUnread => "account.unread",
+        DenyReason::AccountStale { .. } => "account.stale",
     }
 }
 
@@ -389,6 +462,7 @@ fn deny_reason_wire_codes_are_unique() {
         DenyReason::OwnerSignatureStale {
             rotated_at: "2026-01-01T00:00:00Z".into(),
         },
+        DenyReason::AssetNotAllowlisted,
         DenyReason::NoMatchingRule,
         DenyReason::ExplicitRuleDeny,
         DenyReason::CounterpartyKindUnsupported {
@@ -427,6 +501,24 @@ fn deny_reason_wire_codes_are_unique() {
         DenyReason::Sep45SessionMissing {
             contract_id: "CABC1".into(),
         },
+        DenyReason::TotalBudgetExhausted {
+            asset: "native".into(),
+            max_stroops: 10,
+            remaining_stroops: 0,
+        },
+        DenyReason::UnlistedBudgetExceeded {
+            asset: "native".into(),
+            bound: crate::policy::UnlistedBound::PerTx,
+            max_stroops: 10,
+            attempted_stroops: 11,
+        },
+        DenyReason::MemoBindingMismatch { kind: "id".into() },
+        DenyReason::AccountFloorRefused {
+            min_stroops: 10,
+            balance_after_stroops: 9,
+        },
+        DenyReason::AccountUnread,
+        DenyReason::AccountStale { age_ms: 120_001 },
     ];
 
     let mut codes: HashSet<&'static str> = HashSet::new();
@@ -458,7 +550,7 @@ fn deny_reason_wire_codes_are_unique() {
     // but forgets the corresponding entry in `variants`, this catches it.
     assert_eq!(
         variants.len(),
-        20,
+        27,
         "variants list count drifted from DenyReason variant count.  \
          Update enumerate_deny_reason_for_test, the variants vec, and this assertion."
     );

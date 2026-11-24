@@ -187,10 +187,7 @@ pub async fn run(args: &DeploySpendingLimitPolicyArgs) -> i32 {
     let (profile, _origin) = match load_profile_or_synthesize_testnet(&resolved) {
         Ok(loaded) => loaded,
         Err(e) => {
-            print_error(
-                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
-                args.output,
-            );
+            print_error(&Envelope::<()>::err_raw(e.code(), e.message()), args.output);
             return 1;
         }
     };
@@ -486,7 +483,14 @@ mod tests {
     #[serial_test::serial]
     async fn mainnet_flag_without_profile_reaches_no_endpoint() {
         let guard_rpc = wiremock::MockServer::start().await;
-        let guard_home = tempfile::tempdir().expect("home");
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let mut args = dry_run_args();
@@ -508,6 +512,14 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn dry_run_derives_address_without_network() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let _guard = EnvGuard::set(TEST_DEPLOYER_ENV_VAR, &test_deployer_skey());
         let args = dry_run_args();
         let code = run(&args).await;

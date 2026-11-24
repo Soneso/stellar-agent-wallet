@@ -14,14 +14,20 @@
 //! 2. Report the registration URL back to the caller so the CLI can launch the
 //!    browser (or print the URL for manual use).
 //! 3. The CLI polls the approval store via [`CredentialsManager::poll_registration`]
-//!    at 500 ms intervals until the bridge POST handler calls
-//!    `record_passkey_registration` and embeds a `RegistrationInput`, or until
-//!    the deadline expires.
-//! 4. On success, write a `CredentialMetadata` record to the passkeys registry
-//!    TOML file at `<passkeys_dir>/<profile>.toml` (atomic write).
-//! 5. Emit a `PasskeyRegistered` audit-log entry via the optional
-//!    `AuditWriter` (sourced from the `SignersManager`'s shared writer —
-//!    shared `AuditWriter` from `SignersManager`).
+//!    at 500 ms intervals until the bridge POST handler verifies the
+//!    browser's response against the entry's registration challenge and
+//!    calls `record_passkey_registration`, or until the deadline expires. A
+//!    recorded registration comes back as a [`PendingPasskeyRegistration`];
+//!    nothing is written yet.
+//! 4. The CLI asks the operator for the confirmation code the registration
+//!    page shows. [`CredentialsManager::confirm_registration`] compares it
+//!    with the code of the recorded credential; only a match before the
+//!    deadline goes on.
+//! 5. A `PasskeyRegistered` row with status `registered` is written to the
+//!    profile's audit log, and only then is the `CredentialMetadata` record
+//!    written to the passkeys registry TOML file at
+//!    `<passkeys_dir>/<profile>.toml` (atomic write). A registration whose
+//!    row cannot be written is not registered.
 //!
 //! ## Registry storage
 //!
@@ -56,6 +62,7 @@ use crate::managers::signers::{RuleLockGuard, SignersManager, V1Handling};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use stellar_agent_core::approval::retry::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry,
 };
@@ -63,8 +70,11 @@ use stellar_agent_core::approval::store::{
     ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, generate_csrf_token,
 };
 use stellar_agent_core::approval::user_id::process_uid_for_attestation;
+use stellar_agent_core::approval::webauthn_registration::{
+    ConfirmationCode, PASSKEY_REGISTRATION_CODE_DOMAIN, PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN,
+};
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::writer::AuditWriter;
+use stellar_agent_core::audit_log::writer::{AuditWriter, WriterError};
 use stellar_agent_core::observability::{RedactedStrkey, is_loopback_http_url};
 use stellar_agent_core::profile::schema::default_passkeys_dir;
 use stellar_agent_core::redact_first5_last5;
@@ -73,7 +83,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::webauthn::passkey_signer::{PasskeyCredentialRecord, PasskeySignHandle};
-use stellar_agent_network::signing::Signer as _;
+use stellar_agent_core::smart_account::rule_id::ContextRuleId;
+use stellar_agent_network::signing::{Signer as _, SmartAccountAuthDigest};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -209,9 +220,13 @@ impl std::fmt::Debug for RegistrationHandle {
 ///
 /// # Variant triggers
 ///
-/// - [`AddPasskeyOutcome::Registered`] — the bridge POST handler called
-///   `record_passkey_registration` and the polling loop observed the completed
-///   `RegistrationInput` in the shared approval store.
+/// - [`AddPasskeyOutcome::AwaitingConfirmation`]: the bridge POST handler
+///   verified the browser's response against the entry's registration
+///   challenge and called `record_passkey_registration`, and the polling loop
+///   observed the recorded `RegistrationInput` in the shared approval store.
+///   Nothing is registered yet: the registration waits for
+///   [`CredentialsManager::confirm_registration`] with the code the
+///   registration page shows.
 /// - [`AddPasskeyOutcome::Timeout`] — the polling deadline elapsed before
 ///   a `RegistrationInput` appeared.
 /// - [`AddPasskeyOutcome::UserCanceled`] — the approval store entry exists
@@ -226,18 +241,21 @@ impl std::fmt::Debug for RegistrationHandle {
 /// # Note on browser-launch failure
 ///
 /// Browser-launch failure is NOT surfaced through `AddPasskeyOutcome`. The
-/// CLI layer (`add_passkey.rs`) handles a failed `webbrowser::open` call by
-/// printing the URL to stderr and continuing the poll normally. The outcome
-/// of the polling loop is one of the variants above regardless of whether the
-/// browser was launched.
+/// CLI layer (`add_passkey.rs`) prints the URL to stderr as the manual
+/// handoff, opens the browser through a private redirect file, and continues
+/// the poll whether or not the launch succeeded. The outcome of the polling
+/// loop is one of the variants above regardless of whether the browser was
+/// launched.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum AddPasskeyOutcome {
-    /// Registration completed successfully; the credential is stored in the
-    /// passkeys registry.
-    Registered {
-        /// The stored credential metadata.
-        metadata: CredentialMetadata,
+    /// The bridge recorded a verified registration response; the credential
+    /// awaits the operator's confirmation code and is not in the registry.
+    AwaitingConfirmation {
+        /// The recorded registration, for
+        /// [`CredentialsManager::confirm_registration`] or
+        /// [`CredentialsManager::abandon_registration`].
+        pending: PendingPasskeyRegistration,
     },
     /// The polling deadline elapsed before the registration ceremony completed.
     Timeout,
@@ -251,6 +269,64 @@ pub enum AddPasskeyOutcome {
     /// cancellation — the bridge did not reject the ceremony; the entry simply
     /// does not exist.
     EntryMissing,
+}
+
+/// A registration the bridge verified and recorded, awaiting the operator's
+/// confirmation code.
+///
+/// Holds the credential name, the recorded credential ID and key, the
+/// authenticator's transports, the relying-party ID, the code the
+/// registration page computes for that credential, and the deadline the
+/// polling ran under. It cannot be cloned or serialized, and `Debug` shows
+/// only the credential name, so the expected code never leaves it.
+#[must_use]
+pub struct PendingPasskeyRegistration {
+    credential_name: String,
+    credential_id: Vec<u8>,
+    public_key_sec1: [u8; PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN],
+    transports: Vec<String>,
+    rp_id: String,
+    expected_code: ConfirmationCode,
+    deadline: Instant,
+}
+
+impl PendingPasskeyRegistration {
+    /// The name the operator chose for the credential.
+    #[must_use]
+    pub fn credential_name(&self) -> &str {
+        &self.credential_name
+    }
+
+    /// The deadline after which [`CredentialsManager::confirm_registration`]
+    /// refuses.
+    #[must_use]
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// The canonical base64url form of the recorded credential ID.
+    fn credential_id_b64url(&self) -> String {
+        URL_SAFE_NO_PAD.encode(&self.credential_id)
+    }
+}
+
+impl std::fmt::Debug for PendingPasskeyRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingPasskeyRegistration")
+            .field("credential_name", &self.credential_name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a recorded registration ended without a confirmation code.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnconfirmedEnd {
+    /// The deadline passed at the prompt.
+    Expired,
+    /// The prompt ended without a code: end of input, a read error, or an
+    /// interrupt.
+    Canceled,
 }
 
 /// Outcome of [`CredentialsManager::sign_with_passkey_rule`].
@@ -335,7 +411,7 @@ pub enum CredentialsError {
     /// TOML deserialisation error on the passkeys registry.
     #[error("passkeys registry TOML parse error: {detail}")]
     RegistryParse {
-        /// Human-readable parse error from the TOML deserialiser.
+        /// The TOML parse failure position, without source text.
         detail: String,
     },
 
@@ -351,27 +427,19 @@ pub enum CredentialsError {
     StateDirUnavailable,
 
     /// The named credential does not exist in the passkeys registry.
-    #[error("credential '{name}' not found")]
-    NotFound {
-        /// The name that was looked up.
-        name: String,
-    },
+    #[error("the requested credential was not found")]
+    NotFound,
 
     /// A credential with the given name already exists.
     #[error(
-        "credential '{name}' already exists; choose a different name or delete the existing one"
+        "the requested credential already exists; choose a different name or delete the existing one"
     )]
-    DuplicateName {
-        /// The name that already exists in the registry.
-        name: String,
-    },
+    DuplicateName,
 
     /// Credential name fails the naming rules (non-empty, <= 64 chars,
     /// printable ASCII only).
-    #[error("invalid credential name '{name}': {reason}")]
+    #[error("the credential name is not valid: {reason}")]
     InvalidName {
-        /// The name that failed validation.
-        name: String,
         /// A human-readable description of why the name is invalid.
         reason: &'static str,
     },
@@ -514,6 +582,15 @@ pub enum CredentialsError {
         source: Box<crate::SaError>,
     },
 
+    /// The pinned verifier is revoked or retired. No drift row is written,
+    /// and the ceremony aborts before any bridge I/O.
+    #[error("the rule's pinned verifier is revoked or retired; passkey signing refused: {source}")]
+    VerifierStatusRefused {
+        /// The verifier status refusal.
+        #[source]
+        source: Box<crate::SaError>,
+    },
+
     /// The pre-signing drift-check infrastructure was unavailable.
     ///
     /// Distinct from [`CredentialsError::WasmHashDrift`] (which indicates
@@ -524,7 +601,9 @@ pub enum CredentialsError {
     /// whose pin record holds policy pins while the rule has no policy on
     /// chain. It carries `SaError::PinnedVerifierAbsent` too, the refusal of
     /// a rule holding a live `External` signer whose pin record pins no
-    /// verifier. No drift row is written for either.
+    /// verifier, and `SaError::WasmPinIncomplete`, the refusal of a rule
+    /// whose pin record holds eight-byte hash prefixes. No drift row is
+    /// written for any of them.
     ///
     /// The WebAuthn ceremony is aborted (fail-closed) BEFORE any bridge I/O.
     /// No `SaVerifierHashDrift` / `SaPolicyHashDrift` audit row is emitted
@@ -577,6 +656,68 @@ pub enum CredentialsError {
     AuditWriterPoisoned {
         /// Static context label for the write that could not be performed.
         context: AuditWriterPoisonContext,
+    },
+
+    /// Passkey signing was refused because the auth entry's network ID is the
+    /// mainnet network ID.
+    ///
+    /// Wire code: `sa.credentials.mainnet_write_forbidden`, carried in the
+    /// Display text because this type has no code method of its own.
+    ///
+    /// Returned by [`CredentialsManager::sign_with_passkey_rule`] at entry,
+    /// before the rule checks, the approval store and the bridge, so no
+    /// ceremony starts and no `PasskeyAssertion` audit row is written.
+    #[error("passkey signing on mainnet is not permitted (sa.credentials.mainnet_write_forbidden)")]
+    MainnetWriteForbidden,
+
+    /// The confirmation code typed is not the code the registration page
+    /// shows for the recorded credential.
+    ///
+    /// Returned by [`CredentialsManager::confirm_registration`]; the
+    /// registry is untouched.
+    #[error(
+        "the confirmation code typed is not the one the registration page shows; \
+         nothing was registered"
+    )]
+    RegistrationConfirmationMismatch,
+
+    /// The registration deadline passed before the confirmation code was
+    /// typed.
+    ///
+    /// Returned by [`CredentialsManager::confirm_registration`]; the
+    /// registry is untouched.
+    #[error("the timeout passed before the confirmation code was typed; nothing was registered")]
+    RegistrationConfirmationExpired,
+
+    /// The `registered` audit row could not be written, so the credential
+    /// was not written to the registry.
+    #[error(
+        "the passkey registration audit row could not be written; nothing was registered: \
+         {detail}"
+    )]
+    AuditWrite {
+        /// The audit writer's refusal.
+        detail: String,
+    },
+
+    /// Passkey signing was refused because the auth entry's digests are not
+    /// the values its own facts produce.
+    ///
+    /// Wraps the [`crate::SaError`] of
+    /// [`crate::managers::auth_entry::PartialSorobanAuthorizationEntry::validate`]:
+    /// `SaError::AuthEntryBindingMismatch`, or
+    /// `SaError::AuthEntryConstructionFailed` when the recomputation could not
+    /// encode its input. Returned at entry, like
+    /// [`CredentialsError::MainnetWriteForbidden`], so no ceremony starts and
+    /// no `PasskeyAssertion` audit row is written.
+    #[error("auth entry refused before passkey signing: {source}")]
+    AuthEntryInvalid {
+        /// The wrapped validation error.
+        ///
+        /// Named `source` so `thiserror` wires `std::error::Error::source()` for
+        /// correct error-chain traversal.
+        #[source]
+        source: Box<crate::SaError>,
     },
 }
 
@@ -892,7 +1033,13 @@ impl CredentialsManager {
         }
         let content = fs::read_to_string(&path)?;
         toml::from_str(&content).map_err(|e| CredentialsError::RegistryParse {
-            detail: e.to_string(),
+            detail: format!(
+                "not valid TOML: {}",
+                stellar_agent_core::profile::toml_diagnostic::toml_error_position(
+                    &content,
+                    e.span().map(|s| s.start)
+                )
+            ),
         })
     }
 
@@ -1017,7 +1164,7 @@ impl CredentialsManager {
     ///
     /// let mgr = CredentialsManager::from_defaults_readonly("default", "localhost").unwrap();
     /// let err = mgr.show("nonexistent").unwrap_err();
-    /// assert!(matches!(err, CredentialsError::NotFound { .. }));
+    /// assert!(matches!(err, CredentialsError::NotFound));
     /// ```
     pub fn show(&self, name: &str) -> Result<CredentialMetadata, CredentialsError> {
         let registry = self.load_registry()?;
@@ -1025,9 +1172,7 @@ impl CredentialsManager {
             .credentials
             .into_iter()
             .find(|c| c.credential_name == name)
-            .ok_or_else(|| CredentialsError::NotFound {
-                name: name.to_owned(),
-            })
+            .ok_or(CredentialsError::NotFound)
     }
 
     /// Returns the registered SEC1 public key for `credential_id`.
@@ -1072,9 +1217,7 @@ impl CredentialsManager {
         let before = registry.credentials.len();
         registry.credentials.retain(|c| c.credential_name != name);
         if registry.credentials.len() == before {
-            return Err(CredentialsError::NotFound {
-                name: name.to_owned(),
-            });
+            return Err(CredentialsError::NotFound);
         }
         self.persist_registry(&registry)
     }
@@ -1093,7 +1236,8 @@ impl CredentialsManager {
     /// 1. Opening the `PendingApprovalStore` exactly once.
     /// 2. Passing the same `Arc<Mutex<PendingApprovalStore>>` to both
     ///    `start_bridge_register_only` / `start_bridge_with_pubkey_lookup` and [`CredentialsManager::new`].
-    /// 3. Launching the browser to the returned `RegistrationHandle::url`.
+    /// 3. Handing the returned `RegistrationHandle::url` to the browser
+    ///    without placing it in a launcher process's arguments.
     /// 4. Calling [`CredentialsManager::poll_registration`] with the nonce.
     ///
     /// The `nominal_smart_account` parameter is an optional display-only
@@ -1134,9 +1278,7 @@ impl CredentialsManager {
             .iter()
             .any(|c| c.credential_name == credential_name)
         {
-            return Err(CredentialsError::DuplicateName {
-                name: credential_name.to_owned(),
-            });
+            return Err(CredentialsError::DuplicateName);
         }
 
         // Generate CSRF token + user handle.
@@ -1225,10 +1367,7 @@ impl CredentialsManager {
         // with SecurityError (WebAuthn-2 §5.1.2 requires rpId ≡ origin hostname).
         if bridge_addr.ip().is_loopback() && self.rp_id != "localhost" {
             warn!(
-                rp_id = %self.rp_id,
-                "bridge binds loopback but rp_id is not \"localhost\"; \
-                 WebAuthn ceremony will fail in a standards-conforming browser \
-                 (WebAuthn-2 §5.1.2)"
+                "rp_id must be localhost for the loopback registration bridge; use --rp-id localhost."
             );
         }
 
@@ -1251,24 +1390,27 @@ impl CredentialsManager {
     /// The bridge (which holds an `Arc` clone of the same mutex) can write to
     /// the store between poll cycles without contention.
     ///
-    /// On success, writes the credential metadata (including the SEC1 public
-    /// key for assertion verification) to the passkeys registry and
-    /// optionally emits an audit-log entry.
+    /// A recorded registration returns
+    /// [`AddPasskeyOutcome::AwaitingConfirmation`] with the
+    /// [`PendingPasskeyRegistration`] that
+    /// [`CredentialsManager::confirm_registration`] takes; polling writes
+    /// neither the registry nor an audit row for it. A timeout, a missing
+    /// entry and an entry of another kind each write their `PasskeyRegistered`
+    /// row to `audit_writer`, best effort.
     ///
     /// # Errors
     ///
     /// - [`CredentialsError::ApprovalStoreUnavailable`] — the manager was
     ///   constructed without an approval store (e.g. via
     ///   [`CredentialsManager::from_defaults_readonly`]).
-    /// - [`CredentialsError::DuplicateName`] — (internal; should not occur in
-    ///   practice because `prepare_registration` already checked).
-    /// - [`CredentialsError`] variants on registry I/O failure.
+    /// - [`CredentialsError::ApprovalStore`]: the entry holds a recorded
+    ///   registration but no registration challenge.
     pub async fn poll_registration(
         &self,
         credential_name: &str,
         nonce: &str,
         deadline: Instant,
-        mut audit_writer: Option<&mut AuditWriter>,
+        audit_writer: &mut AuditWriter,
     ) -> Result<AddPasskeyOutcome, CredentialsError> {
         // Require approval store — read-only managers cannot poll registrations.
         let _store_check = self
@@ -1279,12 +1421,12 @@ impl CredentialsManager {
         loop {
             // Check deadline before sleeping.
             if Instant::now() >= deadline {
-                self.emit_audit(audit_writer.as_deref_mut(), credential_name, "", "timeout");
+                self.emit_audit_best_effort(audit_writer, credential_name, "", "timeout");
                 return Ok(AddPasskeyOutcome::Timeout);
             }
 
             if let Some(outcome) = self
-                .check_store_for_registration(nonce, credential_name, audit_writer.as_deref_mut())
+                .check_store_for_registration(nonce, credential_name, deadline, audit_writer)
                 .await?
             {
                 return Ok(outcome);
@@ -1295,7 +1437,7 @@ impl CredentialsManager {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let sleep_for = self.poll_interval.min(remaining);
             if sleep_for.is_zero() {
-                self.emit_audit(audit_writer.as_deref_mut(), credential_name, "", "timeout");
+                self.emit_audit_best_effort(audit_writer, credential_name, "", "timeout");
                 return Ok(AddPasskeyOutcome::Timeout);
             }
             tokio::time::sleep(sleep_for).await;
@@ -1308,7 +1450,8 @@ impl CredentialsManager {
     ///
     /// Acquires the tokio mutex, reads the entry for `nonce`, then releases
     /// immediately. Returns `Ok(Some(outcome))` if the nonce is found with a
-    /// completed `RegistrationInput`, `Ok(None)` if still pending, or an
+    /// recorded `RegistrationInput` (staged as a [`PendingPasskeyRegistration`]
+    /// under `deadline`, nothing written), `Ok(None)` if still pending, or an
     /// error on failure.
     ///
     /// Callers MUST only invoke this method after verifying that
@@ -1318,7 +1461,8 @@ impl CredentialsManager {
         &self,
         nonce: &str,
         credential_name: &str,
-        audit_writer: Option<&mut AuditWriter>,
+        deadline: Instant,
+        audit_writer: &mut AuditWriter,
     ) -> Result<Option<AddPasskeyOutcome>, CredentialsError> {
         // Require approval store. This is a private method called only from
         // `poll_registration`, which has already verified `Some(_)` at its
@@ -1339,9 +1483,8 @@ impl CredentialsManager {
             // Nonce not found — may have been cleaned up (TTL-expired) or the
             // entry was never persisted by the bridge. This is distinct from a
             // user-driven cancellation — the entry simply does not exist.
-            let nonce_redacted = redact_first5_last5(nonce);
-            warn!(nonce = %nonce_redacted, "registration nonce not found in store");
-            self.emit_audit(audit_writer, credential_name, "", "entry_missing");
+            warn!("registration nonce not found in store");
+            self.emit_audit_best_effort(audit_writer, credential_name, "", "entry_missing");
             return Ok(Some(AddPasskeyOutcome::EntryMissing));
         };
 
@@ -1349,54 +1492,41 @@ impl CredentialsManager {
             ApprovalKind::RegisterPasskey {
                 registration_input: Some(reg_input),
                 rp_id,
+                registration_challenge,
                 ..
             } => {
-                // Registration completed — write to registry and emit audit.
-                let credential_id_bytes = reg_input.credential_id();
-                let credential_id_b64url = URL_SAFE_NO_PAD.encode(credential_id_bytes);
-                let transports = reg_input.transports().join(",");
-                let registered_at_unix_ms = unix_now_ms();
-
-                // Encode the SEC1 public key (65-byte uncompressed P-256 point).
-                // Required for assertion verification. The fixture in tests
-                // supplies an all-zero key (`[0x04, 0, 0, ...]`) which is not a
-                // valid P-256 point but satisfies the 65-byte structural check.
-                let public_key_sec1_b64 =
-                    URL_SAFE_NO_PAD.encode(reg_input.public_key_uncompressed_sec1());
-
-                let metadata = CredentialMetadata {
-                    credential_name: credential_name.to_owned(),
-                    credential_id_b64url: credential_id_b64url.clone(),
-                    rp_id: rp_id.clone(),
-                    transports,
-                    registered_at_unix_ms,
-                    public_key_sec1_b64,
-                };
-
-                // Write to passkeys registry (no mutex held during persist).
-                let mut registry = self.load_registry()?;
-                // Guard against a concurrent duplicate (defensive).
-                if registry
-                    .credentials
-                    .iter()
-                    .any(|c| c.credential_name == credential_name)
-                {
-                    return Err(CredentialsError::DuplicateName {
-                        name: credential_name.to_owned(),
+                // The bridge recorded a verified response. Stage it with the
+                // code the page computes for the recorded credential; the
+                // registry and the audit log are written only once the
+                // operator confirms that code.
+                let Some(challenge) = registration_challenge else {
+                    return Err(CredentialsError::ApprovalStore {
+                        detail: "the registration entry carries no challenge".to_owned(),
                     });
-                }
-                registry.credentials.push(metadata.clone());
-                self.persist_registry(&registry)?;
-
-                // Emit audit entry.
-                self.emit_audit(
-                    audit_writer,
-                    credential_name,
-                    &credential_id_b64url,
-                    "registered",
+                };
+                let public_key_sec1: [u8; PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN] = reg_input
+                    .public_key_uncompressed_sec1()
+                    .try_into()
+                    .map_err(|_| CredentialsError::ApprovalStore {
+                        detail: "the recorded registration key is not 65 bytes".to_owned(),
+                    })?;
+                let expected_code = ConfirmationCode::compute(
+                    PASSKEY_REGISTRATION_CODE_DOMAIN,
+                    challenge,
+                    reg_input.credential_id(),
+                    &public_key_sec1,
                 );
-
-                Ok(Some(AddPasskeyOutcome::Registered { metadata }))
+                Ok(Some(AddPasskeyOutcome::AwaitingConfirmation {
+                    pending: PendingPasskeyRegistration {
+                        credential_name: credential_name.to_owned(),
+                        credential_id: reg_input.credential_id().to_vec(),
+                        public_key_sec1,
+                        transports: reg_input.transports().to_vec(),
+                        rp_id: rp_id.clone(),
+                        expected_code,
+                        deadline,
+                    },
+                }))
             }
             ApprovalKind::RegisterPasskey {
                 registration_input: None,
@@ -1407,34 +1537,155 @@ impl CredentialsManager {
             }
             _ => {
                 // Kind mismatch — unexpected; treat as user-cancelled.
-                let nonce_redacted = redact_first5_last5(nonce);
-                warn!(nonce = %nonce_redacted, "approval store entry has unexpected kind");
-                self.emit_audit(audit_writer, credential_name, "", "user_canceled");
+                warn!("approval store entry has unexpected kind");
+                self.emit_audit_best_effort(audit_writer, credential_name, "", "user_canceled");
                 Ok(Some(AddPasskeyOutcome::UserCanceled))
             }
         }
     }
 
-    /// Emits a `PasskeyRegistered` audit entry if `audit_writer` is `Some`.
+    /// Registers the credential of `pending` once `typed_code` is the code
+    /// the registration page shows for it, at `now`.
+    ///
+    /// Consumes the pending registration: one code is compared per
+    /// ceremony. In this order:
+    ///
+    /// 1. At or after the deadline, a `confirmation_expired` row is written
+    ///    and the registration refuses.
+    /// 2. A code that is malformed or names another credential writes a
+    ///    `confirmation_mismatch` row carrying the credential ID and refuses.
+    ///    The comparison runs in constant time over the normalized digits.
+    /// 3. A name already in the registry refuses with no row.
+    /// 4. The `registered` row is written; when it cannot be, nothing reaches
+    ///    the registry.
+    /// 5. The credential goes into the registry; when that write fails, a
+    ///    `registry_write_failed` row is written and the error returned.
+    ///
+    /// The rows of steps 1, 2 and 5 are best effort, because none of them
+    /// registers anything; only the `registered` row fails closed.
+    ///
+    /// # Errors
+    ///
+    /// - [`CredentialsError::RegistrationConfirmationExpired`]: step 1.
+    /// - [`CredentialsError::RegistrationConfirmationMismatch`]: step 2.
+    /// - [`CredentialsError::DuplicateName`]: step 3.
+    /// - [`CredentialsError::AuditWrite`]: step 4.
+    /// - [`CredentialsError`] variants on registry I/O failure: step 5, or a
+    ///   registry that cannot be read at step 3.
+    pub fn confirm_registration(
+        &self,
+        pending: PendingPasskeyRegistration,
+        typed_code: &str,
+        now: Instant,
+        audit_writer: &mut AuditWriter,
+    ) -> Result<CredentialMetadata, CredentialsError> {
+        let credential_id_b64url = pending.credential_id_b64url();
+        if now >= pending.deadline {
+            self.emit_audit_best_effort(
+                audit_writer,
+                &pending.credential_name,
+                &credential_id_b64url,
+                "confirmation_expired",
+            );
+            return Err(CredentialsError::RegistrationConfirmationExpired);
+        }
+        if !pending.expected_code.matches(typed_code) {
+            self.emit_audit_best_effort(
+                audit_writer,
+                &pending.credential_name,
+                &credential_id_b64url,
+                "confirmation_mismatch",
+            );
+            return Err(CredentialsError::RegistrationConfirmationMismatch);
+        }
+
+        let mut registry = self.load_registry()?;
+        if registry
+            .credentials
+            .iter()
+            .any(|c| c.credential_name == pending.credential_name)
+        {
+            return Err(CredentialsError::DuplicateName);
+        }
+
+        let metadata = CredentialMetadata {
+            credential_name: pending.credential_name,
+            credential_id_b64url,
+            rp_id: pending.rp_id,
+            transports: pending.transports.join(","),
+            registered_at_unix_ms: unix_now_ms(),
+            public_key_sec1_b64: URL_SAFE_NO_PAD.encode(pending.public_key_sec1),
+        };
+
+        // The row precedes the registry write, so no credential is ever
+        // registered without its trail.
+        self.emit_audit(
+            audit_writer,
+            &metadata.credential_name,
+            &metadata.credential_id_b64url,
+            "registered",
+        )
+        .map_err(|e| CredentialsError::AuditWrite {
+            detail: e.to_string(),
+        })?;
+
+        registry.credentials.push(metadata.clone());
+        if let Err(e) = self.persist_registry(&registry) {
+            self.emit_audit_best_effort(
+                audit_writer,
+                &metadata.credential_name,
+                &metadata.credential_id_b64url,
+                "registry_write_failed",
+            );
+            return Err(e);
+        }
+        Ok(metadata)
+    }
+
+    /// Records why `pending` ended without a confirmation code:
+    /// `confirmation_expired` for [`UnconfirmedEnd::Expired`],
+    /// `confirmation_canceled` for [`UnconfirmedEnd::Canceled`]. Nothing
+    /// reaches the registry, and the row is best effort.
+    pub fn abandon_registration(
+        &self,
+        pending: PendingPasskeyRegistration,
+        end: UnconfirmedEnd,
+        audit_writer: &mut AuditWriter,
+    ) {
+        let status = match end {
+            UnconfirmedEnd::Expired => "confirmation_expired",
+            UnconfirmedEnd::Canceled => "confirmation_canceled",
+        };
+        let PendingPasskeyRegistration {
+            credential_name,
+            credential_id,
+            ..
+        } = pending;
+        self.emit_audit_best_effort(
+            audit_writer,
+            &credential_name,
+            &URL_SAFE_NO_PAD.encode(credential_id),
+            status,
+        );
+    }
+
+    /// Writes a `PasskeyRegistered` audit entry with `status`.
     ///
     /// `credential_id_b64url` must be provided so the
     /// `AuditEntry` constructor can apply first-5-last-5 redaction internally.
     /// Pass `""` for non-success outcomes where no credential ID is available;
     /// the constructor substitutes a fixed placeholder in that case.
     ///
-    /// Audit-log failures are non-fatal — a warn is emitted
-    /// and the caller continues normally.
+    /// # Errors
+    ///
+    /// The [`WriterError`] of the append.
     fn emit_audit(
         &self,
-        audit_writer: Option<&mut AuditWriter>,
+        audit_writer: &mut AuditWriter,
         credential_name: &str,
         credential_id_b64url: &str,
         status: &str,
-    ) {
-        let Some(writer) = audit_writer else {
-            return;
-        };
-
+    ) -> Result<(), WriterError> {
         // Generate a short request_id (8 random bytes, base64url-encoded).
         let mut raw = [0u8; 8];
         OsRng.fill_bytes(&mut raw);
@@ -1462,11 +1713,24 @@ impl CredentialsManager {
             request_id,
         );
 
-        if let Err(e) = writer.write_entry(entry) {
-            // Audit-log failures are non-fatal but must be warned.
+        audit_writer.write_entry(entry)
+    }
+
+    /// [`Self::emit_audit`] for a row that registers nothing: a failed write
+    /// is warned about and the caller continues.
+    fn emit_audit_best_effort(
+        &self,
+        audit_writer: &mut AuditWriter,
+        credential_name: &str,
+        credential_id_b64url: &str,
+        status: &str,
+    ) {
+        if let Err(e) = self.emit_audit(audit_writer, credential_name, credential_id_b64url, status)
+        {
             warn!(
                 error = %e,
                 credential_name = %credential_name,
+                status = %status,
                 "failed to write passkey_registered audit entry"
             );
         }
@@ -1476,6 +1740,11 @@ impl CredentialsManager {
     /// browser-handoff approval spine.
     ///
     /// # Overview
+    ///
+    /// `partial` is validated first with
+    /// [`crate::managers::auth_entry::PartialSorobanAuthorizationEntry::validate`]:
+    /// a mainnet network ID, or digests that differ from the recomputed ones,
+    /// are refused before every step below, including the audit row of step 8.
     ///
     /// 1. Resolve `credential_name` → `CredentialMetadata` from the passkeys
     ///    registry (fails with `CredentialsError::NotFound` if absent).
@@ -1503,23 +1772,23 @@ impl CredentialsManager {
     ///    Early-exit paths (those that return before `poll_signing`) emit with
     ///    `credential_id_b64url = ""` and `rp_id = ""` because those fields are
     ///    only available after `show()` succeeds; `auth_digest_hex` is always
-    ///    derived from the caller-supplied `auth_digest` parameter.
+    ///    derived from the digest of `partial`.
     ///
     /// # Parameters
     ///
     /// - `credential_name`: name to look up in the passkeys registry.
-    /// - `smart_account`: the C-strkey of the smart account that this signing
-    ///   ceremony targets.  Redacted to first-5-last-5 in the approval store
-    ///   entry **and** the `PasskeyAssertion` audit-log entry to prevent
-    ///   sensitive data leaking into logs.
-    ///   The `smart_account_redacted` field in `EventKind::PasskeyAssertion`
+    /// - `partial`: the pre-signature auth entry the ceremony signs. Its
+    ///   `auth_digest` is the 32-byte Soroban auth digest the WebAuthn
+    ///   ceremony signs (the `challenge` the bridge encodes for the browser),
+    ///   its `context_rule_ids` are the rules the per-signing checks run for,
+    ///   and its `smart_account` is the smart account the ceremony targets.
+    ///   The smart account's strkey is redacted to first-5-last-5 in the
+    ///   approval store entry **and** the `PasskeyAssertion` audit-log entry;
+    ///   the `smart_account_redacted` field in `EventKind::PasskeyAssertion`
     ///   distinguishes ceremonies for different smart accounts in the audit
-    ///   trail.
-    /// - `auth_digest`: 32-byte Soroban auth digest that the WebAuthn
-    ///   ceremony must sign (the `challenge` the bridge encodes for the
-    ///   browser).
+    ///   trail. `partial` is validated at entry, before anything else runs.
     /// - `signers_manager`: the `SignersManager` through which the per-signing
-    ///   rule checks of every non-zero rule in `rule_ids` run: the rule locks,
+    ///   rule checks of every non-zero rule in `context_rule_ids` run: the rule locks,
     ///   the signer-set baseline reads, the pinned-hash drift check and the
     ///   signer-set comparison. It also provides the shared
     ///   `Arc<Mutex<AuditWriter>>` (via `SignersManager::audit_writer()`) that
@@ -1534,6 +1803,12 @@ impl CredentialsManager {
     ///
     /// # Errors
     ///
+    /// - [`CredentialsError::MainnetWriteForbidden`]: `partial.network_id` is
+    ///   the mainnet network ID. Refused at entry: no rule check, no store
+    ///   entry, no bridge I/O and no `PasskeyAssertion` audit row.
+    /// - [`CredentialsError::AuthEntryInvalid`]: `partial` fails
+    ///   [`crate::managers::auth_entry::PartialSorobanAuthorizationEntry::validate`]
+    ///   otherwise; refused at entry like the mainnet case.
     /// - [`CredentialsError::ApprovalStoreUnavailable`] — the manager was
     ///   constructed without an approval store (read-only path).
     /// - [`CredentialsError::NotFound`] — no credential with `credential_name`.
@@ -1573,16 +1848,17 @@ impl CredentialsManager {
     /// diversification enforce-default trigger.
     #[allow(
         clippy::too_many_arguments,
-        reason = "signing pipeline requires credential, account, digest, signers_manager, \
+        reason = "signing pipeline requires credential, auth entry, signers_manager, \
                   bridge, timeout, URL callback, and accept_single_verifier opt-in; \
                   accept_single_verifier bypasses the diversification enforce-default trigger"
     )]
+    /// The gate checks the credential and key data before inserting an approval request.
+    /// Once the request is authorized, the admitted charge remains.
     pub async fn sign_with_passkey_rule(
         &self,
+        gate: &crate::signing::gate::SigningGate,
         credential_name: &str,
-        smart_account: &str,
-        auth_digest: &[u8; 32],
-        rule_ids: Vec<u32>,
+        partial: &crate::managers::auth_entry::PartialSorobanAuthorizationEntry,
         // `signers_manager`: runs the per-signing divergence and drift checks
         // before the WebAuthn ceremony, and supplies the audit writer the
         // PasskeyAssertion row goes to. See
@@ -1600,6 +1876,26 @@ impl CredentialsManager {
         // single-verifier high-value or Undetermined-criteria rules.
         accept_single_verifier: bool,
     ) -> Result<SignWithPasskeyOutcome, CredentialsError> {
+        // The entry checks precede the ceremony and its audit machinery: a
+        // refused entry starts nothing, so it leaves no PasskeyAssertion row.
+        let digest = partial.signing_digest().map_err(|e| match e {
+            crate::SaError::MainnetWriteForbidden => CredentialsError::MainnetWriteForbidden,
+            other => CredentialsError::AuthEntryInvalid {
+                source: Box::new(other),
+            },
+        })?;
+        // An address with no strkey form renders as a sentinel that the
+        // contract-strkey parse in the rule checks refuses, so it takes the
+        // same audited refusal as any other non-contract address.
+        let smart_account =
+            crate::managers::rules::xdr_scaddress_to_strkey_or_sentinel(&partial.smart_account);
+        let smart_account = smart_account.as_str();
+        let rule_ids: Vec<u32> = partial
+            .context_rule_ids
+            .iter()
+            .map(ContextRuleId::as_u32)
+            .collect();
+
         // Audit emission must fire on EVERY terminal path,
         // including early-exit errors that propagate before `poll_signing` is
         // called.  Pattern: delegate the signing pipeline to an inner helper that
@@ -1613,7 +1909,7 @@ impl CredentialsManager {
         // the `AuditEntry::new_passkey_assertion` constructor accepts — the `""`
         // sentinel is the documented convention for non-success paths where the
         // field is unavailable.
-        let auth_digest_hex = encode_auth_digest_hex(auth_digest);
+        let auth_digest_hex = encode_auth_digest_hex(digest.as_bytes());
         let signed_at_unix_ms = unix_now_ms();
 
         // Writer-sharing details live in the function rustdoc above; keep the
@@ -1631,9 +1927,10 @@ impl CredentialsManager {
         // on the opt-in path before proceeding.
         let (inner_result, credential_id_b64url_for_audit, rp_id_for_audit, divergence_request_id) =
             self.sign_with_passkey_rule_inner(
+                gate,
                 credential_name,
                 smart_account,
-                auth_digest,
+                &digest,
                 rule_ids,
                 // Clone preserves signers_manager for emit_signing_audit below
                 // Arc clone is O(1).
@@ -1647,7 +1944,7 @@ impl CredentialsManager {
 
         // Derive the audit result tag from the full Result, covering all
         // closed-set outcomes enumerated in
-        // `audit_log/schema.rs PasskeyAssertion.result` (thirteen classes).
+        // `audit_log/schema.rs PasskeyAssertion.result` (fifteen classes).
         let result_tag = match &inner_result {
             Ok(SignWithPasskeyOutcome::Signed { .. }) => {
                 info!(credential_name, "passkey signing ceremony completed");
@@ -1656,10 +1953,15 @@ impl CredentialsManager {
             Ok(SignWithPasskeyOutcome::Timeout) => "failure:timeout",
             Ok(SignWithPasskeyOutcome::UserCanceled) => "failure:user_canceled",
             Ok(SignWithPasskeyOutcome::EntryMissing) => "failure:entry_missing",
-            Err(CredentialsError::NotFound { .. }) => "failure:credential_not_found",
+            Err(CredentialsError::NotFound) => "failure:credential_not_found",
             Err(CredentialsError::Signing { .. }) => "failure:signer_error",
             // Per-signing divergence check fired before the WebAuthn ceremony.
             Err(CredentialsError::SignerSetDivergence { .. }) => "failure:signer_set_diverged",
+            // The pinned verifier's allowlist status refused signing before the
+            // WebAuthn ceremony; no drift row was written.
+            Err(CredentialsError::VerifierStatusRefused { .. }) => {
+                "failure:verifier_status_refused"
+            }
             // Verifier or policy wasm-hash drift check fired before the WebAuthn ceremony.
             // The result tag distinguishes:
             //   - "failure:verifier_hash_drift" — verifier drift detected
@@ -1742,9 +2044,10 @@ impl CredentialsManager {
     )]
     async fn sign_with_passkey_rule_inner(
         &self,
+        gate: &crate::signing::gate::SigningGate,
         credential_name: &str,
         smart_account: &str,
-        auth_digest: &[u8; 32],
+        auth_digest: &SmartAccountAuthDigest,
         rule_ids: Vec<u32>,
         signers_manager: Arc<SignersManager>,
         bridge_local_addr: SocketAddr,
@@ -1857,10 +2160,33 @@ impl CredentialsManager {
                 let pinned_hashes = match audit_reader
                     .find_latest_context_rule_pinned_hashes(rule_id, &smart_account_redacted)
                 {
-                    Ok(Some(ph)) => ph,
+                    Ok(Some(
+                        stellar_agent_core::audit_log::reader::ContextRulePinRecord::Complete(ph),
+                    )) => ph,
+                    Ok(Some(_)) => {
+                        // A pin record of eight-byte prefixes cannot name the
+                        // rule's verifier parties, and no override admits
+                        // it: the ceremony aborts before any bridge I/O.
+                        warn!(
+                            rule_id,
+                            "sign_with_passkey_rule: the rule's pin record holds eight-byte \
+                             hash prefixes; aborting signing (fail closed)"
+                        );
+                        return (
+                            Err(drift_err_route(crate::SaError::WasmPinIncomplete {
+                                rule_id,
+                                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                                    smart_account_redacted.as_str(),
+                                ),
+                                request_id: divergence_request_id.clone(),
+                            })),
+                            String::new(),
+                            String::new(),
+                            Some(divergence_request_id),
+                        );
+                    }
                     Ok(None) => {
                         tracing::info!(
-                            rule_id = %rule_id,
                             "no baseline row found; fail closed via empty pinned-hashes"
                         );
                         // No baseline row → treat as no pinned hashes (fail closed).
@@ -1924,7 +2250,6 @@ impl CredentialsManager {
                                 Ok(mut writer) => {
                                     if let Err(e) = writer.write_entry(entry) {
                                         warn!(
-                                            rule_id = req_rule_id,
                                             error = %e,
                                             "sign_with_passkey_rule: failed to write \
                                              SaVerifierDiversificationOverride audit row \
@@ -2088,7 +2413,7 @@ impl CredentialsManager {
         // RP-ID in the approval page JS; bridge handlers read rp_id from the entry
         // rather than using a hardcoded "localhost" placeholder.
         let entry = match PendingApproval::new_passkey_pending(
-            *auth_digest,
+            *auth_digest.as_bytes(),
             credential_id_bytes.clone(),
             smart_account_redacted,
             rule_ids,
@@ -2105,6 +2430,29 @@ impl CredentialsManager {
 
         let nonce = entry.approval_nonce.clone();
 
+        let subject = match crate::managers::rules::parse_c_strkey_to_smart_account(smart_account)
+            .and_then(|address| {
+                stellar_agent_network::AuthSubject::smart_account(&address)
+                    .map_err(|field| crate::SaError::IntentBindingMismatch { field })
+            }) {
+            Ok(subject) => subject,
+            Err(error) => early_err!(CredentialsError::AuthEntryInvalid {
+                source: Box::new(error)
+            }),
+        };
+        let mut key_data = pubkey_arr.to_vec();
+        key_data.extend_from_slice(&credential_id_bytes);
+        if let Err(error) = gate.authorize(crate::signing::gate::SigningRequest {
+            subject,
+            signer: crate::signing::gate::SignerMatch::ExternalKeyData(
+                sha2::Sha256::digest(key_data).into(),
+            ),
+            payload: stellar_agent_network::SigningPayload::AuthDigest(*auth_digest.as_bytes()),
+        }) {
+            early_err!(CredentialsError::AuthEntryInvalid {
+                source: Box::new(error)
+            });
+        }
         {
             let mut guard = approval_store.lock().await;
             if let Err(e) = guard.insert(entry, unix_now_ms()) {
@@ -2138,10 +2486,8 @@ impl CredentialsManager {
         // loopback-bound bridge — real Chromium rejects with SecurityError.
         if bridge_local_addr.ip().is_loopback() && metadata.rp_id != "localhost" {
             warn!(
-                rp_id = %metadata.rp_id,
-                "bridge binds loopback but credential rp_id is not \"localhost\"; \
-                 WebAuthn signing ceremony will fail in a standards-conforming browser \
-                 (WebAuthn-2 §5.1.2)"
+                "rp_id must be localhost for the loopback signing bridge; delete and re-register \
+                 the credential with --rp-id localhost."
             );
         }
 
@@ -2181,7 +2527,7 @@ impl CredentialsManager {
     async fn poll_signing(
         &self,
         nonce: &str,
-        auth_digest: &[u8; 32],
+        auth_digest: &SmartAccountAuthDigest,
         credential_record: PasskeyCredentialRecord,
         credential_id_bytes: &[u8],
         metadata: &CredentialMetadata,
@@ -2232,7 +2578,7 @@ impl CredentialsManager {
     async fn check_store_for_assertion(
         &self,
         nonce: &str,
-        auth_digest: &[u8; 32],
+        auth_digest: &SmartAccountAuthDigest,
         credential_record: PasskeyCredentialRecord,
         credential_id_bytes: &[u8],
         metadata: &CredentialMetadata,
@@ -2345,7 +2691,6 @@ impl CredentialsManager {
                 // dropped; the failure stays non-fatal for the signing call.
                 signers_manager.mark_audit_writer_degraded();
                 warn!(
-                    credential_name = %credential_name,
                     error = %e,
                     "audit_writer mutex poisoned; PasskeyAssertion entry not written"
                 );
@@ -2374,7 +2719,6 @@ impl CredentialsManager {
         if let Err(e) = writer.write_entry(entry) {
             warn!(
                 error = %e,
-                credential_name = %credential_name,
                 "failed to write passkey_assertion audit entry"
             );
         }
@@ -2408,6 +2752,7 @@ fn encode_auth_digest_hex(auth_digest: &[u8; 32]) -> String {
 ///
 /// - [`CredentialsError::SignerSetDivergence`] wrapping the refusal of steps
 ///   1, 2 and 4, a deadline elapse included.
+/// - [`CredentialsError::VerifierStatusRefused`] for a revoked or retired verifier.
 /// - [`CredentialsError::WasmHashDrift`] for a drifted verifier or policy,
 ///   and [`CredentialsError::DriftCheckUnavailable`] for every other
 ///   refusal of step 3 (see [`drift_err_route`]).
@@ -2462,7 +2807,6 @@ async fn check_passkey_rules(
         .and_then(|addresses| addresses)
         .map_err(|sa_err| {
             warn!(
-                rule_id,
                 error = %sa_err,
                 "sign_with_passkey_rule: the drift check could not read the rule; aborting \
                  signing (fail closed)"
@@ -2470,9 +2814,8 @@ async fn check_passkey_rules(
             drift_err_route(sa_err)
         })?;
 
-        // Only a drifted verifier or policy routes to WasmHashDrift, which is
-        // paired with the drift row the check wrote; every other refusal
-        // routes to DriftCheckUnavailable (see `drift_err_route`).
+        // Drift carries a drift row. Status refusals carry their own result
+        // tag; infrastructure failures use DriftCheckUnavailable.
         for verifier_addr in verifier_addrs {
             bound_pre_submit_stage(
                 budget,
@@ -2485,6 +2828,7 @@ async fn check_passkey_rules(
                     smart_account_redacted,
                     request_id,
                     &mut wasm_hash_cache,
+                    crate::managers::verifiers::VerifierStatusGate::Refuse,
                 ),
             )
             .await
@@ -2552,15 +2896,25 @@ async fn check_passkey_rules(
 /// respectively.  All other `SaError` variants from those functions
 /// (infrastructure failures: `NetworkRpcDivergence`, `DeploymentFailed`,
 /// `MultiplePinnedHashesUnsupported`, `AuditLog`) emit no drift row. Neither
-/// do `PinnedVerifierAbsent` from `verify_pinned_verifier_against_chain` and
-/// `PinnedPolicyAbsent` from `verify_policy_pins_present`. Wrapping them in
+/// do `PinnedVerifierAbsent` from `verify_pinned_verifier_against_chain`,
+/// `PinnedPolicyAbsent` from `verify_policy_pins_present`, and
+/// `WasmPinIncomplete` from any reader of a pin record of eight-byte
+/// prefixes. Wrapping them in
 /// `WasmHashDrift` would break the result-tag ↔ audit-row join that operator
 /// tooling relies on.
+///
+/// Revoked and retired verifier statuses route to `VerifierStatusRefused`
+/// without a drift row and before bridge I/O.
 ///
 /// This function enforces the invariant at a single call site rather than
 /// repeating the match in every loop.
 fn drift_err_route(sa_err: crate::SaError) -> CredentialsError {
     match &sa_err {
+        crate::SaError::VerifierWasmRevoked { .. } | crate::SaError::VerifierWasmRetired { .. } => {
+            CredentialsError::VerifierStatusRefused {
+                source: Box::new(sa_err),
+            }
+        }
         // Actual drift detected — paired SaVerifierHashDrift audit row was emitted.
         crate::SaError::VerifierHashDrift { .. } => CredentialsError::WasmHashDrift {
             source: Box::new(sa_err),
@@ -2587,26 +2941,22 @@ fn drift_err_route(sa_err: crate::SaError) -> CredentialsError {
 pub(crate) fn validate_credential_name(name: &str) -> Result<(), CredentialsError> {
     if name.is_empty() {
         return Err(CredentialsError::InvalidName {
-            name: name.to_owned(),
             reason: "must not be empty",
         });
     }
     if name.len() > 64 {
         return Err(CredentialsError::InvalidName {
-            name: name.to_owned(),
             reason: "must be at most 64 characters",
         });
     }
     for ch in name.chars() {
         if !ch.is_ascii() || ch.is_ascii_control() {
             return Err(CredentialsError::InvalidName {
-                name: name.to_owned(),
                 reason: "must contain only printable ASCII characters",
             });
         }
         if matches!(ch, '/' | '\\' | ':') {
             return Err(CredentialsError::InvalidName {
-                name: name.to_owned(),
                 reason: r"must not contain '/', '\', or ':' characters",
             });
         }
@@ -2650,6 +3000,52 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn credential_registry_and_name_markers_are_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        let dir = TempDir::new().unwrap();
+        let manager = test_manager_readonly(&dir);
+        let missing = manager.show(CREDENTIAL_MARKER).unwrap_err();
+        assert_no_marker(&missing, CREDENTIAL_MARKER);
+        assert_eq!(
+            missing.to_string(),
+            "the requested credential was not found"
+        );
+        let invalid = validate_credential_name(&format!("{CREDENTIAL_MARKER}/x")).unwrap_err();
+        assert_no_marker(&invalid, CREDENTIAL_MARKER);
+        fs::create_dir_all(manager.registry_path().parent().unwrap()).unwrap();
+        fs::write(
+            manager.registry_path(),
+            format!("credentials = {CREDENTIAL_MARKER} here\n"),
+        )
+        .unwrap();
+        for error in [
+            manager.list().unwrap_err(),
+            manager.show(CREDENTIAL_MARKER).unwrap_err(),
+        ] {
+            assert_no_marker(&error, CREDENTIAL_MARKER);
+            assert!(matches!(error, CredentialsError::RegistryParse { .. }));
+            assert!(error.to_string().contains("not valid TOML: line 1, column"));
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_credential_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        let dir = TempDir::new().unwrap();
+        let manager = test_manager(&dir);
+        let mut registry = RegistryFile::default();
+        registry.credentials.push(make_metadata(CREDENTIAL_MARKER));
+        manager.persist_registry(&registry).unwrap();
+        let error = manager
+            .prepare_registration(CREDENTIAL_MARKER, "127.0.0.1:1".parse().unwrap(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CredentialsError::DuplicateName));
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+    }
+
     use serde_json::Value as JsonValue;
     use tempfile::TempDir;
 
@@ -2723,7 +3119,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let err = mgr.show("ghost").unwrap_err();
-        assert!(matches!(err, CredentialsError::NotFound { name } if name == "ghost"));
+        assert!(matches!(err, CredentialsError::NotFound));
     }
 
     #[test]
@@ -2799,7 +3195,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let err = mgr.delete("nonexistent").unwrap_err();
-        assert!(matches!(err, CredentialsError::NotFound { .. }));
+        assert!(matches!(err, CredentialsError::NotFound));
     }
 
     // ── is_empty ──────────────────────────────────────────────────────────────
@@ -3227,6 +3623,15 @@ registered_at_unix_ms = 1700000000000
     fn test_signers_manager_with_writer(
         dir: &TempDir,
     ) -> (Arc<std::sync::Mutex<AuditWriter>>, Arc<SignersManager>) {
+        test_signers_manager_at(dir, TEST_RPC_URL)
+    }
+
+    /// [`test_signers_manager_with_writer`] with both RPC endpoints at
+    /// `rpc_url`.
+    fn test_signers_manager_at(
+        dir: &TempDir,
+        rpc_url: &str,
+    ) -> (Arc<std::sync::Mutex<AuditWriter>>, Arc<SignersManager>) {
         use crate::managers::signers::SignersManagerConfig;
 
         let audit_path = dir.path().join("audit.jsonl");
@@ -3235,8 +3640,8 @@ registered_at_unix_ms = 1700000000000
         let arc_writer = Arc::new(std::sync::Mutex::new(writer));
 
         let sm = SignersManager::new(SignersManagerConfig::new(
-            TEST_RPC_URL.to_owned(),
-            TEST_RPC_URL.to_owned(),
+            rpc_url.to_owned(),
+            rpc_url.to_owned(),
             Arc::clone(&arc_writer),
             audit_path,
             "Test SDF Network ; September 2015".to_owned(),
@@ -3270,14 +3675,327 @@ registered_at_unix_ms = 1700000000000
     /// Passes `parse_c_strkey_to_smart_account` without triggering a network call.
     const ZERO_SA_STRKEY: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
+    /// An auth entry for [`ZERO_SA_STRKEY`] over `rule_ids`, with digests
+    /// derived for the network of `network_passphrase`.
+    fn partial_on(
+        network_passphrase: &str,
+        rule_ids: &[u32],
+    ) -> crate::managers::auth_entry::PartialSorobanAuthorizationEntry {
+        crate::managers::auth_entry::test_helpers::partial_authorization_entry(
+            crate::managers::rules::parse_c_strkey_to_smart_account(ZERO_SA_STRKEY).unwrap(),
+            network_passphrase,
+            rule_ids.iter().copied().map(ContextRuleId::new).collect(),
+        )
+        .unwrap()
+    }
+
+    /// A valid testnet auth entry for [`ZERO_SA_STRKEY`] over `rule_ids`.
+    fn testnet_partial(
+        rule_ids: &[u32],
+    ) -> crate::managers::auth_entry::PartialSorobanAuthorizationEntry {
+        partial_on(
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            rule_ids,
+        )
+    }
+
+    /// Every line of the test audit log, whatever its kind.
+    fn audit_line_count(dir: &TempDir) -> usize {
+        std::fs::read_to_string(dir.path().join("audit.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    }
+
+    /// A loopback registration bridge with another RP ID warns with the
+    /// check and holds the RP ID in no field.
     #[tokio::test]
+    async fn registration_warning_holds_no_rp_id() {
+        let dir = TempDir::new().unwrap();
+        let approval_path = dir.path().join("approvals").join("default.toml");
+        std::fs::create_dir_all(approval_path.parent().unwrap()).unwrap();
+        let store = PendingApprovalStore::open(approval_path).unwrap();
+        let manager = CredentialsManager::new(
+            dir.path().join("passkeys"),
+            "default",
+            "credmarker7.example",
+            Some(Arc::new(Mutex::new(store))),
+        );
+        let (capture, _guard) =
+            stellar_agent_test_support::log_capture::WarningCapture::capture(None);
+
+        manager
+            .prepare_registration("laptop", "127.0.0.1:1".parse().unwrap(), None)
+            .await
+            .unwrap();
+
+        let events = capture.seen();
+        assert!(
+            events.iter().any(|event| {
+                event["message"]
+                    == "rp_id must be localhost for the loopback registration bridge; use \
+                        --rp-id localhost."
+            }),
+            "{events:?}"
+        );
+        assert!(!format!("{events:?}").contains("credmarker7"), "{events:?}");
+    }
+
+    /// A loopback signing bridge for a credential with another RP ID warns
+    /// with the check and holds the RP ID in no field.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn signing_warning_holds_no_rp_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager(&dir);
+        let mut metadata = make_metadata("entry-check");
+        metadata.rp_id = "credmarker7.example".to_owned();
+        write_metadata(&mgr, &metadata);
+        let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
+        let (capture, _guard) =
+            stellar_agent_test_support::log_capture::WarningCapture::capture(None);
+
+        let result = mgr
+            .sign_with_passkey_rule(
+                &passkey_gate(&testnet_partial(&[0]), &metadata),
+                "entry-check",
+                &testnet_partial(&[0]),
+                sm,
+                "127.0.0.1:1".parse().unwrap(),
+                Duration::from_millis(10),
+                |_| {},
+                false,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Ok(SignWithPasskeyOutcome::Timeout)),
+            "the ceremony has no browser: {result:?}"
+        );
+        let events = capture.seen();
+        assert!(
+            events.iter().any(|event| {
+                event["message"]
+                    == "rp_id must be localhost for the loopback signing bridge; delete and \
+                        re-register the credential with --rp-id localhost."
+            }),
+            "{events:?}"
+        );
+        assert!(!format!("{events:?}").contains("credmarker7"), "{events:?}");
+    }
+
+    /// Runs `sign_with_passkey_rule` for a registered credential with a valid
+    /// public key, an approval store and the bootstrap rule, so a valid entry
+    /// reaches the ceremony and times out. Returns the result, the number of
+    /// `on_url` calls (the ceremony starts exactly when it is called) and the
+    /// number of audit lines written.
+    fn passkey_gate(
+        partial: &crate::managers::auth_entry::PartialSorobanAuthorizationEntry,
+        metadata: &CredentialMetadata,
+    ) -> crate::signing::gate::SigningGate {
+        if partial.validate().is_err() {
+            return crate::signing::intent_test_helpers::gate(vec![]);
+        }
+        let mut key_data = decode_validated_sec1("entry-check", &metadata.public_key_sec1_b64)
+            .unwrap()
+            .to_vec();
+        key_data.extend(
+            URL_SAFE_NO_PAD
+                .decode(&metadata.credential_id_b64url)
+                .unwrap(),
+        );
+        crate::signing::intent_test_helpers::partial_gate(
+            partial,
+            vec![stellar_agent_network::SignerDescriptor::External {
+                verifier: stellar_strkey::Contract([99; 32])
+                    .to_string()
+                    .as_str()
+                    .to_owned(),
+                key_data_sha256: sha2::Sha256::digest(key_data).into(),
+            }],
+            false,
+        )
+    }
+
+    async fn sign_entry(
+        partial: &crate::managers::auth_entry::PartialSorobanAuthorizationEntry,
+    ) -> (
+        Result<SignWithPasskeyOutcome, CredentialsError>,
+        usize,
+        usize,
+    ) {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager(&dir);
+        write_metadata(&mgr, &make_metadata("entry-check"));
+        let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
+        let url_calls = AtomicUsize::new(0);
+        let result = mgr
+            .sign_with_passkey_rule(
+                &passkey_gate(partial, &make_metadata("entry-check")),
+                "entry-check",
+                partial,
+                sm,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19911),
+                Duration::from_millis(100),
+                |_| {
+                    url_calls.fetch_add(1, Ordering::SeqCst);
+                },
+                false,
+            )
+            .await;
+        (
+            result,
+            url_calls.load(Ordering::SeqCst),
+            audit_line_count(&dir),
+        )
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_gate_refuses_what_the_plan_does_not_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        crate::signing::intent_test_helpers::assert_envelope_bounds_refuse_before_signing().await;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for wrong_credential in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let mgr = test_manager(&dir);
+            let metadata = make_metadata("entry-check");
+            write_metadata(&mgr, &metadata);
+            let (_writer, sm) = test_signers_manager_with_writer(&dir);
+            let mut partial = testnet_partial(&[0]);
+            let gate = if wrong_credential {
+                passkey_gate(&partial, &metadata)
+            } else {
+                crate::signing::intent_test_helpers::gate(vec![])
+            };
+            if wrong_credential {
+                partial.smart_account = stellar_xdr::ScAddress::Contract(stellar_xdr::ContractId(
+                    stellar_xdr::Hash([9; 32]),
+                ));
+            }
+            partial.validate().unwrap();
+            let url_calls = AtomicUsize::new(0);
+            let error = mgr
+                .sign_with_passkey_rule(
+                    &gate,
+                    "entry-check",
+                    &partial,
+                    sm,
+                    "127.0.0.1:19911".parse().unwrap(),
+                    Duration::from_millis(100),
+                    |_| {
+                        url_calls.fetch_add(1, Ordering::SeqCst);
+                    },
+                    false,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, CredentialsError::AuthEntryInvalid { source } if matches!(*source, crate::SaError::IntentBindingMismatch { field: "signing_request" }))
+            );
+            assert_eq!(url_calls.load(Ordering::SeqCst), 0);
+            assert!(mgr.approval_store.as_ref().unwrap().lock().await.is_empty());
+            assert!(gate.take_unexposed().is_some());
+            assert!(gate.exposure().is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sign_with_passkey_rule_starts_the_ceremony_for_a_valid_testnet_entry() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let (result, url_calls, audit_lines) = sign_entry(&testnet_partial(&[0])).await;
+
+        assert!(
+            matches!(result, Ok(SignWithPasskeyOutcome::Timeout)),
+            "a valid testnet entry must reach the ceremony and time out, got {result:?}"
+        );
+        assert_eq!(url_calls, 1, "the ceremony starts once");
+        assert_eq!(
+            audit_lines, 1,
+            "the ceremony writes one PasskeyAssertion row"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sign_with_passkey_rule_refuses_a_mainnet_entry_before_the_ceremony() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let partial = partial_on(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE, &[0]);
+
+        let (result, url_calls, audit_lines) = sign_entry(&partial).await;
+
+        let err = result.expect_err("a mainnet entry must be refused");
+        assert!(
+            matches!(err, CredentialsError::MainnetWriteForbidden),
+            "expected MainnetWriteForbidden, got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("sa.credentials.mainnet_write_forbidden"),
+            "the refusal carries its code: {err}"
+        );
+        assert_eq!(url_calls, 0, "no ceremony starts");
+        assert_eq!(audit_lines, 0, "no audit row is written for the refusal");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sign_with_passkey_rule_refuses_a_tampered_digest_before_the_ceremony() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut partial = testnet_partial(&[0]);
+        partial.auth_digest[0] ^= 0x01;
+
+        let (result, url_calls, audit_lines) = sign_entry(&partial).await;
+
+        match result {
+            Err(CredentialsError::AuthEntryInvalid { source }) => assert!(
+                matches!(
+                    *source,
+                    crate::SaError::AuthEntryBindingMismatch {
+                        field: "auth_digest"
+                    }
+                ),
+                "expected an auth_digest mismatch, got {source:?}"
+            ),
+            other => panic!("expected AuthEntryInvalid, got {other:?}"),
+        }
+        assert_eq!(url_calls, 0, "no ceremony starts");
+        assert_eq!(audit_lines, 0, "no audit row is written for the refusal");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_audit_on_approval_store_unavailable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         // Read-only manager — no approval store.
         let mgr = test_manager_readonly(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19900);
-        let auth_digest = [0u8; 32];
         // Supply a SignersManager that provides the shared AuditWriter.
         // Use rule_id=0 (bootstrap skip) so no rule check runs (no testnet
         // needed).  The approval-store check fires
@@ -3286,10 +4004,9 @@ registered_at_unix_ms = 1700000000000
 
         let result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "does-not-matter",
-                ZERO_SA_STRKEY, // valid C-strkey: parse passes; rule_id=0 skips network
-                &auth_digest,
-                vec![0], // rule_id=0: bootstrap-skip fires, no network call made
+                &testnet_partial(&[0]), // rule_id=0: bootstrap-skip fires, no network call made
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -3317,22 +4034,25 @@ registered_at_unix_ms = 1700000000000
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_audit_on_not_found() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19901);
-        let auth_digest = [0u8; 32];
         // Writer sourced from SignersManager; rule_id=0 skips network.
         let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
 
         // "nonexistent" has no entry in the empty registry → NotFound.
         let result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "nonexistent",
-                ZERO_SA_STRKEY, // valid C-strkey; rule_id=0 skips network
-                &auth_digest,
-                vec![0], // rule_id=0: bootstrap-skip, no network call
+                &testnet_partial(&[0]), // rule_id=0: bootstrap-skip, no network call
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -3342,7 +4062,7 @@ registered_at_unix_ms = 1700000000000
             .await;
 
         assert!(
-            matches!(result, Err(CredentialsError::NotFound { .. })),
+            matches!(result, Err(CredentialsError::NotFound)),
             "expected NotFound, got {result:?}"
         );
 
@@ -3368,12 +4088,16 @@ registered_at_unix_ms = 1700000000000
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_audit_on_missing_public_key() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19902);
-        let auth_digest = [0u8; 32];
 
         // Write a credential with empty public_key_sec1_b64.
         let mut meta = make_metadata("no-pubkey");
@@ -3387,10 +4111,9 @@ registered_at_unix_ms = 1700000000000
 
         let result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "no-pubkey",
-                ZERO_SA_STRKEY, // valid C-strkey; rule_id=0 skips network
-                &auth_digest,
-                vec![0], // bootstrap-skip, no network call
+                &testnet_partial(&[0]), // bootstrap-skip, no network call
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -3423,22 +4146,25 @@ registered_at_unix_ms = 1700000000000
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_rejects_empty_rule_ids() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19904);
-        let auth_digest = [0u8; 32];
         let meta = make_metadata("empty-rule-ids");
         write_metadata(&mgr, &meta);
         let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
 
         let result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "empty-rule-ids",
-                "CDEPLOY1ABCDE2FGHIJ3KLMNO4PQRST5UVWXY",
-                &auth_digest,
-                vec![],
+                &testnet_partial(&[]),
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -3456,17 +4182,21 @@ registered_at_unix_ms = 1700000000000
     // ── smart_account_redacted in PasskeyAssertion ────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_smart_account_redacted_in_audit() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19903);
-        let auth_digest = [0u8; 32];
 
         // Use a NotFound error path (simpler fixture) to get the audit emitted
         // and assert the smart_account field is set correctly.
         //
-        // Use ZERO_SA_STRKEY (valid C-strkey, 56 chars) so that
+        // The partial targets ZERO_SA_STRKEY (valid C-strkey, 56 chars), so
         // parse_c_strkey_to_smart_account passes.  rule_id=0 bootstrap-skip
         // prevents any network call.  The credential "nonexistent" does not
         // exist → NotFound fires after the approval-store check.
@@ -3475,10 +4205,9 @@ registered_at_unix_ms = 1700000000000
 
         let _ = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "nonexistent",
-                smart_account,
-                &auth_digest,
-                vec![0], // bootstrap-skip, no network call; NotFound fires after
+                &testnet_partial(&[0]), // bootstrap-skip, no network call; NotFound fires after
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -3581,7 +4310,12 @@ registered_at_unix_ms = 1700000000000
     /// approval store, so `ApprovalStoreUnavailable` is the terminal result —
     /// but the audit row is emitted BEFORE the approval-store check.
     #[tokio::test]
+    #[serial_test::serial]
     async fn diversification_override_emits_audit_row_when_accept_single_verifier_true() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         // Read-only manager: ApprovalStoreUnavailable fires after the
@@ -3589,7 +4323,6 @@ registered_at_unix_ms = 1700000000000
         let mgr = test_manager_readonly(&dir);
         let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19910);
-        let auth_digest = [0u8; 32];
 
         // rule_id=1 (non-zero): the diversification check runs; empty audit-log
         // baseline → PinnedHashesRecord::default() → 0 pinned hashes →
@@ -3597,10 +4330,9 @@ registered_at_unix_ms = 1700000000000
         // Required.  accept_single_verifier=true → override path.
         let _result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "irrelevant",
-                ZERO_SA_STRKEY,
-                &auth_digest,
-                vec![1], // non-zero: diversification check runs
+                &testnet_partial(&[1]), // non-zero: diversification check runs
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -3648,14 +4380,399 @@ registered_at_unix_ms = 1700000000000
         );
     }
 
+    /// A rule with no pin record, admitted past the diversification gate by
+    /// the single-verifier override, is refused for its missing baseline. No
+    /// event of the call carries the rule id.
+    ///
+    /// The rule id has ten digits. Every captured line starts with a
+    /// timestamp whose six-digit fraction can spell a six-digit id, and
+    /// cannot spell ten digits.
+    #[test]
+    #[serial_test::serial]
+    fn missing_baseline_refusal_logs_no_rule_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        const REFUSED_RULE_ID: u32 = 4_242_424_242;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager_readonly(&dir);
+        let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19913);
+        let mut result = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            result = Some(runtime.block_on(mgr.sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
+                "irrelevant",
+                &testnet_partial(&[REFUSED_RULE_ID]),
+                sm,
+                addr,
+                Duration::from_millis(100),
+                |_| {},
+                true,
+            )));
+        });
+        match result.expect("the signing ran") {
+            Err(CredentialsError::SignerSetDivergence { source })
+                if matches!(*source, crate::SaError::SignerSetMissingBaseline { .. }) => {}
+            other => panic!("a rule without a baseline must be refused: {other:?}"),
+        }
+        assert!(
+            logs.contains("no baseline row found; fail closed via empty pinned-hashes"),
+            "{logs}"
+        );
+        assert!(!logs.contains(&REFUSED_RULE_ID.to_string()), "{logs}");
+    }
+
+    /// Runs `sign_with_passkey_rule` on a current-thread runtime under a
+    /// TRACE log capture; returns the result and the captured logs.
+    fn sign_capturing_logs(
+        mgr: &CredentialsManager,
+        credential_name: &str,
+        rule_ids: &[u32],
+        sm: Arc<SignersManager>,
+        accept_single_verifier: bool,
+    ) -> (Result<SignWithPasskeyOutcome, CredentialsError>, String) {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19914);
+        let mut result = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            result = Some(runtime.block_on(mgr.sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
+                credential_name,
+                &testnet_partial(rule_ids),
+                sm,
+                addr,
+                Duration::from_millis(100),
+                |_| {},
+                accept_single_verifier,
+            )));
+        });
+        (result.expect("the signing ran"), logs)
+    }
+
+    /// Runs `sign_with_passkey_rule` on a current-thread runtime under the
+    /// wallet's own subscriber stack at the most verbose filter; returns the
+    /// result and the text the stack wrote.
+    fn sign_capturing_wallet_logs(
+        mgr: &CredentialsManager,
+        credential_name: &str,
+        rule_ids: &[u32],
+        sm: Arc<SignersManager>,
+        accept_single_verifier: bool,
+    ) -> (Result<SignWithPasskeyOutcome, CredentialsError>, String) {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use stellar_agent_core::observability::{
+            FormatChoice, SubscriberConfig, subscriber_for_tests,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19914);
+        let capture = stellar_agent_test_support::CaptureWriter::new();
+        let writer = capture.clone();
+        let subscriber = subscriber_for_tests(
+            SubscriberConfig::default()
+                .with_filter_override(Some(tracing_subscriber::EnvFilter::new("trace")))
+                .with_format_override(Some(FormatChoice::Pretty))
+                .with_writer_factory(Some(Box::new(move || Box::new(writer.clone())))),
+        )
+        .unwrap();
+        // An inert dispatcher kept alive for the capture makes `tracing`
+        // compute every callsite's interest from the registered dispatchers,
+        // and the rebuild refreshes callsites cached before this capture.
+        let inert = stellar_agent_test_support::inert_dispatcher();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let mut result = None;
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::callsite::rebuild_interest_cache();
+            result = Some(runtime.block_on(mgr.sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
+                credential_name,
+                &testnet_partial(rule_ids),
+                sm,
+                addr,
+                Duration::from_millis(100),
+                |_| {},
+                accept_single_verifier,
+            )));
+        });
+        drop(inert);
+        (result.expect("the signing ran"), capture.captured_str())
+    }
+
+    /// A missing credential whose assertion row meets a poisoned writer is
+    /// warned about without its name.
+    #[test]
+    #[serial_test::serial]
+    fn poisoned_writer_warning_holds_no_missing_credential_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager(&dir);
+        let (arc_writer, sm) = test_signers_manager_with_writer(&dir);
+        let _ = std::panic::catch_unwind({
+            let arc_writer = Arc::clone(&arc_writer);
+            move || {
+                let _guard = arc_writer.lock().unwrap();
+                panic!("poison audit writer");
+            }
+        });
+
+        let name = format!("missing-{CREDENTIAL_MARKER}");
+        let (result, logs) = sign_capturing_logs(&mgr, &name, &[0], sm, false);
+
+        let err = match result {
+            Err(err @ CredentialsError::NotFound) => err,
+            other => panic!("a missing credential must be refused: {other:?}"),
+        };
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        assert!(
+            logs.contains("audit_writer mutex poisoned; PasskeyAssertion entry not written"),
+            "{logs}"
+        );
+        assert_no_marker_in_text(&logs, CREDENTIAL_MARKER);
+    }
+
+    /// A missing credential whose assertion row cannot be written is warned
+    /// about without its name. The name is longer than an audit row may be,
+    /// so the write refuses the row.
+    #[test]
+    #[serial_test::serial]
+    fn audit_write_failure_warning_holds_no_missing_credential_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        use stellar_agent_core::audit_log::writer::MAX_ROW_BYTES;
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager(&dir);
+        let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
+        let padding = usize::try_from(MAX_ROW_BYTES).unwrap();
+        let name = format!("{CREDENTIAL_MARKER}{}", "x".repeat(padding));
+
+        let (result, logs) = sign_capturing_logs(&mgr, &name, &[0], sm, false);
+
+        let err = match result {
+            Err(err @ CredentialsError::NotFound) => err,
+            other => panic!("a missing credential must be refused: {other:?}"),
+        };
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        assert!(
+            logs.contains("failed to write passkey_assertion audit entry"),
+            "{logs}"
+        );
+        assert_no_marker_in_text(&logs, CREDENTIAL_MARKER);
+        assert_eq!(audit_line_count(&dir), 0, "the oversized row is refused");
+    }
+
+    /// An override row that cannot be written is warned about without the
+    /// rule id; signing goes on to the rule's baseline refusal, whose text
+    /// holds no rule id either. The audit directory is read-only and every
+    /// append rotates, so the rotation's rename fails the append.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn override_write_failure_warning_holds_no_rule_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        use stellar_agent_test_support::rejected_value::{
+            assert_no_marker, assert_no_marker_in_text,
+        };
+
+        /// Gives the owner full access to the directory it holds again when
+        /// dropped, so the temporary directory can be removed.
+        struct ReadOnlyDir(std::path::PathBuf);
+        impl Drop for ReadOnlyDir {
+            fn drop(&mut self) {
+                std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+
+        const RULE_ID: u32 = 3_735_928_559;
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager_readonly(&dir);
+        let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
+        let _rotation = stellar_agent_core::audit_log::rotation::test_seam::set_rotation_threshold(
+            &dir.path().join("audit.jsonl"),
+            0,
+        );
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let read_only = ReadOnlyDir(dir.path().to_path_buf());
+
+        let (result, logs) = sign_capturing_logs(&mgr, "irrelevant", &[RULE_ID], sm, true);
+        drop(read_only);
+
+        let err = match result {
+            Err(CredentialsError::SignerSetDivergence { source })
+                if matches!(*source, crate::SaError::SignerSetMissingBaseline { .. }) =>
+            {
+                CredentialsError::SignerSetDivergence { source }
+            }
+            other => panic!("a rule without a baseline must be refused: {other:?}"),
+        };
+        assert!(
+            logs.contains("failed to write SaVerifierDiversificationOverride audit row"),
+            "{logs}"
+        );
+        let marker = RULE_ID.to_string();
+        assert_no_marker(&err, &marker);
+        assert_no_marker_in_text(&logs, &marker);
+    }
+
+    /// A saved baseline for a rule absent on chain: the drift check's
+    /// `get_context_rule` simulation refuses the rule with a diagnostic event
+    /// log whose `fn_call` data renders the rule id, and neither the warning
+    /// nor the error holds the rule id. The one simulation request reaches
+    /// the endpoint and its refusal is the fixed `ContextRuleNotFound` class.
+    /// The logs are the wallet's own subscriber stack at the most verbose
+    /// filter, which keeps the RPC transport's raw response logging out.
+    #[test]
+    #[serial_test::serial]
+    fn missing_on_chain_rule_warning_holds_no_rule_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        use stellar_agent_core::audit_log::signer_set::{
+            BaselineReason, SignerEntryV2, SignerIdentityV2, SignerSetSnapshotV2, account_digest,
+        };
+        use stellar_agent_test_support::rejected_value::{
+            assert_no_marker, assert_no_marker_in_text,
+        };
+        use wiremock::{
+            Mock, MockServer,
+            matchers::{method, path},
+        };
+
+        const RULE_ID: u32 = 2_718_281_828;
+        // The host's rendering of a contract panic: the error, then the
+        // diagnostic event log, newest first, whose `fn_call` event carries
+        // the invocation's arguments.
+        let host_error = format!(
+            "HostError: Error(Contract, #3000)\n\nEvent log (newest first):\n   \
+             0: [Diagnostic Event] contract:{ZERO_SA_STRKEY}, topics:[error, \
+             Error(Contract, #3000)], data:\"escalating Ok(ScErrorType::Contract) \
+             frame-exit to Err\"\n   \
+             1: [Diagnostic Event] topics:[fn_call, {ZERO_SA_STRKEY}, get_context_rule], \
+             data:{RULE_ID}\n"
+        );
+        let server_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/"))
+                .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                    serde_json::json!({
+                        "error": host_error,
+                        "latestLedger": 1000
+                    }),
+                ))
+                .mount(&server)
+                .await;
+            server
+        });
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager_readonly(&dir);
+        let (arc_writer, sm) = test_signers_manager_at(&dir, &server.uri());
+        let snapshot = SignerSetSnapshotV2 {
+            signers: vec![SignerEntryV2 {
+                id: 0,
+                identity: SignerIdentityV2::Ed25519 { pubkey: [0x11; 32] },
+            }],
+            threshold: None,
+        };
+        arc_writer
+            .lock()
+            .unwrap()
+            .write_built(|writer| {
+                AuditEntry::new_sa_signer_set_baselined_v2(
+                    RULE_ID,
+                    &snapshot,
+                    1000,
+                    0,
+                    BaselineReason::first_observation(),
+                    writer.current_chain_tip(),
+                    account_digest("Test SDF Network ; September 2015", ZERO_SA_STRKEY),
+                    RedactedStrkey::from_already_redacted(redact_first5_last5(ZERO_SA_STRKEY)),
+                    "stellar:testnet",
+                    "req-baseline",
+                )
+            })
+            .unwrap();
+
+        let (result, logs) = sign_capturing_wallet_logs(&mgr, "irrelevant", &[RULE_ID], sm, true);
+
+        let err = match result {
+            Err(CredentialsError::DriftCheckUnavailable { source }) => {
+                match source.as_ref() {
+                    crate::SaError::DeploymentFailed {
+                        phase,
+                        redacted_reason,
+                    } => {
+                        assert_eq!(*phase, "simulate");
+                        assert_eq!(
+                            redacted_reason,
+                            crate::managers::rules::GET_CONTEXT_RULE_NOT_FOUND
+                        );
+                    }
+                    other => panic!("the simulation must refuse the rule: {other:?}"),
+                }
+                CredentialsError::DriftCheckUnavailable { source }
+            }
+            other => panic!("a rule missing on chain must be refused: {other:?}"),
+        };
+        assert!(
+            logs.contains("the drift check could not read the rule"),
+            "{logs}"
+        );
+        let marker = RULE_ID.to_string();
+        assert!(host_error.contains(&marker), "the mock renders the rule id");
+        assert_no_marker(&err, &marker);
+        assert_no_marker_in_text(&logs, &marker);
+        let requests = server_runtime
+            .block_on(server.received_requests())
+            .expect("request recording is on");
+        assert_eq!(requests.len(), 1, "one simulation request");
+        drop(server);
+    }
+
     #[tokio::test]
+    #[serial_test::serial]
     async fn diversification_override_returns_error_when_audit_writer_poisoned() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         let mgr = test_manager_readonly(&dir);
         let (arc_writer, sm) = test_signers_manager_with_writer(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19912);
-        let auth_digest = [0u8; 32];
 
         let _ = std::panic::catch_unwind({
             let arc_writer = std::sync::Arc::clone(&arc_writer);
@@ -3667,10 +4784,9 @@ registered_at_unix_ms = 1700000000000
 
         let result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "irrelevant",
-                ZERO_SA_STRKEY,
-                &auth_digest,
-                vec![1],
+                &testnet_partial(&[1]),
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -3699,7 +4815,12 @@ registered_at_unix_ms = 1700000000000
     ///
     /// Same setup as the override test but with `accept_single_verifier = false`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn result_tag_failure_verifier_diversification_required_emitted_on_refusal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let dir = TempDir::new().unwrap();
         // Read-only manager: if the diversification check is bypassed (bug),
@@ -3708,15 +4829,13 @@ registered_at_unix_ms = 1700000000000
         let mgr = test_manager_readonly(&dir);
         let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19911);
-        let auth_digest = [0u8; 32];
 
         // rule_id=1: diversification check runs; empty log → Required fires.
         let result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "irrelevant",
-                ZERO_SA_STRKEY,
-                &auth_digest,
-                vec![1], // non-zero: diversification check runs
+                &testnet_partial(&[1]), // non-zero: diversification check runs
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -4023,9 +5142,7 @@ registered_at_unix_ms = 1700000000000
             rule_id: 1,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
             deploy_address_redacted: RedactedStrkey::from_already_redacted("CVERIF...ADDR1"),
-            pinned_hash_first8: "abcdef01".to_owned(),
-            observed_hash_first8: "12345678".to_owned(),
-            observed_executable: None,
+            pinned_hash: stellar_agent_core::audit_log::schema::WasmHashPin::new([0xab; 32]),
             request_id: "req-id-1".to_owned(),
         };
         let result = drift_err_route(sa_err);
@@ -4051,9 +5168,7 @@ registered_at_unix_ms = 1700000000000
             rule_id: 2,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
             deploy_address_redacted: RedactedStrkey::from_already_redacted("CPOLI...ADDR1"),
-            pinned_hash_first8: "deadbeef".to_owned(),
-            observed_hash_first8: "cafebabe".to_owned(),
-            observed_executable: None,
+            pinned_hash: stellar_agent_core::audit_log::schema::WasmHashPin::new([0xde; 32]),
             request_id: "req-id-2".to_owned(),
         };
         let result = drift_err_route(sa_err);
@@ -4125,6 +5240,30 @@ registered_at_unix_ms = 1700000000000
         );
     }
 
+    /// A pin record of eight-byte prefixes is no drift row: it routes to
+    /// `DriftCheckUnavailable`, a pre-submission refusal.
+    #[test]
+    fn drift_err_route_wasm_pin_incomplete_routes_to_drift_check_unavailable() {
+        use stellar_agent_core::observability::RedactedStrkey;
+
+        let sa_err = crate::SaError::WasmPinIncomplete {
+            rule_id: 4,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
+            request_id: "req-id-pin-incomplete".to_owned(),
+        };
+        let result = drift_err_route(sa_err);
+        let CredentialsError::DriftCheckUnavailable { ref source } = result else {
+            panic!("WasmPinIncomplete must route to DriftCheckUnavailable: {result:?}");
+        };
+        assert!(
+            matches!(
+                source.as_ref(),
+                crate::SaError::WasmPinIncomplete { rule_id: 4, .. }
+            ),
+            "inner source must be WasmPinIncomplete: {source:?}"
+        );
+    }
+
     #[test]
     fn drift_err_route_infrastructure_failure_routes_to_drift_check_unavailable() {
         use stellar_agent_core::observability::RedactedStrkey;
@@ -4154,7 +5293,12 @@ registered_at_unix_ms = 1700000000000
     // ── result tag for InvalidRuleIds emits failure:invalid_rule_ids ──────────
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sign_with_passkey_rule_emits_invalid_rule_ids_audit_tag() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         // Use a SignersManager-backed writer so the PasskeyAssertion audit row is emitted.
@@ -4162,15 +5306,13 @@ registered_at_unix_ms = 1700000000000
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19920);
-        let auth_digest = [0u8; 32];
         let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
 
         let result = mgr
             .sign_with_passkey_rule(
+                &crate::signing::intent_test_helpers::gate(vec![]),
                 "does-not-matter",
-                ZERO_SA_STRKEY,
-                &auth_digest,
-                vec![], // empty rule_ids → InvalidRuleIds
+                &testnet_partial(&[]), // empty rule_ids → InvalidRuleIds
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -4221,23 +5363,18 @@ registered_at_unix_ms = 1700000000000
             ),
             (CredentialsError::StateDirUnavailable, "passkeys directory"),
             (
-                CredentialsError::NotFound {
-                    name: "mykey".to_owned(),
-                },
-                "mykey",
+                CredentialsError::NotFound,
+                "the requested credential was not found",
             ),
             (
-                CredentialsError::DuplicateName {
-                    name: "dupkey".to_owned(),
-                },
-                "dupkey",
+                CredentialsError::DuplicateName,
+                "the requested credential already exists; choose a different name or delete the existing one",
             ),
             (
                 CredentialsError::InvalidName {
-                    name: "bad/name".to_owned(),
                     reason: "must not contain",
                 },
-                "bad/name",
+                "the credential name is not valid: must not contain",
             ),
             (
                 CredentialsError::ApprovalStore {
@@ -4299,6 +5436,14 @@ registered_at_unix_ms = 1700000000000
 
         for (err, expected_substr) in errors {
             let msg = format!("{err}");
+            if matches!(
+                err,
+                CredentialsError::NotFound
+                    | CredentialsError::DuplicateName
+                    | CredentialsError::InvalidName { .. }
+            ) {
+                assert_eq!(msg, expected_substr);
+            }
             assert!(
                 msg.contains(expected_substr),
                 "Display for {err:?} must contain '{expected_substr}'; got: {msg}"
@@ -4321,7 +5466,7 @@ registered_at_unix_ms = 1700000000000
         let payment_entry = PendingApproval::new_payment_pending(
             "AAAAAQAAAA==".to_owned(), // dummy XDR b64
             b"dummy-xdr-bytes",
-            "GBH...DEST".to_owned(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
             10_000_000,
             "XLM".to_owned(),
             None,
@@ -4344,8 +5489,9 @@ registered_at_unix_ms = 1700000000000
 
         // Deadline in the future so the deadline check doesn't fire first.
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut writer = AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap();
         let outcome = mgr
-            .poll_registration("some-name", &nonce, deadline, None)
+            .poll_registration("some-name", &nonce, deadline, &mut writer)
             .await
             .expect("poll_registration must not return Err on kind mismatch");
 
@@ -4364,8 +5510,14 @@ registered_at_unix_ms = 1700000000000
 
         // Deadline in the future; nonce is never inserted.
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut writer = AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap();
         let outcome = mgr
-            .poll_registration("some-name", "nonce-that-was-never-inserted", deadline, None)
+            .poll_registration(
+                "some-name",
+                "nonce-that-was-never-inserted",
+                deadline,
+                &mut writer,
+            )
             .await
             .expect("poll_registration must not return Err on missing nonce");
 
@@ -4375,6 +5527,101 @@ registered_at_unix_ms = 1700000000000
         );
     }
 
+    /// Polls `nonce` on a current-thread runtime under a TRACE log capture;
+    /// returns the outcome and the captured logs.
+    fn poll_capturing_logs(
+        mgr: &CredentialsManager,
+        dir: &TempDir,
+        nonce: &str,
+    ) -> (Result<AddPasskeyOutcome, CredentialsError>, String) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut writer = AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap();
+        let mut outcome = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            outcome = Some(runtime.block_on(mgr.poll_registration(
+                "some-name",
+                nonce,
+                deadline,
+                &mut writer,
+            )));
+        });
+        (outcome.expect("the poll ran"), logs)
+    }
+
+    /// An absent nonce is warned about by the rule alone: neither end of the
+    /// nonce reaches the logs or the outcome.
+    #[test]
+    fn absent_registration_nonce_warning_holds_neither_end() {
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager(&dir);
+
+        let (outcome, logs) = poll_capturing_logs(&mgr, &dir, "HEADQnever-insertedTAILZ");
+
+        assert!(
+            matches!(outcome, Ok(AddPasskeyOutcome::EntryMissing)),
+            "{outcome:?}"
+        );
+        assert!(
+            logs.contains("registration nonce not found in store"),
+            "{logs}"
+        );
+        let rendered = format!("{outcome:?}");
+        for end in ["HEADQ", "TAILZ"] {
+            assert!(!logs.contains(end), "{logs}");
+            assert!(!rendered.contains(end), "{rendered}");
+        }
+    }
+
+    /// A nonce that names an entry of another kind is warned about by the
+    /// rule alone: neither end of the nonce reaches the logs or the outcome.
+    #[test]
+    fn wrong_kind_registration_nonce_warning_holds_neither_end() {
+        use stellar_agent_core::approval::store::PendingApproval;
+
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager(&dir);
+        let payment_entry = PendingApproval::new_payment_pending(
+            "AAAAAQAAAA==".to_owned(),
+            b"dummy-xdr-bytes",
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
+            10_000_000,
+            "XLM".to_owned(),
+            None,
+            100,
+            1000,
+            "test-uid".to_owned(),
+            300_000,
+        )
+        .expect("PaymentSimulated fixture must construct");
+        let nonce = payment_entry.approval_nonce.clone();
+        mgr.approval_store
+            .as_ref()
+            .unwrap()
+            .blocking_lock()
+            .insert(payment_entry, unix_now_ms())
+            .expect("insert must succeed");
+
+        let (outcome, logs) = poll_capturing_logs(&mgr, &dir, &nonce);
+
+        assert!(
+            matches!(outcome, Ok(AddPasskeyOutcome::UserCanceled)),
+            "{outcome:?}"
+        );
+        assert!(
+            logs.contains("approval store entry has unexpected kind"),
+            "{logs}"
+        );
+        let rendered = format!("{outcome:?}");
+        for end in [&nonce[..5], &nonce[nonce.len() - 5..]] {
+            assert!(!logs.contains(end), "{logs}");
+            assert!(!rendered.contains(end), "{rendered}");
+        }
+    }
+
     // ── poll_registration: ApprovalStoreUnavailable on readonly manager ───────
 
     #[tokio::test]
@@ -4382,26 +5629,16 @@ registered_at_unix_ms = 1700000000000
         let dir = TempDir::new().unwrap();
         let mgr = test_manager_readonly(&dir);
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut writer = AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap();
 
         let err = mgr
-            .poll_registration("some-name", "any-nonce", deadline, None)
+            .poll_registration("some-name", "any-nonce", deadline, &mut writer)
             .await
             .unwrap_err();
         assert!(
             matches!(err, CredentialsError::ApprovalStoreUnavailable),
             "readonly manager must return ApprovalStoreUnavailable; got {err:?}"
         );
-    }
-
-    // ── emit_audit: non-fatal when audit_writer is None ───────────────────────
-
-    #[test]
-    fn emit_audit_with_none_writer_is_noop() {
-        let dir = TempDir::new().unwrap();
-        let mgr = test_manager(&dir);
-        // Should not panic; no audit file should be created.
-        mgr.emit_audit(None, "my-key", "some-cred-id", "registered");
-        // No audit file to check — just verify no panic.
     }
 
     // ── emit_audit: writes entry with correct credential_id sentinel ──────────
@@ -4415,7 +5652,8 @@ registered_at_unix_ms = 1700000000000
             AuditWriter::open(audit_path.clone(), None).expect("AuditWriter must open");
 
         // Empty credential_id → uses "<no-credential-id>" sentinel.
-        mgr.emit_audit(Some(&mut writer), "my-key", "", "timeout");
+        mgr.emit_audit(&mut writer, "my-key", "", "timeout")
+            .unwrap();
         drop(writer);
 
         let content = std::fs::read_to_string(&audit_path).unwrap();
@@ -4443,7 +5681,8 @@ registered_at_unix_ms = 1700000000000
 
         // 32-byte zero credential produces a 43-char base64url string.
         let cred_id_b64 = URL_SAFE_NO_PAD.encode([0u8; 32]);
-        mgr.emit_audit(Some(&mut writer), "my-key", &cred_id_b64, "registered");
+        mgr.emit_audit(&mut writer, "my-key", &cred_id_b64, "registered")
+            .unwrap();
         drop(writer);
 
         let content = std::fs::read_to_string(&audit_path).unwrap();

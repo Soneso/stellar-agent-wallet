@@ -74,10 +74,7 @@ pub fn assert_same_domain_or_https_fqdn(
     // Must be HTTPS in all cases.
     if parsed.scheme() != "https" {
         return Err(AnchorError::InvalidDirectUrl {
-            detail: format!(
-                "transfer server URL must use https://, got '{}'",
-                parsed.scheme()
-            ),
+            detail: "transfer server URL must use https://".to_owned(),
         });
     }
 
@@ -102,10 +99,7 @@ pub fn assert_same_domain_or_https_fqdn(
             // create overly broad matches.  The fix: reject any anchor_domain
             // that is not a valid public FQDN (same check as direct-URL mode).
             validate_public_fqdn(domain).map_err(|_| AnchorError::InvalidAnchorDomain {
-                detail: format!(
-                    "anchor_domain '{domain}' is not a valid public FQDN; \
-                     must be a lowercase LDH hostname with ≥2 labels and no IP address"
-                ),
+                detail: "anchor_domain must be a lowercase LDH hostname with at least two labels and no IP address".to_owned(),
             })?;
 
             // Same-domain SSRF bind.
@@ -121,10 +115,7 @@ pub fn assert_same_domain_or_https_fqdn(
             let is_same_or_subdomain = host == domain || host.ends_with(subdomain_suffix.as_str());
 
             if !is_same_or_subdomain {
-                return Err(AnchorError::TransferServerHostMismatch {
-                    anchor_domain: domain.to_owned(),
-                    resolved_host: host.to_owned(),
-                });
+                return Err(AnchorError::TransferServerHostMismatch);
             }
         }
         None => {
@@ -147,7 +138,7 @@ fn validate_public_fqdn(host: &str) -> Result<(), AnchorError> {
     // Reject IP addresses.
     if host.parse::<std::net::IpAddr>().is_ok() {
         return Err(AnchorError::InvalidDirectUrl {
-            detail: format!("'{host}' is an IP address, not a valid FQDN"),
+            detail: "transfer server host must be a lowercase LDH hostname with at least two labels and no IP address".to_owned(),
         });
     }
 
@@ -157,7 +148,7 @@ fn validate_public_fqdn(host: &str) -> Result<(), AnchorError> {
         .all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()));
     if all_labels_numeric {
         return Err(AnchorError::InvalidDirectUrl {
-            detail: format!("'{host}' consists of numeric labels only; must be a valid FQDN"),
+            detail: "transfer server host must be a lowercase LDH hostname with at least two labels and no IP address".to_owned(),
         });
     }
 
@@ -165,16 +156,14 @@ fn validate_public_fqdn(host: &str) -> Result<(), AnchorError> {
     let label_count = host.split('.').filter(|l| !l.is_empty()).count();
     if label_count < 2 {
         return Err(AnchorError::InvalidDirectUrl {
-            detail: format!(
-                "'{host}' is a single-label hostname; a valid FQDN requires at least two labels"
-            ),
+            detail: "transfer server host must be a lowercase LDH hostname with at least two labels and no IP address".to_owned(),
         });
     }
 
     // Validate LDH syntax.
     if !is_valid_ldh_home_domain(host) {
         return Err(AnchorError::InvalidDirectUrl {
-            detail: format!("'{host}' is not a valid lowercase RFC 1035 LDH FQDN"),
+            detail: "transfer server host must be a lowercase LDH hostname with at least two labels and no IP address".to_owned(),
         });
     }
 
@@ -196,6 +185,28 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn anchor_url_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::assert_no_marker;
+        let marker = "credmarker7";
+        for (url, domain) in [
+            (format!("{marker}://anchor.example"), None),
+            (format!("https://{marker}"), None),
+            (format!("https://{marker}_.example"), None),
+            ("https://anchor.example".to_owned(), Some(marker)),
+            (format!("https://{marker}.example"), Some("anchor.example")),
+            (
+                "https://other.example".to_owned(),
+                Some("credmarker7.example"),
+            ),
+        ] {
+            let error = assert_same_domain_or_https_fqdn(&url, domain).unwrap_err();
+            assert_no_marker(&error, marker);
+        }
+        let error = assert_same_domain_or_https_fqdn("https://192.0.2.7", None).unwrap_err();
+        assert_no_marker(&error, "192.0.2.7");
+    }
+
     // ── Same-domain SSRF bind tests ───────────────────────────────────────────
 
     /// Adversarial test: `TRANSFER_SERVER` host differs from anchor domain.
@@ -209,7 +220,7 @@ mod tests {
             Some("testanchor.stellar.org"),
         );
         assert!(
-            matches!(result, Err(AnchorError::TransferServerHostMismatch { .. })),
+            matches!(result, Err(AnchorError::TransferServerHostMismatch)),
             "host mismatch must return TransferServerHostMismatch; got: {result:?}"
         );
     }
@@ -223,7 +234,7 @@ mod tests {
         let result =
             assert_same_domain_or_https_fqdn("https://evil-anchor.org/sep6", Some("anchor.org"));
         assert!(
-            matches!(result, Err(AnchorError::TransferServerHostMismatch { .. })),
+            matches!(result, Err(AnchorError::TransferServerHostMismatch)),
             "evil-anchor.org must NOT match anchor.org; got: {result:?}"
         );
     }

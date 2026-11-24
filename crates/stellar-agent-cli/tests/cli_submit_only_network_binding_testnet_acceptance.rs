@@ -53,7 +53,9 @@
     reason = "test-only; panics and unwraps are acceptable in testnet acceptance tests"
 )]
 
-use std::process::Command;
+#[path = "cli/acceptance_storage.rs"]
+mod acceptance_storage;
+
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -104,14 +106,9 @@ fn fresh_keypair() -> (String, Zeroizing<String>, Zeroizing<[u8; 32]>) {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 2xx for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Polls RPC until the freshly-funded account is queryable, tolerating
@@ -166,7 +163,8 @@ fn run_pay(
     ];
     args.extend_from_slice(extra);
 
-    let output = Command::new(bin_path)
+    stellar_agent_test_support::sandbox::mark_sandbox(home).expect("mark fixture directory");
+    let output = acceptance_storage::command(bin_path, home, None)
         .args(&args)
         .env(SECRET_ENV_VAR, source_secret)
         .env("STELLAR_AGENT_HOME", home)

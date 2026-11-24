@@ -1,0 +1,52 @@
+{
+  "test_kind": "sequence",
+  "name": "memo_kind_value_matrix",
+  "category": "extended_grammar",
+  "description": "A binding needs its exact memo kind and value. Text, empty text, hash, and return bindings allow their memo and refuse another value or another kind with a mismatch that names only the required kind. Memo facts are the policy fields preparation inserts.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G", "memo_kind": "text", "memo": "invoice-7" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G", "memo_kind": "text", "memo": "invoice-8" },
+      "expected": { "kind": "Deny", "deny_reason": "memo_binding_mismatch", "wire_code": "policy.deny.memo_binding_mismatch", "reason": { "MemoBindingMismatch": { "kind": "text" } } }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G", "memo_kind": "id", "memo": null, "memo_id": "7" },
+      "expected": { "kind": "Deny", "deny_reason": "memo_binding_mismatch", "wire_code": "policy.deny.memo_binding_mismatch", "reason": { "MemoBindingMismatch": { "kind": "text" } } }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GALBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMKWB", "memo_kind": "text", "memo": "" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GALBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMKWB", "memo_kind": "none", "memo": null },
+      "expected": { "kind": "Deny", "deny_reason": "memo_binding_mismatch", "wire_code": "policy.deny.memo_binding_mismatch", "reason": { "MemoBindingMismatch": { "kind": "text" } } }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GALROFYXC4LROFYXC4LROFYXC4LROFYXC4LROFYXC4LROFYXC4LRPFOD", "memo_kind": "hash", "memo": null, "memo_hash": "1111111111111111111111111111111111111111111111111111111111111111" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GALROFYXC4LROFYXC4LROFYXC4LROFYXC4LROFYXC4LROFYXC4LRPFOD", "memo_kind": "return", "memo": null, "memo_return": "1111111111111111111111111111111111111111111111111111111111111111" },
+      "expected": { "kind": "Deny", "deny_reason": "memo_binding_mismatch", "wire_code": "policy.deny.memo_binding_mismatch", "reason": { "MemoBindingMismatch": { "kind": "hash" } } }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQUG3", "memo_kind": "return", "memo": null, "memo_return": "2222222222222222222222222222222222222222222222222222222222222222" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQUG3", "memo_kind": "hash", "memo": null, "memo_hash": "2222222222222222222222222222222222222222222222222222222222222222" },
+      "expected": { "kind": "Deny", "deny_reason": "memo_binding_mismatch", "wire_code": "policy.deny.memo_binding_mismatch", "reason": { "MemoBindingMismatch": { "kind": "return" } } }
+    }
+  ]
+}

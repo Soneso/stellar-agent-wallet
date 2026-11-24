@@ -120,6 +120,7 @@ fn timeout_server(
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", account, seed);
     let profile = crate::common::timeout_profile(mock_uri, account);
     let server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     (profile, server, source_g)
@@ -183,7 +184,7 @@ fn assert_timeout_records(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A timed-out claim leaves the record, and `stellar_transaction_status`
-/// settles it once the chain has the transaction.
+/// reconciles it once the chain has the transaction.
 #[tokio::test]
 #[serial]
 async fn a_timed_out_claim_records_the_submission_and_reports_the_hash() {
@@ -217,6 +218,7 @@ async fn a_timed_out_claim_records_the_submission_and_reports_the_hash() {
             chain_id: "stellar:testnet".to_owned(),
             balance_id: "ab".repeat(32),
             source_account: Some(claimant_g.clone()),
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -233,11 +235,12 @@ async fn a_timed_out_claim_records_the_submission_and_reports_the_hash() {
             chain_id: "stellar:testnet".to_owned(),
             balance_id: "ab".repeat(32),
             source_account: Some(claimant_g),
-            nonce: data["nonce"].as_str().expect("nonce").to_owned(),
-            expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().expect("expires"),
-            envelope_xdr: data["envelope_xdr"].as_str().expect("envelope").to_owned(),
+            nonce: Some(data["nonce"].as_str().expect("nonce").to_owned()),
+            expires_at_unix_ms: Some(data["expires_at_unix_ms"].as_u64().expect("expires")),
+            envelope_xdr: Some(data["envelope_xdr"].as_str().expect("envelope").to_owned()),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must not error");
@@ -283,6 +286,7 @@ async fn a_timed_out_trustline_records_the_submission_and_reports_the_hash() {
         asset: "USDC".to_owned(),
         limit_stroops: Some("1000000000".to_owned()),
         classic_base: None,
+        business_id: None,
     };
     let sim = server
         .call_stellar_trustline(simulate_args.clone())
@@ -300,11 +304,12 @@ async fn a_timed_out_trustline_records_the_submission_and_reports_the_hash() {
         .call_stellar_trustline_commit(StellarTrustlineCommitArgs {
             chain_id: simulate_args.chain_id.clone(),
             from: simulate_args.from.clone(),
-            nonce: data["nonce"].as_str().expect("nonce").to_owned(),
-            expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().expect("expires"),
-            envelope_xdr: data["envelope_xdr"].as_str().expect("envelope").to_owned(),
+            nonce: Some(data["nonce"].as_str().expect("nonce").to_owned()),
+            expires_at_unix_ms: Some(data["expires_at_unix_ms"].as_u64().expect("expires")),
+            envelope_xdr: Some(data["envelope_xdr"].as_str().expect("envelope").to_owned()),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must not error");
@@ -316,8 +321,8 @@ async fn a_timed_out_trustline_records_the_submission_and_reports_the_hash() {
 // stellar_create_account_commit
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A timed-out account creation leaves the record, and the settled row appears
-/// once `stellar_transaction_status` reconciles it.
+/// A timed-out account creation leaves the record, and
+/// `stellar_transaction_status` addresses it by the reported hash.
 #[tokio::test]
 #[serial]
 async fn a_timed_out_create_account_records_the_submission_and_reports_the_hash() {
@@ -347,6 +352,7 @@ async fn a_timed_out_create_account_records_the_submission_and_reports_the_hash(
             destination: destination_g.clone(),
             starting_balance: serde_json::from_str(r#""2 XLM""#).unwrap(),
             classic_base: None,
+            business_id: None,
         })
         .await
         .expect("simulate must not error");
@@ -364,11 +370,12 @@ async fn a_timed_out_create_account_records_the_submission_and_reports_the_hash(
             source: source_g,
             destination: destination_g,
             starting_balance: serde_json::from_str(r#""2 XLM""#).unwrap(),
-            nonce: data["nonce"].as_str().expect("nonce").to_owned(),
-            expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().expect("expires"),
-            envelope_xdr: data["envelope_xdr"].as_str().expect("envelope").to_owned(),
+            nonce: Some(data["nonce"].as_str().expect("nonce").to_owned()),
+            expires_at_unix_ms: Some(data["expires_at_unix_ms"].as_u64().expect("expires")),
+            envelope_xdr: Some(data["envelope_xdr"].as_str().expect("envelope").to_owned()),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect("commit must not error");
@@ -380,7 +387,9 @@ async fn a_timed_out_create_account_records_the_submission_and_reports_the_hash(
     let status = server
         .call_stellar_transaction_status(StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
-            tx_hash,
+            tx_hash: Some(tx_hash),
+            business_id: None,
+            retry_recovery: false,
         })
         .await
         .expect("the status tool must not error");
@@ -433,6 +442,8 @@ async fn a_timed_out_sep43_submission_is_recorded_and_reconcilable() {
             transaction_xdr: envelope.envelope_xdr().to_owned(),
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .expect("the tool must not error");
@@ -473,7 +484,9 @@ async fn a_timed_out_sep43_submission_is_recorded_and_reconcilable() {
     let status = server
         .call_stellar_transaction_status(StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
-            tx_hash,
+            tx_hash: Some(tx_hash),
+            business_id: None,
+            retry_recovery: false,
         })
         .await
         .expect("the status tool must not error");
@@ -515,6 +528,8 @@ async fn a_muxed_source_reaches_the_send_through_sep43() {
             transaction_xdr: envelope.envelope_xdr().to_owned(),
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .expect("the tool must not error");
@@ -526,14 +541,15 @@ async fn a_muxed_source_reaches_the_send_through_sep43() {
     );
 }
 
-/// A confirmed SEP-43 submission writes one settled row.
+/// A SEP-43 submission the endpoint reports as successful writes no submitted
+/// row and keeps its pending row owed.
 ///
-/// The tool carries its own contract in an opaque-action row naming what it
-/// signed, and that row settles the pending row the recorder wrote. A second
-/// row from the recorder would put one send in the log twice.
+/// A reported success is an endpoint claim, not authenticated evidence, so the
+/// pending row the recorder wrote before the send stays owed, and reconciling
+/// the same transaction through the status tool appends no settled row either.
 #[tokio::test]
 #[serial]
-async fn a_confirmed_sep43_submission_writes_one_settled_row() {
+async fn a_reported_sep43_success_keeps_its_pending_row_owed() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
@@ -563,6 +579,8 @@ async fn a_confirmed_sep43_submission_writes_one_settled_row() {
             transaction_xdr: envelope.envelope_xdr().to_owned(),
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .expect("the tool must not error");
@@ -570,48 +588,55 @@ async fn a_confirmed_sep43_submission_writes_one_settled_row() {
     let json = call_result_json(&result);
     assert_eq!(
         json["data"]["status"], "success",
-        "the submission confirms: {json}"
+        "the endpoint reports success: {json}"
     );
 
     let rows = crate::common::audit_rows(&profile);
-    let submitted = crate::common::rows_of_kind(&rows, "value_action_submitted");
-    assert_eq!(
-        submitted.len(),
-        1,
-        "one confirmed send, one settled row: {rows:?}"
+    assert!(
+        crate::common::rows_of_kind(&rows, "value_action_submitted").is_empty(),
+        "a reported success writes no submitted row: {rows:?}"
     );
+    let pending = crate::common::rows_of_kind(&rows, "value_action_pending");
     assert_eq!(
-        submitted[0]["opaque_reason"], "raw_transaction_signature",
-        "the row kept is the one carrying the tool's own contract: {rows:?}"
-    );
-    assert_eq!(
-        crate::common::rows_of_kind(&rows, "value_action_pending").len(),
+        pending.len(),
         1,
         "the pending row is written once: {rows:?}"
     );
 
-    // The row that survives has to close out the pending row. A settled row
-    // that does not name the submission leaves it owed for good, and the
-    // duplicate comes back the moment anyone reconciles the hash.
     let signed_xdr = json["data"]["signedTxXdr"]
         .as_str()
         .unwrap_or_else(|| panic!("the response carries the signed envelope: {json}"));
     let envelope_hash = stellar_agent_network::envelope_hash_hex(signed_xdr);
     assert_eq!(
-        submitted[0]["envelope_hash"], envelope_hash,
-        "the settled row names the submission it settles: {rows:?}"
+        pending[0]["envelope_hash"], envelope_hash,
+        "the pending row names the submission: {rows:?}"
     );
-    assert_eq!(
-        stellar_agent_core::audit_log::reader::try_value_action_settlement(
-            &profile.audit_log_path,
-            &envelope_hash
+    let profile_name = server.profile_name_for_approval();
+    let writer = stellar_agent_core::audit_log::AuditWriterRegistry::get_or_open_keyed(
+        &profile_name,
+        &profile.audit_log_path,
+        stellar_agent_network::keyring::keyed_audit_access(
+            &profile,
+            &profile_name,
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
         )
-        .unwrap(),
-        stellar_agent_core::audit_log::reader::ValueActionSettlement::Settled,
-        "the pending row is accounted for: {rows:?}"
+        .expect("audit access"),
+    )
+    .expect("the server's cached writer");
+    let settlement = stellar_agent_core::audit_log::reader::try_value_action_settlement(
+        &writer.lock().unwrap(),
+        &envelope_hash,
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            settlement,
+            stellar_agent_core::audit_log::reader::ValueActionSettlement::Owed(_)
+        ),
+        "the pending row stays owed: {settlement:?}"
     );
 
-    // And reconciling the same transaction appends nothing.
+    // Reconciling the same transaction appends no settled row.
     let tx_hash = json["data"]["txHash"]
         .as_str()
         .unwrap_or_else(|| panic!("the response carries the hash: {json}"))
@@ -619,16 +644,155 @@ async fn a_confirmed_sep43_submission_writes_one_settled_row() {
     let status = server
         .call_stellar_transaction_status(StellarTransactionStatusArgs {
             chain_id: "stellar:testnet".to_owned(),
-            tx_hash,
+            tx_hash: Some(tx_hash),
+            business_id: None,
+            retry_recovery: false,
         })
         .await
         .expect("the status tool must not error");
     assert_ne!(status.is_error, Some(true), "reconciliation must succeed");
     let rows_after = crate::common::audit_rows(&profile);
+    for kind in ["value_action_submitted", "value_action_failed"] {
+        assert!(
+            crate::common::rows_of_kind(&rows_after, kind).is_empty(),
+            "reconciling a reported success appends no {kind} row: {rows_after:?}"
+        );
+    }
     assert_eq!(
-        crate::common::rows_of_kind(&rows_after, "value_action_submitted").len(),
+        crate::common::rows_of_kind(&rows_after, "value_action_pending").len(),
         1,
-        "reconciling a settled submission appends no second row: {rows_after:?}"
+        "reconciling appends no second pending row: {rows_after:?}"
+    );
+}
+
+/// An approved SEP-43 submission that the endpoint confirms returns the signed
+/// envelope and its hash, and the send spends the approval.
+#[tokio::test]
+#[serial]
+async fn an_approved_sep43_submission_reports_success_and_spends_the_approval() {
+    use base64::Engine as _;
+    use stellar_agent_core::approval::attestation::{compute_attestation_v4, envelope_sha256};
+    use stellar_agent_core::approval::{
+        ApprovalKind, AttestationBinding, AttestedApprover, PendingApprovalStore,
+        process_uid_for_attestation,
+    };
+    use stellar_agent_core::policy::{ApprovalRequest, Decision};
+    use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+
+    let _root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring");
+    install_test_nonce_key();
+    let seed = [0x79; 32];
+    let envelope = stellar_agent_test_support::signed_envelope::SignedTestEnvelope::builder(seed)
+        .sequence(SOURCE_SEQ + 1)
+        .build();
+    let xdr = envelope.envelope_xdr().to_owned();
+    let rpc = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            crate::common::TimeoutRpc::new(vec![(
+                account_ledger_key_xdr(envelope.source()),
+                account_entry_xdr_with_seq(
+                    envelope.source(),
+                    SOURCE_BALANCE_STROOPS,
+                    0,
+                    SOURCE_SEQ,
+                ),
+            )])
+            .confirming_in(1001),
+        )
+        .mount(&rpc)
+        .await;
+    let (profile, mut server, _) = timeout_server(&rpc.uri(), envelope.source(), seed);
+    let approvals = tempfile::TempDir::new().expect("approval dir");
+    server.set_approval_dir_for_test(approvals.path().to_owned());
+    let attestation_key = [0xD2_u8; 32];
+    keyring_core::Entry::new(
+        &profile.attestation_key_id.service,
+        &profile.attestation_key_id.account,
+    )
+    .expect("Entry::new")
+    .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(attestation_key))
+    .expect("set_password");
+    let name = server.profile_name_for_approval();
+    let rule = |tool: &str, decision| PolicyRule {
+        r#match: RuleMatch {
+            tool: tool.into(),
+            chain: "*".into(),
+        },
+        criteria: vec![],
+        decision,
+        allow_opaque_signing: false,
+    };
+    server.set_policy_engine_for_test(std::sync::Arc::new(PolicyEngineV1::new(
+        PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            signature: None,
+            rules: vec![
+                rule(
+                    "stellar_sep43_sign_and_submit_transaction",
+                    Decision::RequireApproval(ApprovalRequest::new("rule".into(), 600)),
+                ),
+                rule("*", Decision::Allow),
+            ],
+        },
+        name.clone(),
+    )));
+    let args =
+        |nonce: Option<String>, attestation: Option<String>| Sep43SignAndSubmitTransactionArgs {
+            chain_id: "stellar:testnet".into(),
+            transaction_xdr: xdr.clone(),
+            network_passphrase: None,
+            address: None,
+            approval_nonce: nonce,
+            approval_attestation: attestation,
+        };
+    let first = server
+        .call_stellar_sep43_sign_and_submit_transaction(args(None, None))
+        .await
+        .expect("first call");
+    let first = call_result_json(&first);
+    let nonce = first["data"]["approval"]["approval_nonce"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a pending approval: {first}"))
+        .to_owned();
+    let store_path = approvals.path().join(format!("{name}.toml"));
+    let mut store = PendingApprovalStore::open(store_path.clone()).expect("approval store");
+    let entry = store.get(&nonce).cloned().expect("the stored approval");
+    let blob = compute_attestation_v4(
+        &attestation_key,
+        &AttestationBinding::new(&name, "stellar:testnet"),
+        &nonce,
+        &envelope_sha256(xdr.as_bytes()),
+        &process_uid_for_attestation().expect("process uid"),
+        &entry.attested_lifetime(),
+        &AttestedApprover::Local,
+    );
+    store
+        .record_attestation(&nonce, blob, AttestedApprover::Local)
+        .expect("attestation");
+    drop(store);
+    let second = server
+        .call_stellar_sep43_sign_and_submit_transaction(args(
+            Some(nonce.clone()),
+            Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob)),
+        ))
+        .await
+        .expect("approved call");
+    let second = call_result_json(&second);
+    assert_eq!(second["ok"], true, "{second}");
+    assert_eq!(second["data"]["status"], "success", "{second}");
+    assert!(second["data"]["signedTxXdr"].is_string(), "{second}");
+    let tx_hash = second["data"]["txHash"].as_str().expect("txHash");
+    assert_eq!(tx_hash.len(), 64, "{second}");
+    let store = PendingApprovalStore::open(store_path).expect("approval store");
+    assert!(
+        matches!(
+            store.get(&nonce).expect("the entry").kind,
+            ApprovalKind::Consumed { .. }
+        ),
+        "the send spends the approval"
     );
 }
 
@@ -704,6 +868,8 @@ async fn profile_chain_sep43_accounting_persists_rate_limit() {
         transaction_xdr: envelope.envelope_xdr().into(),
         network_passphrase: None,
         address: None,
+        approval_nonce: None,
+        approval_attestation: None,
     };
     let submitted = server
         .call_stellar_sep43_sign_and_submit_transaction(args(&first))
@@ -725,10 +891,15 @@ async fn profile_chain_sep43_accounting_persists_rate_limit() {
             .expect("rate window"),
         (1, 1)
     );
-    assert!(
-        disk.pending_reservations(&profile)
-            .expect("reservations")
-            .is_empty()
+    // The reported success keeps its reservation as possible spending.
+    let held = disk.pending_reservations(&profile).expect("reservations");
+    assert_eq!(held.len(), 1, "{held:?}");
+    let signed_xdr = submitted["data"]["signedTxXdr"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the response carries the signed envelope: {submitted}"));
+    assert_eq!(
+        held[0].id,
+        stellar_agent_network::envelope_hash_hex(signed_xdr)
     );
     let refused = server
         .call_stellar_sep43_sign_and_submit_transaction(args(&second))

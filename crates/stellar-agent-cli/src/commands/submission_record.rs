@@ -2,11 +2,11 @@
 //! reporting what the submit layer refused.
 //!
 //! Every value verb that broadcasts records its submission before the
-//! transaction is sent, and settles that record against what the network
-//! answers. The construction is identical across the verbs, so it lives here
-//! once, alongside the reconciliation pass each verb runs before its policy
-//! gate and the mapping that turns the three unresolved-submission refusals
-//! into a response an operator or an agent can act on.
+//! transaction is sent, and records a reported success on it. The
+//! construction is identical across the verbs, so it lives here once. So do
+//! the reconciliation pass each verb runs before its policy gate and the
+//! mapping of the three unresolved-submission refusals. That mapping turns
+//! each refusal into a response an operator or an agent can act on.
 
 use std::sync::{Arc, Mutex};
 
@@ -14,17 +14,56 @@ use stellar_agent_core::audit_log::schema::ValueLegRecord;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{NetworkError, SubmissionError, WalletError};
+use stellar_agent_core::mainnet::decision::MainnetProvenance;
 use stellar_agent_core::policy::v1::{ValueClass, ValueEffects};
 use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor, ToolValueKind};
-use stellar_agent_core::profile::receipt::{
-    ReceiptStatus, ReceiptStore, ReleaseEvidence, SettledRow,
-};
+use stellar_agent_core::profile::receipt::ReceiptStore;
 use stellar_agent_core::profile::schema::Profile;
-use stellar_agent_network::StellarRpcClient;
-use stellar_agent_network::policy_state::{PersistedWindowStore, RECONCILE_BUDGET};
-use stellar_agent_network::{WalletSubmissionRecorder, envelope_hash_hex};
+use stellar_agent_network::cross_check::CrossCheckWitness;
+use stellar_agent_network::mainnet::audit_readiness::AuditReadiness;
+use stellar_agent_network::mainnet::authority::MainnetAuthority;
+use stellar_agent_network::mainnet::authorization::MainnetTxSignAuthorization;
+use stellar_agent_network::policy_state::PersistedWindowStore;
+use stellar_agent_network::submission_flow::{
+    self, RecorderInputs, assemble_recorder, checked_sizing, open_receipts, submission_details,
+};
+use stellar_agent_network::{
+    ApprovalTombstone, AuditWriterHandle, MainnetWriteContext, NetworkContext, StellarRpcClient,
+    WalletSubmissionRecorder,
+};
+
+pub(crate) use stellar_agent_network::submission_flow::StageMarkedRecorder;
 
 use crate::common::profile_access::ProfileOrigin;
+
+/// Observes retained intents before the caller constructs its policy engine.
+pub(crate) async fn observe_intents(profile: &Profile, profile_name: &str) {
+    PersistedWindowStore::for_profile(profile_name)
+        .observe_before_policy(profile)
+        .await;
+}
+
+/// Observes and replaces the state of an existing policy engine.
+///
+/// # Errors
+/// Refuses a state clear or verified refresh failure.
+pub(crate) async fn observe_and_refresh_intents(
+    profile: &Profile,
+    profile_name: &str,
+    engine: &dyn stellar_agent_core::policy::PolicyEngine,
+) -> Result<(), stellar_agent_network::policy_state::WindowStoreError> {
+    let Some(state) = engine.window_state_store() else {
+        return Ok(());
+    };
+    let window = PersistedWindowStore::for_profile(profile_name);
+    window.observe_before_policy(profile).await;
+    state.clear().map_err(|error| {
+        stellar_agent_network::policy_state::WindowStoreError::Invalid {
+            detail: error.to_string(),
+        }
+    })?;
+    window.load_into(profile_name, profile, state)
+}
 
 /// The verb this binary names as the way to reconcile a submission whose
 /// outcome is not known.
@@ -45,15 +84,45 @@ pub(crate) struct SubmitRecord<'a> {
     pub policy_decision: stellar_agent_core::audit_log::PolicyDecision,
     /// CAIP-2 chain identifier for the audit rows.
     pub chain_id: &'a str,
-    /// The value effects the policy gate sized. `None` records no window
-    /// entries and no legs.
+    /// The authenticated value effects the policy gate sizes.
+    /// Without effects, `unvalued` supplies checked count sizing when present.
     pub effects: Option<&'a ValueEffects>,
+    /// The reason a contract call has no measurable value effects.
+    pub unvalued: Option<stellar_agent_core::policy::v1::OpaqueReason>,
     /// The audit writer the origin-aware pre-flight acquired. `None` only on a
     /// synthesized zero-configuration profile, which has no audit log to write
     /// to.
     pub audit: Option<Arc<Mutex<AuditWriter>>>,
     /// The caller's clock in unix milliseconds.
     pub now_ms: u64,
+}
+
+/// The audit legs of `effects` for a submission of `tool`.
+///
+/// A destination-bearing leg of `stellar_pay` or `stellar_pay_commit`
+/// takes [`ValueLegRecord::from_payment_leg`], which records the SHA-256 of
+/// the complete destination. Every other leg takes the generic conversion.
+///
+/// # Errors
+///
+/// `validation.address_invalid` when such a payment destination is not a
+/// canonical G or M address.
+fn audit_legs(
+    tool: &str,
+    effects: Option<&ValueEffects>,
+) -> Result<Vec<ValueLegRecord>, WalletError> {
+    let pay = matches!(tool, "stellar_pay" | "stellar_pay_commit");
+    effects
+        .map_or(&[][..], ValueEffects::legs)
+        .iter()
+        .map(|leg| {
+            if pay && leg.destination.is_some() {
+                ValueLegRecord::from_payment_leg(leg)
+            } else {
+                Ok(leg.into())
+            }
+        })
+        .collect()
 }
 
 /// Builds the recorder for one submission.
@@ -71,72 +140,271 @@ pub(crate) struct SubmitRecord<'a> {
 pub(crate) fn build_recorder(
     record: SubmitRecord<'_>,
 ) -> Result<WalletSubmissionRecorder<'_>, WalletError> {
-    let receipts = ReceiptStore::open(&record.profile_name).map_err(|e| {
-        record_unavailable(format!(
-            "the submission receipt store could not be opened: {e}"
-        ))
-    })?;
+    let receipts = open_receipts(&record.profile_name)?;
 
-    let legs: Vec<ValueLegRecord> = record
-        .effects
-        .map(|e| e.legs().iter().map(Into::into).collect())
-        .unwrap_or_default();
+    let legs = audit_legs(record.tool, record.effects)?;
 
-    let window_entries = match record.effects {
-        Some(effects) => {
-            let engine = crate::commands::policy_engine::build_v1_policy_engine(
-                record.verb,
-                &record.profile.policy.engine,
-                record.profile,
-                &record.profile_name,
-            )
-            .map_err(|e| {
-                record_unavailable(format!("the policy engine could not be rebuilt: {e}"))
-            })?;
-            engine
-                .record_confirmed(
-                    &descriptor_for(record.tool, record.chain_id),
-                    record.profile,
-                    &ValueClass::Value(effects.clone()),
-                )
-                .map_err(|e| {
-                    record_unavailable(format!(
-                        "the policy engine could not account for this action: {e}"
-                    ))
-                })?
-        }
-        None => Vec::new(),
+    let engine = || {
+        crate::commands::policy_engine::build_v1_policy_engine(
+            record.verb,
+            &record.profile.policy.engine,
+            record.profile,
+            &record.profile_name,
+        )
+        .map_err(|error| {
+            record_unavailable(format!("the policy engine cannot be rebuilt: {error}"))
+        })
     };
-
-    Ok(WalletSubmissionRecorder::new(
-        record.profile,
-        record.profile_name.clone(),
-        record.tool,
-        Some(record.chain_id.to_owned()),
-        record.policy_decision,
-        legs,
-        window_entries,
+    let sizing = match (record.effects, record.unvalued) {
+        (Some(effects), _) => Some(engine()?.record_confirmed_checked(
+            &descriptor_for(record.tool, record.chain_id, ToolValueKind::MovesValue),
+            record.profile,
+            &ValueClass::Value(effects.clone()),
+        )),
+        (None, Some(reason)) => Some(engine()?.size_unvalued_call(
+            &descriptor_for(record.tool, record.chain_id, ToolValueKind::OpaqueSign),
+            record.profile,
+            reason,
+            record.now_ms,
+        )),
+        (None, None) => None,
+    }
+    .map(|outcome| {
+        let outcome = outcome.map_err(|error| {
+            record_unavailable(format!(
+                "the policy engine cannot account for this action: {error}"
+            ))
+        })?;
+        checked_sizing(outcome, || record_unavailable("unsupported sizing outcome"))
+    })
+    .transpose()?;
+    Ok(assemble_recorder(
+        RecorderInputs {
+            profile: record.profile,
+            profile_name: record.profile_name,
+            tool: record.tool,
+            chain_id: record.chain_id.to_owned(),
+            policy_decision: record.policy_decision,
+            legs,
+            audit: record.audit,
+            nonce_id: None,
+            now_ms: record.now_ms,
+            provenance: None,
+            operation: None,
+            pre_exposure_ledger: None,
+            observation: None,
+        },
         receipts,
-        PersistedWindowStore::for_profile(&record.profile_name),
-        record.audit,
-        None,
-        uuid::Uuid::new_v4().to_string(),
-        record.now_ms,
+        sizing,
     ))
 }
 
+/// Builds checked count admission from the profile's policy engine.
+pub(crate) fn no_value_admission(
+    profile: &Profile,
+    profile_name: &str,
+    tool: &'static str,
+    chain_id: &str,
+    now_ms: u64,
+) -> Result<Arc<stellar_agent_network::NoValueAdmission>, WalletError> {
+    let unavailable = |_| {
+        WalletError::Submission(SubmissionError::IntentRecordUnavailable {
+            class: "policy_unavailable",
+        })
+    };
+    let engine = crate::commands::policy_engine::build_v1_policy_engine(
+        tool,
+        &profile.policy.engine,
+        profile,
+        profile_name,
+    )
+    .map_err(|_| {
+        WalletError::Submission(SubmissionError::IntentRecordUnavailable {
+            class: "policy_unavailable",
+        })
+    })?;
+    let sizing = engine
+        .size_no_value(
+            &descriptor_for(tool, chain_id, ToolValueKind::ReadOnly),
+            profile,
+            now_ms,
+        )
+        .map_err(unavailable)?;
+    stellar_agent_network::NoValueAdmission::new(profile.clone(), profile_name, sizing)
+        .map(Arc::new)
+}
+
+/// What a mainnet write's recorder records, prepared before the
+/// authorization is minted.
+///
+/// Everything that can fail is done here: the receipt store is open, the
+/// approval directory is resolved, and the clock is read. Binding to the
+/// minted authorization cannot fail, so no refusal falls between the mint and
+/// the signer.
+pub(crate) struct PreparedMainnetRecorder<'a> {
+    profile: &'a Profile,
+    profile_name: String,
+    tool: &'static str,
+    chain_id: String,
+    decision: stellar_agent_core::audit_log::PolicyDecision,
+    legs: Vec<ValueLegRecord>,
+    receipts: ReceiptStore,
+    window: PersistedWindowStore,
+    audit: AuditWriterHandle,
+    request_id: String,
+    now_ms: u64,
+    witness: Option<&'a CrossCheckWitness>,
+    tombstone: Option<ApprovalTombstone>,
+    provenance: MainnetProvenance,
+}
+
+/// Prepares the recorder of a mainnet write under `context`.
+///
+/// The legs are the evaluation's `effects`; the window entries come from the
+/// authorization at [`PreparedMainnetRecorder::bind_authorized`], never from
+/// a rebuilt engine. The audit writer is the one `readiness` verified. The
+/// confirmation entry the approval `authority` names is tombstoned when the
+/// submission settles.
+///
+/// # Errors
+///
+/// `submission.record_unavailable` when the receipt store cannot be opened,
+/// the approval authority's directory cannot be resolved, or the clock
+/// cannot be read.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the recorder binds the governing decision and submission proofs"
+)]
+pub(crate) fn prepare_mainnet_recorder<'a>(
+    context: &'a MainnetWriteContext,
+    tool: &'static str,
+    decision: stellar_agent_core::audit_log::PolicyDecision,
+    provenance: MainnetProvenance,
+    effects: Option<&ValueEffects>,
+    readiness: &AuditReadiness,
+    witness: Option<&'a CrossCheckWitness>,
+    authority: &MainnetAuthority<'_>,
+) -> Result<PreparedMainnetRecorder<'a>, WalletError> {
+    let profile_name = context.profile_name().to_owned();
+    let receipts = open_receipts(&profile_name)?;
+    let now_ms = stellar_agent_network::mainnet::clock::now_ms()
+        .map_err(|e| record_unavailable(format!("the clock could not be read: {e}")))?;
+    let legs = audit_legs(tool, effects)?;
+    Ok(PreparedMainnetRecorder {
+        profile: context.profile(),
+        tombstone: match authority {
+            MainnetAuthority::Approval(approval) => Some(ApprovalTombstone {
+                store_dir: crate::commands::approve::approval_store_dir().map_err(|e| {
+                    record_unavailable(format!(
+                        "the approval store directory could not be resolved: {e}"
+                    ))
+                })?,
+                profile_name: profile_name.clone(),
+                approval_nonce: approval.witness().nonce().to_owned(),
+            }),
+            MainnetAuthority::Policy(_) => None,
+        },
+        provenance,
+        window: PersistedWindowStore::for_profile(&profile_name),
+        chain_id: context.chain().caip2_str().to_owned(),
+        profile_name,
+        tool,
+        decision,
+        legs,
+        receipts,
+        audit: Arc::clone(readiness.writer()),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        now_ms,
+        witness,
+    })
+}
+
+impl<'a> PreparedMainnetRecorder<'a> {
+    /// The audit writer the readiness proof verified, which the operation
+    /// attempt's rows go through.
+    pub(crate) fn audit_writer(&self) -> &AuditWriterHandle {
+        &self.audit
+    }
+
+    /// The request id the recorder's rows carry.
+    pub(crate) fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// Binds the prepared recorder to the minted `authorization`, whose
+    /// window entries it records, with the cross-check witness, any approval
+    /// tombstone, and the operation attempt the submission ends.
+    #[must_use]
+    pub(crate) fn bind_authorized(
+        self,
+        authorization: &MainnetTxSignAuthorization,
+        operation: Option<stellar_agent_network::OperationAttempt>,
+        observation: stellar_agent_network::policy_state::SubmissionObservation,
+    ) -> StageMarkedRecorder<'a> {
+        let recorder = WalletSubmissionRecorder::new_authorized(
+            self.profile,
+            self.profile_name,
+            self.tool,
+            Some(self.chain_id),
+            self.decision,
+            self.legs,
+            authorization,
+            self.receipts,
+            self.window,
+            Some(self.audit),
+            None,
+            self.request_id,
+            self.now_ms,
+        )
+        .with_witness(self.witness)
+        .with_approval(self.tombstone)
+        .with_provenance(self.provenance)
+        .with_operation(operation)
+        .with_pre_exposure_ledger(observation.pre_exposure_ledger)
+        .with_observation(observation.observation);
+        StageMarkedRecorder::new(recorder)
+    }
+}
+
 /// Reconstructs the [`ToolDescriptor`] the gate evaluated against.
-fn descriptor_for(tool: &'static str, chain_id: &str) -> ToolDescriptor {
+fn descriptor_for(tool: &'static str, chain_id: &str, value_kind: ToolValueKind) -> ToolDescriptor {
     let reg = McpToolRegistration {
         name: tool,
         destructive_hint: true,
         read_only_hint: false,
         chain_id_required: true,
-        value_kind: ToolValueKind::MovesValue,
+        value_kind,
     };
     let mut descriptor = ToolDescriptor::from_registration(&reg);
     descriptor.chain_id = chain_id.to_owned();
     descriptor
+}
+
+/// The oracle a reconciliation pass of `profile` consults about a negative
+/// answer of the primary endpoint for a mainnet reservation, built from the
+/// profile. The reservation stands whatever the oracle answers negatively.
+///
+/// See [`settlement_oracle_in`].
+pub(crate) fn settlement_oracle(profile: &Profile) -> Option<StellarRpcClient> {
+    settlement_oracle_in(profile, &NetworkContext::from_profile(profile))
+}
+
+/// The oracle a reconciliation pass of `profile` consults about a negative
+/// answer of the primary endpoint for a mainnet reservation, built as
+/// `context` builds its clients. The reservation stands whatever the oracle
+/// answers negatively.
+///
+/// `None` for a profile on another chain, whose pass never reads an oracle,
+/// and for a mainnet profile that names none. An oracle client that cannot
+/// be built is logged and also yields `None`: the pass then keeps every
+/// reservation the primary reports as failed or unknown, as it does when the
+/// oracle cannot be reached.
+pub(crate) fn settlement_oracle_in(
+    profile: &Profile,
+    context: &NetworkContext,
+) -> Option<StellarRpcClient> {
+    let name = stellar_agent_core::profile::name::derive_profile_name_from_owner_key(profile)?;
+    submission_flow::settlement_oracle(&PersistedWindowStore::for_profile(name), profile, context)
 }
 
 /// Settles the reservations that have stood long enough to be settleable,
@@ -144,20 +412,39 @@ fn descriptor_for(tool: &'static str, chain_id: &str) -> ToolDescriptor {
 ///
 /// A reservation counts against the operator's caps while it stands, so a
 /// verb that is about to be gated asks the chain about the oldest few first.
-/// Reconciliation is not a gate of its own: a pass that cannot reach the
+/// Reconciliation is not a gate of its own. A pass that cannot reach the
 /// endpoint leaves every reservation standing and the verb continues, because
-/// counting a reservation that may still apply is the safe direction.
+/// counting a reservation that may still apply is the safe direction. The
+/// exception is a reservation past its accounting horizon. For each selected
+/// reservation, accounting expiry runs before that reservation's endpoint
+/// reads.
 ///
-/// The settled rows are written under the audit binding check of `origin`,
-/// so a synthesized profile records no binding.
+/// On a mainnet profile `oracle` witnesses the primary endpoint's negative
+/// answers; [`settlement_oracle`] builds it.
+///
+/// Every owed accounting obligation is then drained under the audit binding
+/// check of `origin`, so a synthesized profile records no binding. The drain
+/// runs whatever the pass reported, also after a refused pass, so obligations
+/// of earlier passes are delivered too.
+///
+/// A mainnet run passes the `business_id` it names, before its business-id
+/// lookup. A run whose id is already stored replays or conflicts before it
+/// builds anything, so its pass runs the legacy stage alone and no recovery
+/// stage. The stored-id read is local and sends no request.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the reconciliation arguments plus the run's business id"
+)]
 pub(crate) async fn reconcile_open_reservations(
     profile: &Profile,
     profile_name: &str,
     origin: ProfileOrigin,
     client: &StellarRpcClient,
+    oracle: Option<&StellarRpcClient>,
     now_ms: u64,
+    business_id: Option<&str>,
 ) {
-    let receipts = match ReceiptStore::open(profile_name) {
+    let receipts = match open_receipts(profile_name) {
         Ok(store) => Some(store),
         Err(e) => {
             tracing::debug!(
@@ -169,315 +456,60 @@ pub(crate) async fn reconcile_open_reservations(
         }
     };
     let window = PersistedWindowStore::for_profile(profile_name);
-    let report = match window
-        .reconcile_due(profile, client, receipts.as_ref(), now_ms, RECONCILE_BUDGET)
-        .await
-    {
-        Ok(report) => report,
-        Err(e) => {
-            tracing::debug!(
-                profile = %profile_name,
-                error = ?e,
-                "window reconcile: pass failed; open reservations stand"
-            );
-            return;
-        }
-    };
-
-    // A submission the pass settled is owed the value-action row it never got
-    // to write. The writer is the same keyed one the verb itself uses, so a
-    // log that cannot be appended leaves the row owed rather than the
-    // settlement undone.
-    if report.settled.is_empty() {
-        return;
-    }
-    let Some(audit) = settled_rows_writer(profile, profile_name, origin) else {
-        tracing::debug!(
-            profile = %profile_name,
-            settled = report.settled.len(),
-            "window reconcile: no audit writer; the settled rows stay owed"
-        );
-        return;
-    };
-    for settled in &report.settled {
-        write_settled_row_with_evidence(
+    let writer = || accounting_audit_writer(profile, profile_name, origin);
+    let pass = if submission_flow::business_id_is_stored(profile, &window, business_id) {
+        submission_flow::reconcile_legacy_pass(
             profile,
-            profile_name,
-            &audit,
-            &settled.envelope_hash,
-            &settled.tx_hash,
-            &settled.status,
-            settled.release_code,
-            settled.ledger,
-            stellar_agent_core::audit_log::PolicyDecision::Allow,
-        );
-    }
-}
-
-/// The writer for the rows a reconciliation pass settled, acquired under the
-/// audit binding check of `origin`.
-///
-/// `None` when no writer is acquirable or the binding refuses; the settled
-/// rows then stay owed.
-fn settled_rows_writer(
-    profile: &Profile,
-    profile_name: &str,
-    origin: ProfileOrigin,
-) -> Option<Arc<Mutex<AuditWriter>>> {
-    match crate::commands::value_audit::require_value_audit_writer_for_origin(
+            &window,
+            client,
+            oracle,
+            receipts.as_ref(),
+            now_ms,
+            writer,
+        )
+        .await
+    } else {
+        submission_flow::reconcile_pass(
+            profile,
+            &window,
+            client,
+            oracle,
+            receipts.as_ref(),
+            now_ms,
+            writer,
+        )
+        .await
+    };
+    let _ = submission_flow::finish_reconciliation(
         profile,
         profile_name,
-        origin,
-    ) {
-        Ok(writer) => writer,
-        Err(e) => {
-            tracing::debug!(
-                profile = %profile_name,
-                code = %e.code(),
-                "window reconcile: audit writer refused"
-            );
-            None
-        }
-    }
-}
-
-/// Writes the value-action row that settles a reconciled submission whose
-/// receipt carries no release evidence.
-///
-/// See [`write_settled_row_with_evidence`].
-#[allow(
-    clippy::too_many_arguments,
-    reason = "settlement carries submission identity and the reconciliation decision"
-)]
-pub(crate) fn write_settled_row(
-    profile: &Profile,
-    profile_name: &str,
-    audit: &Arc<Mutex<AuditWriter>>,
-    envelope_hash: &str,
-    tx_hash: &str,
-    status: &ReceiptStatus,
-    ledger: Option<u32>,
-    reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
-) {
-    write_settled_row_with_evidence(
-        profile,
-        profile_name,
-        audit,
-        envelope_hash,
-        tx_hash,
-        status,
-        None,
-        ledger,
-        reconciliation_decision,
+        &window,
+        receipts.as_ref(),
+        &pass,
+        || accounting_audit_writer(profile, profile_name, origin),
     );
 }
 
-/// Writes the value-action row that settles a reconciled submission.
-///
-/// The row carries the SAME value legs the gate sized, read back from the
-/// pending row this submission wrote before it was sent: they were derived
-/// once, at the gate, and are never re-derived here. `ledger` is the ledger
-/// the chain reports the transaction in.
-///
-/// Non-fatal: the chain has already answered, and the settled record is the
-/// receipt and the spending window. A row that cannot be appended is logged,
-/// and the receipt keeps what a later run needs to write it. A settlement
-/// lookup that cannot read the retained history is logged at WARN with the
-/// profile, the envelope hash, and the error, and writes nothing: whether the
-/// row is owed is unknown, and a row written on a guess could count one spend
-/// twice. A later run retries the lookup and appends any row still owed.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "settlement carries submission identity, its evidence and the reconciliation decision"
-)]
-pub(crate) fn write_settled_row_with_evidence(
-    profile: &Profile,
-    profile_name: &str,
-    audit: &Arc<Mutex<AuditWriter>>,
-    envelope_hash: &str,
-    tx_hash: &str,
-    status: &ReceiptStatus,
-    release_code: Option<ReleaseEvidence>,
-    ledger: Option<u32>,
-    reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
-) {
-    match settled_row(
-        profile,
-        envelope_hash,
-        tx_hash,
-        status,
-        release_code,
-        ledger,
-        reconciliation_decision,
-    ) {
-        Ok(Some(entry)) => crate::commands::value_audit::emit_value_audit_row_with_writer(
-            audit,
-            profile_name,
-            entry,
-        ),
-        Ok(None) => {}
-        Err(error) => tracing::warn!(
-            profile = %profile_name,
-            envelope_hash = %envelope_hash,
-            error = %error,
-            "settlement lookup could not read the audit history; settled row NOT emitted"
-        ),
-    }
-}
-
-/// Appends the value-action row that settles a reconciled submission, and
-/// reports a failed append.
-///
-/// `Ok` means the log carries the settled row: it was found in the retained
-/// history, it was appended now, or the submission owes none. An operator
-/// verb that is about to close the submission's record calls this first, so
-/// the record is closed only once its settlement is in the log. A history
-/// that cannot be read refuses, because it cannot show that the row is
-/// there.
+/// The writer accounting delivery appends through, acquired under the audit
+/// binding check of `origin`, for a caller that holds none.
 ///
 /// # Errors
 ///
-/// The append failure, mapped as every strict audit append maps it, to an
-/// `audit.*` code (`audit.tip_anchor_mismatch` included); a poisoned writer
-/// mutex is `audit.chain_key_unavailable`. A settlement lookup that cannot
-/// read the retained history keeps the verifier's `audit.*` code and message.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "settlement carries submission identity, its evidence and the reconciliation decision"
-)]
-pub(crate) fn append_settled_row(
+/// The acquisition refusal of
+/// [`crate::commands::value_audit::require_value_audit_writer_for_origin`],
+/// and `submission.record_unavailable` for a synthesized profile whose writer
+/// cannot be acquired. The obligations then stay owed.
+pub(crate) fn accounting_audit_writer(
     profile: &Profile,
     profile_name: &str,
-    audit: &Arc<Mutex<AuditWriter>>,
-    envelope_hash: &str,
-    tx_hash: &str,
-    status: &ReceiptStatus,
-    release_code: Option<ReleaseEvidence>,
-    reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
-) -> Result<(), Envelope<()>> {
-    let Some(entry) = settled_row(
+    origin: ProfileOrigin,
+) -> Result<Arc<Mutex<AuditWriter>>, WalletError> {
+    crate::commands::value_audit::require_value_audit_writer_for_origin(
         profile,
-        envelope_hash,
-        tx_hash,
-        status,
-        release_code,
-        None,
-        reconciliation_decision,
-    )
-    .map_err(|error| Envelope::err_raw(error.wire_code(), error.to_string()))?
-    else {
-        return Ok(());
-    };
-    let mut guard = audit.lock().map_err(|_| {
-        Envelope::err(&crate::commands::value_audit::audit_writer_open_failed(
-            profile_name,
-        ))
-    })?;
-    crate::commands::value_audit::append_value_audit_row_strict(&mut guard, profile_name, entry)
-        .map_err(|error| Envelope::err(&error))
-}
-
-/// The value-action row a reconciled submission still owes the log, or
-/// `None` when it owes none.
-///
-/// A `Success` receipt owes a `value_action_submitted` row and a `Failed` one
-/// a `value_action_failed` row under its failure code. An `Ambiguous` receipt
-/// released on chain evidence owes a `value_action_failed` row under the
-/// evidence's wire code: the reservation is gone, and the log records why.
-/// Every other status leaves the outcome open, which is what the pending row
-/// already records: a pending receipt, and an ambiguous one whose retention
-/// window closed. A receipt an operator cleared owes no row by design; the
-/// `submission_receipt_cleared` row records the clear.
-///
-/// The settlement lookup reads the retained history, newest file first. A
-/// settled row found there means the submission is accounted for, so a
-/// repeated reconciliation writes nothing. A status that owes no row returns
-/// before the lookup.
-///
-/// # Errors
-///
-/// The lookup's integrity error when a visited file cannot be read or its
-/// chain does not verify. Whether a row is owed is then unknown, which the
-/// caller handles: [`write_settled_row_with_evidence`] logs it and writes
-/// nothing, and [`append_settled_row`] refuses.
-fn settled_row(
-    profile: &Profile,
-    envelope_hash: &str,
-    tx_hash: &str,
-    status: &ReceiptStatus,
-    release_code: Option<ReleaseEvidence>,
-    ledger: Option<u32>,
-    reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
-) -> Result<
-    Option<stellar_agent_core::audit_log::AuditEntry>,
-    stellar_agent_core::audit_log::AuditLogIntegrityError,
-> {
-    use stellar_agent_core::audit_log::{AuditEntry, reader::ValueActionSettlement};
-
-    let Some(row) = status.settled_row(release_code) else {
-        return Ok(None);
-    };
-
-    let (tool, chain_id, legs, nonce_id, policy_decision, approval_nonce, witness) =
-        match stellar_agent_core::audit_log::reader::try_value_action_settlement(
-            &profile.audit_log_path,
-            envelope_hash,
-        )? {
-            // Already accounted for. Reconciliation is repeatable, and a second
-            // row would count one spend twice.
-            ValueActionSettlement::Settled => return Ok(None),
-            ValueActionSettlement::Owed(pending) => (
-                pending.tool,
-                pending.chain_id,
-                pending.legs,
-                pending.nonce_id,
-                pending.policy_decision,
-                pending.approval_nonce,
-                pending.witness,
-            ),
-            // No pending row survives in retained history, so its sizing is
-            // unavailable. The outcome still belongs in the log, under the name
-            // of the surface that settled it.
-            ValueActionSettlement::OwedWithoutLegs => (
-                RECONCILE_VERB.to_owned(),
-                profile.chain_id.caip2_str().to_owned().into(),
-                Vec::new(),
-                None,
-                reconciliation_decision,
-                None,
-                None,
-            ),
-        };
-    let chain_id: Option<String> = chain_id;
-    let tx_redacted = stellar_agent_network::redact_tx_hash(tx_hash);
-    let request_id = uuid::Uuid::new_v4().to_string();
-    Ok(Some(match row {
-        SettledRow::Submitted => AuditEntry::new_value_action_submitted(
-            tool,
-            chain_id,
-            legs,
-            tx_redacted.as_str(),
-            ledger.unwrap_or(0),
-            policy_decision,
-            Some(envelope_hash.to_owned()),
-            nonce_id,
-            approval_nonce,
-            &request_id,
-            witness,
-        ),
-        SettledRow::Failed { code } => AuditEntry::new_value_action_failed(
-            tool,
-            chain_id,
-            legs,
-            tx_redacted.as_str(),
-            code,
-            policy_decision,
-            Some(envelope_hash.to_owned()),
-            nonce_id,
-            approval_nonce,
-            &request_id,
-        ),
-    }))
+        profile_name,
+        origin,
+    )?
+    .ok_or_else(|| record_unavailable("no audit writer is available for accounting delivery"))
 }
 
 /// Renders a submit-path error, attaching the structured detail the three
@@ -494,10 +526,7 @@ pub(crate) fn error_envelope(err: &WalletError, signed_xdr: &str, verb: &str) ->
     if let Some(envelope) = policy_denial_envelope(err, verb) {
         return envelope;
     }
-    match submission_details(err, signed_xdr) {
-        Some(details) => Envelope::<()>::err_with_details(err, details),
-        None => Envelope::<()>::err(err),
-    }
+    submission_flow::submission_error_envelope(err, signed_xdr, RECONCILE_VERB)
 }
 
 /// The refusal envelope for a policy denial reported by the submit path, or
@@ -632,7 +661,8 @@ pub(crate) fn unresolved_from_defi(
 /// Renders a DeFi submit failure and returns the process exit code.
 ///
 /// A policy denial renders as this binary's gate denials do, under `verb`. A
-/// mainnet refusal reports `network.mainnet_write_forbidden`. An unresolved
+/// mainnet refusal reports `network.mainnet_write_forbidden`. A signing refusal
+/// keeps its own code, with no transaction to reconcile. An unresolved
 /// submission keeps its `submission.*` code and its `details`; everything else
 /// is reported under `fallback_code`.
 pub(crate) fn render_defi_submit_error(
@@ -647,7 +677,8 @@ pub(crate) fn render_defi_submit_error(
 /// The refusal envelope a DeFi submit failure is reported in.
 ///
 /// A policy denial reads as this binary's gate denials read, under `verb`. A
-/// mainnet refusal reports `network.mainnet_write_forbidden`. An unresolved
+/// mainnet refusal reports `network.mainnet_write_forbidden`. A signing refusal
+/// keeps its own code, with no transaction to reconcile. An unresolved
 /// submission keeps its `submission.*` code and its `details`; everything else
 /// is reported under `fallback_code`.
 fn defi_submit_error_envelope(
@@ -666,6 +697,11 @@ fn defi_submit_error_envelope(
         stellar_agent_defi::adapter::DefiAdapterError::MainnetWriteForbidden
     ) {
         return Envelope::<()>::err(&WalletError::Network(NetworkError::MainnetWriteForbidden));
+    }
+    if let stellar_agent_defi::adapter::DefiAdapterError::SigningRefusal { wire_code, message } =
+        error
+    {
+        return Envelope::<()>::err_raw(*wire_code, message.clone());
     }
     match unresolved_from_defi(error) {
         Some(unresolved) => unresolved.envelope(),
@@ -691,44 +727,10 @@ pub(crate) fn error_envelope_with_fallback(
     if let Some(envelope) = policy_denial_envelope(err, verb) {
         return envelope;
     }
-    match submission_details(err, signed_xdr) {
+    match submission_details(err, signed_xdr, RECONCILE_VERB) {
         Some(details) => Envelope::<()>::err_with_details(err, details),
         None => Envelope::<()>::err_raw(fallback_code, err.message()),
     }
-}
-
-/// The structured detail for the three codes that carry one, or `None`.
-fn submission_details(err: &WalletError, signed_xdr: &str) -> Option<serde_json::Value> {
-    let WalletError::Submission(submission) = err else {
-        return None;
-    };
-    let mut details = serde_json::Map::new();
-    match submission {
-        SubmissionError::TxTimeout { tx_hash, seconds } => {
-            details.insert("tx_hash".to_owned(), tx_hash.clone().into());
-            details.insert("timeout_seconds".to_owned(), (*seconds).into());
-        }
-        SubmissionError::TxAlreadySubmitted { hash } => {
-            details.insert("tx_hash".to_owned(), hash.clone().into());
-        }
-        SubmissionError::HashMismatch { local, server } => {
-            details.insert("tx_hash".to_owned(), local.clone().into());
-            details.insert("server_tx_hash".to_owned(), server.clone().into());
-        }
-        _ => return None,
-    }
-    // The envelope hash names the submission record the operator verbs
-    // address. A caller that does not hold the signed bytes reports the
-    // transaction hash alone rather than a hash of nothing.
-    if !signed_xdr.is_empty() {
-        details.insert(
-            "envelope_hash".to_owned(),
-            envelope_hash_hex(signed_xdr).into(),
-        );
-    }
-    details.insert("outcome".to_owned(), "unknown".into());
-    details.insert("reconcile_with".to_owned(), RECONCILE_VERB.into());
-    Some(serde_json::Value::Object(details))
 }
 
 fn record_unavailable(detail: impl Into<String>) -> WalletError {
@@ -742,19 +744,410 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
 
     use super::*;
+    use stellar_agent_core::profile::receipt::{ReceiptStatus, ReleaseEvidence};
+    use stellar_agent_network::envelope_hash_hex;
+    use stellar_agent_network::policy_state::DeliveryReport;
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_cli_bind_stores_the_minimum_bound_behind_the_primary() {
+        cli_bind_stores_the_bound("recovery-bound-behind", Some(600)).await;
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_cli_bind_stores_the_minimum_bound_ahead_of_the_primary() {
+        cli_bind_stores_the_bound("recovery-bound-ahead", Some(2100)).await;
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_cli_bind_stores_no_bound_without_the_oracle() {
+        cli_bind_stores_the_bound("recovery-bound-none", None).await;
+    }
+
+    /// A signer that refuses ends the run before the bound read, so the
+    /// oracle receives no request of it.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn recovery_refused_signer_sends_no_bound_read() {
+        use crate::commands::pay::tests::mainnet_full as pay;
+        use crate::common::mainnet_write_fixture::{Spec, install_ledger_double, pay_rule};
+        let fixture = Spec::new("recovery-signer-refused")
+            .rules(vec![pay_rule("allow", "")])
+            .build()
+            .await;
+        let (_ledger, _calls) = install_ledger_double(
+            || {
+                Err(WalletError::WalletState(
+                    stellar_agent_core::error::WalletStateError::HardwareNotFound,
+                ))
+            },
+            || Ok(()),
+        );
+        let mut args = pay::mainnet_args(&fixture);
+        args.sign_with_ledger = true;
+        let run = pay::run(&fixture, &args).await;
+        assert_ne!(run.code, 0, "{}", run.envelope);
+        let oracle = fixture.oracle_methods().await;
+        assert!(
+            !oracle
+                .iter()
+                .any(|method| method == "getLatestLedger" || method == "getLedgers"),
+            "{oracle:?}"
+        );
+    }
+
+    /// An oracle slower than a short authorization lifetime cannot delay the
+    /// run past it. The bound read stops at its deadline, stores no bound,
+    /// and the payment succeeds.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn recovery_slow_oracle_leaves_a_short_authorization_its_lifetime() {
+        use crate::commands::pay::tests::mainnet_full as pay;
+        use crate::common::mainnet_write_fixture::{Spec, pay_rule};
+        use wiremock::{Mock, ResponseTemplate, matchers::body_partial_json};
+        let fixture = Spec::new("recovery-slow-oracle")
+            .rules(vec![pay_rule("allow", "")])
+            .authorization_ttl(10)
+            .build()
+            .await;
+        Mock::given(body_partial_json(
+            serde_json::json!({"method":"getLatestLedger"}),
+        ))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "jsonrpc":"2.0", "id":body["id"],
+                    "result":{"id":"00".repeat(32), "protocolVersion":23, "sequence":2000}
+                }))
+                .set_delay(std::time::Duration::from_secs(12))
+        })
+        .with_priority(1)
+        .mount(&fixture.oracle)
+        .await;
+        let run = pay::run(&fixture, &pay::mainnet_args(&fixture)).await;
+        assert_eq!(run.code, 0, "{}", run.envelope);
+        let state = fixture.window_body();
+        assert_eq!(
+            state["operations"]["records"][0]["attempts"][0]["pre_exposure_ledger"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// A full mainnet write of each value verb family sends the primary the
+    /// requests it sends without recovery. The oracle gets only the added
+    /// bound read: its latest ledger, then one ledger from there.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn recovery_value_verbs_add_only_the_oracle_bound_read() {
+        use crate::commands::accounts::create::tests::mainnet_full as create;
+        use crate::commands::claim::tests::mainnet_full as claim;
+        use crate::commands::pay::tests::mainnet_full as pay;
+        use crate::commands::trustline::tests::mainnet_full as trustline;
+        use crate::common::mainnet_write_fixture::{Spec, pay_rule};
+        const BOUND: [&str; 2] = ["getLatestLedger", "getLedgers"];
+        let mut lists = Vec::new();
+        let fixture = Spec::new("recovery-guard-pay")
+            .rules(vec![pay_rule("allow", "")])
+            .build()
+            .await;
+        pay::run(&fixture, &pay::mainnet_args(&fixture)).await;
+        lists.push((
+            "pay",
+            fixture.primary_methods().await,
+            fixture.oracle_methods().await,
+        ));
+        let fixture = claim::spec("recovery-guard-claim").build().await;
+        claim::run(&fixture, &claim::mainnet_args(&fixture)).await;
+        lists.push((
+            "claim",
+            fixture.primary_methods().await,
+            fixture.oracle_methods().await,
+        ));
+        let fixture = trustline::spec("recovery-guard-trustline").build().await;
+        trustline::run(&fixture, &trustline::mainnet_args(&fixture)).await;
+        lists.push((
+            "trustline",
+            fixture.primary_methods().await,
+            fixture.oracle_methods().await,
+        ));
+        let fixture = Spec::new("recovery-guard-create").build().await;
+        create::run(&fixture, &create::mainnet_args(&fixture)).await;
+        lists.push((
+            "create",
+            fixture.primary_methods().await,
+            fixture.oracle_methods().await,
+        ));
+        // Identity and readiness once, the verb's reads, the rebuild's
+        // readiness check and source read, the resolver's probe and reads
+        // (a claim rereads its balance), the submit probe, the send.
+        let rebuild = ["getHealth", "getLedgers", "getLedgerEntries"];
+        let send = [
+            "getNetwork",
+            "getLedgerEntries",
+            "sendTransaction",
+            "getTransaction",
+        ];
+        let start = ["getNetwork", "getHealth", "getLedgers"];
+        let primary_of = |reads: &[&str], resolver: &[&str]| -> Vec<String> {
+            start
+                .iter()
+                .chain(reads)
+                .chain(&rebuild)
+                .chain(&["getNetwork"])
+                .chain(resolver)
+                .chain(&send)
+                .map(|method| (*method).to_owned())
+                .collect()
+        };
+        let account = ["getLedgerEntries"];
+        // The preparation's oracle check, then the rebuild's.
+        let cross_check = [
+            "getNetwork",
+            "getLedgerEntries",
+            "getNetwork",
+            "getLedgerEntries",
+        ];
+        let oracle_of = |base: &[&str]| -> Vec<String> {
+            base.iter()
+                .chain(&BOUND)
+                .map(|method| (*method).to_owned())
+                .collect()
+        };
+        let expected = [
+            (
+                "pay",
+                primary_of(
+                    &["getLedgerEntries", "getLedgerEntries", "getLedgerEntries"],
+                    &account,
+                ),
+                oracle_of(&cross_check),
+            ),
+            (
+                "claim",
+                primary_of(
+                    &["getLedgerEntries", "getLedgerEntries"],
+                    &["getLedgerEntries", "getLedgerEntries"],
+                ),
+                oracle_of(&cross_check),
+            ),
+            (
+                "trustline",
+                primary_of(&["getLedgerEntries", "getLedgerEntries"], &account),
+                oracle_of(&cross_check),
+            ),
+            (
+                "create",
+                primary_of(&["getLedgerEntries"], &account),
+                oracle_of(&[]),
+            ),
+        ];
+        for ((verb, primary, oracle), (expected_verb, base, bound)) in lists.iter().zip(&expected) {
+            assert_eq!(verb, expected_verb);
+            assert_eq!(primary, base, "{verb}: the primary sees the base requests");
+            assert_eq!(oracle, bound, "{verb}: the oracle adds only the bound read");
+        }
+    }
+
+    /// Runs a mainnet payment whose primary report is older than the
+    /// submission and whose oracle stands at `oracle_ledger`. The exposure
+    /// stores `min(primary, oracle)`, or `None` when the oracle read fails.
+    #[cfg(feature = "mainnet-write")]
+    async fn cli_bind_stores_the_bound(name: &'static str, oracle_ledger: Option<u32>) {
+        use crate::commands::pay::tests::mainnet_full::{mainnet_args, run};
+        use crate::common::mainnet_write_fixture::{Spec, pay_rule};
+        use wiremock::{Mock, ResponseTemplate, matchers::body_partial_json};
+        let fixture = Spec::new(name)
+            .rules(vec![pay_rule("allow", "")])
+            .build()
+            .await;
+        for method in ["getHealth", "getLedgers"] {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            Mock::given(body_partial_json(serde_json::json!({"method":method})))
+                .respond_with(move |request: &wiremock::Request| {
+                    let latest = if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 { 700 } else { 2000 };
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    let result = if method == "getHealth" {
+                        serde_json::json!({"status":"healthy", "latestLedger":latest, "oldestLedger":1, "ledgerRetentionWindow":2000})
+                    } else {
+                        serde_json::json!({"latestLedger":latest, "oldestLedger":1,
+                            "latestLedgerCloseTime":(stellar_agent_core::timefmt::now_unix_ms().unwrap()/1000).to_string(),
+                            "oldestLedgerCloseTime":1, "cursor":latest.to_string(), "ledgers":[]})
+                    };
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
+                }).with_priority(1).mount(&fixture.primary).await;
+        }
+        Mock::given(body_partial_json(
+            serde_json::json!({"method":"getLatestLedger"}),
+        ))
+        .respond_with(move |request: &wiremock::Request| {
+            let Some(latest) = oracle_ledger else {
+                return ResponseTemplate::new(500);
+            };
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc":"2.0", "id":body["id"],
+                "result":{"id":"00".repeat(32), "protocolVersion":23, "sequence":latest}
+            }))
+        })
+        .with_priority(1)
+        .mount(&fixture.oracle)
+        .await;
+        // The oracle refuses a start beyond its latest ledger, as an RPC endpoint does.
+        Mock::given(body_partial_json(serde_json::json!({"method":"getLedgers"})))
+            .respond_with(move |request: &wiremock::Request| {
+                let Some(latest) = oracle_ledger else { return ResponseTemplate::new(500); };
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["params"]["startLedger"].as_u64() > Some(u64::from(latest)) {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc":"2.0", "id":body["id"],
+                        "error":{"code":-32600, "message":"startLedger must be at most the latest ledger"}
+                    }));
+                }
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc":"2.0", "id":body["id"], "result":{
+                        "latestLedger":latest, "oldestLedger":1,
+                        "latestLedgerCloseTime":(stellar_agent_core::timefmt::now_unix_ms().unwrap()/1000).to_string(),
+                        "oldestLedgerCloseTime":1, "cursor":latest.to_string(), "ledgers":[]
+                    }
+                }))
+            }).with_priority(1).mount(&fixture.oracle).await;
+        let result = run(&fixture, &mainnet_args(&fixture)).await;
+        assert_eq!(result.code, 0, "{}", result.envelope);
+        let state = fixture.window_body();
+        let exposure = &state["operations"]["records"][0]["attempts"][0];
+        assert_eq!(
+            exposure["pre_exposure_ledger"],
+            serde_json::json!(oracle_ledger.map(|value| value.min(700)))
+        );
+        // The submission reuses the readiness report and reads the primary once.
+        assert_eq!(state["last_observation"]["ledger"], 700);
+    }
+
+    #[test]
+    fn submission_error_wire_guard_timeout() {
+        let err = WalletError::Submission(SubmissionError::TxTimeout {
+            tx_hash: "ab".repeat(32),
+            seconds: 30,
+        });
+        let text = error_envelope(&err, SIGNED_XDR, "pay")
+            .to_json_pretty()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let text = text.replace(value["request_id"].as_str().unwrap(), "REQUEST_ID");
+        assert_eq!(
+            text,
+            r#"{
+  "ok": false,
+  "error": {
+    "code": "submission.tx_timeout",
+    "message": "transaction 'abababab...abababab' was not confirmed within 30s; its outcome is unknown: settle it by its transaction hash and do not resubmit",
+    "details": {
+      "envelope_hash": "fdca46b81c5c77753f52cce8845503c8eef69ef48266f0e4ded1ea19060db975",
+      "outcome": "unknown",
+      "reconcile_with": "stellar-agent tx status",
+      "recovery": {
+        "next_action": "TargetedStatus",
+        "reason": "RecoveryRequired",
+        "result": "NeedsEvidence",
+        "retry_time_unavailable": "MissingBound"
+      },
+      "timeout_seconds": 30,
+      "tx_hash": "abababababababababababababababababababababababababababababababab"
+    }
+  },
+  "request_id": "REQUEST_ID"
+}"#
+        );
+    }
+
+    /// The verb's oracle builds the configured oracle for a mainnet profile
+    /// and none for a testnet profile with the same oracle configuration.
+    #[test]
+    #[serial_test::serial]
+    fn settlement_oracle_in_follows_the_profile_chain() {
+        use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let mainnet = Profile::builder_mainnet_named(
+            "oracle-wrapper",
+            "https://primary.example",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .primary_provider(PrimaryProviderRecord::new("Primary", "primary.example"))
+        .oracle_provider_url(url::Url::parse("https://oracle.example").unwrap())
+        .oracle_provider(ProviderRecord::new("Oracle", "oracle.example", true))
+        .build();
+        let mut testnet = mainnet.clone();
+        testnet.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
+
+        let context = NetworkContext::from_profile(&mainnet);
+        assert!(settlement_oracle_in(&mainnet, &context).is_some());
+        assert!(settlement_oracle(&mainnet).is_some());
+        let context = NetworkContext::from_profile(&testnet);
+        assert!(settlement_oracle_in(&testnet, &context).is_none());
+        assert!(settlement_oracle(&testnet).is_none());
+    }
+
+    #[test]
+    fn submission_error_wire_guard_policy_denied() {
+        let err = WalletError::PolicyDenied {
+            reason: Box::new(stellar_agent_core::policy::DenyReason::EvaluationError {
+                detail: "guard refusal".to_owned(),
+            }),
+        };
+        let text = error_envelope(&err, SIGNED_XDR, "pay")
+            .to_json_pretty()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let text = text.replace(value["request_id"].as_str().unwrap(), "REQUEST_ID");
+        assert_eq!(
+            text,
+            r#"{
+  "ok": false,
+  "error": {
+    "code": "policy.deny.evaluation_error",
+    "message": "pay operation denied by operator policy: guard refusal"
+  },
+  "request_id": "REQUEST_ID"
+}"#
+        );
+    }
 
     const SIGNED_XDR: &str = "AAAAAgAAAAA=";
 
-    /// The settled rows' writer applies the binding check of the origin: a
+    /// The accounting audit writer applies the binding check of the origin: a
     /// synthesized profile records no binding and refuses a changed one, and a
     /// persisted profile records an absent one.
     #[test]
     #[serial_test::serial]
-    fn the_settled_rows_writer_applies_the_binding_check_of_the_origin() {
+    fn the_accounting_audit_writer_applies_the_binding_check_of_the_origin() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::AuditBinding;
         use stellar_agent_network::keyring::{KeyringAuditBindingStore, rotate_keyring_secret_32};
 
@@ -776,12 +1169,12 @@ mod tests {
 
         let synthesized = keyed("reconcile-synthesized");
         assert!(
-            settled_rows_writer(
+            accounting_audit_writer(
                 &synthesized,
                 "reconcile-synthesized",
                 ProfileOrigin::Synthesized
             )
-            .is_some()
+            .is_ok()
         );
         assert!(
             !recorded("reconcile-synthesized"),
@@ -790,8 +1183,8 @@ mod tests {
 
         let persisted = keyed("reconcile-persisted");
         assert!(
-            settled_rows_writer(&persisted, "reconcile-persisted", ProfileOrigin::Persisted)
-                .is_some()
+            accounting_audit_writer(&persisted, "reconcile-persisted", ProfileOrigin::Persisted)
+                .is_ok()
         );
         assert!(
             recorded("reconcile-persisted"),
@@ -804,9 +1197,9 @@ mod tests {
             .unwrap();
         changed.audit_log_path = dir.path().join("repointed").join("audit.jsonl");
         assert!(
-            settled_rows_writer(&changed, "reconcile-changed", ProfileOrigin::Synthesized)
-                .is_none(),
-            "a changed binding leaves the settled rows owed"
+            accounting_audit_writer(&changed, "reconcile-changed", ProfileOrigin::Synthesized)
+                .is_err(),
+            "a changed binding leaves the obligations owed"
         );
         assert!(!dir.path().join("repointed").exists());
     }
@@ -1085,6 +1478,36 @@ mod tests {
         }
     }
 
+    /// A DeFi signing refusal reports its own code on every verb, with no
+    /// transaction to reconcile.
+    #[test]
+    fn a_defi_signing_refusal_reports_its_own_code_without_a_transaction() {
+        for code in [
+            "smart_account.ledger_witness_unavailable",
+            "simulation.divergence.ledger_skew",
+            "submission.intent_record_unavailable",
+            "submission.intent_binding_mismatch",
+        ] {
+            let error = stellar_agent_defi::adapter::DefiAdapterError::SigningRefusal {
+                wire_code: code,
+                message: "fixed".to_owned(),
+            };
+            for (verb, fallback) in [
+                ("trade", "dex.submit_failed"),
+                ("vault deposit", "vault.submit_failed"),
+            ] {
+                let envelope = defi_submit_error_envelope(&error, verb, fallback);
+                let rendered = envelope.error.as_ref().unwrap();
+                assert_eq!(rendered.code, code, "verb {verb}");
+                assert_eq!(rendered.message, "fixed", "verb {verb}");
+                assert!(
+                    rendered.details.is_none(),
+                    "a refusal before signing names no transaction"
+                );
+            }
+        }
+    }
+
     /// Every other DeFi failure still reports under the verb's own code.
     #[test]
     fn a_defi_network_failure_still_reports_the_fallback_code() {
@@ -1104,6 +1527,389 @@ mod tests {
         let rendered = envelope.error.as_ref().unwrap();
         assert_eq!(rendered.code, "submission.record_unavailable");
         assert!(rendered.details.is_none());
+    }
+
+    /// A total-budget overflow the recorder reports keeps its code, and a
+    /// multibyte diagnostic renders intact.
+    #[test]
+    fn a_total_overflow_keeps_its_code_and_text() {
+        let err = record_unavailable(
+            "the spending-window reservation could not be written: Invalid { detail: \"a \
+             total-budget sum overflows\" } profil \u{e9}t\u{e9} \u{20ac}",
+        );
+        let envelope = error_envelope(&err, SIGNED_XDR, "pay");
+        let rendered = envelope.error.as_ref().unwrap();
+        assert_eq!(rendered.code, "submission.record_unavailable");
+        assert!(
+            rendered.message.contains("a total-budget sum overflows"),
+            "{}",
+            rendered.message
+        );
+        assert!(
+            rendered.message.contains("\u{e9}t\u{e9} \u{20ac}"),
+            "{}",
+            rendered.message
+        );
+        assert!(rendered.details.is_none());
+    }
+
+    /// Only verified approval authority contributes a tombstone.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn mainnet_recorder_tombstones_only_under_approval() {
+        use crate::common::mainnet_confirm::{
+            ConfirmDecision, MainnetWriteSummary, cli_mainnet_authority,
+        };
+        use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
+        use stellar_agent_core::mainnet::decision::{AuthorityScope, MainnetDecision};
+        use stellar_agent_core::profile::name::ResolvedProfileName;
+
+        let name = "recorder-authority";
+        let fixture = MainnetConsentFixture::new(name);
+        let chain_key = &fixture.profile().audit_log_hash_chain_key_id;
+        stellar_agent_network::keyring::rotate_keyring_secret_32(
+            &chain_key.service,
+            &chain_key.account,
+        )
+        .unwrap();
+        let context = stellar_agent_network::NetworkContext::mainnet_write(
+            fixture.profile(),
+            &ResolvedProfileName::from_flag(name),
+            &fixture.home().join("profiles"),
+            stellar_agent_network::MainnetEndpointFlags::default(),
+        )
+        .unwrap();
+        let readiness = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
+            context.profile(),
+            context.profile_name(),
+        )
+        .unwrap();
+        let policy = fixture.current_policy();
+        let envelope = stellar_agent_test_support::SignedTestEnvelope::builder([8; 32])
+            .unsigned()
+            .build();
+        let summary = MainnetWriteSummary::from_envelope(
+            envelope.envelope_xdr(),
+            stellar_agent_network::mainnet::MainnetConsumer::CliPay,
+            500,
+        )
+        .unwrap();
+        let _presence = crate::common::mainnet_presence::driver::install(
+            crate::common::mainnet_presence::driver::fixture_credential(),
+        );
+        for approval in [false, true] {
+            let kind = if approval {
+                stellar_agent_core::policy::Decision::RequireApproval(
+                    stellar_agent_core::policy::ApprovalRequest::new("fixture".to_owned(), 300),
+                )
+            } else {
+                stellar_agent_core::policy::Decision::Allow
+            };
+            let decision = MainnetDecision::for_test(
+                kind,
+                None,
+                policy.digest(),
+                policy.sequence(),
+                3,
+                name,
+                context.chain().caip2_str(),
+                1_900_000_000_000,
+                300_000,
+                AuthorityScope::Classic,
+            );
+            let mut slot = None;
+            let operation = crate::common::mainnet_confirm::tests::prepared_operation(
+                &context,
+                if approval { "approval" } else { "allow" },
+                envelope.envelope_xdr(),
+            );
+            let authority = cli_mainnet_authority(
+                &decision,
+                ConfirmDecision::RequireApproval { ttl_ms: 300_000 },
+                &summary,
+                &context,
+                &policy,
+                &fixture.store_path(),
+                Some(&operation),
+                stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+                &mut slot,
+            )
+            .await
+            .unwrap();
+            let prepared = prepare_mainnet_recorder(
+                &context,
+                "stellar_pay",
+                if approval {
+                    stellar_agent_core::audit_log::PolicyDecision::RequireApproval
+                } else {
+                    stellar_agent_core::audit_log::PolicyDecision::Allow
+                },
+                decision.provenance(),
+                None,
+                &readiness,
+                None,
+                &authority,
+            )
+            .unwrap();
+            assert_eq!(matches!(authority, MainnetAuthority::Approval(_)), approval);
+            assert_eq!(prepared.provenance, decision.provenance());
+            match authority {
+                MainnetAuthority::Policy(_) => assert!(prepared.tombstone.is_none()),
+                MainnetAuthority::Approval(witness) => {
+                    let tombstone = prepared.tombstone.unwrap();
+                    assert_eq!(tombstone.approval_nonce, witness.witness().nonce());
+                    assert_eq!(tombstone.profile_name, name);
+                    assert_eq!(
+                        tombstone.store_dir.join(format!("{name}.toml")),
+                        fixture.store_path()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fixture destination's G, M0, and maximum-ID forms with the
+    /// literal SHA-256 and redaction a payment leg records.
+    const HASHED_FORMS: [(&str, &str, &str); 3] = [
+        (
+            "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+            "8419e4131cc68b0c89dc835394a978dc8cf090e5118e60af862c515c5b787483",
+            "GBPXX...MWIVL",
+        ),
+        (
+            "MBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWAAAAAAAAAAAACKJY",
+            "64e93b350686c45c3c01d84623636a6f40323d247be272b220d98744292907b4",
+            "MBPXX...ACKJY",
+        ),
+        (
+            "MBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMX77777777777752TU",
+            "ce738b37887ec1ae76a1c81c5140596d400dc64a883fccc4f13605822726b99b",
+            "MBPXX...752TU",
+        ),
+    ];
+
+    /// One gate-sized native payment leg of 1 XLM to `destination`.
+    fn payment_effects(destination: &str) -> ValueEffects {
+        ValueEffects::single(stellar_agent_core::policy::v1::ValueLeg {
+            kind: stellar_agent_core::policy::v1::ActionKind::Payment,
+            amount: Some(10_000_000),
+            asset: Some("native".to_owned()),
+            destination: Some(destination.to_owned()),
+        })
+    }
+
+    #[test]
+    fn payment_recorder_hashes_the_complete_destination_and_debit() {
+        for tool in ["stellar_pay", "stellar_pay_commit"] {
+            for asset in [
+                "native",
+                "USD:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+            ] {
+                for (destination, hash, redacted) in HASHED_FORMS {
+                    let mut effects = payment_effects(destination);
+                    effects.legs[0].asset = Some(asset.to_owned());
+                    let legs = audit_legs(tool, Some(&effects)).unwrap();
+                    assert_eq!(legs.len(), 1);
+                    assert_eq!(legs[0].destination_sha256.as_deref(), Some(hash));
+                    assert_eq!(legs[0].destination_redacted.as_deref(), Some(redacted));
+                    assert_eq!(legs[0].amount, Some(10_000_000));
+                    assert_eq!(legs[0].asset.as_deref(), Some(asset));
+                    assert!(!serde_json::to_string(&legs).unwrap().contains(destination));
+                }
+            }
+        }
+    }
+
+    /// `build_recorder` given a payment leg whose destination is lowercase
+    /// refuses `validation.address_invalid` before it writes a receipt, a
+    /// hold, or an audit row.
+    #[test]
+    #[serial_test::serial]
+    fn a_malformed_payment_leg_refuses_before_exposure() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let name = "recorder-malformed-leg";
+        let mut profile = Profile::builder_testnet_named(name, "svc", name, "n-svc", name).build();
+        profile.audit_log_path = home.path().join("audit.jsonl");
+        let effects = payment_effects(&HASHED_FORMS[0].0.to_lowercase());
+        let Err(refused) = build_recorder(SubmitRecord {
+            profile: &profile,
+            profile_name: name.to_owned(),
+            verb: "pay",
+            tool: "stellar_pay_commit",
+            policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
+            chain_id: "stellar:testnet",
+            effects: Some(&effects),
+            unvalued: None,
+            audit: None,
+            now_ms: 1_900_000_000_000,
+        }) else {
+            panic!("the malformed leg refuses")
+        };
+        assert_eq!(refused.code(), "validation.address_invalid");
+        assert!(open_receipts(name).unwrap().all().unwrap().is_empty());
+        assert!(!PersistedWindowStore::for_profile(name).path().exists());
+        assert!(!profile.audit_log_path.exists());
+    }
+
+    /// The legs `prepare_mainnet_recorder` records for `effects`, or its
+    /// refusal, under a policy authority, with the fixture whose home holds
+    /// the run's receipts, window, and audit log.
+    #[cfg(feature = "mainnet-write")]
+    async fn mainnet_recorder_legs(
+        name: &'static str,
+        effects: &ValueEffects,
+    ) -> (
+        Result<Vec<ValueLegRecord>, WalletError>,
+        stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture,
+    ) {
+        use crate::common::mainnet_confirm::{
+            ConfirmDecision, MainnetWriteSummary, cli_mainnet_authority,
+        };
+        use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
+        use stellar_agent_core::mainnet::decision::{AuthorityScope, MainnetDecision};
+        use stellar_agent_core::profile::name::ResolvedProfileName;
+
+        let fixture = MainnetConsentFixture::new(name);
+        let chain_key = &fixture.profile().audit_log_hash_chain_key_id;
+        stellar_agent_network::keyring::rotate_keyring_secret_32(
+            &chain_key.service,
+            &chain_key.account,
+        )
+        .unwrap();
+        let context = stellar_agent_network::NetworkContext::mainnet_write(
+            fixture.profile(),
+            &ResolvedProfileName::from_flag(name),
+            &fixture.home().join("profiles"),
+            stellar_agent_network::MainnetEndpointFlags::default(),
+        )
+        .unwrap();
+        let readiness = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
+            context.profile(),
+            context.profile_name(),
+        )
+        .unwrap();
+        let policy = fixture.current_policy();
+        let envelope = stellar_agent_test_support::SignedTestEnvelope::builder([8; 32])
+            .unsigned()
+            .build();
+        let summary = MainnetWriteSummary::from_envelope(
+            envelope.envelope_xdr(),
+            stellar_agent_network::mainnet::MainnetConsumer::CliPay,
+            500,
+        )
+        .unwrap();
+        let decision = MainnetDecision::for_test(
+            stellar_agent_core::policy::Decision::Allow,
+            None,
+            policy.digest(),
+            policy.sequence(),
+            3,
+            name,
+            context.chain().caip2_str(),
+            1_900_000_000_000,
+            300_000,
+            AuthorityScope::Classic,
+        );
+        let mut slot = None;
+        let authority = cli_mainnet_authority(
+            &decision,
+            ConfirmDecision::RequireApproval { ttl_ms: 300_000 },
+            &summary,
+            &context,
+            &policy,
+            &fixture.store_path(),
+            None,
+            stellar_agent_core::audit_log::PolicyDecision::Allow,
+            &mut slot,
+        )
+        .await
+        .unwrap();
+        let legs = prepare_mainnet_recorder(
+            &context,
+            "stellar_pay",
+            stellar_agent_core::audit_log::PolicyDecision::Allow,
+            decision.provenance(),
+            Some(effects),
+            &readiness,
+            None,
+            &authority,
+        )
+        .map(|prepared| prepared.legs);
+        (legs, fixture)
+    }
+
+    /// The mainnet recorder's payment legs for G, M0, and the maximum-ID M
+    /// carry the literal SHA-256 and redaction of the complete destination.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn the_mainnet_recorder_hashes_the_complete_destination() {
+        for asset in [
+            "native",
+            "USD:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+        ] {
+            for (index, (destination, sha256, redacted)) in HASHED_FORMS.into_iter().enumerate() {
+                let name = if asset == "native" {
+                    ["recorder-hash-g", "recorder-hash-m0", "recorder-hash-mmax"][index]
+                } else {
+                    [
+                        "recorder-hash-issued-g",
+                        "recorder-hash-issued-m0",
+                        "recorder-hash-issued-mmax",
+                    ][index]
+                };
+                let mut effects = payment_effects(destination);
+                effects.legs[0].asset = Some(asset.to_owned());
+                let (legs, fixture) = mainnet_recorder_legs(name, &effects).await;
+                let legs = legs.unwrap();
+                assert_eq!(legs.len(), 1, "{destination}");
+                assert_eq!(legs[0].destination_sha256.as_deref(), Some(sha256));
+                assert_eq!(legs[0].destination_redacted.as_deref(), Some(redacted));
+                assert_eq!(legs[0].amount, Some(10_000_000));
+                assert_eq!(legs[0].asset.as_deref(), Some(asset));
+                let log = std::fs::read_to_string(&fixture.profile().audit_log_path).unwrap();
+                assert!(!log.contains(destination));
+            }
+        }
+    }
+
+    /// The mainnet recorder given a payment leg whose destination is
+    /// lowercase refuses `validation.address_invalid` before any receipt,
+    /// hold, or audit row. The fixture and its home stay alive through every
+    /// check, and a read error of the evidence fails the test.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn a_malformed_payment_leg_refuses_before_exposure_on_mainnet() {
+        let effects = payment_effects(&HASHED_FORMS[2].0.to_lowercase());
+        let (refused, fixture) =
+            mainnet_recorder_legs("recorder-malformed-mainnet", &effects).await;
+        assert!(
+            refused.is_err(),
+            "malformed payment leg refuses before exposure"
+        );
+        assert_eq!(refused.err().unwrap().code(), "validation.address_invalid");
+        let name = "recorder-malformed-mainnet";
+        let profile = fixture.profile();
+        assert!(open_receipts(name).unwrap().all().unwrap().is_empty());
+        assert!(
+            PersistedWindowStore::for_profile(name)
+                .pending_reservations(profile)
+                .unwrap()
+                .is_empty()
+        );
+        let log = std::fs::read_to_string(&profile.audit_log_path).unwrap();
+        assert!(!log.contains("value_action_pending"), "{log}");
+        drop(fixture);
     }
 
     /// A submission that was never sent carries no `details`.
@@ -1129,159 +1935,280 @@ mod tests {
             rendered.details
         );
     }
+    /// A profile under `dir` whose window key and audit chain key live in the
+    /// keyring mock, with its window and receipt stores.
+    struct DrainFixture {
+        _dir: tempfile::TempDir,
+        profile: Profile,
+        name: String,
+        window: PersistedWindowStore,
+        receipts: ReceiptStore,
+    }
+
+    fn drain_fixture(name: &str) -> DrainFixture {
+        use base64::Engine as _;
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = Profile::builder_testnet(name, "acct", "nonce", name).build();
+        profile.audit_log_path = dir.path().join("audit").join("log.jsonl");
+        profile.policy_window_state_key_id =
+            stellar_agent_core::profile::schema::KeyringEntryRef::default_policy_window_state_key(
+                name,
+            );
+        let coordinate = &profile.audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+            .unwrap()
+            .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x53; 32]))
+            .unwrap();
+        let window = PersistedWindowStore::at_path(dir.path().join(format!("{name}.window")));
+        let receipts = ReceiptStore::open_at(dir.path(), name).unwrap();
+        DrainFixture {
+            _dir: dir,
+            profile,
+            name: name.to_owned(),
+            window,
+            receipts,
+        }
+    }
+
+    impl DrainFixture {
+        fn writer(&self) -> Arc<Mutex<AuditWriter>> {
+            accounting_audit_writer(&self.profile, &self.name, ProfileOrigin::Persisted).unwrap()
+        }
+
+        fn drain(&self) -> Result<DeliveryReport, WalletError> {
+            stellar_agent_network::policy_state::drain_accounting_obligations(
+                &self.window,
+                &self.profile,
+                &self.name,
+                Some(&self.receipts),
+                || accounting_audit_writer(&self.profile, &self.name, ProfileOrigin::Persisted),
+            )
+        }
+
+        /// A sent submission `id` whose receipt reads `status`.
+        fn receipt(&self, id: &str, status: Option<ReceiptStatus>) {
+            self.receipts
+                .try_begin(id, id, "GSOURCE", 7, 0, 1_000)
+                .unwrap();
+            self.receipts.mark_submitted(id).unwrap();
+            match status {
+                None | Some(ReceiptStatus::Pending) => {}
+                Some(ReceiptStatus::Ambiguous) => self
+                    .receipts
+                    .finalize_released(id, ReleaseEvidence::TimeBoundPassed)
+                    .unwrap(),
+                Some(ReceiptStatus::ClearedByOperator) => {
+                    self.receipts
+                        .finalize_released(id, ReleaseEvidence::SequenceConsumed)
+                        .unwrap();
+                    self.receipts.clear_by_operator(id).unwrap();
+                }
+                Some(ReceiptStatus::Reorged) => {
+                    self.receipts
+                        .finalize(id, ReceiptStatus::Success, Some(5))
+                        .unwrap();
+                    self.receipts.finalize_reorged(id).unwrap();
+                }
+                Some(other) => self.receipts.finalize(id, other, Some(5)).unwrap(),
+            }
+        }
+
+        /// Commits the accounting expiry of a bounded hold whose horizon has
+        /// passed, through an ordinary reconciliation pass, and returns its
+        /// decision identifier.
+        async fn committed_expiry(&self, id: &str) -> String {
+            let now = self.expired_hold(id);
+            let client = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+            let report = self
+                .window
+                .reconcile_due(&self.profile, &client, None, None, now, 4)
+                .await
+                .unwrap();
+            assert_eq!(report.rpc_calls, 0, "local expiry asks no endpoint");
+            let [settled] = report.settled.as_slice() else {
+                panic!("one committed expiry: {report:?}");
+            };
+            settled.decision_id.clone()
+        }
+
+        /// Takes a bounded hold `id` whose accounting horizon has passed, so
+        /// the next pass commits its expiry without asking an endpoint.
+        /// Returns the time the hold was taken at.
+        fn expired_hold(&self, id: &str) -> u64 {
+            use stellar_agent_core::policy::v1::criteria::state_store::{
+                StateKey, WindowEntry, WindowLimit,
+            };
+            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+            let since = now - stellar_agent_network::policy_state::RECONCILE_MIN_AGE_MS;
+            let hold = stellar_agent_network::policy_state::SubmissionHold {
+                destinations: Default::default(),
+                chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                    self.profile.chain_id,
+                ),
+                id: id.to_owned(),
+                tx_hash: id.to_owned(),
+                source: "GSOURCE".to_owned(),
+                sequence: 7,
+                max_time: now / 1_000 - 61,
+                pending_since_ms: since,
+                submission_ledger: 1_000,
+                submission_anchor: None,
+                operator_required: false,
+            };
+            let entry = WindowEntry::new(
+                StateKey::new(&self.name, 1, "native", 60),
+                since,
+                300,
+                WindowLimit::Amount {
+                    asset: "native".to_owned(),
+                    window: "1m".to_owned(),
+                    max_stroops: 1_000_000,
+                },
+            );
+            self.window
+                .record_pending(&self.profile, &[entry], &hold)
+                .unwrap();
+            now
+        }
+
+        fn rows(&self) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&self.profile.audit_log_path)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+    }
+
+    /// Success and failure receipts leave exactly the original pending row,
+    /// with its tool, policy decision and approval nonce unchanged.
     #[test]
+    #[serial_test::serial]
     fn settlement_rows_preserve_pending_approval_context() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
         for approved in [false, true] {
             for failed in [false, true] {
-                let dir = tempfile::tempdir().unwrap();
-                let mut profile =
-                    Profile::builder_testnet("signer", "default", "nonce", "default").build();
-                profile.audit_log_path = dir.path().join("audit.jsonl");
-                let audit = Arc::new(Mutex::new(
-                    AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
-                ));
+                let f = drain_fixture(&format!("approval-context-{approved}-{failed}"));
+                let envelope = "e1".repeat(32);
                 let decision = if approved {
                     PolicyDecision::RequireApproval
                 } else {
                     PolicyDecision::Allow
                 };
                 let nonce = approved.then(|| "approval-binding".to_owned());
-                audit
+                f.writer()
                     .lock()
                     .unwrap()
                     .write_entry(AuditEntry::new_value_action_pending(
                         "stellar_pay_commit",
                         "stellar:testnet",
                         Vec::new(),
-                        "transaction",
+                        &envelope,
                         "source",
                         7,
                         decision.clone(),
-                        Some("envelope".to_owned()),
+                        Some(envelope.clone()),
                         None,
                         nonce.clone(),
                         "pending-request",
                         None,
                     ))
                     .unwrap();
-                let status = if failed {
-                    ReceiptStatus::Failed {
-                        code: "ledger.failed".to_owned(),
-                    }
-                } else {
-                    ReceiptStatus::Success
-                };
-                write_settled_row(
-                    &profile,
-                    "audit-settlement",
-                    &audit,
-                    "envelope",
-                    "transaction",
-                    &status,
-                    Some(9),
-                    PolicyDecision::Allow,
+                f.receipt(
+                    &envelope,
+                    Some(if failed {
+                        ReceiptStatus::Failed {
+                            code: "ledger.failed".to_owned(),
+                        }
+                    } else {
+                        ReceiptStatus::Success
+                    }),
                 );
-                let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
-                    .unwrap()
-                    .lines()
-                    .map(|line| serde_json::from_str(line).unwrap())
+                f.drain().unwrap();
+                let rows: Vec<_> = f
+                    .rows()
+                    .into_iter()
+                    .filter(|row| row["envelope_hash"] == envelope.as_str())
                     .collect();
-                assert_eq!(rows.len(), 2);
+                assert_eq!(rows.len(), 1, "{rows:?}");
+                assert_eq!(rows[0]["kind"], "value_action_pending");
                 assert_eq!(
-                    rows[1]["policy_decision"],
+                    rows[0]["policy_decision"],
                     serde_json::to_value(decision).unwrap()
                 );
                 assert_eq!(
-                    rows[1]["approval_nonce"],
+                    rows[0]["approval_nonce"],
                     serde_json::to_value(nonce).unwrap()
                 );
-                assert_eq!(rows[1]["tool"], "stellar_pay_commit");
+                assert_eq!(rows[0]["tool"], "stellar_pay_commit");
             }
         }
     }
 
-    /// Each receipt outcome selects the audit row and code it owes.
+    /// No receipt status selects an audit row: every receipt-only case,
+    /// `Failed` included, leaves the log untouched. Delivery of an identifier
+    /// the verified window state does not hold refuses before any append.
     #[test]
-    fn settlement_rows_follow_receipt_status_and_evidence() {
-        use stellar_agent_core::audit_log::PolicyDecision;
-
-        for (status, evidence, expected) in [
+    #[serial_test::serial]
+    fn no_receipt_status_selects_an_audit_row() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for (label, status) in [
+            ("success", Some(ReceiptStatus::Success)),
             (
-                ReceiptStatus::Success,
-                None,
-                Some(("value_action_submitted", None)),
-            ),
-            (
-                ReceiptStatus::Failed {
+                "failed",
+                Some(ReceiptStatus::Failed {
                     code: "ledger.failed".to_owned(),
-                },
-                None,
-                Some(("value_action_failed", Some("ledger.failed"))),
+                }),
             ),
-            (
-                ReceiptStatus::Ambiguous,
-                Some(ReleaseEvidence::TimeBoundPassed),
-                Some(("value_action_failed", Some("submission.time_bound_passed"))),
-            ),
-            (
-                ReceiptStatus::Ambiguous,
-                Some(ReleaseEvidence::SequenceConsumed),
-                Some(("value_action_failed", Some("submission.sequence_consumed"))),
-            ),
-            (ReceiptStatus::Ambiguous, None, None),
-            (ReceiptStatus::Pending, None, None),
-            (ReceiptStatus::Reorged, None, None),
-            (
-                ReceiptStatus::ClearedByOperator,
-                Some(ReleaseEvidence::TimeBoundPassed),
-                None,
-            ),
+            ("ambiguous", Some(ReceiptStatus::Ambiguous)),
+            ("pending", None),
+            ("reorged", Some(ReceiptStatus::Reorged)),
+            ("cleared", Some(ReceiptStatus::ClearedByOperator)),
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            let mut profile =
-                Profile::builder_testnet("row-kind", "default", "nonce", "default").build();
-            profile.audit_log_path = dir.path().join("audit.jsonl");
-            let audit = Arc::new(Mutex::new(
-                AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
-            ));
-            write_settled_row_with_evidence(
-                &profile,
-                "row-kind",
-                &audit,
-                "envelope",
-                "transaction",
-                &status,
-                evidence,
-                Some(9),
-                PolicyDecision::Allow,
-            );
-            let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
-            if let Some((kind, code)) = expected {
-                assert_eq!(rows.len(), 1, "{status:?}/{evidence:?}");
-                assert_eq!(rows[0]["kind"], kind);
-                assert_eq!(rows[0]["code"], serde_json::to_value(code).unwrap());
-            } else {
-                assert!(rows.is_empty(), "{status:?}/{evidence:?}: {rows:?}");
-            }
+            let f = drain_fixture(&format!("row-kind-{label}"));
+            f.receipt(&"ab".repeat(32), status);
+            assert_eq!(f.drain().unwrap(), DeliveryReport::default(), "{label}");
+            assert!(f.rows().is_empty(), "{label}: {:?}", f.rows());
         }
+
+        let f = drain_fixture("row-kind-unverifiable");
+        let writer = f.writer();
+        let before = std::fs::read(&f.profile.audit_log_path).ok();
+        let error = stellar_agent_network::policy_state::deliver_accounting_expiry(
+            &mut writer.lock().unwrap(),
+            &f.window,
+            &f.profile,
+            &f.name,
+            Some(&f.receipts),
+            &"cd".repeat(32),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "submission.settlement_unverifiable");
+        assert_eq!(std::fs::read(&f.profile.audit_log_path).ok(), before);
     }
 
-    /// A log at `path` whose active file holds no row for `"envelope"` and
-    /// whose archive holds that submission's pending row ahead of a broken
-    /// link, so a lookup for it reaches the break.
-    fn history_with_a_broken_archive(path: &std::path::Path) -> Arc<Mutex<AuditWriter>> {
+    /// An authentic owed expiry over a retained history with a broken
+    /// archive link: the drain leaves the audit bytes unchanged, keeps the
+    /// obligation, and logs the integrity refusal at WARN with the profile
+    /// and its code.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unreadable_history_leaves_the_expiry_owed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::audit_log::rotation::test_seam::set_rotation_threshold;
         use stellar_agent_core::audit_log::test_helpers::break_newest_archive_link;
-        use stellar_agent_core::audit_log::{
-            AuditEntry, NewToolInvocation, PolicyDecision, reader::ValueActionSettlement,
-            reader::try_value_action_settlement,
-        };
+        use stellar_agent_core::audit_log::{AuditEntry, NewToolInvocation, PolicyDecision};
 
+        let f = drain_fixture("unreadable-history");
+        let decision_id = f.committed_expiry(&"c1".repeat(32)).await;
         let unrelated = |request_id: &str| {
             AuditEntry::new_tool_invocation(NewToolInvocation::new(
                 "stellar_balance",
@@ -1291,176 +2218,392 @@ mod tests {
                 request_id,
             ))
         };
-        let audit = Arc::new(Mutex::new(
-            AuditWriter::open(path.to_path_buf(), None).unwrap(),
-        ));
         {
-            let mut guard = audit.lock().unwrap();
-            guard
-                .write_entry(AuditEntry::new_value_action_pending(
-                    "stellar_pay_commit",
-                    "stellar:testnet",
-                    Vec::new(),
-                    "transaction",
-                    "source",
-                    7,
-                    PolicyDecision::Allow,
-                    Some("envelope".to_owned()),
-                    None,
-                    None,
-                    "pending-request",
-                    None,
-                ))
-                .unwrap();
+            let writer = f.writer();
+            let mut guard = writer.lock().unwrap();
             guard.write_entry(unrelated("archived")).unwrap();
-            let size = std::fs::metadata(path).unwrap().len();
-            let threshold = set_rotation_threshold(path, size);
+            let size = std::fs::metadata(&f.profile.audit_log_path).unwrap().len();
+            let threshold = set_rotation_threshold(&f.profile.audit_log_path, size);
             guard.write_entry(unrelated("active")).unwrap();
             drop(threshold);
         }
-        assert!(matches!(
-            try_value_action_settlement(path, "envelope").unwrap(),
-            ValueActionSettlement::Owed(_)
-        ));
-        break_newest_archive_link(path);
-        audit
-    }
-
-    /// A settlement lookup that cannot read the retained history writes no
-    /// settled row and logs why: `tx status` settles through this helper, and
-    /// whether the row is owed is unknown.
-    #[test]
-    fn an_unreadable_history_writes_no_settled_row_and_logs_it() {
-        use stellar_agent_core::audit_log::PolicyDecision;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut profile =
-            Profile::builder_testnet("signer", "unreadable", "nonce", "unreadable").build();
-        profile.audit_log_path = dir.path().join("audit.jsonl");
-        let audit = history_with_a_broken_archive(&profile.audit_log_path);
-        let active = std::fs::read(&profile.audit_log_path).unwrap();
+        break_newest_archive_link(&f.profile.audit_log_path);
+        let active = std::fs::read(&f.profile.audit_log_path).unwrap();
+        let mut refused = None;
         let logs = stellar_agent_test_support::with_captured_logs(|| {
-            write_settled_row_with_evidence(
-                &profile,
-                "unreadable",
-                &audit,
-                "envelope",
-                "transaction",
-                &ReceiptStatus::Success,
-                None,
-                Some(9),
-                PolicyDecision::Allow,
-            );
+            refused = Some(f.drain());
         });
+        let code = refused.unwrap().map(|_| ()).unwrap_err().code().to_owned();
         assert_eq!(
-            std::fs::read(&profile.audit_log_path).unwrap(),
+            std::fs::read(&f.profile.audit_log_path).unwrap(),
             active,
-            "no settled row is written"
+            "no expiry event is written"
+        );
+        assert_eq!(
+            f.window
+                .owed_accounting_expiries(&f.profile)
+                .unwrap()
+                .unacknowledged,
+            vec![decision_id],
+            "the obligation stays owed"
         );
         let line = logs
             .lines()
-            .find(|line| line.contains("settled row NOT emitted"));
+            .find(|line| line.contains("accounting delivery refused"));
         assert!(
             line.is_some_and(|line| line.contains("WARN")
-                && line.contains("unreadable")
-                && line.contains("envelope")
-                && line.contains("audit.chain_broken")),
-            "the skipped row is logged with the profile, the hash, and the error: {logs}"
+                && line.contains("unreadable-history")
+                && line.contains(code.as_str())
+                && line.contains("audit.")),
+            "the refusal is logged with the profile and its code: {logs}"
         );
     }
 
-    /// The strict settlement refuses when the lookup cannot read the retained
-    /// history, so a clear never proceeds past a settlement it could not see.
+    /// Receipt-only reconciliation leaves the pending row, with its witness,
+    /// as the one row of the submission.
     #[test]
-    fn an_unreadable_history_refuses_the_strict_settlement() {
-        use stellar_agent_core::audit_log::PolicyDecision;
+    #[serial_test::serial]
+    fn pending_witness_survives_cli_reconciliation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
+        for (label, status) in [
+            ("success", ReceiptStatus::Success),
+            (
+                "failed",
+                ReceiptStatus::Failed {
+                    code: "ledger.failed".to_owned(),
+                },
+            ),
+        ] {
+            let f = drain_fixture(&format!("witness-{label}"));
+            let envelope = "ef".repeat(32);
+            let witness = stellar_agent_core::audit_log::CrossCheckRecord {
+                provider: "https://oracle.example".to_owned(),
+                ledger: 123,
+                inputs_digest: "09".repeat(32),
+                kinds: vec![stellar_agent_core::cross_check::WitnessEntry::SourceAccount],
+            };
+            f.writer()
+                .lock()
+                .unwrap()
+                .write_entry(AuditEntry::new_value_action_pending(
+                    "stellar_pay_commit",
+                    "stellar:testnet",
+                    vec![],
+                    &envelope,
+                    "source",
+                    7,
+                    PolicyDecision::Allow,
+                    Some(envelope.clone()),
+                    None,
+                    None,
+                    "pending-request",
+                    Some(witness.clone()),
+                ))
+                .unwrap();
+            f.receipt(&envelope, Some(status));
+            f.drain().unwrap();
+            let rows: Vec<_> = f
+                .rows()
+                .into_iter()
+                .filter(|row| row["envelope_hash"] == envelope.as_str())
+                .collect();
+            assert_eq!(rows.len(), 1, "{label}: {rows:?}");
+            assert_eq!(rows[0]["kind"], "value_action_pending");
+            assert_eq!(rows[0]["witness"], serde_json::to_value(&witness).unwrap());
+        }
+    }
 
-        let dir = tempfile::tempdir().unwrap();
-        let mut profile =
-            Profile::builder_testnet("signer", "strict-unreadable", "nonce", "strict-unreadable")
-                .build();
-        profile.audit_log_path = dir.path().join("audit.jsonl");
-        let audit = history_with_a_broken_archive(&profile.audit_log_path);
-        let active = std::fs::read(&profile.audit_log_path).unwrap();
-        let refused = append_settled_row(
-            &profile,
-            "strict-unreadable",
-            &audit,
-            "envelope",
-            "transaction",
-            &ReceiptStatus::Ambiguous,
-            Some(ReleaseEvidence::SequenceConsumed),
-            PolicyDecision::Allow,
-        )
-        .expect_err("a history that cannot be read refuses the strict settlement");
-        let error = refused.error.as_ref().expect("error");
-        assert_eq!(error.code, "audit.chain_broken", "{refused:?}");
+    /// The gate drain delivers an obligation an earlier pass left even when
+    /// its own pass refuses. With the window lock held, the pass cannot commit
+    /// the due expiry, and the old event is still appended. Once the lock is
+    /// released, the next pass acknowledges it without a second row.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_gate_drain_delivers_an_old_obligation_after_a_refused_pass() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         assert!(
-            error.message.contains("audit.chain_broken"),
-            "the refusal names the integrity error: {refused:?}"
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
-        assert!(
-            !error.message.contains("on open"),
-            "a lookup failure is not a writer-open failure: {refused:?}"
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let mut f = drain_fixture("gate-refused-drain");
+        f.window = PersistedWindowStore::for_profile(&f.name);
+        f.receipts = ReceiptStore::open(&f.name).unwrap();
+        let old = f.committed_expiry(&"c1".repeat(32)).await;
+        f.expired_hold(&"c2".repeat(32));
+        let expiry_rows = |decision_id: &str| {
+            f.rows()
+                .iter()
+                .filter(|row| {
+                    row["kind"] == "submission_accounting_expired"
+                        && row["decision_id"] == decision_id
+                })
+                .count()
+        };
+        let client = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+        let pass = || async {
+            reconcile_open_reservations(
+                &f.profile,
+                &f.name,
+                ProfileOrigin::Persisted,
+                &client,
+                None,
+                stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                None,
+            )
+            .await;
+        };
+
+        let lock = stellar_agent_core::policy::state_lock::WindowStoreLock::acquire_for(
+            f.window.path(),
+            &f.profile.policy_window_state_key_id,
+        )
+        .unwrap();
+        pass().await;
+        assert_eq!(
+            f.window.pending_reservations(&f.profile).unwrap().len(),
+            1,
+            "the refused pass commits nothing"
         );
         assert_eq!(
-            std::fs::read(&profile.audit_log_path).unwrap(),
-            active,
-            "no settled row is written"
+            expiry_rows(&old),
+            1,
+            "the old event is appended after the refused pass"
+        );
+        assert_eq!(
+            f.window
+                .owed_accounting_expiries(&f.profile)
+                .unwrap()
+                .unacknowledged,
+            vec![old.clone()],
+            "the held lock refuses the acknowledgement"
+        );
+        drop(lock);
+
+        pass().await;
+        assert_eq!(expiry_rows(&old), 1, "no second row");
+        assert!(
+            f.window
+                .pending_reservations(&f.profile)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            f.window
+                .owed_accounting_expiries(&f.profile)
+                .unwrap()
+                .unacknowledged
+                .is_empty()
+        );
+        assert_eq!(
+            f.rows()
+                .iter()
+                .filter(|row| row["kind"] == "submission_accounting_expired")
+                .count(),
+            2,
+            "each decision has one row"
         );
     }
+}
 
-    #[test]
-    fn pending_witness_survives_cli_reconciliation() {
-        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
-        let dir = tempfile::tempdir().unwrap();
-        let mut profile = Profile::builder_testnet("signer", "witness", "nonce", "witness").build();
-        profile.audit_log_path = dir.path().join("audit.jsonl");
-        let audit = Arc::new(Mutex::new(
-            AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
-        ));
-        let witness = stellar_agent_core::audit_log::CrossCheckRecord {
-            provider: "https://oracle.example".to_owned(),
-            ledger: 123,
-            inputs_digest: "09".repeat(32),
-            kinds: vec![stellar_agent_core::cross_check::WitnessEntry::SourceAccount],
-        };
-        audit
-            .lock()
-            .unwrap()
-            .write_entry(AuditEntry::new_value_action_pending(
-                "stellar_pay_commit",
-                "stellar:testnet",
-                vec![],
-                "transaction",
-                "source",
-                7,
-                PolicyDecision::Allow,
-                Some("envelope".to_owned()),
-                None,
-                None,
-                "pending-request",
-                Some(witness.clone()),
-            ))
+#[cfg(test)]
+pub(crate) mod intent_gate_fixture {
+    #![allow(clippy::unwrap_used, clippy::panic, reason = "test fixture assertions")]
+    use super::*;
+    use stellar_agent_core::policy::v1::criteria::state_store::StateKey;
+    use stellar_agent_core::profile::schema::PolicyEngineKind;
+    use stellar_xdr::{OperationBody, TransactionEnvelope};
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    pub(crate) struct IntentGateState {
+        name: String,
+        store: PersistedWindowStore,
+        endpoint: MockServer,
+        clock: stellar_agent_network::mainnet::clock::TestClockGuard,
+        query_clock: stellar_agent_core::policy::v1::criteria::state_store::QueryTimeGuard,
+        key: StateKey,
+    }
+
+    impl IntentGateState {
+        pub(crate) async fn seed(name: &str, profile: &mut Profile) -> Self {
+            let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(1000);
+            let query_clock =
+                stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(
+                    1000,
+                );
+            let endpoint = MockServer::start().await;
+            Mock::given(method("POST")).respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = match body["method"].as_str().unwrap() {
+                    "getNetwork" => stellar_agent_test_support::signed_envelope::get_network_result(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE),
+                    "getLatestLedger" => serde_json::json!({"id": "ab".repeat(32), "sequence": 101, "protocolVersion": 27}),
+                    method => panic!("unexpected observation request {method}"),
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc":"2.0", "id":body["id"], "result":result}))
+            }).mount(&endpoint).await;
+            let profiles = stellar_agent_core::profile::loader::default_profile_dir().unwrap();
+            std::fs::create_dir_all(&profiles).unwrap();
+            std::fs::write(profiles.join(format!("{name}.toml")), format!(
+                "version = 2\nchain_id = \"stellar:testnet\"\nrpc_url = {:?}\nsecondary_rpc_url = {:?}\n",
+                endpoint.uri(), stellar_agent_test_support::second_loopback_host(&endpoint.uri()),
+            )).unwrap();
+            profile.policy.engine = PolicyEngineKind::V1;
+            let owner = ed25519_dalek::SigningKey::from_bytes(&[0x57; 32]);
+            let owner_key = owner.verifying_key().to_bytes();
+            let key = &profile.policy_owner_key_id;
+            keyring_core::Entry::new(&key.service, &key.account)
+                .unwrap()
+                .set_password(
+                    &stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner_key),
+                )
+                .unwrap();
+            let policy = format!(
+                "version = 1\nscope = \"profile:{name}\"\n[[rules]]\nmatch = {{ tool = \"*\", chain = \"*\" }}\ncriteria = [{{ kind = \"rate_limit\", window = \"1w\", max_calls = 1 }}]\ndecision = \"allow\"\n"
+            );
+            let canonical =
+                stellar_agent_core::policy::v1::canonical::canonical_bytes(&policy).unwrap();
+            let digest = stellar_agent_core::policy::v1::signature::digest(&canonical);
+            let signature = stellar_agent_core::policy::v1::signature::sign(&digest, &owner);
+            let owner_g = stellar_strkey::ed25519::PublicKey(owner_key).to_string();
+            let signed = format!(
+                "{policy}\n[signature]\nowner_id = {:?}\nsig = {:?}\n",
+                owner_g.as_str(),
+                hex::encode(signature)
+            );
+            let policies = stellar_agent_core::profile::schema::default_policy_dir().unwrap();
+            std::fs::create_dir_all(&policies).unwrap();
+            std::fs::write(policies.join(format!("{name}.toml")), signed).unwrap();
+            let engine = crate::commands::policy_engine::build_v1_policy_engine(
+                "fixture",
+                &profile.policy.engine,
+                profile,
+                name,
+            )
             .unwrap();
-        write_settled_row(
+            let descriptor = ToolDescriptor::from_registration(&McpToolRegistration {
+                name: "fixture",
+                destructive_hint: true,
+                read_only_hint: false,
+                chain_id_required: true,
+                value_kind: ToolValueKind::ReadOnly,
+            });
+            let sizing = engine.size_no_value(&descriptor, profile, 1000).unwrap();
+            assert_eq!(sizing.entries().len(), 1);
+            let key = sizing.entries()[0].key().clone();
+            let (fixture, envelope) =
+                stellar_agent_network::signed_intent::test_helpers::intent_fixture_plan(1, 1);
+            let TransactionEnvelope::Tx(tx) = envelope else {
+                panic!("transaction")
+            };
+            let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+                panic!("invoke")
+            };
+            let plan = fixture
+                .classify_purpose(&op.host_function, None)
+                .unwrap()
+                .with_envelope_max_ledger(100)
+                .unwrap();
+            let plan = stellar_agent_network::signed_intent::test_helpers::with_legs(
+                &plan,
+                sizing.entries(),
+            );
+            let store = PersistedWindowStore::for_profile(name);
+            let _exposure = store.admit_signed_intent(profile, &plan).unwrap().expose();
+            clock.set(2000);
+            query_clock.set(2000);
+            Self {
+                name: name.into(),
+                store,
+                endpoint,
+                clock,
+                query_clock,
+                key,
+            }
+        }
+
+        pub(crate) async fn assert_closed(&self, profile: &Profile, count: u32) {
+            let views = self.store.signed_intents(&self.name, profile).unwrap();
+            assert_eq!(views.len(), 1);
+            assert_eq!(views[0].expiry_observed_at_ms, Some(2000));
+            assert_eq!(views[0].accounting_horizon, "604802000");
+            let engine = crate::commands::policy_engine::build_v1_policy_engine(
+                "fixture",
+                &profile.policy.engine,
+                profile,
+                &self.name,
+            )
+            .unwrap();
+            assert_eq!(
+                engine
+                    .window_state_store()
+                    .unwrap()
+                    .query_window(&self.key, if count == 0 { 604802001 } else { 2000 })
+                    .unwrap(),
+                (i128::from(count), count)
+            );
+            assert_eq!(self.endpoint.received_requests().await.unwrap().len(), 4);
+        }
+
+        pub(crate) fn after_retention(&self) {
+            self.clock.set(604802001);
+            self.query_clock.set(604802001);
+        }
+
+        pub(crate) fn bytes(&self) -> Vec<u8> {
+            std::fs::read(self.store.path()).unwrap()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    async fn early_observation_precedes_window_gate() {
+        let (_home, _guard) = home();
+        let name = "intent-refresh";
+        let mut profile =
+            Profile::builder_testnet_named(name, "signer", "account", "nonce", name).build();
+        let state = IntentGateState::seed(name, &mut profile).await;
+        let engine = crate::commands::policy_engine::build_v1_policy_engine(
+            "fixture",
+            &profile.policy.engine,
             &profile,
-            "witness",
-            &audit,
-            "envelope",
-            "transaction",
-            &ReceiptStatus::Success,
-            Some(124),
-            PolicyDecision::Allow,
+            name,
+        )
+        .unwrap();
+        let memory = engine.window_state_store().unwrap();
+        assert_eq!(memory.query_window(&state.key, 2000).unwrap(), (1, 1));
+        for after in [false, false, true] {
+            if after {
+                state.after_retention();
+            }
+            observe_and_refresh_intents(&profile, name, engine.as_ref())
+                .await
+                .unwrap();
+            let now = if after { 604802001 } else { 2000 };
+            let expected = if after { (0, 0) } else { (1, 1) };
+            assert_eq!(memory.query_window(&state.key, now).unwrap(), expected);
+            state.assert_closed(&profile, u32::from(!after)).await;
+        }
+    }
+
+    pub(crate) fn home() -> (
+        stellar_agent_test_support::sandbox::StateSandbox,
+        stellar_agent_test_support::StellarAgentHomeGuard,
+    ) {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
         );
-        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1]["kind"], "value_action_submitted");
-        assert_eq!(rows[1]["witness"], serde_json::to_value(&witness).unwrap());
-        assert_eq!(rows[0]["witness"], rows[1]["witness"]);
+        let guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        (home, guard)
     }
 }

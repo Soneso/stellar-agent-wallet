@@ -1,10 +1,11 @@
 //! What the submit layer records, and when, against a mocked Stellar RPC
 //! endpoint.
 //!
-//! The record is written before the transaction is sent and settled against
-//! what the network answered. These tests pin the order of the two checks that
-//! write it, the outcome each exit reports, and what each outcome leaves
-//! behind.
+//! The record is written before the transaction is sent. The submit layer
+//! reports outcomes through the recorder's outcome callback, and a failure to
+//! write the record returns before any callback. These tests pin the order of
+//! the two checks that write it, which outcome, if any, each exit reports, and
+//! what each outcome leaves behind.
 
 #![allow(
     clippy::unwrap_used,
@@ -39,6 +40,7 @@ use stellar_agent_test_support::keyring_mock;
 use stellar_agent_test_support::signed_envelope::{
     SignedTestEnvelope, TESTNET_PASSPHRASE, get_network_result,
 };
+use stellar_agent_test_support::timing::Stamp;
 use stellar_agent_test_support::{EchoIdResponder, rpc_request_count};
 use tempfile::TempDir;
 use wiremock::matchers::{body_partial_json, method, path};
@@ -65,16 +67,24 @@ enum Call {
 struct RecordingRecorder<'a> {
     inner: WalletSubmissionRecorder<'a>,
     calls: Arc<Mutex<Vec<Call>>>,
+    /// When the first pre-send call returned; the send deadline is armed
+    /// after it with no await between.
+    pre_send_returned: Stamp,
+    /// When the first outcome call started.
+    outcome_started: Stamp,
 }
 
 #[async_trait]
 impl SubmissionRecorder for RecordingRecorder<'_> {
     async fn pre_send(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
         self.calls.lock().unwrap().push(Call::PreSend);
-        self.inner.pre_send(intent).await
+        let recorded = self.inner.pre_send(intent).await;
+        self.pre_send_returned.mark();
+        recorded
     }
 
     async fn outcome(&self, intent: &SubmissionIntent, outcome: &SubmissionOutcome) {
+        self.outcome_started.mark();
         self.calls
             .lock()
             .unwrap()
@@ -129,8 +139,8 @@ struct Fixture {
     profile_name: String,
     receipts: ReceiptStore,
     window: PersistedWindowStore,
-    /// The window store's sidecar lock file, which a test holds to make the
-    /// reservation write fail.
+    /// The lock file of the window store's keyring entry, which a test holds
+    /// to make the reservation write fail.
     window_lock_path: std::path::PathBuf,
 }
 
@@ -139,9 +149,13 @@ fn fixture(name: &str) -> Fixture {
     let dir = TempDir::new().unwrap();
     let receipt_dir = TempDir::new().unwrap();
     let window_path = dir.path().join(format!("{name}.window"));
-    let window_lock_path = dir.path().join(format!("{name}.window.lock"));
+    let profile = test_profile(name);
+    let window_lock_path = stellar_agent_core::policy::state_lock::window_lock_path(
+        &window_path,
+        &profile.policy_window_state_key_id,
+    );
     Fixture {
-        profile: test_profile(name),
+        profile,
         profile_name: name.to_owned(),
         receipts: ReceiptStore::open_at(receipt_dir.path(), name).unwrap(),
         window: PersistedWindowStore::at_path(window_path),
@@ -151,7 +165,7 @@ fn fixture(name: &str) -> Fixture {
     }
 }
 
-/// Holds the window store's sidecar lock for as long as it is alive, which is
+/// Holds the lock of the window store's keyring entry for as long as it is alive, which is
 /// what makes `record_pending` refuse.
 fn hold_window_lock(path: &std::path::Path) -> std::fs::File {
     let file = std::fs::OpenOptions::new()
@@ -159,7 +173,7 @@ fn hold_window_lock(path: &std::path::Path) -> std::fs::File {
         .truncate(false)
         .write(true)
         .open(path)
-        .expect("the sidecar lock file must open");
+        .expect("the lock file must open");
     file.try_lock().expect("the lock must be free");
     file
 }
@@ -183,6 +197,8 @@ impl Fixture {
                 now_ms(),
             ),
             calls: Arc::clone(calls),
+            pre_send_returned: Stamp::default(),
+            outcome_started: Stamp::default(),
         }
     }
 
@@ -221,6 +237,8 @@ impl Fixture {
                 now_ms(),
             ),
             calls: Arc::clone(calls),
+            pre_send_returned: Stamp::default(),
+            outcome_started: Stamp::default(),
         }
     }
 
@@ -317,6 +335,9 @@ fn insufficient_fee_result_xdr() -> String {
 #[tokio::test]
 #[serial]
 async fn a_first_submission_reaches_the_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-first");
     let envelope = SignedTestEnvelope::for_source([0x21; 32]);
     let server = MockServer::start().await;
@@ -358,11 +379,13 @@ async fn a_first_submission_reaches_the_send() {
     );
 }
 
-/// Confirmation carries the applying ledger time through the recorder; a
-/// missing close time keeps the debit pending even when the receipt succeeds.
+/// Confirmation carries reported ledger time while retaining untimed exposure.
 #[tokio::test]
 #[serial]
-async fn submission_confirmation_dates_spend_only_from_created_at() {
+async fn submission_confirmation_retains_exposure_regardless_of_created_at() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for created_at in [Some((now_ms() / 1000) as i64), None] {
         let fx = fixture("record-close-time");
         let envelope = SignedTestEnvelope::for_source([0x29; 32]);
@@ -390,7 +413,7 @@ async fn submission_confirmation_dates_spend_only_from_created_at() {
         .unwrap();
         assert_eq!(
             fx.window.pending_reservations(&fx.profile).unwrap().len(),
-            usize::from(created_at.is_none())
+            1
         );
         assert!(
             matches!(&calls.lock().unwrap()[1], Call::Outcome(SubmissionOutcome::Success { created_at: received, .. }) if *received == created_at)
@@ -404,6 +427,9 @@ async fn submission_confirmation_dates_spend_only_from_created_at() {
 #[tokio::test]
 #[serial]
 async fn a_pre_send_refusal_writes_no_record() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-refused");
     let envelope = SignedTestEnvelope::for_source([0x22; 32]);
     let server = MockServer::start().await;
@@ -446,11 +472,84 @@ async fn a_pre_send_refusal_writes_no_record() {
     );
 }
 
+/// A `latestLedger` that names no ledger is refused before the send: the
+/// submission would be recorded against a ledger the retention guard cannot
+/// check, so nothing is sent and nothing is recorded.
+#[tokio::test]
+#[serial]
+async fn a_latest_ledger_that_names_no_ledger_refuses_before_the_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    for latest_ledger in [json!(0), json!(u64::from(u32::MAX) + 1), json!(-1)] {
+        let fx = fixture("record-latest-ledger");
+        let envelope = SignedTestEnvelope::for_source([0x23; 32]);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(json!({"method": "getNetwork"})))
+            .respond_with(rpc_ok(get_network_result(TESTNET_PASSPHRASE)))
+            .mount(&server)
+            .await;
+        let mut entries = envelope.ledger_entries_result();
+        entries["latestLedger"] = latest_ledger.clone();
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+            .respond_with(rpc_ok(entries))
+            .mount(&server)
+            .await;
+        mount_send_pending(&server, envelope.tx_hash_hex()).await;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorder = fx.recorder(&calls);
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let err = submit_transaction_and_wait(
+            &client,
+            envelope.envelope_xdr(),
+            SUBMIT_TIMEOUT,
+            TESTNET_PASSPHRASE,
+            None,
+            Some(&recorder),
+        )
+        .await
+        .expect_err("a latestLedger that names no ledger must refuse");
+
+        assert_eq!(
+            err.code(),
+            "network.rpc_response_malformed",
+            "latestLedger {latest_ledger}: {err}"
+        );
+        assert_eq!(
+            rpc_request_count(&server, "sendTransaction").await,
+            0,
+            "latestLedger {latest_ledger}: nothing is sent"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "latestLedger {latest_ledger}: nothing is recorded: {:?}",
+            calls.lock().unwrap()
+        );
+        let hash = envelope_hash(&envelope);
+        assert!(
+            fx.receipts.get(&hash).unwrap().is_none(),
+            "latestLedger {latest_ledger}: no receipt"
+        );
+        assert!(
+            !fx.reservation_is_open(&hash),
+            "latestLedger {latest_ledger}: no reservation"
+        );
+    }
+}
+
 /// A submission the endpoint accepts and never confirms reports a timeout and
 /// leaves everything it recorded standing.
 #[tokio::test]
 #[serial]
 async fn a_timeout_reports_the_local_hash_and_leaves_the_record_standing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-timeout");
     let envelope = SignedTestEnvelope::for_source([0x23; 32]);
     let server = MockServer::start().await;
@@ -511,7 +610,7 @@ async fn a_timeout_reports_the_local_hash_and_leaves_the_record_standing() {
     assert!(receipt.submitted, "the bytes were sent");
     assert!(
         fx.reservation_is_open(&hash),
-        "the reservation stands until reconciliation or an operator settles it"
+        "the reservation stands through its accounting horizon or until an operator clear"
     );
 }
 
@@ -520,6 +619,9 @@ async fn a_timeout_reports_the_local_hash_and_leaves_the_record_standing() {
 #[tokio::test]
 #[serial]
 async fn a_hash_mismatch_reports_both_hashes_and_leaves_the_record_standing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-mismatch");
     let envelope = SignedTestEnvelope::for_source([0x24; 32]);
     let server = MockServer::start().await;
@@ -567,6 +669,9 @@ async fn a_hash_mismatch_reports_both_hashes_and_leaves_the_record_standing() {
 #[tokio::test]
 #[serial]
 async fn a_transport_failure_after_the_record_returns_the_timeout_shape() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-transport");
     let envelope = SignedTestEnvelope::for_source([0x25; 32]);
     let server = MockServer::start().await;
@@ -628,12 +733,14 @@ async fn a_transport_failure_after_the_record_returns_the_timeout_shape() {
     );
 }
 
-/// A definitive refusal at the send step moves no value: the reservation goes
-/// back, the receipt records the failure, and the caller gets the refusal
-/// itself rather than a timeout.
+/// A reported refusal after signature exposure retains the reservation and
+/// sequence, while the caller receives the endpoint refusal.
 #[tokio::test]
 #[serial]
-async fn a_refused_send_releases_the_reservation_and_frees_the_sequence() {
+async fn a_refused_send_retains_the_reservation_and_sequence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-rejected");
     let envelope = SignedTestEnvelope::for_source([0x26; 32]);
     let server = MockServer::start().await;
@@ -682,17 +789,16 @@ async fn a_refused_send_releases_the_reservation_and_frees_the_sequence() {
     assert!(
         matches!(
             fx.receipts.get(&hash).unwrap().unwrap().status,
-            ReceiptStatus::Failed { .. }
+            ReceiptStatus::Pending
         ),
-        "the receipt records the refusal"
+        "the receipt retains uncertainty"
     );
     assert!(
-        !fx.reservation_is_open(&hash),
-        "nothing was queued, so the reservation goes back"
+        fx.reservation_is_open(&hash),
+        "signature exposure retains possible spending"
     );
 
-    // A rebuilt envelope at the same sequence is not refused as a duplicate:
-    // the refused one can never apply.
+    // Rebuilding at the same sequence cannot bypass the exposed submission.
     let rebuilt = SignedTestEnvelope::builder([0x26; 32])
         .amount_stroops(7_654_321)
         .build();
@@ -713,9 +819,8 @@ async fn a_refused_send_releases_the_reservation_and_frees_the_sequence() {
     .await;
     assert_eq!(
         retry.as_ref().err().map(WalletError::code),
-        Some("submission.tx_malformed"),
-        "a refused send frees the sequence, so the retry reaches the network again and is \
-         refused on its own terms: {retry:?}"
+        Some("submission.tx_already_submitted"),
+        "the retained receipt refuses the same sequence: {retry:?}"
     );
 }
 
@@ -725,6 +830,9 @@ async fn a_refused_send_releases_the_reservation_and_frees_the_sequence() {
 #[tokio::test]
 #[serial]
 async fn a_second_submission_at_a_pending_sequence_is_refused() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-duplicate");
     let envelope = SignedTestEnvelope::for_source([0x27; 32]);
     let server = MockServer::start().await;
@@ -809,6 +917,9 @@ fn envelope_hash(envelope: &SignedTestEnvelope) -> String {
 #[tokio::test]
 #[serial]
 async fn a_reservation_failure_unwinds_and_the_retry_is_admitted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-unwind-reservation");
     let envelope = SignedTestEnvelope::for_source([0x31; 32]);
     let server = MockServer::start().await;
@@ -908,6 +1019,9 @@ async fn a_reservation_failure_unwinds_and_the_retry_is_admitted() {
 #[tokio::test]
 #[serial]
 async fn a_mark_submitted_failure_unwinds_and_sends_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use std::sync::atomic::Ordering;
 
     let fx = fixture("record-unwind-mark");
@@ -973,6 +1087,9 @@ async fn a_mark_submitted_failure_unwinds_and_sends_nothing() {
 #[tokio::test]
 #[serial]
 async fn a_muxed_source_reaches_the_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-muxed");
     let envelope = SignedTestEnvelope::builder([0x33; 32])
         .muxed_source_id(42)
@@ -1036,11 +1153,14 @@ async fn a_muxed_source_reaches_the_send() {
 /// An unexpected `getTransaction` status after the send reports the timeout
 /// shape, so the agent gets the hash it needs to reconcile.
 ///
-/// The record is settled as an unknown outcome either way; what this pins is
-/// that the caller is told which transaction to ask about.
+/// The outcome is reported as unknown either way; what this pins is that the
+/// caller is told which transaction to ask about.
 #[tokio::test]
 #[serial]
 async fn an_unexpected_poll_status_reports_the_timeout_shape() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-poll-status");
     let envelope = SignedTestEnvelope::for_source([0x34; 32]);
     let server = MockServer::start().await;
@@ -1091,7 +1211,7 @@ async fn an_unexpected_poll_status_reports_the_timeout_shape() {
             calls.last(),
             Some(Call::Outcome(SubmissionOutcome::TransportAfterSend { .. }))
         ),
-        "the record is settled as an unknown outcome; got {calls:?}"
+        "the outcome is reported as unknown; got {calls:?}"
     );
 
     let envelope_hash = stellar_agent_network::envelope_hash_hex(envelope.envelope_xdr());
@@ -1251,18 +1371,27 @@ async fn assert_audit_append_refusal(failure: AuditAppendFailure) {
 #[tokio::test]
 #[serial]
 async fn a_truncated_audit_log_refuses_with_the_rollback_code_before_the_receipt() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_audit_append_refusal(AuditAppendFailure::Truncated).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn a_rewritten_audit_log_refuses_with_the_rollback_code_before_the_receipt() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_audit_append_refusal(AuditAppendFailure::Rewritten).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn an_untraversable_audit_directory_refuses_as_record_unavailable_before_the_receipt() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     assert_audit_append_refusal(AuditAppendFailure::Io).await;
 }
 
@@ -1318,6 +1447,8 @@ impl Fixture {
                 now_ms(),
             ),
             calls: Arc::clone(calls),
+            pre_send_returned: Stamp::default(),
+            outcome_started: Stamp::default(),
         }
     }
 }
@@ -1331,6 +1462,18 @@ fn unrelated_row(request_id: &str) -> AuditEntry {
         stellar_agent_core::audit_log::PolicyDecision::Allow,
         request_id,
     ))
+}
+
+/// A consent row, one of the operator rows the audit outbox queues.
+fn consent_row(request_id: &str) -> AuditEntry {
+    AuditEntry::new_approval_attested(
+        "PaymentSimulated",
+        "stellar_pay_commit",
+        None,
+        "ABCDEFGHIJKLMNOPQRSTUV",
+        "cli",
+        request_id,
+    )
 }
 
 /// Mounts a `sendTransaction` answer that must never be asked for.
@@ -1417,6 +1560,9 @@ fn failed_code(kind: &EventKind) -> Option<&str> {
 #[tokio::test]
 #[serial]
 async fn an_anchor_behind_before_the_pending_row_refuses_with_nothing_written() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut fx = fixture("record-anchor-before");
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
@@ -1477,6 +1623,9 @@ async fn an_anchor_behind_before_the_pending_row_refuses_with_nothing_written() 
 #[tokio::test]
 #[serial]
 async fn an_uncovered_pending_row_is_closed_and_its_reservation_released() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut fx = fixture("record-anchor-after");
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
@@ -1524,8 +1673,9 @@ async fn an_uncovered_pending_row_is_closed_and_its_reservation_released() {
     let anchored: Vec<u64> = store.writes().iter().map(|a| a.entry_count).collect();
     assert_eq!(
         anchored,
-        vec![1, 2],
-        "the closing append repairs the pending row's anchor, then anchors itself"
+        vec![1, 2, 3],
+        "the open anchors the boundary row; the closing append repairs the pending \
+         row's anchor, then anchors itself"
     );
 }
 
@@ -1537,6 +1687,9 @@ async fn an_uncovered_pending_row_is_closed_and_its_reservation_released() {
 #[tokio::test]
 #[serial]
 async fn an_uncovered_pending_row_without_window_entries_is_closed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut fx = fixture("record-anchor-unwindowed");
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
@@ -1582,6 +1735,9 @@ async fn an_uncovered_pending_row_without_window_entries_is_closed() {
 #[tokio::test]
 #[serial]
 async fn a_pending_row_covered_by_the_repair_after_it_is_sent() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut fx = fixture("record-anchor-repaired");
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
@@ -1601,14 +1757,15 @@ async fn a_pending_row_covered_by_the_repair_after_it_is_sent() {
 
     let hash = envelope_hash(&envelope);
     let kinds = kinds_for(&audit, &hash);
-    assert_eq!(kinds.len(), 2, "{kinds:?}");
+    assert_eq!(kinds.len(), 1, "{kinds:?}");
     assert!(
         matches!(kinds[0], EventKind::ValueActionPending { .. }),
         "{kinds:?}"
     );
     assert!(
-        matches!(kinds[1], EventKind::ValueActionSubmitted { .. }),
-        "no closing row precedes the outcome: {kinds:?}"
+        kinds
+            .iter()
+            .all(|kind| !matches!(kind, EventKind::ValueActionSubmitted { .. }))
     );
 }
 
@@ -1618,6 +1775,9 @@ async fn a_pending_row_covered_by_the_repair_after_it_is_sent() {
 #[tokio::test]
 #[serial]
 async fn a_policy_refusal_at_the_reservation_outranks_an_uncovered_pending_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut fx = fixture("record-anchor-denied");
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
@@ -1676,8 +1836,8 @@ async fn submit_after_a_queued_outbox_row(
     let mut fx = fixture(name);
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
-    AuditOutbox::for_log(&fx.profile.audit_log_path)
-        .append(&unrelated_row("queued-consent"))
+    AuditOutbox::for_log(&fx.profile.audit_log_path, store.clone())
+        .append(&consent_row("queued-consent"))
         .unwrap();
     let envelope = SignedTestEnvelope::for_source([seed; 32]);
     let server = MockServer::start().await;
@@ -1703,22 +1863,29 @@ async fn submit_after_a_queued_outbox_row(
 #[tokio::test]
 #[serial]
 async fn a_drained_outbox_row_left_uncovered_refuses_the_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (result, kinds) =
         submit_after_a_queued_outbox_row("record-anchor-drain-refused", 0x68, 6).await;
     let error = result.expect_err("six failed anchor writes leave the rows uncovered");
     assert_eq!(error.code(), "submission.record_unavailable", "{error:?}");
     assert!(error.message().contains(AFTER_ROW), "{error:?}");
-    assert_eq!(kinds.len(), 3, "{kinds:?}");
+    assert_eq!(kinds.len(), 4, "{kinds:?}");
     assert!(
-        matches!(kinds[0], EventKind::ToolInvocation),
-        "the queued row lands first: {kinds:?}"
+        matches!(kinds[0], EventKind::AuditEntryTagsStarted { .. }),
+        "the open appends the boundary row: {kinds:?}"
     );
     assert!(
-        matches!(kinds[1], EventKind::ValueActionPending { .. }),
+        matches!(kinds[1], EventKind::ApprovalAttested { .. }),
+        "the queued row lands first after the boundary: {kinds:?}"
+    );
+    assert!(
+        matches!(kinds[2], EventKind::ValueActionPending { .. }),
         "{kinds:?}"
     );
     assert_eq!(
-        failed_code(&kinds[2]),
+        failed_code(&kinds[3]),
         Some("submission.record_unavailable"),
         "{kinds:?}"
     );
@@ -1729,17 +1896,25 @@ async fn a_drained_outbox_row_left_uncovered_refuses_the_send() {
 #[tokio::test]
 #[serial]
 async fn a_drained_outbox_row_covered_by_the_repair_lets_the_send_proceed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (result, kinds) =
         submit_after_a_queued_outbox_row("record-anchor-drain-repaired", 0x69, 5).await;
     assert!(result.is_ok(), "the repair covers both rows: {result:?}");
     assert_eq!(kinds.len(), 3, "{kinds:?}");
     assert!(
-        matches!(kinds[1], EventKind::ValueActionPending { .. }),
+        matches!(kinds[1], EventKind::ApprovalAttested { .. }),
         "{kinds:?}"
     );
     assert!(
-        matches!(kinds[2], EventKind::ValueActionSubmitted { .. }),
+        matches!(kinds[2], EventKind::ValueActionPending { .. }),
         "{kinds:?}"
+    );
+    assert!(
+        kinds
+            .iter()
+            .all(|kind| !matches!(kind, EventKind::ValueActionSubmitted { .. }))
     );
 }
 
@@ -1747,15 +1922,18 @@ async fn a_drained_outbox_row_covered_by_the_repair_lets_the_send_proceed() {
 /// refuses the send and removes the receipt the gate recorded; no row and no
 /// reservation exist.
 ///
-/// A complete outbox line that does not parse refuses the drain the append
-/// runs first, and the check before the row reads no outbox.
+/// A complete outbox line past the recorded commitment refuses the drain the
+/// append runs first, and the check before the row reads no outbox.
 #[tokio::test]
 #[serial]
 async fn a_pending_row_append_failure_after_the_anchor_check_unwinds_the_receipt() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mut fx = fixture("record-anchor-append");
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
-    let outbox = AuditOutbox::for_log(&fx.profile.audit_log_path);
+    let outbox = AuditOutbox::for_log(&fx.profile.audit_log_path, store.clone());
     std::fs::write(outbox.path(), b"not an audit entry\n").unwrap();
     let envelope = SignedTestEnvelope::for_source([0x6b; 32]);
     let server = MockServer::start().await;
@@ -1775,7 +1953,7 @@ async fn a_pending_row_append_failure_after_the_anchor_check_unwinds_the_receipt
         "{error:?}"
     );
     assert!(
-        error.message().contains("audit.outbox_unusable"),
+        error.message().contains("audit.outbox_rows_missing"),
         "{error:?}"
     );
     assert_eq!(calls.lock().unwrap().as_slice(), &[Call::PreSend]);
@@ -1794,11 +1972,13 @@ async fn a_pending_row_append_failure_after_the_anchor_check_unwinds_the_receipt
             .unwrap()
             .is_empty()
     );
+    let kinds: Vec<EventKind> = verified_audit_entries(&audit)
+        .into_iter()
+        .map(|entry| entry.event_kind)
+        .collect();
     assert!(
-        std::fs::read_to_string(&fx.profile.audit_log_path)
-            .unwrap_or_default()
-            .is_empty(),
-        "no row is written"
+        matches!(kinds.as_slice(), [EventKind::AuditEntryTagsStarted { .. }]),
+        "no row is written past the boundary row: {kinds:?}"
     );
 }
 
@@ -1813,6 +1993,9 @@ async fn a_pending_row_append_failure_after_the_anchor_check_unwinds_the_receipt
 #[tokio::test]
 #[serial]
 async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use base64::Engine as _;
     use stellar_agent_core::audit_log::AuditWriter;
     use stellar_agent_core::audit_log::reader::{
@@ -1950,14 +2133,14 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
     );
     drop(first_recorder);
     drop(second_recorder);
-    drop(audit);
     assert!(
         matches!(
-            try_value_action_settlement(&audit_path, &second_hash).unwrap(),
+            try_value_action_settlement(&audit.lock().unwrap(), &second_hash).unwrap(),
             ValueActionSettlement::Settled
         ),
         "the pending row the refused submission wrote is closed out"
     );
+    drop(audit);
     // The row that closes the pending row names the refusal that stopped the
     // submission, so the audit log records a cap refusal as the policy denial
     // it is.
@@ -1985,12 +2168,15 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
 /// The receipt gate admits the resend because the receipt is gone, but the
 /// window file still holds the original's reservation under the same envelope
 /// hash. The resend is refused with the transaction to reconcile, before its
-/// pending row: the original's pending row stays owed, so the settled row its
-/// own reconciliation writes is the one that closes it. The cap is far above
-/// both amounts, so admission does not decide this.
+/// pending row: the refused resend writes no row, and the original's pending
+/// row stays owed. The cap is far above both amounts, so admission does not
+/// decide this.
 #[tokio::test]
 #[serial]
 async fn a_resend_after_a_lost_receipt_is_refused_before_the_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use base64::Engine as _;
     use stellar_agent_core::audit_log::AuditWriter;
     use stellar_agent_core::audit_log::reader::{
@@ -2105,14 +2291,14 @@ async fn a_resend_after_a_lost_receipt_is_refused_before_the_send() {
 
     drop(recorder);
     drop(resend_recorder);
-    drop(audit);
     assert!(
         matches!(
-            try_value_action_settlement(&audit_path, &hash).unwrap(),
+            try_value_action_settlement(&audit.lock().unwrap(), &hash).unwrap(),
             ValueActionSettlement::Owed(_)
         ),
         "the original's settlement stays owed"
     );
+    drop(audit);
     let rows: Vec<EventKind> = verified_audit_entries_from_path(&audit_path)
         .into_iter()
         .filter(|entry| entry.envelope_hash.as_deref() == Some(hash.as_str()))
@@ -2137,9 +2323,9 @@ async fn a_resend_after_a_lost_receipt_is_refused_before_the_send() {
 /// request left to run would overrun it by seconds.
 const HANG: Duration = Duration::from_secs(10);
 
-/// What a deadline exit may add to the deadline: the timeout record and
-/// scheduling. Smaller than the one-second overrun of an unclamped
-/// two-second poll sleep.
+/// What the wake-up at the deadline may add before the exit reports the
+/// timeout: scheduling alone. Smaller than the one-second overrun of an
+/// unclamped two-second poll sleep.
 const DEADLINE_MARGIN: Duration = Duration::from_millis(500);
 
 /// Answers like `inner`, after `delay`.
@@ -2156,8 +2342,13 @@ impl<R: wiremock::Respond> wiremock::Respond for Delayed<R> {
 
 /// Submits `envelope` under [`TIMEOUT_DEADLINE`] against `server`, which must
 /// answer the reads before the send and the send itself, and checks that the
-/// submission ended at the deadline with the timeout outcome and its record
-/// standing.
+/// submission reported the timeout at the deadline, with the timeout outcome
+/// and its record standing.
+///
+/// The deadline is armed when the pre-send record returns, so the span from
+/// that return to the start of the timeout report holds the send, the poll,
+/// and the wake-up at the deadline. The reads and the record writes before
+/// and after it spend no part of the timeout.
 async fn assert_timeout_at_the_deadline(
     fx: &Fixture,
     envelope: &SignedTestEnvelope,
@@ -2167,7 +2358,6 @@ async fn assert_timeout_at_the_deadline(
     let recorder = fx.recorder(&calls);
     let client = StellarRpcClient::new(&server.uri()).unwrap();
 
-    let started = std::time::Instant::now();
     let err = tokio::time::timeout(
         HANG,
         submit_transaction_and_wait(
@@ -2182,11 +2372,16 @@ async fn assert_timeout_at_the_deadline(
     .await
     .expect("the submission must end before the held-open request would")
     .expect_err("a submission that never confirms must report a timeout");
-    let elapsed = started.elapsed();
 
+    let elapsed = recorder.outcome_started.get("the timeout report")
+        - recorder.pre_send_returned.get("the pre-send record");
+    assert!(
+        elapsed >= TIMEOUT_DEADLINE,
+        "no timeout is reported before the {TIMEOUT_DEADLINE:?} deadline; elapsed {elapsed:?}"
+    );
     assert!(
         elapsed < TIMEOUT_DEADLINE + DEADLINE_MARGIN,
-        "the submission must end at its {TIMEOUT_DEADLINE:?} deadline; elapsed {elapsed:?}"
+        "the timeout is reported at its {TIMEOUT_DEADLINE:?} deadline; elapsed {elapsed:?}"
     );
     match &err {
         WalletError::Submission(SubmissionError::TxTimeout { tx_hash, .. }) => {
@@ -2225,6 +2420,9 @@ async fn assert_timeout_at_the_deadline(
 #[tokio::test]
 #[serial]
 async fn a_poll_request_held_past_the_deadline_is_cut_at_the_deadline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-poll-held");
     let envelope = SignedTestEnvelope::for_source([0x26; 32]);
     let server = MockServer::start().await;
@@ -2249,6 +2447,9 @@ async fn a_poll_request_held_past_the_deadline_is_cut_at_the_deadline() {
 #[tokio::test]
 #[serial]
 async fn the_sleep_after_a_not_found_ends_at_the_deadline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-poll-sleep");
     let envelope = SignedTestEnvelope::for_source([0x27; 32]);
     let server = MockServer::start().await;
@@ -2270,6 +2471,9 @@ async fn the_sleep_after_a_not_found_ends_at_the_deadline() {
 #[tokio::test]
 #[serial]
 async fn the_sleep_after_a_transient_poll_error_ends_at_the_deadline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let fx = fixture("record-poll-transient");
     let envelope = SignedTestEnvelope::for_source([0x28; 32]);
     let server = MockServer::start().await;

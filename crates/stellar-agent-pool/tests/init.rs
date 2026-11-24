@@ -79,9 +79,9 @@ async fn init_pool_n0_returns_size_out_of_range() {
     };
 
     match init_pool(&client, params).await {
-        Err(PoolError::SizeOutOfRange { requested: 0 }) => {}
-        Err(e) => panic!("expected SizeOutOfRange(0), got Err: {e}"),
-        Ok(_) => panic!("expected SizeOutOfRange(0), got Ok"),
+        Err(PoolError::SizeOutOfRange) => {}
+        Err(e) => panic!("expected SizeOutOfRange, got Err: {e}"),
+        Ok(_) => panic!("expected SizeOutOfRange, got Ok"),
     }
 }
 
@@ -120,9 +120,9 @@ async fn init_pool_n_exceeds_max_returns_size_out_of_range() {
     };
 
     match init_pool(&client, params).await {
-        Err(PoolError::SizeOutOfRange { requested }) if requested == n => {}
-        Err(e) => panic!("expected SizeOutOfRange({n}), got Err: {e}"),
-        Ok(_) => panic!("expected SizeOutOfRange({n}), got Ok"),
+        Err(PoolError::SizeOutOfRange) => {}
+        Err(e) => panic!("expected SizeOutOfRange, got Err: {e}"),
+        Ok(_) => panic!("expected SizeOutOfRange, got Ok"),
     }
 }
 
@@ -326,7 +326,10 @@ async fn init_pool_n2_success_submits_valid_sandwich() {
         .expect("init_pool must succeed against mock RPC");
 
     let rows = std::fs::read_to_string(&recording.profile.audit_log_path).unwrap();
-    assert!(rows.contains("value_action_submitted"));
+    // The reported success writes no submitted row: the pending row stays
+    // open.
+    assert!(rows.contains("value_action_pending"));
+    assert!(!rows.contains("value_action_submitted"));
     assert!(rows.contains(&stellar_agent_network::redact_tx_hash(&result.tx_hash)));
     assert_eq!(
         recording.receipts.all().unwrap()[0].status,
@@ -584,7 +587,7 @@ async fn init_pool_invalid_channel_strkey_returns_init_failed() {
 #[tokio::test]
 #[serial_test::serial]
 async fn timed_out_initialization_is_recorded_and_reconcilable() {
-    stellar_agent_test_support::keyring_mock::install().unwrap();
+    crate::common::install_keyring();
     let rpc = MockServer::start().await;
     Mock::given(body_partial_json(json!({"method":"getNetwork"})))
         .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
@@ -650,6 +653,7 @@ async fn timed_out_initialization_is_recorded_and_reconcilable() {
     .reconcile_one(
         &fixture.profile,
         &client,
+        None,
         Some(&fixture.receipts),
         &records[0].envelope_hash,
         1_700_000_002_000,
@@ -816,12 +820,8 @@ async fn init_pool_fee_overflow_refuses_before_any_request() {
     );
     let result = completed.unwrap().map(|_| ());
     assert!(
-        matches!(result, Err(PoolError::FeeOverflow {
-            fee_per_op: reported,
-            op_count: 3,
-        }) if reported == fee_per_op),
-        "init_pool must return FeeOverflow with the selected fee and \
-         operation count; got {result:?}"
+        matches!(result, Err(PoolError::FeeOverflow { op_count: 3 })),
+        "init_pool must return FeeOverflow with the operation count; got {result:?}"
     );
     assert!(server.received_requests().await.unwrap().is_empty());
     assert!(recording.receipts.all().unwrap().is_empty());

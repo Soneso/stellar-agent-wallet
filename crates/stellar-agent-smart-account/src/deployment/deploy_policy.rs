@@ -39,7 +39,10 @@ use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::SaInvocationResult;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::error::{SubmissionError, WalletError};
-use stellar_agent_core::rpc_budget::{SequentialRpcBudget, bound_stage};
+use stellar_agent_core::rpc_budget::{
+    SequentialRpcBudget, SequentialRpcBudgetElapsed, bound_stage,
+};
+use stellar_agent_network::retry::{BusyRetryError, retry_preflight_busy};
 use stellar_agent_network::{
     StellarRpcClient, fetch_account, signing::envelope_signing::attach_signature,
     submit_transaction_and_wait,
@@ -69,6 +72,7 @@ use crate::deployment::deploy_spending_limit_policy::{
 };
 use crate::deployment::map_budget_elapsed;
 use crate::signers::policy_identification::{THRESHOLD_POLICY_WASM, THRESHOLD_POLICY_WASM_HASHES};
+use crate::submit::refuse_mainnet_sa;
 use crate::verifiers::{RecordOutcome, VerifierRegistry};
 use crate::weighted_threshold_policy::{
     WEIGHTED_THRESHOLD_POLICY_WASM, WEIGHTED_THRESHOLD_POLICY_WASM_SHA256,
@@ -169,6 +173,10 @@ pub struct PolicyDeployResult {
 ///
 /// # Errors
 ///
+/// - [`SaError::MainnetWriteForbidden`]: `args.network_passphrase` names
+///   mainnet or `args.rpc_url` is a mainnet-pattern endpoint; refused at
+///   entry, before the deployer key is read, any request and any audit row,
+///   dry runs included.
 /// - [`SaError::SimpleThresholdPolicyProvenanceMismatch`] /
 ///   [`SaError::WeightedThresholdPolicyProvenanceMismatch`] — runtime SHA
 ///   gate failed.
@@ -189,6 +197,8 @@ pub async fn deploy_policy(
     args: PolicyDeployArgs,
     audit_writer: Option<&mut AuditWriter>,
 ) -> Result<PolicyDeployResult, SaError> {
+    refuse_mainnet_sa(&args.network_passphrase, &args.rpc_url)?;
+
     match args.kind {
         PolicyDeployKind::SpendingLimit => {
             let inner = SpendingLimitPolicyDeployArgs {
@@ -437,12 +447,10 @@ async fn deploy_wasm_policy_body(
         return Err(match spec.kind {
             PolicyDeployKind::SimpleThreshold => SaError::SimpleThresholdPolicySha256Drift {
                 network: args.network_passphrase,
-                recorded: existing_sha256,
                 attempted: spec.wasm_sha256.clone(),
             },
             PolicyDeployKind::WeightedThreshold => SaError::WeightedThresholdPolicySha256Drift {
                 network: args.network_passphrase,
-                recorded: existing_sha256,
                 attempted: spec.wasm_sha256.clone(),
             },
             PolicyDeployKind::SpendingLimit => unreachable!(
@@ -561,22 +569,41 @@ async fn deploy_wasm_policy_body(
                 phase: "build",
                 redacted_reason: format!("upload to_envelope (pre-sim) failed: {e}"),
             })?;
+        let upload_stage = "upload_simulate";
         let upload_sim = bound_stage(
             deploy_budget,
-            "upload_simulate",
-            rpc_server.simulate_transaction_envelope(&upload_envelope, None),
+            upload_stage,
+            retry_preflight_busy(Some(deploy_budget.deadline), || {
+                rpc_server.simulate_transaction_envelope(&upload_envelope, None)
+            }),
         )
         .await
         .map_err(|elapsed| map_budget_elapsed(elapsed, "simulate"))?
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!("upload simulate_transaction_envelope failed: {e}"),
+        .map_err(|e| match e {
+            BusyRetryError::Rpc(e) => SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!("upload simulate_transaction_envelope failed: {e}"),
+            },
+            BusyRetryError::Expired => map_budget_elapsed(
+                SequentialRpcBudgetElapsed {
+                    stage: upload_stage,
+                    total_secs: deploy_budget.total.as_secs(),
+                },
+                "simulate",
+            ),
         })?;
 
         if let Some(sim_error) = &upload_sim.error {
             return Err(SaError::DeploymentFailed {
                 phase: "simulate",
-                redacted_reason: format!("upload simulation returned error: {sim_error}"),
+                redacted_reason: format!(
+                    "upload simulation returned error: {}",
+                    crate::managers::rules::refusal_text(
+                        sim_error,
+                        &upload_sim.events,
+                        &upload_envelope
+                    )
+                ),
             });
         }
         if upload_sim.min_resource_fee == 0 || upload_sim.transaction_data.is_empty() {
@@ -731,22 +758,41 @@ async fn deploy_wasm_policy_body(
         phase: "build",
         redacted_reason: format!("deploy to_envelope (pre-sim) failed: {e}"),
     })?;
+    let deploy_stage = "deploy_simulate";
     let sim_response = bound_stage(
         deploy_budget,
-        "deploy_simulate",
-        rpc_server.simulate_transaction_envelope(&deploy_envelope_pre, None),
+        deploy_stage,
+        retry_preflight_busy(Some(deploy_budget.deadline), || {
+            rpc_server.simulate_transaction_envelope(&deploy_envelope_pre, None)
+        }),
     )
     .await
     .map_err(|elapsed| map_budget_elapsed(elapsed, "simulate"))?
-    .map_err(|e| SaError::DeploymentFailed {
-        phase: "simulate",
-        redacted_reason: format!("deploy simulate_transaction_envelope failed: {e}"),
+    .map_err(|e| match e {
+        BusyRetryError::Rpc(e) => SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("deploy simulate_transaction_envelope failed: {e}"),
+        },
+        BusyRetryError::Expired => map_budget_elapsed(
+            SequentialRpcBudgetElapsed {
+                stage: deploy_stage,
+                total_secs: deploy_budget.total.as_secs(),
+            },
+            "simulate",
+        ),
     })?;
 
     if let Some(sim_error) = &sim_response.error {
         return Err(SaError::DeploymentFailed {
             phase: "simulate",
-            redacted_reason: format!("deploy simulation returned error: {sim_error}"),
+            redacted_reason: format!(
+                "deploy simulation returned error: {}",
+                crate::managers::rules::refusal_text(
+                    sim_error,
+                    &sim_response.events,
+                    &deploy_envelope_pre
+                )
+            ),
         });
     }
     if sim_response.min_resource_fee == 0 || sim_response.transaction_data.is_empty() {
@@ -1069,5 +1115,102 @@ mod tests {
             "already_deployed must return the REGISTRY's recorded address (deployer A's), \
              not one re-derived from deployer B's (the caller's) pubkey"
         );
+    }
+
+    // ── Mainnet refusal before the deployer and the endpoint ────────────────
+
+    /// Runs the deployment for `network_passphrase` with a counting deployer
+    /// and a mock endpoint that answers nothing. Returns the result, the
+    /// deployer's key accesses and the requests the endpoint received.
+    #[tokio::test]
+    async fn deployment_simulates_retry_busy() {
+        crate::deployment::deploy::tests::check_deployment_busy(|url, timeout| async move {
+            let registry = tempfile::TempDir::new().unwrap();
+            let signer =
+                stellar_agent_network::signing::test_doubles::CountingSigner::new([0x61; 32]);
+            deploy_policy(
+                PolicyDeployArgs {
+                    deployer: crate::deployment::deploy::DeployerKeypair::from_signer(
+                        "counting".to_owned(),
+                        Box::new(signer),
+                    ),
+                    network_passphrase: stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE
+                        .to_owned(),
+                    rpc_url: url,
+                    timeout,
+                    fee: ResolvedFeePerOp {
+                        stroops: 100,
+                        percentile_label: "profile_default".to_owned(),
+                    },
+                    dry_run: false,
+                    registry_path_override: Some(registry.path().join("networks.toml")),
+                    kind: PolicyDeployKind::SimpleThreshold,
+                },
+                None,
+            )
+            .await
+            .map(|_| ())
+        })
+        .await;
+    }
+
+    async fn deploy_on(
+        network_passphrase: &str,
+        dry_run: bool,
+    ) -> (Result<PolicyDeployResult, SaError>, usize, usize) {
+        let server = wiremock::MockServer::start().await;
+        let registry = tempfile::TempDir::new().unwrap();
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x61; 32]);
+        let result = deploy_policy(
+            PolicyDeployArgs {
+                kind: PolicyDeployKind::SimpleThreshold,
+                deployer: DeployerKeypair::from_signer(
+                    "counting".to_owned(),
+                    Box::new(signer.clone()),
+                ),
+                network_passphrase: network_passphrase.to_owned(),
+                rpc_url: server.uri(),
+                timeout: Duration::from_secs(1),
+                fee: ResolvedFeePerOp {
+                    stroops: 100,
+                    percentile_label: "profile_default".to_owned(),
+                },
+                dry_run,
+                registry_path_override: Some(registry.path().join("networks.toml")),
+            },
+            None,
+        )
+        .await;
+        let requests = server.received_requests().await.unwrap().len();
+        (result, signer.key_accesses(), requests)
+    }
+
+    #[tokio::test]
+    async fn a_testnet_dry_run_reads_the_deployer_key_and_sends_nothing() {
+        let (result, key_accesses, requests) =
+            deploy_on(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE, true).await;
+
+        assert_eq!(result.unwrap().status, "dry_run");
+        assert_eq!(
+            key_accesses, 1,
+            "the dry run reads the deployer's public key"
+        );
+        assert_eq!(requests, 0);
+    }
+
+    #[tokio::test]
+    async fn a_mainnet_deployment_is_refused_before_the_deployer_and_the_endpoint() {
+        let (result, key_accesses, requests) = deploy_on(
+            stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SaError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(key_accesses, 0);
+        assert_eq!(requests, 0);
     }
 }

@@ -212,6 +212,19 @@ fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
     (Arc::new(Mutex::new(writer)), path, dir)
 }
 
+/// Creates a marked wallet home below the workspace target directory.
+///
+/// The MCP server of step 6 resolves wallet state under `STELLAR_AGENT_HOME`,
+/// so the test holds this home behind a `StellarAgentHomeGuard`.
+fn storage_sandbox() -> TempDir {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/test-sandboxes");
+    std::fs::create_dir_all(&root).expect("sandbox root directory");
+    let home = tempfile::tempdir_in(root.canonicalize().expect("sandbox root resolves"))
+        .expect("storage sandbox");
+    stellar_agent_test_support::sandbox::mark_sandbox(home.path()).expect("marked storage sandbox");
+    home
+}
+
 /// Constructs a `ContextRuleManager` against testnet with a signers manager,
 /// both writing to one audit log under the returned `TempDir`, which the
 /// caller holds while it uses the manager. Rule install requires the signers
@@ -219,7 +232,7 @@ fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
 fn fresh_rule_manager() -> (ContextRuleManager, TempDir) {
     let (manager, _signers_manager, _audit_log_path, dir) = managers_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Duration::from_secs(TIMEOUT_SECS),
     );
     (manager, dir)
@@ -235,7 +248,7 @@ fn fresh_signers_manager(
 ) -> Arc<SignersManager> {
     signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         audit_writer,
         audit_log_path,
         Duration::from_secs(TIMEOUT_SECS),
@@ -588,25 +601,24 @@ fn result_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
     serde_json::from_str(text).expect("tool result text must be valid JSON")
 }
 
-/// Writes a toolset pin file declaring only the `read-rules` capability.
-fn write_read_rules_toolset_pin(toolsets_root: &Path, toolset_name: &str, publisher_g: &str) {
-    let toolset_dir = toolsets_root.join(toolset_name);
-    std::fs::create_dir_all(&toolset_dir).expect("create toolset dir");
-    let pin_json = serde_json::json!({
-        "package": toolset_name,
-        "version": "1.0.0",
-        "shasum": "a".repeat(64),
-        "publisher": publisher_g,
-        "installed_at": "2026-07-05T00:00:00Z",
-        "capabilities": ["read-rules"],
-        "allowed_tools": []
-    });
-    let pin_path = toolset_dir.join(".stellar-agent-toolset-pin.json");
-    std::fs::write(
-        &pin_path,
-        serde_json::to_string_pretty(&pin_json).expect("serialise pin"),
+/// The pin key the suite tags its toolset record under and hands the server.
+fn toolset_pin_key() -> stellar_agent_toolsets_install::PinKey {
+    stellar_agent_toolsets_install::PinKey::from_bytes(Zeroizing::new([0x5a; 32]))
+}
+
+/// Writes a toolset declaring only the `read-rules` capability, as an install
+/// leaves it, with its record tagged under [`toolset_pin_key`].
+fn write_read_rules_toolset_pin(toolsets_root: &Path, toolset_name: &str) {
+    stellar_agent_toolsets_install::write_toolset_for_test(
+        toolsets_root,
+        toolset_name,
+        &["read-rules"],
+        &[],
+        "2026-07-05T00:00:00Z",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        &toolset_pin_key(),
     )
-    .expect("write pin");
+    .expect("write toolset");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -616,7 +628,12 @@ fn write_read_rules_toolset_pin(toolsets_root: &Path, toolset_name: &str, publis
 /// Full policy-observability-and-tuning flow: setup, read, transact, retune,
 /// squeeze, read through real MCP dispatch, negative identification.
 #[tokio::test]
+#[serial_test::serial]
 async fn policy_observability_full_flow_testnet_acceptance() {
+    let storage_sandbox = storage_sandbox();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
 
@@ -796,6 +813,9 @@ async fn policy_observability_full_flow_testnet_acceptance() {
     let rule_ids = vec![ContextRuleId::new(rule_id)];
     let transfer_a_result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(XLM_SAC_TESTNET)
             .auth_address(smart_account_strkey.as_str())
             .auth_rule_ids(&rule_ids)
@@ -811,6 +831,7 @@ async fn policy_observability_full_flow_testnet_acceptance() {
                 verifier: verifier_sc_addr.clone(),
             })
             .primary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(Duration::from_secs(TIMEOUT_SECS))
@@ -934,6 +955,9 @@ async fn policy_observability_full_flow_testnet_acceptance() {
     let rule_ids_squeeze = vec![ContextRuleId::new(rule_id)];
     let squeeze_err = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(XLM_SAC_TESTNET)
             .auth_address(smart_account_strkey.as_str())
             .auth_rule_ids(&rule_ids_squeeze)
@@ -949,6 +973,7 @@ async fn policy_observability_full_flow_testnet_acceptance() {
                 verifier: verifier_sc_addr.clone(),
             })
             .primary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(Duration::from_secs(TIMEOUT_SECS))
@@ -1012,6 +1037,7 @@ async fn policy_observability_full_flow_testnet_acceptance() {
     let mut server = WalletServer::new(mcp_profile).expect("WalletServer::new");
     server.set_approval_dir_for_test(approval_dir.path().to_path_buf());
     server.set_toolsets_root_for_test(toolsets_dir.path().to_path_buf());
+    server.set_toolset_pin_key_for_test(toolset_pin_key());
 
     let get_result = server
         .call_stellar_rules_get(StellarRulesGetArgs {
@@ -1104,7 +1130,7 @@ async fn policy_observability_full_flow_testnet_acceptance() {
 
     // Toolset-grant assertion: a toolset declaring ONLY read-rules resolves
     // and dispatches stellar_rules_get end-to-end through check_toolset_action.
-    write_read_rules_toolset_pin(toolsets_dir.path(), "policy-obs-read-rules", &operator_g);
+    write_read_rules_toolset_pin(toolsets_dir.path(), "policy-obs-read-rules");
     let toolset_invoke_result = server
         .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
             toolset: "policy-obs-read-rules".to_owned(),

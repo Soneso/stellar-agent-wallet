@@ -128,7 +128,11 @@ fn build_simulate_error_response(error_message: &str, latest_ledger: u32) -> ser
 /// Happy path: a full `SpendingLimitData` return value decodes correctly and
 /// the simulation's `latestLedger` is carried through as `as_of_ledger`.
 #[tokio::test]
+#[serial_test::serial]
 async fn get_spending_limit_data_decodes_full_response_and_carries_ledger() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     let policy = policy_sc_address();
@@ -180,7 +184,11 @@ async fn get_spending_limit_data_decodes_full_response_and_carries_ledger() {
 /// On-chain `SmartAccountNotInstalled` (code 3220) maps to the typed
 /// `SpendingLimitNotInstalled`, not a raw decode/simulate error.
 #[tokio::test]
+#[serial_test::serial]
 async fn get_spending_limit_data_maps_3220_to_spending_limit_not_installed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     let policy = policy_sc_address();
@@ -233,7 +241,11 @@ async fn get_spending_limit_data_maps_3220_to_spending_limit_not_installed() {
 /// `DeploymentFailed`, NOT `SpendingLimitNotInstalled` — the 3220 mapping must
 /// not over-match arbitrary simulate failures.
 #[tokio::test]
+#[serial_test::serial]
 async fn get_spending_limit_data_other_simulate_errors_are_not_remapped() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     let policy = policy_sc_address();

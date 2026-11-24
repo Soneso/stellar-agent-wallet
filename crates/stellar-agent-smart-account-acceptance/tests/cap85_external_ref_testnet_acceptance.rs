@@ -84,7 +84,9 @@ use rand_core::{OsRng, RngCore as _};
 use sha2::{Digest as _, Sha256};
 use soroban_spec_tools::Spec;
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::{ContractKind, EventKind, ExecutableRefPin};
+use stellar_agent_core::audit_log::schema::{
+    ContractKind, EventKind, ExecutableRefPin, WasmHashPin,
+};
 use stellar_agent_core::audit_log::signer_set::BaselineReason;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
@@ -105,6 +107,7 @@ use stellar_agent_smart_account::deployment::{
 };
 use stellar_agent_smart_account::ed25519_verifier::ED25519_VERIFIER_WASM;
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::auth_entry::test_helpers::partial_authorization_entry;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRulePolicy, ContextRuleSignerInput, PinStatus, RuleContext,
@@ -601,6 +604,7 @@ fn proxy_rule_definition(
 /// signing-time drift paths report the change.
 #[tokio::test(flavor = "multi_thread")]
 async fn install_pins_the_reference_and_signing_detects_the_repoint() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     const TEST: &str = "install-drift";
     let registry = tempfile::tempdir().expect("tempdir");
     let registry_path = registry.path().join("networks.toml");
@@ -660,14 +664,14 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
     let signers_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Arc::clone(&audit_writer),
         audit_log_path.clone(),
         TIMEOUT,
     );
     let manager = rule_manager_for_tests(
         TESTNET_RPC_URL,
-        None,
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url()),
         Arc::clone(&signers_manager),
         Arc::clone(&audit_writer),
         TIMEOUT,
@@ -696,12 +700,10 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     let refused_rule_id = match refusal {
         SaError::VerifierMutable {
             rule_id,
-            ref contract_address_redacted,
             admin_or_owner_key: AdminOrOwnerKey::ExternalRefExecutable,
             detail: Some(ref detail),
             ..
         } => {
-            assert_eq!(contract_address_redacted.as_str(), proxy_redacted);
             assert_eq!(
                 detail,
                 &format!("owner {beacon_redacted}, tag \"{TAG}\""),
@@ -767,7 +769,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
         ),
         tag: TAG.to_owned(),
         ref_key_hex: hex::encode(Sha256::digest(&ref_key_xdr)),
-        resolved_hash_first8: first8_hex(&fixture.ed25519_hash),
+        resolved_hash: WasmHashPin::new(fixture.ed25519_hash),
     };
     assert_eq!(
         installed.pin_result.pinned_verifier_executable_refs,
@@ -777,7 +779,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     let entries = read_audit_entries(&audit_log_path);
     // The override row is written after the install confirms, carrying the
     // installed rule's id: the install's rows are the override row, then
-    // SaContextRuleCreated, then the baseline the confirmed rule records,
+    // SaContextRuleCreatedV2, then the baseline the confirmed rule records,
     // then the `sa.ok` raw-invocation row.
     let install_rows: Vec<&EventKind> = entries
         .iter()
@@ -789,7 +791,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
             install_rows.as_slice(),
             [
                 EventKind::SaMutableContractOverride { .. },
-                EventKind::SaContextRuleCreated { .. },
+                EventKind::SaContextRuleCreatedV2 { .. },
                 EventKind::SaSignerSetBaselinedV2 {
                     rule_id: baselined_rule_id,
                     baseline_reason: BaselineReason::ConfirmedInstall,
@@ -848,21 +850,21 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     let created = entries
         .iter()
         .find_map(|entry| match &entry.event_kind {
-            EventKind::SaContextRuleCreated {
+            EventKind::SaContextRuleCreatedV2 {
                 rule_id: created_rule_id,
-                pinned_verifier_wasm_hashes_first8,
+                pinned_verifier_wasm_hashes,
                 pinned_verifier_executable_refs,
                 mutable_override,
                 ..
             } if *created_rule_id == rule_id && entry.request_id == install_request_id => Some((
-                pinned_verifier_wasm_hashes_first8.clone(),
+                pinned_verifier_wasm_hashes.clone(),
                 pinned_verifier_executable_refs.clone(),
                 *mutable_override,
             )),
             _ => None,
         })
-        .expect("SaContextRuleCreated row for the installed rule and the install request");
-    assert_eq!(created.0, vec![first8_hex(&fixture.ed25519_hash)]);
+        .expect("SaContextRuleCreatedV2 row for the installed rule and the install request");
+    assert_eq!(created.0, vec![WasmHashPin::new(fixture.ed25519_hash)]);
     assert_eq!(created.1, vec![Some(expected_pin)]);
     assert!(created.2, "the created row must carry mutable_override");
 
@@ -903,6 +905,9 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     let transfer_request_id = rid();
     let transfer = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(XLM_SAC_TESTNET)
             .auth_address(smart_account.as_str())
             .auth_rule_ids(&rule_ids)
@@ -918,6 +923,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
                 verifier: fixture.proxy_sc.clone(),
             })
             .primary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(TIMEOUT)
@@ -946,7 +952,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     assert_proxy_resolves_to(&fixture, &fixture.webauthn_hash).await;
     let expected_observed = format!(
         "external reference owner {beacon_redacted} tag \"{TAG}\" resolved {}",
-        first8_hex(&fixture.webauthn_hash)
+        hex::encode(fixture.webauthn_hash)
     );
 
     // ── Proof 3: the execute path refuses on drift before signing ──────────
@@ -956,6 +962,9 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     let drift_request_id = rid();
     let execute_refusal = submit_signed_invoke(
         SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
             .target_contract(XLM_SAC_TESTNET)
             .auth_address(smart_account.as_str())
             .auth_rule_ids(&rule_ids)
@@ -971,6 +980,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
                 verifier: fixture.proxy_sc.clone(),
             })
             .primary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .chain_id(CHAIN_ID)
             .timeout(TIMEOUT)
@@ -985,28 +995,26 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     )
     .await
     .expect_err("a transfer through the repointed reference must be refused before signing");
-    match execute_refusal {
+    match &execute_refusal {
         SaError::VerifierHashDrift {
             rule_id: drift_rule_id,
-            ref deploy_address_redacted,
-            ref pinned_hash_first8,
-            ref observed_hash_first8,
-            observed_executable: Some(ref observed_executable),
-            ref request_id,
+            deploy_address_redacted,
+            pinned_hash,
+            request_id,
             ..
         } => {
-            assert_eq!(drift_rule_id, rule_id);
+            assert_eq!(*drift_rule_id, rule_id);
             assert_eq!(deploy_address_redacted.as_str(), proxy_redacted);
-            assert_eq!(pinned_hash_first8, &first8_hex(&fixture.ed25519_hash));
-            assert_eq!(observed_hash_first8, &first8_hex(&fixture.webauthn_hash));
-            assert_eq!(observed_executable, &expected_observed);
+            assert_eq!(*pinned_hash, WasmHashPin::new(fixture.ed25519_hash));
             assert_eq!(request_id, &drift_request_id);
         }
-        other => panic!(
-            "expected VerifierHashDrift {{ observed_executable: Some(..) }} from the execute \
-             path; got {other:?}"
-        ),
+        other => panic!("expected VerifierHashDrift from the execute path; got {other:?}"),
     }
+    let rendered = format!("{execute_refusal}\n{execute_refusal:?}");
+    assert!(
+        !rendered.contains(&first8_hex(&fixture.webauthn_hash)),
+        "the execute refusal holds no part of the observed hash: {rendered}"
+    );
     let execute_drift_rows: Vec<AuditEntry> = read_audit_entries(&audit_log_path)
         .into_iter()
         .filter(|entry| {
@@ -1022,6 +1030,20 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
         1,
         "exactly one SaVerifierHashDrift row carries the execute path's request id"
     );
+    match &execute_drift_rows[0].event_kind {
+        EventKind::SaVerifierHashDrift {
+            observed_hash_first8,
+            observed_executable,
+            ..
+        } => {
+            assert_eq!(observed_hash_first8, &first8_hex(&fixture.webauthn_hash));
+            assert_eq!(
+                observed_executable.as_deref(),
+                Some(expected_observed.as_str())
+            );
+        }
+        other => panic!("filtered to SaVerifierHashDrift; got {other:?}"),
+    }
     record(TEST, "execute-drift-request-id", &drift_request_id);
     let recipient_after_refusal = xlm_stroops_balance(&recipient_g).await;
     assert_eq!(
@@ -1037,12 +1059,17 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
         "localhost",
         None,
     );
+    let entry = partial_authorization_entry(
+        parse_c_strkey_to_smart_account(&smart_account).expect("smart account strkey parses"),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(rule_id)],
+    )
+    .expect("auth entry builds");
     let outcome = credentials
         .sign_with_passkey_rule(
+            &stellar_agent_smart_account::signing::intent_test_helpers::gate(vec![]),
             "cap85-no-such-credential",
-            &smart_account,
-            &[0u8; 32],
-            vec![rule_id],
+            &entry,
             Arc::clone(&signers_manager),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19907),
             Duration::from_millis(500),
@@ -1052,23 +1079,22 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
         .await;
     match outcome {
         Err(CredentialsError::WasmHashDrift { ref source }) => match source.as_ref() {
-            SaError::VerifierHashDrift {
+            inner @ SaError::VerifierHashDrift {
                 rule_id: drift_rule_id,
                 deploy_address_redacted,
-                pinned_hash_first8,
-                observed_hash_first8,
-                observed_executable: Some(observed_executable),
+                pinned_hash,
                 ..
             } => {
                 assert_eq!(*drift_rule_id, rule_id);
                 assert_eq!(deploy_address_redacted.as_str(), proxy_redacted);
-                assert_eq!(pinned_hash_first8, &first8_hex(&fixture.ed25519_hash));
-                assert_eq!(observed_hash_first8, &first8_hex(&fixture.webauthn_hash));
-                assert_eq!(observed_executable, &expected_observed);
+                assert_eq!(*pinned_hash, WasmHashPin::new(fixture.ed25519_hash));
+                let rendered = format!("{inner}\n{inner:?}");
+                assert!(
+                    !rendered.contains(&first8_hex(&fixture.webauthn_hash)),
+                    "the passkey refusal holds no part of the observed hash: {rendered}"
+                );
             }
-            other => panic!(
-                "expected VerifierHashDrift {{ observed_executable: Some(..) }}; got {other:?}"
-            ),
+            other => panic!("expected VerifierHashDrift; got {other:?}"),
         },
         other => panic!("expected CredentialsError::WasmHashDrift; got {other:?}"),
     }
@@ -1125,12 +1151,12 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
         .expect("verify_rule_wasm_pins must return a report");
     assert_eq!(pins.verifier_pin_status, PinStatus::Drift);
     assert_eq!(
-        pins.pinned_verifier_first8,
-        vec![first8_hex(&fixture.ed25519_hash)]
+        pins.pinned_verifier_hashes,
+        vec![WasmHashPin::new(fixture.ed25519_hash)]
     );
     assert_eq!(
-        pins.observed_verifier_first8,
-        vec![first8_hex(&fixture.webauthn_hash)]
+        pins.observed_verifier_hashes,
+        vec![Some(WasmHashPin::new(fixture.webauthn_hash))]
     );
     assert_eq!(pins.policy_pin_status, PinStatus::Match);
 }
@@ -1176,11 +1202,9 @@ async fn assert_defi_gates_refuse(fixture: &Cap85Fixture, resolved: &[u8; 32]) {
 
     match verify_defindex_vault_wasm(&fixture.proxy, &rpc, None).await {
         Err(DefindexPinError::ExternalRef {
-            vault_redacted,
             owner_redacted,
             tag,
         }) => {
-            assert_eq!(vault_redacted, proxy_redacted);
             assert_eq!(owner_redacted, beacon_redacted);
             assert_eq!(tag, TAG);
         }

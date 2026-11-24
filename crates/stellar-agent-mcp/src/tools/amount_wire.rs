@@ -44,18 +44,19 @@ use rmcp::ErrorData;
 ///
 /// # Errors
 ///
-/// Returns `rmcp::ErrorData::invalid_params` naming `field` and the raw
-/// value when `s` is not a valid decimal `i128`.
+/// Returns `rmcp::ErrorData::invalid_params` naming `field` and the expected
+/// form when `s` is not a valid decimal `i128`. The message never repeats
+/// `s`, because a refused argument can hold a secret pasted into the wrong
+/// field.
 pub(crate) fn parse_i128_field(field: &str, s: &str) -> Result<i128, ErrorData> {
-    s.parse::<i128>().map_err(|_| {
-        ErrorData::invalid_params(format!("{field}: not a valid decimal i128: {s:?}"), None)
-    })
+    s.parse::<i128>()
+        .map_err(|_| ErrorData::invalid_params(format!("{field}: not a valid decimal i128"), None))
 }
 
 /// Parses each element of a decimal-string `Vec` field to `i128`.
 ///
 /// On the first parse failure, the error names `field` and the failing
-/// index — e.g. `"amounts_desired[2]: not a valid decimal i128: ..."` — so a
+/// index, for example `"amounts_desired[2]: not a valid decimal i128"`, so a
 /// caller with a long vector can locate the bad entry without a linear scan
 /// of the raw request.
 ///
@@ -84,14 +85,11 @@ pub(crate) fn parse_i128_vec_field(field: &str, v: &[String]) -> Result<Vec<i128
 ///
 /// # Errors
 ///
-/// Returns `rmcp::ErrorData::invalid_params` naming `field` and the raw
-/// value when `s` is not a valid decimal `i64`.
+/// Returns `rmcp::ErrorData::invalid_params` naming `field` and the expected
+/// form when `s` is not a valid decimal `i64`; the message never repeats `s`.
 pub(crate) fn parse_stroops_i64_field(field: &str, s: &str) -> Result<i64, ErrorData> {
     s.parse::<i64>().map_err(|_| {
-        ErrorData::invalid_params(
-            format!("{field}: not a valid decimal i64 (stroops): {s:?}"),
-            None,
-        )
+        ErrorData::invalid_params(format!("{field}: not a valid decimal i64 (stroops)"), None)
     })
 }
 
@@ -119,12 +117,13 @@ pub(crate) fn parse_stroops_i64_opt_field(
 ///
 /// # Errors
 ///
-/// Returns `rmcp::ErrorData::invalid_params` naming `field` and the raw
-/// value when `s` is not a valid non-negative decimal `u64`.
+/// Returns `rmcp::ErrorData::invalid_params` naming `field` and the expected
+/// form when `s` is not a valid non-negative decimal `u64`; the message never
+/// repeats `s`.
 pub(crate) fn parse_stroops_u64_field(field: &str, s: &str) -> Result<u64, ErrorData> {
     s.parse::<u64>().map_err(|_| {
         ErrorData::invalid_params(
-            format!("{field}: not a valid non-negative decimal u64 (stroops): {s:?}"),
+            format!("{field}: not a valid non-negative decimal u64 (stroops)"),
             None,
         )
     })
@@ -249,14 +248,14 @@ mod tests {
     }
 
     #[test]
-    fn error_message_names_the_field_and_the_raw_value() {
+    fn error_message_names_the_field_and_not_the_raw_value() {
         let err = parse_i128_field("qty_out_min", "1.5").unwrap_err();
         let msg = err.message.to_string();
+        assert_eq!(msg, "qty_out_min: not a valid decimal i128");
         assert!(
-            msg.contains("qty_out_min"),
-            "error must name the field: {msg}"
+            !msg.contains("1.5"),
+            "error must not echo the raw value: {msg}"
         );
-        assert!(msg.contains("1.5"), "error must echo the raw value: {msg}");
     }
 
     #[test]
@@ -337,11 +336,14 @@ mod tests {
     }
 
     #[test]
-    fn stroops_i64_error_names_field_and_raw_value() {
+    fn stroops_i64_error_names_field_and_not_the_raw_value() {
         let err = parse_stroops_i64_field("limit_stroops", "1.5").unwrap_err();
         let msg = err.message.to_string();
-        assert!(msg.contains("limit_stroops"));
-        assert!(msg.contains("1.5"));
+        assert_eq!(msg, "limit_stroops: not a valid decimal i64 (stroops)");
+        assert!(
+            !msg.contains("1.5"),
+            "error must not echo the raw value: {msg}"
+        );
     }
 
     #[test]

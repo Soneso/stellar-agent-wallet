@@ -46,7 +46,7 @@ fn every_audit_writer_open_registers_the_profile_path() {
         "commands/value_audit.rs",
         "commands/profile/audit_emit.rs",
         "commands/accounts/deploy_c.rs",
-        "commands/credentials/add_passkey.rs",
+        "common/consent.rs",
     ];
 
     for (path, source) in &hits {
@@ -135,9 +135,10 @@ fn signing_verbs_acquire_the_writer_before_submit() {
 /// chain key), and the pre-flight still precedes the stage's signing step.
 ///
 /// EVERY pre-flight call site is checked: for each occurrence (staged files
-/// have several — sign-only, submit-only, full pipeline), a policy-eval CALL
-/// (definitions excluded) must appear between the previous pre-flight and
-/// this one, and a signing step must follow it before the next pre-flight.
+/// have several: sign-only, submit-only, full pipeline, mainnet pipeline), a
+/// policy-eval CALL (definitions excluded) must appear between the previous
+/// pre-flight and this one, and a signing step must follow it before the next
+/// pre-flight.
 #[test]
 fn value_verbs_evaluate_policy_before_the_audit_preflight() {
     fn call_indices(hay: &str, needles: &[&str]) -> Vec<usize> {
@@ -168,30 +169,46 @@ fn value_verbs_evaluate_policy_before_the_audit_preflight() {
     for (file, policy_calls, preflight_calls, sign_calls, witness_calls) in [
         (
             "commands/pay.rs",
-            &["evaluate_pay_policy(", "evaluate_staged_pay_policy("][..],
+            &[
+                "evaluate_pay_policy(",
+                "evaluate_staged_pay_policy(",
+                "evaluate_mainnet_policy(",
+            ][..],
             &["value_audit::require_value_audit_writer_for_origin("][..],
-            &["sign_envelope(", "submit_envelope("][..],
+            &[
+                "sign_envelope(",
+                "submit_envelope(",
+                "authorize_and_submit(",
+            ][..],
             &[][..],
         ),
         (
             "commands/claim.rs",
-            &["evaluate_claim_policy(", "evaluate_staged_claim_policy("][..],
+            &[
+                "evaluate_claim_policy(",
+                "evaluate_staged_claim_policy(",
+                "evaluate_mainnet_policy(",
+            ][..],
             &["value_audit::require_value_audit_writer_for_origin("][..],
-            &["sign_envelope(", "submit_envelope("][..],
+            &[
+                "sign_envelope(",
+                "submit_envelope(",
+                "authorize_and_submit(",
+            ][..],
             &[][..],
         ),
         (
             "commands/trustline.rs",
-            &["evaluate_value_moving_policy("][..],
+            &["evaluate_value_moving_policy(", "evaluate_mainnet_policy("][..],
             &["value_audit::require_value_audit_writer("][..],
-            &["enrolled_keyring_signer("][..],
+            &["enrolled_keyring_signer(", "authorize_and_submit("][..],
             &["obtain_classic_witness("][..],
         ),
         (
             "commands/accounts/create.rs",
-            &["evaluate_create_policy("][..],
+            &["evaluate_create_policy(", "evaluate_mainnet_policy("][..],
             &["value_audit::require_value_audit_writer_for_origin("][..],
-            &["sponsored_create("][..],
+            &["sponsored_create(", "authorize_and_submit("][..],
             &["obtain_classic_witness("][..],
         ),
     ] {
@@ -248,8 +265,10 @@ fn value_verbs_evaluate_policy_before_the_audit_preflight() {
     );
 }
 
-/// The two `tx` verbs acquire the audit writer the same way the value verbs
-/// do: fail-closed on a persisted profile, best-effort on the synthesized one.
+/// The two `tx` verbs acquire the audit writer by profile origin, the way the
+/// value verbs do: fail-closed on a persisted profile, best-effort on the
+/// synthesized one. `tx status` acquires it through the accounting delivery
+/// writer, which applies the same origin rule.
 ///
 /// A submission on a zero-config profile leaves a receipt holding its source
 /// account's sequence. If the verbs that settle it refused on a profile with
@@ -258,15 +277,41 @@ fn value_verbs_evaluate_policy_before_the_audit_preflight() {
 #[test]
 fn the_tx_verbs_acquire_the_audit_writer_by_profile_origin() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for file in ["commands/tx/status.rs", "commands/tx/receipt.rs"] {
-        // The Windows checkout is CRLF; the scan is substring-based, so the
-        // normalisation only keeps the reported source readable.
-        let source = std::fs::read_to_string(src.join(file))
+    // The Windows checkout is CRLF; the scan is substring-based, so the
+    // normalisation only keeps the reported source readable.
+    let read = |file: &str| {
+        std::fs::read_to_string(src.join(file))
             .expect("read source")
-            .replace("\r\n", "\n");
+            .replace("\r\n", "\n")
+    };
+    let delivery = read("commands/submission_record.rs");
+    let delivery_writer = delivery
+        .split("pub(crate) fn accounting_audit_writer(")
+        .nth(1)
+        .and_then(|body| body.split("\n}\n").next())
+        .expect("the accounting delivery writer");
+    assert!(
+        delivery_writer.contains("value_audit::require_value_audit_writer_for_origin("),
+        "the accounting delivery writer must be acquired by profile origin"
+    );
+    for (file, acquisition) in [
+        (
+            "commands/tx/status.rs",
+            "submission_record::accounting_audit_writer(",
+        ),
+        (
+            "commands/tx/receipt.rs",
+            "value_audit::require_value_audit_writer_for_origin(",
+        ),
+    ] {
+        let source = read(file);
         assert!(
-            source.contains("value_audit::require_value_audit_writer_for_origin("),
+            source.contains(acquisition),
             "{file}: the audit writer must be acquired by profile origin"
+        );
+        assert!(
+            !production_half(&source).contains("value_audit::require_value_audit_writer("),
+            "{file}: no acquisition may skip the profile origin"
         );
         assert!(
             source.contains("load_profile_or_synthesize_testnet("),

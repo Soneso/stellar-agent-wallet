@@ -1,0 +1,3 @@
+- Mainnet success output from `pay`, `claim`, sponsored `accounts create`, and `trustline` echoes a supplied `business_id`.
+- `profile enable-mainnet` lists policy hints only for missing or invalid settings and a sign-policy hint whenever the policy needs a signature.
+- Readiness retries a `getLedgers` read that timed out or failed in transport, up to three attempts within the caller deadline, with pauses of 250 ms and 500 ms. Each refusal of the read keeps `network.endpoint_not_ready` and names the attempts made.

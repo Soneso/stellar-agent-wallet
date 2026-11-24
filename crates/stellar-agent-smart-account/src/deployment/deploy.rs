@@ -23,9 +23,12 @@ use stellar_agent_core::audit_log::schema::SaInvocationResult;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::error::{SubmissionError, WalletError};
 use stellar_agent_core::profile::caip2::Caip2;
-use stellar_agent_core::rpc_budget::{SequentialRpcBudget, bound_stage};
+use stellar_agent_core::rpc_budget::{
+    SequentialRpcBudget, SequentialRpcBudgetElapsed, bound_stage,
+};
 #[cfg(any(test, feature = "test-helpers"))]
 use stellar_agent_network::SoftwareSigningKey;
+use stellar_agent_network::retry::{BusyRetryError, retry_preflight_busy};
 use stellar_agent_network::{
     Signer, StellarRpcClient, fetch_account, signing::envelope_signing::attach_signature,
     submit_transaction_and_wait,
@@ -47,6 +50,7 @@ use tracing::info;
 use crate::SaError;
 use crate::deployment::address::derive_smart_account_address;
 use crate::deployment::map_budget_elapsed;
+use crate::submit::refuse_mainnet_sa;
 
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::deployment::address::derive_interop_deployer_seed;
@@ -406,8 +410,8 @@ fn redact_salt(salt_hex: &str) -> String {
 
 /// Redacts a WASM hash hex string to first-8-last-8 for tracing/table output.
 ///
-/// Exception: the `post_deploy_verification` mismatch error carries
-/// first-8 of both observed and expected for operator triage.
+/// The `post_deploy_verification` mismatch error names only the expected
+/// hash's first eight bytes and the redacted contract address.
 ///
 /// Delegates to `stellar_agent_core::hex::redact_hex_first8_last8`.
 pub(crate) fn redact_wasm_hash(wasm_hash_hex: &str) -> String {
@@ -470,7 +474,8 @@ fn build_signer_delegated_scval(g_strkey: &str) -> Result<ScVal, SaError> {
 ///   executable, not the uploaded Wasm);
 /// - `expected_hash_hex` not parseable as 32-byte hex (programmer error);
 /// - hash mismatch (the substantive substitution check; `redacted_reason` carries
-///   redacted C-strkey + first-8 hex of observed AND expected for operator triage).
+///   the redacted C-strkey and the expected hash's first-8 hex, and no part of
+///   the observed hash, which failed the comparison).
 ///
 /// # Errors
 ///
@@ -541,18 +546,17 @@ pub(crate) fn verify_post_deploy_wasm_hash(
         })?;
 
     if observed_wasm_hash != expected_wasm_hash {
-        // First-8 hex of both observed and expected are included in `redacted_reason`
-        // for operator triage (distinguishes RPC-substitution from salt-collision
-        // deployment scenarios). The C-strkey is redacted first-5-last-5.
-        let observed_first8 = stellar_agent_core::hex::wasm_hash_first8_hex(&observed_wasm_hash);
+        // The observed hash failed the comparison, so the reason names only the
+        // expected hash, as first-8 hex, and the C-strkey, redacted
+        // first-5-last-5.
         let expected_first8 = stellar_agent_core::hex::wasm_hash_first8_hex(&expected_wasm_hash);
         let sa_redacted =
             stellar_agent_core::observability::redact_strkey_first5_last5(derived_smart_account);
         return Err(SaError::DeploymentFailed {
             phase: "post_deploy_verification",
             redacted_reason: format!(
-                "post-deploy WASM-hash mismatch on {sa_redacted}: \
-                 observed first-8 hex {observed_first8}, expected first-8 hex {expected_first8}"
+                "post-deploy WASM-hash mismatch on {sa_redacted}: the deployed executable must \
+                 be the uploaded Wasm, expected first-8 hex {expected_first8}"
             ),
         });
     }
@@ -608,6 +612,11 @@ pub(crate) fn verify_post_deploy_wasm_hash(
 ///
 /// # Errors
 ///
+/// Refuses with [`SaError::MainnetWriteForbidden`] when
+/// `args.network_passphrase` names mainnet or `args.rpc_url` is a
+/// mainnet-pattern endpoint, at entry: before the deployer key is read, any
+/// request and any audit row, dry runs included.
+///
 /// Returns `SaError::DeploymentFailed { phase, redacted_reason }` where `phase` is one of
 /// the 7-value canonical set: `"build"`, `"simulate"`, `"upload"`, `"deploy"`,
 /// `"constructor"`, `"submit"`, `"post_deploy_verification"`.
@@ -625,6 +634,8 @@ pub async fn deploy_smart_account(
     args: DeploymentArgs,
     audit_writer: Option<&mut AuditWriter>,
 ) -> Result<DeploymentResult, SaError> {
+    refuse_mainnet_sa(&args.network_passphrase, &args.rpc_url)?;
+
     // Capture chain_id and dry_run before args is consumed.
     let chain_id = caip2_chain_id_for_passphrase(&args.network_passphrase);
     let is_dry_run = args.dry_run;
@@ -954,23 +965,42 @@ async fn deploy_smart_account_body(
                 phase: "build",
                 redacted_reason: format!("upload to_envelope (pre-sim) failed: {e}"),
             })?;
+        let upload_stage = "upload_simulate";
         let upload_sim = bound_stage(
             deploy_budget,
-            "upload_simulate",
-            rpc_server.simulate_transaction_envelope(&upload_envelope, None),
+            upload_stage,
+            retry_preflight_busy(Some(deploy_budget.deadline), || {
+                rpc_server.simulate_transaction_envelope(&upload_envelope, None)
+            }),
         )
         .await
         .map_err(|elapsed| map_budget_elapsed(elapsed, "simulate"))?
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!("upload simulate_transaction_envelope failed: {e}"),
+        .map_err(|e| match e {
+            BusyRetryError::Rpc(e) => SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!("upload simulate_transaction_envelope failed: {e}"),
+            },
+            BusyRetryError::Expired => map_budget_elapsed(
+                SequentialRpcBudgetElapsed {
+                    stage: upload_stage,
+                    total_secs: deploy_budget.total.as_secs(),
+                },
+                "simulate",
+            ),
         })?;
 
         // Panic-insulation pre-check.
         if let Some(sim_error) = &upload_sim.error {
             return Err(SaError::DeploymentFailed {
                 phase: "simulate",
-                redacted_reason: format!("upload simulation returned error: {sim_error}"),
+                redacted_reason: format!(
+                    "upload simulation returned error: {}",
+                    crate::managers::rules::refusal_text(
+                        sim_error,
+                        &upload_sim.events,
+                        &upload_envelope
+                    )
+                ),
             });
         }
         if upload_sim.min_resource_fee == 0 || upload_sim.transaction_data.is_empty() {
@@ -1174,16 +1204,28 @@ async fn deploy_smart_account_body(
         phase: "build",
         redacted_reason: format!("deploy to_envelope (pre-sim) failed: {e}"),
     })?;
+    let deploy_stage = "deploy_simulate";
     let sim_response = bound_stage(
         deploy_budget,
-        "deploy_simulate",
-        rpc_server.simulate_transaction_envelope(&deploy_envelope_pre, None),
+        deploy_stage,
+        retry_preflight_busy(Some(deploy_budget.deadline), || {
+            rpc_server.simulate_transaction_envelope(&deploy_envelope_pre, None)
+        }),
     )
     .await
     .map_err(|elapsed| map_budget_elapsed(elapsed, "simulate"))?
-    .map_err(|e| SaError::DeploymentFailed {
-        phase: "simulate",
-        redacted_reason: format!("deploy simulate_transaction_envelope failed: {e}"),
+    .map_err(|e| match e {
+        BusyRetryError::Rpc(e) => SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("deploy simulate_transaction_envelope failed: {e}"),
+        },
+        BusyRetryError::Expired => map_budget_elapsed(
+            SequentialRpcBudgetElapsed {
+                stage: deploy_stage,
+                total_secs: deploy_budget.total.as_secs(),
+            },
+            "simulate",
+        ),
     })?;
 
     // Panic-insulation pre-check.
@@ -1193,7 +1235,14 @@ async fn deploy_smart_account_body(
     if let Some(sim_error) = &sim_response.error {
         return Err(SaError::DeploymentFailed {
             phase: "simulate",
-            redacted_reason: format!("deploy simulation returned error: {sim_error}"),
+            redacted_reason: format!(
+                "deploy simulation returned error: {}",
+                crate::managers::rules::refusal_text(
+                    sim_error,
+                    &sim_response.events,
+                    &deploy_envelope_pre
+                )
+            ),
         });
     }
     if sim_response.min_resource_fee == 0 || sim_response.transaction_data.is_empty() {
@@ -1381,7 +1430,7 @@ async fn deploy_smart_account_body(
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -1459,24 +1508,37 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Signer for RecordingSigner {
-        async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        async fn sign_tx_payload(
+            &self,
+            payload: &stellar_agent_network::signing::TxSigningPayload,
+        ) -> Result<[u8; 64], WalletError> {
             self.record("sign_tx_payload");
             self.key.sign_tx_payload(payload).await
         }
-        async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        async fn sign_auth_digest(
+            &self,
+            digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
+        ) -> Result<[u8; 64], WalletError> {
             self.record("sign_auth_digest");
             self.key.sign_auth_digest(digest).await
         }
         async fn sign_soroban_address_auth_payload(
             &self,
-            payload: &[u8; 32],
+            payload: &stellar_agent_network::signing::SorobanAuthPayload,
         ) -> Result<[u8; 64], WalletError> {
             self.record("sign_soroban_address_auth_payload");
             self.key.sign_soroban_address_auth_payload(payload).await
         }
+        async fn sign_message(
+            &self,
+            payload: &stellar_agent_network::signing::MessagePayload,
+        ) -> Result<[u8; 64], WalletError> {
+            self.record("sign_message");
+            self.key.sign_message(payload).await
+        }
         async fn sign_webauthn_assertion(
             &self,
-            auth_digest: &[u8; 32],
+            auth_digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
             credential_id: &[u8],
         ) -> Result<stellar_agent_network::WebAuthnAssertion, WalletError> {
             self.record("sign_webauthn_assertion");
@@ -1506,6 +1568,120 @@ mod tests {
             dry_run: true,
             genesis_signer_scval_override: None,
         }
+    }
+
+    /// Exercises both simulation stages through a deployment entry point.
+    pub(crate) async fn check_deployment_busy<F, Fut>(mut deploy: F)
+    where
+        F: FnMut(String, Duration) -> Fut,
+        Fut: std::future::Future<Output = Result<(), SaError>>,
+    {
+        use stellar_xdr::{LedgerKey, ReadXdr, ScVal, SorobanTransactionData};
+        for upload in [true, false] {
+            for (busy, delayed) in [(1, false), (4, false), (1, true)] {
+                let server = wiremock::MockServer::start().await;
+                let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let observed = calls.clone();
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .respond_with(move |request: &wiremock::Request| {
+                        let body: serde_json::Value = request.body_json().unwrap();
+                        let result = match body["method"].as_str().unwrap() {
+                            "getLedgerEntries" => {
+                                let key = LedgerKey::from_xdr_base64(body["params"]["keys"][0].as_str().unwrap(), Limits::none()).unwrap();
+                                if matches!(key, LedgerKey::Account(_)) || (!upload && matches!(key, LedgerKey::ContractCode(_))) {
+                                    let source = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x61; 32]);
+                                    stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[&source])
+                                } else {
+                                    serde_json::json!({"entries": [], "latestLedger": 100})
+                                }
+                            }
+                            "getNetwork" => stellar_agent_test_support::signed_envelope::get_network_result(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE),
+                            "simulateTransaction" => {
+                                let n = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if n < busy {
+                                    return wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                                        "jsonrpc": "2.0", "id": body["id"], "error": {"code": -32004, "message": "preflight queue full"}
+                                    }));
+                                }
+                                serde_json::json!({
+                                    "latestLedger": 100, "minResourceFee": "1000",
+                                    "transactionData": SorobanTransactionData::default().to_xdr_base64(Limits::none()).unwrap(),
+                                    "results": [{"auth": [], "xdr": ScVal::Void.to_xdr_base64(Limits::none()).unwrap()}]
+                                })
+                            }
+                            "sendTransaction" => return wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                                "jsonrpc": "2.0", "id": body["id"], "error": {"code": -32602, "message": "submission boundary"}
+                            })),
+                            other => panic!("unexpected method {other}"),
+                        };
+                        let response = wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0", "id": body["id"], "result": result
+                        }));
+                        if delayed && body["method"] == "simulateTransaction" {
+                            response.set_delay(Duration::from_secs(3))
+                        } else { response }
+                    }).mount(&server).await;
+                let timeout = Duration::from_secs(if delayed { 2 } else { 30 });
+                let error = deploy(server.uri(), timeout).await.unwrap_err();
+                assert_eq!(
+                    calls.load(std::sync::atomic::Ordering::SeqCst),
+                    if busy == 4 { 4 } else { 2 },
+                    "{error:?}"
+                );
+                if delayed {
+                    let expected = map_budget_elapsed(
+                        SequentialRpcBudgetElapsed {
+                            stage: if upload {
+                                "upload_simulate"
+                            } else {
+                                "deploy_simulate"
+                            },
+                            total_secs: 2,
+                        },
+                        "simulate",
+                    );
+                    assert_eq!(
+                        serde_json::to_value(&error).unwrap(),
+                        serde_json::to_value(expected).unwrap()
+                    );
+                } else if busy == 4 {
+                    assert!(
+                        matches!(
+                            error,
+                            SaError::DeploymentFailed {
+                                phase: "simulate",
+                                ..
+                            }
+                        ),
+                        "{error:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        stellar_agent_test_support::rpc_request_count(&server, "sendTransaction")
+                            .await,
+                        1,
+                        "{error:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_simulates_retry_busy() {
+        check_deployment_busy(|url, timeout| async move {
+            let signer =
+                stellar_agent_network::signing::test_doubles::CountingSigner::new([0x61; 32]);
+            let mut args = dry_run_args(DeployerKeypair::from_signer(
+                "counting".to_owned(),
+                Box::new(signer),
+            ));
+            args.rpc_url = url;
+            args.timeout = timeout;
+            args.dry_run = false;
+            deploy_smart_account(args, None).await.map(|_| ())
+        })
+        .await;
     }
 
     /// Bytes that are a valid empty Wasm module and hash to another digest
@@ -1626,8 +1802,8 @@ mod tests {
     }
 
     /// Regression gate: a `LedgerEntryResult` with a valid XDR field but a non-matching WASM hash
-    /// causes `verify_post_deploy_wasm_hash` to return a typed mismatch error carrying first-8 hex
-    /// prefixes of both observed and expected.
+    /// causes `verify_post_deploy_wasm_hash` to return a typed mismatch error. The mismatch error
+    /// names only the expected hash's first eight bytes and the redacted contract address.
     #[test]
     fn post_deploy_verification_aborts_on_wasm_hash_mismatch() {
         // Build a synthetic ContractData entry with a non-matching wasm hash.
@@ -1678,27 +1854,19 @@ mod tests {
             panic!("expected mismatch error; got: {result:?}");
         };
         assert_eq!(phase, "post_deploy_verification");
-        assert!(
-            redacted_reason.starts_with("post-deploy WASM-hash mismatch on "),
-            "redacted_reason should start with mismatch literal: {redacted_reason}"
-        );
-        // The redacted C-strkey should be present.
+        // The reason names the redacted C-strkey and the expected hash's
+        // first-8 hex; the observed all-zeros hash failed the comparison and
+        // appears in no form.
         let redacted_sa =
             stellar_agent_core::observability::redact_strkey_first5_last5(test_c_strkey);
-        assert!(
-            redacted_reason.contains(&redacted_sa),
-            "redacted_reason should carry redacted C-strkey '{redacted_sa}': {redacted_reason}"
+        assert_eq!(
+            redacted_reason,
+            format!(
+                "post-deploy WASM-hash mismatch on {redacted_sa}: the deployed executable must \
+                 be the uploaded Wasm, expected first-8 hex 1234567890abcdef"
+            )
         );
-        // first-8 hex of [0u8; 32]
-        assert!(
-            redacted_reason.contains("0000000000000000"),
-            "redacted_reason should carry observed first-8 hex: {redacted_reason}"
-        );
-        // first-8 hex of the expected hash (1234567890abcdef...)
-        assert!(
-            redacted_reason.contains("1234567890abcdef"),
-            "redacted_reason should carry expected first-8 hex: {redacted_reason}"
-        );
+        assert!(!redacted_reason.contains("00000000"), "{redacted_reason}");
     }
 
     /// A deployed instance whose executable is a CAP-85 external reference is
@@ -1872,5 +2040,57 @@ mod tests {
                 "ON_CHAIN_REJECTED_PHASES entry '{phase}' is not in ALL_EMITTED_PHASES"
             );
         }
+    }
+
+    // ── Mainnet refusal before the deployer and the endpoint ────────────────
+
+    /// Runs the deployment for `network_passphrase` with a counting deployer
+    /// and a mock endpoint that answers nothing. Returns the result, the
+    /// deployer's key accesses and the requests the endpoint received.
+    async fn deploy_on(
+        network_passphrase: &str,
+        dry_run: bool,
+    ) -> (Result<DeploymentResult, SaError>, usize, usize) {
+        let server = wiremock::MockServer::start().await;
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x61; 32]);
+        let mut args = dry_run_args(DeployerKeypair::from_signer(
+            "counting".to_owned(),
+            Box::new(signer.clone()),
+        ));
+        args.network_passphrase = network_passphrase.to_owned();
+        args.rpc_url = server.uri();
+        args.dry_run = dry_run;
+        let result = deploy_smart_account(args, None).await;
+        let requests = server.received_requests().await.unwrap().len();
+        (result, signer.key_accesses(), requests)
+    }
+
+    #[tokio::test]
+    async fn a_testnet_dry_run_reads_the_deployer_key_and_sends_nothing() {
+        let (result, key_accesses, requests) =
+            deploy_on(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE, true).await;
+
+        assert!(result.unwrap().tx_hash.is_none(), "a dry run sends nothing");
+        assert_eq!(
+            key_accesses, 1,
+            "the dry run reads the deployer's public key"
+        );
+        assert_eq!(requests, 0);
+    }
+
+    #[tokio::test]
+    async fn a_mainnet_deployment_is_refused_before_the_deployer_and_the_endpoint() {
+        let (result, key_accesses, requests) = deploy_on(
+            stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SaError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(key_accesses, 0);
+        assert_eq!(requests, 0);
     }
 }

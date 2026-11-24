@@ -100,7 +100,7 @@ use stellar_agent_core::audit_log::AuditLogIntegrityError;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::health::{AuditWriterHealth, AuditWriterHealthHandle};
 use stellar_agent_core::audit_log::reader::PinnedHashesRecord;
-use stellar_agent_core::audit_log::schema::{ContractKind, PinsUpdateReason};
+use stellar_agent_core::audit_log::schema::{ContractKind, PinsUpdateReason, WasmHashPin};
 use stellar_agent_core::audit_log::signer_set::{
     BaselineReason, ObservedSignerSet, SignerEntryV2, SignerIdentityV2, SignerPubkey,
     SignerSetSnapshotV2, SignerSetView, SignerSetViewPayload, ThresholdObservation, account_digest,
@@ -108,9 +108,7 @@ use stellar_agent_core::audit_log::signer_set::{
 };
 use stellar_agent_core::audit_log::writer::{AuditWriter, WriterError};
 use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
-use stellar_agent_core::observability::{
-    RedactedStrkey, redact_strkey_first5_last5, untrusted_display_bounded,
-};
+use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::scval::scval_variant_name;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_core::timefmt::now_unix_ms;
@@ -136,17 +134,20 @@ use crate::error::{
 use crate::managers::auth_entry::{PreSubmitBudget, bound_pre_submit_stage};
 use crate::managers::migration::PendingAddStep;
 use crate::managers::rules::{
-    BASE_FEE_STROOPS, ExpectedInstallState, ExpiryCheck, augment_with_oz_error_name,
-    contract_instance_key, scaddress_to_strkey,
+    BASE_FEE_STROOPS, ExpectedInstallState, ExpiryCheck, SimulationFailure, contract_instance_key,
+    read_only_refusal, scaddress_to_strkey,
 };
 use crate::managers::verifiers::{PinnedKind, PlannedPinUpdate};
 use crate::signers::policy_identification::THRESHOLD_POLICY_WASM_HASHES;
-use crate::signers::types::{
-    FrozenChainStateTuple, PolicyIdentifiedKind, ThresholdAffectingOp, WasmHashSummary,
-};
+use crate::signers::types::{FrozenChainStateTuple, PolicyIdentifiedKind, ThresholdAffectingOp};
 use crate::simple_threshold_policy::parse_simple_threshold_install_param;
-use crate::submit::ExpectedReturn;
+use crate::submit::{ExpectedReturn, refuse_mainnet_sa};
 use crate::weighted_threshold_policy::WEIGHTED_THRESHOLD_POLICY_WASM_HASHES;
+
+/// Refusal text for a non-positive spending limit, shared by the library
+/// check and the CLI pre-flight so both state the same check.
+pub const SPENDING_LIMIT_POSITIVE_REASON: &str =
+    "--limit must be positive; supply a positive spending limit.";
 
 /// Weighted-threshold policy's on-chain view state: the current threshold
 /// and per-signer weight map.
@@ -489,12 +490,17 @@ pub(crate) type LockedSubmitFuture<'l> = std::pin::Pin<
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct SignersManagerConfig {
+    /// Count admission required by signing operations.
+    pub intent_admission: Option<Arc<stellar_agent_network::NoValueAdmission>>,
     /// Primary Soroban RPC URL.
     pub primary_rpc_url: String,
 
-    /// Secondary Soroban RPC URL for two-RPC consultation.
+    /// Secondary Soroban RPC URL for two-RPC consultation and the ledger
+    /// witness of every signing verb.
     ///
-    /// May equal `primary_rpc_url` (degrades to single-RPC; warning is logged).
+    /// May equal `primary_rpc_url` for read verbs, whose consultation then
+    /// degrades to single-RPC with a logged warning. Signing refuses that
+    /// configuration with [`SaError::LedgerWitnessUnavailable`].
     pub secondary_rpc_url: String,
 
     /// Shared audit-log writer handle.
@@ -523,6 +529,7 @@ pub struct SignersManagerConfig {
 impl std::fmt::Debug for SignersManagerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
+            intent_admission: _,
             primary_rpc_url,
             secondary_rpc_url,
             audit_writer: _,
@@ -552,10 +559,21 @@ impl std::fmt::Debug for SignersManagerConfig {
 }
 
 impl SignersManagerConfig {
+    /// Supplies the checked count admission for signing operations.
+    #[must_use]
+    pub fn with_intent_admission(
+        mut self,
+        admission: Arc<stellar_agent_network::NoValueAdmission>,
+    ) -> Self {
+        self.intent_admission = Some(admission);
+        self
+    }
+
     /// Constructs a new `SignersManagerConfig`.
     ///
     /// Logs a warning if `primary_rpc_url == secondary_rpc_url`, because the
-    /// two-RPC consultation degrades to a single RPC in that case.
+    /// two-RPC consultation degrades to a single RPC in that case and signing
+    /// verbs refuse.
     ///
     /// # Arguments
     ///
@@ -590,6 +608,7 @@ impl SignersManagerConfig {
             );
         }
         Self {
+            intent_admission: None,
             primary_rpc_url,
             secondary_rpc_url,
             audit_writer,
@@ -639,7 +658,9 @@ impl SignersManagerConfig {
 ///   the active signer set to guard against configurations where the threshold
 ///   exceeds the number of available signers.
 pub struct SignersManager {
+    intent_admission: Option<Arc<stellar_agent_network::NoValueAdmission>>,
     primary_rpc_url: String,
+    secondary_rpc_url: String,
     audit_writer: Arc<Mutex<AuditWriter>>,
     audit_log_path: PathBuf,
     network_passphrase: String,
@@ -691,7 +712,9 @@ impl SignersManager {
         let secondary_rpc_client = StellarRpcClient::new(&config.secondary_rpc_url)
             .map_err(|e| mk_err(&config.secondary_rpc_url, &e))?;
         Ok(Self {
+            intent_admission: config.intent_admission,
             primary_rpc_url: config.primary_rpc_url,
+            secondary_rpc_url: config.secondary_rpc_url,
             audit_writer: config.audit_writer,
             audit_log_path: config.audit_log_path,
             network_passphrase: config.network_passphrase,
@@ -724,6 +747,23 @@ impl SignersManager {
     #[must_use]
     pub(crate) fn secondary_rpc_client(&self) -> &StellarRpcClient {
         &self.secondary_rpc_client
+    }
+
+    /// Refuses a write when the manager's passphrase names mainnet or its
+    /// primary endpoint is a mainnet-pattern URL.
+    ///
+    /// The managers also serve mainnet reads, so the refusal is not made at
+    /// construction: every write method calls this first, before any signer
+    /// key access and any request, and a caller holding the manager for a
+    /// multi-step write, such as `MigrationPlan::submit`, calls it before its
+    /// first step. Local checks only; no I/O.
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::MainnetWriteForbidden`] for a mainnet passphrase or a
+    /// mainnet-pattern primary endpoint.
+    pub(crate) fn refuse_mainnet_write(&self) -> Result<(), SaError> {
+        refuse_mainnet_sa(&self.network_passphrase, &self.primary_rpc_url)
     }
 
     /// Returns a clone of the shared `Arc<Mutex<AuditWriter>>`.
@@ -780,11 +820,42 @@ impl SignersManager {
         self.health.handle()
     }
 
-    /// Returns the CAIP-2 chain identifier configured for this manager.
+    /// Runs the pinned-hash drift check, with its verifier status gate, for
+    /// each signing rule.
     ///
-    /// `pub(crate)` — used by `managers::verifiers::verify_pinned_verifier_against_chain`
-    /// and `verify_pinned_policy_against_chain` to populate the
-    /// `chain_id` field on drift audit entries.
+    /// The returned proof is bound to this manager's network, the account and
+    /// the complete rule set. Rule `0` and a rule without a pin record pass
+    /// unchecked: neither has a pin to compare the live verifier with, so
+    /// neither is status-checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns pin drift, verifier status and pin-check availability refusals.
+    pub async fn check_signing_rules(
+        &self,
+        smart_account: &ScAddress,
+        rule_ids: &[stellar_agent_core::smart_account::rule_id::ContextRuleId],
+        request_id: &str,
+    ) -> Result<crate::submit::CheckedSigningRules, SaError> {
+        crate::submit::check_signing_rules(
+            self,
+            smart_account,
+            rule_ids,
+            request_id,
+            crate::managers::auth_entry::PreSubmitBudget {
+                deadline: tokio::time::Instant::now() + self.timeout,
+                total: self.timeout,
+            },
+        )
+        .await
+    }
+
+    pub(crate) fn signing_network_id(&self) -> [u8; 32] {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(self.network_passphrase.as_bytes()).into()
+    }
+
+    /// Returns the CAIP-2 chain identifier for drift audit entries.
     #[must_use]
     pub(crate) fn chain_id(&self) -> &str {
         &self.chain_id
@@ -847,8 +918,8 @@ impl SignersManager {
     ///
     /// Called by [`crate::managers::migration::MigrationPlan::submit`] once
     /// per pair. `remove_args` and `add_args` are the invoke arguments of the
-    /// pair's two host functions; `from_hash_first8` and `to_hash_first8`
-    /// name the source and destination verifier hashes.
+    /// pair's two host functions; `from_hash` and `to_hash` are the full
+    /// source and destination verifier hashes.
     ///
     /// # Order
     ///
@@ -861,7 +932,9 @@ impl SignersManager {
     /// 2. The plan is checked before anything is sent. The compared set
     ///    holds signer `signer_id` with an `External` identity, `add_args`
     ///    add the same key data on the destination verifier, and
-    ///    `remove_args` remove signer `signer_id` of rule `rule_id`.
+    ///    `remove_args` remove signer `signer_id` of rule `rule_id`. A rule
+    ///    whose pin record holds eight-byte hash prefixes is refused here,
+    ///    so the repoint never rewrites an unauthenticated record.
     /// 3. The removal's preconditions of [`Self::remove_signer`] apply: a
     ///    rule with policies and no simple-threshold policy, and a rule whose
     ///    threshold the removal would make unreachable, are refused. The
@@ -879,7 +952,7 @@ impl SignersManager {
     ///    `SaSignerAddedV2` records it.
     /// 8. `SaVerifierMigrated` records the completed pair.
     ///
-    /// A completed pair writes `[SaSignerRemovedV2, SaContextRulePinsUpdated,
+    /// A completed pair writes `[SaSignerRemovedV2, SaContextRulePinsUpdatedV2,
     /// SaSignerAddedV2, SaVerifierMigrated]`; the pins row is written only
     /// for a rule with a pin record that does not already name the
     /// destination alone. The pins row and `SaVerifierMigrated` are logged
@@ -888,15 +961,15 @@ impl SignersManager {
     ///
     /// # Pin record
     ///
-    /// The repoint replaces the record's verifier pins by `to_hash_first8`
-    /// with no executable-reference pin, the policy pins and override flags
+    /// The repoint replaces the record's verifier pins by the full
+    /// `to_hash` with no executable-reference pin, the policy pins and override flags
     /// unchanged. The migration preflight identified the destination,
     /// required it in the allowlist and refused a mutable one, which
     /// includes every external reference. It runs as soon as the removal
     /// was sent and before the add, so a pair that stops after the send
     /// leaves a record that already names the destination. A rule without a
     /// pin record stays unpinned, and a record that already names the
-    /// destination alone is not rewritten.
+    /// destination alone, compared in all 32 bytes, is not rewritten.
     ///
     /// # Pending add
     ///
@@ -939,6 +1012,8 @@ impl SignersManager {
     ///   disagree.
     /// - [`SaError::VerifierMigrationFailed`] at phase `plan_build`: the
     ///   plan check of step 2.
+    /// - [`SaError::WasmPinIncomplete`]: the rule's pin record holds
+    ///   eight-byte hash prefixes; nothing is sent.
     /// - [`SaError::AuthEntryConstructionFailed`] at stage `rule_lock`: the
     ///   lock was not acquired within its budget.
     /// - The errors of [`Self::submit_migration_step`] for either step.
@@ -953,8 +1028,8 @@ impl SignersManager {
         rule_id: u32,
         signer_id: u32,
         to_verifier_addr: &ScAddress,
-        from_hash_first8: &str,
-        to_hash_first8: &str,
+        from_hash: WasmHashPin,
+        to_hash: WasmHashPin,
         remove_args: Vec<ScVal>,
         add_args: Vec<ScVal>,
         signer: &(dyn Signer + Send + Sync),
@@ -1009,6 +1084,19 @@ impl SignersManager {
         })?;
         check_remove_preconditions(&compared[0], signer_id, &smart_account_redacted, request_id)
             .map_err(without_pending_add)?;
+        // A record of eight-byte prefixes refuses before the removal is sent:
+        // the repoint after the send would otherwise replace a record whose
+        // pins never authenticated the code they name.
+        if let Err(error @ SaError::WasmPinIncomplete { .. }) =
+            crate::managers::verifiers::read_pinned_hashes_for_rule(
+                self,
+                rule_id,
+                &smart_account_redacted,
+                request_id,
+            )
+        {
+            return Err(without_pending_add(error));
+        }
 
         let pending = |remove_tx_hash: &str, remove_confirmed: bool| {
             PendingAddStep::new(
@@ -1049,7 +1137,7 @@ impl SignersManager {
                         self.repoint_migrated_pins(
                             rule_id,
                             &smart_account_redacted,
-                            to_hash_first8,
+                            to_hash,
                             request_id,
                         );
                         Some(pending(tx_hash, false))
@@ -1080,7 +1168,7 @@ impl SignersManager {
             .await;
         // The removal is on chain: the record names the destination whatever
         // its recording returned.
-        self.repoint_migrated_pins(rule_id, &smart_account_redacted, to_hash_first8, request_id);
+        self.repoint_migrated_pins(rule_id, &smart_account_redacted, to_hash, request_id);
         recorded.map_err(stopped)?;
 
         // The add's comparison, against the removal's state row.
@@ -1158,8 +1246,8 @@ impl SignersManager {
         self.write_verifier_migrated_row(
             rule_id,
             &smart_account_redacted,
-            from_hash_first8,
-            to_hash_first8,
+            from_hash,
+            to_hash,
             &mutation.tx_hash,
             request_id,
         );
@@ -1248,16 +1336,17 @@ impl SignersManager {
         &self,
         rule_id: u32,
         smart_account_redacted: &str,
-        to_hash_first8: &str,
+        to_hash: WasmHashPin,
         request_id: &str,
     ) {
         match crate::managers::verifiers::read_pinned_hashes_for_rule(
             self,
             rule_id,
             smart_account_redacted,
+            request_id,
         ) {
             Ok(Some(record)) => {
-                if record.pinned_verifier_first8 == [to_hash_first8]
+                if record.pinned_verifier_hashes == [to_hash]
                     && record.pinned_verifier_executable_refs.is_empty()
                 {
                     debug!(
@@ -1269,7 +1358,7 @@ impl SignersManager {
                     return;
                 }
                 let mut update = PlannedPinUpdate::unchanged(record);
-                update.record.pinned_verifier_first8 = vec![to_hash_first8.to_owned()];
+                update.record.pinned_verifier_hashes = vec![to_hash];
                 update.record.pinned_verifier_executable_refs = Vec::new();
                 self.write_pin_rows(
                     rule_id,
@@ -1289,13 +1378,14 @@ impl SignersManager {
                 error = %e,
                 request_id,
                 "migrate_signer_pair: the pin record is unreadable after the removal was sent; \
-                 SaContextRulePinsUpdated row not written"
+                 SaContextRulePinsUpdatedV2 row not written"
             ),
         }
     }
 
     /// Writes the `SaVerifierMigrated` row of a completed migration pair,
-    /// carrying the redacted hash of its add transaction.
+    /// carrying the redacted hash of its add transaction. The row's hash
+    /// fields are labeled first-8 display projections of the full hashes.
     ///
     /// The pair's state rows carry its integrity, so a row the audit log
     /// refuses is logged, and a poisoned writer marks the session degraded.
@@ -1303,8 +1393,8 @@ impl SignersManager {
         &self,
         rule_id: u32,
         smart_account_redacted: &str,
-        from_hash_first8: &str,
-        to_hash_first8: &str,
+        from_hash: WasmHashPin,
+        to_hash: WasmHashPin,
         add_tx_hash: &str,
         request_id: &str,
     ) {
@@ -1313,8 +1403,8 @@ impl SignersManager {
             AuditEntry::new_sa_verifier_migrated(
                 rule_id,
                 RedactedStrkey::from_already_redacted(smart_account_redacted),
-                from_hash_first8,
-                to_hash_first8,
+                from_hash.first8_display(),
+                to_hash.first8_display(),
                 &add_tx_hash_redacted,
                 self.chain_id.as_str(),
                 request_id,
@@ -2030,6 +2120,7 @@ impl SignersManager {
             self,
             rule_id,
             smart_account_redacted,
+            request_id,
         )?
         else {
             debug!(
@@ -2039,15 +2130,15 @@ impl SignersManager {
             return Ok(RefreshPinPlan::Unchanged);
         };
         if live_verifiers.is_empty() {
-            if record.pinned_verifier_first8.len() != 1 {
+            if record.pinned_verifier_hashes.len() != 1 {
                 return Ok(RefreshPinPlan::Unchanged);
             }
             let mut update = PlannedPinUpdate::unchanged(record);
-            update.record.pinned_verifier_first8 = Vec::new();
+            update.record.pinned_verifier_hashes = Vec::new();
             update.record.pinned_verifier_executable_refs = Vec::new();
             return Ok(RefreshPinPlan::DropDeadPin(update));
         }
-        if !record.pinned_verifier_first8.is_empty() {
+        if !record.pinned_verifier_hashes.is_empty() {
             return Ok(RefreshPinPlan::Unchanged);
         }
 
@@ -2064,13 +2155,13 @@ impl SignersManager {
                 request_id,
             )
             .await?;
-            if update.record.pinned_verifier_first8.is_empty() {
+            if update.record.pinned_verifier_hashes.is_empty() {
                 update.append_pin(PinnedKind::Verifier, pin);
-            } else if update.record.pinned_verifier_first8.first() == Some(&pin.hash_first8)
+            } else if update.record.pinned_verifier_hashes.first() == Some(&pin.hash)
                 && update.record.verifier_executable_ref(0) == pin.executable_ref.as_ref()
             {
-                // Another address whose pin equals the recorded one, in hash
-                // and executable reference. The signing check compares it
+                // Another address whose pin equals the recorded one, in all
+                // 32 bytes of the hash and in executable reference. The signing check compares it
                 // with that pin and accepts it, so it adds no pin, and the
                 // overrides applied to it are recorded.
                 update.fold_overrides(
@@ -2272,6 +2363,9 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
     /// - [`SaError::VerifierWasmNotInAllowlist`] / [`SaError::VerifierMutable`] /
     ///   [`SaError::ContractInstanceUnsupported`]: a new verifier of a pinned
     ///   rule was refused under "Pin record".
@@ -2314,6 +2408,8 @@ impl SignersManager {
         accept_mutable_verifier: bool,
         accept_unknown_verifier: bool,
     ) -> Result<u32, SaError> {
+        self.refuse_mainnet_write()?;
+
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
@@ -2338,8 +2434,8 @@ impl SignersManager {
                 },
             )
             .await;
-        let confirmed = outcome
-            .inspect_err(|err| warn_failed("add_signer", rule_id, &smart_account_redacted, err))?;
+        let confirmed =
+            outcome.inspect_err(|err| warn_failed("add_signer", &smart_account_redacted, err))?;
 
         let [signer_id] = self.record_confirmed_add(
             "add_signer",
@@ -2386,6 +2482,10 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
+    ///
     /// See [`Self::add_signer`] for the error taxonomy; the same variants
     /// apply, plus [`SaError::ThresholdPolicyIdentificationFailed`] for a rule
     /// whose policies include no simple-threshold policy.
@@ -2407,6 +2507,8 @@ impl SignersManager {
         signer: &(dyn Signer + Send + Sync),
         request_id: String,
     ) -> Result<(), SaError> {
+        self.refuse_mainnet_write()?;
+
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
@@ -2427,9 +2529,8 @@ impl SignersManager {
                 &request_id,
             )
             .await;
-        let confirmed = outcome.inspect_err(|err| {
-            warn_failed("remove_signer", rule_id, &smart_account_redacted, err)
-        })?;
+        let confirmed = outcome
+            .inspect_err(|err| warn_failed("remove_signer", &smart_account_redacted, err))?;
 
         let account = account_digest(&self.network_passphrase, &smart_account_strkey);
         self.write_confirmed_state_row(
@@ -2482,6 +2583,9 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
     /// - [`SaError::ThresholdUnreachable`]: new threshold would violate invariants.
     /// - [`SaError::ThresholdPolicyNotInstalled`]: the rule has no
     ///   simple-threshold policy.
@@ -2501,6 +2605,8 @@ impl SignersManager {
         signer: &(dyn Signer + Send + Sync),
         request_id: String,
     ) -> Result<(), SaError> {
+        self.refuse_mainnet_write()?;
+
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
@@ -2521,9 +2627,8 @@ impl SignersManager {
                 &request_id,
             )
             .await;
-        let (previous, confirmed) = outcome.inspect_err(|err| {
-            warn_failed("set_threshold", rule_id, &smart_account_redacted, err)
-        })?;
+        let (previous, confirmed) = outcome
+            .inspect_err(|err| warn_failed("set_threshold", &smart_account_redacted, err))?;
 
         let account = account_digest(&self.network_passphrase, &smart_account_strkey);
         self.write_confirmed_state_row(
@@ -2764,7 +2869,7 @@ impl SignersManager {
                     smart_account_redacted: RedactedStrkey::from_already_redacted(
                         smart_account_redacted,
                     ),
-                    observed_wasm_hashes_summary: compared[0].policy_hashes().clone(),
+                    observed_policy_count: compared[0].policy_count(),
                     request_id: request_id.to_owned(),
                 });
             }
@@ -2985,7 +3090,7 @@ impl SignersManager {
             address: policy,
             rule_policy_count,
         } = rule_policy_for_id(compared[0].primary_rule(), policy_id)
-            .ok_or_else(|| policy_not_attached(rule_id, policy_id))?;
+            .ok_or_else(policy_not_attached)?;
         let observation = self
             .observe_policy_path(&policy, rule_id, smart_account_redacted, request_id, budget)
             .await?;
@@ -3001,7 +3106,7 @@ impl SignersManager {
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
-                observed_wasm_hashes_summary: compared[0].policy_hashes().clone(),
+                observed_policy_count: compared[0].policy_count(),
                 request_id: request_id.to_owned(),
             });
         }
@@ -3013,9 +3118,10 @@ impl SignersManager {
                 rule_id,
                 smart_account_redacted,
                 policy_id,
-                &observation.effective_hash,
+                observation.effective_hash.as_ref(),
                 rule_policy_count,
                 budget,
+                request_id,
             )
         })
         .await??;
@@ -3128,8 +3234,8 @@ impl SignersManager {
             address: policy,
             rule_policy_count,
         } = rule_policy_for_id(&primary.rule.raw_scval, policy_id)
-            .ok_or_else(|| policy_not_attached(rule_id, policy_id))?;
-        let (matches, _summary) = self
+            .ok_or_else(policy_not_attached)?;
+        let matches = self
             .allowlisted_threshold_policies(
                 &primary.rule.policies,
                 rule_id,
@@ -3177,9 +3283,10 @@ impl SignersManager {
                 rule_id,
                 smart_account_redacted,
                 policy_id,
-                &removed_hash,
+                Some(&removed_hash),
                 rule_policy_count,
                 budget,
+                request_id,
             )
         })
         .await??;
@@ -3261,6 +3368,8 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::WasmPinIncomplete`]: the pin record holds eight-byte
+    ///   hash prefixes.
     /// - [`SaError::AuditLog`]: the pin record could not be read.
     /// - The refusals of `pin_added_contract` for the policy.
     async fn plan_policy_add_pin_update(
@@ -3276,6 +3385,7 @@ impl SignersManager {
             self,
             rule_id,
             smart_account_redacted,
+            request_id,
         )?
         else {
             debug!(
@@ -3304,7 +3414,7 @@ impl SignersManager {
             // policy of the rule; the row pins exactly the policy set the
             // add produces. The override flags stay, since they record
             // overrides applied to the rule's contracts.
-            update.record.pinned_policy_first8.clear();
+            update.record.pinned_policy_hashes.clear();
             update.record.pinned_policy_executable_refs.clear();
         }
         update.append_pin(PinnedKind::Policy, pin);
@@ -3315,12 +3425,15 @@ impl SignersManager {
     /// once the removal confirms.
     ///
     /// `removed_hash` is the removed policy's effective hash as observed
-    /// under the rule's lock, and `rule_policy_count` the number of policies
-    /// the rule held there. Returns `None` without a pin record, or when no
-    /// policy pin is the removed policy's. A pin is the removed policy's when
-    /// it equals `removed_hash`. When the policy is the rule's only policy
-    /// and the record holds one policy pin, that pin is the removed policy's
-    /// whatever the hash: it can only be that policy's. The rule then ends
+    /// under the rule's lock, `None` when the policy has no Wasm code, and
+    /// `rule_policy_count` the number of policies the rule held there.
+    /// Returns `None` without a pin record, or when no policy pin is the
+    /// removed policy's. A pin is the removed policy's when it equals
+    /// `removed_hash` in all 32 bytes; a pin sharing only a prefix with it is
+    /// another policy's, and absent Wasm code matches no pin. When the policy
+    /// is the rule's only policy and the record holds one policy pin, that pin
+    /// is the removed policy's whatever the hash: it can only be that policy's.
+    /// The rule then ends
     /// with no policy and no policy pin, the state of a rule installed
     /// without a policy.
     ///
@@ -3329,22 +3442,31 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::WasmPinIncomplete`] when the pin record holds eight-byte
+    ///   hash prefixes.
     /// - [`SaError::AuditLog`] when the pin record cannot be read.
     /// - [`SaError::AuthEntryConstructionFailed`] (stage `auth_payload`, the
     ///   reason naming `pin_plan`) when `budget` elapsed during the scan.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the rule, the removed policy and its hash, the policy count, the budget and \
+                  the correlation id"
+    )]
     fn plan_policy_remove_pin_update(
         &self,
         rule_id: u32,
         smart_account_redacted: &str,
         policy_id: u32,
-        removed_hash: &[u8; 32],
+        removed_hash: Option<&[u8; 32]>,
         rule_policy_count: usize,
         budget: PreSubmitBudget,
+        request_id: &str,
     ) -> Result<Option<PinnedHashesRecord>, SaError> {
         let record = crate::managers::verifiers::read_pinned_hashes_for_rule(
             self,
             rule_id,
             smart_account_redacted,
+            request_id,
         )?;
         budget.check_at("pin_plan", "auth_payload")?;
         let Some(mut record) = record else {
@@ -3354,25 +3476,26 @@ impl SignersManager {
             );
             return Ok(None);
         };
-        let removed_first8 = hash_first8_hex(removed_hash);
-        let position = match record
-            .pinned_policy_first8
-            .iter()
-            .position(|pinned| *pinned == removed_first8)
-        {
+        let position = match removed_hash.and_then(|removed| {
+            record
+                .pinned_policy_hashes
+                .iter()
+                .position(|pinned| pinned.matches(removed))
+        }) {
             Some(position) => position,
-            None if rule_policy_count == 1 && record.pinned_policy_first8.len() == 1 => 0,
+            None if rule_policy_count == 1 && record.pinned_policy_hashes.len() == 1 => 0,
             None => {
+                // The removed policy's hash matches no pin, and the signing
+                // pin check can refuse it, so the event names only the ids.
                 debug!(
                     rule_id,
                     policy_id,
-                    removed_first8 = %removed_first8,
                     "remove_policy: no policy pin is the removed policy's; no pin update is written"
                 );
                 return Ok(None);
             }
         };
-        record.pinned_policy_first8.remove(position);
+        record.pinned_policy_hashes.remove(position);
         if position < record.pinned_policy_executable_refs.len() {
             record.pinned_policy_executable_refs.remove(position);
         }
@@ -3581,6 +3704,9 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
     /// - [`SaError::SpendingLimitInstallRefused`] — `new_limit <= 0`, or
     ///   `auth_rule_ids` empty.
     /// - [`SaError::SpendingLimitNotInstalled`] — no accessible spending-limit
@@ -3605,6 +3731,8 @@ impl SignersManager {
         signer: &(dyn Signer + Send + Sync),
         request_id: String,
     ) -> Result<(), SaError> {
+        self.refuse_mainnet_write()?;
+
         // The AUTHORIZING rule must be admin-capable (typically the genesis
         // Default rule): the retune's auth context is `execute` on the smart
         // account itself, and the CallContract-scoped rule being retuned can
@@ -3624,11 +3752,7 @@ impl SignersManager {
         }
         if new_limit <= 0 {
             return Err(SaError::SpendingLimitInstallRefused {
-                reason: format!(
-                    "set-spending-limit refused: --limit must be positive; got {new_limit} \
-                     (OZ set_spending_limit rejects non-positive values with \
-                     InvalidLimitOrPeriod)"
-                ),
+                reason: SPENDING_LIMIT_POSITIVE_REASON.to_owned(),
             });
         }
 
@@ -3704,7 +3828,6 @@ impl SignersManager {
             Err(err) => {
                 warn!(
                     error = %err,
-                    rule_id,
                     smart_account = %smart_account_redacted,
                     "set_spending_limit: operation failed"
                 );
@@ -4023,18 +4146,14 @@ impl SignersManager {
         // Single-entry allowlist match: exactly-one-match required, fail-closed.
         let mut matched_policy_addr: Option<ScAddress> = None;
         let mut match_count = 0usize;
-        let first_first8: Option<[u8; 8]> = primary_hashes
-            .iter()
-            .find_map(|opt_h| opt_h.as_ref())
-            .map(|h| <[u8; 8]>::try_from(&h[..8]).expect("sha256 is 32 bytes"));
-
         for (opt_hash, policy_addr) in primary_hashes.iter().zip(context_rule.policies.iter()) {
             let Some(hash) = opt_hash else { continue };
+            let allowlisted = hash == &allowed_hash;
             debug!(
-                policy_wasm_hash_first8 = %hash_first8_hex(hash),
-                "identify_spending_limit_policy: observed policy wasm hash"
+                allowlisted,
+                "identify_spending_limit_policy: observed a policy wasm hash"
             );
-            if hash == &allowed_hash {
+            if allowlisted {
                 match_count += 1;
                 matched_policy_addr = Some(policy_addr.clone());
             }
@@ -4056,10 +4175,7 @@ impl SignersManager {
                     smart_account_redacted: RedactedStrkey::from_already_redacted(
                         smart_account_redacted,
                     ),
-                    observed_wasm_hashes_summary: WasmHashSummary {
-                        count,
-                        first_first8,
-                    },
+                    observed_policy_count: count,
                     request_id,
                 })
             }
@@ -4114,7 +4230,7 @@ impl SignersManager {
 
         let invoke_args = vec![ScVal::U32(rule_id), ScVal::Address(smart_account)];
 
-        let sim_result = simulate_read_only_with_ledger(
+        let sim_result = simulate_read_only_described(
             self.primary_rpc_client.url(),
             policy,
             "get_spending_limit_data",
@@ -4128,20 +4244,24 @@ impl SignersManager {
         // Mirrors the `ContextRuleNotFound` decode pattern
         // (`managers::rules::get_rule`) — the on-chain panic is surfaced as a
         // simulation `error` string containing `Error(Contract, #3220)`
-        // (optionally augmented with the symbolic `[OZ:SmartAccountNotInstalled]`
-        // name by `augment_with_oz_error_name`). Unlike `get_rule`, absence of
+        // with the symbolic `[OZ:SmartAccountNotInstalled]` name its
+        // `SimulationErrorClass` attaches. Unlike `get_rule`, absence of
         // the policy here is an operator mistake, not a benign gap, so this
         // maps to a typed error rather than `Ok(None)`.
         let (scval, as_of_ledger) = match sim_result {
             Ok(v) => v,
-            Err(SaError::DeploymentFailed {
-                phase,
-                redacted_reason,
-            }) if phase == "simulate"
-                && (redacted_reason.contains("SmartAccountNotInstalled")
-                    // Exact bracketed form only: a bare "#3220" substring
-                    // would prefix-over-match hypothetical codes 3220x.
-                    || redacted_reason.contains("Error(Contract, #3220)")) =>
+            Err(failure)
+                if matches!(
+                    failure.text_error(),
+                    SaError::DeploymentFailed {
+                        phase,
+                        redacted_reason,
+                    } if *phase == "simulate"
+                        && (redacted_reason.contains("SmartAccountNotInstalled")
+                            // Exact bracketed form only: a bare "#3220" substring
+                            // would prefix-over-match hypothetical codes 3220x.
+                            || redacted_reason.contains("Error(Contract, #3220)"))
+                ) =>
             {
                 return Err(SaError::SpendingLimitNotInstalled {
                     rule_id,
@@ -4151,7 +4271,7 @@ impl SignersManager {
                     request_id,
                 });
             }
-            Err(other) => return Err(other),
+            Err(other) => return Err(other.into_shown()),
         };
 
         let data = crate::managers::spending_limit_data::decode_spending_limit_data(&scval)?;
@@ -4280,21 +4400,16 @@ impl SignersManager {
 
         let mut matched_policy_addr: Option<ScAddress> = None;
         let mut match_count = 0usize;
-        let first_first8: Option<[u8; 8]> = primary_hashes
-            .iter()
-            .find_map(|opt_h| opt_h.as_ref())
-            .map(|h| <[u8; 8]>::try_from(&h[..8]).expect("sha256 is 32 bytes"));
-
         for (opt_hash, policy_addr) in primary_hashes.iter().zip(context_rule.policies.iter()) {
             let Some(hash) = opt_hash else { continue };
-            debug!(
-                policy_wasm_hash_first8 = %hash_first8_hex(hash),
-                "identify_weighted_threshold_policy: observed policy wasm hash"
-            );
-            if WEIGHTED_THRESHOLD_POLICY_WASM_HASHES
+            let allowlisted = WEIGHTED_THRESHOLD_POLICY_WASM_HASHES
                 .iter()
-                .any(|allowed| allowed == hash)
-            {
+                .any(|allowed| allowed == hash);
+            debug!(
+                allowlisted,
+                "identify_weighted_threshold_policy: observed a policy wasm hash"
+            );
+            if allowlisted {
                 match_count += 1;
                 matched_policy_addr = Some(policy_addr.clone());
             }
@@ -4316,10 +4431,7 @@ impl SignersManager {
                     smart_account_redacted: RedactedStrkey::from_already_redacted(
                         smart_account_redacted,
                     ),
-                    observed_wasm_hashes_summary: WasmHashSummary {
-                        count,
-                        first_first8,
-                    },
+                    observed_policy_count: count,
                     request_id,
                 })
             }
@@ -4413,7 +4525,7 @@ impl SignersManager {
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
         let threshold_args = vec![ScVal::U32(rule_id), ScVal::Address(smart_account.clone())];
-        let threshold_sim = simulate_read_only_with_ledger(
+        let threshold_sim = simulate_read_only_described(
             self.primary_rpc_client.url(),
             policy.clone(),
             "get_threshold",
@@ -4426,12 +4538,16 @@ impl SignersManager {
 
         let (threshold_scval, _as_of_ledger) = match threshold_sim {
             Ok(v) => v,
-            Err(SaError::DeploymentFailed {
-                phase,
-                redacted_reason,
-            }) if phase == "simulate"
-                && (redacted_reason.contains("SmartAccountNotInstalled")
-                    || redacted_reason.contains("Error(Contract, #3210)")) =>
+            Err(failure)
+                if matches!(
+                    failure.text_error(),
+                    SaError::DeploymentFailed {
+                        phase,
+                        redacted_reason,
+                    } if *phase == "simulate"
+                        && (redacted_reason.contains("SmartAccountNotInstalled")
+                            || redacted_reason.contains("Error(Contract, #3210)"))
+                ) =>
             {
                 return Err(SaError::WeightedThresholdNotInstalled {
                     rule_id,
@@ -4441,7 +4557,7 @@ impl SignersManager {
                     request_id,
                 });
             }
-            Err(other) => return Err(other),
+            Err(other) => return Err(other.into_shown()),
         };
 
         let threshold = extract_u32_return(&threshold_scval, "get_threshold")?;
@@ -4523,6 +4639,9 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
     /// - [`SaError::WeightedThresholdInstallRefused`] — `new_threshold == 0`
     ///   or exceeds the current weight sum, or `auth_rule_ids` is empty.
     /// - [`SaError::WeightedThresholdNotInstalled`] /
@@ -4539,6 +4658,8 @@ impl SignersManager {
         signer: &(dyn Signer + Send + Sync),
         request_id: String,
     ) -> Result<(), SaError> {
+        self.refuse_mainnet_write()?;
+
         if auth_rule_ids.is_empty() {
             return Err(SaError::WeightedThresholdInstallRefused {
                 reason: "set-weighted-threshold refused: auth_rule_ids must not be empty"
@@ -4616,7 +4737,6 @@ impl SignersManager {
             Err(err) => {
                 warn!(
                     error = %err,
-                    rule_id,
                     smart_account = %smart_account_redacted,
                     "set_weighted_threshold: operation failed"
                 );
@@ -4687,11 +4807,9 @@ impl SignersManager {
         }
         if new_threshold > total_weight {
             return Err(SaError::WeightedThresholdInstallRefused {
-                reason: format!(
-                    "--threshold ({new_threshold}) must not exceed the sum of current signer \
-                     weights ({total_weight}); OZ set_threshold rejects this with \
-                     InvalidThreshold"
-                ),
+                reason: "--new-threshold must be non-zero and must not exceed the sum of current \
+                         signer weights; lower the threshold or increase signer weights."
+                    .to_owned(),
             });
         }
 
@@ -4773,6 +4891,10 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
+    ///
     /// See [`Self::set_weighted_threshold`] for the error taxonomy.
     #[allow(
         clippy::too_many_arguments,
@@ -4788,6 +4910,8 @@ impl SignersManager {
         signer: &(dyn Signer + Send + Sync),
         request_id: String,
     ) -> Result<(), SaError> {
+        self.refuse_mainnet_write()?;
+
         if auth_rule_ids.is_empty() {
             return Err(SaError::WeightedThresholdInstallRefused {
                 reason: "set-signer-weight refused: auth_rule_ids must not be empty".to_owned(),
@@ -4868,7 +4992,6 @@ impl SignersManager {
             Err(err) => {
                 warn!(
                     error = %err,
-                    rule_id,
                     smart_account = %smart_account_redacted,
                     "set_signer_weight: operation failed"
                 );
@@ -4951,11 +5074,10 @@ impl SignersManager {
 
         if current_threshold > adjusted_total {
             return Err(SaError::WeightedThresholdInstallRefused {
-                reason: format!(
-                    "--weight ({new_weight}) would drop the adjusted signer-weight sum \
-                     ({adjusted_total}) below the current threshold ({current_threshold}); \
-                     OZ set_signer_weight rejects this with InvalidThreshold"
-                ),
+                reason: "--new-weight must keep the sum of signer weights at or above the \
+                         current threshold; lower the threshold first or choose a sufficient \
+                         weight."
+                    .to_owned(),
             });
         }
 
@@ -5055,6 +5177,9 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
     /// - [`SaError::BatchSignerAddRefused`] — the batch is empty (nothing to
     ///   add), refused before acquiring the per-rule mutex, or one of its
     ///   signers is not a signer the wallet can decode.
@@ -5082,6 +5207,8 @@ impl SignersManager {
         accept_mutable_verifier: bool,
         accept_unknown_verifier: bool,
     ) -> Result<Vec<u32>, SaError> {
+        self.refuse_mainnet_write()?;
+
         if new_signers.is_empty() {
             return Err(SaError::BatchSignerAddRefused {
                 reason: "batch is empty: at least one signer is required".to_owned(),
@@ -5113,7 +5240,7 @@ impl SignersManager {
             )
             .await;
         let confirmed = outcome.inspect_err(|err| {
-            warn_failed("batch_add_signers", rule_id, &smart_account_redacted, err);
+            warn_failed("batch_add_signers", &smart_account_redacted, err);
         })?;
 
         self.record_confirmed_add(
@@ -5456,6 +5583,9 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::VerifierWasmRevoked`] and [`SaError::VerifierWasmRetired`]:
+    ///   the verifier status refuses the operation; no flag overrides it.
+    ///
     /// - [`SaError::VerifierWasmNotInAllowlist`]: no code, or an effective
     ///   hash outside the allowlist (fail-closed; allowlist is the
     ///   authoritative gate).
@@ -5499,18 +5629,29 @@ impl SignersManager {
             )
             .await?;
 
-        if !observation.allowlisted {
+        // No code is never allowlisted, so an allowlisted observation always
+        // carries its hash.
+        let Some(effective_hash) = observation
+            .effective_hash
+            .filter(|_| observation.allowlisted)
+        else {
             return Err(SaError::VerifierWasmNotInAllowlist {
                 rule_id: Some(rule_id),
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
-                observed_hash_first8: observation.observed_hash_first8(),
                 request_id,
             });
-        }
+        };
 
-        Ok(observation.effective_hash)
+        crate::verifier_allowlist::refuse_revoked_or_retired_verifier(
+            &effective_hash,
+            Some(rule_id),
+            &smart_account_redacted,
+            &request_id,
+        )?;
+
+        Ok(effective_hash)
     }
 
     /// Observes a deployed verifier or policy contract and decides whether
@@ -5521,8 +5662,9 @@ impl SignersManager {
     /// reference with no live tag entry is refused before any allowlist
     /// decision, because it names no code the wallet can pin. Otherwise the
     /// returned [`ContractObservation`] carries the executable, its effective
-    /// hash (zero for no code) and whether `is_allowlisted` accepts that
-    /// hash; no code is never allowlisted.
+    /// hash (`None` for no Wasm code) and whether `is_allowlisted` accepts that
+    /// hash. Absent Wasm code is never allowlisted, and a caller that pins
+    /// the contract refuses it.
     ///
     /// `contract_kind` names the role of `contract_addr` in a refusal.
     /// `rule_id` is `None` before install, when the rule has no on-chain id
@@ -5555,15 +5697,10 @@ impl SignersManager {
         )
         .await?;
 
-        let contract_redacted = scaddress_to_strkey(contract_addr)
-            .map(|s| redact_strkey_first5_last5(&s))
-            .unwrap_or_else(|_| "unknown".to_owned());
-
         if let ObservedExecutable::ExternalRef(external) = &observed
             && external.resolved.is_none()
         {
             warn!(
-                contract_redacted = %contract_redacted,
                 contract_kind = %contract_kind,
                 owner_redacted = %external.owner_redacted(),
                 tag = %external.tag_display(),
@@ -5576,24 +5713,23 @@ impl SignersManager {
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
-                contract_address_redacted: RedactedStrkey::from_already_redacted(contract_redacted),
                 reason: AdminOrOwnerKey::ExternalRefUnresolved,
                 request_id: request_id.to_owned(),
             });
         }
 
-        let effective = observed.effective_hash();
+        let effective_hash = observed.effective_hash();
         let observation = ContractObservation {
-            allowlisted: effective.is_some_and(|hash| is_allowlisted(&hash)),
-            effective_hash: effective.unwrap_or([0u8; 32]),
+            allowlisted: effective_hash.is_some_and(|hash| is_allowlisted(&hash)),
+            effective_hash,
             observed,
         };
 
+        // The caller judges the observation after this event, and a pin
+        // check can still refuse an allowlisted executable, so the event
+        // names neither the contract nor the observed executable.
         debug!(
-            contract = %contract_redacted,
             contract_kind = %contract_kind,
-            executable = %observation.observed.summary(),
-            wasm_hash_first8 = %observation.observed_hash_first8(),
             allowlisted = observation.allowlisted,
             "observe_contract: observed contract executable"
         );
@@ -5656,7 +5792,6 @@ impl SignersManager {
                 &smart_account_redacted,
             )?
             .ok_or_else(|| SaError::SignerSetMissingBaseline {
-                rule_id,
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted.as_str(),
                 ),
@@ -5835,7 +5970,7 @@ impl SignersManager {
         )?;
 
         let policies = primary.rule.policies.clone();
-        let (threshold_policy, policy_hashes) = self
+        let (threshold_policy, policy_count) = self
             .identify_simple_threshold_policy(
                 &policies,
                 rule_id,
@@ -5925,7 +6060,7 @@ impl SignersManager {
             request_id: request_id.to_owned(),
             snapshot,
             policies,
-            policy_hashes,
+            policy_count,
             ledger: primary.ledger.min(secondary.ledger),
             primary_rule: primary.rule.raw_scval,
             v1_signers,
@@ -5966,7 +6101,7 @@ impl SignersManager {
                 continue;
             }
             return Ok(EndpointRead {
-                rule: decode_context_rule_scval(outcome?)?,
+                rule: decode_context_rule_scval(outcome.map_err(SimulationFailure::into_shown)?)?,
                 ledger,
                 threshold: None,
             });
@@ -6102,7 +6237,7 @@ impl SignersManager {
                 ))),
                 ledger,
             )),
-            Ok((Err(e), ledger)) => Ok((Err(refused(e.to_string())), ledger)),
+            Ok((Err(e), ledger)) => Ok((Err(refused(e.into_shown().to_string())), ledger)),
             Err(e) => Err(refused(e.to_string())),
         }
     }
@@ -6154,7 +6289,7 @@ impl SignersManager {
     ///
     /// Returns the one match of [`Self::allowlisted_threshold_policies`] with
     /// its contract id, or `None` when no policy matches, together with the
-    /// summary a refusal carries.
+    /// number of attached policies a refusal carries.
     ///
     /// # Errors
     ///
@@ -6167,17 +6302,18 @@ impl SignersManager {
         rule_id: u32,
         smart_account_redacted: &str,
         request_id: &str,
-    ) -> Result<(Option<(ScAddress, [u8; 32])>, WasmHashSummary), SaError> {
-        let (matches, summary) = self
+    ) -> Result<(Option<(ScAddress, [u8; 32])>, u32), SaError> {
+        let matches = self
             .allowlisted_threshold_policies(policies, rule_id, smart_account_redacted, request_id)
             .await?;
+        let policy_count = u32::try_from(policies.len()).unwrap_or(u32::MAX);
         if matches.len() > 1 {
             return Err(SaError::ThresholdPolicyIdentificationFailed {
                 rule_id,
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
-                observed_wasm_hashes_summary: summary,
+                observed_policy_count: policy_count,
                 request_id: request_id.to_owned(),
             });
         }
@@ -6185,7 +6321,7 @@ impl SignersManager {
             .into_iter()
             .next()
             .map(|matched| (matched.address, matched.contract_id));
-        Ok((identified, summary))
+        Ok((identified, policy_count))
     }
 
     /// Lists the policies among `policies` that identify as the
@@ -6198,9 +6334,7 @@ impl SignersManager {
     /// matches when its effective hash is in [`THRESHOLD_POLICY_WASM_HASHES`];
     /// a policy with no code (an absent instance or a Stellar asset) is
     /// readable and never matches. The matches keep the order of `policies`
-    /// and each distinct address appears once. The summary is the one a
-    /// refusal carries: the number of attached policies and the first 8 bytes
-    /// of the first observed effective hash.
+    /// and each distinct address appears once.
     ///
     /// # Errors
     ///
@@ -6213,7 +6347,7 @@ impl SignersManager {
         rule_id: u32,
         smart_account_redacted: &str,
         request_id: &str,
-    ) -> Result<(Vec<ThresholdPolicyMatch>, WasmHashSummary), SaError> {
+    ) -> Result<Vec<ThresholdPolicyMatch>, SaError> {
         let mut distinct: Vec<&ScAddress> = Vec::with_capacity(policies.len());
         for policy in policies {
             if !distinct.contains(&policy) {
@@ -6221,7 +6355,6 @@ impl SignersManager {
             }
         }
 
-        let mut first_first8: Option<[u8; 8]> = None;
         let mut matches: Vec<ThresholdPolicyMatch> = Vec::new();
         for policy in distinct {
             let observation = self
@@ -6234,14 +6367,12 @@ impl SignersManager {
                     request_id,
                 )
                 .await?;
-            if first_first8.is_none()
-                && let Some(hash) = observation.observed.effective_hash()
+            // No code is never allowlisted, so an allowlisted observation
+            // always carries its hash.
+            if let Some(executable_hash) = observation
+                .effective_hash
+                .filter(|_| observation.allowlisted)
             {
-                let mut first8 = [0u8; 8];
-                first8.copy_from_slice(&hash[..8]);
-                first_first8 = Some(first8);
-            }
-            if observation.allowlisted {
                 let ScAddress::Contract(ContractId(Hash(policy_id))) = policy else {
                     return Err(SaError::DeploymentFailed {
                         phase: "simulate",
@@ -6253,16 +6384,12 @@ impl SignersManager {
                 matches.push(ThresholdPolicyMatch {
                     address: policy.clone(),
                     contract_id: *policy_id,
-                    executable_hash: observation.effective_hash,
+                    executable_hash,
                 });
             }
         }
 
-        let summary = WasmHashSummary {
-            count: u32::try_from(policies.len()).unwrap_or(u32::MAX),
-            first_first8,
-        };
-        Ok((matches, summary))
+        Ok(matches)
     }
 
     /// Refuses with [`SaError::NetworkRpcDivergence`] unless the two
@@ -6637,7 +6764,7 @@ impl SignersManager {
         let account = account_digest(&self.network_passphrase, smart_account_strkey);
         let recorded = confirmed
             .outcome
-            .inspect_err(|err| warn_failed(verb, rule_id, smart_account_redacted, err))
+            .inspect_err(|err| warn_failed(verb, smart_account_redacted, err))
             .and_then(|(added_ids, mutation)| {
                 for signer_id in added_ids.as_ref() {
                     self.write_confirmed_state_row(
@@ -6848,7 +6975,7 @@ impl SignersManager {
                 post_op_signer_count,
                 threshold.threshold,
                 threshold.threshold,
-                ThresholdAffectingOp::AddSigner {
+                &ThresholdAffectingOp::AddSigner {
                     signer_type: identity_kind_label(&identity).to_owned(),
                     signer_id: None,
                 },
@@ -7008,9 +7135,11 @@ impl SignersManager {
     /// `External` signers, decoded from the signers being added. `live` is
     /// the rule's signer set as the pre-submission comparison observed it
     /// through both endpoints. Returns `None` when `new_verifiers` is empty
-    /// or the rule has no pin record. Otherwise each new verifier address
-    /// that no `External` signer of `live` uses is identified and probed
-    /// here, before submission, with the overrides applied to it pending. A
+    /// or the rule has no pin record. Every added verifier is observed and
+    /// status-checked first, whether or not the rule has a pin record. On a
+    /// rule with a pin record, each new verifier address that no `External`
+    /// signer of `live` uses is then identified and probed here, before
+    /// submission, with the overrides applied to it pending. A
     /// probed pin equal to a recorded verifier pin, in hash and executable
     /// reference, adds no pin. The signing check compares the verifier with
     /// that pin and accepts it, and only the overrides applied to it are
@@ -7020,6 +7149,11 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::VerifierWasmRevoked`] / [`SaError::VerifierWasmRetired`]:
+    ///   an added verifier's hash carries that allowlist status.
+    /// - The refusals of `observe_contract` for an added verifier
+    ///   ([`SaError::ContractInstanceUnsupported`],
+    ///   [`SaError::NetworkRpcDivergence`], [`SaError::DeploymentFailed`]).
     /// - [`SaError::AuditLog`]: the pin record could not be read.
     /// - The refusals of `pin_added_contract` for a new verifier.
     async fn plan_signer_add_pin_update(
@@ -7034,10 +7168,33 @@ impl SignersManager {
         if new_verifiers.is_empty() {
             return Ok(None);
         }
+        for verifier in new_verifiers {
+            let observation = self
+                .observe_contract(
+                    verifier,
+                    ContractKind::Verifier,
+                    verifier_hash_allowlisted,
+                    Some(rule_id),
+                    smart_account_redacted,
+                    request_id,
+                )
+                .await?;
+            // No code has no allowlist status; when the rule has a pin
+            // record, pinning the verifier below refuses it.
+            if let Some(hash) = &observation.effective_hash {
+                crate::verifier_allowlist::refuse_revoked_or_retired_verifier(
+                    hash,
+                    Some(rule_id),
+                    smart_account_redacted,
+                    request_id,
+                )?;
+            }
+        }
         let Some(record) = crate::managers::verifiers::read_pinned_hashes_for_rule(
             self,
             rule_id,
             smart_account_redacted,
+            request_id,
         )?
         else {
             debug!(
@@ -7073,13 +7230,19 @@ impl SignersManager {
                 request_id,
             )
             .await?;
-            let recorded = update.record.pinned_verifier_first8.iter().enumerate().any(
-                |(position, first8)| {
-                    *first8 == pin.hash_first8
-                        && update.record.verifier_executable_ref(position)
-                            == pin.executable_ref.as_ref()
-                },
-            );
+            // A pin is already recorded only when all 32 bytes of its hash
+            // and its executable reference equal a recorded position's.
+            let recorded =
+                update
+                    .record
+                    .pinned_verifier_hashes
+                    .iter()
+                    .enumerate()
+                    .any(|(position, hash)| {
+                        *hash == pin.hash
+                            && update.record.verifier_executable_ref(position)
+                                == pin.executable_ref.as_ref()
+                    });
             if recorded {
                 update.fold_overrides(
                     pin.mutable_override,
@@ -7212,7 +7375,7 @@ impl SignersManager {
             before.signer_count(),
             previous.threshold,
             new_threshold,
-            ThresholdAffectingOp::SetThreshold { new: new_threshold },
+            &ThresholdAffectingOp::SetThreshold { new: new_threshold },
             smart_account_redacted,
             request_id,
         )?;
@@ -7419,6 +7582,13 @@ impl SignersManager {
         let contract_strkey = scaddress_to_strkey(&contract)?;
         let auth_address_strkey = scaddress_to_strkey(auth_address)?;
 
+        let admission = self
+            .intent_admission
+            .as_ref()
+            .ok_or(SaError::IntentRecordUnavailable {
+                class: "missing_admission",
+            })?;
+
         // Build the pre-form HostFunction from the entrypoint + args.
         let function_name =
             ScSymbol::try_from(entrypoint).map_err(|e| SaError::AuthEntryConstructionFailed {
@@ -7441,6 +7611,7 @@ impl SignersManager {
 
         crate::submit::submit_signed_invoke(
             crate::submit::SubmitInvokeArgs::builder()
+                .admission(stellar_agent_network::SigningAdmission::NoValue(admission))
                 .target_contract(&contract_strkey)
                 // auth_address differs from target_contract when the entrypoint's
                 // require_auth credential is a different address; pass it
@@ -7450,6 +7621,7 @@ impl SignersManager {
                 .host_function(host_function)
                 .signer(signer)
                 .primary_rpc_url(&self.primary_rpc_url)
+                .secondary_rpc_url(&self.secondary_rpc_url)
                 .network_passphrase(&self.network_passphrase)
                 .chain_id(&self.chain_id)
                 .timeout(self.timeout)
@@ -7521,12 +7693,12 @@ fn rule_policy_for_id(rule: &ScVal, policy_id: u32) -> Option<RulePolicy> {
 
 /// The refusal of a policy removal naming a policy id the rule does not
 /// hold.
-fn policy_not_attached(rule_id: u32, policy_id: u32) -> SaError {
+fn policy_not_attached() -> SaError {
     SaError::DeploymentFailed {
         phase: "simulate",
-        redacted_reason: format!(
-            "remove_policy: policy {policy_id} is not attached to rule {rule_id}"
-        ),
+        redacted_reason: "policy_id must identify a policy attached to the selected rule; list \
+                          the rule policies and choose an attached policy ID."
+            .to_owned(),
     }
 }
 
@@ -7621,9 +7793,8 @@ struct ObservationV2 {
     snapshot: SignerSetSnapshotV2,
     /// The rule's attached policies, in the rule's order.
     policies: Vec<ScAddress>,
-    /// The number of attached policies and the first 8 bytes of the first
-    /// observed effective hash, for a threshold-policy refusal.
-    policy_hashes: WasmHashSummary,
+    /// The number of attached policies, for a threshold-policy refusal.
+    policy_count: u32,
     /// The smallest `latestLedger` across the reads the observation kept.
     ledger: u32,
     /// The primary's verbatim `get_context_rule` value.
@@ -7684,10 +7855,9 @@ impl ComparedState {
         &self.observation.policies
     }
 
-    /// The policy count and first observed executable hash, for a
-    /// threshold-policy refusal.
-    pub(crate) fn policy_hashes(&self) -> &WasmHashSummary {
-        &self.observation.policy_hashes
+    /// The number of attached policies, for a threshold-policy refusal.
+    pub(crate) fn policy_count(&self) -> u32 {
+        self.observation.policy_count
     }
 
     /// The smallest `latestLedger` across the reads the observation kept.
@@ -7956,7 +8126,7 @@ fn project_v1(obs: &ObservationV2) -> Result<ObservedSignerSet, SaError> {
             SaError::ThresholdPolicyIdentificationFailed {
                 rule_id: obs.rule_id,
                 smart_account_redacted,
-                observed_wasm_hashes_summary: obs.policy_hashes.clone(),
+                observed_policy_count: obs.policy_count,
                 request_id: obs.request_id.clone(),
             }
         });
@@ -8240,12 +8410,12 @@ async fn signer_source_strkey(signer: &(dyn Signer + Send + Sync)) -> Result<Str
     ))
 }
 
-/// Logs a signer verb's refusal or failure.
-fn warn_failed(verb: &str, rule_id: u32, smart_account_redacted: &str, err: &SaError) {
+/// Logs a signer verb's refusal or failure. The error text states the
+/// failed check and holds no argument of the verb.
+fn warn_failed(verb: &str, smart_account_redacted: &str, err: &SaError) {
     warn!(
         error = %err,
         verb,
-        rule_id,
         smart_account = %smart_account_redacted,
         "signer verb failed"
     );
@@ -8343,7 +8513,7 @@ fn check_remove_preconditions(
         return Err(SaError::ThresholdPolicyIdentificationFailed {
             rule_id,
             smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
-            observed_wasm_hashes_summary: compared.policy_hashes().clone(),
+            observed_policy_count: compared.policy_count(),
             request_id: request_id.to_owned(),
         });
     }
@@ -8353,7 +8523,7 @@ fn check_remove_preconditions(
             before.signer_count().saturating_sub(1),
             threshold.threshold,
             threshold.threshold,
-            ThresholdAffectingOp::RemoveSigner { signer_id },
+            &ThresholdAffectingOp::RemoveSigner { signer_id },
             smart_account_redacted,
             request_id,
         )?;
@@ -8386,7 +8556,7 @@ fn compute_post_op_invariant(
     post_op_signer_count: u32,
     current_threshold: u32,
     effective_threshold: u32,
-    requested_op: ThresholdAffectingOp,
+    requested_op: &ThresholdAffectingOp,
     smart_account_redacted: &str,
     request_id: &str,
 ) -> Result<(), SaError> {
@@ -8394,7 +8564,7 @@ fn compute_post_op_invariant(
 
     if !invariant_ok {
         let safe_threshold = post_op_signer_count.max(1);
-        let hint = match &requested_op {
+        let hint = match requested_op {
             ThresholdAffectingOp::RemoveSigner { signer_id } => {
                 format!(
                     "run 'smart-account signers set-threshold --rule-id {rule_id} \
@@ -8411,18 +8581,16 @@ fn compute_post_op_invariant(
                      --threshold {safe_threshold}'"
                 )
             }
-            ThresholdAffectingOp::SetThreshold { new } => {
-                format!(
-                    "threshold {new} exceeds post-op signer count {post_op_signer_count}; \
-                     use a value between 1 and {post_op_signer_count}"
-                )
-            }
+            ThresholdAffectingOp::SetThreshold { .. } => "--new-threshold must be between 1 and \
+                                                           the number of signers remaining after \
+                                                           the operation; add signers first or \
+                                                           lower the requested threshold."
+                .to_owned(),
         };
         return Err(SaError::ThresholdUnreachable {
             rule_id,
             current_signer_count: post_op_signer_count, // show post-op count
             current_threshold,
-            requested_op,
             safe_ordering_hint: hint,
             smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
             request_id: request_id.to_owned(),
@@ -8633,9 +8801,12 @@ impl ObservedExecutable {
         }
     }
 
-    /// Returns a bounded summary for drift rows and errors: `wasm`,
-    /// `no code`, or `external reference owner <redacted> tag "<bounded>"
-    /// resolved <first-8 hex or unset>`.
+    /// Returns a bounded executable summary for audit rows and inspection reports.
+    ///
+    /// The forms are `wasm`, `no code`, and `external reference owner
+    /// <redacted> tag "<bounded>" resolved <full hash hex or unset>`. The
+    /// resolved hash is shown in full so two resolutions that share a prefix
+    /// stay distinguishable.
     #[must_use]
     pub fn summary(&self) -> String {
         match self {
@@ -8647,7 +8818,7 @@ impl ObservedExecutable {
                 external.tag_display(),
                 external
                     .resolved
-                    .map_or_else(|| "unset".to_owned(), |hash| hash_first8_hex(&hash)),
+                    .map_or_else(|| "unset".to_owned(), hex::encode),
             ),
         }
     }
@@ -8674,7 +8845,8 @@ pub(crate) fn policy_hash_allowlisted(hash: &[u8; 32]) -> bool {
         || hex::encode(hash) == crate::spending_limit_policy::SPENDING_LIMIT_POLICY_WASM_SHA256
 }
 
-/// The first-8 projection of a hash the audit rows, pins and errors carry.
+/// The labeled first-8 display projection of a hash that drift rows,
+/// override rows and allowlist errors carry; pins carry the full hash.
 pub(crate) use stellar_agent_core::hex::wasm_hash_first8_hex as hash_first8_hex;
 
 /// Identification result of one verifier or policy contract: the observed
@@ -8683,8 +8855,9 @@ pub(crate) use stellar_agent_core::hex::wasm_hash_first8_hex as hash_first8_hex;
 pub(crate) struct ContractObservation {
     /// The executable both endpoints agreed on.
     pub(crate) observed: ObservedExecutable,
-    /// The effective hash, or the zero hash for no code.
-    pub(crate) effective_hash: [u8; 32],
+    /// The effective hash: the Wasm hash or the hash an external reference
+    /// resolved to; `None` for no Wasm code, which has no hash.
+    pub(crate) effective_hash: Option<[u8; 32]>,
     /// `true` when the instance has code and its effective hash is in the
     /// caller's allowlist.
     pub(crate) allowlisted: bool,
@@ -8692,12 +8865,11 @@ pub(crate) struct ContractObservation {
 
 impl ContractObservation {
     /// First-8 hex of the effective hash, or `"none"` for no code; the form
-    /// the allowlist-miss errors and override rows carry.
+    /// the unknown-hash override row carries.
     pub(crate) fn observed_hash_first8(&self) -> String {
-        match self.observed {
-            ObservedExecutable::NoCode => "none".to_owned(),
-            _ => hash_first8_hex(&self.effective_hash),
-        }
+        self.effective_hash
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), hash_first8_hex)
     }
 }
 
@@ -8757,7 +8929,6 @@ pub(crate) async fn fetch_observed_executable(
         rule_id,
         contract_kind,
         smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
-        contract_address_redacted: RedactedStrkey::from_full(&strkey),
         reason,
         request_id: request_id.to_owned(),
     };
@@ -8772,7 +8943,6 @@ pub(crate) async fn fetch_observed_executable(
         Ok(_) => Err(unsupported(AdminOrOwnerKey::NonWasmExecutable)),
         Err(FetchContractWasmHashError::Malformed { reason, .. }) => {
             warn!(
-                contract_redacted = %redact_strkey_first5_last5(&strkey),
                 contract_kind = %contract_kind,
                 reason = %reason,
                 rule_id,
@@ -8909,7 +9079,7 @@ pub fn build_external_signer_scval(
 pub(crate) async fn simulate_read_only(
     rpc_url: &str,
     smart_account: ScAddress,
-    entrypoint: &str,
+    entrypoint: &'static str,
     invoke_args: Vec<ScVal>,
     source_account_strkey: Option<&str>,
     network_passphrase: &str,
@@ -8945,12 +9115,36 @@ pub(crate) async fn simulate_read_only(
 pub(crate) async fn simulate_read_only_with_ledger(
     rpc_url: &str,
     smart_account: ScAddress,
-    entrypoint: &str,
+    entrypoint: &'static str,
     invoke_args: Vec<ScVal>,
     source_account_strkey: Option<&str>,
     network_passphrase: &str,
     timeout: Duration,
 ) -> Result<(ScVal, u32), SaError> {
+    simulate_read_only_described(
+        rpc_url,
+        smart_account,
+        entrypoint,
+        invoke_args,
+        source_account_strkey,
+        network_passphrase,
+        timeout,
+    )
+    .await
+    .map_err(SimulationFailure::into_shown)
+}
+
+/// [`simulate_read_only_with_ledger`] whose refusal keeps the text error a
+/// caller's decision reads beside the error the wallet shows.
+pub(crate) async fn simulate_read_only_described(
+    rpc_url: &str,
+    smart_account: ScAddress,
+    entrypoint: &'static str,
+    invoke_args: Vec<ScVal>,
+    source_account_strkey: Option<&str>,
+    network_passphrase: &str,
+    timeout: Duration,
+) -> Result<(ScVal, u32), SimulationFailure> {
     let (outcome, latest_ledger) = simulate_read_only_at_ledger(
         rpc_url,
         smart_account,
@@ -8980,12 +9174,12 @@ pub(crate) async fn simulate_read_only_with_ledger(
 async fn simulate_read_only_at_ledger(
     rpc_url: &str,
     smart_account: ScAddress,
-    entrypoint: &str,
+    entrypoint: &'static str,
     invoke_args: Vec<ScVal>,
     source_account_strkey: Option<&str>,
     network_passphrase: &str,
     timeout: Duration,
-) -> Result<(Result<ScVal, SaError>, u32), SaError> {
+) -> Result<(Result<ScVal, SimulationFailure>, u32), SaError> {
     let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
         stage: "auth_payload",
         redacted_reason: reason,
@@ -9048,24 +9242,33 @@ async fn simulate_read_only_at_ledger(
     let sim_envelope = tx_for_simulate
         .to_envelope()
         .map_err(|e| auth_payload_err(format!("to_envelope failed: {e:?}")))?;
+    let deadline = tokio::time::Instant::now().checked_add(timeout);
     let sim = tokio::time::timeout(
         timeout,
-        server.simulate_transaction_envelope(&sim_envelope, None),
+        stellar_agent_network::retry::retry_preflight_busy(deadline, || {
+            server.simulate_transaction_envelope(&sim_envelope, None)
+        }),
     )
     .await
     .map_err(|_| auth_payload_err("simulate_transaction_envelope timed out".to_owned()))?
-    .map_err(|e| auth_payload_err(format!("simulate_transaction_envelope failed: {e}")))?;
+    .map_err(|e| match e {
+        stellar_agent_network::retry::BusyRetryError::Rpc(e) => {
+            auth_payload_err(format!("simulate_transaction_envelope failed: {e}"))
+        }
+        stellar_agent_network::retry::BusyRetryError::Expired => {
+            auth_payload_err("simulate_transaction_envelope timed out".to_owned())
+        }
+    })?;
 
     let latest_ledger = sim.latest_ledger;
     if let Some(err) = &sim.error {
         return Ok((
-            Err(SaError::DeploymentFailed {
-                phase: "simulate",
-                redacted_reason: format!(
-                    "{entrypoint} simulation error: {}",
-                    augment_with_oz_error_name(err)
-                ),
-            }),
+            Err(read_only_refusal(
+                entrypoint,
+                err,
+                &sim.events,
+                &sim_envelope,
+            )),
             latest_ledger,
         ));
     }
@@ -9085,7 +9288,7 @@ async fn simulate_read_only_at_ledger(
                 )
             });
 
-    Ok((return_val, latest_ledger))
+    Ok((return_val.map_err(SimulationFailure::from), latest_ledger))
 }
 
 // ── OnChainContextRule ────────────────────────────────────────────────────────
@@ -9569,10 +9772,9 @@ fn contract_address_bytes(address: &ScAddress) -> [u8; 32] {
 /// or has no version-1 form.
 ///
 /// One variant per refusal. The `Display` text names the offending shape
-/// (an `ScVal` variant name, an item count or the tag bounded to
-/// [`stellar_agent_core::observability::UNTRUSTED_DISPLAY_MAX_BYTES`] bytes)
-/// and never renders an address, a key blob or an unbounded value, so it is
-/// safe inside a redacted error reason.
+/// (an `ScVal` variant name or an item count) and never renders an address,
+/// a key blob, a tag or any other value of the signer, so it is safe inside a
+/// redacted error reason.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SignerDecodeError {
@@ -9606,11 +9808,8 @@ pub enum SignerDecodeError {
         variant: &'static str,
     },
     /// The tag names neither `Delegated` nor `External`.
-    #[error("unknown signer tag \"{tag}\"")]
-    UnknownTag {
-        /// The tag bytes rendered through `untrusted_display_bounded`.
-        tag: String,
-    },
+    #[error("signer tag must be Delegated or External")]
+    UnknownTag,
     /// A `Delegated` signer's address is not an account (G) address.
     ///
     /// Raised by [`decode_signer_scval_full`] for an address that is neither
@@ -9756,9 +9955,7 @@ pub fn decode_signer_scval_full(val: &ScVal) -> Result<DecodedOnChainSigner, Sig
                 key_data: key_data.as_slice().to_vec(),
             })
         }
-        other => Err(SignerDecodeError::UnknownTag {
-            tag: untrusted_display_bounded(other),
-        }),
+        _ => Err(SignerDecodeError::UnknownTag),
     }
 }
 
@@ -9781,6 +9978,96 @@ pub(crate) mod tests {
     use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
 
     use super::*;
+
+    async fn busy_ledger_read(timeout: Duration, busy: u64, delayed: bool) -> SaError {
+        use crate::managers::rules::event_reason_tests::{
+            SMART_ACCOUNT, address, busy_replies, read_only_server, successful_read_result,
+        };
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let server = read_only_server(&source, successful_read_result()).await;
+        if delayed {
+            wiremock::Mock::given(wiremock::matchers::body_partial_json(
+                serde_json::json!({"method": "simulateTransaction"}),
+            ))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": body["id"], "result": successful_read_result()
+                    }))
+                    .set_delay(Duration::from_secs(3))
+            })
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        }
+        busy_replies(&server, busy).await;
+        let error = simulate_read_only_at_ledger(
+            &server.uri(),
+            address(SMART_ACCOUNT),
+            "get_context_rules_count",
+            vec![],
+            None,
+            "Test SDF Network ; September 2015",
+            timeout,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            stellar_agent_test_support::rpc_request_count(&server, "simulateTransaction").await,
+            if delayed { 2 } else { 4 }
+        );
+        error
+    }
+
+    #[tokio::test]
+    async fn ledger_read_simulate_retries_busy() {
+        use crate::managers::rules::event_reason_tests::{
+            SMART_ACCOUNT, address, busy_replies, read_only_server, successful_read_result,
+        };
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let server = read_only_server(&source, successful_read_result()).await;
+        busy_replies(&server, 1).await;
+        let (result, ledger) = simulate_read_only_at_ledger(
+            &server.uri(),
+            address(SMART_ACCOUNT),
+            "get_context_rules_count",
+            vec![],
+            None,
+            "Test SDF Network ; September 2015",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), ScVal::U32(7));
+        assert_eq!(ledger, 100);
+        assert_eq!(
+            stellar_agent_test_support::rpc_request_count(&server, "simulateTransaction").await,
+            2
+        );
+        let error = busy_ledger_read(Duration::from_secs(30), 4, false).await;
+        assert!(
+            matches!(error, SaError::AuthEntryConstructionFailed { stage: "auth_payload", ref redacted_reason } if redacted_reason.starts_with("simulate_transaction_envelope failed: ")),
+            "{error:?}"
+        );
+        let error = busy_ledger_read(Duration::from_secs(2), 1, true).await;
+        assert!(
+            matches!(error, SaError::AuthEntryConstructionFailed { stage: "auth_payload", ref redacted_reason } if redacted_reason == "simulate_transaction_envelope timed out"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_read_overflowing_timeout_is_bounded() {
+        let error = crate::managers::rules::event_reason_tests::drive_busy_paused(
+            busy_ledger_read(Duration::MAX, 4, false),
+        )
+        .await;
+        assert!(
+            matches!(error, SaError::AuthEntryConstructionFailed { stage: "auth_payload", ref redacted_reason } if redacted_reason.starts_with("simulate_transaction_envelope failed: ")),
+            "{error:?}"
+        );
+    }
 
     /// A migration step keeps a mainnet refusal as itself, so
     /// `MigrationPlan::submit` reports the canonical code; another failure is
@@ -9852,7 +10139,7 @@ pub(crate) mod tests {
             2, // post_op_signer_count
             3, // current_threshold
             2, // effective_threshold
-            ThresholdAffectingOp::RemoveSigner { signer_id: 2 },
+            &ThresholdAffectingOp::RemoveSigner { signer_id: 2 },
             "CDABC...12345",
             "req-1",
         );
@@ -9870,7 +10157,7 @@ pub(crate) mod tests {
             2, // post_op_signer_count
             3, // current_threshold
             3, // effective_threshold (unchanged, would brick)
-            ThresholdAffectingOp::RemoveSigner { signer_id: 2 },
+            &ThresholdAffectingOp::RemoveSigner { signer_id: 2 },
             "CDABC...12345",
             "req-1",
         );
@@ -9887,7 +10174,7 @@ pub(crate) mod tests {
             1,
             1,
             0, // threshold = 0 is invalid
-            ThresholdAffectingOp::SetThreshold { new: 0 },
+            &ThresholdAffectingOp::SetThreshold { new: 0 },
             "CDABC...12345",
             "req-1",
         );
@@ -9905,7 +10192,7 @@ pub(crate) mod tests {
             3,
             3,
             3,
-            ThresholdAffectingOp::SetThreshold { new: 3 },
+            &ThresholdAffectingOp::SetThreshold { new: 3 },
             "CDABC...12345",
             "req-1",
         );
@@ -10067,10 +10354,12 @@ pub(crate) mod tests {
         use stellar_agent_core::audit_log::tip_anchor::{InMemoryTipAnchorStore, TipAnchorStore};
 
         let audit_log_path = dir.join("audit").join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
         let writer = AuditWriter::open_with_tip_anchor(
             audit_log_path.clone(),
             None,
-            Arc::new(InMemoryTipAnchorStore::new()) as Arc<dyn TipAnchorStore>,
+            store.clone() as Arc<dyn TipAnchorStore>,
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
         .expect("a draining writer opens");
         let manager = SignersManager::new(SignersManagerConfig::new(
@@ -10084,7 +10373,7 @@ pub(crate) mod tests {
             "stellar:testnet".to_owned(),
         ))
         .expect("manager construction must succeed");
-        AuditOutbox::for_log(&audit_log_path)
+        AuditOutbox::for_log(&audit_log_path, store)
             .append(&AuditEntry::new_approval_attested(
                 "PaymentSimulated",
                 "stellar_pay_commit",
@@ -10148,10 +10437,7 @@ pub(crate) mod tests {
             request_id: "req-test".to_owned(),
             snapshot,
             policies: vec![],
-            policy_hashes: WasmHashSummary {
-                count: 0,
-                first_first8: None,
-            },
+            policy_count: 0,
             ledger: 1000,
             primary_rule: ScVal::Void,
             v1_signers: Ok(vec![]),
@@ -10179,10 +10465,7 @@ pub(crate) mod tests {
             (0, SignerPubkey::Ed25519 { pubkey: [0x10; 32] }),
             (1, SignerPubkey::Ed25519 { pubkey: [0x11; 32] }),
         ]);
-        observation.policy_hashes = WasmHashSummary {
-            count: u32::try_from(policies.len()).unwrap(),
-            first_first8: (!policies.is_empty()).then_some([0xab; 8]),
-        };
+        observation.policy_count = u32::try_from(policies.len()).unwrap();
         observation.policies = policies;
         observation
     }
@@ -10596,7 +10879,7 @@ pub(crate) mod tests {
             4, // post_op_signer_count
             2, // current_threshold
             2, // effective_threshold (unchanged)
-            ThresholdAffectingOp::AddSigner {
+            &ThresholdAffectingOp::AddSigner {
                 signer_type: "ed25519".to_owned(),
                 signer_id: None,
             },
@@ -10748,7 +11031,7 @@ pub(crate) mod tests {
         let vec_val = ScVal::Vec(Some(ScVec(VecM::try_from(vec![sym, addr]).unwrap())));
         assert!(matches!(
             decode_signer_scval_full(&vec_val),
-            Err(SignerDecodeError::UnknownTag { tag }) if tag == "UnknownTag"
+            Err(SignerDecodeError::UnknownTag)
         ));
     }
 
@@ -10793,6 +11076,7 @@ pub(crate) mod tests {
     /// A URL the submit path never dials: every refusal below lands before
     /// network I/O.
     const LOCK_TEST_RPC: &str = "http://rule-locks-must-not-be-dialed.invalid";
+    const LOCK_TEST_SECONDARY_RPC: &str = "http://rule-locks-secondary-must-not-be-dialed.invalid";
 
     /// A signers manager over a fresh audit log, with the directory that
     /// holds the log.
@@ -10804,7 +11088,7 @@ pub(crate) mod tests {
         ));
         let manager = crate::test_helpers::signers_manager_for_tests(
             LOCK_TEST_RPC,
-            LOCK_TEST_RPC,
+            LOCK_TEST_SECONDARY_RPC,
             writer,
             log_path,
             std::time::Duration::from_secs(5),
@@ -10833,11 +11117,15 @@ pub(crate) mod tests {
         });
         crate::submit::submit_signed_invoke(
             crate::submit::SubmitInvokeArgs::builder()
+                .admission(stellar_agent_network::SigningAdmission::NoValue(
+                    crate::signing::intent_test_helpers::no_value_admission(),
+                ))
                 .target_contract(LOCK_TEST_ACCOUNT)
                 .auth_rule_ids(&rule_ids)
                 .host_function(host_function)
                 .signer(&signer)
                 .primary_rpc_url(LOCK_TEST_RPC)
+                .secondary_rpc_url(LOCK_TEST_SECONDARY_RPC)
                 .network_passphrase(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE)
                 .chain_id("stellar:testnet")
                 .timeout(std::time::Duration::from_secs(5))
@@ -10864,7 +11152,12 @@ pub(crate) mod tests {
     /// names refuses at stage `rule_lock_missing` naming that rule, before
     /// any network I/O; the submit path acquires nothing in its place.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_held_lock_context_without_a_named_rule_refuses_rule_lock_missing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let (manager, _dir) = lock_test_manager();
         let guards = manager
             .acquire_rule_locks(LOCK_TEST_ACCOUNT, [1], lock_test_budget())
@@ -10894,7 +11187,12 @@ pub(crate) mod tests {
     /// account: the context's guard of rule 1 on a second account refuses
     /// rule 1 at stage `rule_lock_missing`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_held_lock_context_for_another_account_refuses_rule_lock_missing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let (manager, _dir) = lock_test_manager();
         let guards = manager
             .acquire_rule_locks(&other_lock_test_account(), [1], lock_test_budget())
@@ -10922,7 +11220,12 @@ pub(crate) mod tests {
     /// manager and submitted with another's drift check refuses rule 1 at
     /// stage `rule_lock_missing`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_held_lock_context_from_another_log_refuses_rule_lock_missing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let (lending, _lending_dir) = lock_test_manager();
         let (checking, _checking_dir) = lock_test_manager();
         let guards = lending
@@ -10949,7 +11252,12 @@ pub(crate) mod tests {
     /// A held-lock context without a drift check refuses at stage
     /// `rule_locks_without_pin_check`, whatever the auth rules are.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_held_lock_context_without_a_pin_check_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let (manager, _dir) = lock_test_manager();
         let guards = manager
             .acquire_rule_locks(LOCK_TEST_ACCOUNT, [1, 2], lock_test_budget())
@@ -10974,7 +11282,11 @@ pub(crate) mod tests {
     /// acquisition of an overlapping set waits for the first and refuses at
     /// stage `rule_lock` when its budget ends, releasing what it took.
     #[tokio::test]
+    #[serial_test::serial]
     async fn rule_lock_acquisition_is_sorted_and_bounded() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (manager, _dir) = lock_test_manager();
         let held = manager
             .acquire_rule_locks(LOCK_TEST_ACCOUNT, [3, 1, 3], lock_test_budget())
@@ -11174,7 +11486,7 @@ pub(crate) mod tests {
                 post_op_count,
                 threshold,
                 threshold, // effective_threshold unchanged (no atomic decrement)
-                ThresholdAffectingOp::RemoveSigner { signer_id: 0 },
+                &ThresholdAffectingOp::RemoveSigner { signer_id: 0 },
                 "CDABC...12345",
                 "prop-req",
             );
@@ -11202,7 +11514,7 @@ pub(crate) mod tests {
                 signer_count,
                 threshold,
                 new_threshold,
-                ThresholdAffectingOp::SetThreshold { new: new_threshold },
+                &ThresholdAffectingOp::SetThreshold { new: new_threshold },
                 "CDABC...12345",
                 "prop-req",
             );
@@ -11558,7 +11870,7 @@ pub(crate) mod tests {
                 observed.summary(),
                 format!(
                     "external reference owner GAAAA...AAWHF tag \"verifier\" resolved {}",
-                    hash_first8_hex(&allowlisted)
+                    hex::encode(allowlisted)
                 )
             );
         }
@@ -11648,7 +11960,7 @@ pub(crate) mod tests {
             .expect("resolved reference is observed");
 
         assert!(observation.allowlisted);
-        assert_eq!(observation.effective_hash, allowlisted);
+        assert_eq!(observation.effective_hash, Some(allowlisted));
         assert_eq!(
             observation.observed_hash_first8(),
             hash_first8_hex(&allowlisted)
@@ -11681,7 +11993,7 @@ pub(crate) mod tests {
             .expect("resolved reference is observed");
 
         assert!(!observation.allowlisted);
-        assert_eq!(observation.effective_hash, unknown);
+        assert_eq!(observation.effective_hash, Some(unknown));
         assert_eq!(observation.observed_hash_first8(), "d1d1d1d1d1d1d1d1");
     }
 
@@ -11718,7 +12030,6 @@ pub(crate) mod tests {
             let Err(SaError::ContractInstanceUnsupported {
                 rule_id,
                 contract_kind,
-                contract_address_redacted,
                 reason,
                 request_id,
                 ..
@@ -11730,7 +12041,6 @@ pub(crate) mod tests {
             assert_eq!(contract_kind, kind);
             assert_eq!(rule_id, Some(7));
             assert_eq!(request_id, "req-1");
-            assert_eq!(contract_address_redacted.as_str(), "CAAAA...AD2KM");
         }
     }
 
@@ -12247,10 +12557,8 @@ pub(crate) mod tests {
                 "tag is not a Symbol: U32",
             ),
             (
-                SignerDecodeError::UnknownTag {
-                    tag: "Future".to_owned(),
-                },
-                "unknown signer tag \"Future\"",
+                SignerDecodeError::UnknownTag,
+                "signer tag must be Delegated or External",
             ),
             (
                 SignerDecodeError::DelegatedAddressNotAnAccount,
@@ -12442,7 +12750,7 @@ pub(crate) mod tests {
 
     /// A signer with an unknown `Signer` tag refuses the whole rule: the
     /// observed set must hold every signer of the rule, and the reason names
-    /// the signer's index, its id and the tag.
+    /// the signer's index, its id and the accepted tags, not the tag.
     #[test]
     fn decode_context_rule_scval_refuses_an_unknown_signer() {
         let val = rule_with_signer_lists(
@@ -12455,7 +12763,7 @@ pub(crate) mod tests {
         assert_eq!(
             refused_rule_reason(val),
             "get_context_rule: signer at index 1 (id 1) is not a recognised Signer: \
-             unknown signer tag \"Future\""
+             signer tag must be Delegated or External"
         );
     }
 
@@ -12767,21 +13075,18 @@ pub(crate) mod tests {
         }
     }
 
-    /// An unknown tag renders through `untrusted_display_bounded`: a 32-byte
-    /// tag of control characters yields a bounded, escaped reason.
+    /// An unknown tag of 32 control characters is not rendered: the reason
+    /// is the fixed text naming the accepted tags.
     #[test]
-    fn decode_context_rule_scval_large_unknown_tag_reason_is_bounded() {
+    fn decode_context_rule_scval_large_unknown_tag_is_not_rendered() {
         let tag = ScSymbol::try_from(vec![0x1bu8; 32]).expect("32 bytes fit an ScSymbol");
         let val = rule_with_signer_lists(vec![ScVal::U32(0)], vec![tagged_signer(tag)]);
         let Err(err) = decode_context_rule_scval(val) else {
             panic!("an unknown tag must fail closed");
         };
-        let expected = format!(
-            "get_context_rule: signer at index 0 (id 0) is not a recognised Signer: \
-             unknown signer tag \"{}...\"",
-            r"\u{1b}".repeat(10)
-        );
-        assert_bounded_string_reason(err, &expected);
+        let expected = "get_context_rule: signer at index 0 (id 0) is not a recognised Signer: \
+                        signer tag must be Delegated or External";
+        assert_bounded_string_reason(err, expected);
     }
 
     /// A signer that is a large non-`Vec` value is named by its variant and
@@ -13029,7 +13334,7 @@ pub(crate) mod tests {
             2, // post_op_signer_count
             3, // current_threshold
             3, // effective_threshold — unchanged, violates 3 <= 2
-            ThresholdAffectingOp::AddSigner {
+            &ThresholdAffectingOp::AddSigner {
                 signer_type: "ed25519".to_owned(),
                 signer_id: None,
             },
@@ -13062,35 +13367,40 @@ pub(crate) mod tests {
         }
     }
 
-    /// The `SetThreshold` hint text must mention the proposed new threshold and
-    /// the post-op signer count so the operator knows the valid range.
+    /// The `SetThreshold` refusal states the valid range and holds the
+    /// refused threshold in no form, in the error or in the failure event.
     #[test]
-    fn post_op_invariant_set_threshold_hint_contains_counts() {
-        // signer_count=2, new_threshold=5 — clearly exceeds count.
-        let result = compute_post_op_invariant(
-            9, // rule_id
-            2, // post_op_signer_count
-            2, // current_threshold
-            5, // effective_threshold (new_threshold) — 5 > 2 → fail
-            ThresholdAffectingOp::SetThreshold { new: 5 },
+    fn post_op_invariant_set_threshold_refusal_holds_no_requested_value() {
+        let error = compute_post_op_invariant(
+            9,
+            2,
+            2,
+            424_242,
+            &ThresholdAffectingOp::SetThreshold { new: 424_242 },
             "CDABC...12345",
             "req-threshold-hint",
+        )
+        .expect_err("a threshold above the signer count must be refused");
+
+        let expected = "threshold unreachable: the operation must leave at least as many \
+                        signers as the rule threshold; --new-threshold must be between 1 and \
+                        the number of signers remaining after the operation; add signers \
+                        first or lower the requested threshold.";
+        assert_eq!(error.to_string(), expected);
+        assert!(!format!("{error:?}").contains("424242"), "{error:?}");
+        assert!(
+            !serde_json::to_string(&error).unwrap().contains("424242"),
+            "the serialized error must hold no refused value"
         );
-        match result {
-            Err(SaError::ThresholdUnreachable {
-                safe_ordering_hint, ..
-            }) => {
-                assert!(
-                    safe_ordering_hint.contains('5'),
-                    "hint must contain the bad threshold value: {safe_ordering_hint}"
-                );
-                assert!(
-                    safe_ordering_hint.contains('2'),
-                    "hint must contain the signer count: {safe_ordering_hint}"
-                );
-            }
-            other => panic!("expected ThresholdUnreachable, got: {other:?}"),
-        }
+
+        let (capture, _guard) =
+            stellar_agent_test_support::log_capture::WarningCapture::capture(None);
+        warn_failed("set_threshold", "CDABC...12345", &error);
+        let events = capture.seen();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["message"], "signer verb failed");
+        assert_eq!(events[0]["error"], expected);
+        assert!(!format!("{events:?}").contains("424242"), "{events:?}");
     }
 
     // ── accessor methods ──────────────────────────────────────────────────────
@@ -13322,25 +13632,31 @@ pub(crate) mod tests {
     impl stellar_agent_network::signing::Signer for UnreachableSigner {
         async fn sign_tx_payload(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::TxSigningPayload,
         ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
             unimplemented!("stub — must not be called by the empty-batch refusal test")
         }
         async fn sign_auth_digest(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SmartAccountAuthDigest,
         ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
             unimplemented!("stub — must not be called by the empty-batch refusal test")
         }
         async fn sign_soroban_address_auth_payload(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SorobanAuthPayload,
         ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
             unimplemented!("stub — must not be called by the empty-batch refusal test")
         }
+        async fn sign_message(
+            &self,
+            _: &stellar_agent_network::signing::MessagePayload,
+        ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
+            unimplemented!("stub: must not be called by the empty-batch refusal test")
+        }
         async fn sign_webauthn_assertion(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SmartAccountAuthDigest,
             _: &[u8],
         ) -> Result<
             stellar_agent_network::signing::WebAuthnAssertion,
@@ -13458,6 +13774,547 @@ pub(crate) mod tests {
         assert!(
             !error.contains("SENTINEL"),
             "construction error leaked: {error}"
+        );
+    }
+
+    // ── Mainnet refusal before the signer and the endpoint ──────────────────
+
+    /// A signers manager declared for mainnet whose endpoints are the mock
+    /// `server`, with the audit log in `dir`.
+    fn mainnet_signers_manager(
+        server: &wiremock::MockServer,
+        dir: &tempfile::TempDir,
+    ) -> SignersManager {
+        let audit_log_path = dir.path().join("audit.jsonl");
+        let audit_writer = Arc::new(Mutex::new(
+            AuditWriter::open(audit_log_path.clone(), None).unwrap(),
+        ));
+        SignersManager::new(SignersManagerConfig::new(
+            server.uri(),
+            server.uri(),
+            audit_writer,
+            audit_log_path,
+            stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE.to_owned(),
+            "test".to_owned(),
+            Duration::from_secs(1),
+            "stellar:pubnet".to_owned(),
+        ))
+        .unwrap()
+    }
+
+    /// Writes the signer baselines required before a manager write reaches RPC.
+    pub(crate) fn write_entry_guard_baselines(manager: &SignersManager, target: &ScAddress) {
+        let account = scaddress_to_strkey(target).unwrap();
+        let observation = test_observation(SignerSetSnapshotV2 {
+            signers: vec![ed25519_entry(0, 0x71)],
+            threshold: None,
+        });
+        for rule in [0, 1] {
+            manager
+                .emit_baseline(
+                    &observation,
+                    rule,
+                    &account,
+                    &redact_strkey_first5_last5(&account),
+                    BaselineReason::FirstObservation,
+                    None,
+                    "entry-guard-baseline",
+                )
+                .unwrap();
+        }
+    }
+
+    fn mainnet_target() -> ScAddress {
+        ScAddress::Contract(ContractId(Hash([0x81; 32])))
+    }
+
+    /// A testnet contract target for the accepted manager writes.
+    pub(crate) fn testnet_target() -> ScAddress {
+        ScAddress::Contract(ContractId(Hash([0x91; 32])))
+    }
+
+    fn delegated_signer_scval() -> ScVal {
+        build_delegated_signer_scval(SIMULATE_SENTINEL_G).unwrap()
+    }
+
+    /// Runs `write` against a mainnet signers manager with a counting signer,
+    /// and asserts the canonical mainnet refusal with no signer method called
+    /// and no request sent.
+    async fn assert_mainnet_write_refused<F, Fut>(write: F)
+    where
+        F: FnOnce(
+            SignersManager,
+            stellar_agent_network::signing::test_doubles::CountingSigner,
+        ) -> Fut,
+        Fut: std::future::Future<Output = Result<(), SaError>>,
+    {
+        let server = wiremock::MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x71; 32]);
+
+        let manager = mainnet_signers_manager(&server, &dir);
+        write_entry_guard_baselines(&manager, &mainnet_target());
+        let result = write(manager, signer.clone()).await;
+
+        assert!(
+            matches!(result, Err(SaError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(signer.key_accesses(), 0, "no signer method is called");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no request is sent"
+        );
+    }
+
+    /// A testnet write passes its network guard, reads the key, and reaches RPC.
+    async fn assert_testnet_write_reaches_rpc<F, Fut>(write: F)
+    where
+        F: FnOnce(
+            Arc<SignersManager>,
+            stellar_agent_network::signing::test_doubles::CountingSigner,
+        ) -> Fut,
+        Fut: std::future::Future<Output = Result<(), SaError>>,
+    {
+        let server = stellar_agent_test_support::KeyedLedgerEntriesResponder::new()
+            .serve()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("audit.jsonl");
+        let manager = crate::test_helpers::signers_manager_for_tests(
+            &server.uri(),
+            &server.uri(),
+            Arc::new(Mutex::new(
+                AuditWriter::open(audit_path.clone(), None).unwrap(),
+            )),
+            audit_path,
+            Duration::from_secs(1),
+        );
+        write_entry_guard_baselines(&manager, &testnet_target());
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x71; 32]);
+        let result = write(manager, signer.clone()).await;
+        assert!(
+            !matches!(result, Err(SaError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert!(signer.key_accesses() > 0);
+        assert!(
+            !server.received_requests().await.unwrap().is_empty(),
+            "the call reaches its first RPC: {result:?}"
+        );
+    }
+
+    /// The manager guard refuses mainnet and accepts testnet.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn refuse_mainnet_write_refuses_only_a_mainnet_manager() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let server = wiremock::MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            mainnet_signers_manager(&server, &dir).refuse_mainnet_write(),
+            Err(SaError::MainnetWriteForbidden)
+        ));
+
+        let testnet = crate::test_helpers::signers_manager_for_tests(
+            &server.uri(),
+            &server.uri(),
+            Arc::new(Mutex::new(
+                AuditWriter::open(dir.path().join("testnet.jsonl"), None).unwrap(),
+            )),
+            dir.path().join("testnet.jsonl"),
+            Duration::from_secs(1),
+        );
+        testnet.refuse_mainnet_write().unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_signer_refuses_mainnet_before_any_key_access_or_request() {
+        assert_mainnet_write_refused(|manager, signer| async move {
+            manager
+                .add_signer(
+                    mainnet_target(),
+                    1,
+                    delegated_signer_scval(),
+                    &signer,
+                    "req-add".to_owned(),
+                    false,
+                    false,
+                )
+                .await
+                .map(drop)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn remove_signer_refuses_mainnet_before_any_key_access_or_request() {
+        assert_mainnet_write_refused(|manager, signer| async move {
+            manager
+                .remove_signer(mainnet_target(), 1, 2, &signer, "req-remove".to_owned())
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_threshold_refuses_mainnet_before_any_key_access_or_request() {
+        assert_mainnet_write_refused(|manager, signer| async move {
+            manager
+                .set_threshold(mainnet_target(), 1, 1, &signer, "req-threshold".to_owned())
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_spending_limit_refuses_mainnet_before_any_key_access_or_request() {
+        assert_mainnet_write_refused(|manager, signer| async move {
+            manager
+                .set_spending_limit(
+                    mainnet_target(),
+                    2,
+                    &[ContextRuleId::new(0)],
+                    1_000,
+                    &signer,
+                    "req-limit".to_owned(),
+                )
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_weighted_threshold_refuses_mainnet_before_any_key_access_or_request() {
+        assert_mainnet_write_refused(|manager, signer| async move {
+            manager
+                .set_weighted_threshold(
+                    mainnet_target(),
+                    1,
+                    1,
+                    &[ContextRuleId::new(0)],
+                    &signer,
+                    "req-weighted".to_owned(),
+                )
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_signer_weight_refuses_mainnet_before_any_key_access_or_request() {
+        assert_mainnet_write_refused(|manager, signer| async move {
+            manager
+                .set_signer_weight(
+                    mainnet_target(),
+                    1,
+                    crate::weighted_threshold_policy::WeightedThresholdSignerInput::Delegated {
+                        g_strkey: SIMULATE_SENTINEL_G.to_owned(),
+                    },
+                    2,
+                    &[ContextRuleId::new(0)],
+                    &signer,
+                    "req-weight".to_owned(),
+                )
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn batch_add_signers_refuses_mainnet_before_any_key_access_or_request() {
+        assert_mainnet_write_refused(|manager, signer| async move {
+            manager
+                .batch_add_signers(
+                    mainnet_target(),
+                    1,
+                    vec![delegated_signer_scval()],
+                    &signer,
+                    "req-batch".to_owned(),
+                    false,
+                    false,
+                )
+                .await
+                .map(drop)
+        })
+        .await;
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn add_signer_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        assert_testnet_write_reaches_rpc(|manager, signer| async move {
+            manager
+                .add_signer(
+                    testnet_target(),
+                    1,
+                    delegated_signer_scval(),
+                    &signer,
+                    "req-add".to_owned(),
+                    false,
+                    false,
+                )
+                .await
+                .map(drop)
+        })
+        .await;
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn remove_signer_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        assert_testnet_write_reaches_rpc(|manager, signer| async move {
+            manager
+                .remove_signer(testnet_target(), 1, 2, &signer, "req-remove".to_owned())
+                .await
+        })
+        .await;
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn set_threshold_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        assert_testnet_write_reaches_rpc(|manager, signer| async move {
+            manager
+                .set_threshold(testnet_target(), 1, 1, &signer, "req-threshold".to_owned())
+                .await
+        })
+        .await;
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn set_spending_limit_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        assert_testnet_write_reaches_rpc(|manager, signer| async move {
+            manager
+                .set_spending_limit(
+                    testnet_target(),
+                    2,
+                    &[ContextRuleId::new(0)],
+                    1_000,
+                    &signer,
+                    "req-limit".to_owned(),
+                )
+                .await
+        })
+        .await;
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn set_weighted_threshold_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        assert_testnet_write_reaches_rpc(|manager, signer| async move {
+            manager
+                .set_weighted_threshold(
+                    testnet_target(),
+                    1,
+                    1,
+                    &[ContextRuleId::new(0)],
+                    &signer,
+                    "req-weighted".to_owned(),
+                )
+                .await
+        })
+        .await;
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn set_signer_weight_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        assert_testnet_write_reaches_rpc(|manager, signer| async move {
+            manager
+                .set_signer_weight(
+                    testnet_target(),
+                    1,
+                    crate::weighted_threshold_policy::WeightedThresholdSignerInput::Delegated {
+                        g_strkey: SIMULATE_SENTINEL_G.to_owned(),
+                    },
+                    2,
+                    &[ContextRuleId::new(0)],
+                    &signer,
+                    "req-weight".to_owned(),
+                )
+                .await
+        })
+        .await;
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn batch_add_signers_reaches_rpc_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        assert_testnet_write_reaches_rpc(|manager, signer| async move {
+            manager
+                .batch_add_signers(
+                    testnet_target(),
+                    1,
+                    vec![delegated_signer_scval()],
+                    &signer,
+                    "req-batch".to_owned(),
+                    false,
+                    false,
+                )
+                .await
+                .map(drop)
+        })
+        .await;
+    }
+
+    /// A signers manager reading from `rpc_url`, with its audit log in `dir`.
+    fn read_manager(rpc_url: &str, dir: &tempfile::TempDir) -> SignersManager {
+        let audit_log_path = dir.path().join("audit.jsonl");
+        let audit_writer = Arc::new(Mutex::new(
+            AuditWriter::open(audit_log_path.clone(), None).unwrap(),
+        ));
+        SignersManager::new(SignersManagerConfig::new(
+            rpc_url.to_owned(),
+            rpc_url.to_owned(),
+            audit_writer,
+            audit_log_path,
+            "Test SDF Network ; September 2015".to_owned(),
+            "test-profile".to_owned(),
+            Duration::from_secs(5),
+            "stellar:testnet".to_owned(),
+        ))
+        .unwrap()
+    }
+
+    /// A mock endpoint refusing every simulation with `error` and an event of
+    /// the policy carrying `code`, or with `error` alone when `code` is `None`.
+    async fn policy_refusal(error: &str, code: Option<u32>) -> wiremock::MockServer {
+        use crate::managers::rules::event_reason_tests::{
+            POLICY, error_event, read_only_server, refusal_result,
+        };
+        let events: Vec<String> = code
+            .map(|code| error_event(POLICY, code))
+            .into_iter()
+            .collect();
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        read_only_server(&source, refusal_result(error, &events)).await
+    }
+
+    /// The spending-limit read shows the policy's event code and decides
+    /// `SpendingLimitNotInstalled` only from the error text.
+    #[tokio::test]
+    async fn spending_limit_read_ignores_events() {
+        use crate::managers::rules::event_reason_tests::{
+            POLICY, RPC30_ERROR, SMART_ACCOUNT, address,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let server = policy_refusal(RPC30_ERROR, Some(3220)).await;
+        let result = read_manager(&server.uri(), &dir)
+            .get_spending_limit_data(
+                address(POLICY),
+                1,
+                address(SMART_ACCOUNT),
+                None,
+                "req".to_owned(),
+            )
+            .await;
+        match result {
+            Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason,
+            }) => assert!(
+                redacted_reason.starts_with(
+                    "get_spending_limit_data simulation error: Error(Contract, #3220)"
+                ),
+                "{redacted_reason}"
+            ),
+            other => panic!("expected the simulate refusal, got {other:?}"),
+        }
+
+        let server = policy_refusal("HostError: Error(Contract, #3220)", None).await;
+        let result = read_manager(&server.uri(), &dir)
+            .get_spending_limit_data(
+                address(POLICY),
+                1,
+                address(SMART_ACCOUNT),
+                None,
+                "req".to_owned(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(SaError::SpendingLimitNotInstalled { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// The threshold read shows the policy's event code and decides
+    /// `WeightedThresholdNotInstalled` only from the error text.
+    #[tokio::test]
+    async fn weighted_threshold_read_ignores_events() {
+        use crate::managers::rules::event_reason_tests::{
+            POLICY, RPC30_ERROR, SMART_ACCOUNT, address,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let server = policy_refusal(RPC30_ERROR, Some(3210)).await;
+        let result = read_manager(&server.uri(), &dir)
+            .get_weighted_threshold_view(
+                address(POLICY),
+                1,
+                address(SMART_ACCOUNT),
+                ScVal::Void,
+                None,
+                "req".to_owned(),
+            )
+            .await;
+        match result {
+            Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason,
+            }) => assert_eq!(
+                redacted_reason,
+                "get_threshold simulation error: Error(Contract, #3210)"
+            ),
+            Err(other) => panic!("expected the simulate refusal, got {other:?}"),
+            Ok(_) => panic!("expected the simulate refusal, got a view"),
+        }
+
+        let server = policy_refusal("HostError: Error(Contract, #3210)", None).await;
+        let result = read_manager(&server.uri(), &dir)
+            .get_weighted_threshold_view(
+                address(POLICY),
+                1,
+                address(SMART_ACCOUNT),
+                ScVal::Void,
+                None,
+                "req".to_owned(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(SaError::WeightedThresholdNotInstalled { .. })),
+            "{:?}",
+            result.err()
         );
     }
 }

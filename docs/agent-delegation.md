@@ -1,5 +1,8 @@
 # Agent delegation
 
+See [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 Hand an autonomous agent a scoped, budgeted, revocable slice of a smart
 account: one target contract, a spending cap, and its own key, instead of
 the account's full authority. The agent transacts with a key it holds
@@ -10,22 +13,21 @@ and policy machinery: a `CallContract` rule scopes what the agent's signer
 may invoke, and a spending-limit policy caps how much it may move. Nothing
 here grants the agent any new administrative capability. Creating, scoping,
 capping, and revoking a rule are all operator/CLI-side actions. The agent's
-side of the picture is unchanged in kind, only in degree: it signs with a key
-the wallet's context-rule machinery now recognizes as a first-class signer
-type.
+side of the picture is unchanged in kind, only in degree. The agent signs with
+a key that the context-rule machinery accepts as a signer type.
 
 The walkthrough below has the operator author the rule directly via the CLI.
-An agent can also PROPOSE a rule for the operator to review and consent to,
+An agent can also propose a rule for the operator to review and consent to,
 via the `stellar_rule_create` / `stellar_rule_create_commit` MCP tool pair
 (see [MCP: tool catalog](mcp.md#tool-catalog)). The agent resolves and
 simulates the definition (signers, policies, context, expiry) but never
 installs it. Installation only proceeds after the operator attests to the
-EXACT resolved definition on one of the three approval surfaces (CLI
+exact resolved definition on one of the three approval surfaces (CLI
 `approve`, the loopback inbox, the remote inbox). Each surface renders the
 full rule, including a prominent callout when the proposed context is
 `Default` (account-wide authority), before the operator can consent. This is
 the same "no new administrative capability without operator sign-off"
-posture as the CLI-authored path above; only the AUTHORING step moves from
+posture as the CLI-authored path above; only the authoring step moves from
 operator-typed flags to agent-resolved, operator-reviewed JSON.
 
 ## Recommended agent-signer doctrine
@@ -36,13 +38,13 @@ authorization decides for it. An External signer is authenticated through a
 verifier contract, with a raw key of the verifier's own choosing. Two
 External shapes matter for an agent:
 
-- **External Ed25519** (this guide): a raw ed25519 public key, verified
+- External Ed25519 (this guide) is a raw ed25519 public key, verified
   on-chain by a deployed Ed25519-verifier contract. No funded classic account
   is required: the key only ever appears as a signature over an auth digest,
   never as a source account. It can be held in an HSM, a keyring, or any
   process that can produce an ed25519 signature, and rotating it is a
   `signers remove` + `signers add` pair, not a re-funding operation.
-- **Delegated**: a classic `G...` account, which the agent would need to
+- Delegated is a classic `G...` account, which the agent would need to
   hold funded on its own. A delegated `C...` contract fits a signer that is
   itself a contract, not an agent's key. Workable, but it ties the agent's identity to a
   funded account and makes rotation a funding operation, not a policy edit.
@@ -59,6 +61,13 @@ token contract, under a spending cap. Every write verb here is
 testnet-only and structurally refuses `mainnet`; see
 [CLI reference: smart-account](cli-reference/smart-account.md) for the full
 flag reference.
+
+Every smart-account signing verb in this walkthrough needs a secondary RPC on
+the same network and on a host other than the primary's. Set
+`secondary_rpc_url` in the profile, or pass `--secondary-rpc-url <URL>` to each
+signing step; without one the step refuses with
+`smart_account.ledger_witness_unavailable` before the signer loads.
+`profile init` writes no secondary.
 
 Each signing step reads the seed it needs into an environment variable
 without echo, as [Pass a secret seed](getting-started.md#pass-a-secret-seed)
@@ -183,13 +192,13 @@ itself rejects both conditions the same way.
 
 Because `rules create` pinned the rule, the wallet probes the policy against
 the policy allowlist before submitting and, once the add confirms, pins its
-hash in a `SaContextRulePinsUpdated` audit row, so every later signing verb
+full code hash in a `SaContextRulePinsUpdatedV2` audit row, so every later signing verb
 under the rule checks the policy as well.
 
 ## Submitting an agent-signed call
 
-Everything above sets the delegation UP; `smart-account execute` is how the
-agent's key actually SUBMITS a call under it. The agent process holds only
+Everything above sets the delegation up; `smart-account execute` is how the
+agent's key actually submits a call under it. The agent process holds only
 its own ed25519 seed and never touches the operator's wallet key.
 `execute` is the one CLI verb built for that shape. It signs the smart-account
 auth digest with the agent's External-Ed25519 key while a separate,
@@ -225,10 +234,10 @@ unset AGENT_SK FEE_PAYER_SK
   token from step 3). For most delegated calls these are different
   addresses.
 - `--arg` takes one standard-base64 XDR `ScVal` per contract argument,
-  repeated in order. Encode each argument with the `stellar-xdr` MCP tools
-  or `stellar-xdr encode`; the wallet validates well-formedness client-side
-  but never re-encodes the value.
-- `--auth-rule-id` has NO default on this verb, unlike every other
+  repeated in order. Encode each argument outside the wallet, for example
+  with `stellar-xdr encode`. The wallet decodes each value under bounded XDR
+  limits and re-encodes the decoded value canonically for submission.
+- `--auth-rule-id` has no default on this verb, unlike every other
   smart-account write command. It must always be given explicitly. A
   delegated agent call always names a specific scoped rule; defaulting to
   the account-wide bootstrap rule would either succeed against the wrong
@@ -249,7 +258,7 @@ A call that clears the rule's scope and the spending cap returns
 `status: "submitted"` with the confirmed `tx_hash`. A call that does not (over budget, wrong contract, expired rule) surfaces the same typed
 on-chain error every other smart-account write verb renders (see below).
 
-There is currently no MCP tool for this verb; see
+The MCP server has no tool for this verb; see
 [MCP: why there is no agent-facing execute tool](mcp.md#why-there-is-no-agent-facing-execute-tool)
 for the reasoning and what would change it.
 
@@ -284,8 +293,9 @@ read the same state about its own rules through the read-only MCP tools
 granted by exposing these; both tools are `read_only_hint=true,
 destructive_hint=false`. `stellar_rules_get`'s `policies` field also reports
 each attached policy's best-effort classification (`threshold`,
-`spending-limit`, or `unknown`). A policy whose code hash is absent or
-unrecognized reports `unknown`. A failed rule read or hash fetch fails the
+`spending-limit`, or `unknown`). `threshold` names the simple-threshold
+policy. Any other code hash, the weighted-threshold policy's included, reports
+`unknown`, and so does an absent hash. A failed rule read or hash fetch fails the
 request.
 
 The returned budget numbers are a point-in-time estimate, not a guarantee:
@@ -294,8 +304,16 @@ ledger movement only grows headroom (older spend entries fall out of the
 rolling window), but an intervening spend shrinks it. A submission that
 looked affordable a moment earlier can still fail `SpendingLimitExceeded`.
 
-The operator retunes the limit without tearing the rule down via
-`smart-account rules set-spending-limit --rule-id <N> --limit <STROOPS>`.
+The operator retunes the limit without tearing the rule down:
+
+```bash
+stellar-agent smart-account rules set-spending-limit \
+  --account CABC...WXYZ \
+  --rule-id <RULE_ID> \
+  --limit <STROOPS> \
+  --signer-secret-env WALLET_SK
+```
+
 This changes only the limit; the rolling spend history is preserved, so a
 retune cannot be used to reset the window early. The period is immutable
 once installed. Changing it requires removing and re-adding the policy,
@@ -311,7 +329,7 @@ being changed, so it cannot drop a signer from a `CallContract` rule.
 
 The simple threshold-policy above is signer-count based: any `N` of the
 configured signers authorize equally. When a rule delegates to several
-agents (or an operator plus several agents) whose keys should NOT carry
+agents (or an operator plus several agents) whose keys should not carry
 equal authority, attach a weighted-threshold policy.
 For example, an operator key can meet the threshold alone while two agent keys
 must sign together. The quorum is the same for every call, whatever the
@@ -331,13 +349,6 @@ threshold is built the same multi-signer way any other quorum-authorized
 call is (`AuthorizationInfo` / `SignerGroup`). The weighted-threshold
 policy does not change how the wallet gathers signatures, only how the
 policy contract itself decides whether the gathered set is sufficient.
-
-The signing substrate authenticates an External-Ed25519 call, supplying
-the agent's key alongside the verifier address to the same production
-submission path every other smart-account operation uses. This makes
-this delegation real rather than a paper scope. The wallet records the rule
-and enforces it on every submission that carries that
-signer's signature.
 
 ## Related pages
 

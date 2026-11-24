@@ -17,14 +17,15 @@ the review approves with no blocking findings.
 - No secret material appears in logs, `Debug` output, or error messages. Account
   identifiers and transaction hashes are redacted at info level.
 - Secret values zeroize on drop; no un-zeroized copies linger.
-- No `unsafe`. No `unwrap`, `expect`, or `panic` in library code unless provably
+- The workspace denies `unsafe_code`. Each production exception is a scoped
+  `unsafe_code` allow around an operating system call. No `unwrap`, `expect`, or `panic` in library code unless provably
   infallible with an inline justification.
 - Fail closed. A check that runs before signing or submission refuses on error
   rather than proceeds. The behaviors that deliberately differ are documented:
   the audit chain-key pre-flight on the synthesized zero-config profile in
-  [SECURITY.md](../../SECURITY.md#security-model-summary) and the
-  post-confirmation audit append in
-  [concepts](../concepts.md#fail-closed-on-an-unminted-audit-key). A change adds
+  [SECURITY.md](../../SECURITY.md#security-model-summary) and the audit rows
+  written after the chain action in
+  [concepts](../concepts.md#the-hash-chained-audit-log). A change adds
   no new one without a security review.
 - No secrets or mainnet keys are committed.
 - A credential or authorization returned without local submission is treated as
@@ -41,7 +42,7 @@ the review approves with no blocking findings.
   below current offline coverage); 90% per crate is the aspirational target,
   and any shortfall below it is justified in the review (for example,
   live-network paths exercised by acceptance tests rather than unit tests).
-- **Tests assert correct behavior.** A test must fail if the behavior it covers
+- Tests assert correct behavior. A test must fail if the behavior it covers
   regresses. A test that only raises the coverage number by exercising or
   asserting wrong or buggy behavior, or that would still pass if the code were
   broken, is a blocking finding and must be reported. The fix is to correct the
@@ -75,14 +76,16 @@ the review approves with no blocking findings.
   construction and re-check `is_definitive_send_refusal` in
   `crates/stellar-agent-network/src/submit.rs`. The classifier depends on the
   client's `No status yet:` wording to distinguish an unknown transport outcome
-  from a definitive endpoint refusal; that distinction controls reservation
-  retention and sequence release.
+  from a definitive endpoint refusal; that distinction controls the code the
+  caller receives.
 - Run both real-client tests in
   `crates/stellar-agent-network/tests/network/submission_record_integration.rs`:
   `a_transport_failure_after_the_record_returns_the_timeout_shape` and
-  `a_refused_send_releases_the_reservation_and_frees_the_sequence`. Confirm that
-  transport failures retain the submission for reconciliation and definitive
-  refusals release the reservation and sequence.
+  `a_refused_send_retains_the_reservation_and_sequence`. Confirm that transport
+  failures return the timeout shape and definitive refusals return the
+  endpoint's code. Both retain the receipt, the reservation, and the
+  sequence. A bounded reservation stays charged through its accounting
+  horizon, and an operator clear releases only an untimed one.
 
 ### 6. Public API and dead code
 
@@ -96,18 +99,15 @@ the review approves with no blocking findings.
 - The change preserves the project invariants: self-custodial keys that never
   leave the host without explicit per-action consent, no required
   project-operated backend, no central store of user secrets, a permissive
-  license, deterministic machine-readable output, and testnet/mainnet parity.
+  license, deterministic machine-readable output, and mainnet admission only for the operations that
+  [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+  lists.
 
 ### 8. Build gates
 
-Start local verification with `bash .github/scripts/preflight.sh` and run the
-issue-specific acceptance commands. `bash .github/scripts/preflight.sh --full`
-runs the complete local registry, including coverage.
-
-CI runs the offline workspace suite on every pull request. Pull-request
-coverage requires the `coverage` label; live acceptance uses its separate
-workflow. Local coverage, `cargo machete`, and `cargo deny check` are optional
-reproductions. Record each local gate's exit code or unavailable status.
+Run the local preflight and the issue-specific acceptance commands as the
+[gate suite](building.md#gate-suite) describes. Record each local gate's exit
+code or unavailable status.
 
 ## Self-review before you open a pull request
 
@@ -121,21 +121,89 @@ way in the pull request description.
 
 ### Quality criteria
 
-1. **Comments and docstrings** state what holds and why. Nothing in them is
+1. Comments and docstrings state what holds and why. Nothing in them is
    stale, narrates the obvious, tells the history, or contrasts the code with
    behavior it does not have.
-2. **Dead code.** No branch is unreachable, and no condition tests a state the
+2. Dead code: no branch is unreachable, and no condition tests a state the
    callers cannot produce.
-3. **Unused surface.** Every symbol, parameter, field, constant, and import
+3. Unused surface: every symbol, parameter, field, constant, and import
    has a consumer, and each item's visibility matches what its callers need.
-4. **Duplication.** The change repeats no logic within itself and none that
+4. Duplication: the change repeats no logic within itself and none that
    the workspace already provides. Read the neighboring modules before you add
    a helper.
-5. **Dark code.** The purpose of each item follows from its name, structure,
+5. Dark code: the purpose of each item follows from its name, structure,
    and comments. Names do not mislead, and the code prefers a plain
    construction to a clever one.
-6. **Size and structure.** Each function has one responsibility, and every
+6. Size and structure: each function has one responsibility, and every
    abstraction earns its indirection.
-7. **House style.** The change follows the writing rules of
+7. House style: the change follows the writing rules of
    [CONTRIBUTING.md](../../CONTRIBUTING.md), the lint posture of the root
    `Cargo.toml`, and the test naming of the crate it changes.
+
+## Mainnet release reviews
+
+A release that ships the `mainnet-write` build gets two reviews beyond the
+dimensions above: a signing-authority review and an approval-flow review.
+Each runs against the commit the release is cut from. Two reviewers who did
+not implement the reviewed code carry out each review.
+
+### Signing-authority review
+
+Scope:
+
+- The policy Allow path, from the policy decision to the signature.
+- The presence-gated witness path.
+- The operation record and its single use.
+- The recovery transitions.
+- The audit writer and its outbox.
+
+Attacker model:
+
+- An agent process with the wallet's MCP access.
+- Another process of the same OS user.
+- A malicious or stalled RPC endpoint.
+- A replayed or copied approval record.
+- A restored older state file.
+
+Pass criteria:
+
+- A test or a named probe reproduces every finding.
+- Every blocking finding is closed with a regression test.
+- Every claimed invariant has a named test.
+- The two reviewers did not implement the reviewed code.
+
+Deliverable: a written verdict that lists the invariants checked, the probes
+run, the findings, and the closure of each finding.
+
+### Approval-flow review
+
+Scope:
+
+- The durable approval record.
+- The consumption of an approval.
+- Revocation.
+- Re-sign invalidation: a policy re-sign at a higher sequence invalidates
+  every consent, witness, and authorization issued under the earlier
+  signature, also when the credentials are unchanged.
+  `mainnet_witness_reloads_current_policy` in
+  `crates/stellar-agent-core/src/approval/witness.rs` proves it for a consent given before the re-sign.
+- The intent the consent page renders.
+- The remote listener's origin and certificate binding.
+- Enrollment.
+
+Attacker model: every attacker of the signing-authority review, and a device
+on the approving network.
+
+Pass criteria:
+
+- A named test demonstrates single use.
+- A named test demonstrates digest binding.
+- A named test demonstrates revocation.
+- A named test demonstrates re-sign invalidation.
+- A named test demonstrates origin binding.
+- The browser acceptance suites pass at the configured origin. The
+  [serialized driver](building.md#live-testnet-acceptance-tests) runs them.
+- The wallet refuses the remote listener without the signed configuration.
+- Every finding is reproduced and closed as in the signing-authority review.
+
+Deliverable: a written verdict as for the signing-authority review.

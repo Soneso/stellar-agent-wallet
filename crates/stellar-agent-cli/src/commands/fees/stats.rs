@@ -20,7 +20,7 @@ pub struct FeesStatsArgs {
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 
-    /// Allow-listed Stellar RPC endpoint override.
+    /// Stellar RPC endpoint override.
     #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub rpc_url: Option<String>,
 
@@ -40,13 +40,6 @@ enum FeeStatsEndpoint {
 }
 
 impl FeeStatsEndpoint {
-    fn url(&self) -> &str {
-        match self {
-            Self::Profile(context) => &context.rpc_url,
-            Self::Url(url) => url,
-        }
-    }
-
     fn client(&self) -> Result<StellarRpcClient, WalletError> {
         match self {
             Self::Profile(context) => context.primary_client(),
@@ -65,14 +58,6 @@ pub async fn run(args: &FeesStatsArgs) -> i32 {
             return 1;
         }
     };
-
-    if args.rpc_url.is_some()
-        && let Err(err) = validate_rpc_url_for_cli(endpoint.url())
-    {
-        let envelope = Envelope::<()>::err(&err);
-        print_error(&envelope, args.output);
-        return 1;
-    }
 
     let client = match endpoint.client() {
         Ok(client) => client,
@@ -101,7 +86,7 @@ pub async fn run(args: &FeesStatsArgs) -> i32 {
 fn resolve_rpc_url(args: &FeesStatsArgs) -> Result<FeeStatsEndpoint, WalletError> {
     if let Some(name) = &args.profile {
         let profile = load_profile_reconciled(&ResolvedProfileName::from_flag(name))
-            .map_err(|e| e.to_wallet_error(name))?;
+            .map_err(|e| e.to_wallet_error())?;
         let context = crate::common::network::network_context_for_command(
             &profile,
             name,
@@ -113,17 +98,23 @@ fn resolve_rpc_url(args: &FeesStatsArgs) -> Result<FeeStatsEndpoint, WalletError
         )?;
         return Ok(FeeStatsEndpoint::Profile(context));
     }
-    Ok(FeeStatsEndpoint::Url(
-        args.rpc_url
-            .clone()
-            .unwrap_or_else(|| TESTNET_RPC_URL.to_owned()),
-    ))
+    let url = match args.rpc_url.as_deref() {
+        Some(url) => {
+            validate_rpc_url_for_cli(url)?;
+            url.to_owned()
+        }
+        None => TESTNET_RPC_URL.to_owned(),
+    };
+    Ok(FeeStatsEndpoint::Url(url))
 }
 
+/// Refuses an `--rpc-url` without `--profile` that breaks the HTTPS-without-
+/// credentials rule, naming the failed rule and never the URL.
 fn validate_rpc_url_for_cli(url: &str) -> Result<(), WalletError> {
     validate_rpc_url(url).map_err(|err| {
-        WalletError::Validation(ValidationError::ProfileNotFound {
-            name: format!("invalid rpc_url: {err}"),
+        WalletError::Validation(ValidationError::ConfigInvalid {
+            component: "--rpc-url",
+            reason: err.to_string(),
         })
     })
 }
@@ -180,15 +171,49 @@ mod tests {
         );
         let flag = FeesStatsArgs {
             profile: None,
-            rpc_url: Some("https://soroban-testnet.stellar.org".to_owned()),
+            rpc_url: Some("https://custom-rpc.example".to_owned()),
             output: OutputFormat::DEFAULT,
         };
         assert!(
             matches!(
                 resolve_rpc_url(&flag).unwrap(),
-                FeeStatsEndpoint::Url(url) if url == "https://soroban-testnet.stellar.org"
+                FeeStatsEndpoint::Url(url) if url == "https://custom-rpc.example"
             ),
-            "the flag's URL without a profile"
+            "any HTTPS flag URL without credentials works without a profile"
         );
+    }
+
+    /// A rejected `--rpc-url` without `--profile` names the failed rule and
+    /// never the URL or a host list.
+    #[test]
+    fn a_rejected_rpc_url_names_the_rule_not_the_url() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        for (url, expected_rule) in [
+            (
+                format!("http://custom-rpc.example/{CREDENTIAL_MARKER}"),
+                "must use https",
+            ),
+            (
+                format!("https://user:{CREDENTIAL_MARKER}@custom-rpc.example"),
+                "embedded credentials",
+            ),
+            (format!("{CREDENTIAL_MARKER} %%"), "invalid RPC URL"),
+        ] {
+            let err = resolve_rpc_url(&FeesStatsArgs {
+                profile: None,
+                rpc_url: Some(url),
+                output: OutputFormat::DEFAULT,
+            })
+            .err()
+            .unwrap();
+            assert_eq!(err.code(), "validation.config_invalid");
+            let msg = err.to_string();
+            assert!(msg.contains(expected_rule), "{msg}");
+            assert!(!msg.contains("allow-list"), "{msg}");
+            assert!(!msg.contains("custom-rpc.example"), "{msg}");
+            assert_no_marker(&err, CREDENTIAL_MARKER);
+            let envelope = serde_json::to_string(&Envelope::<()>::err(&err)).unwrap();
+            assert!(!envelope.contains(CREDENTIAL_MARKER), "{envelope}");
+        }
     }
 }

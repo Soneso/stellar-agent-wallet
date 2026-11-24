@@ -39,6 +39,8 @@ use stellar_agent_smart_account::managers::rules::{
     parse_c_strkey_to_smart_account,
 };
 use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
+use stellar_agent_smart_account::signing::ledger_witness::checked_secondary_rpc_url;
+use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use uuid::Uuid;
 
 use crate::common::ResolvedProfileName;
@@ -176,9 +178,9 @@ pub(crate) fn validate_source_account(source: &str) -> Result<(), WalletError> {
     stellar_strkey::ed25519::PublicKey::from_string(source)
         .map(|_| ())
         .map_err(|e| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("--source-account: invalid G-strkey ({e})"),
-            })
+            WalletError::Validation(ValidationError::address_check(format!(
+                "--source-account: invalid G-strkey ({e})"
+            )))
         })
 }
 
@@ -234,9 +236,7 @@ impl ReadHandlerContext {
         let profile_name = resolved.name;
         let (audit_writer, audit_log_path) = open_audit_writer(&profile, origin, &profile_name)?;
         let smart_account = parse_c_strkey_to_smart_account(args.account()).map_err(|e| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("--account: {e}"),
-            })
+            WalletError::Validation(ValidationError::address_check(format!("--account: {e}")))
         })?;
         Ok(Self {
             smart_account,
@@ -261,6 +261,7 @@ impl ReadHandlerContext {
             self.timeout,
             Arc::clone(&self.audit_writer),
             &self.audit_log_path,
+            None,
         )
     }
 
@@ -278,12 +279,39 @@ impl ReadHandlerContext {
             self.timeout,
             Arc::clone(&self.audit_writer),
             &self.audit_log_path,
+            None,
         )
     }
 }
 
+/// The secondary endpoint a signing verb's ledger witness reads.
+///
+/// Read-only verbs take the context's secondary or the primary and never call
+/// this. A signing verb calls it before signing key access, so an endpoint
+/// set that cannot witness a ledger refuses without loading the signer.
+///
+/// # Errors
+///
+/// [`SaError::LedgerWitnessUnavailable`] when the secondary is absent,
+/// malformed, or on the primary's host.
+#[allow(
+    clippy::result_large_err,
+    reason = "SaError::SignerSetDiverged carries full diagnostic state by design \
+              (see stellar-agent-smart-account's crate-level allow); this fn simply \
+              propagates it"
+)]
+pub(crate) fn signing_secondary_rpc_url(context: &NetworkContext) -> Result<&str, SaError> {
+    checked_secondary_rpc_url(
+        &context.rpc_url,
+        context.secondary_rpc_url.as_deref(),
+        context.network_passphrase(),
+    )
+}
+
 /// Common wallet handler context shared by rules and signers handlers.
 pub struct CommonHandlerContext {
+    /// Count admission passed to each signing manager.
+    pub intent_admission: Option<Arc<stellar_agent_network::NoValueAdmission>>,
     /// Resolved signing implementation.
     pub signer: Box<dyn Signer + Send + Sync>,
     /// Parsed smart-account address.
@@ -303,21 +331,42 @@ pub struct CommonHandlerContext {
 }
 
 impl CommonHandlerContext {
+    /// Builds a context with count admission for the submitting tool.
+    ///
+    /// # Errors
+    /// Refuses unavailable admission, audit state, endpoints, or signer setup.
+    pub async fn new_admitted(
+        args: &impl CommonArgsView,
+        resolved: ResolvedProfileName,
+        profile: Profile,
+        origin: ProfileOrigin,
+        context: &NetworkContext,
+        tool: &'static str,
+    ) -> Result<Self, WalletError> {
+        let admission = submission_admission(&profile, origin, &resolved.name, tool, context)?;
+        Self::new(args, resolved, profile, origin, context, Some(admission)).await
+    }
+
     /// Builds a context from common CLI args.
     ///
     /// # Errors
     ///
-    /// Returns a wallet error when signer resolution, smart-account parsing,
-    /// audit-log opening, or path setup fails.
+    /// Returns a wallet error when audit-log opening fails, the endpoints
+    /// cannot witness a ledger, or signer resolution, smart-account parsing or
+    /// path setup fails. A mainnet context keeps the refusal its verb raises.
     pub async fn new(
         args: &impl CommonArgsView,
         resolved: ResolvedProfileName,
         profile: Profile,
         origin: ProfileOrigin,
         context: &NetworkContext,
+        admission: Option<Arc<stellar_agent_network::NoValueAdmission>>,
     ) -> Result<Self, WalletError> {
         let profile_name = resolved.name.clone();
         let (audit_writer, audit_log_path) = open_audit_writer(&profile, origin, &profile_name)?;
+        if !context.chain_id.is_mainnet() {
+            signing_secondary_rpc_url(context).map_err(|e| wrap_sa_error(&e))?;
+        }
         let (signer, mlock_degradation) = resolve_signer(
             args.signer_source(),
             &profile,
@@ -326,9 +375,7 @@ impl CommonHandlerContext {
         )
         .await?;
         let smart_account = parse_c_strkey_to_smart_account(args.account()).map_err(|e| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("--account: {e}"),
-            })
+            WalletError::Validation(ValidationError::address_check(format!("--account: {e}")))
         })?;
         let timeout = Duration::from_secs(args.timeout_seconds());
 
@@ -340,6 +387,7 @@ impl CommonHandlerContext {
         );
 
         Ok(Self {
+            intent_admission: admission,
             signer,
             smart_account,
             profile_name,
@@ -366,6 +414,7 @@ impl CommonHandlerContext {
             self.timeout,
             Arc::clone(&self.audit_writer),
             &self.audit_log_path,
+            self.intent_admission.clone(),
         )
     }
 
@@ -384,6 +433,7 @@ impl CommonHandlerContext {
             self.timeout,
             Arc::clone(&self.audit_writer),
             &self.audit_log_path,
+            self.intent_admission.clone(),
         )
     }
 }
@@ -443,8 +493,9 @@ pub(crate) fn construct_signers_manager_from_fields(
     timeout: Duration,
     audit_writer: Arc<Mutex<AuditWriter>>,
     audit_log_path: &std::path::Path,
+    admission: Option<Arc<stellar_agent_network::NoValueAdmission>>,
 ) -> Result<SignersManager, WalletError> {
-    let config = SignersManagerConfig::new(
+    let mut config = SignersManagerConfig::new(
         context.rpc_url.clone(),
         context
             .secondary_rpc_url
@@ -458,6 +509,9 @@ pub(crate) fn construct_signers_manager_from_fields(
         timeout,
         context.chain_id.caip2_str().to_owned(),
     );
+    if let Some(admission) = admission {
+        config = config.with_intent_admission(admission);
+    }
     SignersManager::new(config).map_err(|e| {
         WalletError::Validation(ValidationError::ConfigInvalid {
             component: "SignersManager",
@@ -487,6 +541,7 @@ fn construct_context_rule_manager_from_fields(
     timeout: Duration,
     audit_writer: Arc<Mutex<AuditWriter>>,
     audit_log_path: &std::path::Path,
+    admission: Option<Arc<stellar_agent_network::NoValueAdmission>>,
 ) -> Result<ContextRuleManager, WalletError> {
     let signers_manager = construct_signers_manager_from_fields(
         profile_name,
@@ -494,6 +549,7 @@ fn construct_context_rule_manager_from_fields(
         timeout,
         Arc::clone(&audit_writer),
         audit_log_path,
+        admission.clone(),
     )
     .map_err(|e| {
         WalletError::Validation(ValidationError::ConfigInvalid {
@@ -518,6 +574,9 @@ fn construct_context_rule_manager_from_fields(
         config = config.with_session_rule_max_horizon_ledgers(ledgers);
     }
 
+    if let Some(admission) = admission {
+        config = config.with_intent_admission(admission);
+    }
     ContextRuleManager::new(config).map_err(|e| {
         WalletError::Validation(ValidationError::ConfigInvalid {
             component: "ContextRuleManager",
@@ -526,12 +585,48 @@ fn construct_context_rule_manager_from_fields(
     })
 }
 
+/// Opens the verifier registry a command resolves a contract address from.
+///
+/// # Errors
+///
+/// Returns the refusal of [`verifier_registry_refusal`] when the registry file
+/// cannot be read or parsed.
+pub(crate) fn open_verifier_registry() -> Result<VerifierRegistry, WalletError> {
+    verifier_registry_refusal(VerifierRegistry::open())
+}
+
+/// Maps a registry open result onto the command's refusal.
+///
+/// The refusal names the file to check and never the registry error: a read
+/// or parse failure of `networks.toml` describes text an operator wrote, and
+/// that text can hold a credential.
+fn verifier_registry_refusal(
+    opened: Result<VerifierRegistry, SaError>,
+) -> Result<VerifierRegistry, WalletError> {
+    opened.map_err(|_| {
+        WalletError::Validation(ValidationError::address_check(
+            "the verifier registry cannot be read; check networks.toml in the wallet \
+             configuration directory",
+        ))
+    })
+}
+
+/// Refusal of a verifier registry entry whose address fails the C-strkey
+/// parse. The address stays out because the refusal is for it.
+pub(crate) const VERIFIER_REGISTRY_ADDRESS_INVALID: &str = "verifier registry address must be a \
+     valid Stellar C-strkey; repair the verifier entry in networks.toml";
+
+/// Refusal of an Ed25519 verifier override or registry entry that fails the
+/// C-strkey parse. The address stays out because the refusal is for it.
+pub(crate) const ED25519_VERIFIER_ADDRESS_INVALID: &str = "--signer-ed25519 verifier must be a \
+     valid Stellar C-strkey; supply --verifier or configure the verifier entry in networks.toml";
+
 /// Builds the `WalletError::SmartAccount` envelope an `emit_sa_error` call
 /// would render, with operator-facing filesystem paths under `$HOME` redacted
 /// to `<HOME>/...`.
 ///
 /// Several `SaError` variants embed `path: PathBuf` in their `Display` (e.g.
-/// `NetworksTomlIo`, `NetworksTomlParse`). Without
+/// `AuditWriterIo`). Without
 /// redaction the absolute prefix leaks the operator's home directory and
 /// active profile name through the wire envelope (same class as the
 /// `WalletError::Io.message` path leak handled in [`wallet_io_error`]).
@@ -642,13 +737,13 @@ pub(crate) fn load_command_profile(
 /// acquisition reads the audit binding and the audit key.
 ///
 /// A store already registered is kept.
-fn ensure_keyring_store() -> Result<(), WalletError> {
+pub(crate) fn ensure_keyring_store() -> Result<(), WalletError> {
     ensure_keyring_store_with(register_keyring_store)
 }
 
 /// [`ensure_keyring_store`] with the registrar injected: `register` runs only
 /// when no store is registered.
-fn ensure_keyring_store_with(
+pub(crate) fn ensure_keyring_store_with(
     register: impl FnOnce() -> Result<(), WalletError>,
 ) -> Result<(), WalletError> {
     if keyring_core::get_default_store().is_none() {
@@ -719,7 +814,6 @@ pub(crate) fn open_audit_writer(
 /// Other load failures map to an audit-writer I/O error.
 pub(crate) fn map_access_error(
     err: &crate::common::profile_access::ProfileAccessError,
-    profile_name: &str,
 ) -> WalletError {
     use stellar_agent_core::profile::loader::ProfileLoadError;
 
@@ -733,10 +827,10 @@ pub(crate) fn map_access_error(
             | ProfileLoadError::MainnetRpcUrlRequired { .. }
             | ProfileLoadError::InvalidEndpointUrl { .. }
             | ProfileLoadError::InvalidProviderAttestation { .. },
-        ) => err.to_wallet_error(profile_name),
+        ) => err.to_wallet_error(),
         ProfileAccessError::Load(_) => wallet_io_error(
             IoSource::AuditWriterSetup,
-            format!("profile resolution failed: {}", err.message(profile_name)),
+            format!("profile resolution failed: {}", err.message()),
         ),
     }
 }
@@ -780,6 +874,34 @@ pub(crate) fn open_audit_writer_read_only(
     Ok((writer, log_path))
 }
 
+/// Checks the audit binding and witness configuration before sizing a signing command.
+pub(crate) fn submission_admission(
+    profile: &Profile,
+    origin: ProfileOrigin,
+    profile_name: &str,
+    tool: &'static str,
+    context: &NetworkContext,
+) -> Result<Arc<stellar_agent_network::NoValueAdmission>, WalletError> {
+    open_audit_writer(profile, origin, profile_name)?;
+    if !context.chain_id.is_mainnet() {
+        signing_secondary_rpc_url(context).map_err(|error| wrap_sa_error(&error))?;
+    }
+    let now_ms = stellar_agent_core::timefmt::now_unix_ms().map_err(|_| {
+        WalletError::Submission(
+            stellar_agent_core::SubmissionError::IntentRecordUnavailable {
+                class: "policy_unavailable",
+            },
+        )
+    })?;
+    crate::commands::submission_record::no_value_admission(
+        profile,
+        profile_name,
+        tool,
+        context.chain_id.caip2_str(),
+        now_ms,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::panic, reason = "test-only assertions")]
@@ -787,15 +909,78 @@ mod tests {
     use stellar_agent_core::profile::name::ProfileNameSource;
 
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn intent_total_recorder_codes_reach_cli_adapters() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new()
+            .expect("the adapter fixture creates a marked sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for (case, code) in [
+            ("unavailable", "policy.total_epoch_unavailable"),
+            ("stale", "policy.total_epoch_stale"),
+            ("retired", "policy.total_epoch_retired"),
+            ("exhausted", "policy.deny.total_budget_exhausted"),
+            ("binding", "submission.intent_binding_mismatch"),
+            ("invalid", "submission.intent_record_unavailable"),
+        ] {
+            let error = stellar_agent_network::policy_state::store::total_intent_test_helpers::recorder_refusal(case).await;
+            for mapped in
+                stellar_agent_smart_account::signing::intent_test_helpers::total_intent_error_routes(
+                    &error,
+                )
+            {
+                assert_eq!(wrap_sa_error(&mapped).code(), code, "plain/{case}");
+                assert_eq!(
+                    build_sa_error_envelope(&mapped).code(),
+                    code,
+                    "redacted/{case}"
+                );
+            }
+        }
+    }
     use crate::common::signer_ceremony::test_fixtures::{
         EnrolledPin, assert_enrolled_outcome, enrolled_mainnet_profile,
     };
+
+    /// A registry file whose malformed line holds a credential is refused by
+    /// the file to check; the line reaches neither the error, its source
+    /// chain, nor the envelope.
+    #[test]
+    fn a_malformed_registry_line_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("networks.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[networks.testnet]\nrpc_url = \"https://user:{CREDENTIAL_MARKER}@rpc.example\n"
+            ),
+        )
+        .expect("write");
+
+        let err = verifier_registry_refusal(VerifierRegistry::open_at(path))
+            .expect_err("a malformed registry is refused");
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        assert_eq!(
+            err.to_string(),
+            "the verifier registry cannot be read; check networks.toml in the wallet \
+             configuration directory"
+        );
+        let envelope = Envelope::<()>::err(&err);
+        let json = serde_json::to_string(&envelope).expect("serialize");
+        assert_no_marker_in_text(&json, CREDENTIAL_MARKER);
+    }
 
     #[test]
     fn audit_writer_mapping_preserves_protected_refusals() {
         for error in crate::common::profile_access::protected_load_errors_for_test() {
             let expected = error.code();
-            let result = Err::<(), _>(map_access_error(&error, "mainnet"));
+            let result = Err::<(), _>(map_access_error(&error));
             let error = match result {
                 Err(error) => error,
                 Ok(_) => panic!("protected refusal was swallowed"),
@@ -861,7 +1046,13 @@ mod tests {
     fn open_audit_writer_is_origin_aware() {
         use stellar_agent_core::profile::loader as profile_loader;
         use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         keyring_mock::install().expect("mock store");
 
@@ -893,15 +1084,30 @@ mod tests {
     #[serial_test::serial]
     fn open_audit_writer_refuses_a_named_absent_profile() {
         use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         keyring_mock::install().expect("mock store");
 
         let err = load_command_profile(&named("gate-absent"))
             .expect_err("a named profile with no file must refuse, not synthesize");
         assert!(
-            err.to_string().contains("gate-absent"),
-            "the refusal must name the profile the operator asked for: {err}"
+            matches!(
+                err,
+                ProfileAccessError::Load(
+                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound
+                )
+            ),
+            "a named profile with no file must refuse as absent: {err}"
+        );
+        assert!(
+            !err.message().contains("gate-absent") && !err.to_string().contains("gate-absent"),
+            "the refusal must not repeat the requested name: {err}"
         );
     }
 
@@ -912,7 +1118,13 @@ mod tests {
     #[serial_test::serial]
     fn open_audit_writer_synthesizes_when_no_profile_was_named() {
         use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");
+        assert!(
+            dir.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home = StellarAgentHomeGuard::new(dir.path());
         keyring_mock::install().expect("mock store");
 
@@ -935,6 +1147,10 @@ mod tests {
         reason = "test-only process environment mutation; the variable name is unique to this test"
     )]
     async fn resolve_signer_secret_env_derives_the_expected_public_key() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let seed = [0x42u8; 32];
         let s_strkey = stellar_strkey::ed25519::PrivateKey(seed)
             .as_unredacted()
@@ -976,12 +1192,17 @@ mod tests {
         }
     }
 
-    /// An unset env var refuses with `validation.secret_env_not_set` naming the
-    /// variable — an input-validation failure, not a keyring condition.
+    /// An unset env var refuses with `validation.secret_env_not_set` without
+    /// retaining the variable name.
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn resolve_signer_unset_env_var_is_refused() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let flags = SignerSourceFlags {
-            signer_secret_env: Some("COMMON_RESOLVE_SIGNER_UNSET_VAR_TEST".to_owned()),
+            signer_secret_env: Some("COMMON_RESOLVE_SIGNER_UNSET_CREDMARKER7".to_owned()),
             sign_with_ledger: false,
             account_index: None,
         };
@@ -997,16 +1218,15 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.code(), "validation.secret_env_not_set");
-        assert!(
-            err.to_string()
-                .contains("COMMON_RESOLVE_SIGNER_UNSET_VAR_TEST"),
-            "error must name the variable: {err}"
+        assert_eq!(
+            err.to_string(),
+            "the secret environment variable named by the argument is not set"
         );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, "CREDMARKER7");
     }
 
     /// A malformed S-strkey refuses before any unlock with
-    /// `validation.secret_env_invalid`, naming the variable but never echoing
-    /// its value.
+    /// `validation.secret_env_invalid`, without echoing the variable name or value.
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
     #[allow(
@@ -1014,9 +1234,13 @@ mod tests {
         reason = "test-only process environment mutation; the variable name is unique to this test"
     )]
     async fn resolve_signer_invalid_s_strkey_is_refused() {
-        let var = "COMMON_RESOLVE_SIGNER_MALFORMED_TEST_SK";
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let var = "COMMON_RESOLVE_SIGNER_MALFORMED_CREDMARKER7";
         unsafe {
-            std::env::set_var(var, "not-an-s-strkey");
+            std::env::set_var(var, "invalid-CREDMARKER7");
         }
         let flags = SignerSourceFlags {
             signer_secret_env: Some(var.to_owned()),
@@ -1035,14 +1259,11 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.code(), "validation.secret_env_invalid");
-        assert!(
-            err.to_string().contains(var),
-            "error must name the variable: {err}"
+        assert_eq!(
+            err.to_string(),
+            "the secret environment variable named by the argument must contain a valid S-strkey"
         );
-        assert!(
-            !err.to_string().contains("not-an-s-strkey"),
-            "error must not echo the malformed value: {err}"
-        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, "CREDMARKER7");
         unsafe {
             std::env::remove_var(var);
         }
@@ -1053,7 +1274,12 @@ mod tests {
     /// device can return a signer. The test rejects every `auth.keyring_*`
     /// code, including missing entries and platform failures.
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn resolve_signer_ledger_source_never_reports_keyring_error() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let flags = SignerSourceFlags {
             signer_secret_env: None,
             sign_with_ledger: true,
@@ -1087,7 +1313,12 @@ mod tests {
     /// access or network call with `validation.signer_source_required` — a
     /// missing-input failure, not a keyring condition.
     #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
     async fn resolve_signer_missing_source_reports_signer_source_required() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let flags = SignerSourceFlags {
             signer_secret_env: None,
             sign_with_ledger: false,
@@ -1108,47 +1339,48 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::parallel]
     fn wallet_io_error_redacts_home_prefixed_path() {
         let home = std::env::var("HOME").expect("HOME is set in test environment");
-        let message = format!(
-            "networks.toml I/O error at {home}/.local/share/stellar-agent/networks.toml: Permission denied"
-        );
+        let suffix = stellar_agent_test_support::sandbox::LINUX_WALLET_SUFFIX.trim();
+        let message =
+            format!("networks.toml I/O error at {home}/{suffix}/networks.toml: Permission denied");
 
         let err = wallet_io_error(IoSource::MulticallRegistryLoad, message);
 
         match err {
             WalletError::Io { message, .. } => {
-                assert!(message.contains("<HOME>/.local/share/stellar-agent/networks.toml"));
+                assert!(message.contains(&format!("<HOME>/{suffix}/networks.toml")));
                 assert!(!message.contains(&format!("{home}/.local/share/")));
             }
             other => panic!("expected WalletError::Io, got {other:?}"),
         }
     }
 
-    /// Closes the parallel-leak path opened by
-    /// `SaError::NetworksTomlParse.path` embedding `$HOME` in its
-    /// Display impl. `emit_sa_error` (and therefore
-    /// `build_sa_error_envelope`) must redact the message before it reaches
-    /// the wire envelope, the same way `wallet_io_error` redacts
-    /// `WalletError::Io` paths.
+    /// `SaError::NetworksTomlIo` embeds its path in its Display.
+    /// `emit_sa_error` (and therefore `build_sa_error_envelope`) must redact
+    /// the message before it reaches the wire envelope, the same way
+    /// `wallet_io_error` redacts `WalletError::Io` paths.
     #[test]
+    #[serial_test::parallel]
     fn build_sa_error_envelope_redacts_home_prefixed_paths_from_smart_account_message() {
         use std::path::PathBuf;
 
         let home = std::env::var("HOME").expect("HOME is set in test environment");
-        let toml_text = "not = valid = toml";
-        let source: toml::de::Error = toml::from_str::<toml::Value>(toml_text)
-            .expect_err("malformed TOML must fail to parse");
-        let path = PathBuf::from(format!("{home}/.local/share/stellar-agent/networks.toml"));
-        let sa_err = SaError::NetworksTomlParse { source, path };
+        let suffix = stellar_agent_test_support::sandbox::LINUX_WALLET_SUFFIX.trim();
+        let path = PathBuf::from(format!("{home}/{suffix}/networks.toml"));
+        let sa_err = SaError::AuditWriterIo {
+            detail: "permission denied".to_owned(),
+            path,
+        };
 
         let wallet_err = build_sa_error_envelope(&sa_err);
 
         match wallet_err {
             WalletError::SmartAccount { wire_code, message } => {
-                assert_eq!(wire_code, "sa.networks_toml_parse");
+                assert_eq!(wire_code, "sa.audit_writer_io");
                 assert!(
-                    message.contains("<HOME>/.local/share/stellar-agent/networks.toml"),
+                    message.contains(&format!("<HOME>/{suffix}/networks.toml")),
                     "expected <HOME>-redacted path in message: {message}"
                 );
                 assert!(
@@ -1192,18 +1424,30 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_resolver_equal() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_resolver_case(EnrolledPin::Derived).await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_resolver_placeholder() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_resolver_case(EnrolledPin::Placeholder).await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_resolver_mismatch() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         enrolled_resolver_case(EnrolledPin::Other).await;
     }
 
@@ -1211,6 +1455,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_resolver_testnet() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = enrolled_mainnet_profile(EnrolledPin::Other);
         profile.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
         resolve_test_seed_signer(&profile)
@@ -1240,6 +1488,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn read_only_open_refuses_a_changed_binding_and_creates_nothing() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = repointed_profile("read-only-binding", dir.path());
@@ -1258,6 +1510,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn signing_open_refuses_a_changed_binding_and_creates_nothing() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = repointed_profile("signing-binding", dir.path());

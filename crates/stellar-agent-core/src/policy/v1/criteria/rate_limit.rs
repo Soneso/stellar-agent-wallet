@@ -24,8 +24,6 @@
 //! The criterion only reads accumulated state.  Recording a new call entry at
 //! commit time is the dispatch site's responsibility.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
@@ -92,6 +90,10 @@ impl RateLimitCriterion {
 }
 
 impl Criterion for RateLimitCriterion {
+    fn windowed(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "rate_limit"
     }
@@ -108,16 +110,10 @@ impl Criterion for RateLimitCriterion {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] when:
-    /// - `SystemTime::now()` is before UNIX epoch.
-    /// - The state store detects clock skew exceeding 30 seconds.
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] when the state store
+    /// detects clock skew exceeding 30 seconds against `ctx.now_ms`.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .map_err(|e| PolicyError::CriterionEvaluationFailed {
-                detail: format!("rate_limit: system clock is before UNIX epoch: {e}"),
-            })?;
+        let now_ms = ctx.now_ms;
 
         let state_key = StateKey::new(
             ctx.profile_name,
@@ -200,31 +196,30 @@ impl Criterion for RateLimitCriterion {
     /// (this criterion's `evaluate` is not called at bundle level either — see
     /// its per-tool-call scoping).
     fn record_confirmed(&self, ctx: &EvalContext<'_>) -> Result<Vec<WindowEntry>, PolicyError> {
+        let entry = self.size(ctx, ctx.now_ms)?;
+        if let Some(entry) = &entry {
+            ctx.state_store
+                .append(entry.key(), entry.timestamp_ms(), entry.amount())
+                .map_err(|error| PolicyError::CriterionEvaluationFailed {
+                    detail: format!("rate_limit: record_confirmed state store error: {error}"),
+                })?;
+        }
+        Ok(entry.into_iter().collect())
+    }
+
+    fn size(&self, ctx: &EvalContext<'_>, now_ms: u64) -> Result<Option<WindowEntry>, PolicyError> {
         // Bundle path: per-inner counting is BundleRateLimitCriterion's job;
         // this criterion counts single-tx calls only.
         if ctx.bundle.is_some() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .map_err(|e| PolicyError::CriterionEvaluationFailed {
-                detail: format!(
-                    "rate_limit: record_confirmed system clock is before UNIX epoch: {e}"
-                ),
-            })?;
         let state_key = StateKey::new(ctx.profile_name, 1, "rate_limit", self.window.as_secs());
-        ctx.state_store.append(&state_key, now_ms, 1).map_err(|e| {
-            PolicyError::CriterionEvaluationFailed {
-                detail: format!("rate_limit: record_confirmed state store error: {e}"),
-            }
-        })?;
-        Ok(vec![WindowEntry::new(
+        Ok(Some(WindowEntry::new(
             state_key,
             now_ms,
             1,
             self.window_limit(),
-        )])
+        )))
     }
 }
 
@@ -289,19 +284,23 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: now_ms(),
         }
     }
 
+    /// The fixture evaluation instant every context of this module carries.
     fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after UNIX epoch")
-            .as_millis() as u64
+        1_700_000_000_000
     }
 
     #[test]
     #[serial]
     fn zero_calls_in_window_allows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -316,6 +315,9 @@ mod tests {
     #[test]
     #[serial]
     fn calls_below_cap_minus_one_allows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -336,6 +338,9 @@ mod tests {
     #[test]
     #[serial]
     fn calls_at_cap_denies_next_call() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -359,6 +364,9 @@ mod tests {
     #[test]
     #[serial]
     fn expired_entries_are_evicted_before_count() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -387,6 +395,9 @@ mod tests {
     #[test]
     #[serial]
     fn clock_skew_over_30s_returns_evaluation_failed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -410,6 +421,9 @@ mod tests {
     #[test]
     #[serial]
     fn evaluate_with_bundle_overlay_single_tx_none_sees_zero_overlay() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -438,6 +452,9 @@ mod tests {
     #[test]
     #[serial]
     fn evaluate_with_bundle_overlay_accumulated_calls_added_to_window() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::bundle::{BundleStateOverlay, BundleView};
 
         let tool = make_tool("stellar_pay");
@@ -478,6 +495,9 @@ mod tests {
             sep45_sessions: None,
             state_store: &store,
             bundle: Some(&view),
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: now_ms(),
         };
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(

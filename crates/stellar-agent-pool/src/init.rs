@@ -112,17 +112,12 @@ pub struct InitResult {
 /// [`PoolError::FeeOverflow`] when the total does not fit the transaction fee field.
 pub fn total_init_fee(fee_per_op: u32, channel_count: usize) -> Result<u32, PoolError> {
     if !(1..=ChannelPool::MAX_SIZE).contains(&channel_count) {
-        return Err(PoolError::SizeOutOfRange {
-            requested: channel_count,
-        });
+        return Err(PoolError::SizeOutOfRange);
     }
     let op_count = channel_count as u32 * 3;
     fee_per_op
         .checked_mul(op_count)
-        .ok_or(PoolError::FeeOverflow {
-            fee_per_op,
-            op_count,
-        })
+        .ok_or(PoolError::FeeOverflow { op_count })
 }
 
 /// Builds and submits the CAP-33 sponsored-reserve sandwich transaction.
@@ -152,7 +147,7 @@ pub async fn init_pool(
 ) -> Result<InitResult, PoolError> {
     let n = params.channel_strkeys.len();
     if n == 0 || n > ChannelPool::MAX_SIZE {
-        return Err(PoolError::SizeOutOfRange { requested: n });
+        return Err(PoolError::SizeOutOfRange);
     }
     if params.channel_signers.len() != n || params.channel_indices.len() != n {
         return Err(PoolError::InitFailed {
@@ -462,15 +457,12 @@ mod tests {
         for count in [0, 20, usize::MAX] {
             assert!(matches!(
                 total_init_fee(100, count),
-                Err(PoolError::SizeOutOfRange { .. })
+                Err(PoolError::SizeOutOfRange)
             ));
         }
         assert!(matches!(
             total_init_fee(u32::MAX, 1),
-            Err(PoolError::FeeOverflow {
-                fee_per_op: u32::MAX,
-                op_count: 3
-            })
+            Err(PoolError::FeeOverflow { op_count: 3 })
         ));
     }
 }

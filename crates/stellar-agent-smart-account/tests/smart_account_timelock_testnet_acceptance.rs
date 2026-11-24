@@ -69,9 +69,8 @@ use stellar_agent_smart_account::timelock::{
     TimelockOperationStateView, cancel, execute, list_pending, query_operation_state,
     schedule_upgrade,
 };
-use stellar_agent_test_support::EchoIdResponder;
 use wiremock::{
-    Mock, MockServer,
+    Mock, MockServer, Request, Respond, ResponseTemplate,
     matchers::{method, path},
 };
 use zeroize::Zeroizing;
@@ -123,19 +122,14 @@ fn signer_from_seed(seed_bytes: [u8; 32]) -> Box<dyn stellar_agent_network::Sign
 
 /// Funds an account via testnet Friendbot and waits until it is queryable.
 ///
-/// Friendbot returning 200 does not guarantee the RPC has indexed the new
-/// account yet; the view can lag by a few seconds. The wait lets callers build
-/// transactions against the account immediately after this returns.
+/// A funded answer from Friendbot does not guarantee the RPC has indexed the
+/// new account yet; the view can lag by a few seconds. The wait lets callers
+/// build transactions against the account immediately after this returns.
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 200 for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 
     let rpc = stellar_agent_network::StellarRpcClient::new(TESTNET_RPC_URL)
         .expect("RPC client construction must succeed");
@@ -247,6 +241,7 @@ async fn deploy_timelock_controller(
 /// audit-row presence on cancel).
 #[tokio::test]
 async fn t1_schedule_cancel_lifecycle() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // Setup: fresh signer (proposer + canceller via CANCELLER_ROLE auto-grant).
     let (signer_g, seed_bytes, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
@@ -267,13 +262,16 @@ async fn t1_schedule_cancel_lifecycle() {
     // Step 1: Schedule.
     let scheduled = schedule_upgrade(
         stellar_agent_smart_account::timelock::TimelockScheduleArgs::builder()
+            .submission_recorder(
+                &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .target_strkey(&target_strkey)
             .function("update_delay")
             .delay_ledgers(10)
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id_schedule)
@@ -311,11 +309,14 @@ async fn t1_schedule_cancel_lifecycle() {
     // Step 2: Cancel.
     cancel(
         stellar_agent_smart_account::timelock::TimelockCancelArgs::builder()
+            .intent_admission(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .operation_id(&operation_id)
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id_cancel)
@@ -418,6 +419,7 @@ async fn t1_schedule_cancel_lifecycle() {
 /// `Waiting { ready_ledger <= current_ledger }` to `Ready`.
 #[tokio::test]
 async fn t2_schedule_ready_state_min_delay_zero() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, seed_bytes, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -432,13 +434,16 @@ async fn t2_schedule_ready_state_min_delay_zero() {
     // Schedule: target=timelock itself, function="get_min_delay" (harmless view fn).
     let scheduled = schedule_upgrade(
         stellar_agent_smart_account::timelock::TimelockScheduleArgs::builder()
+            .submission_recorder(
+                &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .target_strkey(&timelock_strkey)
             .function("get_min_delay")
             .delay_ledgers(0) // delay_ledgers = 0 → immediately Ready
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id)
@@ -518,11 +523,14 @@ async fn t3_cancel_unknown_operation_id_rejected() {
 
     let result = cancel(
         stellar_agent_smart_account::timelock::TimelockCancelArgs::builder()
+            .intent_admission(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .operation_id(&random_op_id)
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id)
@@ -587,13 +595,16 @@ async fn t4_execute_not_ready_rejected() {
     // the state pre-check runs after simulate_hash_operation (fallback path).
     let result = execute(
         stellar_agent_smart_account::timelock::TimelockExecuteArgs::builder()
+            .submission_recorder(
+                &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .target_strkey(&timelock_strkey)
             .function("get_min_delay")
             .salt(random_salt)
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id)
@@ -627,9 +638,9 @@ async fn t4_execute_not_ready_rejected() {
             );
         }
         SaError::NetworkRpcDivergence { .. } => {
-            // Both RPCs returned the same Unset state; divergence not expected on single-RPC
-            // test setup but is an acceptable outcome (both RPCs are the same endpoint).
-            eprintln!("[T-4] PASS (divergence path — same RPC for primary+secondary)");
+            // Two providers can answer one read from different ledgers, and
+            // either refusal leaves the operation unexecuted.
+            eprintln!("[T-4] PASS (divergence path)");
         }
         other => panic!(
             "expected TimelockExecuteFailed {{ OperationNotReady {{ Unset }} }} \
@@ -655,6 +666,7 @@ async fn t4_execute_not_ready_rejected() {
 /// from the `schedule_upgrade` arguments.
 #[tokio::test]
 async fn t5_schedule_emits_audit_row() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     let (signer_g, seed_bytes, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -670,13 +682,16 @@ async fn t5_schedule_emits_audit_row() {
 
     let scheduled = schedule_upgrade(
         stellar_agent_smart_account::timelock::TimelockScheduleArgs::builder()
+            .submission_recorder(
+                &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .target_strkey(&timelock_strkey)
             .function(FUNCTION_NAME)
             .delay_ledgers(DELAY_LEDGERS)
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id)
@@ -750,6 +765,81 @@ async fn t5_schedule_emits_audit_row() {
 
 // ── Dual-RPC divergence rejection on cross_confirm_event ────────────────
 
+/// A secondary endpoint that relays every request to the configured testnet
+/// secondary and strips the events from its `getTransaction` answers.
+///
+/// The proxy forwards ledger observations from the configured secondary and
+/// removes transaction events.
+struct EventStrippingSecondary {
+    upstream: &'static str,
+}
+
+impl EventStrippingSecondary {
+    /// A proxy in front of [`stellar_agent_test_support::testnet_secondary_rpc_url`].
+    fn relaying_to_the_testnet_secondary() -> Self {
+        Self {
+            upstream: stellar_agent_test_support::testnet_secondary_rpc_url(),
+        }
+    }
+
+    /// Relays the JSON-RPC request `body` to the upstream and returns its
+    /// answer.
+    ///
+    /// [`Respond::respond`] is synchronous and runs on the mock server's own
+    /// runtime, so the request goes out on a thread with a runtime of its
+    /// own.
+    fn relay(&self, body: &[u8]) -> Result<serde_json::Value, String> {
+        let upstream = self.upstream;
+        let body = body.to_vec();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("relay runtime: {e}"))?;
+            runtime.block_on(async move {
+                reqwest::Client::new()
+                    .post(upstream)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .timeout(Duration::from_secs(30))
+                    .send()
+                    .await
+                    .map_err(|e| format!("relay request: {e}"))?
+                    .error_for_status()
+                    .map_err(|e| format!("relay status: {e}"))?
+                    .json::<serde_json::Value>()
+                    .await
+                    .map_err(|e| format!("relay body: {e}"))
+            })
+        })
+        .join()
+        .map_err(|_| "the relay thread panicked".to_owned())?
+    }
+}
+
+impl Respond for EventStrippingSecondary {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let transaction_lookup = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .is_ok_and(|body| body["method"] == "getTransaction");
+        match self.relay(&request.body) {
+            Ok(mut answer) => {
+                if transaction_lookup
+                    && let Some(result) = answer
+                        .get_mut("result")
+                        .and_then(serde_json::Value::as_object_mut)
+                {
+                    result.remove("events");
+                }
+                ResponseTemplate::new(200).set_body_json(answer)
+            }
+            Err(reason) => {
+                eprintln!("[T-6] the relay to the configured secondary failed: {reason}");
+                ResponseTemplate::new(502)
+            }
+        }
+    }
+}
+
 /// Secondary RPC returns no events → `NetworkRpcDivergence` on cancel.
 ///
 /// Demonstrates dual-RPC defence-in-depth: a compromised or divergent secondary
@@ -760,9 +850,10 @@ async fn t5_schedule_emits_audit_row() {
 /// # Test strategy
 ///
 /// 1. Deploy a timelock contract on live testnet and schedule an operation.
-/// 2. Start a wiremock server to act as the secondary RPC.
-///    The wiremock returns a bare `SUCCESS` response with NO `events` field for
-///    any `getTransaction` call — mimicking a compromised RPC that strips event data.
+/// 2. Start a wiremock server to act as the secondary RPC. It relays every
+///    request to the configured testnet secondary and removes the `events`
+///    field from each `getTransaction` answer, mimicking a compromised RPC that
+///    strips event data.
 /// 3. Call `cancel(primary=testnet, secondary=wiremock)`.
 /// 4. The primary RPC confirms the `OperationCancelled` event is present (real
 ///    testnet response). The secondary wiremock returns no events → `secondary_found = false`.
@@ -777,6 +868,7 @@ async fn t5_schedule_emits_audit_row() {
 /// defence-in-depth measure with no equivalent in the underlying contract.
 #[tokio::test]
 async fn t6_cross_confirm_event_divergence_rejection() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // Setup: fresh signer (proposer + canceller).
     let (signer_g, seed_bytes, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
@@ -792,13 +884,16 @@ async fn t6_cross_confirm_event_divergence_rejection() {
     // Schedule an operation on live testnet (primary RPC only at this point).
     let scheduled = schedule_upgrade(
         stellar_agent_smart_account::timelock::TimelockScheduleArgs::builder()
+            .submission_recorder(
+                &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .target_strkey(&timelock_strkey)
             .function("update_delay")
             .delay_ledgers(10)
             .signer(signer_box.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL) // secondary = testnet for schedule (no divergence here)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id_schedule)
@@ -809,30 +904,14 @@ async fn t6_cross_confirm_event_divergence_rejection() {
     let operation_id = scheduled.operation_id;
     eprintln!("[T-6] scheduled: {}", operation_id.redacted());
 
-    // Start wiremock secondary that returns SUCCESS with NO events field.
-    // This mimics a compromised RPC stripping event data from getTransaction responses.
+    // The secondary mock relays to the configured testnet secondary, so the
+    // ledger witness reads that endpoint's network and height. It removes the
+    // `events` field from every getTransaction answer: `cross_confirm_event`
+    // then finds no contract event on the secondary.
     let secondary_mock = MockServer::start().await;
-
-    // The secondary responds to any POST (getTransaction, simulateTransaction, etc.)
-    // with a bare SUCCESS JSON-RPC response that has no `events` field.
-    // `cross_confirm_event` calls getTransaction on the secondary; `to_events()` on a
-    // response without `events` returns `None`, so `event_present_in_response` → false.
-    //
-    // EchoIdResponder mirrors the incoming JSON-RPC `id` back in the response so that
-    // the RPC client's per-request id validation succeeds regardless of the sequence
-    // counter value.
     Mock::given(method("POST"))
         .and(path("/"))
-        .respond_with(EchoIdResponder::new(serde_json::json!({
-            "status": "SUCCESS",
-            "latestLedger": 1001,
-            "latestLedgerCloseTime": "1234567890",
-            "oldestLedger": 1,
-            "oldestLedgerCloseTime": "1234000000",
-            "createdAt": "1234567890",
-            "ledger": 1000
-            // Note: no "events" field — simulates a compromised RPC stripping event data
-        })))
+        .respond_with(EventStrippingSecondary::relaying_to_the_testnet_secondary())
         .mount(&secondary_mock)
         .await;
 
@@ -845,6 +924,9 @@ async fn t6_cross_confirm_event_divergence_rejection() {
     let signer_box2 = signer_from_seed(seed_bytes);
     let cancel_result = cancel(
         stellar_agent_smart_account::timelock::TimelockCancelArgs::builder()
+            .intent_admission(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .operation_id(&operation_id)
             .signer(signer_box2.as_ref())
@@ -913,6 +995,7 @@ async fn t6_cross_confirm_event_divergence_rejection() {
 /// authorisation.
 #[tokio::test]
 async fn t7_schedule_execute_min_delay_zero() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // Controller signer: proposer + executor role on the controller timelock.
     let (signer_g, seed_bytes, _signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
@@ -948,13 +1031,16 @@ async fn t7_schedule_execute_min_delay_zero() {
     let signer_box_schedule = signer_from_seed(seed_bytes);
     let scheduled: ScheduledTimelockOperation = schedule_upgrade(
         stellar_agent_smart_account::timelock::TimelockScheduleArgs::builder()
+            .submission_recorder(
+                &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .target_strkey(target_strkey)
             .function("symbol")
             .delay_ledgers(0)
             .signer(signer_box_schedule.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id_schedule)
@@ -977,6 +1063,9 @@ async fn t7_schedule_execute_min_delay_zero() {
     let signer_box_exec = signer_from_seed(seed_bytes);
     let execute_result = execute(
         stellar_agent_smart_account::timelock::TimelockExecuteArgs::builder()
+            .submission_recorder(
+                &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+            )
             .timelock_contract_strkey(&timelock_strkey)
             .target_strkey(target_strkey)
             .function("symbol")
@@ -984,7 +1073,7 @@ async fn t7_schedule_execute_min_delay_zero() {
             .expected_operation_id(&scheduled.operation_id)
             .signer(signer_box_exec.as_ref())
             .primary_rpc_url(TESTNET_RPC_URL)
-            .secondary_rpc_url(TESTNET_RPC_URL)
+            .secondary_rpc_url(stellar_agent_test_support::testnet_secondary_rpc_url())
             .network_passphrase(TESTNET_PASSPHRASE)
             .audit_writer(&audit_writer)
             .request_id(&request_id_execute)

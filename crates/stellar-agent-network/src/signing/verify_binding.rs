@@ -56,7 +56,7 @@ use tokio::time::Instant;
 
 use crate::account::fetch_account_signers;
 use crate::client::StellarRpcClient;
-use crate::submit::{MAINNET_PASSPHRASE, bytes_to_hex};
+use crate::submit::MAINNET_PASSPHRASE;
 
 /// The `Display` detail used when a legacy V0 envelope reaches a path that
 /// only handles the SEP-23 tagged-transaction variants.
@@ -304,11 +304,7 @@ fn verify_one_signature(
     mainnet_hash: &[u8; 32],
 ) -> Result<(), WalletError> {
     let hint = signature.hint.0;
-    let unverifiable = || {
-        WalletError::Network(NetworkError::EnvelopeSignatureUnverifiable {
-            hint: bytes_to_hex(&hint),
-        })
-    };
+    let unverifiable = || WalletError::Network(NetworkError::EnvelopeSignatureUnverifiable);
 
     let candidates: Vec<&[u8; 32]> = candidate_keys
         .iter()
@@ -348,6 +344,48 @@ fn verify_one_signature(
     Err(unverifiable())
 }
 
+/// Whether `signature` is `key`'s ed25519 signature over `payload`.
+///
+/// Uses the strict verification of [`verify_signature_network_binding`], so a
+/// small-order or non-canonical key never verifies.
+pub(crate) fn signature_verifies(key: &[u8; 32], payload: &[u8; 32], signature: &[u8; 64]) -> bool {
+    VerifyingKey::from_bytes(key).is_ok_and(|verifying_key| {
+        verifying_key
+            .verify_strict(payload, &DalekSignature::from_bytes(signature))
+            .is_ok()
+    })
+}
+
+/// Whether one signature on a `Tx` envelope is `signer_key`'s signature over
+/// the transaction's mainnet payload.
+///
+/// The check a mainnet submit grant adds to
+/// [`verify_signature_network_binding`], which has already accounted for
+/// every signature on the envelope: the grant's signer must be among them.
+/// Only signatures whose hint matches the key are tried. Any other envelope
+/// kind has no such signature.
+///
+/// # Errors
+///
+/// [`WalletError::Protocol`] when the payload does not encode.
+pub(crate) fn grant_signer_signed(
+    envelope: &TransactionEnvelope,
+    signer_key: &[u8; 32],
+) -> Result<bool, WalletError> {
+    let TransactionEnvelope::Tx(v1) = envelope else {
+        return Ok(false);
+    };
+    let payload = payload_hash(
+        &network_id(MAINNET_PASSPHRASE),
+        &TransactionSignaturePayloadTaggedTransaction::Tx(v1.tx.clone()),
+    )?;
+    Ok(v1.signatures.iter().any(|signature| {
+        signature.hint.0 == signer_key[28..32]
+            && <[u8; 64]>::try_from(signature.signature.0.as_slice())
+                .is_ok_and(|bytes| signature_verifies(signer_key, &payload, &bytes))
+    }))
+}
+
 /// Refuses a legacy V0 envelope with the same error the signing path uses.
 ///
 /// Called before the endpoint identity probe so a V0 envelope costs no round
@@ -359,4 +397,31 @@ pub(crate) fn reject_v0_envelope(envelope: &TransactionEnvelope) -> Result<(), W
         }));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test-only")]
+
+    use stellar_xdr::{BytesM, DecoratedSignature, Signature, SignatureHint};
+
+    use super::*;
+
+    /// A signature that matches no signer is refused by the rule, with no
+    /// rendering of its hint.
+    #[test]
+    fn unverifiable_signature_hint_stays_out_of_the_error() {
+        let signature = DecoratedSignature {
+            hint: SignatureHint([0xDE, 0xAD, 0xBE, 0xEF]),
+            signature: Signature(BytesM::try_from(vec![0_u8; 64]).unwrap()),
+        };
+        let error = verify_one_signature(&signature, &[[1; 32]], &[2; 32], &[3; 32]).unwrap_err();
+        assert_eq!(error.code(), "network.envelope_signature_unverifiable");
+        assert_eq!(
+            error.to_string(),
+            "transaction_xdr must contain signatures that verify against a source-account signer \
+             on the selected network; rebuild and sign the envelope for that network."
+        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&error, "deadbeef");
+    }
 }

@@ -5,6 +5,12 @@
 //! (big-endian, low-S canonical) consumed by the External-arm encoders at
 //! `webauthn/sig_data.rs`.
 //!
+//! The normalisation is the shared workspace implementation
+//! [`stellar_agent_core::approval::webauthn::normalize_der_to_compact_low_s`],
+//! which the mainnet consent verifier also uses. This module re-exports its
+//! [`NormalisedSignature`] and maps its error to this crate's `SaError`
+//! contract.
+//!
 //! # Pipeline
 //!
 //! 1. Parse DER via `p256::ecdsa::Signature::from_der`. The DER decoder
@@ -38,46 +44,18 @@
 //! replay-flavoured attacks at upstream systems that don't track
 //! signature uniqueness).
 
-use p256::ecdsa::Signature;
+use stellar_agent_core::approval::webauthn::WebAuthnSignatureError;
 
 use crate::SaError;
 use crate::error::WebAuthnInvalidReason;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Public types
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// 64-byte compact ECDSA-secp256r1 signature (raw r ‖ s, big-endian, low-S
 /// canonical) ready for the External-arm `WebAuthnSigData::signature` field.
 ///
-/// The newtype documents the invariant — low-S canonical — so call-sites
-/// that accept `&NormalisedSignature` are self-documenting. Using a newtype
-/// rather than a bare `[u8; 64]` also prevents inadvertently mixing a
-/// non-normalised compact array into the External-arm pipeline.
-///
 /// Wire format matches `signature: BytesN<64>` in the OpenZeppelin
-/// smart-account contract.
-/// Serialisation layout: bytes 0..32 = r (big-endian), bytes 32..64 = s (big-endian).
-/// Canonical source: `ecdsa` crate, `Signature::to_bytes`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NormalisedSignature([u8; 64]);
-
-impl NormalisedSignature {
-    /// Returns the inner 64-byte compact representation.
-    ///
-    /// Bytes 0..32 are r (big-endian); bytes 32..64 are s (big-endian, low-S
-    /// canonical). Canonical source: `ecdsa` crate, `Signature::to_bytes`.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 64] {
-        &self.0
-    }
-}
-
-impl AsRef<[u8]> for NormalisedSignature {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
+/// smart-account contract. Only [`normalize_der_to_compact_low_s`] produces
+/// one, and its `Debug` shows the length only.
+pub use stellar_agent_core::approval::webauthn::NormalisedSignature;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
@@ -95,7 +73,7 @@ impl AsRef<[u8]> for NormalisedSignature {
 ///
 /// Returns `SaError::WebAuthnAssertionInvalid { reason: WebAuthnInvalidReason::SignatureInvalid }`
 /// on DER parse failure. Failures are intentionally collapsed to a single
-/// sub-code (see intentional-collapse note in module rustdoc). This includes:
+/// sub-code. This includes:
 /// - Truncated SEQUENCE.
 /// - Wrong outer tag (expected 0x30).
 /// - Non-INTEGER components or extra trailing bytes.
@@ -124,38 +102,13 @@ impl AsRef<[u8]> for NormalisedSignature {
 pub fn normalize_der_to_compact_low_s(
     der_signature: &[u8],
 ) -> Result<(NormalisedSignature, bool), SaError> {
-    // Step 1: Parse DER.
-    //
-    // `Signature::from_der` delegates to the `der` crate's SEQUENCE + INTEGER
-    // parser. The DER decoder enforces: outer 0x30 tag, two INTEGER components,
-    // minimal length encoding, non-negative integers, each integer ≤ 32 bytes
-    // (P-256 field size). Negative-path DER coverage is in `ecdsa` crate `der.rs`.
-    let signature =
-        Signature::from_der(der_signature).map_err(|_| SaError::WebAuthnAssertionInvalid {
-            reason: WebAuthnInvalidReason::SignatureInvalid,
-        })?;
-
-    // Step 2: Normalise s.
-    //
-    // `ecdsa` crate `Signature::normalize_s`: returns `Some(normalised)` if
-    // s > n/2 (high-S); `None` if already low-S. The negation `−s` computes
-    // `n − s` in the scalar field (BIP-0062).
-    // P-256 group order n:
-    //   `ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551`.
-    let (normalised, was_high_s) = match signature.normalize_s() {
-        Some(low_s) => (low_s, true),
-        None => (signature, false),
-    };
-
-    // Step 3: Serialise to 64-byte compact.
-    //
-    // `ecdsa` crate `Signature::to_bytes`: output is bytes 0..32 = r (big-endian),
-    // bytes 32..64 = s (big-endian). `C::FieldBytesSize::USIZE` for NistP256 = 32.
-    // Matches the on-chain wire format `signature: BytesN<64>` in the
-    // OpenZeppelin smart-account contract.
-    let compact: [u8; 64] = normalised.to_bytes().into();
-
-    Ok((NormalisedSignature(compact), was_high_s))
+    stellar_agent_core::approval::webauthn::normalize_der_to_compact_low_s(der_signature).map_err(
+        |error| match error {
+            WebAuthnSignatureError::Invalid => SaError::WebAuthnAssertionInvalid {
+                reason: WebAuthnInvalidReason::SignatureInvalid,
+            },
+        },
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -173,8 +126,9 @@ mod tests {
 
     use proptest::prelude::*;
 
+    use p256::ecdsa::Signature;
+
     use super::*;
-    use crate::error::WebAuthnInvalidReason;
 
     // ── Helper ────────────────────────────────────────────────────────────────
 

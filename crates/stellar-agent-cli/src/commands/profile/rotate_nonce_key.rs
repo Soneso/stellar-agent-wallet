@@ -121,14 +121,21 @@ where
     ) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %args.profile_name(), error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e, args.profile_name()));
+            tracing::debug!(error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e));
             return 1;
         }
     };
 
     // A coordinate in the owner key namespace refuses before the keyring
     // opens, so the rotation never writes over an owner entry.
+    if let Err(e) = owner_key::refuse_installation_key_coordinate(
+        &profile.mcp_nonce_key_alias,
+        stellar_agent_nonce::mint::NONCE_KEY_FIELD,
+    ) {
+        render::render_json(&Envelope::err(&e));
+        return 1;
+    }
     if let Err(e) = owner_key::refuse_owner_key_coordinate(
         &profile.mcp_nonce_key_alias,
         stellar_agent_nonce::mint::NONCE_KEY_FIELD,
@@ -222,15 +229,20 @@ mod tests {
     // Defensive #[serial] — see enroll_signer.rs for full rationale; the
     // test binary observes a flaky race during parallel execution that
     // clobbers sibling #[serial] keyring tests' mock store.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn rotate_nonexistent_profile_returns_exit_1() {
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         let args = RotateNonceKeyArgs {
             name: Some("__nonexistent_rotate_nonce_key__".to_owned()),
             profile: None,
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
+        fixture.assert_refusal(
+            Some("validation.profile_not_found"),
+            &["the requested profile was not found"],
+        );
     }
 
     /// A nonce-key coordinate in the owner key namespace refuses before the
@@ -238,6 +250,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn an_owner_namespace_coordinate_refuses_the_rotation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::KeyringEntryRef;
 
         stellar_agent_test_support::keyring_mock::install().unwrap();
@@ -277,5 +292,22 @@ mod tests {
         );
         assert_eq!(init_calls.get(), 0, "the refusal precedes the keyring");
         assert_eq!(code, 1);
+    }
+
+    /// Installation coordinates refuse on testnet before the keyring opens.
+    #[tokio::test]
+    #[serial]
+    async fn installation_coordinate_refuses_without_writing() {
+        crate::common::installation_key_fixture::assert_installation_profile_refusal(
+            |profile| &mut profile.mcp_nonce_key_alias,
+            async |fixture, profile, name| {
+                let args = RotateNonceKeyArgs {
+                    name: Some(name.to_owned()),
+                    profile: None,
+                };
+                run_with_dependencies(&args, |_| Ok(profile.clone()), || fixture.init()).await
+            },
+        )
+        .await;
     }
 }

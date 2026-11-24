@@ -1,0 +1,17 @@
+version = 2
+scope = "profile:*"
+sequence = 1
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = [
+    { kind = "per_tx_cap", asset = "native", max_stroops = 100 },
+    { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"], unlisted = { mode = "approval" } },
+]
+decision = "allow"
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = []
+decision = "require_approval"
+reason = "review"

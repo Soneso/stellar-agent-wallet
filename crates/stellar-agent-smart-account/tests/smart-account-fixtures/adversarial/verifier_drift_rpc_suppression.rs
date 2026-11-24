@@ -7,8 +7,8 @@
 //!
 //! # Design
 //!
-//! 1. Write a `SaContextRuleCreated` audit entry with pinned hash `"67800690..."`
-//!    (i.e., `VERIFIER_ALLOWLIST[0].wasm_hash` first-8).
+//! 1. Write a `SaContextRuleCreatedV2` audit entry pinning
+//!    `VERIFIER_ALLOWLIST[0].wasm_hash` in full.
 //! 2. Primary RPC serves `VERIFIER_ALLOWLIST[0].wasm_hash` (matches pin).
 //! 3. Secondary RPC serves `UNKNOWN_WASM_HASH` (does NOT match primary).
 //! 4. Call `verify_pinned_verifier_against_chain`.
@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
+use stellar_agent_core::audit_log::schema::WasmHashPin;
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::signers::ObservedExecutable;
@@ -83,15 +84,12 @@ async fn rpc_suppression_fires_divergence_before_drift_check() {
         audit_log_path.clone(),
     );
 
-    // Write a SaContextRuleCreated row with the pinned hash matching VERIFIER_ALLOWLIST[0].wasm_hash.
-    let pinned_first8 = VERIFIER_ALLOWLIST[0].wasm_hash[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    // Write a SaContextRuleCreatedV2 row pinning VERIFIER_ALLOWLIST[0].wasm_hash.
+    let pinned = WasmHashPin::new(VERIFIER_ALLOWLIST[0].wasm_hash);
     let rule_id: u32 = 1;
     let request_id = Uuid::new_v4().to_string();
 
-    let fake_entry = AuditEntry::new_sa_context_rule_created(
+    let fake_entry = AuditEntry::new_sa_context_rule_created_v2(
         ZERO_CONTRACT_REDACTED,
         rule_id,
         "default",
@@ -100,7 +98,7 @@ async fn rpc_suppression_fires_divergence_before_drift_check() {
         None,
         "stellar:testnet",
         &request_id,
-        vec![pinned_first8],
+        vec![pinned],
         vec![],
         false,
         false,

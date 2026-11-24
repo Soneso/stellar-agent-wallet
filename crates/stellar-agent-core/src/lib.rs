@@ -13,8 +13,7 @@
 //! per-profile configuration ([`profile`]), and the mainnet write-tools policy
 //! gate ([`policy`]).
 //!
-//! All APIs are synchronous except [`wallet::Wallet::unlock`], which is async
-//! and must be awaited inside a Tokio runtime (the `time` feature).
+//! Wallet unlock and seed access are synchronous and require no Tokio runtime.
 //!
 //! # Primary consumers
 //!
@@ -26,8 +25,7 @@
 //! # Non-goals
 //!
 //! - Network transport, transaction assembly, and signing live in
-//!   `stellar-agent-network`.  This crate uses Tokio only for the unlock-TTL
-//!   timer in [`wallet::Wallet::unlock`]; it carries no network runtime.
+//!   `stellar-agent-network`. This crate carries no network runtime.
 //! - Smart-account transaction submission lives in `stellar-agent-network`.
 //!
 //! # Related crates
@@ -66,6 +64,9 @@ pub mod audit_log;
 /// Public, non-secret constants shared by wallet crates.
 pub mod constants;
 
+/// Compile-time feature state shared by wallet binaries and libraries.
+pub mod build_info;
+
 /// Typed Stellar amount value and unit-enforcing parsers.
 ///
 /// The central type is [`amount::StellarAmount`], stored internally as `i64`
@@ -85,6 +86,9 @@ pub mod counterparty;
 /// and library API in this crate.  See the module documentation for the full
 /// taxonomy overview, wire-format specification, and secret-material policy.
 pub mod error;
+
+/// Exclusive advisory file locks released when their guards drop.
+pub mod file_lock;
 
 /// Classifies platform-keyring failures with fixed labels.
 /// Exports `classify_keyring_operation_error`, `KeyringOperation`, and
@@ -124,6 +128,10 @@ pub mod rpc_budget;
 /// fatal startup error rather than a silent first-registration-wins drop.
 pub mod policy;
 
+/// Mainnet proof types core owns: the verified signed policy, the verified
+/// enablement record, and the shared fact-digest layout.
+pub mod mainnet;
+
 /// Per-profile wallet configuration.
 ///
 /// Provides the figment-backed [`profile::loader`], the [`profile::schema::Profile`]
@@ -145,6 +153,14 @@ pub mod hex;
 /// `DEFAULT_CLASSIC_FEE_STROOPS`) colocated for single-source-of-truth imports.
 pub mod protocol_consts;
 
+/// Canonical G and M destinations of classic payments
+/// ([`payment_accounts::PaymentAccount`]).
+pub mod payment_accounts;
+
+/// Plain `AccountId` fields that refuse a muxed `M...` address
+/// ([`classic_address::require_account_id`]).
+pub mod classic_address;
+
 /// Strkey rendering for XDR `ScAddress` values
 /// ([`sc_address::scaddress_to_strkey`]).
 pub mod sc_address;
@@ -155,6 +171,9 @@ pub mod scval;
 /// Shared timestamp formatting helpers (ISO-8601 UTC, epoch decomposition).
 pub mod timefmt;
 
+/// Test-only process initialization trace; inert in production builds.
+pub mod test_trace;
+
 /// `serde(with = ...)` boundary encoders for stroop-denominated struct
 /// fields: keeps a struct's internal numeric type, encodes it as a decimal
 /// string on the wire, and tolerates a legacy JSON number on deserialize.
@@ -162,7 +181,7 @@ pub mod wire_stroops;
 
 /// Short-in-memory-unlock window: `mlock`-protected signing seed with RAII dispose.
 ///
-/// Provides [`wallet::Wallet`] (unlock + TTL + RAII dispose),
+/// Provides [`wallet::Wallet`] (clock-checked access and RAII disposal),
 /// [`wallet::LockedSeed`] (region-backed locked seed buffer),
 /// [`wallet::MlockRequired`] (three-posture config enum), and
 /// [`wallet::WalletLifecycleError`] (typed lifecycle errors).
@@ -181,6 +200,8 @@ pub mod wallet;
 /// args at the commit step.
 pub mod envelope_decode;
 
+pub mod sac_payment;
+
 pub use amount::{
     ANCHOR_AMOUNT_MAX_DECIMAL_PLACES, ANCHOR_AMOUNT_MAX_LEN, AnchorAmount, AnchorAmountError,
     McpAmountArgument, McpMemoTextArgument, STELLAR_DECIMALS, StellarAmount,
@@ -196,8 +217,9 @@ pub use audit_log::{
 pub use counterparty::is_valid_ldh_home_domain;
 pub use envelope::{Envelope, EnvelopeError, OutputFormat};
 pub use error::{
-    ApprovalFailure, AuthError, AuthMismatchReason, ErrorCategory, InternalError, LedgerError,
-    NetworkError, ProtocolError, SubmissionError, ValidationError, WalletError, WalletStateError,
+    AddressField, ApprovalFailure, AuthError, AuthMismatchReason, ErrorCategory, InternalError,
+    LedgerError, NetworkError, ProtocolError, SubmissionError, ValidationError, WalletError,
+    WalletStateError,
 };
 pub use observability::{
     FormatChoice, InitError, RedactingJsonFormatter, SubscriberConfig, init_subscriber,

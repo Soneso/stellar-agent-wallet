@@ -1,0 +1,11 @@
+{
+  "test_kind": "load_failure",
+  "name": "unlisted_bound_not_below_cap_rejected",
+  "category": "extended_grammar",
+  "description": "An unlisted per-transaction bound equal to the rule's per_tx_cap refuses; the bound must be strictly below the cap.",
+  "load_signing_strategy": "grammar_refused",
+  "expected_load_ok": false,
+  "expected_load_error": "policy_file_parse_failed",
+  "expected_load_wire_code": "policy.policy_file_parse_failed",
+  "expected_load_detail": "rule[0].criteria[0].unlisted: `per_tx_stroops` must be less than the `per_tx_cap` bound"
+}

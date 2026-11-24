@@ -87,12 +87,6 @@
     clippy::too_many_lines,
     reason = "test-only; panics and unwraps are acceptable in testnet acceptance tests"
 )]
-#![allow(
-    unsafe_code,
-    reason = "test-only STELLAR_AGENT_HOME / STELLAR_AGENT_NETWORKS_TOML overrides for isolated \
-              passkeys/verifier-registry storage, matching stellar_agent_approval_remote::tls's \
-              own test convention"
-)]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -121,15 +115,7 @@ use stellar_agent_core::approval::{ApprovalKind, DEFAULT_TTL_MS, process_uid_for
 use stellar_agent_core::audit_log::schema::EventKind;
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
 use stellar_agent_core::audit_log::writer::AuditWriter;
-use stellar_agent_core::policy::v1::{
-    AccountIdentityView, AccountReservesView, CounterpartyCacheView, Sep10SessionView,
-    Sep45SessionView,
-};
-use stellar_agent_core::policy::{
-    ApprovalRequest, Decision as PolicyDecision, PolicyEngine, PolicyError, ToolDescriptor,
-};
 use stellar_agent_core::profile::schema::{Profile, default_passkeys_dir};
-use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_core::timefmt;
 use stellar_agent_mcp::server::{
     RuleCreatePolicyArg, RuleCreateSignerArg, StellarRuleCreateArgs, StellarRuleCreateCommitArgs,
@@ -141,14 +127,16 @@ use stellar_agent_smart_account::deployment::{
     deploy_smart_account, deploy_webauthn_verifier,
 };
 use stellar_agent_smart_account::managers::credentials::{AddPasskeyOutcome, CredentialsManager};
-use stellar_agent_smart_account::managers::rules::{
-    compute_context_rule_proposal_sha256, context_rule_definition_from_snapshot,
-    parse_c_strkey_to_smart_account,
-};
+use stellar_agent_test_support::StellarAgentHomeGuard;
+use stellar_agent_test_support::env_guard::ScopedEnvVar;
 use stellar_agent_test_support::keyring_mock;
+use stellar_agent_test_support::sandbox::StateSandbox;
 use tempfile::TempDir;
 use tokio::sync::Mutex as TokioMutex;
 use zeroize::Zeroizing;
+
+mod common;
+use common::RequireApprovalEngine;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -166,30 +154,8 @@ const TESTNET_CHAIN_ID: &str = "stellar:testnet";
 /// credentials scoped to this one RP-ID across both origins.
 const TEST_RP_ID: &str = "localhost";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RequireApproval policy engine — forces every dispatch to park a pending entry
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct RequireApprovalEngine;
-
-impl PolicyEngine for RequireApprovalEngine {
-    fn evaluate(
-        &self,
-        _tool: &ToolDescriptor,
-        _args: &serde_json::Value,
-        _profile: &Profile,
-        _account_view: Option<&dyn AccountReservesView>,
-        _identity_view: Option<&dyn AccountIdentityView>,
-        _counterparty_cache: Option<&dyn CounterpartyCacheView>,
-        _sep10_sessions: Option<&dyn Sep10SessionView>,
-        _sep45_sessions: Option<&dyn Sep45SessionView>,
-    ) -> Result<PolicyDecision, PolicyError> {
-        Ok(PolicyDecision::RequireApproval(ApprovalRequest::new(
-            "rule-proposal-remote-browser-testnet-acceptance".into(),
-            600,
-        )))
-    }
-}
+/// The reason every pending approval of this suite carries.
+const REQUIRE_APPROVAL_REASON: &str = "rule-proposal-remote-browser-testnet-acceptance";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Testnet helpers
@@ -217,14 +183,9 @@ fn fresh_deployer_keypair() -> (String, DeployerKeypair) {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 2xx for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 async fn wait_until_queryable(g_strkey: &str) {
@@ -248,6 +209,20 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .expect("signer keyring entry")
         .set_password(&s_strkey)
         .expect("set signing key");
+    // The identity record an enrollment stores beside the seed.
+    stellar_agent_network::keyring::write_keyring_string(
+        &stellar_agent_core::profile::schema::signer_identity_entry_ref(signer_ref),
+        &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .to_bytes(),
+            stellar_agent_core::profile::name::profile_name_for_approval(profile),
+            profile.chain_id,
+        )
+        .render()
+        .expect("an agent record renders"),
+    )
+    .expect("set identity record");
 
     let attest_ref = &profile.attestation_key_id;
     let attest_key_b64 = URL_SAFE_NO_PAD.encode(attestation_key);
@@ -389,21 +364,6 @@ impl Drop for BrowserGuard {
     }
 }
 
-/// RAII guard clearing the `STELLAR_AGENT_HOME` / `STELLAR_AGENT_NETWORKS_TOML`
-/// env-var overrides even if the test panics partway through — otherwise a
-/// panic here leaks the override for the rest of the process's lifetime,
-/// affecting any sibling test.
-struct EnvOverrideGuard;
-
-impl Drop for EnvOverrideGuard {
-    fn drop(&mut self) {
-        unsafe {
-            std::env::remove_var("STELLAR_AGENT_HOME");
-            std::env::remove_var("STELLAR_AGENT_NETWORKS_TOML");
-        }
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Browser launch
 // ─────────────────────────────────────────────────────────────────────────────
@@ -512,15 +472,30 @@ async fn start_remote_serve_for_profile(
     )
     .expect("TLS cert must provision");
 
-    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let config = RemoteServeConfig::new(
-        bind_addr,
-        TEST_RP_ID,
-        allowed_credentials,
-        ctx,
-        operator_credentials_path,
-        tls,
+    // The listener reads its allowlist from the profile file at every
+    // check, so the served profile is written with `allowed_credentials`.
+    let profile_dir = approval_dir.path().join("profiles");
+    let mut served = profile.clone();
+    served.remote_approval = Some(
+        serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "bind": "127.0.0.1:0",
+            "rp_id": TEST_RP_ID,
+            "allowed_credentials": allowed_credentials,
+        }))
+        .expect("remote approval config"),
     );
+    stellar_agent_core::profile::loader::save_to_dir(&profile_name, &served, &profile_dir)
+        .expect("write the served profile");
+    let authority = stellar_agent_core::approval::RemoteApprovalAuthority::from_paths(
+        profile_name.clone(),
+        profile_dir,
+        operator_credentials_path,
+    )
+    .expect("remote approval authority");
+
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let config = RemoteServeConfig::new(bind_addr, TEST_RP_ID, authority, ctx, tls);
     start_remote_serve(config)
         .await
         .expect("start_remote_serve must succeed")
@@ -569,6 +544,30 @@ async fn poll_enroll_output(page: &chromiumoxide::Page, deadline: Instant) -> (S
             Instant::now() < deadline,
             "the enrollment page's credential id / public key outputs did not populate within \
              the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Reads the confirmation code the bridge registration page shows once the
+/// bridge accepted the browser's response.
+async fn poll_confirmation_code(page: &chromiumoxide::Page, deadline: Instant) -> String {
+    loop {
+        let code: String = page
+            .evaluate(evaluate_by_value(
+                "(function(){var el = document.getElementById('confirmation-code'); \
+                 return el && !el.hidden ? el.textContent : '';})()",
+            ))
+            .await
+            .expect("evaluate must not error")
+            .into_value()
+            .expect("evaluate result must deserialise as String");
+        if !code.is_empty() {
+            return code;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the registration page did not show a confirmation code within the deadline"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -710,14 +709,18 @@ async fn register_cosigner_credential_via_bridge(
             credential_name,
             &reg_handle.nonce,
             reg_deadline,
-            Some(&mut reg_audit),
+            &mut reg_audit,
         )
         .await
         .expect("poll_registration must not error");
-    let metadata = match reg_outcome {
-        AddPasskeyOutcome::Registered { metadata } => metadata,
-        other => panic!("co-signer registration: expected Registered; got {other:?}"),
+    let pending = match reg_outcome {
+        AddPasskeyOutcome::AwaitingConfirmation { pending } => pending,
+        other => panic!("co-signer registration: expected AwaitingConfirmation; got {other:?}"),
     };
+    let code = poll_confirmation_code(page, Instant::now() + Duration::from_secs(10)).await;
+    let metadata = creds_manager
+        .confirm_registration(pending, &code, Instant::now(), &mut reg_audit)
+        .expect("co-signer registration: the code the page shows must confirm it");
     assert_eq!(metadata.rp_id, TEST_RP_ID);
     assert!(!metadata.credential_id_b64url.is_empty());
     assert!(!metadata.public_key_sec1_b64.is_empty());
@@ -796,6 +799,10 @@ async fn propose_and_extract_nonce(
 #[serial]
 #[ignore = "requires testnet, chromium, and explicit --ignored flag"]
 async fn rule_proposal_remote_browser_drives_real_rule_install() {
+    // The marked home holds TLS, passkeys, and wallet state for the whole
+    // body; both guards restore the inherited values on drop.
+    let tls_home_dir = StateSandbox::new().expect("TLS/passkeys home sandbox");
+    let _home = StellarAgentHomeGuard::new(tls_home_dir.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (proposer_g, proposer_seed) = fresh_keypair();
@@ -804,15 +811,13 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
 
     let attestation_key = [0x44u8; 32];
     let approval_dir = TempDir::new().expect("approval temp dir");
-    let tls_home_dir = TempDir::new().expect("TLS/passkeys home temp dir");
     let networks_toml_path = tls_home_dir.path().join("networks.toml");
     let operator_credentials_path = approval_dir.path().join("operator_credentials.toml");
 
-    let _env_guard = EnvOverrideGuard;
-    unsafe {
-        std::env::set_var("STELLAR_AGENT_HOME", tls_home_dir.path());
-        std::env::set_var("STELLAR_AGENT_NETWORKS_TOML", &networks_toml_path);
-    }
+    let _networks_toml = ScopedEnvVar::new(
+        "STELLAR_AGENT_NETWORKS_TOML",
+        Some(networks_toml_path.as_os_str()),
+    );
 
     // ── 1. Deploy the WebAuthn verifier + a fresh smart account ─────────────
     let verifier_address = deploy_verifier_to_registry(&networks_toml_path).await;
@@ -827,11 +832,15 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
     .with_noop_engine()
     .build();
     profile.rpc_url = TESTNET_RPC_URL.to_owned();
+    profile.secondary_rpc_url =
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url().to_owned());
     seed_keyring(&profile, &proposer_seed, &attestation_key);
 
     let mut server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     server.set_approval_dir_for_test(approval_dir.path().to_path_buf());
-    server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine));
+    server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine {
+        reason: REQUIRE_APPROVAL_REASON,
+    }));
     let profile_name = server.profile_name_for_approval();
 
     // ── 2. Launch Chromium + a DEDICATED virtual authenticator for the
@@ -978,6 +987,7 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
             label: "test-browser-authenticator".to_owned(),
             registered_at_unix_ms: timefmt::now_unix_ms().expect("clock read"),
             sign_count: None,
+            source: stellar_agent_core::approval::OperatorCredentialSource::Enrolled,
         })
         .expect("operator credential enrollment must succeed with the page-displayed values");
 
@@ -1103,32 +1113,27 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
         .get(&full_nonce)
         .cloned()
         .expect("the full-rule pending entry must still be present before commit");
-    let (smart_account_str, definition_snapshot, stored_digest) = match &entry.kind {
+    let (recomputed_digest, stored_digest) = match &entry.kind {
         ApprovalKind::RuleProposalSimulated {
             smart_account,
+            network_passphrase,
+            chain_id,
             definition,
             proposal_sha256,
+            summary_line,
             ..
-        } => (smart_account.clone(), definition.clone(), *proposal_sha256),
+        } => (
+            stellar_agent_core::approval::rule_proposal_digest(
+                smart_account,
+                network_passphrase,
+                chain_id,
+                definition,
+                summary_line,
+            ),
+            *proposal_sha256,
+        ),
         other => panic!("expected RuleProposalSimulated, got {other:?}"),
     };
-    let smart_account_addr = parse_c_strkey_to_smart_account(&smart_account_str)
-        .expect("stored smart_account must parse");
-    let rule_definition = context_rule_definition_from_snapshot(&definition_snapshot)
-        .expect("definition must reconstruct from the stored snapshot");
-    let auth_rule_ids: Vec<ContextRuleId> = definition_snapshot
-        .auth_rule_ids
-        .iter()
-        .map(|id| ContextRuleId::new(*id))
-        .collect();
-    let recomputed_digest = compute_context_rule_proposal_sha256(
-        &smart_account_addr,
-        &rule_definition,
-        &auth_rule_ids,
-        definition_snapshot.accept_mutable_verifier,
-        definition_snapshot.accept_unknown_verifier,
-    )
-    .expect("digest must recompute from the stored snapshot");
     assert_eq!(
         recomputed_digest, stored_digest,
         "the digest recomputed from the snapshot must equal the entry's own proposal_sha256"
@@ -1252,13 +1257,19 @@ async fn negative_test_fixture() -> (WalletServer, TempDir, String, String, [u8;
         &proposer_g,
     )
     .with_noop_engine()
+    // The server's audit log stays inside the fixture's directory.
+    .audit_log_path(approval_dir.path().join("wallet-audit.jsonl"))
     .build();
     profile.rpc_url = TESTNET_RPC_URL.to_owned();
+    profile.secondary_rpc_url =
+        Some(stellar_agent_test_support::testnet_secondary_rpc_url().to_owned());
     seed_keyring(&profile, &proposer_seed, &attestation_key);
 
     let mut server = WalletServer::new(profile).expect("WalletServer::new");
     server.set_approval_dir_for_test(approval_dir.path().to_path_buf());
-    server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine));
+    server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine {
+        reason: REQUIRE_APPROVAL_REASON,
+    }));
 
     (
         server,
@@ -1273,8 +1284,11 @@ async fn negative_test_fixture() -> (WalletServer, TempDir, String, String, [u8;
 /// `approval_attestation` must return `policy.approval_required` — the
 /// dedicated `verify_rule_proposal_gate` never runs without one.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 #[ignore = "requires testnet and explicit --ignored flag"]
 async fn commit_without_attestation_is_approval_required() {
+    let storage_sandbox = StateSandbox::new().expect("storage sandbox");
+    let _storage_home = StellarAgentHomeGuard::new(storage_sandbox.path());
     let (server, _approval_dir, smart_account_strkey, proposer_g, _attestation_key) =
         negative_test_fixture().await;
 
@@ -1317,8 +1331,11 @@ async fn commit_without_attestation_is_approval_required() {
 /// caught by the store-self-consistency digest recompute check —
 /// `simulation.divergence`, independent of the operator-consent question.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 #[ignore = "requires testnet and explicit --ignored flag"]
 async fn tampered_snapshot_is_simulation_divergence() {
+    let storage_sandbox = StateSandbox::new().expect("storage sandbox");
+    let _storage_home = StellarAgentHomeGuard::new(storage_sandbox.path());
     let (server, approval_dir, smart_account_strkey, proposer_g, _attestation_key) =
         negative_test_fixture().await;
 
@@ -1368,8 +1385,11 @@ async fn tampered_snapshot_is_simulation_divergence() {
 /// distinguishable `policy.approval_rejected` (not the indistinguishable
 /// `policy.approval_required`).
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 #[ignore = "requires testnet and explicit --ignored flag"]
 async fn operator_reject_then_commit_is_rejected() {
+    let storage_sandbox = StateSandbox::new().expect("storage sandbox");
+    let _storage_home = StellarAgentHomeGuard::new(storage_sandbox.path());
     let (server, approval_dir, smart_account_strkey, proposer_g, _attestation_key) =
         negative_test_fixture().await;
 
@@ -1426,8 +1446,11 @@ async fn operator_reject_then_commit_is_rejected() {
 /// lesson from Package B/A — the `ToolsetFirstInvokeGate` pending entry must
 /// be CONSUMED (removed) once the grant is recorded, not merely ignored.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 #[ignore = "requires testnet and explicit --ignored flag"]
 async fn toolset_gated_first_invoke_entry_is_consumed() {
+    let storage_sandbox = StateSandbox::new().expect("storage sandbox");
+    let _storage_home = StellarAgentHomeGuard::new(storage_sandbox.path());
     let (server, approval_dir, smart_account_strkey, proposer_g, attestation_key) =
         negative_test_fixture().await;
 
@@ -1453,6 +1476,9 @@ async fn toolset_gated_first_invoke_entry_is_consumed() {
     let mut store = PendingApprovalStore::open(store_path.clone()).expect("store re-open");
     let gate_entry = PendingApproval::new_toolset_first_invoke_gate_pending(
         "test-toolset".to_owned(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        "1.0.0".to_owned(),
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
         "sign-rule-create".to_owned(),
         smart_account_strkey.clone(),
         "RULECREATE:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
@@ -1490,11 +1516,16 @@ async fn toolset_gated_first_invoke_entry_is_consumed() {
         ),
         stellar_agent_core::approval::Surface::Cli,
         stellar_agent_core::approval::ConsentAudit::Writer(&mut consent_writer),
-        None,
+        stellar_agent_core::approval::ConsentAuthorization::Standard(
+            &stellar_agent_core::approval::AttestedApprover::Local,
+        ),
         |req, key| {
             stellar_agent_toolsets_runtime::record_first_invoke_grant(
                 &profile_name,
                 req.toolset_name,
+                req.install_id,
+                req.package_version,
+                req.package_shasum,
                 req.capability,
                 req.destination,
                 req.asset,

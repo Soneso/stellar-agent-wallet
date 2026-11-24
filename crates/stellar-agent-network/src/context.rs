@@ -10,6 +10,62 @@ use crate::client::StellarRpcClient;
 use crate::redact_url_authority;
 use crate::rpc_endpoint::{RpcCredentialBinding, rpc_client};
 
+/// Test transport routes from an endpoint host to the URL its requests go to.
+///
+/// A route's host and an endpoint's host compare as
+/// [`stellar_agent_core::profile::schema::same_provider_host`] compares them,
+/// so the letter case of a host and one trailing dot do not distinguish a
+/// route. A client built through a route keeps the endpoint URL as its
+/// identity and carries no credential; an endpoint whose host has no route
+/// builds the ordinary client.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct TestTransportRoutes(Vec<(String, String)>);
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl TestTransportRoutes {
+    /// Routes for `(host, transport URL)` pairs.
+    pub(crate) fn new(routes: &[(&str, &str)]) -> Self {
+        Self(
+            routes
+                .iter()
+                .map(|(host, transport)| (format!("https://{host}/"), (*transport).to_owned()))
+                .collect(),
+        )
+    }
+
+    /// The transport URL of the route for the host of `endpoint`.
+    pub(crate) fn transport_for(&self, endpoint: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(host_url, _)| {
+                stellar_agent_core::profile::schema::same_provider_host(endpoint, host_url)
+            })
+            .map(|(_, transport)| transport.as_str())
+    }
+
+    /// The routed client for `endpoint`, or `None` when its host has no
+    /// route.
+    pub(crate) fn client(&self, endpoint: &str) -> Option<Result<StellarRpcClient, WalletError>> {
+        self.transport_for(endpoint)
+            .map(|transport| StellarRpcClient::with_test_transport(endpoint, transport))
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl std::fmt::Debug for TestTransportRoutes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(host_url, transport)| {
+                (
+                    redact_url_authority(host_url),
+                    redact_url_authority(transport),
+                )
+            }))
+            .finish()
+    }
+}
+
 /// The network identity resolved once at command entry and passed to stages
 /// that build, simulate, sign, or submit.
 ///
@@ -18,6 +74,8 @@ use crate::rpc_endpoint::{RpcCredentialBinding, rpc_client};
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct NetworkContext {
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_transport_routes: TestTransportRoutes,
     /// The resolved CAIP-2 chain identity.
     pub chain_id: Caip2,
     /// The primary RPC endpoint.
@@ -49,7 +107,15 @@ impl NetworkContext {
             rpc_url,
             secondary_rpc_url: None,
             primary_credential: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            test_transport_routes: TestTransportRoutes::default(),
         }
+    }
+
+    /// The test transport routes every client this context builds consults.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_transport_routes(&self) -> &TestTransportRoutes {
+        &self.test_transport_routes
     }
 
     /// Builds the client for the primary endpoint, [`Self::rpc_url`].
@@ -67,7 +133,48 @@ impl NetworkContext {
     /// send, and `network.rpc_unreachable` when the transport refuses the
     /// URL.
     pub fn primary_client(&self) -> Result<StellarRpcClient, WalletError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(client) = self.test_transport_routes.client(&self.rpc_url) {
+            return client;
+        }
         rpc_client(&self.rpc_url, self.primary_credential.as_ref())
+    }
+
+    /// Builds the client for the oracle endpoint `profile` names, as the
+    /// cross-check builds it: a host with a test transport route gets the
+    /// routed client, and every other oracle the profile's credential-bound
+    /// client. No request is sent.
+    ///
+    /// On a mainnet profile the submit path and reconciliation consult this
+    /// oracle about a negative answer of the primary endpoint. The
+    /// reservation stands whatever either endpoint answers negatively.
+    ///
+    /// `Ok(None)` when the profile sets no `oracle_provider_url`.
+    ///
+    /// # Errors
+    ///
+    /// A credential refusal of the oracle's provider record, such as
+    /// `auth.keyring_not_found`, and `network.witness_unavailable` when the
+    /// client cannot be built from the URL.
+    pub fn oracle_client(
+        &self,
+        profile: &Profile,
+    ) -> Result<Option<StellarRpcClient>, WalletError> {
+        crate::cross_check::OracleEndpoint::from_context(profile, self)
+            .map(|oracle| oracle.map(crate::cross_check::OracleEndpoint::into_client))
+    }
+
+    /// Routes the requests of every client this context builds by endpoint
+    /// host, as [`MainnetWriteContext::with_test_transport_routes`] does for
+    /// a mainnet write context.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_test_transport_routes(self, routes: &[(&str, &str)]) -> Self {
+        Self {
+            test_transport_routes: TestTransportRoutes::new(routes),
+            ..self
+        }
     }
 
     /// Sets or clears the secondary endpoint selected by the command.
@@ -98,6 +205,341 @@ impl std::fmt::Debug for NetworkContext {
     }
 }
 
+/// Endpoint flags supplied at a mainnet command boundary.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MainnetEndpointFlags {
+    /// An explicit chain selection, which must name mainnet.
+    pub network: Option<Caip2>,
+    /// Whether the primary URL was overridden.
+    pub rpc_url: bool,
+    /// Whether the secondary URL was overridden.
+    pub secondary_rpc_url: bool,
+}
+
+/// A validated, overlay-free mainnet profile selected by an explicit flag.
+pub struct MainnetWriteContext {
+    #[cfg(feature = "mainnet-write")]
+    profile_name: String,
+    #[cfg(feature = "mainnet-write")]
+    snapshot: Profile,
+    #[cfg(feature = "mainnet-write")]
+    authority: String,
+    #[cfg(feature = "mainnet-write")]
+    primary_credential: Option<RpcCredentialBinding>,
+    #[cfg(all(feature = "mainnet-write", any(test, feature = "test-hooks")))]
+    test_transport_routes: TestTransportRoutes,
+    #[cfg(not(feature = "mainnet-write"))]
+    never: Never,
+}
+
+#[cfg(not(feature = "mainnet-write"))]
+enum Never {}
+
+impl NetworkContext {
+    /// Loads the stored mainnet profile after validating its explicit selection.
+    ///
+    /// # Errors
+    /// Returns `network.mainnet_write_forbidden` for a refused selection or
+    /// disabled feature, and the profile loader error for an unreadable profile.
+    pub fn mainnet_write(
+        merged: &Profile,
+        resolved: &stellar_agent_core::profile::name::ResolvedProfileName,
+        profiles_dir: &std::path::Path,
+        flags: MainnetEndpointFlags,
+    ) -> Result<MainnetWriteContext, WalletError> {
+        #[cfg(feature = "mainnet-write")]
+        {
+            MainnetWriteContext::build(merged, resolved, profiles_dir, flags).map_err(|error| {
+                match error {
+                    crate::mainnet::refusal::AuthorizedPathError::Refused(precondition) => {
+                        tracing::warn!(
+                            path = "mainnet_write_context",
+                            precondition = precondition.label(),
+                            "mainnet write context refused"
+                        );
+                        stellar_agent_core::error::NetworkError::MainnetWriteForbidden.into()
+                    }
+                    crate::mainnet::refusal::AuthorizedPathError::Wallet(error) => error,
+                }
+            })
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            let _ = (merged, resolved, profiles_dir, flags);
+            Err(stellar_agent_core::error::NetworkError::MainnetWriteForbidden.into())
+        }
+    }
+}
+
+impl MainnetWriteContext {
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn build(
+        merged: &Profile,
+        resolved: &stellar_agent_core::profile::name::ResolvedProfileName,
+        profiles_dir: &std::path::Path,
+        flags: MainnetEndpointFlags,
+    ) -> Result<Self, crate::mainnet::refusal::AuthorizedPathError> {
+        use crate::mainnet::refusal::{MainnetPrecondition as P, require};
+        use stellar_agent_core::error::ValidationError;
+        use stellar_agent_core::profile::{
+            loader::{ProfileLoadError, load_from_dir_without_overlays},
+            name::{ProfileNameSource, profile_name_mismatch_refusal},
+        };
+        require(
+            resolved.source == ProfileNameSource::Flag,
+            P::NameSourceNotFlag,
+        )?;
+        require(resolved.name != "default", P::DefaultProfile)?;
+        require(
+            !flags.rpc_url
+                && !flags.secondary_rpc_url
+                && flags.network.is_none_or(Caip2::is_mainnet),
+            P::EndpointFlagRefused,
+        )?;
+        let snapshot = load_from_dir_without_overlays(&resolved.name, profiles_dir, None).map_err(
+            |error| match error {
+                ProfileLoadError::NotFound => {
+                    WalletError::Validation(ValidationError::ProfileNotFound)
+                }
+                other => WalletError::Validation(ValidationError::ConfigInvalid {
+                    component: "profile",
+                    reason: stellar_agent_core::observability::redact_path_in_message(&format!(
+                        "the stored profile cannot be read: {other}"
+                    )),
+                }),
+            },
+        )?;
+        require(snapshot.chain_id.is_mainnet(), P::ChainNotMainnet)?;
+        require(
+            profile_name_mismatch_refusal(&snapshot, &resolved.name).is_none(),
+            P::DerivedNameMismatch,
+        )?;
+        require(
+            merged.chain_id == snapshot.chain_id
+                && merged.rpc_url == snapshot.rpc_url
+                && merged.oracle_provider_url == snapshot.oracle_provider_url,
+            P::DiskViewMismatch,
+        )?;
+        Ok(Self {
+            profile_name: resolved.name.clone(),
+            authority: redact_url_authority(&snapshot.rpc_url),
+            primary_credential: RpcCredentialBinding::for_role(&snapshot, ProviderRole::Primary),
+            snapshot,
+            #[cfg(any(test, feature = "test-hooks"))]
+            test_transport_routes: TestTransportRoutes::default(),
+        })
+    }
+
+    #[cfg(not(feature = "mainnet-write"))]
+    pub(crate) fn absurd(&self) -> ! {
+        match self.never {}
+    }
+
+    /// The explicitly selected profile name.
+    #[must_use]
+    pub fn profile_name(&self) -> &str {
+        #[cfg(feature = "mainnet-write")]
+        {
+            &self.profile_name
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            self.absurd()
+        }
+    }
+
+    /// The validated chain identity.
+    #[must_use]
+    pub fn chain(&self) -> Caip2 {
+        #[cfg(feature = "mainnet-write")]
+        {
+            self.snapshot.chain_id
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            self.absurd()
+        }
+    }
+
+    /// The stored endpoint authority, with credentials and paths removed.
+    #[must_use]
+    pub fn authority(&self) -> &str {
+        #[cfg(feature = "mainnet-write")]
+        {
+            &self.authority
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            self.absurd()
+        }
+    }
+
+    /// The canonical network passphrase.
+    #[must_use]
+    pub fn network_passphrase(&self) -> &'static str {
+        self.chain().network_passphrase()
+    }
+
+    /// The validated stored profile, without environment overlays.
+    #[must_use]
+    pub fn profile(&self) -> &Profile {
+        #[cfg(feature = "mainnet-write")]
+        {
+            &self.snapshot
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            self.absurd()
+        }
+    }
+
+    #[cfg_attr(
+        not(feature = "mainnet-write"),
+        expect(dead_code, reason = "uninhabited without mainnet writes")
+    )]
+    pub(crate) fn signer_coordinate(
+        &self,
+    ) -> &stellar_agent_core::profile::schema::KeyringEntryRef {
+        &self.profile().mcp_signer_default
+    }
+
+    /// Builds a fresh primary client with the stored credential binding.
+    ///
+    /// # Errors
+    /// Returns the RPC client or keyring error when construction fails.
+    pub fn primary_client(&self) -> Result<StellarRpcClient, WalletError> {
+        #[cfg(feature = "mainnet-write")]
+        {
+            #[cfg(any(test, feature = "test-hooks"))]
+            if let Some(client) = self.test_transport_routes.client(&self.snapshot.rpc_url) {
+                return client;
+            }
+            rpc_client(&self.snapshot.rpc_url, self.primary_credential.as_ref())
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            self.absurd()
+        }
+    }
+
+    /// Builds the client for the stored profile's oracle endpoint, as
+    /// [`NetworkContext::oracle_client`] builds it for the network context
+    /// this one returns. No request is sent.
+    ///
+    /// The mainnet submit path consults this oracle about a `FAILED`
+    /// confirmation of the primary endpoint. The reservation stands whatever
+    /// the oracle answers.
+    ///
+    /// The stored oracle URL must name the owner-signed oracle host of
+    /// `enablement`, normalized as the enablement normalizes it, so the
+    /// result is a client whenever it is `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// `network.mainnet_authorization_refused`, logged with the precondition
+    /// `witness_oracle_unbound`, when the stored oracle URL is absent or names
+    /// another host; otherwise the errors of [`NetworkContext::oracle_client`].
+    pub fn oracle_client(
+        &self,
+        enablement: &stellar_agent_core::mainnet::enablement::EnablementRecord,
+    ) -> Result<Option<StellarRpcClient>, WalletError> {
+        #[cfg(feature = "mainnet-write")]
+        {
+            use crate::mainnet::refusal::{MainnetAuthorizationError, MainnetPrecondition as P};
+            let signed = self
+                .snapshot
+                .oracle_provider_url
+                .as_ref()
+                .and_then(|url| {
+                    stellar_agent_core::mainnet::enablement::normalize_endpoint_host(url.as_str())
+                        .ok()
+                })
+                .is_some_and(|host| host == enablement.oracle_host());
+            if !signed {
+                tracing::warn!(
+                    path = "mainnet_oracle_client",
+                    precondition = P::WitnessOracleUnbound.label(),
+                    "mainnet authorization refused"
+                );
+                return Err(MainnetAuthorizationError::Refused(P::WitnessOracleUnbound).into());
+            }
+            self.network_context().oracle_client(&self.snapshot)
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            let _ = enablement;
+            self.absurd()
+        }
+    }
+
+    /// The network identity of the stored profile for stages that take a
+    /// [`NetworkContext`], such as the bound witness producers.
+    ///
+    /// The chain, both endpoints and the primary credential binding are the
+    /// snapshot's, and every client the returned context builds, the oracle
+    /// client of a witness included, is built as this context builds its own.
+    #[must_use]
+    pub fn network_context(&self) -> NetworkContext {
+        #[cfg(feature = "mainnet-write")]
+        {
+            let network = NetworkContext::from_profile(&self.snapshot);
+            #[cfg(any(test, feature = "test-hooks"))]
+            let network = NetworkContext {
+                test_transport_routes: self.test_transport_routes.clone(),
+                ..network
+            };
+            network
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            self.absurd()
+        }
+    }
+
+    /// Routes the requests of every client this context builds by endpoint
+    /// host, `routes` pairing a host with the transport URL its requests go
+    /// to, while each client keeps the profile's endpoint URL as its
+    /// identity. A host without a route builds the ordinary client.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_test_transport_routes(self, routes: &[(&str, &str)]) -> Self {
+        #[cfg(feature = "mainnet-write")]
+        {
+            Self {
+                test_transport_routes: TestTransportRoutes::new(routes),
+                ..self
+            }
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            let _ = routes;
+            self.absurd()
+        }
+    }
+}
+
+impl std::fmt::Debug for MainnetWriteContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(feature = "mainnet-write")]
+        {
+            let mut debug = f.debug_struct("MainnetWriteContext");
+            debug
+                .field("profile_name", &self.profile_name)
+                .field("chain", &self.chain())
+                .field("authority", &self.authority);
+            #[cfg(any(test, feature = "test-hooks"))]
+            debug.field("test_transport_routes", &self.test_transport_routes);
+            debug.finish_non_exhaustive()
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            let _ = f;
+            self.absurd()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -121,7 +563,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn from_profile_copies_identity_and_secondary() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         for chain in [Caip2::Testnet, Caip2::Mainnet] {
             let mut profile = profile(chain);
             let context = NetworkContext::from_profile(&profile);
@@ -139,7 +585,11 @@ mod tests {
     /// The primary credential of the profile binds to its `rpc_url`; a
     /// context from `new` and a profile without a record bind none.
     #[test]
+    #[serial_test::serial]
     fn from_profile_binds_the_primary_credential() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_agent_core::profile::schema::{
             KeyringEntryRef, PrimaryProviderRecord, RpcCredentialPlacement,
         };
@@ -178,7 +628,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn with_secondary_sets_and_clears_command_endpoint() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let context = NetworkContext::from_profile(&profile(Caip2::Testnet))
             .with_secondary(Some("https://command-secondary.example".to_owned()));
         assert_eq!(
@@ -189,7 +643,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_passphrase_is_canonical() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert_eq!(
             NetworkContext::from_profile(&profile(Caip2::Testnet)).network_passphrase(),
             TESTNET_PASSPHRASE
@@ -197,7 +655,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_passphrase_is_derived_from_chain() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = profile(Caip2::Mainnet);
         profile.network_passphrase = "not the passphrase".to_owned();
         assert_eq!(
@@ -229,5 +691,387 @@ mod tests {
         }
         assert!(debug.contains("https://primary.example"));
         assert!(debug.contains("https://secondary.example"));
+    }
+    fn stored_context_profile() -> (
+        tempfile::TempDir,
+        Profile,
+        stellar_agent_core::profile::name::ResolvedProfileName,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = Profile::builder_mainnet_named(
+            "context",
+            "https://rpc.example.invalid",
+            "signer",
+            "key",
+            "nonce",
+            "key",
+        )
+        .build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        stellar_agent_core::profile::loader::save_to_dir("context", &profile, dir.path()).unwrap();
+        (
+            dir,
+            profile,
+            stellar_agent_core::profile::name::ResolvedProfileName::from_flag("context"),
+        )
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mainnet_write_refuses_without_reading_inputs() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, profile, resolved) = stored_context_profile();
+        let error = NetworkContext::mainnet_write(
+            &profile,
+            &resolved,
+            &dir.path().join("absent"),
+            MainnetEndpointFlags::default(),
+        )
+        .unwrap_err();
+        #[cfg(not(feature = "mainnet-write"))]
+        assert_eq!(error.code(), "network.mainnet_write_forbidden");
+        #[cfg(feature = "mainnet-write")]
+        assert_eq!(error.code(), "validation.profile_not_found");
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    fn refusal(
+        profile: &Profile,
+        resolved: &stellar_agent_core::profile::name::ResolvedProfileName,
+        dir: &std::path::Path,
+        flags: MainnetEndpointFlags,
+    ) -> crate::mainnet::MainnetPrecondition {
+        match MainnetWriteContext::build(profile, resolved, dir, flags).unwrap_err() {
+            crate::mainnet::refusal::AuthorizedPathError::Refused(p) => p,
+            error => unreachable!("{error:?}"),
+        }
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial]
+    fn context_accepts_flag_named_mainnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, profile, resolved) = stored_context_profile();
+        let context = NetworkContext::mainnet_write(
+            &profile,
+            &resolved,
+            dir.path(),
+            MainnetEndpointFlags {
+                network: Some(Caip2::Mainnet),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(context.profile_name(), "context");
+        assert_eq!(context.chain(), Caip2::Mainnet);
+        assert_eq!(context.authority(), "https://rpc.example.invalid");
+        assert_eq!(context.profile().rpc_url, profile.rpc_url);
+        assert_eq!(context.signer_coordinate(), &profile.mcp_signer_default);
+        assert_eq!(context.network_passphrase(), MAINNET_PASSPHRASE);
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial]
+    fn context_refuses_env_and_default_sources() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_core::profile::name::ProfileNameSource;
+        let (dir, profile, mut resolved) = stored_context_profile();
+        for source in [ProfileNameSource::Env, ProfileNameSource::Default] {
+            resolved.source = source;
+            assert_eq!(
+                refusal(
+                    &profile,
+                    &resolved,
+                    dir.path(),
+                    MainnetEndpointFlags::default()
+                ),
+                crate::mainnet::MainnetPrecondition::NameSourceNotFlag
+            );
+        }
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial]
+    fn context_refuses_default_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, profile, mut resolved) = stored_context_profile();
+        resolved.name = "default".into();
+        assert_eq!(
+            refusal(
+                &profile,
+                &resolved,
+                dir.path(),
+                MainnetEndpointFlags::default()
+            ),
+            crate::mainnet::MainnetPrecondition::DefaultProfile
+        );
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial]
+    fn context_refuses_endpoint_flags() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, profile, resolved) = stored_context_profile();
+        for flags in [
+            MainnetEndpointFlags {
+                network: Some(Caip2::Testnet),
+                ..Default::default()
+            },
+            MainnetEndpointFlags {
+                rpc_url: true,
+                ..Default::default()
+            },
+            MainnetEndpointFlags {
+                secondary_rpc_url: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                refusal(&profile, &resolved, dir.path(), flags),
+                crate::mainnet::MainnetPrecondition::EndpointFlagRefused
+            );
+        }
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial]
+    fn context_refuses_merged_view_differing_from_disk() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, profile, resolved) = stored_context_profile();
+        let mut merged = profile.clone();
+        merged.rpc_url = "https://other.invalid".into();
+        assert_eq!(
+            refusal(
+                &merged,
+                &resolved,
+                dir.path(),
+                MainnetEndpointFlags::default()
+            ),
+            crate::mainnet::MainnetPrecondition::DiskViewMismatch
+        );
+        merged = profile;
+        merged.chain_id = Caip2::Testnet;
+        assert_eq!(
+            refusal(
+                &merged,
+                &resolved,
+                dir.path(),
+                MainnetEndpointFlags::default()
+            ),
+            crate::mainnet::MainnetPrecondition::DiskViewMismatch
+        );
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial]
+    fn context_refuses_merged_oracle_differing_from_disk() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, _, resolved) = stored_context_profile();
+        let mut profile = Profile::builder_mainnet_named(
+            "context",
+            "https://rpc.example.invalid",
+            "signer",
+            "key",
+            "nonce",
+            "key",
+        )
+        .primary_provider(
+            stellar_agent_core::profile::schema::PrimaryProviderRecord::new(
+                "Primary operator",
+                "rpc.example.invalid",
+            ),
+        )
+        .oracle_provider_url(url::Url::parse("https://oracle.example.invalid").unwrap())
+        .oracle_provider(stellar_agent_core::profile::schema::ProviderRecord::new(
+            "Oracle operator",
+            "oracle.example.invalid",
+            true,
+        ))
+        .build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        stellar_agent_core::profile::loader::save_to_dir("context", &profile, dir.path()).unwrap();
+        let mut merged = profile.clone();
+        merged.oracle_provider_url = Some("https://other-oracle.example.invalid".parse().unwrap());
+        assert_eq!(
+            refusal(
+                &merged,
+                &resolved,
+                dir.path(),
+                MainnetEndpointFlags::default()
+            ),
+            crate::mainnet::MainnetPrecondition::DiskViewMismatch
+        );
+        merged.oracle_provider_url = None;
+        assert_eq!(
+            refusal(
+                &merged,
+                &resolved,
+                dir.path(),
+                MainnetEndpointFlags::default()
+            ),
+            crate::mainnet::MainnetPrecondition::DiskViewMismatch
+        );
+        assert!(
+            MainnetWriteContext::build(
+                &profile,
+                &resolved,
+                dir.path(),
+                MainnetEndpointFlags::default()
+            )
+            .is_ok(),
+            "the stored oracle URL as merged builds the context"
+        );
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial]
+    fn context_refuses_testnet_snapshot() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, _, resolved) = stored_context_profile();
+        let profile = Profile::builder_testnet_named("context", "s", "a", "n", "a").build();
+        stellar_agent_core::profile::loader::save_to_dir("context", &profile, dir.path()).unwrap();
+        assert_eq!(
+            refusal(
+                &profile,
+                &resolved,
+                dir.path(),
+                MainnetEndpointFlags::default()
+            ),
+            crate::mainnet::MainnetPrecondition::ChainNotMainnet
+        );
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial]
+    fn context_refuses_derived_name_mismatch() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, mut profile, resolved) = stored_context_profile();
+        profile.policy_owner_key_id =
+            stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key("other");
+        stellar_agent_core::profile::loader::save_to_dir("context", &profile, dir.path()).unwrap();
+        assert_eq!(
+            refusal(
+                &profile,
+                &resolved,
+                dir.path(),
+                MainnetEndpointFlags::default()
+            ),
+            crate::mainnet::MainnetPrecondition::DerivedNameMismatch
+        );
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn network_context_routes_the_primary() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_test_support::{EchoIdResponder, signed_envelope::get_network_result};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::body_partial_json(
+            serde_json::json!({"method": "getNetwork"}),
+        ))
+        .respond_with(EchoIdResponder::new(get_network_result(MAINNET_PASSPHRASE)))
+        .mount(&server)
+        .await;
+        let (dir, profile, resolved) = stored_context_profile();
+        let context =
+            NetworkContext::mainnet_write(&profile, &resolved, dir.path(), Default::default())
+                .unwrap()
+                .with_test_transport_routes(&[("rpc.example.invalid", &server.uri())]);
+        let network = context.network_context();
+        assert_eq!(network.rpc_url, "https://rpc.example.invalid");
+        let client = network.primary_client().unwrap();
+        assert_eq!(client.url(), "https://rpc.example.invalid");
+        assert_eq!(client.transport_base_url(), format!("{}/", server.uri()));
+        let identity = client
+            .mainnet_endpoint_identity(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(identity.authority(), context.authority());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial]
+    fn unmapped_host_uses_the_profile_endpoint() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, profile, resolved) = stored_context_profile();
+        let context =
+            NetworkContext::mainnet_write(&profile, &resolved, dir.path(), Default::default())
+                .unwrap()
+                .with_test_transport_routes(&[("other.example.invalid", "http://127.0.0.1:9")]);
+        for client in [
+            context.primary_client().unwrap(),
+            context.network_context().primary_client().unwrap(),
+        ] {
+            assert_eq!(client.url(), "https://rpc.example.invalid");
+            assert_eq!(
+                client.transport_base_url(),
+                "https://rpc.example.invalid:443/"
+            );
+        }
+    }
+
+    #[test]
+    fn route_host_ignores_case_and_one_trailing_dot() {
+        for (endpoint, route) in [
+            ("https://RPC.Example.Invalid./", "rpc.example.invalid"),
+            ("https://rpc.example.invalid", "RPC.EXAMPLE.INVALID."),
+        ] {
+            let context = NetworkContext {
+                test_transport_routes: TestTransportRoutes::new(&[(route, "http://127.0.0.1:9")]),
+                ..NetworkContext::new(Caip2::Mainnet, endpoint.to_owned())
+            };
+            let client = context.primary_client().unwrap();
+            assert_eq!(client.url(), endpoint);
+            assert_eq!(client.transport_base_url(), "http://127.0.0.1:9/");
+        }
+        let context = NetworkContext {
+            test_transport_routes: TestTransportRoutes::new(&[(
+                "rpc.example.invalid",
+                "http://127.0.0.1:9",
+            )]),
+            ..NetworkContext::new(
+                Caip2::Mainnet,
+                "https://rpc.example.invalid.evil/".to_owned(),
+            )
+        };
+        assert_eq!(
+            context.primary_client().unwrap().transport_base_url(),
+            "https://rpc.example.invalid.evil:443/"
+        );
     }
 }

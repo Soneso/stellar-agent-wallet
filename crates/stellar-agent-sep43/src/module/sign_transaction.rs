@@ -22,7 +22,9 @@
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::signing::Signer;
 
-use crate::{address::validate_strkey, error::Sep43Error, signing::sign_classic_transaction};
+use crate::address::validate_strkey;
+use crate::error::Sep43Error;
+use crate::signing::{refuse_mainnet, sign_classic_transaction};
 
 /// Dispatches the SEP-43 `signTransaction` method.
 ///
@@ -31,6 +33,8 @@ use crate::{address::validate_strkey, error::Sep43Error, signing::sign_classic_t
 ///
 /// # Argument validation
 ///
+/// - A mainnet profile is refused at entry, before the signer is asked for
+///   its key → [`Sep43Error::MainnetSigningForbidden`].
 /// - If `network_passphrase` is `Some`, it must equal
 ///   `profile.network_passphrase`; mismatch → [`Sep43Error::InvalidNetworkPassphrase`].
 /// - If `address` is `Some`, it must be a valid strkey AND must equal the
@@ -38,6 +42,8 @@ use crate::{address::validate_strkey, error::Sep43Error, signing::sign_classic_t
 ///
 /// # Errors
 ///
+/// - [`Sep43Error::MainnetSigningForbidden`]: the profile's network is
+///   mainnet.
 /// - [`Sep43Error::InvalidNetworkPassphrase`] — passphrase mismatch.
 /// - [`Sep43Error::InvalidAddress`] — provided `address` is not a valid strkey
 ///   or does not match the signing key.
@@ -56,6 +62,8 @@ pub async fn dispatch(
     network_passphrase: Option<&str>,
     address: Option<&str>,
 ) -> Result<serde_json::Value, Sep43Error> {
+    refuse_mainnet(&profile.network_passphrase)?;
+
     // Validate the optional address argument shape first (no signer I/O).
     if let Some(addr) = address {
         validate_strkey(addr)?;
@@ -121,7 +129,36 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn muxed_contract_dispatch_refuses_before_signature() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([5; 32]);
+        let result = dispatch(
+            &testnet_profile(),
+            &signer,
+            &stellar_agent_test_support::xdr_fixtures::muxed_contract_envelope(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(signer.sign_calls(), 0);
+        let error = result.unwrap_err();
+        assert_eq!(error.wire_code(), "sep43.invalid_xdr");
+        assert!(
+            error
+                .to_string()
+                .ends_with("a muxed contract address (W) is not accepted on this path")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_invalid_xdr_returns_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = testnet_profile();
         let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
         let err = dispatch(&profile, &key, "not-valid-xdr", None, None)
@@ -132,7 +169,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_passphrase_mismatch_returns_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = testnet_profile();
         let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
         let err = dispatch(
@@ -152,7 +193,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_invalid_address_arg_returns_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = testnet_profile();
         let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
         let err = dispatch(&profile, &key, "AAAA", None, Some("not-a-strkey"))
@@ -205,7 +250,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_success_returns_signed_tx_xdr_and_signer_address() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope};
 
         let key = SoftwareSigningKey::new_from_bytes([0x70u8; 32]);
@@ -237,7 +286,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_address_matches_active_signer_ok() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope};
 
         let key = SoftwareSigningKey::new_from_bytes([0x71u8; 32]);
@@ -263,7 +316,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_address_mismatch_returns_invalid_address() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // The address-mismatch guard fires when the `address` arg is a valid
         // G-strkey that does not equal the signer's own key. Using a valid
         // envelope (not garbage XDR) ensures the only reachable error is
@@ -338,7 +395,11 @@ mod tests {
     /// signature verifies over the SEP-23 `TxFeeBump`-tagged
     /// `TransactionSignaturePayload` hash.
     #[tokio::test]
+    #[serial_test::serial]
     async fn dispatch_fee_bump_envelope_is_signed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use ed25519_dalek::{Signature, VerifyingKey};
         use sha2::{Digest, Sha256};
         use stellar_xdr::{
@@ -401,5 +462,69 @@ mod tests {
         let sig = Signature::from_bytes(&raw_sig);
         vk.verify_strict(&signing_hash, &sig)
             .expect("fee-bump signature must verify against the SEP-23 TxFeeBump payload hash");
+    }
+
+    /// A mainnet profile is refused before the signer is asked for its key.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatch_refuses_a_mainnet_profile_before_any_key_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let profile = Profile::builder_mainnet(
+            "https://rpc.example",
+            "svc",
+            "acct",
+            "nonce-svc",
+            "nonce-acct",
+        )
+        .build();
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([1u8; 32]);
+        let err = dispatch(
+            &profile,
+            &signer,
+            &minimal_tx_v1_xdr(
+                &ed25519_dalek::SigningKey::from_bytes(&[1u8; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, Sep43Error::MainnetSigningForbidden { .. }),
+            "got: {err:?}"
+        );
+        assert_eq!(signer.public_key_calls(), 0);
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    /// The same call on testnet reads the signer's key, so the refusal above
+    /// is the network's.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatch_reads_the_key_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([1u8; 32]);
+        let result = dispatch(
+            &testnet_profile(),
+            &signer,
+            &minimal_tx_v1_xdr(
+                &ed25519_dalek::SigningKey::from_bytes(&[1u8; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            ),
+            None,
+            None,
+        )
+        .await
+        .expect("a valid testnet request signs");
+        assert!(result["signedTxXdr"].is_string());
+        assert_eq!(signer.public_key_calls(), 2);
+        assert_eq!(signer.sign_calls(), 1);
     }
 }

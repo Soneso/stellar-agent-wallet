@@ -4,7 +4,8 @@
 # Builds a scratch Git repository with one commit on main. It holds copies of
 # the root manifest, lockfile, toolchain, every crates/*/Cargo.toml, four crate
 # sources, and the cap85-beacon record of the smart-account crate. It also
-# holds .github, CHANGELOG.md, CONTRIBUTING.md, the building guide, and the skill.
+# holds .github, scripts/deploy, CHANGELOG.md, CONTRIBUTING.md, the building
+# guide, and the skill.
 # Each case copies that repository, changes it on a branch, and runs
 # preflight.sh against main, or against the default base in the base cases.
 #
@@ -50,22 +51,23 @@ REAL_BASH=$(command -v bash)
 REAL_PYTHON=$(python3 -c 'import sys; print(sys.executable)')
 FIXTURE="$TMP/fixture"
 
-CASES="docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
-release-rehearsal-workflow
+CASES="changelog-fragments changelog-selection changelog-registry docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
+release-rehearsal-workflow vendored-wasm-workflow
 triage-workflow triage-review-workflow triage-sweep-workflow
-ci-yml-only python-check-script shell-check-script skill inbox-web one-crate two-owners
+ci-yml-only python-check-script proof-matrix-only shell-check-script testnet-driver-script deploy-scripts deploy-scripts-run skill inbox-web enroll-web bridge-web one-crate sep43-through-mcp two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
 unowned-rust-path
-wallet-manifest removed-member untracked-test-file fixture-markdown
+wallet-manifest removed-member untracked-test-file fixture-markdown crate-sources-select-proof-matrix
 committed-cross-scope-rename staged-rename-record spaces-and-an-apostrophe
 full vendored contracts action-script invariants-helper release-build-scripts duplicate-triggers changed-self-test
-deleted-shell-script deleted-self-test unavailable-tool
+deleted-shell-script deleted-self-test unavailable-tool missing-pyyaml
 exit-aggregation table bad-base malformed-manifest unloadable-install-surface-check
 the-preflight-itself registry-completeness
 drift drift-new-step drift-unnamed-step drift-removed-step drift-renamed-step
-install-hint coverage-suppression coverage-unavailable coverage-written"
+install-hint coverage-suppression coverage-unavailable coverage-written coverage-off-only-fails coverage-on-only-fails
+release-shape-libudev"
 
-ALWAYS=(docs-style install-surface gate-tool-versions)
+ALWAYS=(docs-style install-surface gate-tool-versions docs-reads)
 RUST=(fmt clippy rustdoc)
 # The scripts that preflight.sh executes by path; an execution case replaces
 # them with logging stubs.
@@ -81,41 +83,67 @@ EXPECTED_REGISTRY=$(
 docs-style	python3 .github/scripts/check-docs-style.py
 install-surface	python3 .github/scripts/check-install-surface.py
 gate-tool-versions	bash .github/scripts/check-gate-tool-versions.sh
+docs-reads	python3 .github/scripts/check-docs-reads.py
+changelog	python3 .github/scripts/changelog.py check
+self-test:test-changelog.py	python3 .github/scripts/test-changelog.py
 actionlint	actionlint
+feature-discipline	cargo fetch --locked && python3 .github/scripts/check-feature-discipline.py
+self-test:test-check-feature-discipline.py	python3 .github/scripts/test-check-feature-discipline.py --mutations
+self-test:test-check-binary-marker.sh	bash .github/scripts/test-check-binary-marker.sh
+self-test:test-release-checks.sh	bash .github/scripts/test-release-checks.sh
+self-test:test-check-provenance.py	python3 .github/scripts/test-check-provenance.py --mutations
 workflow-invariants	python3 .github/scripts/check-workflow-invariants.py
 self-test:test-check-coverage.py	python3 .github/scripts/test-check-coverage.py
 self-test:test-check-crates-exist.sh	bash .github/scripts/test-check-crates-exist.sh
+self-test:test-check-docs-reads.py	python3 .github/scripts/test-check-docs-reads.py
 self-test:test-check-docs-style.py	python3 .github/scripts/test-check-docs-style.py
 self-test:test-check-gate-tool-versions.sh	bash .github/scripts/test-check-gate-tool-versions.sh
 self-test:test-check-install-surface.py	python3 .github/scripts/test-check-install-surface.py
 self-test:test-check-no-direct-sasignersetbaselined-emit.sh	bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh
+self-test:test-check-proof-matrix.py	python3 .github/scripts/test-check-proof-matrix.py
 self-test:test-check-ref-on-main.sh	bash .github/scripts/test-check-ref-on-main.sh
 self-test:test-check-workflow-invariants.py	python3 .github/scripts/test-check-workflow-invariants.py
+self-test:test-classify-docs-only.py	python3 .github/scripts/test-classify-docs-only.py
 self-test:test-compare-crate-sums.py	python3 .github/scripts/test-compare-crate-sums.py
 self-test:test-preflight.sh	bash .github/scripts/test-preflight.sh
 self-test:test-publish-crates-check.sh	.github/scripts/test-publish-crates-check.sh
 self-test:test-publish-crates-verify.sh	bash .github/scripts/test-publish-crates-verify.sh
 self-test:test-rebuild-vendored-wasm.sh	bash .github/scripts/test-rebuild-vendored-wasm.sh
+self-test:test-run-testnet-acceptance.sh	bash .github/scripts/test-run-testnet-acceptance.sh
 self-test:test-sync-labels.py	python3 .github/scripts/test-sync-labels.py
 self-test:test-take-workflow.py	python3 .github/scripts/test-take-workflow.py
 self-test:test-triage-workflow.py	python3 .github/scripts/test-triage-workflow.py
 self-test:test-validate-unsigned-archive.py	python3 .github/scripts/test-validate-unsigned-archive.py
 self-test:test-welcome-workflow.py	python3 .github/scripts/test-welcome-workflow.py
 shellcheck-preflight	shellcheck -s bash .github/scripts/preflight.sh .github/scripts/test-preflight.sh
+deploy-shellcheck	shellcheck -s bash scripts/deploy/bootstrap.sh scripts/deploy/mcp-launch scripts/deploy/cli-launch scripts/deploy/provision scripts/deploy/validate-macos.sh scripts/deploy/validate-linux.sh scripts/deploy/test-deploy.sh
+deploy-harness	bash scripts/deploy/test-deploy.sh
 package-skill	.github/scripts/package-skill.sh --check
 vendored-tree-check	bash .github/scripts/rebuild-vendored-wasm.sh --check-tree --repo-root .
 publish-check	.github/scripts/publish-crates.sh --check
 baseline-gate	bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh
 fmt	cargo fmt --all -- --check
-clippy	cargo clippy --all-targets --all-features -- -D warnings
-rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-test	cargo test --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry
+clippy	cargo clippy --workspace --all-targets --no-default-features --features deploy-cli,live-platform-keyring,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers -- -D warnings
+rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --no-default-features --features deploy-cli,live-platform-keyring,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
+test	cargo test --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry
+proof-matrix	python3 .github/scripts/check-proof-matrix.py --configuration feature-off --workspace
+feature-on:clippy	cargo clippy --workspace --all-targets --features mainnet-write,deploy-cli,live-platform-keyring,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers -- -D warnings
+feature-on:doc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features mainnet-write,deploy-cli,live-platform-keyring,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
+feature-on:test	cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry
+feature-on:network	cargo check -p stellar-agent-network --features mainnet-write
+proof-matrix:feature-on	python3 .github/scripts/check-proof-matrix.py --configuration feature-on --workspace
+release-shape	bash .github/scripts/release/check-host.sh
+test-support-friendbot	cargo test -p stellar-agent-test-support --no-default-features --features testnet-helpers --lib
 test-vendored-release-cfg	cargo test -p stellar-agent-smart-account --test vendored_wasm_release_cfg
+test-policy-pin-release-cfg	cargo test -p stellar-agent-core --doc policy::pin
 machete	cargo machete
 deny	cargo deny check
-coverage	cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov.json
-coverage-floors	python3 .github/scripts/check-coverage.py cov.json
-inbox-js	node --test crates/stellar-agent-approval-ui/src/web/app_shared.test.mjs
+coverage	cargo llvm-cov --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json
+coverage-floors	python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off
+coverage:feature-on	cargo llvm-cov --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-on.json
+coverage-floors:feature-on	python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on
+inbox-js	node --test crates/stellar-agent-approval-ui/src/web/app_shared.test.mjs crates/stellar-agent-webauthn-bridge/src/web/glue.test.mjs crates/stellar-agent-approval-remote/src/web/signed-login.test.mjs
+mainnet-presence-js	node --test crates/stellar-agent-approval-ui/src/web/mainnet-presence.test.mjs
 interop:mpp	.github/scripts/test-mpp-interop.sh
 interop:sdk-v17	.github/scripts/test-sdk-v17-interop.sh
 EOF
@@ -125,6 +153,14 @@ EOF
 # workflow, job, step name, and the reason the preflight does not run them.
 NOT_CARRIED=$(
   cat <<'EOF'
+ci.yml	feature-on-clippy	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+ci.yml	feature-on-doc	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+ci.yml	feature-on-test	Free disk space	reclaims runner disk space
+ci.yml	feature-on-test	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+ci.yml	feature-discipline	Fetch the locked graph	preflight includes fetch in the discipline row
+changelog.yml	changelog	Fetch main for changelog protection	CI supplies the remote ancestry
+changelog.yml	changelog	Protect integration changelog	CI checks the pull request event SHAs
+ci.yml	release-shape	Install libudev (Linux hidapi)	the row requires libudev instead of installing it
 ci.yml	clippy	Install libudev (Linux hidapi)	installs Linux system headers on the runner
 ci.yml	doc	Install libudev (Linux hidapi)	installs Linux system headers on the runner
 ci.yml	test	Free disk space	reclaims runner disk space
@@ -132,8 +168,13 @@ ci.yml	test	Install libudev (Linux hidapi)	installs Linux system headers on the 
 ci.yml	test	Check each test-support feature set	the per-feature compile matrix runs in CI only
 ci.yml	mpp-interop	Enable Corepack	activates Corepack on the runner
 ci.yml	sdk-v17-interop	Enable Corepack	activates Corepack on the runner
-coverage.yml	coverage	Free disk space	reclaims runner disk space
-coverage.yml	coverage	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+coverage.yml	coverage-off	Free disk space	reclaims runner disk space
+coverage.yml	coverage-off	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+coverage.yml	coverage-on	Free disk space	reclaims runner disk space
+coverage.yml	coverage-on	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+coverage.yml	coverage	Check both measurements	reads the results of the two measurement jobs
+coverage.yml	coverage	Reject a cancelled run before the floors	fails a cancelled CI run
+coverage.yml	coverage	Reject a cancelled run after the floors	fails a cancelled CI run
 install-surface.yml	install-surface	Self-test Python checks on Python 3.11	repeats the Python self-tests on a second interpreter
 install-surface.yml	install-surface	Install actionlint	installs a gate tool on the runner
 vendored-wasm.yml	check	Decide whether the change needs a rebuild	decides whether the CI rebuild jobs run
@@ -186,6 +227,9 @@ build_fixture() {
     cp "$ROOT/$file" "$dir/$file"
   done
   cp -R "$ROOT/.github" "$dir/.github"
+  cp -R "$ROOT/changelog.d" "$dir/changelog.d"
+  mkdir -p "$dir/scripts"
+  cp -R "$ROOT/scripts/deploy" "$dir/scripts/deploy"
   if [ -n "${2:-}" ]; then
     apply_mutation "$2" "$dir/.github/scripts/preflight.sh"
     bash -n "$dir/.github/scripts/preflight.sh"
@@ -288,7 +332,22 @@ expect_list() {
     flags+=(--full)
     shift
   fi
-  expected_rows "$@" >"$CASE_DIR.expected"
+  local extra=() argument
+  case "$CASE_NAME" in
+    deleted-install-surface-doc | welcome-workflow | release-workflow | release-rehearsal-workflow | vendored-wasm-workflow | triage-workflow | triage-review-workflow | triage-sweep-workflow | ci-yml-only | python-check-script | proof-matrix-only | shell-check-script | one-crate | sep43-through-mcp | two-owners | target-specific-edge | dev-dependency-edge | optional-dependency-edge | root-manifest | lockfile | wallet-manifest | removed-member | untracked-test-file | crate-sources-select-proof-matrix | staged-rename-record | spaces-and-an-apostrophe | action-script | invariants-helper | release-build-scripts | duplicate-triggers | changed-self-test | deleted-shell-script | deleted-self-test | the-preflight-itself)
+      extra+=(feature-discipline self-test:test-check-feature-discipline.py)
+      ;;
+  esac
+  for argument in "$@"; do
+    if [ "$argument" = clippy ]; then
+      extra+=(feature-on:clippy feature-on:doc feature-on:test feature-on:network)
+    fi
+  done
+  expected_rows "$@" ${extra[@]+"${extra[@]}"} >"$CASE_DIR.unordered"
+  printf '%s\n' "$EXPECTED_REGISTRY" >"$CASE_DIR.registry"
+  awk -F '\t' 'FILENAME == ARGV[1] { rows[$1]=$0; next } $1 in rows { print rows[$1]; delete rows[$1] }
+    END { if ("shellcheck-changed" in rows) print rows["shellcheck-changed"] }' \
+    "$CASE_DIR.unordered" "$CASE_DIR.registry" >"$CASE_DIR.expected"
   "$REAL_BASH" "$SCRIPT_REL" "${flags[@]}" >"$CASE_DIR.actual" 2>"$CASE_DIR.stderr" || rc=$?
   if [ "$rc" -ne 0 ] || [ -s "$CASE_DIR.stderr" ]; then
     cat "$CASE_DIR.stderr" >&2
@@ -348,6 +407,9 @@ dependents = sorted(
     if directory not in owners and uses(directory, manifest) & set(owners)
 )
 selection = [name[directory] for directory in owners] + dependents
+# The MCP tests run the CLI executable, so the MCP package brings the CLI.
+if "stellar-agent-mcp" in selection and "stellar-agent-cli" not in selection:
+    selection.append("stellar-agent-cli")
 declared = set()
 for directory, manifest in manifests.items():
     if name[directory] in selection:
@@ -371,19 +433,44 @@ pin_packages() {
   for package in "${list[@]}"; do
     operands="$operands -p $package"
   done
-  test_command="cargo test$operands"
+  test_command="cargo test$operands --no-default-features"
   if [ -n "$features" ]; then
     test_command="$test_command --features $features"
   fi
-  PACKAGE_GATES=(fmt "clippy=cargo clippy$operands --all-targets --all-features -- -D warnings"
-    "rustdoc=${RUSTDOC_PREFIX}cargo doc --no-deps$operands --all-features" "test=$test_command")
+  local declared on_declared all_args="" on_args="" on_test="cargo test$operands${features:+ --features $features}"
+  declared=$(python3 - "$packages" <<'PYDECLARED'
+import pathlib, sys, tomllib
+selected = sys.argv[1].split()
+keys = set()
+for path in pathlib.Path("crates").glob("*/Cargo.toml"):
+    manifest = tomllib.loads(path.read_text())
+    if manifest["package"]["name"] in selected:
+        keys.update(manifest.get("features", {}))
+print(",".join(sorted(keys - {"default", "mainnet-write"})))
+print("mainnet-write" if "mainnet-write" in keys else "")
+PYDECLARED
+  )
+  on_declared=$(printf '%s\n' "$declared" | tail -n 1)
+  declared=$(printf '%s\n' "$declared" | head -n 1)
+  [ -z "$declared" ] || all_args=" --features $declared"
+  if [ "$on_declared" = mainnet-write ]; then
+    on_args=" --features mainnet-write${declared:+,$declared}"
+    on_test="cargo test$operands --features mainnet-write${features:+,$features}"
+  else
+    on_args=$all_args
+  fi
+  PACKAGE_GATES=(fmt "clippy=cargo clippy$operands --all-targets --no-default-features$all_args -- -D warnings"
+    "rustdoc=${RUSTDOC_PREFIX}cargo doc --no-deps$operands --no-default-features$all_args" "test=$test_command"
+    "feature-on:clippy=cargo clippy$operands --all-targets$on_args -- -D warnings"
+    "feature-on:doc=${RUSTDOC_PREFIX}cargo doc --no-deps$operands$on_args" "feature-on:test=$on_test"
+    feature-on:network)
 }
 
-# Prints the .github/scripts/ paths that EXPECTED_REGISTRY runs with
-# interpreter $1, one per line.
+# Prints the .github/scripts/ and scripts/deploy/ paths that
+# EXPECTED_REGISTRY runs with interpreter $1, one per line.
 registry_scripts() {
   printf '%s\n' "$EXPECTED_REGISTRY" | awk -F '\t' -v interpreter="$1" '
-    split($2, words, " ") >= 2 && words[1] == interpreter && words[2] ~ /^\.github\/scripts\// { print words[2] }
+    split($2, words, " ") >= 2 && words[1] == interpreter && words[2] ~ /^(\.github\/scripts|scripts\/deploy)\// { print words[2] }
   '
 }
 
@@ -391,10 +478,12 @@ registry_scripts() {
 # arguments to the case call log. Each argument is logged as "ARG <bytes>:"
 # and its exact bytes, so an argument cannot forge a log line. Kind $3
 # decides the rest.
-#   python  Runs the real python3 for a planner block (-) and for the two
-#           probes of preflight.sh. For a script that EXPECTED_REGISTRY runs
-#           with python3, it exits the configured status. Any other call
-#           logs UNEXPECTED and exits 97.
+#   python  Runs the real python3 for a planner block (-) and for the
+#           version probe of preflight.sh. The PyYAML probe exits the
+#           configured status of "import yaml", so the case, never the host,
+#           decides whether PyYAML is present. For a script that
+#           EXPECTED_REGISTRY runs with python3, it exits the configured
+#           status. Any other call logs UNEXPECTED and exits 97.
 #   bash    For a script that EXPECTED_REGISTRY runs with bash, it exits the
 #           configured status. Any other call runs the real bash.
 #   cargo   Exits the configured status of "cargo <subcommand>", or of
@@ -406,7 +495,7 @@ registry_scripts() {
 write_shim() {
   local file=$1 name=$2 kind=$3 gates=""
   case "$kind" in
-    python) gates=$(registry_scripts python3) ;;
+    python) gates=$(registry_scripts python3; echo .github/scripts/check-feature-discipline.py) ;;
     bash) gates=$(registry_scripts bash) ;;
   esac
   {
@@ -448,8 +537,11 @@ case "${1-}" in
   -) exec "$REAL_PYTHON" "$@" ;;
   -c)
     case "${2-}" in
-      'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' | 'import yaml')
+      'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)')
         exec "$REAL_PYTHON" "$@"
+        ;;
+      'import yaml')
+        exit "$(status_of "import yaml")"
         ;;
     esac
     ;;
@@ -478,6 +570,12 @@ if [ "${2-}" = --version ]; then
   key="$key --version"
 fi
 status=$(status_of "$key")
+if [ "${1-}" = llvm-cov ] && [ "${2-}" != --version ] && [ "$status" = 0 ]; then
+  case "$*" in
+    *cov-feature-on.json*) status=$(status_of "cargo llvm-cov:feature-on") ;;
+    *cov-feature-off.json*) status=$(status_of "cargo llvm-cov:feature-off") ;;
+  esac
+fi
 if [ "${1-}" = llvm-cov ] && [ "$status" = 0 ]; then
   previous=""
   for argument in "$@"; do
@@ -626,11 +724,12 @@ assert_clean_calls() {
   {
     {
       while IFS=$'\t' read -r id command; do
-        if [ "$id" = rustdoc ]; then
+        if { [ "$id" = rustdoc ] || [ "$id" = feature-on:doc ]; }; then
           command=${command#"$RUSTDOC_PREFIX"}
         fi
         printf '%s\n' "$command"
       done <<<"$EXPECTED_REGISTRY"
+      printf '%s\n' "cargo fetch --locked" "python3 .github/scripts/check-feature-discipline.py"
       printf '%s\n' "cargo llvm-cov --version" "cargo machete --version" "cargo deny --version"
     } | command_records
     if [ "$#" -gt 0 ]; then
@@ -889,6 +988,41 @@ expect_drift() {
   done
 }
 
+case_changelog_fragments() {
+  start_case
+  edit changelog.d/README.md
+  expect_list "${ALWAYS[@]}" changelog self-test:test-changelog.py
+}
+
+case_changelog_selection() {
+  start_case
+  edit .github/scripts/changelog.py
+  expect_list "${ALWAYS[@]}" changelog self-test:test-changelog.py \
+    feature-discipline self-test:test-check-feature-discipline.py workflow-invariants self-test:test-check-workflow-invariants.py
+  edit .github/scripts/test-changelog.py
+  expect_list "${ALWAYS[@]}" changelog self-test:test-changelog.py \
+    feature-discipline self-test:test-check-feature-discipline.py workflow-invariants self-test:test-check-workflow-invariants.py
+  edit .github/workflows/changelog.yml
+  expect_list "${ALWAYS[@]}" changelog self-test:test-changelog.py actionlint \
+    feature-discipline self-test:test-check-feature-discipline.py workflow-invariants self-test:test-check-workflow-invariants.py
+}
+
+case_changelog_registry() {
+  start_case
+  python3 - <<'PY' || fail "changelog registry differs from workflow commands"
+from pathlib import Path
+source = Path('.github/scripts/preflight.sh').read_text()
+workflow = Path('.github/workflows/changelog.yml').read_text()
+for gate, command, step in (
+    ('changelog', 'python3 .github/scripts/changelog.py check', 'Check changelog fragments'),
+    ('self-test:test-changelog.py', 'python3 .github/scripts/test-changelog.py', 'Test changelog fragments'),
+):
+    row = '\t'.join((gate, command, '-', 'changelog.yml', 'changelog', step))
+    assert source.splitlines().count(row) == 1, 'changelog registry mapping differs'
+    assert f'      - name: {step}\n        run: {command}\n' in workflow, 'changelog workflow command differs'
+PY
+}
+
 # CHANGELOG.md is Markdown outside the surface scope.
 case_docs_only() {
   start_case
@@ -1010,10 +1144,16 @@ case_release_rehearsal_workflow() {
   expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py
 }
 
+case_vendored_wasm_workflow() {
+  start_case
+  edit .github/workflows/vendored-wasm.yml
+  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py
+}
+
 case_ci_yml_only() {
   start_case
   edit .github/workflows/ci.yml
-  expect_list "${ALWAYS[@]}" actionlint
+  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py
 }
 
 case_python_check_script() {
@@ -1022,11 +1162,55 @@ case_python_check_script() {
   expect_list "${ALWAYS[@]}" self-test:test-check-docs-style.py
 }
 
+# A change to the proof matrix alone selects both matrix checks.
+case_proof_matrix_only() {
+  start_case
+  edit .github/scripts/proof-matrix.toml
+  expect_list "${ALWAYS[@]}" proof-matrix proof-matrix:feature-on
+}
+
 case_shell_check_script() {
   start_case
   edit .github/scripts/check-gate-tool-versions.sh
   expect_list "${ALWAYS[@]}" self-test:test-check-gate-tool-versions.sh \
     "shellcheck-changed=shellcheck -s bash .github/scripts/check-gate-tool-versions.sh"
+}
+
+# The testnet acceptance driver selects its self-test, and shellcheck reads it.
+# A workflow runs it and it runs cargo, so the feature discipline gates
+# read it too.
+case_testnet_driver_script() {
+  start_case
+  edit .github/scripts/run-testnet-acceptance.sh
+  expect_list "${ALWAYS[@]}" feature-discipline self-test:test-check-feature-discipline.py \
+    self-test:test-run-testnet-acceptance.sh \
+    "shellcheck-changed=shellcheck -s bash .github/scripts/run-testnet-acceptance.sh"
+}
+
+# A change below scripts/deploy/ selects the shellcheck of those scripts and
+# the deployment harness, in that order.
+case_deploy_scripts() {
+  start_case
+  edit scripts/deploy/cli-launch
+  expect_list "${ALWAYS[@]}" deploy-shellcheck deploy-harness
+}
+
+# The deployment gates run shellcheck, then the harness; a failing harness
+# fails the run.
+case_deploy_scripts_run() {
+  start_run_case
+  edit scripts/deploy/provision
+  write_shim "$BIN/shellcheck" shellcheck plain
+  write_shim "$BIN/perl" perl plain
+  echo "scripts/deploy/test-deploy.sh=1" >>"$STATE/status"
+  run_preflight
+  expect_line "- \`$(registry_row deploy-harness | cut -f 2)\`: exit 1"
+  expect_end 1 "preflight: 6 gates run, 1 failed, 0 unavailable"
+  expect_calls "python3 .github/scripts/check-docs-style.py" "python3 .github/scripts/check-install-surface.py" \
+    "bash .github/scripts/check-gate-tool-versions.sh" "python3 .github/scripts/check-docs-reads.py" \
+    "$(registry_row deploy-shellcheck | cut -f 2)" \
+    "bash scripts/deploy/test-deploy.sh"
+  assert_clean_calls
 }
 
 case_skill() {
@@ -1039,50 +1223,81 @@ case_inbox_web() {
   start_case
   mkdir -p crates/stellar-agent-approval-ui/src/web
   edit crates/stellar-agent-approval-ui/src/web/app_shared.js
-  pin_packages "stellar-agent-approval-ui stellar-agent-approval-remote stellar-agent-cli stellar-agent-mcp" test-helpers \
+  pin_packages "stellar-agent-approval-ui stellar-agent-approval-remote stellar-agent-cli stellar-agent-mcp stellar-agent-webauthn-bridge" test-helpers \
     crates/stellar-agent-approval-ui/src/web/app_shared.js
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" inbox-js
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on inbox-js mainnet-presence-js
+}
+
+case_enroll_web() {
+  start_case
+  mkdir -p crates/stellar-agent-approval-ui/src/operator_enroll/web
+  edit crates/stellar-agent-approval-ui/src/operator_enroll/web/operator-enroll.js
+  pin_packages "stellar-agent-approval-ui stellar-agent-approval-remote stellar-agent-cli stellar-agent-mcp stellar-agent-webauthn-bridge" test-helpers \
+    crates/stellar-agent-approval-ui/src/operator_enroll/web/operator-enroll.js
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on inbox-js mainnet-presence-js
+}
+
+case_bridge_web() {
+  start_case
+  mkdir -p crates/stellar-agent-webauthn-bridge/src/web
+  edit crates/stellar-agent-webauthn-bridge/src/web/glue.js
+  pin_packages "stellar-agent-webauthn-bridge stellar-agent-approval-remote stellar-agent-cli stellar-agent-smart-account-acceptance" test-helpers \
+    crates/stellar-agent-webauthn-bridge/src/web/glue.js
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on inbox-js
 }
 
 # The MCP manifest inherits stellar-agent-sep7 from [workspace.dependencies].
 case_one_crate() {
   start_case
   edit crates/stellar-agent-sep7/src/lib.rs
-  pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers crates/stellar-agent-sep7/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
+  pin_packages "stellar-agent-sep7 stellar-agent-mcp stellar-agent-cli" test-helpers crates/stellar-agent-sep7/src/lib.rs
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
+}
+
+# SEP-43 selects its direct dependents MCP, MPP, and x402. The MCP tests run
+# the CLI executable, so the CLI follows them; the CLI has no SEP-43 edge.
+case_sep43_through_mcp() {
+  start_case
+  mkdir -p crates/stellar-agent-sep43/src
+  edit crates/stellar-agent-sep43/src/lib.rs
+  pin_packages "stellar-agent-sep43 stellar-agent-mcp stellar-agent-mpp stellar-agent-x402 stellar-agent-cli" test-helpers \
+    crates/stellar-agent-sep43/src/lib.rs
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }
 
 case_two_owners() {
   start_case
   edit crates/stellar-agent-sep7/src/lib.rs crates/stellar-agent-sep5/src/lib.rs
   pin_packages "stellar-agent-sep5 stellar-agent-sep7 stellar-agent-cli stellar-agent-mcp stellar-agent-pool" \
-    test-helpers crates/stellar-agent-sep7/src/lib.rs crates/stellar-agent-sep5/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
+    test-helpers,test-hooks crates/stellar-agent-sep7/src/lib.rs crates/stellar-agent-sep5/src/lib.rs
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }
 
-# Core and headless-keyring depend on windows-identity only in their Windows
-# target tables.
+# Core, headless-keyring and the CLI depend on windows-identity only in their
+# Windows target tables.
 case_target_specific_edge() {
   start_case
   edit crates/stellar-agent-windows-identity/src/lib.rs
-  pin_packages "stellar-agent-windows-identity stellar-agent-core stellar-agent-headless-keyring" test-helpers \
+  pin_packages "stellar-agent-windows-identity stellar-agent-cli stellar-agent-core stellar-agent-headless-keyring" test-helpers \
     crates/stellar-agent-windows-identity/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on test-policy-pin-release-cfg
 }
 
 # Most members reach test-support through a dev-dependency path; the
-# smart-account crate is among them.
+# smart-account crate is among them. test-support owns the change, so its
+# Friendbot unit tests run.
 case_dev_dependency_edge() {
   start_case
   edit crates/stellar-agent-test-support/src/lib.rs
-  pin_packages "stellar-agent-test-support stellar-agent-approval-remote stellar-agent-approval-ui \
-stellar-agent-claimable stellar-agent-cli stellar-agent-core stellar-agent-defi stellar-agent-defindex \
-stellar-agent-dex stellar-agent-mcp stellar-agent-mpp stellar-agent-network stellar-agent-nonce \
-stellar-agent-pool stellar-agent-sep43 stellar-agent-sep48 stellar-agent-sep53 stellar-agent-sep7 \
-stellar-agent-smart-account stellar-agent-smart-account-acceptance stellar-agent-stablecoin \
-stellar-agent-toolsets-install stellar-agent-toolsets-runtime stellar-agent-x402" \
+  pin_packages "stellar-agent-test-support stellar-agent-anchor stellar-agent-approval-remote \
+stellar-agent-approval-ui stellar-agent-claimable stellar-agent-cli stellar-agent-core stellar-agent-defi \
+stellar-agent-defindex stellar-agent-dex stellar-agent-headless-keyring stellar-agent-mcp stellar-agent-mpp \
+stellar-agent-network stellar-agent-nonce stellar-agent-pool stellar-agent-sep43 stellar-agent-sep48 \
+stellar-agent-sep53 stellar-agent-sep7 stellar-agent-smart-account stellar-agent-smart-account-acceptance \
+stellar-agent-stablecoin stellar-agent-toolsets-install stellar-agent-toolsets-runtime stellar-agent-x402" \
     test-helpers,test-hooks,test-loopback,verifier-registry crates/stellar-agent-test-support/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" test-vendored-release-cfg
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on test-support-friendbot test-vendored-release-cfg \
+    test-policy-pin-release-cfg
 }
 
 # The acceptance member reaches sep48 only through an optional dependency,
@@ -1091,35 +1306,38 @@ case_optional_dependency_edge() {
   start_case
   mkdir -p crates/stellar-agent-sep48/src
   edit crates/stellar-agent-sep48/src/lib.rs
-  pin_packages "stellar-agent-sep48 stellar-agent-mcp stellar-agent-smart-account-acceptance" test-helpers \
+  pin_packages "stellar-agent-sep48 stellar-agent-mcp stellar-agent-smart-account-acceptance stellar-agent-cli" test-helpers \
     crates/stellar-agent-sep48/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }
 
 case_root_manifest() {
   start_case
   edit Cargo.toml
   expect_list "${ALWAYS[@]}" self-test:test-check-install-surface.py "${RUST[@]}" test \
-    test-vendored-release-cfg
+    test-support-friendbot test-vendored-release-cfg test-policy-pin-release-cfg
 }
 
 case_lockfile() {
   start_case
   edit Cargo.lock
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg
+  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-support-friendbot test-vendored-release-cfg \
+    test-policy-pin-release-cfg
 }
 
 case_toolchain() {
   start_case
   edit rust-toolchain.toml
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg
+  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-support-friendbot test-vendored-release-cfg \
+    test-policy-pin-release-cfg
 }
 
 case_unowned_rust_path() {
   start_case
   mkdir -p tests
   edit tests/unowned.rs
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg
+  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-support-friendbot test-vendored-release-cfg \
+    test-policy-pin-release-cfg
 }
 
 # The install-surface check reads the binstall metadata of the wallet crate
@@ -1136,15 +1354,16 @@ case_removed_member() {
   git rm -q -r crates/stellar-agent-sep53
   git commit -q -m "remove sep53"
   assert_changed crates/stellar-agent-sep53/Cargo.toml
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg
+  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-support-friendbot test-vendored-release-cfg \
+    test-policy-pin-release-cfg
 }
 
 case_untracked_test_file() {
   start_case
   printf '#[test]\nfn new_case() {}\n' >crates/stellar-agent-sep7/tests/new_case.rs
   assert_changed crates/stellar-agent-sep7/tests/new_case.rs
-  pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers crates/stellar-agent-sep7/tests/new_case.rs
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
+  pin_packages "stellar-agent-sep7 stellar-agent-mcp stellar-agent-cli" test-helpers crates/stellar-agent-sep7/tests/new_case.rs
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }
 
 # Markdown under the test fixtures of a crate is outside the surface scope.
@@ -1153,9 +1372,20 @@ case_fixture_markdown() {
   mkdir -p crates/stellar-agent-sep7/tests/fixtures
   printf '# Fixture\n' >crates/stellar-agent-sep7/tests/fixtures/notes.md
   assert_changed crates/stellar-agent-sep7/tests/fixtures/notes.md
-  pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers \
+  pin_packages "stellar-agent-sep7 stellar-agent-mcp stellar-agent-cli" test-helpers \
     crates/stellar-agent-sep7/tests/fixtures/notes.md
-  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
+}
+
+# A crate source and a crate test each select both proof-matrix checks.
+case_crate_sources_select_proof_matrix() {
+  start_case
+  edit crates/stellar-agent-sep7/src/lib.rs
+  printf '#[test]\nfn renamed_case() {}\n' >crates/stellar-agent-sep7/tests/renamed_case.rs
+  assert_changed crates/stellar-agent-sep7/tests/renamed_case.rs
+  pin_packages "stellar-agent-sep7 stellar-agent-mcp stellar-agent-cli" test-helpers crates/stellar-agent-sep7/src/lib.rs \
+    crates/stellar-agent-sep7/tests/renamed_case.rs
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
 }
 
 case_committed_cross_scope_rename() {
@@ -1198,7 +1428,7 @@ case_spaces_and_an_apostrophe() {
   : >".github/scripts/it's.sh"
   write_shim "$BIN/shellcheck" shellcheck plain
   run_preflight
-  expect_end 0 "preflight: 4 gates run, 0 failed, 0 unavailable"
+  expect_end 1 "preflight: 5 gates run, 0 failed, 2 unavailable"
   shellcheck_call=$(argv_record shellcheck -s bash ".github/scripts/it's.sh" ".github/scripts/with space.sh")
   record_gate_calls
   if [ "$(grep -c '^\["shellcheck"' "$CASE_DIR.calls")" -ne 1 ] ||
@@ -1214,8 +1444,15 @@ case_full() {
   start_case
   edit CONTRIBUTING.md
   read -r -a ids <<<"$(printf '%s\n' "$EXPECTED_REGISTRY" | awk -F '\t' '{ printf "%s ", $1 }')"
-  if [ "${#ids[@]}" -ne 40 ]; then
-    fail "the expected registry holds ${#ids[@]} rows, expected 40"
+  local original=0 added=0 id
+  for id in "${ids[@]}"; do
+    case "$id" in
+      changelog | self-test:test-changelog.py) added=$((added + 1)) ;;
+      *) original=$((original + 1)) ;;
+    esac
+  done
+  if [ "$original" -ne 64 ] || [ "$added" -ne 2 ]; then
+    fail "the expected registry requires 64 original rows and 2 changelog rows"
   fi
   expect_list --full "${ids[@]}"
 }
@@ -1226,7 +1463,7 @@ case_vendored() {
   edit crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/REFERENCE.md
   pin_packages "stellar-agent-smart-account stellar-agent-approval-remote stellar-agent-cli \
 stellar-agent-defindex stellar-agent-dex stellar-agent-mcp stellar-agent-smart-account-acceptance \
-stellar-agent-webauthn-bridge" test-helpers \
+stellar-agent-webauthn-bridge" test-helpers,test-hooks \
     crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/REFERENCE.md
   expect_list "${ALWAYS[@]}" vendored-tree-check "${PACKAGE_GATES[@]}" test-vendored-release-cfg
 }
@@ -1262,7 +1499,8 @@ case_invariants_helper() {
 
 # release-rehearsal.yml names the release build scripts in a subdirectory of
 # .github/scripts/, so the computed input set of the invariants gate holds
-# them, and a change to one selects the check and its self-test.
+# them, and a change to one selects the check and its self-test. A change to
+# sodium.sh also selects the release checks, which hold its stub-download test.
 case_release_build_scripts() {
   local script
   start_case
@@ -1278,6 +1516,10 @@ case_release_build_scripts() {
   expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
     "shellcheck-changed=shellcheck -s bash .github/scripts/release/build.sh"
   git checkout -q -- .github/scripts/release/build.sh
+  edit .github/scripts/release/sodium.sh
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-release-checks.sh "shellcheck-changed=shellcheck -s bash .github/scripts/release/sodium.sh"
+  git checkout -q -- .github/scripts/release/sodium.sh
   edit .github/scripts/release/windows-perl.ps1
   expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py
 }
@@ -1291,7 +1533,8 @@ case_duplicate_triggers() {
 case_changed_self_test() {
   start_case
   edit .github/scripts/test-compare-crate-sums.py
-  expect_list "${ALWAYS[@]}" self-test:test-compare-crate-sums.py
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-compare-crate-sums.py \
+    self-test:test-check-workflow-invariants.py
 }
 
 # A deleted script still selects the gates of its scope, but it is never an
@@ -1306,11 +1549,12 @@ case_deleted_shell_script() {
 }
 
 # A deleted self-test file selects neither its own record nor shellcheck.
+# ci.yml names it, so the workflow checks run.
 case_deleted_self_test() {
   start_case
   git rm -q .github/scripts/test-check-ref-on-main.sh
   assert_changed .github/scripts/test-check-ref-on-main.sh
-  expect_list "${ALWAYS[@]}"
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py
 }
 
 case_unavailable_tool() {
@@ -1327,9 +1571,31 @@ case_unavailable_tool() {
   version=$(sed -n 's/.*actionlint_\([0-9][0-9.]*\)_linux_amd64.*/\1/p' .github/workflows/install-surface.yml)
   [ -n "$version" ] || fail "install-surface.yml pins no actionlint archive"
   expect_line "- \`actionlint\`: unavailable (actionlint: brew install actionlint, or the $version release archive for your platform (actionlint_${version}_<os>_<arch>.tar.gz))"
-  expect_end 1 "preflight: 3 gates run, 0 failed, 1 unavailable"
+  expect_end 1 "preflight: 6 gates run, 0 failed, 3 unavailable"
   expect_calls "python3 .github/scripts/check-docs-style.py" "python3 .github/scripts/check-install-surface.py" \
-    "bash .github/scripts/check-gate-tool-versions.sh"
+    "bash .github/scripts/check-gate-tool-versions.sh" "python3 .github/scripts/check-docs-reads.py" \
+    "python3 .github/scripts/check-workflow-invariants.py" \
+    "python3 .github/scripts/test-check-workflow-invariants.py"
+  assert_clean_calls
+}
+
+# Without PyYAML, both workflow-invariants rows report unavailable with the
+# virtual-environment hint, and the summary counts them with the two cargo
+# rows. actionlint passes, so only those four rows are unavailable.
+case_missing_pyyaml() {
+  local hint
+  start_run_case
+  edit .github/workflows/ci.yml
+  write_shim "$BIN/actionlint" actionlint plain
+  echo "import yaml=1" >>"$STATE/status"
+  run_preflight
+  # shellcheck disable=SC2016 # The hint holds a literal $PWD and $PATH.
+  hint='python3 -m venv .venv && .venv/bin/python -m pip install --require-hashes -r .github/scripts/workflow-check-requirements.txt && export PATH=$PWD/.venv/bin:$PATH'
+  expect_line "- \`python3 .github/scripts/check-workflow-invariants.py\`: unavailable (yaml: $hint)"
+  expect_line "- \`python3 .github/scripts/test-check-workflow-invariants.py\`: unavailable (yaml: $hint)"
+  expect_end 1 "preflight: 5 gates run, 0 failed, 4 unavailable"
+  expect_calls "python3 .github/scripts/check-docs-style.py" "python3 .github/scripts/check-install-surface.py" \
+    "bash .github/scripts/check-gate-tool-versions.sh" "python3 .github/scripts/check-docs-reads.py" "actionlint"
   assert_clean_calls
 }
 
@@ -1346,9 +1612,11 @@ run_exit_aggregation() {
 case_exit_aggregation() {
   run_exit_aggregation
   expect_line "- \`actionlint\`: exit 3"
-  expect_end 1 "preflight: 5 gates run, 1 failed, 0 unavailable"
+  expect_end 1 "preflight: 8 gates run, 1 failed, 2 unavailable"
   expect_calls "python3 .github/scripts/check-docs-style.py" "python3 .github/scripts/check-install-surface.py" \
-    "bash .github/scripts/check-gate-tool-versions.sh" "actionlint" "python3 .github/scripts/test-check-docs-style.py"
+    "bash .github/scripts/check-gate-tool-versions.sh" "python3 .github/scripts/check-docs-reads.py" "actionlint" \
+    "python3 .github/scripts/check-workflow-invariants.py" "python3 .github/scripts/test-check-docs-style.py" \
+    "python3 .github/scripts/test-check-workflow-invariants.py"
   assert_clean_calls
 }
 
@@ -1369,18 +1637,23 @@ case_table() {
       "- \`python3 .github/scripts/check-docs-style.py\`: exit 0" \
       "- \`python3 .github/scripts/check-install-surface.py\`: exit 0" \
       "- \`bash .github/scripts/check-gate-tool-versions.sh\`: exit 0" \
+      "- \`python3 .github/scripts/check-docs-reads.py\`: exit 0" \
       "- \`actionlint\`: exit 3" \
+      "- \`cargo fetch --locked && python3 .github/scripts/check-feature-discipline.py\`: unavailable (cargo: install Rust with rustup from https://rustup.rs)" \
+      "- \`python3 .github/scripts/test-check-feature-discipline.py --mutations\`: unavailable (cargo: install Rust with rustup from https://rustup.rs)" \
+      "- \`python3 .github/scripts/check-workflow-invariants.py\`: exit 0" \
       "- \`python3 .github/scripts/test-check-docs-style.py\`: exit 0" \
+      "- \`python3 .github/scripts/test-check-workflow-invariants.py\`: exit 0" \
       "- \`.github/scripts/test-mpp-interop.sh\`: not run (--full; needs Node $node and Corepack)" \
       "- \`.github/scripts/test-sdk-v17-interop.sh\`: not run (--full; needs Node $node and Corepack)" \
-      "preflight: 5 gates run, 1 failed, 0 unavailable"
+      "preflight: 8 gates run, 1 failed, 2 unavailable"
   } >"$CASE_DIR.expected-table"
   if ! diff -u "$CASE_DIR.expected-table" "$CASE_DIR.table" >&2; then
     fail "the table differs"
   fi
   rows=$(grep -c '^- ' "$CASE_DIR.table" || true)
-  if [ "$rows" -ne 7 ]; then
-    fail "the table holds $rows rows, expected 7"
+  if [ "$rows" -ne 12 ]; then
+    fail "the table holds $rows rows, expected 12"
   fi
   # shellcheck disable=SC2016 # The backticks are literal row characters.
   if grep '^- ' "$CASE_DIR.table" |
@@ -1542,9 +1815,9 @@ case_install_hint() {
   [ -z "$missing" ] || fail "no install hint for: $missing"
 }
 
-# Starts a --full run on a branch that changes only Markdown, with a stale
-# cov.json in the work tree and cargo answering from the status lines $@,
-# each 0 by default.
+# Starts a --full run on a branch that changes only Markdown, with stale
+# reports of both coverage configurations in the work tree and cargo
+# answering from the status lines $@, each 0 by default.
 run_full_with_stale_coverage() {
   local status
   start_run_case
@@ -1553,8 +1826,9 @@ run_full_with_stale_coverage() {
   for status in "$@"; do
     echo "$status" >>"$STATE/status"
   done
-  printf '{"stale": true}\n' >cov.json
-  cp cov.json "$CASE_DIR.stale"
+  printf '{"stale": true}\n' >cov-feature-on.json
+  printf '{"stale": true}\n' >cov-feature-off.json
+  cp cov-feature-off.json "$CASE_DIR.stale"
   run_preflight --full
 }
 
@@ -1571,12 +1845,16 @@ case_coverage_suppression() {
   if grep -qxF -- "$(command_record "$floors")" "$CASE_DIR.calls"; then
     fail "check-coverage.py ran"
   fi
-  cmp -s cov.json "$CASE_DIR.stale" || fail "cov.json changed"
+  cmp -s cov-feature-off.json "$CASE_DIR.stale" || fail "cov-feature-off.json changed"
+  floors=$(registry_row coverage-floors:feature-on | cut -f 2)
+  coverage=$(registry_row coverage:feature-on | cut -f 2)
+  expect_line "- \`$floors\`: not run (no coverage file from this run)"
+  cmp -s cov-feature-on.json "$CASE_DIR.stale" || fail "feature-on stale report changed"
   assert_clean_calls
 }
 
-# A passing coverage run writes cov.json, and coverage-floors runs right
-# after it.
+# A passing coverage run writes cov-feature-off.json, and coverage-floors
+# runs right after it; the feature-on pair does the same with its report.
 case_coverage_written() {
   local coverage floors first second
   coverage=$(registry_row coverage | cut -f 2)
@@ -1592,7 +1870,7 @@ case_coverage_written() {
     tail -n 1 "$CASE_DIR.out" >&2
     fail "the summary line does not show 0 failed and unavailable gates"
   fi
-  grep -qxF '{"written by": "the cargo shim"}' cov.json || fail "coverage did not write cov.json"
+  grep -qxF '{"written by": "the cargo shim"}' cov-feature-off.json || fail "coverage did not write cov-feature-off.json"
   record_gate_calls
   first=$(grep -nxF -- "$(command_record "$coverage")" "$CASE_DIR.calls" | cut -d : -f 1)
   second=$(grep -nxF -- "$(command_record "$floors")" "$CASE_DIR.calls" | cut -d : -f 1)
@@ -1600,6 +1878,11 @@ case_coverage_written() {
     cat "$CASE_DIR.calls" >&2
     fail "coverage-floors did not run right after coverage"
   fi
+  floors=$(registry_row coverage-floors:feature-on | cut -f 2)
+  coverage=$(registry_row coverage:feature-on | cut -f 2)
+  expect_line "- \`$coverage\`: exit 0"
+  expect_line "- \`$floors\`: exit 0"
+  grep -qxF '{"written by": "the cargo shim"}' cov-feature-on.json || fail "feature-on coverage did not write its report"
   assert_clean_calls
 }
 
@@ -1621,25 +1904,69 @@ case_coverage_unavailable() {
     grep -qxF -- "$(command_record "$floors")" "$CASE_DIR.calls"; then
     fail "a coverage command ran"
   fi
-  cmp -s cov.json "$CASE_DIR.stale" || fail "cov.json changed"
+  cmp -s cov-feature-off.json "$CASE_DIR.stale" || fail "cov-feature-off.json changed"
+  floors=$(registry_row coverage-floors:feature-on | cut -f 2)
+  coverage=$(registry_row coverage:feature-on | cut -f 2)
+  expect_line "- \`$floors\`: not run (no coverage file from this run)"
+  cmp -s cov-feature-on.json "$CASE_DIR.stale" || fail "feature-on stale report changed"
   assert_clean_calls
 }
 
-MUTATION_CONTROLS="rename-source untracked-paths dev-dependencies target-dependencies unique-gates failed-gate unavailable-gate fresh-coverage"
+# On a Linux host without libudev, release-shape is unavailable with the
+# install command, and check-host.sh does not run.
+case_release_shape_libudev() {
+  local host
+  start_run_case
+  edit CONTRIBUTING.md
+  write_shim "$BIN/cargo" cargo cargo
+  printf '#!%s\necho Linux\n' "$REAL_BASH" >"$BIN/uname"
+  printf '#!%s\nexit 1\n' "$REAL_BASH" >"$BIN/pkg-config"
+  chmod +x "$BIN/uname" "$BIN/pkg-config"
+  run_preflight --full
+  host=$(registry_row release-shape | cut -f 2)
+  expect_line "- \`$host\`: unavailable (libudev: apt-get install libudev-dev pkg-config)"
+  assert_clean_calls
+}
+
+case_coverage_off_only_fails() {
+  local floors on_floors
+  run_full_with_stale_coverage "cargo llvm-cov:feature-off=1"
+  floors=$(registry_row coverage-floors | cut -f 2)
+  on_floors=$(registry_row coverage-floors:feature-on | cut -f 2)
+  expect_line "- \`$floors\`: not run (no coverage file from this run)"
+  expect_line "- \`$on_floors\`: exit 0"
+  assert_clean_calls
+}
+
+case_coverage_on_only_fails() {
+  local floors on_floors
+  run_full_with_stale_coverage "cargo llvm-cov:feature-on=1"
+  floors=$(registry_row coverage-floors | cut -f 2)
+  on_floors=$(registry_row coverage-floors:feature-on | cut -f 2)
+  expect_line "- \`$floors\`: exit 0"
+  expect_line "- \`$on_floors\`: not run (no coverage file from this run)"
+  assert_clean_calls
+}
+
+MUTATION_CONTROLS="changelog-fragments changelog-workflow changelog-registry rename-source untracked-paths dev-dependencies target-dependencies unique-gates failed-gate unavailable-gate fresh-coverage"
 
 # Prints the existing case that pins mutation control $1, then the message of
 # the assertion that must end the case log on the mutant.
 mutation_case() {
   local differs="the list differs from the expected gates with base main"
   local end="the run exited 0, expected 1 with the last line 'preflight:" floors
+  local end1="the run exited 1, expected 1 with the last line 'preflight:"
   case "$1" in
+    changelog-fragments) echo "changelog-fragments $differs" ;;
+    changelog-workflow) echo "changelog-selection $differs" ;;
+    changelog-registry) echo "changelog-registry changelog registry differs from workflow commands" ;;
     rename-source) echo "committed-cross-scope-rename $differs" ;;
     untracked-paths) echo "untracked-test-file $differs" ;;
     dev-dependencies) echo "dev-dependency-edge $differs" ;;
     target-dependencies) echo "target-specific-edge $differs" ;;
     unique-gates) echo "duplicate-triggers $differs" ;;
-    failed-gate) echo "exit-aggregation $end 5 gates run, 1 failed, 0 unavailable'" ;;
-    unavailable-gate) echo "unavailable-tool $end 3 gates run, 0 failed, 1 unavailable'" ;;
+    failed-gate) echo "exit-aggregation $end1 8 gates run, 1 failed, 2 unavailable'" ;;
+    unavailable-gate) echo "unavailable-tool $end 6 gates run, 0 failed, 3 unavailable'" ;;
     fresh-coverage)
       floors=$(registry_row coverage-floors | cut -f 2)
       echo "coverage-suppression the run printed no line '- \`$floors\`:" \
@@ -1654,6 +1981,15 @@ mutation_case() {
 apply_mutation() {
   local file=$2
   case "$1" in
+    changelog-fragments)
+      replace_line "$file" '    changelog.d/* | .github/scripts/changelog.py | .github/scripts/test-changelog.py) select_gate changelog ;;' \
+        '    .github/scripts/changelog.py | .github/scripts/test-changelog.py) select_gate changelog ;;' ;;
+    changelog-workflow)
+      replace_line "$file" 'INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm changelog"' \
+        'INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm"' ;;
+    changelog-registry)
+      replace_line "$file" $'changelog\tpython3 .github/scripts/changelog.py check\t-\tchangelog.yml\tchangelog\tCheck changelog fragments' \
+        $'changelog\tpython3 .github/scripts/changelog.py check\t-\tchangelog.yml\tchangelog\tCheck fragment entries' ;;
     rename-source)
       replace_line "$file" '  git diff --name-only -z --no-renames --merge-base "$BASE" -- >"$SCRATCH/diff" ||' \
         '  git diff --name-only -z --merge-base "$BASE" -- >"$SCRATCH/diff" ||' ;;

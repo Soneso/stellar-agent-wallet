@@ -1,0 +1,640 @@
+//! Unsigned policy validation and the operator-open origin guard.
+
+use std::io::Read as _;
+
+use clap::Args;
+use stellar_agent_core::envelope::Envelope;
+use stellar_agent_core::policy::PolicyError;
+use stellar_agent_core::policy::v1::{
+    approval_origin::validate_bootstrap,
+    presets::{AuthorityStatus, contract_transfer_fee_report},
+    validate_unsigned_policy,
+};
+use stellar_agent_core::profile::{loader::default_policy_dir, schema::Profile};
+
+use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
+use crate::common::render::render_json;
+use crate::common::resolve_profile_name;
+
+const INPUT_UNAVAILABLE: (&str, &str) = (
+    "profile.policy_input_unavailable",
+    "The policy body cannot be read.",
+);
+const MAINNET_REQUIRED: (&str, &str) = (
+    "approve.operator_open_mainnet_required",
+    "Operator-open requires a mainnet profile.",
+);
+const INVALID_BODY: &str = "The policy body fails unsigned validation.";
+
+/// Arguments for `profile policy-check`.
+#[derive(Debug, Args)]
+pub struct PolicyCheckArgs {
+    /// The persisted profile whose name and network govern validation.
+    #[arg(long, value_name = "NAME")]
+    pub profile: String,
+    /// Exit 3 when the valid body declares an approval origin.
+    #[arg(long)]
+    pub origin: bool,
+}
+
+/// The unsigned body's local approval classification.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Classification {
+    LocalOnly,
+    SignedOrigin,
+    Invalid(&'static str),
+}
+
+/// Validates the body and its bootstrap origin/pin pair without reading authority.
+///
+/// An unsigned version 2 body may omit `sequence` (treated as zero, as signing
+/// does), and a `[mainnet]` table on a testnet profile is refused with
+/// `policy.mainnet_table_on_testnet`.
+pub(crate) fn classify(body: &str, name: &str, passphrase: &str) -> Classification {
+    let mut doc = match body.parse::<toml_edit::DocumentMut>() {
+        Ok(doc) => doc,
+        Err(e) => return Classification::Invalid(PolicyError::toml_syntax(body, &e).wire_code()),
+    };
+    let validated = if doc.get("version").and_then(toml_edit::Item::as_integer) == Some(2)
+        && doc.get("sequence").is_none()
+    {
+        doc["sequence"] = toml_edit::value(1);
+        std::borrow::Cow::Owned(doc.to_string())
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    };
+    if let Err(error) = validate_unsigned_policy(&validated, name, passphrase) {
+        return Classification::Invalid(error.wire_code());
+    }
+    let Some(table) = doc.get("mainnet").and_then(toml_edit::Item::as_table_like) else {
+        return Classification::LocalOnly;
+    };
+    if passphrase != stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE {
+        return Classification::Invalid(PolicyError::MainnetTableOnTestnet.wire_code());
+    }
+    match validate_bootstrap(table) {
+        Ok((Some(_), _)) => Classification::SignedOrigin,
+        Ok((None, _)) => Classification::LocalOnly,
+        Err(error) => Classification::Invalid(error.wire_code()),
+    }
+}
+
+/// Classifies the installed body for routing; admission still verifies its signature.
+///
+/// The value reads the unverified policy text, so it only selects a mode: the
+/// listener mode of `approve serve` and the consent line a ceremony prints. It
+/// grants no trust and must not be used as authority. The listener's verified
+/// load of the signed policy, before any bind, decides trust and refuses a
+/// policy without `approval_origin`.
+pub(crate) fn has_signed_origin(name: &str, profile: &Profile) -> bool {
+    default_policy_dir()
+        .ok()
+        .and_then(|directory| std::fs::read_to_string(directory.join(format!("{name}.toml"))).ok())
+        .is_some_and(|body| {
+            classify(&body, name, &profile.network_passphrase) == Classification::SignedOrigin
+        })
+}
+
+fn report(body: &str, args: &PolicyCheckArgs, profile: &Profile) -> i32 {
+    match classify(body, &args.profile, &profile.network_passphrase) {
+        Classification::Invalid(code) => {
+            render_json(&Envelope::<()>::err_raw(code, INVALID_BODY));
+            65
+        }
+        classification => {
+            let signed_origin = classification == Classification::SignedOrigin;
+            let contract_transfer_fee_cap =
+                body.parse::<toml_edit::DocumentMut>().ok().map(|doc| {
+                    contract_transfer_fee_report(
+                        &doc,
+                        &profile.network_passphrase,
+                        AuthorityStatus::Draft,
+                    )
+                });
+            render_json(&Envelope::ok(
+                serde_json::json!({"valid": true, "signed_origin": signed_origin, "contract_transfer_fee_cap": contract_transfer_fee_cap}),
+            ));
+            if args.origin && signed_origin { 3 } else { 0 }
+        }
+    }
+}
+
+/// Reads and validates standard input, returning 0, 3, 65, or 1 for access errors.
+pub fn run(args: &PolicyCheckArgs) -> i32 {
+    let profile = match load_profile_reconciled(&resolve_profile_name(Some(&args.profile))) {
+        Ok(profile) => profile,
+        Err(error) => {
+            render_json(&profile_access_envelope(&error));
+            return 1;
+        }
+    };
+    let mut body = String::new();
+    if std::io::stdin().read_to_string(&mut body).is_err() {
+        render_json(&Envelope::<()>::err_raw(
+            INPUT_UNAVAILABLE.0,
+            INPUT_UNAVAILABLE.1,
+        ));
+        return 1;
+    }
+    report(&body, args, &profile)
+}
+
+/// Refuses operator-open before any ceremony resource is acquired.
+pub(crate) fn guard_operator_open(name: &str, profile: &Profile) -> Result<(), Envelope<()>> {
+    if !profile.chain_id.is_mainnet() {
+        return Err(Envelope::err_raw(MAINNET_REQUIRED.0, MAINNET_REQUIRED.1));
+    }
+    let path = default_policy_dir()
+        .map_err(|_| Envelope::err_raw(INPUT_UNAVAILABLE.0, INPUT_UNAVAILABLE.1))?
+        .join(format!("{name}.toml"));
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(Envelope::err_raw(INPUT_UNAVAILABLE.0, INPUT_UNAVAILABLE.1)),
+    };
+    match classify(&body, name, &profile.network_passphrase) {
+        Classification::LocalOnly => Ok(()),
+        Classification::SignedOrigin => {
+            Err(Envelope::err(&stellar_agent_core::WalletError::Approval(
+                stellar_agent_core::ApprovalFailure::OriginSignedRemote,
+            )))
+        }
+        Classification::Invalid(code) => Err(Envelope::err_raw(code, INVALID_BODY)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test assertions"
+    )]
+    use super::*;
+    use crate::common::render::take_rendered_for_test;
+    use crate::common::test_support::{capture, tree};
+    use clap::Parser;
+    use stellar_agent_core::approval::mainnet_fixtures::{
+        MainnetConsentFixture, SIGNED_CERT_SPKI_SHA256, SIGNED_ORIGIN, policy_body_with_origin,
+    };
+
+    fn body(origin: bool) -> String {
+        let body = policy_body_with_origin(
+            "main",
+            "rpc.example.invalid",
+            1,
+            &[],
+            origin.then_some((SIGNED_ORIGIN, &SIGNED_CERT_SPKI_SHA256)),
+        );
+        let mut doc: toml_edit::DocumentMut = body.parse().unwrap();
+        doc["mainnet"]
+            .as_table_mut()
+            .unwrap()
+            .remove("approval_credentials");
+        doc.to_string()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn contract_fee_policy_check_reports_unsigned_input() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let profile = Profile::builder_testnet_named("fee-test", "s", "a", "n", "b").build();
+        for version in [1, 2] {
+            let sequence = if version == 2 { "sequence = 1\n" } else { "" };
+            let base = format!("version = {version}\nscope = \"profile:fee-test\"\n{sequence}");
+            for cap in [None, Some(0), Some(1_000_000), Some(u32::MAX)] {
+                let body = cap.map_or_else(
+                    || base.clone(),
+                    |value| format!("contract_transfer_max_fee_stroops = {value}\n{base}"),
+                );
+                for text in [
+                    body.clone(),
+                    format!("{body}\n[signature]\nsig = \"altered\"\n"),
+                ] {
+                    take_rendered_for_test();
+                    assert_eq!(
+                        report(
+                            &text,
+                            &PolicyCheckArgs {
+                                profile: "fee-test".into(),
+                                origin: false
+                            },
+                            &profile
+                        ),
+                        0
+                    );
+                    let rendered = take_rendered_for_test();
+                    assert_eq!(
+                        rendered[0]["data"]["contract_transfer_fee_cap"],
+                        match cap {
+                            Some(value) =>
+                                serde_json::json!({"configured_stroops": value, "effective_stroops": null, "status": "requires_signature"}),
+                            None =>
+                                serde_json::json!({"configured_stroops": null, "effective_stroops": 1_000_000, "status": "testnet_default"}),
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn policy_check_exit_codes() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let profile = Profile::builder_testnet_named("main", "s", "a", "n", "b").build();
+        let v1 = "version = 1\nscope = \"profile:main\"\n[[rules]]\nmatch = { tool = \"stellar_balances\", chain = \"*\" }\ncriteria = []\ndecision = \"allow\"\n";
+        let v2 = v1.replace("version = 1", "version = 2\nsequence = 1");
+        for valid in [
+            v1.to_owned(),
+            v2,
+            format!("{v1}\n[signature]\nstale = true\n"),
+        ] {
+            take_rendered_for_test();
+            assert_eq!(
+                report(
+                    &valid,
+                    &PolicyCheckArgs {
+                        profile: "main".into(),
+                        origin: false
+                    },
+                    &profile
+                ),
+                0
+            );
+            assert_eq!(take_rendered_for_test()[0]["ok"], true);
+        }
+        for invalid in [
+            "[".to_owned(),
+            format!("unknown = true\n{v1}"),
+            v1.replace("profile:main", "profile:foreign"),
+        ] {
+            let code = validate_unsigned_policy(&invalid, "main", &profile.network_passphrase)
+                .unwrap_err()
+                .wire_code();
+            take_rendered_for_test();
+            assert_eq!(
+                report(
+                    &invalid,
+                    &PolicyCheckArgs {
+                        profile: "main".into(),
+                        origin: false
+                    },
+                    &profile
+                ),
+                65
+            );
+            assert_eq!(take_rendered_for_test()[0]["error"]["code"], code);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn policy_check_origin_classification() {
+        let mut fixture = MainnetConsentFixture::new("main");
+        fixture.sign_signed_origin_policy(
+            &[&stellar_agent_test_support::webauthn::fixture_authenticator()],
+            &SIGNED_CERT_SPKI_SHA256,
+        );
+        let signed = std::fs::read_to_string(fixture.policy_path()).unwrap();
+        for (text, exit) in [
+            (body(false), 0),
+            (body(true), 3),
+            (signed, 3),
+            ("[".into(), 65),
+        ] {
+            assert_eq!(
+                report(
+                    &text,
+                    &PolicyCheckArgs {
+                        profile: "main".into(),
+                        origin: true
+                    },
+                    fixture.profile()
+                ),
+                exit
+            );
+        }
+        for key in ["approval_origin", "approval_cert_spki_sha256"] {
+            let unpaired = body(true)
+                .lines()
+                .filter(|line| !line.starts_with(&format!("{key} =")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for origin in [false, true] {
+                assert_eq!(
+                    report(
+                        &unpaired,
+                        &PolicyCheckArgs {
+                            profile: "main".into(),
+                            origin
+                        },
+                        fixture.profile()
+                    ),
+                    65
+                );
+            }
+        }
+    }
+
+    async fn native(args: &[&str]) -> (i32, serde_json::Value) {
+        let cli = crate::Cli::try_parse_from(
+            std::iter::once("stellar-agent").chain(args.iter().copied()),
+        )
+        .unwrap();
+        let crate::Commands::Approve(args) = cli.command else {
+            panic!("approval command")
+        };
+        take_rendered_for_test();
+        let exit = crate::commands::approve::dispatch(args).await;
+        let rendered = take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        (exit, rendered[0].clone())
+    }
+
+    const MODES: [&[&str]; 3] = [
+        &[
+            "approve",
+            "serve",
+            "--profile",
+            "main",
+            "--open-by-operator",
+        ],
+        &[
+            "approve",
+            "credential",
+            "enroll",
+            "--profile",
+            "main",
+            "--open-by-operator",
+        ],
+        &[
+            "approve",
+            "--id",
+            "pending",
+            "--profile",
+            "main",
+            "--open-by-operator",
+        ],
+    ];
+
+    async fn assert_guard(body: &str, code: &str, fixture: &MainnetConsentFixture) {
+        std::fs::write(fixture.policy_path(), body).unwrap();
+        let before = tree(fixture.home());
+        for args in MODES {
+            let (exit, envelope) = native(args).await;
+            assert_eq!(exit, 1);
+            assert_eq!(envelope["error"]["code"], code, "{args:?}: {envelope}");
+            assert_eq!(
+                tree(fixture.home()),
+                before,
+                "no ceremony file changes: {args:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_open_by_operator_refused_under_signed_origin() {
+        if let Some((stdout, stderr)) =
+            capture("native_open_by_operator_refused_under_signed_origin")
+        {
+            assert!(!stdout.contains("http://") && !stderr.contains("http://"));
+            assert!(
+                !stderr.contains("Create the passkey"),
+                "guard precedes enrollment startup: {stderr}"
+            );
+            return;
+        }
+        let _tty = crate::common::tty::tests::test_tty(true, true);
+        let mut fixture = MainnetConsentFixture::new("main");
+        fixture.sign_signed_origin_policy(
+            &[&stellar_agent_test_support::webauthn::fixture_authenticator()],
+            &SIGNED_CERT_SPKI_SHA256,
+        );
+        let signed = std::fs::read_to_string(fixture.policy_path()).unwrap();
+        assert_guard(&body(true), "approval.origin_signed_remote", &fixture).await;
+        assert_guard(&signed, "approval.origin_signed_remote", &fixture).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_guard_refuses_an_invalid_installed_body() {
+        let _tty = crate::common::tty::tests::test_tty(true, true);
+        let fixture = MainnetConsentFixture::new("main");
+        assert_guard("[", "policy.policy_file_parse_failed", &fixture).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_guard_passes_a_missing_installed_body() {
+        let _tty = crate::common::tty::tests::test_tty(true, true);
+        let fixture = MainnetConsentFixture::new("main");
+        std::fs::rename(
+            fixture.policy_path(),
+            fixture.home().join("saved-policy.toml"),
+        )
+        .unwrap();
+        assert!(guard_operator_open("main", fixture.profile()).is_ok());
+        for args in [MODES[0], MODES[2]] {
+            let (exit, envelope) = native(args).await;
+            assert_eq!(exit, 1);
+            assert_ne!(envelope["error"]["code"], "approval.origin_signed_remote");
+            assert_ne!(
+                envelope["error"]["code"],
+                "approval.presence_browser_required"
+            );
+        }
+        let mut args = MODES[1].to_vec();
+        args.extend(["--timeout-seconds", "1"]);
+        let (exit, envelope) = native(&args).await;
+        assert_eq!(exit, 1);
+        assert_eq!(
+            envelope["error"]["code"],
+            "approve.credential_enroll_expired"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn operator_open_flag_conflicts() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for args in [
+            vec!["approve", "serve", "--open-by-operator", "--remote"],
+            vec!["approve", "serve", "--open-by-operator", "--no-open"],
+            vec!["approve", "--open-by-operator", "--yes"],
+        ] {
+            assert!(
+                crate::Cli::try_parse_from(std::iter::once("stellar-agent").chain(args)).is_err()
+            );
+        }
+        let profile = Profile::builder_testnet_named("main", "s", "a", "n", "b").build();
+        assert_eq!(
+            guard_operator_open("main", &profile)
+                .unwrap_err()
+                .error
+                .unwrap()
+                .code,
+            MAINNET_REQUIRED.0
+        );
+    }
+
+    /// `profile policy-check` accepts a version 2 body without `sequence`
+    /// (treating the absent sequence as zero, as `sign-policy` does) while
+    /// still refusing invalid explicit sequences and version 1 sequences.
+    #[test]
+    #[serial_test::serial]
+    fn policy_check_accepts_v2_body_without_sequence() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let testnet = Profile::builder_testnet_named("main", "s", "a", "n", "b").build();
+        let mainnet = Profile::builder_mainnet_named(
+            "main",
+            "https://rpc.example.invalid",
+            "s",
+            "a",
+            "n",
+            "b",
+        )
+        .build();
+
+        let v2_no_seq = "version = 2\nscope = \"profile:main\"\n[[rules]]\n\
+             match = { tool = \"stellar_balances\", chain = \"*\" }\n\
+             criteria = []\ndecision = \"allow\"\n";
+        assert_eq!(
+            classify(v2_no_seq, "main", &testnet.network_passphrase),
+            Classification::LocalOnly
+        );
+        take_rendered_for_test();
+        assert_eq!(
+            report(
+                v2_no_seq,
+                &PolicyCheckArgs {
+                    profile: "main".into(),
+                    origin: false
+                },
+                &testnet
+            ),
+            0
+        );
+        assert_eq!(take_rendered_for_test()[0]["ok"], true);
+
+        // Mainnet body with `[mainnet]` and approval origin omitting `sequence` exits 3 with `--origin`.
+        let mainnet_origin_no_seq = body(true)
+            .lines()
+            .filter(|line| !line.starts_with("sequence ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            classify(&mainnet_origin_no_seq, "main", &mainnet.network_passphrase),
+            Classification::SignedOrigin
+        );
+        take_rendered_for_test();
+        assert_eq!(
+            report(
+                &mainnet_origin_no_seq,
+                &PolicyCheckArgs {
+                    profile: "main".into(),
+                    origin: true
+                },
+                &mainnet
+            ),
+            3
+        );
+        let rendered = take_rendered_for_test();
+        assert_eq!(rendered[0]["ok"], true);
+        assert_eq!(rendered[0]["data"]["signed_origin"], true);
+
+        // Explicit invalid sequences on v2 and any sequence on v1 stay refused.
+        let v2_zero_seq = format!("sequence = 0\n{v2_no_seq}");
+        let v2_str_seq = format!("sequence = \"1\"\n{v2_no_seq}");
+        let v1_with_seq = v2_no_seq.replace("version = 2", "version = 1\nsequence = 1");
+        for invalid in [v2_zero_seq, v2_str_seq, v1_with_seq] {
+            take_rendered_for_test();
+            assert_eq!(
+                report(
+                    &invalid,
+                    &PolicyCheckArgs {
+                        profile: "main".into(),
+                        origin: false
+                    },
+                    &testnet
+                ),
+                65,
+                "invalid sequence must be refused: {invalid}"
+            );
+        }
+    }
+
+    /// `profile policy-check` refuses a `[mainnet]` table on a testnet profile
+    /// with `policy.mainnet_table_on_testnet`, matching signing.
+    #[test]
+    #[serial_test::serial]
+    fn policy_check_refuses_mainnet_table_on_testnet() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let testnet = Profile::builder_testnet_named("main", "s", "a", "n", "b").build();
+        let mainnet = Profile::builder_mainnet_named(
+            "main",
+            "https://rpc.example.invalid",
+            "s",
+            "a",
+            "n",
+            "b",
+        )
+        .build();
+
+        let plain_mainnet_table = "version = 2\nsequence = 1\nscope = \"profile:main\"\n\
+             [[rules]]\nmatch = { tool = \"stellar_balances\", chain = \"*\" }\n\
+             criteria = []\ndecision = \"allow\"\n\n[mainnet]\n\
+             classic_max_fee_per_op_stroops = 10000\n";
+        let origin_mainnet_table = body(true);
+
+        for text in [plain_mainnet_table, origin_mainnet_table.as_str()] {
+            assert_eq!(
+                classify(text, "main", &testnet.network_passphrase),
+                Classification::Invalid("policy.mainnet_table_on_testnet")
+            );
+            for origin in [false, true] {
+                take_rendered_for_test();
+                assert_eq!(
+                    report(
+                        text,
+                        &PolicyCheckArgs {
+                            profile: "main".into(),
+                            origin
+                        },
+                        &testnet
+                    ),
+                    65
+                );
+                let rendered = take_rendered_for_test();
+                assert_eq!(
+                    rendered[0]["error"]["code"], "policy.mainnet_table_on_testnet",
+                    "origin={origin}: {rendered:?}"
+                );
+            }
+        }
+
+        // Control: the same bodies pass on a mainnet profile.
+        assert_eq!(
+            classify(plain_mainnet_table, "main", &mainnet.network_passphrase),
+            Classification::LocalOnly
+        );
+        assert_eq!(
+            classify(&origin_mainnet_table, "main", &mainnet.network_passphrase),
+            Classification::SignedOrigin
+        );
+    }
+}

@@ -30,8 +30,9 @@ use wiremock::{
 
 use super::combined_rpc_responder::JsonRpcResultResponder;
 use super::rpc_mock_helpers::{
-    SOURCE_G, UNKNOWN_WASM_HASH, ZERO_CONTRACT_REDACTED, build_ledger_entries_contract_instance,
-    manager_one_url, tmp_audit_writer,
+    SOURCE_G, UNKNOWN_WASM_HASH, ZERO_CONTRACT_REDACTED, assert_refusal_holds_no_marker,
+    build_ledger_entries_contract_instance, manager_one_url, mcp_error_envelope, tmp_audit_writer,
+    wallet_traced,
 };
 
 // ── Address helpers ───────────────────────────────────────────────────────────
@@ -52,47 +53,48 @@ fn smart_account_addr() -> ScAddress {
 /// an unknown wasm hash (not in `VERIFIER_ALLOWLIST`) must return
 /// `SaError::VerifierWasmNotInAllowlist` with
 /// `wire_code = "sa.verifier_wasm_not_in_allowlist"`.
-#[tokio::test]
-async fn verifier_unknown_wasm_hash_rejected_without_override() {
-    let verifier = verifier_addr();
-    let smart_account = smart_account_addr();
-
-    // RPC returns UNKNOWN_WASM_HASH — not in VERIFIER_ALLOWLIST.
-    let ledger_entries = build_ledger_entries_contract_instance(&verifier, UNKNOWN_WASM_HASH);
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .respond_with(JsonRpcResultResponder(ledger_entries))
-        .mount(&server)
-        .await;
-
+///
+/// The observed hash failed the allowlist, so no form of it, whole or as its
+/// first eight bytes, nor its executable summary, appears in the refusal's
+/// Display, Debug and source chain, its serialized form, the MCP error
+/// envelope or the wallet's logs, which hold the observation event.
+#[test]
+fn verifier_unknown_wasm_hash_rejected_without_override() {
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-    let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
-
-    let definition = ContextRuleDefinition::new(
-        RuleContext::Default,
-        "unknown-wasm-test".to_owned(),
-        None,
-        vec![ContextRuleSignerInput::External {
-            verifier: verifier.clone(),
-            pubkey_data: vec![0xeeu8; 32],
-        }],
-        vec![],
-    );
-
-    let result = pin_referenced_contracts(
-        &manager,
-        smart_account,
-        ZERO_CONTRACT_REDACTED,
-        &definition,
-        None,
-        SOURCE_G,
-        false, // accept_mutable_verifier
-        false, // accept_unknown_verifier — MUST refuse unknown hash
-        Uuid::new_v4().to_string(),
-    )
-    .await;
+    let (result, logs) = wallet_traced(async move {
+        // RPC returns UNKNOWN_WASM_HASH, which is not in VERIFIER_ALLOWLIST.
+        let ledger_entries =
+            build_ledger_entries_contract_instance(&verifier_addr(), UNKNOWN_WASM_HASH);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(JsonRpcResultResponder(ledger_entries))
+            .mount(&server)
+            .await;
+        let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
+        let definition = ContextRuleDefinition::new(
+            RuleContext::Default,
+            "unknown-wasm-test".to_owned(),
+            None,
+            vec![ContextRuleSignerInput::External {
+                verifier: verifier_addr(),
+                pubkey_data: vec![0xeeu8; 32],
+            }],
+            vec![],
+        );
+        pin_referenced_contracts(
+            &manager,
+            smart_account_addr(),
+            ZERO_CONTRACT_REDACTED,
+            &definition,
+            None,
+            SOURCE_G,
+            false, // accept_mutable_verifier
+            false, // accept_unknown_verifier: MUST refuse the unknown hash
+            Uuid::new_v4().to_string(),
+        )
+        .await
+    });
 
     assert!(
         matches!(result, Err(SaError::VerifierWasmNotInAllowlist { .. })),
@@ -112,11 +114,27 @@ async fn verifier_unknown_wasm_hash_rejected_without_override() {
         ),
         "a pre-install refusal carries no rule id: {error:?}"
     );
+    assert_eq!(
+        error.to_string(),
+        "verifier wasm hash must be in VERIFIER_ALLOWLIST; --accept-unknown-verifier is \
+         required for a hash outside it"
+    );
     assert!(
-        error
-            .to_string()
-            .starts_with("verifier wasm hash not in VERIFIER_ALLOWLIST: "),
-        "{error}"
+        logs.contains("observe_contract: observed contract executable")
+            && logs.contains("\"allowlisted\":false"),
+        "the observation event is captured: {logs}"
+    );
+    assert!(
+        mcp_error_envelope(&error).contains("\"sa.verifier_wasm_not_in_allowlist\""),
+        "the MCP envelope carries the wire code"
+    );
+    let observed_full = hex::encode(UNKNOWN_WASM_HASH);
+    let observed_first8 = hex::encode(&UNKNOWN_WASM_HASH[..8]);
+    assert_refusal_holds_no_marker(
+        &error,
+        &logs,
+        &[&observed_full, &observed_first8],
+        &["wasm"],
     );
 }
 
@@ -129,12 +147,88 @@ fn verifier_wasm_not_in_allowlist_wire_code_is_consistent() {
     let err = SaError::VerifierWasmNotInAllowlist {
         rule_id: None,
         smart_account_redacted: RedactedStrkey::from_already_redacted(ZERO_CONTRACT_REDACTED),
-        observed_hash_first8: "dddddddd".to_owned(),
         request_id: Uuid::new_v4().to_string(),
     };
     assert_eq!(
         err.wire_code(),
         "sa.verifier_wasm_not_in_allowlist",
         "VerifierWasmNotInAllowlist wire_code must be 'sa.verifier_wasm_not_in_allowlist'"
+    );
+}
+
+#[cfg(feature = "test-helpers")]
+#[tokio::test]
+async fn a_revoked_verifier_is_refused_with_both_overrides() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(JsonRpcResultResponder(
+            build_ledger_entries_contract_instance(&verifier_addr(), [0xee; 32]),
+        ))
+        .mount(&server)
+        .await;
+    let (audit, path, _dir) = tmp_audit_writer();
+    let manager = manager_one_url(&server.uri(), audit, path);
+    let definition = ContextRuleDefinition::new(
+        RuleContext::Default,
+        "revoked".to_owned(),
+        None,
+        vec![ContextRuleSignerInput::External {
+            verifier: verifier_addr(),
+            pubkey_data: vec![0x11; 32],
+        }],
+        vec![],
+    );
+    let error = pin_referenced_contracts(
+        &manager,
+        smart_account_addr(),
+        ZERO_CONTRACT_REDACTED,
+        &definition,
+        None,
+        SOURCE_G,
+        true,
+        true,
+        "revoked-install".to_owned(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, SaError::VerifierWasmRevoked { rule_id: None, .. }),
+        "{error:?}"
+    );
+    assert_eq!(error.wire_code(), "sa.verifier_wasm_revoked");
+    assert!(!error.to_string().contains("for rule"));
+}
+
+#[cfg(feature = "test-helpers")]
+#[tokio::test]
+async fn identify_verifier_refuses_a_revoked_verifier() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(JsonRpcResultResponder(
+            build_ledger_entries_contract_instance(&verifier_addr(), [0xee; 32]),
+        ))
+        .mount(&server)
+        .await;
+    let (audit, path, _dir) = tmp_audit_writer();
+    let manager = manager_one_url(&server.uri(), audit, path);
+    let error = manager
+        .identify_verifier(
+            smart_account_addr(),
+            verifier_addr(),
+            7,
+            SOURCE_G,
+            "revoked-identify".to_owned(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SaError::VerifierWasmRevoked {
+                rule_id: Some(7),
+                ..
+            }
+        ),
+        "{error:?}"
     );
 }

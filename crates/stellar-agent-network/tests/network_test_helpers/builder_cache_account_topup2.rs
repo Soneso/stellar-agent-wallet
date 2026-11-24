@@ -514,7 +514,8 @@ async fn fetch_account_pool_share_trustline_returns_xdr_codec_failed() {
         "PoolShare key mismatch must not add a balance entry; expected 1 (native only)"
     );
     assert_eq!(
-        view.balances[0].asset.asset_type, "native",
+        view.balances[0].asset.asset_type,
+        stellar_agent_network::AssetType::Native,
         "only native must be present"
     );
 }

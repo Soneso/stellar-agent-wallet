@@ -85,9 +85,10 @@ const RULES_OBSERVABILITY_PROFILE: &str = "mcp-rules-observability";
 /// The signers-manager configuration for `context`.
 ///
 /// The primary endpoint is the context's primary. The secondary is the
-/// context's secondary, or the primary again when the context has none, which
-/// is the manager's degraded single-endpoint mode. Every signers manager the
-/// MCP server builds takes its configuration from this function.
+/// context's secondary, or the primary again when the context has none. Reads
+/// then compare one endpoint with itself, and a signing verb refuses for want
+/// of a ledger witness on another host. Every signers manager the MCP server
+/// builds takes its configuration from this function.
 pub(super) fn signers_manager_config(
     context: &NetworkContext,
     audit_writer: Arc<Mutex<AuditWriter>>,
@@ -287,10 +288,8 @@ pub struct StellarRulesListResult {
 impl WalletServer {
     /// Enumerates active context rules on a smart account (read-only).
     ///
-    /// Scans the on-chain OZ rule-ID space `[0, max_scan_id)`
-    /// (`max_scan_id` = [`DEFAULT_MAX_SCAN_ID`], the same default the CLI
-    /// `smart-account rules list` uses — the scan cannot silently truncate
-    /// relative to the CLI view).
+    /// Scans the on-chain OZ rule-ID space `[0, DEFAULT_MAX_SCAN_ID)`, which
+    /// is IDs 0 to 49. The bound is fixed and ignores the profile's scan setting.
     #[mcp_tool_item(
         name = "stellar_rules_list",
         destructive_hint = false,
@@ -304,8 +303,8 @@ impl WalletServer {
                        policy_count and baseline (the rule's signer-set baseline in the \
                        profile's audit log: none, v1, v2, unreadable or unknown; a rule \
                        reporting none refuses signing until its baseline is recorded), plus \
-                       the as_of_ledger the scan was read at. Scans up to max_scan_id rule IDs \
-                       (same default as the CLI `rules list`). Data comes from a single RPC \
+                       the as_of_ledger the scan was read at. Scans rule IDs 0 to 49. The \
+                       bound is fixed and ignores the profile's scan setting. Data comes from a single RPC \
                        endpoint (no two-RPC cross-check; advisory read, not a signing input). \
                        read_only_hint=true; destructive_hint=false.",
         annotations(read_only_hint = true, destructive_hint = false)
@@ -796,7 +795,12 @@ mod tests {
 
     /// A testnet server whose context carries `secondary` as its secondary
     /// endpoint.
+    ///
+    /// Construction reads the keyring and registers the platform store when
+    /// none is registered, so the helper installs a fresh mock store and
+    /// every caller holds the `keyring` serial key.
     fn server_with_secondary(secondary: Option<&str>) -> WalletServer {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let profile = stellar_agent_core::profile::Profile::builder_testnet_named(
             "manager-config",
             "s",
@@ -837,7 +841,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn manager_configs_carry_a_distinct_context_secondary() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = server_with_secondary(Some(SECONDARY));
         let (signers, rules) = manager_configs(&server);
         assert_eq!(signers.primary_rpc_url, PRIMARY);
@@ -847,7 +856,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn manager_configs_without_a_secondary_fall_back_to_the_primary() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let server = server_with_secondary(None);
         let (signers, rules) = manager_configs(&server);
         assert_eq!(signers.secondary_rpc_url, PRIMARY);
@@ -1144,11 +1158,18 @@ mod tests {
     /// the rule with an empty policy list.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn stellar_rules_get_refuses_a_rule_with_an_undecodable_signer() {
         use stellar_agent_core::profile::schema::Profile;
         use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
 
-        let home = tempfile::tempdir().expect("temp home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("temp home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _home_guard = StellarAgentHomeGuard::new(home.path());
         keyring_mock::install().expect("mock keyring store");
 
@@ -1179,7 +1200,7 @@ mod tests {
         assert!(
             message.contains(
                 "get_context_rule: signer at index 1 (id 1) is not a recognised Signer: \
-                 unknown signer tag \"Future\""
+                 signer tag must be Delegated or External"
             ),
             "{message}"
         );

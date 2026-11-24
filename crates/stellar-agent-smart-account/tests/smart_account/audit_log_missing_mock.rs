@@ -3,7 +3,7 @@
 //! # Purpose
 //!
 //! When the local audit log records two rules as installed-but-not-deleted
-//! (`SaContextRuleCreated` without a matching `SaContextRuleDeleted`) but the
+//! (`SaContextRuleCreatedV2` without a matching `SaContextRuleDeleted`) but the
 //! on-chain enumeration returns only one of them, `list_active_context_rules` must:
 //! 1. Return the on-chain rule in `rules`.
 //! 2. Return the missing rule ID in `audit_log_missing`.
@@ -15,7 +15,7 @@
 //!
 //! # Setup
 //!
-//! - Audit log: `SaContextRuleCreated` for rule IDs 0 and 1 (no matching
+//! - Audit log: `SaContextRuleCreatedV2` for rule IDs 0 and 1 (no matching
 //!   `SaContextRuleDeleted` for either — both appear installed).
 //! - Mock RPC: `Count=1`, `get_rule(0)` returns a valid rule, `get_rule(1)`
 //!   would not be reached (Count=1, early-exit after rule 0 found).
@@ -88,9 +88,9 @@ fn u32_xdr(n: u32) -> String {
         .expect("ScVal::U32 must encode")
 }
 
-/// Writes a `SaContextRuleCreated` audit entry for the given rule_id.
+/// Writes a `SaContextRuleCreatedV2` audit entry for the given rule_id.
 fn write_rule_created(writer: &Arc<Mutex<AuditWriter>>, rule_id: u32, sa_redacted: &str) {
-    let entry = AuditEntry::new_sa_context_rule_created(
+    let entry = AuditEntry::new_sa_context_rule_created_v2(
         sa_redacted,
         rule_id,
         "Default",
@@ -110,7 +110,7 @@ fn write_rule_created(writer: &Arc<Mutex<AuditWriter>>, rule_id: u32, sa_redacte
         .lock()
         .unwrap()
         .write_entry(entry)
-        .expect("write_entry for SaContextRuleCreated must succeed");
+        .expect("write_entry for SaContextRuleCreatedV2 must succeed");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -136,7 +136,12 @@ fn write_rule_created(writer: &Arc<Mutex<AuditWriter>>, rule_id: u32, sa_redacte
 /// Rule 1 is NOT probed by the enumeration — Count=1 causes early-exit.
 /// But the audit log has rule 1 as installed → audit_log_missing = [1].
 #[tokio::test]
+#[serial_test::serial]
 async fn t11_audit_log_missing_fires_on_rpc_drop() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x00); // zero address → CAAAA...ABSC4
 
@@ -169,6 +174,9 @@ async fn t11_audit_log_missing_fires_on_rpc_drop() {
         NETWORK_PASSPHRASE.to_owned(),
         std::time::Duration::from_secs(5),
         CHAIN_ID.to_owned(),
+    )
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
     )
     .with_audit_writer(Arc::clone(&audit_writer));
 
@@ -208,7 +216,12 @@ async fn t11_audit_log_missing_fires_on_rpc_drop() {
 /// Both rules 0 and 1 are in the audit log; the RPC serves Count=2 and both rules.
 /// No desync → `audit_log_missing.is_empty()`.
 #[tokio::test]
+#[serial_test::serial]
 async fn t11b_no_audit_log_missing_when_in_sync() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let smart_account = addr(0x00);
 
@@ -241,6 +254,9 @@ async fn t11b_no_audit_log_missing_when_in_sync() {
         NETWORK_PASSPHRASE.to_owned(),
         std::time::Duration::from_secs(5),
         CHAIN_ID.to_owned(),
+    )
+    .with_intent_admission(
+        stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
     )
     .with_audit_writer(Arc::clone(&audit_writer));
 

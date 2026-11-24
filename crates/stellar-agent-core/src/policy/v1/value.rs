@@ -20,9 +20,11 @@
 
 use serde_json::Value;
 
+use crate::envelope_decode::ClassicMemo;
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::InnerOpDescriptor;
 use crate::policy::v1::criteria::amount_extract::resolve_pay_or_create_account_stroops;
+use crate::policy::v1::criteria::counterparty_allowlist::RecipientClass;
 use crate::policy::{DenyReason, ToolValueKind};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -103,10 +105,20 @@ impl ValueClass {
 /// empty [`ValueEffects`] is a construction bug. Use [`ValueEffects::single`]
 /// or [`ValueEffects::new`], which document and (in debug builds) assert the
 /// invariant.
+///
+/// # Carried facts
+///
+/// [`Self::memo`] is the memo the signed transaction carries, set by the
+/// dispatch site from the same source as the legs. [`Self::recipient_class`]
+/// is the class the evaluation assigned to the recipients; the engine attaches
+/// it to the effects of a permitted decision, so accounting reads the class
+/// the gate decided with and never classifies again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueEffects {
     /// The per-leg effects. Non-empty for a [`ValueClass::Value`].
     pub legs: Vec<ValueLeg>,
+    memo: Option<ClassicMemo>,
+    recipient_class: Option<RecipientClass>,
 }
 
 impl ValueEffects {
@@ -123,19 +135,71 @@ impl ValueEffects {
             !legs.is_empty(),
             "ValueEffects must carry at least one leg for a value-moving call"
         );
-        Self { legs }
+        Self {
+            legs,
+            memo: None,
+            recipient_class: None,
+        }
     }
 
     /// Constructs a single-leg [`ValueEffects`].
     #[must_use]
     pub fn single(leg: ValueLeg) -> Self {
-        Self { legs: vec![leg] }
+        Self::new(vec![leg])
     }
 
     /// Returns the legs.
     #[must_use]
     pub fn legs(&self) -> &[ValueLeg] {
         &self.legs
+    }
+
+    /// Returns the effects with the transaction's memo set.
+    ///
+    /// `None` means the dispatch site supplied no memo fact; the
+    /// `memo_binding` criterion refuses a bound payment without one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::envelope_decode::ClassicMemo;
+    /// use stellar_agent_core::policy::v1::value::{ActionKind, ValueEffects, ValueLeg};
+    ///
+    /// let effects = ValueEffects::single(ValueLeg {
+    ///     kind: ActionKind::Payment,
+    ///     amount: Some(1),
+    ///     asset: Some("native".into()),
+    ///     destination: None,
+    /// })
+    /// .with_memo(Some(ClassicMemo::Id(7)));
+    /// assert_eq!(effects.memo(), Some(&ClassicMemo::Id(7)));
+    /// ```
+    #[must_use]
+    pub fn with_memo(mut self, memo: Option<ClassicMemo>) -> Self {
+        self.memo = memo;
+        self
+    }
+
+    /// Returns the transaction's memo, or `None` when no memo fact was
+    /// supplied.
+    #[must_use]
+    pub fn memo(&self) -> Option<&ClassicMemo> {
+        self.memo.as_ref()
+    }
+
+    /// Returns the effects with the evaluated recipient class set.
+    #[must_use]
+    pub fn with_recipient_class(mut self, class: Option<RecipientClass>) -> Self {
+        self.recipient_class = class;
+        self
+    }
+
+    /// Returns the recipient class the evaluation assigned, or `None` when the
+    /// effects did not come from a permitted decision with a counterparty
+    /// criterion.
+    #[must_use]
+    pub fn recipient_class(&self) -> Option<RecipientClass> {
+        self.recipient_class
     }
 }
 
@@ -263,8 +327,8 @@ impl ValueLeg {
     /// Whether this leg is a native-XLM debit — a debit-carrying leg
     /// ([`ActionKind::carries_debit`]) whose asset is the canonical `"native"`.
     ///
-    /// The minimum-reserve criterion counts only these legs: a token-only move
-    /// does not reduce the native reserve.
+    /// This network-free predicate recognizes native aliases. Account balance
+    /// criteria also recognize the native asset contract on their network.
     #[must_use]
     pub fn is_native_debit(&self) -> bool {
         self.kind.carries_debit()
@@ -285,6 +349,10 @@ impl ValueLeg {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpaqueReason {
+    /// A contract call whose value effect cannot be measured.
+    UnvaluedContractCall,
+    /// A wallet-authorized multicall call whose value effect cannot be sized.
+    UnvaluedBundleCall,
     /// The tool signs a caller-supplied transaction envelope whose value
     /// effect the wallet does not decode (`sep43_sign_transaction`,
     /// `sep43_sign_and_submit_transaction`; also the CLI `pay`/`claim`
@@ -306,6 +374,8 @@ impl OpaqueReason {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::UnvaluedContractCall => "unvalued_contract_call",
+            Self::UnvaluedBundleCall => "unvalued_bundle_call",
             Self::RawTransactionSignature => "raw_transaction_signature",
             Self::RawAuthEntrySignature => "raw_auth_entry_signature",
         }
@@ -363,7 +433,7 @@ pub fn asset_normalise(asset: &str) -> String {
 /// derives [`ValueClass::ReadOnly`].
 #[must_use]
 pub fn derive_value_class(tool_name: &str, args: &Value) -> ValueClass {
-    match tool_name {
+    let value = match tool_name {
         "stellar_pay" | "stellar_pay_commit" => {
             let amount = resolve_pay_or_create_account_stroops(tool_name, args, "derive")
                 .ok()
@@ -467,6 +537,12 @@ pub fn derive_value_class(tool_name: &str, args: &Value) -> ValueClass {
         }
         "stellar_sep43_sign_auth_entry" => ValueClass::Opaque(OpaqueReason::RawAuthEntrySignature),
         _ => ValueClass::ReadOnly,
+    };
+    match value {
+        ValueClass::Value(effects) => {
+            ValueClass::Value(effects.with_memo(ClassicMemo::from_policy_args(args)))
+        }
+        other => other,
     }
 }
 
@@ -489,29 +565,18 @@ pub enum ValueGate<'a> {
     Deny(DenyReason),
 }
 
-/// Classifies a call's value axis for a value criterion, applying the
-/// fail-closed default (design §2.2).
-///
-/// - `ValueClass::Value(effects)` → [`ValueGate::Effects`]; the criterion sizes
-///   the legs.
-/// - `ValueClass::Opaque(_)` → [`ValueGate::Deny`] under a matched value rule,
-///   UNLESS `ctx.bundle.is_some()` (bundle inners are typed by
-///   `decompose_bundle` and never opaque, so the opaque-deny is suppressed on
-///   the per-inner axis).
-/// - `ValueClass::ReadOnly` → [`ValueGate::NotApplicable`], EXCEPT a
-///   `MovesValue` tool that resolved no effects on the single-tx path: that is
-///   a forgotten/failed population and is denied fail-closed
-///   ([`DenyReason::UnsizableValueEffect`]) rather than waved through. In bundle
-///   mode a ReadOnly inner (a `Generic` inner) is not-applicable — Generic-inner
-///   policing belongs to `restrict_bundle_to_recognised_kinds`, not the value
-///   caps.
+/// Classifies the value axis for a matched value criterion.
+/// Opaque calls refuse in single-call and bundle evaluation. Read-only calls
+/// are not applicable unless a single-call value tool lacks its effects.
 #[must_use]
 pub fn classify_value<'a>(ctx: &'a EvalContext<'_>) -> ValueGate<'a> {
     match &ctx.value {
         ValueClass::Value(effects) => ValueGate::Effects(effects),
         ValueClass::Opaque(_) => {
             if ctx.bundle.is_some() {
-                ValueGate::NotApplicable
+                ValueGate::Deny(DenyReason::UnsizableValueEffect {
+                    detail: "a multicall call whose value effect the wallet cannot size; only a transfer from the wallet is valued; a value rule matched it without allow_opaque_signing".to_owned(),
+                })
             } else {
                 ValueGate::Deny(DenyReason::UnsizableValueEffect {
                     detail: format!(
@@ -542,17 +607,10 @@ pub fn classify_value<'a>(ctx: &'a EvalContext<'_>) -> ValueGate<'a> {
 // value_class_for_inner
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Maps a decomposed multicall inner descriptor to its [`ValueClass`].
-///
-/// A recognised [`InnerOpDescriptor::TokenTransfer`] maps to a single-leg
-/// value effect (SAC contract as the asset, the transfer `to` as the
-/// destination). An [`InnerOpDescriptor::Generic`] maps to
-/// [`ValueClass::ReadOnly`] on the value axis: it contributes nothing to
-/// value caps (matching the existing per-inner zero-contribution for Generic),
-/// and Generic-inner policing stays with the dedicated
-/// `restrict_bundle_to_recognised_kinds` criterion. Mapping Generic to a leg
-/// with `amount == None` would wrongly trip the fail-closed `None`-is-deny
-/// rule and over-deny any bundle containing a Generic inner.
+/// Maps a typed wallet transfer to one value leg.
+/// Generic calls are unsizable. A matched per-call value criterion denies
+/// them unless the rule sets `allow_opaque_signing`. Bundle caps retain
+/// their own rejection of generic calls.
 #[must_use]
 pub fn value_class_for_inner(inner: &InnerOpDescriptor) -> ValueClass {
     match inner {
@@ -564,7 +622,7 @@ pub fn value_class_for_inner(inner: &InnerOpDescriptor) -> ValueClass {
             asset: Some(asset_normalise(asset)),
             destination: Some(to.clone()),
         }),
-        _ => ValueClass::ReadOnly,
+        _ => ValueClass::Opaque(OpaqueReason::UnvaluedBundleCall),
     }
 }
 
@@ -880,31 +938,38 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn classify_value_value_effects_are_sized() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = tool_with_kind("stellar_pay", ToolValueKind::MovesValue);
         let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
         let args = json!({});
         let store = PolicyStateStore::new();
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store).with_value(
-            ValueClass::single(ValueLeg {
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
+            .with_value(ValueClass::single(ValueLeg {
                 kind: ActionKind::Payment,
                 amount: Some(1),
                 asset: Some("native".into()),
                 destination: None,
-            }),
-        );
+            }));
         assert!(matches!(classify_value(&ctx), ValueGate::Effects(_)));
     }
 
     #[test]
+    #[serial_test::serial]
     fn classify_value_moves_value_tool_without_effects_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         // A MovesValue tool whose dispatch site resolved ReadOnly is a forgotten
         // population; fail-closed deny rather than a silent pass.
         let tool = tool_with_kind("stellar_blend_lend", ToolValueKind::MovesValue);
         let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
         let args = json!({});
         let store = PolicyStateStore::new();
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000);
         assert!(matches!(
             classify_value(&ctx),
             ValueGate::Deny(DenyReason::UnsizableValueEffect { .. })
@@ -912,17 +977,25 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn classify_value_read_only_tool_is_not_applicable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = tool_with_kind("stellar_balances", ToolValueKind::ReadOnly);
         let profile = Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build();
         let args = json!({});
         let store = PolicyStateStore::new();
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store);
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000);
         assert!(matches!(classify_value(&ctx), ValueGate::NotApplicable));
     }
 
     #[test]
-    fn classify_value_opaque_denies_on_single_tx_but_suppressed_in_bundle() {
+    #[serial_test::serial]
+    fn classify_value_opaque_denies_on_single_tx_and_in_bundle() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::bundle::{BundleStateOverlay, BundleView, InnerOpDescriptor};
 
         let tool = tool_with_kind("stellar_sep43_sign_transaction", ToolValueKind::OpaqueSign);
@@ -930,7 +1003,7 @@ mod tests {
         let args = json!({});
         let store = PolicyStateStore::new();
 
-        let single = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let single = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Opaque(OpaqueReason::RawTransactionSignature));
         assert!(matches!(
             classify_value(&single),
@@ -943,10 +1016,17 @@ mod tests {
             inners: &inners,
             overlay: &overlay,
         };
-        let bundled = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let bundled = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
             .with_value(ValueClass::Opaque(OpaqueReason::RawTransactionSignature))
             .with_bundle(&view);
-        assert!(matches!(classify_value(&bundled), ValueGate::NotApplicable));
+        let ValueGate::Deny(DenyReason::UnsizableValueEffect { detail }) = classify_value(&bundled)
+        else {
+            panic!("opaque bundle call must deny");
+        };
+        assert_eq!(
+            detail,
+            "a multicall call whose value effect the wallet cannot size; only a transfer from the wallet is valued; a value rule matched it without allow_opaque_signing"
+        );
     }
 
     #[test]
@@ -997,14 +1077,14 @@ mod tests {
     }
 
     #[test]
-    fn inner_generic_maps_to_read_only() {
-        // A Generic inner must NOT become a leg with amount None (which would
-        // trip the fail-closed None-is-deny rule and over-deny bundles); it maps
-        // to ReadOnly on the value axis.
+    fn inner_generic_maps_to_opaque() {
         let inner = InnerOpDescriptor::Generic {
             target: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA".into(),
             fn_name: "do_something".into(),
         };
-        assert_eq!(value_class_for_inner(&inner), ValueClass::ReadOnly);
+        assert_eq!(
+            value_class_for_inner(&inner),
+            ValueClass::Opaque(OpaqueReason::UnvaluedBundleCall)
+        );
     }
 }

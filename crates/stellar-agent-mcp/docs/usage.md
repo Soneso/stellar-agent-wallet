@@ -1,4 +1,7 @@
-# stellar-agent-mcp — tool documentation
+# stellar-agent-mcp: tool documentation
+
+See [Mainnet configurations and scope](../../../docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
 
 > **Note:** This document covers the core payment and account-management flows
 > only. The server exposes many additional tools (SEP-43, SEP-53, x402, toolsets,
@@ -13,17 +16,116 @@ skipped. `profile show` displays a conflicting document for diagnosis.
 Stop the MCP server before `profile reset-window-state`: it holds the profile's
 audit writer, and the reset refuses while that writer is held.
 
+## Classic mainnet authorization
+
+A feature-enabled server admits `stellar_pay_commit`, `stellar_claim_commit`,
+`stellar_create_account_commit`, and `stellar_trustline_commit` after setup.
+Both prepare and commit policy names need matching rules. Under Allow, a
+mainnet commit signs without an approval. Under RequireApproval, it needs a
+verified approval. On mainnet a commit evaluates both its own name and its
+preparation's name, and the stricter decision governs.
+On testnet the commit's own rule alone decides, so a commit rule needs its own
+`decision = "require_approval"` to require an approval.
+On mainnet a pending approval uses the shorter lifetime from the two evaluations. Allow
+contributes 600 seconds; RequireApproval supplies its configured lifetime.
+Authorization defaults to 120 seconds and cannot outlive the governing
+decision.
+
+Paired preparation refuses an undecodable envelope with `simulation.divergence`.
+A denied rule retains `policy.deny.*`; an unknown decision uses
+`policy.unexpected_decision`. None of these refusals persists an approval.
+On mainnet, each commit evaluates both names before attestation validation. A
+proof supplied there under Allow to a classic commit or an x402 payment tool verifies
+against its approval's durable record and is spent like a required one. A proof
+without a durable record refuses and stays unspent. Off mainnet, Allow neither
+verifies nor spends a proof supplied to `stellar_pay_commit`,
+`stellar_claim_commit`, `stellar_create_account_commit`,
+`stellar_trustline_commit`, `stellar_x402_create_payment`, or
+`stellar_x402_authenticated_payment`. `stellar_rule_create_commit` always
+requires approval, so it verifies and spends its approval under Allow too.
+`stellar_mpp_charge_commit` takes no approval arguments.
+
+Feature-on startup loads the mainnet write context for a verified enabled
+profile. Failed enablement or policy checks abort startup. Admission refusals
+use `network.mainnet_write_forbidden` for unsupported tools or missing V1 engine,
+verified policy, enablement, enabled context, or profiles directory. A stored
+or merged `oracle_provider_url` that is absent or names another host than the
+signed `[mainnet].oracle_host` fails enablement. Startup then aborts with
+`profile.mainnet_enablement_invalid`, naming `on_disk_oracle_host` or
+`merged_oracle_host`. Admission also refuses a context profile without
+`oracle_provider_url` with `profile.mainnet_oracle_required`, before signing.
+The server builds its clients from the profile it read at startup, so it
+applies an oracle change from its next start. A stored `rpc_url` or
+`oracle_provider_url` changed to another host while the server runs refuses
+value and status calls with `network.mainnet_write_forbidden`.
+
+After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
+Freshness compares current policy and enablement facts without advancing the pin.
+A changed binding reports `network.mainnet_write_forbidden` with
+`enablement or policy changed, restart the server`. Missing startup authority
+instead names the missing prerequisite.
+
+Preparation and commit use the smaller signed/profile fee cap, or the one
+available value. A higher profile cap warns. The enabled-policy minimum
+requires the signed cap. The resolver independently reevaluates effective fees
+and thresholds. An admitted mainnet prepare probes endpoint identity before
+action reads, as does commit before consuming its nonce.
+
+Every classic prepare, on any network, checks that the endpoint reports a
+healthy status and that its latest ledger closed within 60 seconds of the host
+clock, before it reads the account it signs against. A failed check refuses with
+`network.endpoint_not_ready`. The prepare result carries the observed ledger as
+`operational`: `{latest_ledger, close_time_unix, close_lag_seconds}`.
+
+Endpoint refusals preserve `network.endpoint_network_mismatch`,
+`network.endpoint_identity_unavailable`, `network.unsupported_protocol_version`,
+`network.endpoint_not_ready`, and `network.rpc_credential_refused`.
+`network.envelope_signed_for_mainnet` means a signature fails under the endpoint network but verifies under mainnet.
+
+Missing, invalid, expired, or unverifiable approvals use `policy.approval_required`.
+A live rejection uses `policy.approval_rejected`. On testnet a live consumed
+approval or an approval held by a submission receipt uses
+`policy.approval_consumed`, and expired tombstones use `policy.approval_required`.
+
+On mainnet a commit verifies the presented attestation against the wallet's
+durable approval record, never against the approval inbox. A revoked approval
+returns `approval.revoked`. A verified approval whose queued consent has no
+delivered evidence returns `approval.consent_undelivered`. A submission receipt
+or a proof of another operation answers `policy.approval_consumed`. A repeated
+proof of a completed payment answers `policy.approval_required`.
+Authorization consumption followed by a pre-send recording failure consumes
+the durable approval record and ends the operation unsent. A retry under the
+same `business_id` returns that stored outcome; a retry under another
+`business_id` refuses with `policy.approval_required`.
+
+Ordinary signing and submission refuse mainnet. Authorized entry points check
+sealed authority independently. Durable consumption precedes sending.
+Classic MCP authorization refusal renders
+`the mainnet write was refused before submission; nothing was sent`.
+Classic MCP uses this message at both signing and submission boundaries.
+A signer may run before its result is rejected. An envelope may already carry
+a signature.
+
+Report authorization refusal to the operator. Fresh preparation and fresh
+approval are required for a retry; do not switch networks. The operator reads
+`path` and `precondition` in the warn-level `mainnet authorization refused` log.
+A submission timeout has an unknown outcome and requires transaction reconciliation.
+
 ## stellar_balances
 
 Fetches the native XLM balance and trustlines for a Stellar account.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier. Accepted values: `stellar:testnet`, `stellar:mainnet`.
-- `account_id` (string, required): Stellar G-strkey (ed25519 public key, 56 chars).
+- `account_id` (string, required): Stellar G-strkey, or M-strkey whose G base account is read; the response echoes the address as given.
 
 - `assets` (array, optional): Non-native trustlines to include. Each element is `{ "code": "USDC", "issuer": "GA5Z..." }`. Returns the native XLM balance plus any trustlines listed in the optional `assets` argument. Up to 100 trustline assets may be queried per call; assets the account does not currently trust are omitted from the returned `balances` list.
 
 **Returns:** JSON envelope identical to `stellar-agent balances --account <G>`.
+In each `balances` entry, `asset.asset_type` is `native`, `credit_alphanum4`,
+or `credit_alphanum12`. Credit assets carry `asset.code` and `asset.issuer`;
+native XLM omits both. Codes of 1 to 4 characters use `credit_alphanum4`;
+codes of 5 to 12 characters use `credit_alphanum12`.
 
 **Annotations:** `readOnlyHint=true`, `destructiveHint=false`.
 
@@ -32,7 +134,7 @@ Fetches the native XLM balance and trustlines for a Stellar account.
 Funds a testnet account via the Stellar Friendbot HTTP endpoint.
 
 **Arguments:**
-- `chain_id` (string, required): CAIP-2 chain identifier. Only `stellar:testnet` is accepted — mainnet profiles are rejected by the policy gate.
+- `chain_id` (string, required): CAIP-2 chain identifier. Only `stellar:testnet` is accepted. On mainnet the dispatch gate answers first: the Noop engine returns `policy.engine_required`, and a V1 engine denial returns its `policy.deny.*` code. A call the policy lets through without `friendbot_url` returns `invalid_params`, because mainnet has no default Friendbot URL. Only a call with an explicit, allow-listed `friendbot_url` reaches the inner guard, `network.friendbot_mainnet_forbidden`.
 - `account_id` (string, required): Stellar G-strkey to fund (ed25519 public key, 56 chars).
 - `friendbot_url` (string, optional): Override Friendbot endpoint URL. When supplied, must be in the production allow-list (friendbot.stellar.org or friendbot-futurenet.stellar.org over HTTPS). Defaults to `https://friendbot.stellar.org` for testnet.
 
@@ -44,7 +146,7 @@ Funds a testnet account via the Stellar Friendbot HTTP endpoint.
 
 ## stellar_create_account
 
-Simulate step: builds a CreateAccount transaction envelope and mints a single-use nonce. Returns `{envelope_xdr, nonce, expires_at_unix_ms, simulation}`. Pass all three values unmodified to `stellar_create_account_commit`.
+Simulate step: builds a CreateAccount transaction envelope and mints a single-use nonce. Pass `envelope_xdr`, `nonce`, and `expires_at_unix_ms` unmodified to `stellar_create_account_commit`.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
@@ -52,30 +154,32 @@ Simulate step: builds a CreateAccount transaction envelope and mints a single-us
 - `destination` (string, required): G-strkey of the new account to create.
 - `starting_balance` (string, required): Amount with unit suffix, e.g. `"1 XLM"`.
 - `fee` (string, optional): Classic fee per operation: `<stroops>`, `auto`, or `auto:pNN`.
+- `business_id` (string, required on `stellar:mainnet`): 1 to 64 printable ASCII characters without a space, naming this value operation. A mainnet retry with the same id returns the stored operation. On another chain a supplied id is validated and echoed.
 
-**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, simulation}`.
+**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, simulation, operational}`.
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=false`.
 
-**Fee cap:** The resolved per-operation fee is checked against the profile's
+**Fee cap:** The resolved per-operation fee is checked against the effective signed/profile
 `classic_max_fee_per_op_stroops`. A fee above the cap returns
 `fees.percentile_exceeds_cap`; the message names an auto-selected fee and its
-percentile, an explicit `classic_base`, or the profile's
-`classic_fee_per_op_stroops`. A mainnet profile without the cap returns
+percentile, an explicit `fee` argument, or the profile's
+`classic_fee_per_op_stroops`. A mainnet action without an effective cap returns
 `validation.mainnet_fee_cap_required`.
 
 ## stellar_create_account_commit
 
-Commit step: verifies the nonce, re-builds the envelope for divergence check, signs via the profile keyring, and submits the transaction. Testnet-only — mainnet profiles are rejected by the policy gate. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
+Commit step: verifies the nonce, re-builds the envelope for divergence check, signs via the profile keyring, and submits the transaction. A mainnet commit of an intent stored under `business_id` needs no `nonce`, `expires_at_unix_ms` or `envelope_xdr`: it rebuilds the envelope from that intent with a fresh sequence and deadline at the fee per operation of the prepared envelope, and verifies no nonce. Configured mainnet writes require a feature-enabled build and per-action authorization. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
 - `source` (string, required): G-strkey of the funding account.
 - `destination` (string, required): G-strkey of the new account.
 - `starting_balance` (string, required): Amount with unit suffix (same as simulate).
-- `nonce` (string, required): Base64 nonce from the simulate step.
-- `expires_at_unix_ms` (number, required): Expiry from the simulate step.
-- `envelope_xdr` (string, required): Base64 envelope from the simulate step.
+- `business_id` (string, required on `stellar:mainnet`): The business id the simulate step named. Another id refuses with `operation.business_id_mismatch`.
+- `nonce` (string): Base64 nonce from the simulate step. Required except on a mainnet commit of an intent stored under `business_id`.
+- `expires_at_unix_ms` (number): Expiry from the simulate step. Required as `nonce` is.
+- `envelope_xdr` (string): Base64 envelope from the simulate step. Required as `nonce` is.
 - `approval_nonce` (string, optional): Approval nonce from the simulate step's `approval` block. Required, with `approval_attestation`, when the simulate step reported that approval is required.
 - `approval_attestation` (string, optional): URL-safe base64 attestation that `stellar-agent approve` writes after the operator confirms.
 
@@ -83,13 +187,13 @@ Commit step: verifies the nonce, re-builds the envelope for divergence check, si
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
-**Submission record:** Before the transaction is sent, the wallet records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation under a policy with a stateful criterion, and a `value_action_pending` audit row. The record is settled by what the network answers; a submission that ends without a confirmed outcome keeps it and returns `submission.tx_timeout`. On that code the outcome is unknown: pass `error.details.tx_hash` to `stellar_transaction_status`, and never resubmit. See "Unresolved submissions" below.
+**Submission record:** Before the transaction is sent, the wallet records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation under a policy with a stateful criterion, and a `value_action_pending` audit row. A confirmed success is recorded on the receipt as a report, and no network answer releases the reservation. A submission that ends without a confirmed outcome keeps the record and returns `submission.tx_timeout`. On that code the outcome is unknown: pass `error.details.tx_hash` to `stellar_transaction_status`, and never resubmit. See "Unresolved submissions" below.
 
 **Fee cap:** Before signing, the presented envelope's per-operation fee is
-checked against the profile's `classic_max_fee_per_op_stroops`. A fee above the
+checked against the effective signed/profile `classic_max_fee_per_op_stroops`. A fee above the
 cap returns `fees.percentile_exceeds_cap` with a message naming the envelope's
-fee; prepare the transaction again with a fee within the cap. A mainnet profile
-without the cap returns `validation.mainnet_fee_cap_required`.
+fee; prepare the transaction again with a fee within the cap. A mainnet action
+without an effective cap returns `validation.mainnet_fee_cap_required`.
 
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
 `fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
@@ -108,12 +212,12 @@ reason, or `not_required` with reason `below_threshold`.
 
 ## stellar_pay
 
-Simulate step: builds a Payment transaction envelope for a native XLM or non-native asset payment, runs SEP-29 memo-required enforcement against the destination account, and mints a single-use nonce. Returns `{envelope_xdr, nonce, expires_at_unix_ms, simulation}`. Pass all three values unmodified to `stellar_pay_commit`.
+Simulate step: builds a Payment transaction envelope for a native XLM or non-native asset payment, runs SEP-29 memo-required enforcement against the destination account, and mints a single-use nonce. Pass `envelope_xdr`, `nonce`, and `expires_at_unix_ms` unmodified to `stellar_pay_commit`.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
 - `source` (string, required): G-strkey of the source (funding) account.
-- `destination` (string, required): G-strkey of the recipient account.
+- `destination` (string, required): G-strkey or M-strkey of the recipient account.
 - `amount` (string, optional): Amount with unit suffix, e.g. `"10 XLM"`. Mutually exclusive with
   `amount_in_stroops`.
 - `amount_in_stroops` (string, optional): Raw positive stroop integer as a decimal string, e.g. `"10000000"`. Mutually exclusive with `amount`.
@@ -123,54 +227,70 @@ Simulate step: builds a Payment transaction envelope for a native XLM or non-nat
 - `memo_hash_hex` (string, optional): 32-byte hash memo as 64 hex chars. Mutually exclusive.
 - `memo_return_hex` (string, optional): 32-byte return memo as 64 hex chars. Mutually exclusive.
 - `fee` (string, optional): Classic fee per operation: `<stroops>`, `auto`, or `auto:pNN`.
+- `business_id` (string, required on `stellar:mainnet`): 1 to 64 printable ASCII characters without a space, naming this value operation. A mainnet retry with the same id returns the stored operation. On another chain a supplied id is validated and echoed.
 
-**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, simulation}`.
+**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, simulation, operational}`.
+
+A C contract or W muxed contract `destination` refuses with `validation.contract_payment_unavailable`
+("Contract payments are not available on this payment surface."), or with
+`validation.contract_payment_memo_unsupported` when any memo argument is set,
+before any request, approval, or nonce. `stellar_pay_commit` applies the same
+refusal, and a commit envelope holding one `transfer(Account, Contract, I128)`
+invocation refuses first. Without a valid `asset` its code is
+`validation.contract_payment_invalid`. Otherwise it is
+`validation.contract_payment_memo_unsupported` when the envelope carries a
+memo, `validation.contract_payment_unavailable` once proven for `asset`, and
+`validation.contract_payment_invalid` when not proven. On mainnet the commit's
+admission and freshness refusals come first.
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=false`.
 
 **SEP-29:** If the destination's `config.memo_required` data entry is set to `"1"` and no memo is provided, returns `validation.memo_required`.
 
-**Fee cap:** The resolved per-operation fee is checked against the profile's
+**Memo binding:** A version 2 policy's `memo_binding` criterion can require an exact memo kind and value for a destination and its muxed addresses. This tool evaluates the parsed memo argument, and the commit evaluates the memo encoded in the envelope. A missing or different memo refuses `policy.deny.memo_binding_mismatch`.
+
+**Fee cap:** The resolved per-operation fee is checked against the effective signed/profile
 `classic_max_fee_per_op_stroops`. A fee above the cap returns
 `fees.percentile_exceeds_cap`; the message names an auto-selected fee and its
-percentile, an explicit `classic_base`, or the profile's
-`classic_fee_per_op_stroops`. A mainnet profile without the cap returns
+percentile, an explicit `fee` argument, or the profile's
+`classic_fee_per_op_stroops`. A mainnet action without an effective cap returns
 `validation.mainnet_fee_cap_required`.
 
 ## stellar_pay_commit
 
-Commit step: verifies the nonce, re-builds the Payment envelope for divergence check, signs via the profile keyring, and submits the transaction. Testnet-only — mainnet profiles are rejected by the policy gate. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
+Commit step: verifies the nonce, re-builds the Payment envelope for divergence check, signs via the profile keyring, and submits the transaction. A mainnet commit of an intent stored under `business_id` needs no `nonce`, `expires_at_unix_ms` or `envelope_xdr`: it rebuilds the envelope from that intent with a fresh sequence and deadline at the fee per operation of the prepared envelope, and verifies no nonce. A payment through a toolset keeps the three fields. Configured mainnet writes require a feature-enabled build and per-action authorization. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
 - `source` (string, required): G-strkey of the source account.
-- `destination` (string, required): G-strkey of the recipient account.
+- `destination` (string, required): G-strkey or M-strkey of the recipient account.
 - `amount` (string, optional): Amount with unit suffix (same as simulate). Mutually exclusive with
   `amount_in_stroops`.
 - `amount_in_stroops` (string, optional): Raw positive stroop integer as a decimal string (same as
   simulate). Mutually exclusive with `amount`.
 - `asset` (string, required): Asset descriptor (same as simulate).
 - `memo_text` / `memo_id` / `memo_hash_hex` / `memo_return_hex` (optional, same as simulate).
-- `nonce` (string, required): Base64 nonce from the simulate step.
-- `expires_at_unix_ms` (number, required): Expiry from the simulate step.
-- `envelope_xdr` (string, required): Base64 envelope from the simulate step.
+- `business_id` (string, required on `stellar:mainnet`): The business id the simulate step named. Another id refuses with `operation.business_id_mismatch`.
+- `nonce` (string): Base64 nonce from the simulate step. Required except on a mainnet commit of an intent stored under `business_id`.
+- `expires_at_unix_ms` (number): Expiry from the simulate step. Required as `nonce` is.
+- `envelope_xdr` (string): Base64 envelope from the simulate step. Required as `nonce` is.
 - `approval_nonce` (string, optional): Approval nonce from the simulate step's `approval` block. Required, with `approval_attestation`, when the simulate step reported that approval is required.
 - `approval_attestation` (string, optional): URL-safe base64 attestation that `stellar-agent approve` writes after the operator confirms.
 
-**Returns:** `{tx_hash, ledger, cross_check}` on success.
+**Returns:** `{tx_hash, ledger, cross_check, destination}` on success, plus `business_id` when the call names one. `destination` is the complete G or M address the sent envelope pays.
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
-**Submission record:** Before the transaction is sent, the wallet records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation under a policy with a stateful criterion, and a `value_action_pending` audit row. The record is settled by what the network answers; a submission that ends without a confirmed outcome keeps it and returns `submission.tx_timeout`. On that code the outcome is unknown: pass `error.details.tx_hash` to `stellar_transaction_status`, and never resubmit. See "Unresolved submissions" below.
+**Submission record:** Before the transaction is sent, the wallet records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation under a policy with a stateful criterion, and a `value_action_pending` audit row. A confirmed success is recorded on the receipt as a report, and no network answer releases the reservation. A submission that ends without a confirmed outcome keeps the record and returns `submission.tx_timeout`. On that code the outcome is unknown: pass `error.details.tx_hash` to `stellar_transaction_status`, and never resubmit. See "Unresolved submissions" below.
 
 **Destination read:** Only an absent destination account counts as absent; any
 other failed destination read refuses with the read's own code.
 
 **Fee cap:** Before signing, the presented envelope's per-operation fee is
-checked against the profile's `classic_max_fee_per_op_stroops`. A fee above the
+checked against the effective signed/profile `classic_max_fee_per_op_stroops`. A fee above the
 cap returns `fees.percentile_exceeds_cap` with a message naming the envelope's
-fee; prepare the transaction again with a fee within the cap. A mainnet profile
-without the cap returns `validation.mainnet_fee_cap_required`.
+fee; prepare the transaction again with a fee within the cap. A mainnet action
+without an effective cap returns `validation.mainnet_fee_cap_required`.
 
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
 `fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
@@ -195,22 +315,24 @@ Simulate step: fetches the claimable-balance entry, renders a typed preview, enf
 - `chain_id` (string, required): CAIP-2 chain identifier.
 - `balance_id` (string, required): Claimable-balance id: a `B...` strkey, the canonical 72-hex id, or the bare 64-hex hash.
 - `source_account` (string, optional): G-strkey of the claiming account. Defaults to the profile's default MCP signer account.
+- `business_id` (string, required on `stellar:mainnet`): 1 to 64 printable ASCII characters without a space, naming this value operation. A mainnet retry with the same id returns the stored operation. On another chain a supplied id is validated and echoed.
 
-**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, preview}`.
+**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, preview, operational}`.
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=false`.
 
 ## stellar_claim_commit
 
-Commit step for `stellar_claim`: verifies the nonce, re-builds the `ClaimClaimableBalance` envelope for the divergence check, signs via the profile keyring, and submits. Testnet-only. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
+Commit step for `stellar_claim`: verifies the nonce, re-builds the `ClaimClaimableBalance` envelope for the divergence check, signs via the profile keyring, and submits. A mainnet commit of an intent stored under `business_id` needs no `nonce`, `expires_at_unix_ms` or `envelope_xdr`: it rebuilds the envelope from that intent with a fresh sequence and deadline at the fee per operation of the prepared envelope, and verifies no nonce. Configured mainnet writes require a feature-enabled build and per-action authorization. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
 - `balance_id` (string, required): Claimable-balance id (same as simulate).
 - `source_account` (string, optional): G-strkey of the claiming account (same as simulate).
-- `nonce` (string, required): Base64 nonce from the simulate step.
-- `expires_at_unix_ms` (number, required): Expiry from the simulate step.
-- `envelope_xdr` (string, required): Base64 envelope from the simulate step.
+- `business_id` (string, required on `stellar:mainnet`): The business id the simulate step named. Another id refuses with `operation.business_id_mismatch`.
+- `nonce` (string): Base64 nonce from the simulate step. Required except on a mainnet commit of an intent stored under `business_id`.
+- `expires_at_unix_ms` (number): Expiry from the simulate step. Required as `nonce` is.
+- `envelope_xdr` (string): Base64 envelope from the simulate step. Required as `nonce` is.
 - `approval_nonce` (string, optional): Approval nonce from the simulate step's `approval` block. Required, with `approval_attestation`, when the simulate step reported that approval is required.
 - `approval_attestation` (string, optional): URL-safe base64 attestation that `stellar-agent approve` writes after the operator confirms.
 
@@ -226,10 +348,10 @@ with a reason. A witness refusal keeps the nonce usable.
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
 **Fee cap:** Before signing, the presented envelope's per-operation fee is
-checked against the profile's `classic_max_fee_per_op_stroops`. A fee above the
+checked against the effective signed/profile `classic_max_fee_per_op_stroops`. A fee above the
 cap returns `fees.percentile_exceeds_cap` with a message naming the envelope's
-fee; prepare the transaction again with a fee within the cap. A mainnet profile
-without the cap returns `validation.mainnet_fee_cap_required`.
+fee; prepare the transaction again with a fee within the cap. A mainnet action
+without an effective cap returns `validation.mainnet_fee_cap_required`.
 
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
 `fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
@@ -254,21 +376,23 @@ Simulate step: resolves the asset, fetches the issuer's live flags, runs the cla
 - `asset` (string, required): A bare code such as `"USDC"`, resolved through the pin table, or `"CODE:G…ISSUER"`. A SAC `C…` address returns a typed error.
 - `limit_stroops` (string, optional): Trustline limit in stroops as a decimal string. Absent sets the protocol default (`i64::MAX`); `"0"` removes the trustline.
 - `fee` (string, optional): Classic fee per operation: `<stroops>`, `auto`, or `auto:pNN`.
+- `business_id` (string, required on `stellar:mainnet`): 1 to 64 printable ASCII characters without a space, naming this value operation. A mainnet retry with the same id returns the stored operation. On another chain a supplied id is validated and echoed.
 
-**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, preview}`.
+**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, simulation, preview, operational}`.
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=false`.
 
 ## stellar_trustline_commit
 
-Commit step for `stellar_trustline`: verifies the nonce, re-builds the `ChangeTrust` envelope for the divergence check, signs via the profile keyring, and submits. Testnet-only. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
+Commit step for `stellar_trustline`: verifies the nonce, re-builds the `ChangeTrust` envelope for the divergence check, signs via the profile keyring, and submits. A mainnet commit of an intent stored under `business_id` needs no `nonce`, `expires_at_unix_ms` or `envelope_xdr`: it rebuilds the envelope from that intent with a fresh sequence and deadline at the fee per operation of the prepared envelope, and verifies no nonce. Configured mainnet writes require a feature-enabled build and per-action authorization. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier (same as simulate).
 - `from` (string, required): G-strkey of the trustline account (same as simulate).
-- `nonce` (string, required): Base64 nonce from the simulate step.
-- `expires_at_unix_ms` (number, required): Expiry from the simulate step.
-- `envelope_xdr` (string, required): Base64 envelope from the simulate step. The commit derives the asset, issuer, and limit from it.
+- `business_id` (string, required on `stellar:mainnet`): The business id the simulate step named. Another id refuses with `operation.business_id_mismatch`.
+- `nonce` (string): Base64 nonce from the simulate step. Required except on a mainnet commit of an intent stored under `business_id`.
+- `expires_at_unix_ms` (number): Expiry from the simulate step. Required as `nonce` is.
+- `envelope_xdr` (string): Base64 envelope from the simulate step. Required as `nonce` is. The commit derives the asset, issuer, and limit from it.
 - `approval_nonce` (string, optional): Approval nonce from the simulate step's `approval` block. Required, with `approval_attestation`, when the simulate step reported that approval is required.
 - `approval_attestation` (string, optional): URL-safe base64 attestation that `stellar-agent approve` writes after the operator confirms.
 
@@ -290,10 +414,10 @@ with a reason. A witness refusal keeps the nonce usable.
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
 **Fee cap:** Before signing, the presented envelope's per-operation fee is
-checked against the profile's `classic_max_fee_per_op_stroops`. A fee above the
+checked against the effective signed/profile `classic_max_fee_per_op_stroops`. A fee above the
 cap returns `fees.percentile_exceeds_cap` with a message naming the envelope's
-fee; prepare the transaction again with a fee within the cap. A mainnet profile
-without the cap returns `validation.mainnet_fee_cap_required`.
+fee; prepare the transaction again with a fee within the cap. A mainnet action
+without an effective cap returns `validation.mainnet_fee_cap_required`.
 
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
 `fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
@@ -312,22 +436,26 @@ Clawback re-check refusals use `trustline.gate_refused` or
 
 ## stellar_transaction_status
 
-Reconciles one submitted transaction against the chain and settles the wallet's record of it.
+Reconciles one submitted transaction against the chain and records a reported success on the wallet's record of it.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
-- `tx_hash` (string, required): 64 lowercase hex characters: the `details.tx_hash` a `submission.tx_timeout` response carries.
+- `tx_hash` (string, optional when `business_id` is given): 64 lowercase hex characters: the `details.tx_hash` a `submission.tx_timeout` response carries.
+- `business_id` (string, optional when `tx_hash` is given): business id of a mainnet operation. With `tx_hash`, both must name the same operation. On testnet it is checked for shape and echoed.
+- `retry_recovery` (boolean, optional, default `false`): starts one new bounded evidence run for this hash's stopped mainnet attempt, also before its retry time or after `RetriesExhausted`. It never resubmits.
 
-**Returns:** `{tx_hash, chain_status, ledger, record, reservation}`. `chain_status` is what the endpoint reported (`SUCCESS`, `FAILED` or `NOT_FOUND`).
+**Returns:** `{tx_hash, chain_status, ledger, record, reservation, operation}`, plus `business_id` when supplied and `recovery` for a managed mainnet attempt or a recovery refusal. `operation` is the stored operation projection, or `null` for an unrecorded hash and on testnet. A mainnet call with `business_id` alone and no exposed hash returns the five hash fields as `null`. A testnet call with `business_id` alone returns `{business_id, operation, chain, receipt, reservation}`, the last four `null`. `chain_status` is what the endpoint reported (`SUCCESS`, `FAILED` or `NOT_FOUND`); for a managed mainnet attempt, the cached recovery result or `UNKNOWN`.
 
-- `record` is the wallet's settled record of the submission, or `null` when it holds none: `envelope_hash`, `status`, `failure_code`, `release_code`, `ledger`, `source_redacted`, `sequence`, `submitted` and `reservation_open`. `release_code` names the chain evidence a reservation was released on, `submission.sequence_consumed` or `submission.time_bound_passed`, and is `null` otherwise. It is how an agent tells a release on evidence (`status: "ambiguous"` with a `release_code`) from an outcome nothing can establish (`status: "ambiguous"` without one). Read `status` and `release_code`, not `reservation_open`.
-- `reservation` is a hold that remains after reconciliation, `{envelope_hash, operator_required}`, or `null`. `operator_required: true` marks a reservation whose receipt is missing and whose submission ledger is below the endpoint's retention floor: only the operator's `stellar-agent tx receipt clear` resolves it.
+- `recovery` is `{attempts, refusal}`. Each attempt carries `operation_id`, `attempt_index`, `tx_hash`, `result` (`Included`, `NeverApplicable` or `NeedsEvidence`) and its fields, `settlement_commit_id` (the authenticated decision's commit identifier, or `null`), `last_reason` (the underlying reason of `RetriesExhausted`, or `null`), `class`, `earliest_retry_ms`, `reservations` and `next_unread`. `refusal` is `{code, state_unavailable}` or `null`.
 
-The tool settles a submission by its receipt, or by its reservation when the receipt is missing, and sends nothing.
+- `record` is the wallet's record of the submission, or `null` when it holds none: `settlement_evidence`, `settlement_decision_id`, `envelope_hash`, `status`, `failure_code`, `release_code`, `ledger`, `source_redacted`, `sequence`, `submitted` and `reservation_open`. The record is display data. `settlement_evidence` is always `"unavailable"`, and `settlement_decision_id` only locates an authenticated accounting decision. Once the reservation's accounting horizon has passed, a `pending` or `ambiguous` receipt reads `ambiguous` with `release_code` `submission.accounting_expired`, the outcome unknown. A receipt with any other status keeps its status and code, and every receipt the expiry projects onto carries its `settlement_decision_id`. A receipt can also carry `submission.sequence_consumed` or `submission.time_bound_passed`, which name an observation and release nothing. Read `status` and `release_code`, not `reservation_open`.
+- `reservation` is a hold that remains after reconciliation, `{envelope_hash, operator_required}`, or `null`. `operator_required: true` marks a reservation whose receipt is missing and whose submission ledger is below the endpoint's retention floor: no endpoint answer resolves it. A time-bounded one ends at its accounting horizon; otherwise only the operator's `stellar-agent tx receipt clear` resolves it.
 
-**Annotations:** `readOnlyHint=false`, `destructiveHint=false`. The pairing is deliberate: the call moves no value, and it does change the wallet's record. A confirmed transaction records its spend and writes the value-action row the submission never got to write, and one that can no longer apply releases its spending-window reservation and writes a `value_action_failed` row under its `release_code`.
+The tool reconciles a submission by its receipt, or by its reservation when the receipt is missing, and sends nothing.
 
-**Error codes:** `validation.address_invalid`, `submission.record_unavailable`, `network.rpc_unreachable`, `audit.chain_key_unavailable`, `audit.tip_anchor_mismatch`.
+**Annotations:** `readOnlyHint=false`, `destructiveHint=false`. The pairing is deliberate: the call moves no value, and it does change the wallet's record. It records a success report on the receipt and in the spending window, and ends a reservation whose accounting horizon has passed. A failure report leaves the receipt and the reservation as they were. No receipt status writes an audit row: a reported success writes no submitted row, and an accounting expiry writes no `value_action_failed` row.
+
+**Error codes:** `validation.address_invalid`, `validation.usage_error`, `operation.unknown`, `network.mainnet_write_forbidden`, `submission.record_unavailable`, `network.rpc_unreachable`, `audit.chain_key_unavailable`, `audit.tip_anchor_mismatch`.
 
 ## Unresolved submissions
 
@@ -345,45 +473,65 @@ Three error codes describe a submission whose outcome the wallet cannot settle o
 - `envelope_hash`: the submission record's identity, which `stellar-agent tx receipt clear` takes. Present where the reporting surface holds the signed bytes, the DeFi verbs included. Recover it from `stellar_transaction_status`'s `record.envelope_hash` when it is absent.
 - `timeout_seconds`: present on `submission.tx_timeout`.
 - `server_tx_hash`: present on `submission.hash_mismatch`.
+- `recovery`: `result: "NeedsEvidence"`, `reason: "RecoveryRequired"`, `next_action: "TargetedStatus"`, and `earliest_retry_ms` (six seconds after the envelope's maxTime, in Unix milliseconds) or, without a finite bound, `retry_time_unavailable` (`MissingBound` or `Overflow`).
 - `outcome`: always `"unknown"`.
 - `reconcile_with`: `"stellar_transaction_status"`.
 
-**Recovery protocol.** Call `stellar_transaction_status` with `details.tx_hash`. Do not re-simulate, rebuild, or resubmit the payment: the transaction may still apply, the sequence number it consumes may already be spent by it, and a second submission at that sequence is refused with `submission.tx_already_submitted` until the first is settled. `stellar_transaction_status` reports what the chain says and settles the record:
+**Recovery protocol.** Call `stellar_transaction_status` with `details.tx_hash`. Do not re-simulate, rebuild, or resubmit the payment: the transaction may still apply, and the sequence number it consumes may already be spent by it. A second submission at that sequence is refused with `submission.tx_already_submitted` while the first one's receipt remains pending. `stellar_transaction_status` reports what the endpoint says and records a success as a report. A reported failure or missing transaction does not release possible spending:
 
-- `SUCCESS`: the payment went through. The spend is recorded and the value-action row is written. Calling again appends no second row.
-- `FAILED`: the transaction applied and failed. Nothing moved, and the reservation is released.
-- `NOT_FOUND`: the endpoint has no record of it. Within the retention window, two kinds of chain evidence say the transaction can no longer apply: an observed ledger close time strictly past its time bound, or a source account sequence that has reached the transaction's. Either is followed by a second transaction lookup: `SUCCESS` records the spend, `FAILED` releases it, and a second `NOT_FOUND` releases the reservation. The record becomes `ambiguous` with `release_code` set to `submission.sequence_consumed` or `submission.time_bound_passed`, and a `value_action_failed` row is written under that code. Without such evidence the record stands: call again later.
+- `SUCCESS`: the endpoint reports that the transaction applied. The receipt records `success`, unless it belongs to an untimed reservation and already records another network answer, which it keeps. A time-bounded reservation keeps counting through its accounting horizon. An untimed one has no horizon, and a testnet classic commit that reserved spending makes one: it stays open, with `record.reservation_open: true`, until the operator runs `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge --acknowledge-unbounded`. A commit whose policy produced no window entries holds nothing and answers `record.reservation_open: false`. No submitted row is written, and the pending row stays open.
+- `FAILED`: the endpoint reports that the transaction applied and failed. The report changes neither the reservation nor the receipt, and no `value_action_failed` row is owed.
+- `NOT_FOUND`: the endpoint has no record of it. Within the retention window, an observed ledger close time strictly past its time bound, or a source account sequence that has reached the transaction's, is followed by a second transaction lookup. Neither observation proves that the transaction can no longer apply. A second `NOT_FOUND` keeps the reservation, and a `SUCCESS` is recorded as above. Without such an observation the record stands: call again later.
 
-`submission.time_bound_passed` needs a transaction with a time bound. The
-wallet's commit tools build classic envelopes without one, so on those the
-evidence is a consumed sequence. A presented envelope, such as one the SEP-43
-tool submits, can carry a time bound, and so can the inner transaction of a
-fee-bump.
+Accounting expiry ends a reservation whatever the endpoint reports. The accounting horizon is the later of the signed time bound and a recorded success observation, plus each affected window's duration. Once it has passed on this host's clock, the reservation ends with the outcome unknown. A `pending` or `ambiguous` receipt then reads `ambiguous` with `release_code` `submission.accounting_expired`. A receipt with any other status keeps its status and code, and every projected receipt carries the decision identifier. An absent receipt is rebuilt from the committed expiry. The expiry owes one `submission_accounting_expired` audit event, which the call delivers from the authenticated window state. Repeated calls append no second event, and no `value_action_failed` row is written. A reservation without a time bound has no accounting horizon.
 
-The receipt keeps its `release_code` when the reservation is released, so
-a later call can retry any settled row still owed. A receipt released without
-recorded evidence, for example by an older binary, reads as `ambiguous` with no
-`release_code`, and no row is written for it.
-When the settlement lookup cannot read the retained audit history, the call
-still answers; it logs the error and writes no settled row. A later call
-retries the lookup and appends any row still owed.
+On a mainnet profile the primary endpoint's `FAILED` and `NOT_FOUND` are claims the oracle has to confirm. The call asks the oracle named by `oracle_provider_url` about the same transaction. The oracle's `SUCCESS` is recorded as a report, as above, and its `FAILED` keeps the reservation. Its `NOT_FOUND` runs the rule above with the oracle as the endpoint: the retention window, the ledger close time, the account sequence and the second lookup are all the oracle's. The oracle's answers count only once it reports the mainnet passphrase, which the call checks first. An oracle that reports another network, whose identity cannot be read, or that cannot answer, and a mainnet profile without an oracle, preserve the existing receipt status and the reservation. Accounting expiry is checked before any endpoint or oracle lookup, so it ends a time-bounded reservation in each of these cases.
 
-Automatic reconciliation applies the same chain and retention checks when the
-receipts file is absent. A definitive chain answer or a release on chain
-evidence restores the receipt's transaction identity from its reservation.
+On a mainnet profile the wallet's commit tools build classic envelopes with
+a deadline at most 120 seconds after the build, so their accounting horizon
+is bounded. On a testnet profile they build classic envelopes without a time
+bound. A presented envelope, such as one the SEP-43 tool submits, can carry a
+time bound, and so can the inner transaction of a fee-bump.
+
+A `release_code` is display data and releases nothing by itself: a receipt
+that carries one while its reservation is still held is reconciled like any
+other. A receipt that reads `ambiguous` with no `release_code` names an
+outcome nothing establishes, and no row is written for it.
+When the expiry event cannot be delivered, for example because another process
+holds the profile's audit writer, the call still answers. It logs the refusal,
+and the event stays owed until a later call delivers it.
+
+Automatic reconciliation applies the same checks when the receipts file is
+absent. A success report or an accounting expiry restores the receipt's
+transaction identity from its authenticated reservation.
 An approval nonce is held durably in its submission receipt before sending. If
 the approval-store consumption write fails, the commit gate still reports
 `policy.approval_consumed`; a status call completes the owed write. Repeating
 status is safe.
 
-A submission whose ledger has fallen outside the endpoint's retention window can never be settled this way. `stellar_transaction_status` reports it as `ambiguous` with no `release_code`, or, when its receipt is missing, as `reservation` with `operator_required: true`; the operator resolves it with `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`.
+No endpoint answer establishes the outcome of a submission whose ledger has fallen outside the endpoint's retention window. When the endpoint answers `NOT_FOUND` for it, `stellar_transaction_status` reports a `pending` or `ambiguous` receipt as `ambiguous` without adding a `release_code`. When its receipt is missing and no success is recorded on the reservation, it reports a `reservation` with `operator_required: true`. A `SUCCESS` is recorded as above, and an untimed reservation's receipt that already records a network answer keeps it. A time-bounded reservation still ends at its accounting horizon without an operator clear. Once its execution bound has passed, an eligible receipt clears with `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`, and the bounded spend stays charged through the horizon. An untimed hold clears with `--acknowledge --acknowledge-unbounded`.
 
-A send the endpoint refused outright is settled at the send and never reaches this protocol. When `sendTransaction` answers `ERROR` with a transaction result, the endpoint has reported a validation error for the envelope: the commit returns that error's code, the receipt records the failure, the reservation is released, and the wallet never sends those bytes again. They did leave the wallet, though. A copy relayed elsewhere that later becomes valid applies without being counted against the window, and its receipt stays `failed`.
+On a testnet profile, a send the endpoint refused outright returns the refusal's code at the send, not `submission.tx_timeout`. When `sendTransaction` answers `ERROR` with a transaction result, the endpoint has reported a validation error for the envelope. The commit returns that error's code, and the wallet never sends those bytes again. The bytes did leave the wallet, so the receipt stays `pending`. The pending row and the reservation stand through the accounting horizon, and an operator clear of the receipt keeps a bounded spend charged until then. A reservation without a time bound has no accounting horizon, so the clear needs `--acknowledge --acknowledge-unbounded`. A copy relayed elsewhere that later becomes valid counts against the window while the reservation stands.
+
+On a mainnet profile no second endpoint confirms a refusal at the send, so the commit returns `submission.tx_timeout`. The receipt, the pending row and the reservation stand: `stellar_transaction_status` records the oracle's answers as reports, and the reservation ends at its accounting horizon. A consumed sequence releases nothing. A refused envelope without a time bound keeps its reservation until the operator clears it with `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge --acknowledge-unbounded`.
 
 No recovery path sends a transaction again.
 
 `submission.record_unavailable` is different: the wallet could not write the record, so nothing was sent. The condition is local: an unwritable receipt store, an unreadable spending-window file, an audit log that cannot be appended, or a pending audit row the audit log's tip anchor does not cover, whose message carries `audit.tip_anchor_unavailable`. The submission is safe to retry once it is fixed.
 
-Every submitting tool reports these codes, `stellar_dex_trade`, the two vault tools and `stellar_sep43_sign_and_submit_transaction` included. The SEP-43 tool keeps its own `status: "pending"` response shape for a timeout and records the submission the same way, so `stellar_transaction_status` settles it too.
+Every submitting tool reports these codes, `stellar_dex_trade`, the two vault tools and `stellar_sep43_sign_and_submit_transaction` included. The SEP-43 tool keeps its own `status: "pending"` response shape for a timeout and records the submission the same way, so `stellar_transaction_status` reconciles it too.
 
 An operator policy that lists tools explicitly must include `stellar_transaction_status`, or a timed-out submission cannot be resolved through this server.
+
+## SEP-43 signing
+
+Both SEP-43 transaction tools, `stellar_sep43_sign_transaction` and `stellar_sep43_sign_and_submit_transaction`, decide each payment in a caller-supplied transaction under its payment tool's rule and charge the policy windows before the signer loads. The charge stands through a signer, signing or send failure, and repeated sign-only calls charge again. The pending row of the submitting tool and the `opaque_payload_signed` row of the sign-only tool carry the allowed payment legs. `stellar_sep43_sign_auth_entry` decides each token transfer its signer's account authorizes under the `stellar_pay_commit` rule, charges those payments and its own count before the signer loads, and records the legs in its `opaque_payload_signed` row; an approval requirement refuses with `policy.approval_required_unsupported`. The SEP-43 library interface itself evaluates no policy; this decision belongs to the MCP tools. An operation of another source account counts only when that account's signer set, read once per call, lists the wallet key; a failed read refuses with its own code.
+
+Both transaction tools accept two optional arguments for an approval requirement:
+
+| Argument | Meaning |
+| --- | --- |
+| `approval_nonce` | The `approval_nonce` of the approval response this call repeats. |
+| `approval_attestation` | The operator's attestation for that nonce, which `stellar-agent approve` records. |
+
+A transaction of one payment, path payment, account creation or trustline change that needs approval returns `{ "approval": { approval_nonce, profile, chain_id, expires_at_unix_ms, reason, instructions } }` and signs nothing. The repeat with the same `transaction_xdr` and both arguments signs and spends the approval. The sign-only tool spends it before it returns the signature. Any other shape refuses with `policy.approval_required_unsupported`.

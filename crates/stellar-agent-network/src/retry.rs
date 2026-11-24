@@ -39,6 +39,7 @@
 //! Each call site selects its classifier:
 //! - [`is_retryable_send_error`] for `send_transaction`.
 //! - [`is_retryable_poll_error`] for `get_transaction` / `get_health`.
+//! - [`is_preflight_busy`] for `simulateTransaction`, through [`retry_preflight_busy`].
 //! - `is_retryable_identity_error` for `getNetwork`. It matches the send
 //!   classifier except that `JsonRpc(ParseError(_))` and an HTTP 401 or 403
 //!   answer are not retryable.
@@ -54,6 +55,108 @@ use std::time::Duration;
 
 use rand_core::{OsRng, RngCore};
 use tokio::time::Instant;
+
+/// The JSON-RPC code for a full simulation queue.
+pub const PREFLIGHT_BUSY_CODE: i32 = -32004;
+
+const SIMULATE_BUSY_ATTEMPTS: u32 = 4;
+const SIMULATE_BUSY_BASE_DELAY: Duration = Duration::from_millis(250);
+const SIMULATE_BUSY_MAX_DELAY: Duration = Duration::from_secs(1);
+
+/// The total simulation bound when the caller supplies no deadline.
+pub const SIMULATE_BUSY_TOTAL_BOUND: Duration = Duration::from_secs(60);
+
+/// Whether the RPC error reports a full simulation queue.
+pub fn is_preflight_busy(error: &stellar_rpc_client::Error) -> bool {
+    matches!(
+        error,
+        stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Call(object))
+            if object.code() == PREFLIGHT_BUSY_CODE
+    )
+}
+
+/// Why a bounded simulation retry returns no response.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "callers retain the RPC error type for their existing mappings"
+)]
+pub enum BusyRetryError {
+    /// The request fails or exhausts its busy retries.
+    Rpc(stellar_rpc_client::Error),
+    /// The deadline expires before a response arrives.
+    Expired,
+}
+
+impl std::fmt::Display for BusyRetryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rpc(error) => error.fmt(formatter),
+            Self::Expired => formatter.write_str("deadline elapsed"),
+        }
+    }
+}
+
+/// Retries a busy simulation within one absolute deadline.
+///
+/// The closure contains only the RPC request and borrows an envelope built before this call.
+/// Signatures, admission, approvals, and budget holds stay outside the closure.
+///
+/// # Errors
+/// Returns the request error on exhaustion or a non-busy error, and [`BusyRetryError::Expired`] on expiry.
+#[expect(
+    clippy::result_large_err,
+    reason = "the helper preserves the RPC error for each caller's typed mapping"
+)]
+pub async fn retry_preflight_busy<F, Fut, T>(
+    deadline: Option<Instant>,
+    op: F,
+) -> Result<T, BusyRetryError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, stellar_rpc_client::Error>>,
+{
+    retry_preflight_busy_with_delay(deadline, jitter_delay, op).await
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "the helper preserves the RPC error for each caller's typed mapping"
+)]
+async fn retry_preflight_busy_with_delay<F, Fut, T>(
+    deadline: Option<Instant>,
+    mut delay_for: impl FnMut(u32, Duration, Duration) -> Duration,
+    mut op: F,
+) -> Result<T, BusyRetryError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, stellar_rpc_client::Error>>,
+{
+    let deadline = deadline.unwrap_or_else(|| Instant::now() + SIMULATE_BUSY_TOTAL_BOUND);
+    let mut attempt = 0;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(BusyRetryError::Expired);
+        }
+        // The heap holds the request future, so each call site's future
+        // grows by a fixed amount and not by the request's size.
+        let error = match tokio::time::timeout_at(deadline, Box::pin(op())).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => error,
+            Err(_) => return Err(BusyRetryError::Expired),
+        };
+        if !is_preflight_busy(&error) || attempt + 1 >= SIMULATE_BUSY_ATTEMPTS {
+            return Err(BusyRetryError::Rpc(error));
+        }
+        let delay = delay_for(attempt, SIMULATE_BUSY_BASE_DELAY, SIMULATE_BUSY_MAX_DELAY);
+        if Instant::now() + delay >= deadline {
+            return Err(BusyRetryError::Rpc(error));
+        }
+        tracing::debug!(target: "simulate_busy_retry", attempt, "waiting to retry busy simulation");
+        tokio::time::sleep(delay).await;
+        attempt += 1;
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RetryPolicy
@@ -112,6 +215,12 @@ impl Default for RetryPolicy {
 // Per-call-site retryable classifiers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The `sendTransaction` status with which an endpoint declines to take a
+/// transaction for now. The submit layer's status read reports it as
+/// `stellar_rpc_client::Error::UnexpectedTransactionStatus` carrying this
+/// text, which [`is_retryable_send_error`] retries.
+pub(crate) const SEND_TRY_AGAIN_LATER: &str = "TRY_AGAIN_LATER";
+
 /// Returns `true` if a `sendTransaction` RPC error is worth retrying.
 ///
 /// # Classification rationale
@@ -126,12 +235,17 @@ impl Default for RetryPolicy {
 /// on-chain rejection would be retried, wasting attempts.  The
 /// Transport-429-on-send is not currently honoured; blind backoff is used instead.
 ///
-/// Only `TransactionSubmissionTimeout` and `JsonRpc(_)` are retried:
+/// Only `TransactionSubmissionTimeout`, `JsonRpc(_)` and a
+/// `TRY_AGAIN_LATER` answer are retried:
 /// - `TransactionSubmissionTimeout`: the RPC call timed out at the transport
 ///   layer (no on-chain decision was made); safe to retry.
 /// - `JsonRpc(_)`: raw transport error (connection reset, server-side error,
 ///   or 429 surfacing through the jsonrpsee layer before `send_transaction`
 ///   gets a chance to inspect the response body); safe to retry.
+/// - `UnexpectedTransactionStatus("TRY_AGAIN_LATER")`: the
+///   submit layer's own `sendTransaction` status read reports the endpoint's
+///   `TRY_AGAIN_LATER` this way. The endpoint did not take the transaction
+///   for inclusion, so resending the same bytes is safe.
 ///
 /// # Errors
 ///
@@ -163,7 +277,11 @@ pub fn is_retryable_send_error(e: &stellar_rpc_client::Error) -> bool {
         // The RPC client found a transaction-level failure after submission.
         E::TransactionFailed(_) => false,
 
-        // An unexpected status string came back.  Non-transient protocol error.
+        // The endpoint answered `TRY_AGAIN_LATER`: it did not take the
+        // transaction now, and the same bytes may be sent again.
+        E::UnexpectedTransactionStatus(status) if status == SEND_TRY_AGAIN_LATER => true,
+
+        // Any other unexpected status string.  Non-transient protocol error.
         E::UnexpectedTransactionStatus(_) => false,
 
         // XDR decode failure: the payload is structurally wrong; retry
@@ -564,26 +682,98 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, stellar_rpc_client::Error>>,
 {
-    retry_with_delay(policy, overall_deadline, is_retryable, jitter_delay, op).await
+    retry_with_delay(
+        policy,
+        overall_deadline,
+        None,
+        is_retryable,
+        jitter_delay,
+        op,
+    )
+    .await
+    .map_err(StartedByError::into_rpc_error)
 }
 
-/// [`retry_with_backoff`] with the delay before each retry drawn from
-/// `delay_for(attempt, base_delay, max_delay)`.
+/// Why [`retry_with_backoff_started_by`] returned without a value.
+#[derive(Debug)]
+pub(crate) enum StartedByError {
+    /// The start-by instant passed before the next attempt could start.
+    StartByPassed {
+        /// The attempts that started before the instant.
+        attempts: u32,
+    },
+    /// Every error of [`retry_with_backoff`], boxed so that the start-by
+    /// variant stays small.
+    Failed(Box<stellar_rpc_client::Error>),
+}
+
+impl StartedByError {
+    /// The error of a retry without a start-by instant, where only
+    /// [`StartedByError::Failed`] arises. A passed instant reads as the
+    /// deadline cut-off of an attempt.
+    fn into_rpc_error(self) -> stellar_rpc_client::Error {
+        match self {
+            Self::StartByPassed { .. } => stellar_rpc_client::Error::TransactionSubmissionTimeout,
+            Self::Failed(error) => *error,
+        }
+    }
+}
+
+/// [`retry_with_backoff`] with a second instant, `start_by`, that bounds when
+/// an attempt may start.
+///
+/// Every attempt, the first included, starts only while `start_by` has not
+/// passed, and a sleep between attempts ends at `start_by` at the latest. An
+/// attempt that started before the instant runs under `overall_deadline`, as
+/// in [`retry_with_backoff`]: the answer to a request already made is still
+/// awaited. A caller whose request rests on a deadline passes it as
+/// `start_by`, so no request starts after it. `None` bounds nothing beyond
+/// [`retry_with_backoff`].
+///
+/// # Errors
+///
+/// - [`StartedByError::StartByPassed`] when `start_by` has passed before an
+///   attempt, with the number of attempts that started before it.
+/// - [`StartedByError::Failed`] with every error of [`retry_with_backoff`].
+///
+/// # Panics
+///
+/// Never panics.
+pub(crate) async fn retry_with_backoff_started_by<F, Fut, T>(
+    policy: &RetryPolicy,
+    overall_deadline: Instant,
+    start_by: Option<Instant>,
+    is_retryable: fn(&stellar_rpc_client::Error) -> bool,
+    op: F,
+) -> Result<T, StartedByError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, stellar_rpc_client::Error>>,
+{
+    retry_with_delay(
+        policy,
+        overall_deadline,
+        start_by,
+        is_retryable,
+        jitter_delay,
+        op,
+    )
+    .await
+}
+
+/// [`retry_with_backoff_started_by`] with the delay before each retry drawn
+/// from `delay_for(attempt, base_delay, max_delay)`.
 ///
 /// Production passes [`jitter_delay`]. A test passes a fixed delay, which is
 /// how a delay longer than the remaining budget is produced on demand.
-#[expect(
-    clippy::result_large_err,
-    reason = "the error type is stellar_rpc_client's own, passed through unchanged \
-              as in retry_with_backoff"
-)]
 async fn retry_with_delay<F, Fut, T>(
     policy: &RetryPolicy,
     overall_deadline: Instant,
+    start_by: Option<Instant>,
     is_retryable: fn(&stellar_rpc_client::Error) -> bool,
     delay_for: fn(u32, Duration, Duration) -> Duration,
     mut op: F,
-) -> Result<T, stellar_rpc_client::Error>
+) -> Result<T, StartedByError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, stellar_rpc_client::Error>>,
@@ -591,12 +781,17 @@ where
     let mut last_err: Option<stellar_rpc_client::Error> = None;
 
     for attempt in 0..policy.max_attempts.max(1) {
+        // No attempt starts once the start-by instant has passed, the first
+        // included.
+        if start_by.is_some_and(|start_by| Instant::now() >= start_by) {
+            return Err(StartedByError::StartByPassed { attempts: attempt });
+        }
         match tokio::time::timeout_at(overall_deadline, op()).await {
             Ok(Ok(val)) => return Ok(val),
             Ok(Err(e)) => {
                 if !is_retryable(&e) {
                     // Non-retryable: surface immediately without sleeping.
-                    return Err(e);
+                    return Err(StartedByError::Failed(Box::new(e)));
                 }
 
                 last_err = Some(e);
@@ -611,9 +806,13 @@ where
 
                 // The sleep never outlasts the deadline, and a sleep that
                 // reaches it ends the retries with the last error, so no
-                // attempt starts past the caller's budget.
+                // attempt starts past the caller's budget. It ends at the
+                // start-by instant at the latest as well, where the check
+                // above refuses the next attempt.
+                let wake_by =
+                    start_by.map_or(overall_deadline, |start_by| start_by.min(overall_deadline));
                 let delay = delay_for(attempt, policy.base_delay, policy.max_delay)
-                    .min(overall_deadline.saturating_duration_since(now));
+                    .min(wake_by.saturating_duration_since(now));
                 tokio::time::sleep(delay).await;
                 if Instant::now() >= overall_deadline {
                     break;
@@ -626,7 +825,9 @@ where
             // `submit_transaction_and_wait`'s own timeout path returns, so
             // this maps through existing caller error-handling unchanged.
             Err(_elapsed) => {
-                return Err(stellar_rpc_client::Error::TransactionSubmissionTimeout);
+                return Err(StartedByError::Failed(Box::new(
+                    stellar_rpc_client::Error::TransactionSubmissionTimeout,
+                )));
             }
         }
     }
@@ -642,7 +843,9 @@ where
         clippy::unreachable,
         reason = "last_err is guaranteed Some here; see SAFETY comment above"
     )]
-    Err(last_err.unwrap_or_else(|| unreachable!("retry_with_backoff: last_err must be Some")))
+    Err(StartedByError::Failed(Box::new(last_err.unwrap_or_else(
+        || unreachable!("retry_with_backoff: last_err must be Some"),
+    ))))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -667,6 +870,230 @@ mod tests {
     use tokio::time::Instant;
 
     use super::*;
+
+    fn call_error(code: i32) -> stellar_rpc_client::Error {
+        stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Call(
+            serde_json::from_value(serde_json::json!({
+                "code": code, "message": "preflight queue full"
+            }))
+            .unwrap(),
+        ))
+    }
+
+    /// A request whose future holds `N` bytes across a pending poll.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the request returns the RPC error type the retry drives"
+    )]
+    async fn request_holding<const N: usize>() -> Result<u8, stellar_rpc_client::Error> {
+        let payload = [1u8; N];
+        tokio::task::yield_now().await;
+        Ok(std::hint::black_box(&payload)[0])
+    }
+
+    /// The retry future's size does not depend on the request future's size.
+    #[test]
+    fn the_retry_future_does_not_hold_the_request_future() {
+        const ALLOWANCE: usize = 64;
+        let large_request = request_holding::<65_536>();
+        assert!(std::mem::size_of_val(&large_request) >= 65_536);
+        drop(large_request);
+
+        let small = retry_preflight_busy(None, request_holding::<1>);
+        let large = retry_preflight_busy(None, request_holding::<65_536>);
+        let (small_size, large_size) =
+            (std::mem::size_of_val(&small), std::mem::size_of_val(&large));
+        assert!(
+            large_size.abs_diff(small_size) <= ALLOWANCE,
+            "the retry takes {small_size} bytes for a 1-byte request and {large_size} for a 65536-byte one"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_then_answer_is_retried() {
+        let mut calls = 0;
+        let result = retry_preflight_busy(None, || {
+            calls += 1;
+            std::future::ready(if calls < 3 {
+                Err(call_error(-32004))
+            } else {
+                Ok(7)
+            })
+        })
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_stops_at_the_attempt_cap() {
+        let start = Instant::now();
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        let result = retry_preflight_busy_with_delay(
+            None,
+            |attempt, base, max| {
+                delays.push((attempt, base, max));
+                (base * 2_u32.pow(attempt)).min(max)
+            },
+            || {
+                calls += 1;
+                std::future::ready(Err::<(), _>(call_error(-32004)))
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(BusyRetryError::Rpc(ref e)) if is_preflight_busy(e)));
+        assert_eq!(calls, 4);
+        assert_eq!(
+            delays,
+            (0..3)
+                .map(|i| (i, Duration::from_millis(250), Duration::from_secs(1)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(start.elapsed(), Duration::from_millis(1750));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_stops_when_the_sleep_does_not_fit() {
+        for (delay, expected_calls, elapsed) in [(100, 1, 0), (40, 3, 80)] {
+            let start = Instant::now();
+            let mut calls = 0;
+            let result = retry_preflight_busy_with_delay(
+                Some(start + Duration::from_millis(100)),
+                |_, _, _| Duration::from_millis(delay),
+                || {
+                    calls += 1;
+                    std::future::ready(Err::<(), _>(call_error(-32004)))
+                },
+            )
+            .await;
+            assert!(matches!(result, Err(BusyRetryError::Rpc(ref e)) if is_preflight_busy(e)));
+            assert_eq!(calls, expected_calls);
+            assert_eq!(start.elapsed(), Duration::from_millis(elapsed));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_deadline_dispatches_nothing() {
+        let mut calls = 0;
+        let result = retry_preflight_busy(Some(Instant::now()), || {
+            calls += 1;
+            std::future::ready(Ok::<_, stellar_rpc_client::Error>(7))
+        })
+        .await;
+        assert!(matches!(result, Err(BusyRetryError::Expired)));
+        assert_eq!(calls, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_attempt_is_cut_at_the_deadline() {
+        for busy_first in [false, true] {
+            let start = Instant::now();
+            let mut calls = 0;
+            let result = retry_preflight_busy_with_delay(
+                Some(start + Duration::from_millis(200)),
+                |_, _, _| Duration::from_millis(100),
+                || {
+                    calls += 1;
+                    let busy = busy_first && calls == 1;
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(if busy { 50 } else { 500 }))
+                            .await;
+                        if busy { Err(call_error(-32004)) } else { Ok(7) }
+                    }
+                },
+            )
+            .await;
+            assert!(matches!(result, Err(BusyRetryError::Expired)));
+            assert_eq!(start.elapsed(), Duration::from_millis(200));
+            assert_eq!(calls, if busy_first { 2 } else { 1 });
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unbounded_call_gets_the_total_bound() {
+        let start = Instant::now();
+        let mut calls = 0;
+        let result = retry_preflight_busy_with_delay(
+            None,
+            |_, _, _| Duration::from_secs(1),
+            || {
+                calls += 1;
+                async {
+                    tokio::time::sleep(Duration::from_secs(25)).await;
+                    Err::<(), _>(call_error(-32004))
+                }
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(BusyRetryError::Expired)));
+        assert!(start.elapsed() <= Duration::from_secs(60));
+        assert!(calls <= 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_busy_code_is_retried() {
+        for transport in [false, true] {
+            let mut calls = 0;
+            let result = retry_preflight_busy(None, || {
+                calls += 1;
+                let error = if transport {
+                    stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Transport(
+                        Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+                    ))
+                } else {
+                    call_error(-32602)
+                };
+                std::future::ready(Err::<(), _>(error))
+            })
+            .await;
+            assert!(matches!(result, Err(BusyRetryError::Rpc(_))));
+            assert_eq!(calls, 1);
+        }
+        let mut calls = 0;
+        let response = retry_preflight_busy(None, || {
+            calls += 1;
+            std::future::ready(Ok::<_, stellar_rpc_client::Error>(
+                stellar_rpc_client::SimulateTransactionResponse {
+                    error: Some("preflight queue full".to_owned()),
+                    ..Default::default()
+                },
+            ))
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.error.as_deref(), Some("preflight queue full"));
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_does_not_dispatch_after_a_late_wake() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let sleeping = Arc::new(tokio::sync::Notify::new());
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let task = tokio::spawn({
+            let calls = calls.clone();
+            let sleeping = sleeping.clone();
+            async move {
+                retry_preflight_busy_with_delay(
+                    Some(deadline),
+                    |_, _, _| {
+                        sleeping.notify_one();
+                        Duration::from_millis(50)
+                    },
+                    || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Err::<(), _>(call_error(-32004)))
+                    },
+                )
+                .await
+            }
+        });
+        sleeping.notified().await;
+        tokio::time::advance(Duration::from_millis(200)).await;
+        assert!(matches!(task.await.unwrap(), Err(BusyRetryError::Expired)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     // ─── is_retryable_send_error ─────────────────────────────────────────────
 
@@ -700,6 +1127,18 @@ mod tests {
     fn send_transaction_failed_is_not_retryable() {
         assert!(!is_retryable_send_error(
             &stellar_rpc_client::Error::TransactionFailed("some failure".to_owned())
+        ));
+    }
+
+    /// A `TRY_AGAIN_LATER` answer is resent; any other unexpected status is
+    /// not.
+    #[test]
+    fn send_try_again_later_is_retryable() {
+        assert!(is_retryable_send_error(
+            &stellar_rpc_client::Error::UnexpectedTransactionStatus(SEND_TRY_AGAIN_LATER.into())
+        ));
+        assert!(!is_retryable_send_error(
+            &stellar_rpc_client::Error::UnexpectedTransactionStatus("DUPLICATE".into())
         ));
     }
 
@@ -1106,6 +1545,7 @@ mod tests {
         let result = retry_with_delay(
             &policy,
             deadline,
+            None,
             is_retryable_poll_error,
             |_, _, _| Duration::from_secs(10),
             || {
@@ -1134,11 +1574,86 @@ mod tests {
             "no attempt may start after a sleep that reached the deadline"
         );
         match result {
-            Err(stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Custom(m))) => {
-                assert_eq!(m, "first attempt", "the first attempt's error is returned");
-            }
+            Err(StartedByError::Failed(error)) => match *error {
+                stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Custom(m)) => {
+                    assert_eq!(m, "first attempt", "the first attempt's error is returned");
+                }
+                other => panic!("expected the first attempt's error; got {other:?}"),
+            },
             other => panic!("expected the first attempt's error; got {other:?}"),
         }
+    }
+
+    /// An attempt that fails before the start-by instant is not followed by
+    /// another once a backoff crosses the instant: the sleep ends at the
+    /// instant, and the attempt it scheduled is refused. The operation
+    /// succeeds on its second call, so an attempt past the instant shows as
+    /// a success and a second invocation.
+    #[tokio::test(start_paused = true)]
+    async fn a_backoff_past_the_start_by_instant_starts_no_further_attempt() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+        };
+        let start = Instant::now();
+        let start_by = start + Duration::from_secs(1);
+
+        let result = retry_with_delay(
+            &policy,
+            start + Duration::from_secs(30),
+            Some(start_by),
+            is_retryable_send_error,
+            |_, _, _| Duration::from_secs(2),
+            || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(stellar_rpc_client::Error::TransactionSubmissionTimeout)
+                    } else {
+                        Ok(7u32)
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(StartedByError::StartByPassed { attempts: 1 })),
+            "the attempt after the instant is refused: {result:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one attempt started");
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(1),
+            "the backoff ends at the instant"
+        );
+    }
+
+    /// A start-by instant already passed on entry starts no attempt at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_passed_start_by_instant_starts_no_attempt() {
+        let calls = AtomicU32::new(0);
+        let start = Instant::now();
+
+        let result = retry_with_backoff_started_by(
+            &RetryPolicy::default(),
+            start + Duration::from_secs(30),
+            Some(start),
+            is_retryable_send_error,
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<u32, stellar_rpc_client::Error>(7) }
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(StartedByError::StartByPassed { attempts: 0 })),
+            "{result:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing is attempted");
     }
 
     /// The default policy is five attempts, a 500 ms base delay, and an 8 s

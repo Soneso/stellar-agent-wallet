@@ -5,19 +5,27 @@ name: Publish to crates.io
 # and never uploaded.
 #
 # Publishing is a separate, manually dispatched act, so pushing a tag never
-# publishes by itself. Two jobs split the work:
+# publishes by itself. Four jobs split the work:
 # - verify holds no credential. It builds and packages every workspace member
-#   of the tag, the unpublished one included, with `cargo package --workspace`
-#   and records the archive checksums in SHA256SUMS.
+#   of the tag, the unpublished one included, with `cargo package --workspace`,
+#   checks the mainnet-write marker of the binaries that package verification
+#   builds, and records the archive checksums in SHA256SUMS.
+# - vendored-wasm holds no credential. It rebuilds every vendored contract
+#   Wasm file of the verified tag's commit with pinned tools and compares
+#   the bytes. Publish waits for this rebuild to pass.
 # - publish runs in the `crates-io` environment and compiles nothing. It
 #   regenerates the archives with `--no-verify`, requires them to equal the
 #   verify job's SHA256SUMS, and uploads each crate with
 #   `cargo publish --no-verify`. It authenticates through crates.io Trusted
 #   Publishing (GitHub OIDC, no long-lived registry token).
-# Both jobs refuse a tag whose commit is not an ancestor of origin/main, and
-# check out the tag by its full ref. They package the tag's tree in `src/` and
-# run this workflow's scripts from the dispatched commit in `wf/`. Both
-# install RELEASE_TOOLCHAIN, so both package with the same cargo.
+# - verify-install holds no credential and runs only after publish. It
+#   installs stellar-agent-cli of the tag's version from crates.io, derives
+#   stellar-agent-mcp, and checks both names.
+# verify and publish refuse a tag whose commit is not an ancestor of
+# origin/main. The verify, publish, and verify-install jobs check out the tag
+# by its full ref in `src/` and run this workflow's scripts from the dispatched
+# commit in `wf/`. These jobs install RELEASE_TOOLCHAIN, so verify and publish
+# package with the same cargo, and verify-install builds with it.
 
 on:
   workflow_dispatch:
@@ -40,6 +48,7 @@ permissions:
   contents: read
 
 env:
+  EXPECTED_MAINNET_WRITE: "on"
   # The exact toolchain both jobs package with. The publish job refuses any
   # other cargo or rustc version.
   RELEASE_TOOLCHAIN: "1.99.0"
@@ -48,6 +57,8 @@ jobs:
   verify:
     name: verify (${{ inputs.tag }})
     runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
     # One cargo invocation verify-builds every workspace member.
     timeout-minutes: 90
     permissions:
@@ -108,6 +119,15 @@ jobs:
           set -euo pipefail
           "$GITHUB_WORKSPACE/wf/.github/scripts/check-ref-on-main.sh" "$(git rev-parse HEAD)"
 
+      - name: Record the verified source commit
+        id: source
+        working-directory: src
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       - name: Verify every workspace member carries the tag's version
         working-directory: src
         env:
@@ -119,14 +139,21 @@ jobs:
       # stellar-ledger pulls hidapi, which links libudev on Linux for HID device
       # enumeration. The runner ships pkg-config but not the libudev headers.
       - name: Install libudev (Linux hidapi)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
 
       # Cargo packages every workspace member, then verify-builds each one
       # against the other members through its temporary local registry, so no
       # lower tier needs to be on crates.io yet.
       - name: Build and package every crate
         working-directory: src
-        run: cargo package --workspace --locked
+        run: |
+          mkdir -p target
+          touch target/package-verification-start
+          cargo package --workspace --locked
+
+      - name: Verify packaged feature state
+        working-directory: src
+        run: bash "$GITHUB_WORKSPACE/wf/.github/scripts/check-packaged-markers.sh" target target/package-verification-start "$EXPECTED_MAINNET_WRITE"
 
       - name: Record the archive checksums
         working-directory: src
@@ -155,9 +182,20 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  vendored-wasm:
+    name: vendored-wasm
+    needs: verify
+    if: ${{ !inputs.verify_only }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/vendored-wasm.yml
+    with:
+      source_sha: ${{ needs.verify.outputs.sha }}
+      publication: true
+
   publish:
     name: publish (${{ inputs.tag }})
-    needs: verify
+    needs: [verify, vendored-wasm]
     if: ${{ !inputs.verify_only }}
     runs-on: ubuntu-24.04
     environment: crates-io
@@ -194,6 +232,14 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: wf
           persist-credentials: false
+
+      - name: Require the verified source commit
+        env:
+          VERIFIED_SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$VERIFIED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [ "$(git -C src rev-parse HEAD)" = "$VERIFIED_SHA" ]
 
       # The one toolchain install in a credentialed job. It downloads the
       # pinned release with rustup and compiles nothing.
@@ -288,3 +334,53 @@ jobs:
         run: |
           set -euo pipefail
           bash "$GITHUB_WORKSPACE/wf/.github/scripts/publish-crates.sh" --sums "$RUNNER_TEMP/verify/SHA256SUMS"
+
+  verify-install:
+    name: verify-install
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Validate the tag input
+        id: tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag_re='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if ! [[ "$TAG" =~ $tag_re ]]; then
+            echo "tag input does not match $tag_re" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          path: src
+          persist-credentials: false
+
+      # The commit of this workflow; its scripts install and check the
+      # published binaries.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: wf
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RELEASE_TOOLCHAIN }}
+
+      - name: Pin the install toolchain
+        run: echo "RUSTUP_TOOLCHAIN=$RELEASE_TOOLCHAIN" >> "$GITHUB_ENV"
+
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
+
+      - name: Verify registry installs
+        env:
+          TAG: ${{ inputs.tag }}
+        run: bash "$GITHUB_WORKSPACE/wf/.github/scripts/release/verify-install.sh" "$TAG" "$EXPECTED_MAINNET_WRITE"

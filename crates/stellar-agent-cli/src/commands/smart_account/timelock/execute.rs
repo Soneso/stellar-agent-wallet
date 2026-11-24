@@ -15,7 +15,7 @@
 //! | `--operation-id <HEX>` | yes | 64-char hex operation identifier. |
 //! | `--salt <HEX>` | yes | 64-char hex salt used when scheduling. |
 //! | `--rpc-url <URL>` | no | Primary Soroban RPC; the profile endpoint when absent; refused on mainnet. |
-//! | `--secondary-rpc-url <URL>` | no | Secondary RPC for cross-RPC validation; the profile value when absent; refused on mainnet. |
+//! | `--secondary-rpc-url <URL>` | yes, unless the profile sets it | Ledger witness and cross-RPC validation, on a host other than the primary's; refused on mainnet. |
 //! | `--network {testnet\|mainnet}` | no | Must equal the profile's chain when given. |
 //! | `--signer-secret-env <VAR>` | no | Env var holding the executor S-strkey. |
 //! | `--profile <NAME>` | no | Profile name. |
@@ -46,12 +46,11 @@ use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use tracing::info;
-use url::Url;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
     SignerSourceFlags, emit_sa_error, load_command_profile, map_access_error, open_audit_writer,
-    resolve_signer,
+    resolve_signer, signing_secondary_rpc_url,
 };
 use crate::common::network::{
     EndpointFlags, EndpointUrlFlag, TargetNetwork, mainnet_write_refusal,
@@ -168,7 +167,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved_profile) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved_profile.name);
+            let e = map_access_error(&error);
             let envelope: Envelope<()> = Envelope::err(&e);
             render_json(&envelope);
             return 1;
@@ -212,15 +211,10 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let op_bytes = match decode_hex32(&args.operation_id) {
         Some(b) => b,
         None => {
-            let wallet_err = WalletError::Validation(
-                stellar_agent_core::error::ValidationError::AddressInvalid {
-                    input: format!(
-                        "--operation-id must be a 64-char lowercase hex string; got '{}' ({} chars)",
-                        args.operation_id,
-                        args.operation_id.len()
-                    ),
-                },
-            );
+            let wallet_err =
+                WalletError::Validation(stellar_agent_core::error::ValidationError::address_check(
+                    "--operation-id must be a 64-char lowercase hex string",
+                ));
             let envelope: Envelope<()> = Envelope::err(&wallet_err);
             render_json(&envelope);
             return 1;
@@ -231,15 +225,10 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let salt_bytes = match decode_hex32(&args.salt) {
         Some(b) => b,
         None => {
-            let wallet_err = WalletError::Validation(
-                stellar_agent_core::error::ValidationError::AddressInvalid {
-                    input: format!(
-                        "--salt must be a 64-char lowercase hex string; got '{}' ({} chars)",
-                        args.salt,
-                        args.salt.len()
-                    ),
-                },
-            );
+            let wallet_err =
+                WalletError::Validation(stellar_agent_core::error::ValidationError::address_check(
+                    "--salt must be a 64-char lowercase hex string",
+                ));
             let envelope: Envelope<()> = Envelope::err(&wallet_err);
             render_json(&envelope);
             return 1;
@@ -255,6 +244,13 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
                 return 1;
             }
         };
+
+    // The signature rests on a second endpoint's ledger observation; a command
+    // without one refuses before any key access.
+    let secondary_rpc_url = match signing_secondary_rpc_url(&context) {
+        Ok(url) => url.to_owned(),
+        Err(e) => return emit_sa_error(&e),
+    };
 
     let (signer, mlock_degradation) = match resolve_signer(
         &args.signer_source,
@@ -279,29 +275,6 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         &request_id,
     );
 
-    let secondary_rpc_url = context
-        .secondary_rpc_url
-        .clone()
-        .unwrap_or_else(|| context.rpc_url.clone());
-
-    // Warn when secondary == primary: the dual-RPC divergence defence is
-    // degraded. A single compromised RPC can satisfy both confirmation checks.
-    // Provide --secondary-rpc-url pointing to an independent endpoint.
-    // Log host-only at INFO; full URL at DEBUG.
-    let rpc_host = Url::parse(&context.rpc_url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_owned))
-        .unwrap_or_else(|| "<unparseable>".to_owned());
-
-    if secondary_rpc_url == context.rpc_url {
-        info!(
-            request_id = %request_id,
-            rpc_host = %rpc_host,
-            "smart-account timelock execute: --secondary-rpc-url not set or equals \
-             --rpc-url; cross-RPC divergence defence is degraded — \
-             provide an independent secondary RPC endpoint for production use"
-        );
-    }
     tracing::debug!(
         rpc_url = %stellar_agent_core::redact::redact_url_authority(&context.rpc_url),
         "execute rpc_url"
@@ -310,9 +283,6 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let timelock_redacted = redact_strkey_first5_last5(&args.timelock);
 
     info!(
-        timelock = %timelock_redacted,
-        operation_id = %&args.operation_id[..8],
-        function = %args.function,
         network = %context.chain_id,
         request_id = %request_id,
         "smart-account timelock execute: submitting"
@@ -339,13 +309,16 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             &profile_name,
             origin,
             &reconcile_client,
+            crate::commands::submission_record::settlement_oracle(&profile).as_ref(),
             now_ms,
+            None,
         )
         .await;
     }
     let chain_id = profile.chain_id.caip2_str();
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
+            unvalued: Some(stellar_agent_core::policy::v1::OpaqueReason::UnvaluedContractCall),
             policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
             profile: &profile,
             profile_name: profile_name.clone(),
@@ -477,7 +450,14 @@ mod tests {
     #[serial_test::serial]
     async fn execute_mainnet_flag_without_profile_reaches_no_endpoint() {
         let guard_rpc = wiremock::MockServer::start().await;
-        let guard_home = tempfile::tempdir().expect("home");
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            guard_home
+                .path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         use crate::common::network::TargetNetwork;

@@ -44,7 +44,7 @@ mod i128_decimal_str {
     {
         let s = String::deserialize(deserializer)?;
         s.parse::<i128>()
-            .map_err(|e| serde::de::Error::custom(format!("invalid decimal i128 '{s}': {e}")))
+            .map_err(|_| serde::de::Error::custom("invalid decimal i128"))
     }
 }
 
@@ -77,7 +77,7 @@ mod i128_decimal_str_opt {
             Some(s) => s
                 .parse::<i128>()
                 .map(Some)
-                .map_err(|e| serde::de::Error::custom(format!("invalid decimal i128 '{s}': {e}"))),
+                .map_err(|_| serde::de::Error::custom("invalid decimal i128")),
             None => Ok(None),
         }
     }
@@ -150,6 +150,157 @@ impl fmt::Display for ContractKind {
     }
 }
 
+// ── WasmHashPin ───────────────────────────────────────────────────────────────
+
+/// The full 32-byte SHA-256 hash of a Wasm executable, as a verifier or
+/// policy pin records it.
+///
+/// Two pins are equal exactly when all 32 bytes are equal; a pin never
+/// carries a truncated hash. [`Self::first8_display`] renders the first
+/// eight bytes for labeled display fields, and no such projection is
+/// compared or turned back into a pin.
+///
+/// # Wire form
+///
+/// Exactly 64 lowercase hexadecimal characters. [`Self::parse`] and the
+/// `Deserialize` implementation refuse any other length, a character that
+/// is not a hexadecimal digit, and uppercase digits.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::audit_log::WasmHashPin;
+///
+/// let pin = WasmHashPin::new([0x42; 32]);
+/// let mut twin = [0x42; 32];
+/// twin[8..].fill(0x43);
+/// assert!(pin.matches(&[0x42; 32]));
+/// assert!(!pin.matches(&twin));
+/// assert_eq!(WasmHashPin::parse(&pin.to_hex()), Ok(pin));
+/// assert!(WasmHashPin::parse("4242424242424242").is_err());
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WasmHashPin([u8; 32]);
+
+/// Why a string is not the wire form of a [`WasmHashPin`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum WasmHashPinParseError {
+    /// The string is not 64 characters long.
+    #[error("a Wasm hash pin is 64 lowercase hex characters, got {actual} characters")]
+    InvalidLength {
+        /// The length of the refused string, in bytes.
+        actual: usize,
+    },
+    /// A character is not a lowercase hexadecimal digit.
+    #[error("a Wasm hash pin is lowercase hex; offset {offset} is not a lowercase hex digit")]
+    InvalidChar {
+        /// Zero-based byte offset of the first refused character.
+        offset: usize,
+    },
+}
+
+impl WasmHashPin {
+    /// Wraps the 32 bytes of a Wasm hash.
+    #[must_use]
+    pub const fn new(hash: [u8; 32]) -> Self {
+        Self(hash)
+    }
+
+    /// Returns the 32 bytes of the pinned hash.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Returns `true` when `hash` equals the pinned hash in all 32 bytes.
+    #[must_use]
+    pub fn matches(&self, hash: &[u8; 32]) -> bool {
+        self.0 == *hash
+    }
+
+    /// Returns the wire form: 64 lowercase hexadecimal characters.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        crate::hex::encode(&self.0)
+    }
+
+    /// Returns the first eight bytes as 16 lowercase hexadecimal characters,
+    /// for display fields whose name carries the `first8` label.
+    #[must_use]
+    pub fn first8_display(&self) -> String {
+        crate::hex::wasm_hash_first8_hex(&self.0)
+    }
+
+    /// Parses the wire form.
+    ///
+    /// # Errors
+    ///
+    /// [`WasmHashPinParseError::InvalidLength`] when `text` is not 64
+    /// characters, and [`WasmHashPinParseError::InvalidChar`] at the first
+    /// character that is not a lowercase hexadecimal digit.
+    pub fn parse(text: &str) -> Result<Self, WasmHashPinParseError> {
+        if text.len() != 64 {
+            return Err(WasmHashPinParseError::InvalidLength { actual: text.len() });
+        }
+        if let Some(offset) = text
+            .bytes()
+            .position(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(WasmHashPinParseError::InvalidChar { offset });
+        }
+        crate::hex::decode_hex32(text)
+            .map(Self)
+            .map_err(|_| WasmHashPinParseError::InvalidChar { offset: 0 })
+    }
+}
+
+impl From<[u8; 32]> for WasmHashPin {
+    fn from(hash: [u8; 32]) -> Self {
+        Self(hash)
+    }
+}
+
+impl TryFrom<&[u8]> for WasmHashPin {
+    type Error = WasmHashPinParseError;
+
+    /// Accepts exactly 32 bytes; any other length is refused with
+    /// [`WasmHashPinParseError::InvalidLength`] carrying twice the byte
+    /// length, the length of its hexadecimal form.
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        <[u8; 32]>::try_from(bytes)
+            .map(Self)
+            .map_err(|_| WasmHashPinParseError::InvalidLength {
+                actual: bytes.len().saturating_mul(2),
+            })
+    }
+}
+
+impl fmt::Display for WasmHashPin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+impl fmt::Debug for WasmHashPin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WasmHashPin({})", self.to_hex())
+    }
+}
+
+impl Serialize for WasmHashPin {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for WasmHashPin {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
 // ── ExecutableRefPin ──────────────────────────────────────────────────────────
 
 /// Install-time pin of a verifier or policy contract whose executable is a
@@ -158,12 +309,12 @@ impl fmt::Display for ContractKind {
 /// Such a contract runs the Wasm whose hash its owner stores under the
 /// owner's executable-tag entry, and the owner can repoint that entry at any
 /// time. The pin records which owner and tag the instance named at install
-/// time and which hash the tag resolved to, so the signing-time drift check
-/// can refuse when the owner repoints the tag, the instance names a different
-/// reference, or the executable is no longer a reference.
+/// time and the full hash the tag resolved to, so the signing-time drift
+/// check can refuse when the owner repoints the tag, the instance names a
+/// different reference, or the executable is not a reference.
 ///
-/// Carried by [`EventKind::SaContextRuleCreated`] and
-/// [`EventKind::SaContextRulePinsUpdated`] beside the first-8 hash lists, and
+/// Carried by [`EventKind::SaContextRuleCreatedV2`] and
+/// [`EventKind::SaContextRulePinsUpdatedV2`] beside the full hash lists, and
 /// by the rule-install JSON envelopes.
 ///
 /// # Rendering
@@ -186,13 +337,13 @@ pub struct ExecutableRefPin {
     /// ([`crate::sc_address::executable_tag_key_digest`]); identifies the
     /// owner and tag pair exactly.
     pub ref_key_hex: String,
-    /// First-8 hex of the Wasm hash the tag resolved to at install time.
-    pub resolved_hash_first8: String,
+    /// The full Wasm hash the tag resolved to at install time.
+    pub resolved_hash: WasmHashPin,
 }
 
 impl ExecutableRefPin {
     /// Builds the pin for the external reference `owner` / `tag` that
-    /// resolved to `resolved`.
+    /// resolved to `resolved`, keeping all 32 bytes of `resolved`.
     ///
     /// # Errors
     ///
@@ -210,6 +361,68 @@ impl ExecutableRefPin {
             ),
             tag: crate::observability::untrusted_display_bounded(tag.0.as_vec()),
             ref_key_hex: lower_hex(&ref_key),
+            resolved_hash: WasmHashPin::new(*resolved),
+        })
+    }
+
+    /// Returns `true` when every field has the shape [`Self::new`] produces:
+    /// a 64-character lower-case hex reference key, a tag within
+    /// [`crate::observability::UNTRUSTED_DISPLAY_MAX_BYTES`], and a redacted
+    /// owner at most as long as the placeholder. The resolved hash is a
+    /// [`WasmHashPin`], whose wire form deserialization already validates.
+    ///
+    /// Audit readers refuse a record holding a pin of any other shape.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        is_lower_hex(&self.ref_key_hex, 64)
+            && bounded_display_fields(&self.tag, &self.owner_redacted)
+    }
+}
+
+// ── ExecutableRefPinFirst8 ────────────────────────────────────────────────────
+
+/// The executable-reference pin of a version-1 pin row
+/// ([`EventKind::SaContextRuleCreated`] and
+/// [`EventKind::SaContextRulePinsUpdated`]), which recorded only the first
+/// eight bytes of the resolved hash.
+///
+/// The wallet reads such rows for inspection and never signs against them:
+/// the audit reader reports a record holding a hash as incomplete, and the
+/// signing check refuses it. Its serialization is the version-1 row's, byte
+/// for byte, so existing rows keep their chain digest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutableRefPinFirst8 {
+    /// Executable owner, redacted first-5-last-5.
+    pub owner_redacted: RedactedStrkey,
+    /// Owner-chosen tag, bounded for display.
+    pub tag: String,
+    /// Lower-case hex of the full SHA-256 digest of the owner's
+    /// executable-tag `LedgerKey` XDR.
+    pub ref_key_hex: String,
+    /// First eight bytes of the resolved hash, as 16 lower-case hex
+    /// characters.
+    pub resolved_hash_first8: String,
+}
+
+impl ExecutableRefPinFirst8 {
+    /// Builds the version-1 pin for the external reference `owner` / `tag`
+    /// that resolved to `resolved`, recording its first eight bytes. It
+    /// builds version-1 rows for compatibility fixtures.
+    ///
+    /// # Errors
+    ///
+    /// Returns the XDR encoder's error from
+    /// [`crate::sc_address::executable_tag_key_digest`].
+    pub fn new(
+        owner: &stellar_xdr::ScAddress,
+        tag: &stellar_xdr::ScString,
+        resolved: &[u8; 32],
+    ) -> Result<Self, stellar_xdr::Error> {
+        let full = ExecutableRefPin::new(owner, tag, resolved)?;
+        Ok(Self {
+            owner_redacted: full.owner_redacted,
+            tag: full.tag,
+            ref_key_hex: full.ref_key_hex,
             resolved_hash_first8: crate::hex::wasm_hash_first8_hex(resolved),
         })
     }
@@ -218,32 +431,31 @@ impl ExecutableRefPin {
     /// a 64-character and a 16-character lower-case hex string, a tag within
     /// [`crate::observability::UNTRUSTED_DISPLAY_MAX_BYTES`], and a redacted
     /// owner no longer than the placeholder.
-    ///
-    /// Audit readers refuse a record holding a pin of any other shape.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
-        fn is_lower_hex(s: &str, len: usize) -> bool {
-            s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        }
         is_lower_hex(&self.ref_key_hex, 64)
             && is_lower_hex(&self.resolved_hash_first8, 16)
-            && self.tag.len() <= crate::observability::UNTRUSTED_DISPLAY_MAX_BYTES
-            && self.owner_redacted.len() <= crate::sc_address::UNSUPPORTED_ADDRESS_PLACEHOLDER.len()
+            && bounded_display_fields(&self.tag, &self.owner_redacted)
     }
+}
+
+fn is_lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn bounded_display_fields(tag: &str, owner_redacted: &RedactedStrkey) -> bool {
+    tag.len() <= crate::observability::UNTRUSTED_DISPLAY_MAX_BYTES
+        && owner_redacted.len() <= crate::sc_address::UNSUPPORTED_ADDRESS_PLACEHOLDER.len()
 }
 
 /// Returns `refs` unchanged when at least one entry is a pin, or an empty
 /// list when every entry is `None`.
 ///
-/// An executable-reference list on a `SaContextRuleCreated` or
-/// `SaContextRulePinsUpdated` row or an install envelope is either aligned
-/// with its first-8 list or absent;
-/// recording an all-`None` list as empty keeps rules without an external
-/// reference in the shape older readers know.
+/// An executable-reference list on a pin row or an install envelope is
+/// either aligned with its hash list or empty; recording an all-`None` list
+/// as empty keeps rules without an external reference in the shortest form.
 #[must_use]
-pub fn executable_refs_or_empty(
-    refs: Vec<Option<ExecutableRefPin>>,
-) -> Vec<Option<ExecutableRefPin>> {
+pub fn executable_refs_or_empty<T>(refs: Vec<Option<T>>) -> Vec<Option<T>> {
     if refs.iter().all(Option::is_none) {
         Vec::new()
     } else {
@@ -260,9 +472,12 @@ fn lower_hex(bytes: &[u8]) -> String {
 /// The wallet mutation that changed a pinned rule's live verifier or policy
 /// set.
 ///
-/// Carried by [`EventKind::SaContextRulePinsUpdated`]. The pin record of a
-/// rule is the newest `SaContextRuleCreated` or `SaContextRulePinsUpdated`
-/// row for it; this reason records which wallet verb wrote the newer one.
+/// Carried by [`EventKind::SaContextRulePinsUpdatedV2`], the row the wallet
+/// writes, and by [`EventKind::SaContextRulePinsUpdated`]. The pin record of
+/// a rule is the newest `SaContextRuleCreatedV2`, `SaContextRulePinsUpdatedV2`,
+/// `SaContextRuleCreated` or `SaContextRulePinsUpdated` row for it, selected
+/// across both versions; a version 1 row that holds hashes is an incomplete
+/// record. This reason records which wallet verb wrote an update row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum PinsUpdateReason {
@@ -475,12 +690,36 @@ pub const RECORDED_STR_MAX: usize = 128;
 
 /// Truncates `s` to [`RECORDED_STR_MAX`] characters (char-boundary safe) for
 /// recording in an audit row.
-pub(super) fn bound_recorded_str(s: &str) -> String {
+pub fn bound_recorded_str(s: &str) -> String {
     if s.chars().count() <= RECORDED_STR_MAX {
         s.to_string()
     } else {
         s.chars().take(RECORDED_STR_MAX).collect()
     }
+}
+
+/// Maximum reset-reason length in Unicode characters. Even JSON-escaped
+/// control characters fit the audit row alongside the largest authorization,
+/// the retained count and the entry tag.
+pub const WINDOW_RESET_REASON_MAX: usize = 50;
+
+/// Bounds a reset reason before both signing and recording it.
+pub fn bound_window_reset_reason(reason: &str) -> String {
+    reason.chars().take(WINDOW_RESET_REASON_MAX).collect()
+}
+
+/// The pinned owner's authorization of a window-state reset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowResetAuthorization {
+    /// The first-five-last-five redaction of the pinned owner's G-strkey.
+    pub owner_redacted: RedactedStrkey,
+    /// SHA-256 of the store bytes read, in lowercase hex; `None` when absent.
+    pub store_sha256: Option<String>,
+    /// The store's challenge in the signed statement, as 64 lowercase hex
+    /// characters.
+    pub challenge: String,
+    /// Ed25519 signature over the reset digest, as 128 lowercase hex characters.
+    pub signature: String,
 }
 
 /// Authentication disposition of the store observed before a reset.
@@ -508,8 +747,17 @@ pub struct WipedAccrualRecord {
     pub truncated: bool,
     /// Trusted generation observed before recording.
     pub generation_before: Option<u64>,
-    /// Generation assigned to the empty replacement.
+    /// Generation assigned to the successor.
     pub generation_after: u64,
+    /// Authorization records the successor keeps because their approval can
+    /// still be presented. Absent from the row when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retained_authorizations: u32,
+}
+
+/// Whether a retained count is zero, so the row omits it.
+const fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Confirmed and pending live accrual for one window bucket.
@@ -532,6 +780,51 @@ pub struct WipedBucket {
     /// Saturating sum of pending amounts.
     #[serde(with = "i128_decimal_str")]
     pub pending_total: i128,
+}
+
+/// The contiguous evidence sequence numbers one
+/// [`EventKind::OperationEvidence`] row adds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceSeqRange {
+    /// The first added sequence number.
+    pub first: u64,
+    /// The last added sequence number, at least `first`.
+    pub last: u64,
+}
+
+/// One evidence row an [`EventKind::OperationEvidence`] row adds: its
+/// sequence number, its digest and the ledger its endpoint reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationEvidenceRow {
+    /// The row's evidence sequence number.
+    pub evidence_seq: u64,
+    /// The row's SHA-256 digest as lowercase hexadecimal.
+    pub digest: String,
+    /// The ledger the endpoint reported for the observation.
+    pub observed_ledger: u32,
+    /// The endpoint and answer kind, when the writer records them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<EvidenceKind>,
+}
+
+/// The endpoint and answer kind of recovery evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    /// The primary endpoint's transaction answer.
+    PrimaryOutcome,
+    /// The oracle's transaction answer.
+    OracleOutcome,
+    /// The primary endpoint's ledger answer.
+    PrimaryLedger,
+    /// The oracle's ledger answer.
+    OracleLedger,
+    /// The primary endpoint's account answer.
+    PrimaryAccount,
+    /// The oracle's account answer.
+    OracleAccount,
 }
 
 /// One leg of a value-moving action, in audit-wire form.
@@ -565,6 +858,70 @@ pub struct ValueLegRecord {
     /// leg has no destination. Never a full strkey.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination_redacted: Option<String>,
+    /// Lowercase hexadecimal SHA-256 of the complete payment destination's
+    /// UTF-8 bytes, which identifies an M address without recording it.
+    ///
+    /// Only [`ValueLegRecord::from_payment_leg`] sets it. A row written
+    /// without it reads as `None` and serializes without the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_sha256: Option<String>,
+}
+
+impl ValueLegRecord {
+    /// Builds the audit form of a payment leg with its destination hash.
+    ///
+    /// The action, amount, and asset come from `leg` as in the [`From`]
+    /// conversion. The redaction and the hash come from the complete
+    /// canonical destination: a G account, an M address, or the C recipient
+    /// of a contract payment.
+    ///
+    /// # Errors
+    ///
+    /// Returns `validation.address_invalid` when the leg has no destination
+    /// or its destination is not a canonical G account, M address, or C
+    /// contract.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::audit_log::ValueLegRecord;
+    /// use stellar_agent_core::policy::v1::value::{ActionKind, ValueLeg};
+    ///
+    /// let destination = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H";
+    /// let leg = ValueLeg {
+    ///     kind: ActionKind::Payment,
+    ///     amount: Some(10),
+    ///     asset: Some("native".to_owned()),
+    ///     destination: Some(destination.to_owned()),
+    /// };
+    /// let record = ValueLegRecord::from_payment_leg(&leg)?;
+    /// assert_eq!(record.destination_redacted.as_deref(), Some("GAAQC...QDZ7H"));
+    /// assert_eq!(record.destination_sha256.map(|hash| hash.len()), Some(64));
+    /// # Ok::<(), stellar_agent_core::WalletError>(())
+    /// ```
+    pub fn from_payment_leg(
+        leg: &crate::policy::v1::value::ValueLeg,
+    ) -> Result<ValueLegRecord, crate::error::WalletError> {
+        use sha2::Digest as _;
+        let destination = leg.destination.as_deref().ok_or_else(|| {
+            crate::error::ValidationError::address_argument("payment destination")
+        })?;
+        let canonical = match crate::payment_accounts::PaymentAccount::parse(destination) {
+            Ok(account) => account.canonical().to_owned(),
+            Err(_) if crate::sac_payment::is_canonical_contract(destination) => {
+                destination.to_owned()
+            }
+            Err(error) => return Err(error),
+        };
+        let canonical = canonical.as_str();
+        Ok(Self {
+            destination_redacted: Some(crate::observability::redact_strkey_first5_last5(canonical)),
+            destination_sha256: Some(crate::hex::encode(&sha2::Sha256::digest(
+                canonical.as_bytes(),
+            ))),
+            ..Self::from(leg)
+        })
+    }
 }
 
 impl From<&crate::policy::v1::value::ValueLeg> for ValueLegRecord {
@@ -577,6 +934,7 @@ impl From<&crate::policy::v1::value::ValueLeg> for ValueLegRecord {
                 .destination
                 .as_deref()
                 .map(crate::observability::redact_strkey_first5_last5),
+            destination_sha256: None,
         }
     }
 }
@@ -624,6 +982,44 @@ impl std::fmt::Display for KeyPurpose {
     }
 }
 
+// ── MainnetPresenceAudit ─────────────────────────────────────────────────────
+
+/// What a mainnet consent's WebAuthn ceremony proved, as an audit row
+/// records it.
+///
+/// Every value is a digest, a public policy fact, or a bit read from the
+/// signed authenticator data; the row carries no credential ID, public key,
+/// assertion byte, session bearer or proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MainnetPresenceAudit {
+    /// `sha256:` and the lowercase hex SHA-256 of
+    /// `b"stellar-agent-mainnet-approval-credential:v1" || lp(id) || key`.
+    pub credential_fingerprint: String,
+    /// The lowercase hex challenge, itself a SHA-256 digest of the consent.
+    pub challenge_sha256_hex: String,
+    /// The lowercase hex receipt digest the attestation binds: version 5 on
+    /// an envelope-text record, version 6 on an intent-digest record.
+    pub receipt_sha256_hex: String,
+    /// The lowercase hex BLAKE3 digest of the signed policy.
+    pub policy_digest_hex: String,
+    /// The signed policy sequence.
+    pub policy_sequence: i64,
+    /// The relying-party ID, `localhost`.
+    pub rp_id: String,
+    /// The origin the browser reported and the challenge bound.
+    pub webauthn_origin: String,
+    /// The UP bit of the signed authenticator data.
+    pub user_present: bool,
+    /// The UV bit of the signed authenticator data.
+    pub user_verified: bool,
+    /// The signature counter of the signed authenticator data, recorded as
+    /// an observation only.
+    pub sign_count: u32,
+    /// When the assertion was verified, in Unix milliseconds.
+    pub verified_at_unix_ms: u64,
+}
+
 // ── EventKind ────────────────────────────────────────────────────────────────
 
 /// All known audit-log event kinds.
@@ -646,8 +1042,8 @@ pub enum EventKind {
     /// The CLI `mpp state prune` command emits this before pruning.
     /// Transaction submissions, signed authorizations, approvals, and lifecycle
     /// changes use their dedicated event kinds at their emission sites.
-    /// MCP payment simulation can trigger reconciliation and settlement rows;
-    /// it produces no automatic `ToolInvocation` row.
+    /// MCP payment simulation can trigger reconciliation and accounting audit
+    /// delivery; it produces no automatic `ToolInvocation` row.
     ToolInvocation,
 
     /// A fail-closed executable policy plugin was invoked.
@@ -748,10 +1144,14 @@ pub enum EventKind {
         ledger: u32,
     },
 
-    /// Smart-account context-rule installation event.
+    /// Smart-account context-rule installation event, version 1.
     ///
-    /// Emitted by `ContextRuleManager::install_rule` after a successful on-chain
-    /// `add_context_rule` invocation.
+    /// Its pin lists hold the first eight bytes of each pinned hash. No
+    /// production code writes this row: rule install writes
+    /// [`EventKind::SaContextRuleCreatedV2`]. The reader reads it from
+    /// existing logs; a selected version-1 record that holds a hash is
+    /// incomplete and refuses signing. Its serialization is unchanged, so
+    /// existing rows keep their chain digest.
     ///
     /// # Schema additivity
     ///
@@ -827,16 +1227,78 @@ pub enum EventKind {
         /// as empty from rows without the field. A non-empty list has the
         /// length of the first-8 list; readers refuse any other length.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
         /// Executable-reference pins aligned by position with
         /// `pinned_policy_wasm_hashes_first8`, with the same shape and
         /// defaulting rules as `pinned_verifier_executable_refs`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
+    },
+
+    /// Smart-account context-rule installation event, carrying the rule's
+    /// pin record with full hashes.
+    ///
+    /// Emitted by `ContextRuleManager::install_rule` after a successful
+    /// on-chain `add_context_rule` invocation. The signing-time drift check
+    /// reads the newest pin row of either version for
+    /// `(rule_id, smart_account)` as the rule's pin record.
+    ///
+    /// # Field redaction
+    ///
+    /// `smart_account` is the C-strkey form, redacted first-5-last-5. The
+    /// pinned hashes are public on-chain code identifiers.
+    ///
+    /// # Required fields
+    ///
+    /// Every field except `valid_until` is required on the wire, empty lists
+    /// and `false` flags included: a row missing one fails deserialization.
+    SaContextRuleCreatedV2 {
+        /// Smart-account C-strkey, redacted first-5-last-5.
+        smart_account: String,
+        /// Public on-chain rule identifier.
+        rule_id: u32,
+        /// Stable label of the rule's `ContextRuleType` variant: `"default"`,
+        /// `"call_contract"` or `"create_contract"`.
+        context_type: String,
+        /// Number of signer entries the rule was installed with.
+        signers_count: u32,
+        /// Number of policy entries the rule was installed with.
+        policies_count: u32,
+        /// Optional ledger sequence at which the rule expires; absent for a
+        /// permanent rule.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        valid_until: Option<u32>,
+        /// Full hash of each pinned verifier, one entry per distinct
+        /// verifier address; for an external reference, the hash its tag
+        /// resolved to.
+        pinned_verifier_wasm_hashes: Vec<WasmHashPin>,
+        /// Full hash of each pinned policy, one entry per distinct policy
+        /// address.
+        pinned_policy_wasm_hashes: Vec<WasmHashPin>,
+        /// `true` if `--accept-mutable-verifier` admitted a pinned contract.
+        mutable_override: bool,
+        /// `true` if `--accept-unknown-verifier` admitted a pinned contract.
+        unknown_override: bool,
+        /// Executable-reference pins aligned by position with
+        /// `pinned_verifier_wasm_hashes`, `None` at a position pinned by its
+        /// Wasm hash; empty when no pinned verifier is an external reference.
+        /// Each pin's resolved hash equals the aligned hash; readers refuse
+        /// any other length or hash.
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        /// Executable-reference pins aligned by position with
+        /// `pinned_policy_wasm_hashes`, with the shape of
+        /// `pinned_verifier_executable_refs`.
         pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
     },
 
-    /// A pinned context rule's pin record, rewritten after a wallet mutation
-    /// changed the rule's live verifier or policy set.
+    /// A pinned context rule's pin record, version 1, rewritten after a
+    /// wallet mutation changed the rule's live verifier or policy set.
+    ///
+    /// Its pin lists hold the first eight bytes of each pinned hash. No
+    /// production code writes this row: the mutations write
+    /// [`EventKind::SaContextRulePinsUpdatedV2`]. The reader reads it from
+    /// existing logs; a selected version-1 record that holds a hash is
+    /// incomplete and refuses signing. Its serialization is unchanged.
     ///
     /// Written by `smart-account migrate-verifier` after each confirmed
     /// `add_signer` step, by `smart-account signers add` / `signers batch-add`
@@ -881,10 +1343,59 @@ pub enum EventKind {
         /// `pinned_verifier_wasm_hashes_first8`, with the shape and defaulting
         /// rules of the `SaContextRuleCreated` field of the same name.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
         /// Executable-reference pins aligned by position with
         /// `pinned_policy_wasm_hashes_first8`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
+        /// The wallet mutation that wrote this record.
+        reason: PinsUpdateReason,
+    },
+
+    /// A pinned context rule's pin record with full hashes, rewritten after
+    /// a wallet mutation changed the rule's live verifier or policy set.
+    ///
+    /// Written by `smart-account migrate-verifier` after each confirmed
+    /// removal of a pair, by `smart-account signers add` / `signers
+    /// batch-add` after an External signer is added, by `smart-account
+    /// rules add-policy` / `rules remove-policy` after a policy is attached
+    /// or detached, and by `smart-account signers refresh`, only when the
+    /// rule already has a complete pin record. The row carries the whole
+    /// record: both hash lists, their aligned executable-reference lists, the
+    /// override flags and the reason. The outer entry's `request_id`
+    /// correlates it with the mutation's other rows.
+    ///
+    /// # Field redaction
+    ///
+    /// `smart_account` is the C-strkey form, redacted first-5-last-5. The
+    /// pinned hashes are public on-chain code identifiers.
+    ///
+    /// # Required fields
+    ///
+    /// Every field is required on the wire, empty lists and `false` flags
+    /// included: a row missing one fails deserialization.
+    SaContextRulePinsUpdatedV2 {
+        /// Smart-account C-strkey, redacted first-5-last-5.
+        smart_account: String,
+        /// Public on-chain rule identifier.
+        rule_id: u32,
+        /// Full hash of each pinned verifier, one entry per distinct
+        /// verifier address.
+        pinned_verifier_wasm_hashes: Vec<WasmHashPin>,
+        /// Full hash of each pinned policy.
+        pinned_policy_wasm_hashes: Vec<WasmHashPin>,
+        /// `true` when any pin in the record was established under
+        /// `--accept-mutable-verifier`.
+        mutable_override: bool,
+        /// `true` when any pin in the record was established under
+        /// `--accept-unknown-verifier`.
+        unknown_override: bool,
+        /// Executable-reference pins aligned by position with
+        /// `pinned_verifier_wasm_hashes`, with the shape of the
+        /// `SaContextRuleCreatedV2` field of the same name.
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        /// Executable-reference pins aligned by position with
+        /// `pinned_policy_wasm_hashes`.
         pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
         /// The wallet mutation that wrote this record.
         reason: PinsUpdateReason,
@@ -979,9 +1490,11 @@ pub enum EventKind {
 
     /// Passkey registration event.
     ///
-    /// Emitted by `CredentialsManager::add_passkey` when a WebAuthn registration
-    /// ceremony completes (status `registered`) or is attempted but fails
-    /// (status `timeout`, `user_canceled`, `entry_missing`).
+    /// Emitted by the `CredentialsManager` registration steps: when the
+    /// operator confirms a verified WebAuthn registration (status
+    /// `registered`), and when a registration is attempted but ends without
+    /// one (every other status). The `registered` row precedes the registry
+    /// write: when it cannot be written, nothing is registered.
     ///
     /// # Redaction
     ///
@@ -1015,13 +1528,24 @@ pub enum EventKind {
         rp_id: String,
 
         /// Registration outcome. One of `"registered"`, `"timeout"`,
-        /// `"user_canceled"`, or `"entry_missing"`.
+        /// `"user_canceled"`, `"entry_missing"`, `"confirmation_mismatch"`,
+        /// `"confirmation_expired"`, `"confirmation_canceled"`, or
+        /// `"registry_write_failed"`.
         ///
-        /// - `"registered"` — ceremony completed; credential stored in registry.
+        /// - `"registered"`: the operator typed the code the registration
+        ///   page shows; written before the credential goes into the registry.
         /// - `"timeout"` — polling deadline elapsed before completion.
         /// - `"user_canceled"` — store entry has unexpected kind (bridge-side abort).
         /// - `"entry_missing"` — nonce not found in store (TTL-expired or never
         ///   persisted); distinct from a user-driven cancellation.
+        /// - `"confirmation_mismatch"`: the typed code is not the page's code
+        ///   for the recorded credential; nothing was registered.
+        /// - `"confirmation_expired"`: the deadline passed before a code was
+        ///   typed or confirmed; nothing was registered.
+        /// - `"confirmation_canceled"`: the prompt ended without a code;
+        ///   nothing was registered.
+        /// - `"registry_write_failed"`: the `registered` row was written but
+        ///   the registry write failed; the credential is not in the registry.
         status: String,
     },
 
@@ -1109,6 +1633,8 @@ pub enum EventKind {
         ///   disagreed, the baseline was missing, or the audit-log integrity check
         ///   failed (`CredentialsError::SignerSetDivergence`).  The browser window
         ///   is never opened on this path.
+        /// - `"failure:verifier_status_refused"`: the pinned verifier is revoked
+        ///   or retired; no bridge request or drift row occurs.
         /// - `"failure:verifier_hash_drift"` — the pre-signing verifier wasm-hash
         ///   drift check detected that the live on-chain wasm hash differs from the
         ///   verifier hash pinned at rule-install time
@@ -1557,12 +2083,13 @@ pub enum EventKind {
         /// First-8 hex chars of the wasm hash pinned at rule-install time.
         pinned_hash_first8: String,
         /// First-8 hex chars of the effective hash observed via two-RPC
-        /// re-fetch: the Wasm hash, the hash an external reference resolved
-        /// to, or the zero hash for no code or an unresolved reference.
+        /// re-fetch: the Wasm hash or the hash an external reference
+        /// resolved to; `none` for no Wasm code or an unresolved reference, which
+        /// have no hash.
         observed_hash_first8: String,
         /// Bounded summary of the observed executable: `wasm`, `no code`, or
         /// `external reference owner <redacted> tag "<bounded>" resolved
-        /// <first-8 or unset>`.
+        /// <full hash or unset>`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         observed_executable: Option<String>,
     },
@@ -1758,6 +2285,14 @@ pub enum EventKind {
         /// Renaming or moving the archive file after rotation will cause
         /// `audit verify` to report `RotationGap`.
         next_file_name: String,
+        /// Entry tags are in force when this handoff is written; every later
+        /// file carries them.
+        ///
+        /// Absent when false, so a handoff written while tags are not in force
+        /// serializes as it always has. The flag sits inside the hashed body,
+        /// so removing it breaks the chain.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        entry_tags: bool,
     },
 
     /// Verifier wasm hash on a context rule was migrated from one hash to
@@ -2633,8 +3168,13 @@ pub enum EventKind {
         envelope_sha256_hex: Option<String>,
         /// First 8 characters of the approval nonce.
         nonce_prefix: String,
-        /// Which origin attested the entry: `"cli"` or `"serve"`.
+        /// Which origin attested the entry: `"cli"`, `"serve"`,
+        /// `"serve-remote"`, or `"cli-mainnet-confirm"`.
         origin: String,
+        /// The verified WebAuthn ceremony of a mainnet consent; absent for
+        /// every other approval.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mainnet_presence: Option<MainnetPresenceAudit>,
     },
 
     /// A pending approval was rejected by the operator.
@@ -2656,6 +3196,19 @@ pub enum EventKind {
         nonce_prefix: String,
         /// Which origin rejected the entry: `"cli"` or `"serve"`.
         origin: String,
+    },
+
+    /// An existing durable approval is revoked through an authenticated surface.
+    ApprovalRevoked {
+        /// The durable approval's kind.
+        approval_kind: String,
+        /// The first eight characters of the approval nonce.
+        nonce_prefix: String,
+        /// The deciding surface: `cli`, `serve`, or `serve-remote`.
+        origin: String,
+        /// The signed-origin credential's pseudonym; local rows omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operator_credential_id_redacted: Option<String>,
     },
 
     /// A pending approval was attested (approved) by an operator
@@ -2726,28 +3279,26 @@ pub enum EventKind {
         operator_credential_id_redacted: String,
     },
 
-    /// A value-moving action was CONFIRMED on-chain.
+    /// Records a reported on-chain confirmation.
     ///
-    /// Emitted after a successful submit-and-confirm on an allow-path value
-    /// verb (classic pay / create-account / claim / trustline, and the DeFi
-    /// trade / lend / vault adapters). The `legs` are the SAME descriptor the
-    /// policy gate sized — the single-derivation invariant, never a second
-    /// derivation. The verb identity, chain id, policy decision, and request id
-    /// ride on the OUTER [`AuditEntry`](super::entry::AuditEntry) fields, as
-    /// with every other row.
+    /// The wallet's submit and reconciliation paths write no such row: a
+    /// reported success is recorded on the receipt, and the pending row
+    /// stands. Readers accept this row in retained logs. The `legs` are the
+    /// SAME descriptor the policy gate sized: the single-derivation
+    /// invariant, never a second derivation. The verb identity, chain id,
+    /// policy decision, and request id ride on the OUTER
+    /// [`AuditEntry`](super::entry::AuditEntry) fields, as with every other
+    /// row.
     ///
-    /// # Sized vs opaque submits
+    /// # Sized vs opaque rows
     ///
-    /// A sized submit (classic pay/create/claim/trustline, DeFi trade/lend/vault
-    /// under a value-sizing policy engine) carries non-empty `legs` and
-    /// `opaque_reason: None`. An opaque submit — a raw sign-and-submit the
-    /// policy could not size (e.g. `stellar_sep43_sign_and_submit_transaction`)
-    /// — carries empty `legs` and `opaque_reason: Some(reason)`; the outer
-    /// entry's `envelope_hash` identifies what was submitted. Empty `legs` with
-    /// `opaque_reason: None` records an allow from an engine that sizes no
-    /// value (the no-op engine returns no descriptor). Non-empty `legs` is
-    /// valid ONLY with `opaque_reason: None`: legs are never fabricated for an
-    /// envelope the policy could not size.
+    /// A sized row carries non-empty `legs` and `opaque_reason: None`; an
+    /// opaque row carries empty `legs` and `opaque_reason: Some(reason)`, and
+    /// the outer entry's `envelope_hash` identifies what was submitted. Empty
+    /// `legs` with `opaque_reason: None` records an allow from an engine that
+    /// sizes no value (the no-op engine returns no descriptor). Non-empty
+    /// `legs` is valid ONLY with `opaque_reason: None`: legs are never
+    /// fabricated for an envelope the policy could not size.
     ///
     /// # Field redaction
     ///
@@ -2788,11 +3339,10 @@ pub enum EventKind {
     /// A signed value-moving transaction was recorded before it was sent.
     ///
     /// Written immediately before `sendTransaction`, so the log holds the
-    /// intent whatever happens to the send. The row stands until a
-    /// [`Self::ValueActionSubmitted`] or [`Self::ValueActionFailed`] row
-    /// records the outcome; a row that stands alone is a submission whose
-    /// outcome is not known, resolved by reconciling `transaction_hash_redacted`
-    /// against the chain.
+    /// intent whatever happens to the send. No endpoint answer closes the
+    /// row: a sent submission's row stands, and reconciling
+    /// `transaction_hash_redacted` against the chain records a reported
+    /// success on the receipt.
     ///
     /// A pending row can also describe an attempt the recorder refused before
     /// the send. A [`Self::ValueActionFailed`] row under the refusal's code
@@ -2836,20 +3386,27 @@ pub enum EventKind {
         source_redacted: String,
         /// The sequence number the transaction consumes.
         sequence: i64,
+        /// Optional. The BLAKE3 digest of the verified policy that decided
+        /// the submission, as 64 lowercase hex characters. Absent when the
+        /// row records no policy provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_digest: Option<String>,
+        /// Optional. The zero-based document position of the deciding rule.
+        /// Absent when the row records no policy provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_index: Option<u32>,
     },
 
-    /// A recorded value-moving submission that moved no value: refused before
-    /// or at the send, or failed on-chain.
+    /// A recorded value-moving submission that never left the wallet.
     ///
-    /// Written where a [`Self::ValueActionPending`] row's submission reached
-    /// a definitive negative answer: the send step refused the bytes, the
-    /// poll reported the transaction applied and failed, or reconciliation
-    /// released the submission's reservation on chain evidence that the
-    /// transaction can no longer apply, in which case `code` names that
-    /// evidence. It also closes the pending row of a submission the recorder
-    /// refused before the send, under the refusal's code. A spending-window
-    /// reservation the submission took is released best-effort; one left
-    /// standing remains until reconciliation or an operator settles it.
+    /// Closes the [`Self::ValueActionPending`] row of a submission the
+    /// recorder refused before the send, under the refusal's code, and of a
+    /// pool attempt that was never transmitted. No endpoint answer writes it:
+    /// a refused send, a reported failure and a missing transaction keep the
+    /// pending row and the reservation. The local pre-send cleanup releases
+    /// the reservation the submission took best-effort. One left standing
+    /// with an execution bound counts through its accounting horizon, and an
+    /// operator clear releases one without an execution bound.
     ///
     /// # Field redaction
     ///
@@ -2875,20 +3432,143 @@ pub enum EventKind {
         code: String,
     },
 
-    /// An operator acknowledged a submission and released its hold on the
-    /// spending window.
+    /// An authenticated accounting decision expired a reservation's
+    /// conservative accounting horizon.
+    ///
+    /// The event records accounting expiry, never transaction failure: the
+    /// chain outcome stays unknown. The spending window commits the
+    /// disposition and this event's obligation in one authenticated
+    /// successor, and delivery appends at most one event per `decision_id`
+    /// in the verified retained history. Receipt contents never produce it.
+    ///
+    /// The outer [`AuditEntry`](super::entry::AuditEntry) carries the
+    /// authenticated chain and, in `envelope_hash`, the reservation
+    /// identifier.
+    ///
+    /// # Field redaction
+    ///
+    /// - `transaction_hash_redacted`: first-8-last-8.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    SubmissionAccountingExpired {
+        /// The authenticated decision identifier: lowercase hexadecimal
+        /// SHA-256 over the canonical chain, passphrase hash, reservation,
+        /// committing generation and disposition.
+        decision_id: String,
+        /// The spending-window generation that committed the expiry.
+        generation: u64,
+        /// Transaction hash, redacted first-8-last-8.
+        transaction_hash_redacted: String,
+        /// The checked local expiry time, in unix milliseconds.
+        observed_at_ms: u64,
+        /// The greatest affected accounting horizon, in unix milliseconds.
+        accounting_until_ms: u64,
+        /// Always `"submission.accounting_expired"`.
+        code: String,
+        /// Always `"unknown"`.
+        chain_outcome: String,
+    },
+
+    /// A mainnet operation committed a state step or its exposure.
+    ///
+    /// The operation store appends this row before it commits the step. The
+    /// row names the operation, the attempt, the state left, the step taken
+    /// and the commit identifier the record retains, so a verifier matches
+    /// the row against the retained transition. A step whose commit fails
+    /// leaves a row without a retained commit identifier. The outer
+    /// [`AuditEntry`](super::entry::AuditEntry) carries `request_id`.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    OperationTransition {
+        /// The operation identifier: 16 bytes as lowercase hexadecimal.
+        operation_id: String,
+        /// The attempt the step belongs to, starting at 1; absent for a
+        /// step before the first attempt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_index: Option<u32>,
+        /// The state the operation left; absent for its creation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_state: Option<String>,
+        /// The state the operation entered, or `"expose"` for the commit
+        /// that establishes an attempt's exposure.
+        step: String,
+        /// The commit identifier: 16 random bytes as lowercase hexadecimal.
+        commit_id: String,
+        /// The SHA-256 of the ordered endpoint answers that decide a
+        /// recovery transition, as lowercase hexadecimal; absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence_digest: Option<String>,
+        /// The primary endpoint's deciding ledger, with a recovery decision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        primary_ledger: Option<u32>,
+        /// The oracle's deciding ledger, with a recovery decision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        witness_ledger: Option<u32>,
+        /// The receipt release code the decision projects, such as
+        /// `accounting.released_on_evidence` for non-inclusion.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        release_code: Option<String>,
+    },
+
+    /// A mainnet operation committed recovery evidence or its first
+    /// sequence release.
+    ///
+    /// The operation store appends one row per commit that adds evidence
+    /// rows or first records a sequence release, before it commits. Each
+    /// added row takes its own sequence number; `evidence_seqs` names the
+    /// contiguous range the commit adds, or is `null` for a release without
+    /// new rows. The row carries digests and ledger numbers only, never an
+    /// endpoint URL or a secret. The outer
+    /// [`AuditEntry`](super::entry::AuditEntry) carries `request_id`.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    OperationEvidence {
+        /// The operation identifier: 16 bytes as lowercase hexadecimal.
+        operation_id: String,
+        /// The attempt the evidence belongs to, starting at 1.
+        attempt_index: u32,
+        /// The evidence sequence numbers the commit adds, or `null`.
+        evidence_seqs: Option<EvidenceSeqRange>,
+        /// The digest and observed ledger of each added row, in sequence
+        /// order.
+        rows: Vec<OperationEvidenceRow>,
+        /// Whether the commit records the attempt's first sequence release.
+        sequence_released: bool,
+        /// The primary endpoint's release ledger, with a release.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        primary_ledger: Option<u32>,
+        /// The witness endpoint's release ledger, with a release.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        witness_ledger: Option<u32>,
+        /// The release's minimum close time in Unix milliseconds, with a
+        /// release.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_close_time_ms: Option<u64>,
+        /// The commit identifier: 16 random bytes as lowercase hexadecimal.
+        commit_id: String,
+    },
+
+    /// An operator acknowledges a submission and clears its receipt.
     ///
     /// Written by `tx receipt clear --acknowledge` after the command has
     /// reconciled the submission against the chain. The row names the state
     /// the receipt was left in, so the log records what the operator
-    /// acknowledged rather than only that they acknowledged something, and
-    /// it names the chain evidence when reconciliation released the
-    /// reservation on evidence. A row without `evidence` records an outcome
-    /// that is unknown.
+    /// acknowledged rather than only that they acknowledged something. It
+    /// names, as `evidence`, the accounting disposition the window bears out
+    /// or the endpoint's unrecorded answer under an untimed hold; neither is a
+    /// chain outcome. A row without `evidence` records an outcome that is
+    /// unknown.
     ///
     /// The row is not a settlement: a cleared receipt owes no
-    /// `value_action_*` row. When reconciliation released the reservation on
-    /// evidence, the settled `value_action_failed` row precedes this one.
+    /// `value_action_*` row. The clear row records the operator's
+    /// acknowledgement before capacity changes. Accounting expiry has a
+    /// separate event whose chain outcome remains unknown.
     ///
     /// # Field redaction
     ///
@@ -2898,22 +3578,31 @@ pub enum EventKind {
     ///
     /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
     /// `evidence` is absent from a row that carries none, so such a row keeps
-    /// its serialized form.
+    /// its serialized form. `unbounded_exposure` is absent when false, so a
+    /// row without it keeps its serialized form.
     SubmissionReceiptCleared {
         /// Transaction hash of the cleared submission, redacted first-8-last-8.
         transaction_hash_redacted: String,
-        /// The receipt status the clear replaced, as its stable wire tag
-        /// (`"pending"` or `"ambiguous"`).
+        /// The receipt status the clear replaced, as its stable wire tag:
+        /// `"pending"` or `"ambiguous"`, and under an untimed hold also
+        /// `"success"`, `"failed"` or `"reorged"`.
         cleared_from: String,
-        /// True when the command finds a held reservation at its start or
-        /// after its reconciliation, and releases it through reconciliation
-        /// or the clear. False when no reservation is held while it runs.
-        /// An evidence release is recorded in `evidence`.
+        /// True when the clear releases a held reservation: an untimed hold
+        /// the operator's decision releases, or one this run's reconciliation
+        /// ended. False when no reservation is held while it runs, and for a
+        /// bounded hold, which keeps counting until its accounting horizon.
         reservation_released: bool,
-        /// The wire code of the chain evidence on which reconciliation
-        /// released the reservation (`"submission.sequence_consumed"` or
-        /// `"submission.time_bound_passed"`); absent when the outcome is
-        /// unknown and in older rows.
+        /// True when the operator acknowledges that untimed bytes can still apply
+        /// after their spend stops counting against the window.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unbounded_exposure: bool,
+        /// The wire code of the accounting disposition the receipt carries
+        /// (`"submission.sequence_consumed"`, `"submission.time_bound_passed"`
+        /// or `"submission.accounting_expired"`), or, under an untimed hold
+        /// whose receipt keeps its recorded network answer, of the endpoint's
+        /// current answer (`"submission.reported_success"` or
+        /// `"submission.retention_expired"`); absent otherwise and in older
+        /// rows. Neither establishes a chain outcome.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence: Option<String>,
     },
@@ -2940,6 +3629,11 @@ pub enum EventKind {
         /// Independent oracle witness, when a comparison is required.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         witness: Option<CrossCheckRecord>,
+        /// The last ledger at which the signed authorization is valid on
+        /// chain: the host accepts it through this ledger and refuses it
+        /// after. Absent in rows that do not record it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature_expiration_ledger: Option<u32>,
         /// The value legs the policy gate sized for this authorization. Each
         /// leg's `destination_redacted` identifies the redacted `pay_to`
         /// recipient; the leg `asset` is the SAC token contract (a non-secret
@@ -2954,15 +3648,32 @@ pub enum EventKind {
         /// constant identifying how the host settles, facilitator-supplied and
         /// bounded to [`RECORDED_STR_MAX`] characters at construction.
         scheme: String,
+        /// Optional. The BLAKE3 digest of the verified policy that decided
+        /// the authorization, as 64 lowercase hex characters. Absent when the
+        /// row records no policy provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_digest: Option<String>,
+        /// Optional. The signed sequence of that policy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_sequence: Option<i64>,
+        /// Optional. The zero-based document position of the deciding rule.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_index: Option<u32>,
+        /// Optional. The evaluation instant in Unix milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evaluated_at_ms: Option<u64>,
     },
 
     /// An x402 payment whose `x402_payment_authorized` row was written did not
     /// return a payment signature to the caller.
     ///
-    /// Paired with that row by the outer `request_id`. At every stage but
-    /// `anchor_unavailable`, the signed authorization reached, or may have
-    /// reached, the configured RPC in the re-simulation. `failure_stage` is one
-    /// of a closed set:
+    /// Paired with that row by the outer `request_id`. The signed authorization
+    /// reached, or may have reached, the configured RPC in the re-simulation at
+    /// the `resimulation`, `encoding`, `payload_release`, and `terminal_approval`
+    /// stages, and at `response_processing` when the RPC answered. It never left
+    /// the wallet at `anchor_unavailable`, nor at `response_processing` when the
+    /// mainnet payment intent could not be consumed. `failure_stage` is one of a
+    /// closed set:
     ///
     /// - `anchor_unavailable`: the tip anchor could not be written after the
     ///   authorized row, so the signed authorization never left the wallet. The
@@ -2970,9 +3681,15 @@ pub enum EventKind {
     /// - `resimulation`: the signed re-simulation request failed in transport,
     ///   or the RPC answered it with an error or with no resource data.
     /// - `response_processing`: the RPC answered, and the payload could not be
-    ///   built from the answer.
+    ///   built from the answer; or, on mainnet, the payment intent could not be
+    ///   consumed after the transmit gate, before the signed re-simulation
+    ///   request was sent.
     /// - `encoding`: the payload was built, and it could not be encoded as the
     ///   `PAYMENT-SIGNATURE` header value.
+    /// - `payload_release`: the payload was built under a mainnet authorization,
+    ///   and the release consumption of its child authorization was refused.
+    /// - `terminal_approval`: the child authorization was consumed, and the
+    ///   mainnet pending approval could not be tombstoned.
     ///
     /// This variant intentionally has NO field named `request_id` or `tool`
     /// (the outer [`AuditEntry`](super::entry::AuditEntry) owns those). A binary
@@ -2996,9 +3713,8 @@ pub enum EventKind {
     ///
     /// Emitted at the point the signature is produced and about to be
     /// returned; the caller broadcasts externally, so the wallet never
-    /// observes a submit. Records only non-secret identifiers — a redacted
-    /// digest of the signed payload and the redacted signer address — never
-    /// the signature or the payload itself.
+    /// observes a submit. Records the redacted payload digest, redacted signer,
+    /// and optional evaluated legs. It never records the signature or payload.
     ///
     /// This variant intentionally has NO field named `request_id` or `tool`
     /// (the outer [`AuditEntry`](super::entry::AuditEntry) owns those).
@@ -3013,6 +3729,9 @@ pub enum EventKind {
         /// First-5-last-5 redacted signer address the signature was produced
         /// with.
         signer_redacted: RedactedStrkey,
+        /// Evaluated value legs in signed operation order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        legs: Vec<ValueLegRecord>,
     },
 
     /// A sponsored MPP charge credential passed every delivery gate.
@@ -3106,17 +3825,55 @@ pub enum EventKind {
         public_address: Option<RedactedStrkey>,
     },
 
+    /// `profile enroll-signer` or `profile bind-signer` recorded the enrolled
+    /// signer's identity record beside its seed.
+    ///
+    /// Emitted after the identity record write succeeds: on enrollment, on
+    /// `--repair-identity`, and when `bind-signer` writes the owner binding
+    /// (tool `profile_bind_signer`). Records the coordinate of the identity record, the
+    /// redacted public address it names, and its role, never the seed or any
+    /// key material.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    SignerIdentityEnrolled {
+        /// Keyring service the identity record was written under.
+        keyring_service: String,
+        /// Keyring entry the identity record was written under.
+        keyring_entry: String,
+        /// Redacted first-5-last-5 strkey of the enrolled public key.
+        public_address: RedactedStrkey,
+        /// The enrolled role, `agent`.
+        role: String,
+    },
+
     /// `profile reset-window-state` records the accrual before mutating the
     /// store, while holding the audit writer and the window lock.
     PolicyWindowStateReset {
         /// The profile whose window-state store was reset.
         profile: String,
         /// Operator-supplied reason for the reset (bounded to
-        /// [`RECORDED_STR_MAX`] characters at construction).
+        /// [`WINDOW_RESET_REASON_MAX`] characters at construction).
         reason: String,
         /// Snapshot recorded before mutation; absent in older rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wiped: Option<WipedAccrualRecord>,
+        /// The pinned owner's signature over this reset, when supplied.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_authorization: Option<WindowResetAuthorization>,
+    },
+
+    /// An installation binding was authorized before the nonce was written.
+    MainnetEnablementMinted {
+        /// The profile enabled by the ceremony.
+        profile: String,
+        /// The normalized RPC endpoint host.
+        endpoint_host: String,
+        /// SHA-256 of the installation nonce, in lowercase hex.
+        installation_nonce_sha256: String,
+        /// Whether the ceremony replaces an existing nonce.
+        rotated: bool,
     },
 
     /// Verified MPP history was selected for generation anchoring. The row
@@ -3128,12 +3885,20 @@ pub enum EventKind {
         generation: u64,
     },
 
-    /// An acknowledged MPP history reset was requested under the store lock.
+    /// An acknowledged MPP state reset was requested under the store lock.
     MppStateReset {
-        /// Profile whose replay markers are discarded.
+        /// Profile whose MPP state is reset.
         profile: String,
         /// Trusted generation discarded, or null for an absent/unparseable counter.
         discarded_generation: Option<u64>,
+        /// Generation of the authenticated snapshot the reset carries; absent
+        /// when no snapshot authenticates and the reset discards the history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        carried_generation: Option<u64>,
+        /// Whether the committed counter proves the carried snapshot older than
+        /// the last committed one; absent when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stale_carry: bool,
         /// Bounded operator reason.
         reason: String,
     },
@@ -3198,6 +3963,70 @@ pub enum EventKind {
         /// repair. `None` for adoption, which does not touch the counter.
         reanchor_count: Option<u64>,
     },
+    /// The operator records the carrier identities and starts a new outbox
+    /// generation with `audit bind-carriers`.
+    AuditCarriersBound {
+        /// The outbox generation the binding starts.
+        generation: u64,
+        /// The outbox generation the binding retires.
+        previous_generation: u64,
+        /// Committed operator rows carried into the new generation.
+        carried_rows: u64,
+        /// File name the previous outbox is retired to, `None` when the log
+        /// had no outbox file.
+        retired_file: Option<String>,
+    },
+    /// The operator acknowledges lost queued operator rows after the decided
+    /// approvals are removed from the approval inbox and the toolset grants
+    /// are revoked.
+    AuditOutboxLossAcknowledged {
+        /// Number of rows committed in the keyring.
+        expected_rows: u64,
+        /// Number of complete lines found in the outbox.
+        found_rows: u64,
+        /// Bounded operator-supplied reason.
+        reason: String,
+        /// Decided approvals removed from the approval inbox before this row.
+        revoked_approvals: usize,
+        /// Toolset grants revoked before this row.
+        revoked_grants: usize,
+    },
+    /// The audit log's entry-tag boundary: from this row on, every entry
+    /// carries a keyed entry tag.
+    ///
+    /// Appended and tagged by the first acquisition of a writer that holds
+    /// both the audit key and a tip-anchor store. Its tag covers every entry
+    /// before it, through its chain hash. Every keyed writer and the keyed
+    /// `audit verify` then require a valid tag on every later entry.
+    AuditEntryTagsStarted {
+        /// Entry count of the stored anchor the acquisition found, or zero
+        /// when it adopted the log.
+        anchored_count: u64,
+        /// Entries past that anchor the acquisition took in without tags:
+        /// the tail it absorbed, the file a completed rotation left, or the
+        /// whole adopted file.
+        absorbed_count: u64,
+    },
+    /// Entry tags continue under a new key from this row on.
+    ///
+    /// Tagged under the new key, and its tag covers every entry before it.
+    /// `audit verify` requires every later entry to carry a tag under that
+    /// key.
+    AuditEntryTagsRekeyed {
+        /// Why the key changed.
+        cause: EntryTagsRekeyCause,
+    },
+    /// The operator acknowledged the entries directly before this row in its
+    /// file, which carry no valid entry tag, and kept them as quarantined.
+    ///
+    /// Written by `audit reanchor --acknowledge-unauthenticated-tail`. Readers
+    /// skip the quarantined entries, and `audit verify` accepts them under
+    /// this row's valid tag.
+    AuditEntriesQuarantined {
+        /// Number of entries directly before this row in its file that it
+        /// covers.
+        quarantined_count: u64,
+    },
 }
 
 /// Total number of [`EventKind`] variants.
@@ -3220,7 +4049,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 72;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 84;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3237,6 +4066,19 @@ pub enum TipAnchorReason {
     /// a profile whose audit log path or audit key differs from the binding
     /// recorded in the keyring.
     BindingChanged,
+}
+
+/// Why an [`EventKind::AuditEntryTagsRekeyed`] row was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum EntryTagsRekeyCause {
+    /// `profile rotate-audit-key` switched the writer to the new audit key.
+    Rotation,
+    /// A keyed open found entries after the newest valid keyed start whose
+    /// tags do not verify under the current key, for example after a key
+    /// rotation stopped between persisting the new key and writing its row.
+    OpenRepair,
 }
 
 impl std::fmt::Display for TipAnchorReason {
@@ -3256,6 +4098,121 @@ impl std::fmt::Display for TipAnchorReason {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, reason = "test-only")]
     use super::*;
+
+    /// A transition row without a recovery decision keeps its stored bytes,
+    /// and the decision fields serialize after `commit_id` and round-trip.
+    #[test]
+    fn transition_row_fields_are_additive() {
+        use sha2::{Digest, Sha256};
+        let old = br#"{"kind":"operation_transition","operation_id":"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a","attempt_index":1,"from_state":"authorized","step":"sending","commit_id":"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"}"#;
+        let kind: EventKind = serde_json::from_slice(old).unwrap();
+        let EventKind::OperationTransition {
+            evidence_digest,
+            primary_ledger,
+            witness_ledger,
+            release_code,
+            ..
+        } = &kind
+        else {
+            panic!("an operation transition row: {kind:?}");
+        };
+        assert_eq!(
+            (
+                evidence_digest,
+                primary_ledger,
+                witness_ledger,
+                release_code
+            ),
+            (&None, &None, &None, &None)
+        );
+        let encoded = serde_json::to_vec(&kind).unwrap();
+        assert_eq!(encoded, old);
+        assert_eq!(Sha256::digest(&encoded), Sha256::digest(old));
+
+        let decided = crate::audit_log::AuditEntry::new_operation_transition(
+            "pay",
+            "stellar:pubnet",
+            "0a".repeat(16),
+            Some(1),
+            Some("sent_outcome_unknown".to_owned()),
+            "not_included",
+            "0c".repeat(16),
+            "request-1",
+        )
+        .with_recovery_decision(
+            "0d".repeat(32),
+            (120, 121),
+            Some("accounting.released_on_evidence"),
+        );
+        assert_eq!(decided.request_id, "request-1");
+        let json = serde_json::to_string(&decided.event_kind).unwrap();
+        let tail = format!(
+            r#""commit_id":"{}","evidence_digest":"{}","primary_ledger":120,"witness_ledger":121,"release_code":"accounting.released_on_evidence"}}"#,
+            "0c".repeat(16),
+            "0d".repeat(32)
+        );
+        assert!(json.ends_with(&tail), "{json}");
+        assert!(!json.contains("request"), "{json}");
+        assert!(!json.contains("http"), "{json}");
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, decided.event_kind);
+
+        let untouched = crate::audit_log::AuditEntry::new_operation_evidence(
+            "pay",
+            "stellar:pubnet",
+            "0a".repeat(16),
+            1,
+            Vec::new(),
+            None,
+            "0c".repeat(16),
+            "request-1",
+        );
+        let before = serde_json::to_vec(&untouched.event_kind).unwrap();
+        let after = untouched.with_recovery_decision("0d".repeat(32), (1, 2), None);
+        assert_eq!(serde_json::to_vec(&after.event_kind).unwrap(), before);
+    }
+
+    #[test]
+    fn evidence_row_kind_is_optional_and_old_rows_keep_their_bytes() {
+        use sha2::{Digest, Sha256};
+        let bytes = br#"{"evidence_seq":1,"digest":"abcd","observed_ledger":42}"#;
+        let row: OperationEvidenceRow = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(row.kind, None);
+        let encoded = serde_json::to_vec(&row).unwrap();
+        assert_eq!(encoded, bytes);
+        assert_eq!(Sha256::digest(&encoded), Sha256::digest(bytes));
+        let row = OperationEvidenceRow {
+            kind: Some(EvidenceKind::PrimaryLedger),
+            ..row
+        };
+        assert_eq!(
+            serde_json::to_value(&row).unwrap()["kind"],
+            "primary_ledger"
+        );
+        assert_eq!(
+            serde_json::from_slice::<OperationEvidenceRow>(&serde_json::to_vec(&row).unwrap())
+                .unwrap(),
+            row
+        );
+    }
+
+    /// A stored decimal that fails its parse is named by the rule alone.
+    #[test]
+    fn invalid_decimals_stay_out_of_the_error() {
+        let value = serde_json::Value::String("credmarker7".to_owned());
+        assert_eq!(
+            i128_decimal_str::deserialize(value.clone())
+                .unwrap_err()
+                .to_string(),
+            "invalid decimal i128"
+        );
+        assert_eq!(
+            i128_decimal_str_opt::deserialize(value)
+                .unwrap_err()
+                .to_string(),
+            "invalid decimal i128"
+        );
+    }
 
     // ── TipAnchorReason ──────────────────────────────────────────────────────
 
@@ -3364,6 +4321,7 @@ mod tests {
     fn event_kind_rotation_handoff_round_trip() {
         let ev = EventKind::AuditRotationHandoff {
             next_file_name: "default.jsonl.20260428T123456".to_owned(),
+            entry_tags: false,
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
@@ -3383,6 +4341,7 @@ mod tests {
         let archive_name = "default.jsonl.20260429T123456789";
         let ev = EventKind::AuditRotationHandoff {
             next_file_name: archive_name.to_owned(),
+            entry_tags: false,
         };
         // Verify that next_file_name matches the rotated-sibling pattern.
         assert!(
@@ -3403,6 +4362,7 @@ mod tests {
         let back: EventKind = serde_json::from_str(&s).unwrap();
         if let EventKind::AuditRotationHandoff {
             next_file_name: ref n,
+            ..
         } = back
         {
             assert_eq!(
@@ -3702,7 +4662,17 @@ mod tests {
         );
     }
 
-    fn executable_ref_pin_fixture(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPin {
+    fn executable_ref_pin_fixture(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPinFirst8 {
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
+        ExecutableRefPinFirst8::new(
+            &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+            &ScString(tag.to_vec().try_into().unwrap()),
+            &resolved,
+        )
+        .unwrap()
+    }
+
+    fn full_executable_ref_pin_fixture(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPin {
         use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
         ExecutableRefPin::new(
             &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
@@ -3712,9 +4682,19 @@ mod tests {
         .unwrap()
     }
 
+    /// The pinned hash of the pin-width tests and a hash sharing its first
+    /// eight bytes that differs in every later byte.
+    fn pinned_and_twin() -> ([u8; 32], [u8; 32]) {
+        let pinned = [0x42u8; 32];
+        let mut twin = pinned;
+        twin[8..].fill(0x43);
+        (pinned, twin)
+    }
+
     /// `ExecutableRefPin::new` renders the redacted owner and the bounded tag,
-    /// records the full SHA-256 of the tag key XDR and the resolved first-8,
-    /// is stable for a fixed owner and tag, and differs for a different tag.
+    /// records the full SHA-256 of the tag key XDR and the full resolved
+    /// hash, is stable for a fixed owner and tag, and differs for a different
+    /// tag.
     #[test]
     fn executable_ref_pin_new_is_stable_and_tag_sensitive() {
         use sha2::{Digest as _, Sha256};
@@ -3738,7 +4718,7 @@ mod tests {
             .collect();
         assert_eq!(pin.ref_key_hex, expected_key);
         assert_eq!(pin.ref_key_hex.len(), 64);
-        assert_eq!(pin.resolved_hash_first8, "abababababababab");
+        assert_eq!(pin.resolved_hash, WasmHashPin::new([0xabu8; 32]));
         assert_eq!(pin.owner_redacted.as_str(), "CAAAA...ABSC4");
         assert_eq!(
             pin.tag, "v1\\u{202e}",
@@ -3749,6 +4729,91 @@ mod tests {
         let other_tag = ScString(b"v2".to_vec().try_into().unwrap());
         let other = ExecutableRefPin::new(&owner, &other_tag, &[0xabu8; 32]).unwrap();
         assert_ne!(other.ref_key_hex, pin.ref_key_hex);
+
+        let first8 = ExecutableRefPinFirst8::new(&owner, &tag, &[0xabu8; 32]).unwrap();
+        assert_eq!(first8.ref_key_hex, pin.ref_key_hex);
+        assert_eq!(first8.resolved_hash_first8, "abababababababab");
+        assert!(first8.is_well_formed());
+    }
+
+    /// The full pin and the reference-pin constructor keep every byte: a
+    /// change at byte 8 or at byte 31 changes the pin, its wire form and its
+    /// round trip.
+    #[test]
+    fn wasm_hash_pin_and_reference_pin_keep_all_32_bytes() {
+        let (pinned, twin) = pinned_and_twin();
+        let mut last = pinned;
+        last[31] = 0x00;
+        for other in [twin, last] {
+            assert_ne!(WasmHashPin::new(pinned), WasmHashPin::new(other));
+            assert!(!WasmHashPin::new(pinned).matches(&other));
+            assert_ne!(
+                WasmHashPin::new(pinned).to_hex(),
+                WasmHashPin::new(other).to_hex()
+            );
+            let pin = full_executable_ref_pin_fixture(b"v1", pinned);
+            let other_pin = full_executable_ref_pin_fixture(b"v1", other);
+            assert_ne!(pin, other_pin, "the reference pin keeps the full hash");
+            assert_eq!(other_pin.resolved_hash.as_bytes(), &other);
+            let wire = serde_json::to_string(&other_pin).unwrap();
+            let back: ExecutableRefPin = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back.resolved_hash.as_bytes(), &other);
+        }
+        assert_eq!(
+            WasmHashPin::new(pinned).first8_display(),
+            WasmHashPin::new(twin).first8_display(),
+            "the labeled display projection cannot tell the twins apart"
+        );
+        let hex = WasmHashPin::new(twin).to_hex();
+        assert_eq!(hex.len(), 64);
+        assert_eq!(WasmHashPin::parse(&hex).unwrap().as_bytes(), &twin);
+        assert_eq!(
+            serde_json::to_string(&WasmHashPin::new(twin)).unwrap(),
+            format!("\"{hex}\"")
+        );
+        assert_eq!(WasmHashPin::try_from(&twin[..]).unwrap().as_bytes(), &twin);
+        assert_eq!(
+            WasmHashPin::try_from(&twin[..8]),
+            Err(WasmHashPinParseError::InvalidLength { actual: 16 })
+        );
+    }
+
+    /// The wire form is exactly 64 lowercase hex characters: 16, 63 and 65
+    /// characters, a non-hex character and an uppercase digit are refused,
+    /// by `parse` and by deserialization.
+    #[test]
+    fn wasm_hash_pin_parse_refuses_every_other_form() {
+        let good = "42".repeat(32);
+        assert!(WasmHashPin::parse(&good).is_ok());
+        for (text, expected) in [
+            (
+                "4242424242424242".to_owned(),
+                WasmHashPinParseError::InvalidLength { actual: 16 },
+            ),
+            (
+                good[..63].to_owned(),
+                WasmHashPinParseError::InvalidLength { actual: 63 },
+            ),
+            (
+                format!("{good}4"),
+                WasmHashPinParseError::InvalidLength { actual: 65 },
+            ),
+            (
+                format!("{}g{}", &good[..10], &good[11..]),
+                WasmHashPinParseError::InvalidChar { offset: 10 },
+            ),
+            (
+                format!("{}A{}", &good[..3], &good[4..]),
+                WasmHashPinParseError::InvalidChar { offset: 3 },
+            ),
+        ] {
+            assert_eq!(WasmHashPin::parse(&text), Err(expected.clone()), "{text}");
+            let quoted = format!("\"{text}\"");
+            assert!(
+                serde_json::from_str::<WasmHashPin>(&quoted).is_err(),
+                "deserialization refuses {text}"
+            );
+        }
     }
 
     /// A pin whose fields do not have the constructor's shape is not
@@ -3773,6 +4838,158 @@ mod tests {
         let mut long_owner = pin;
         long_owner.owner_redacted = RedactedStrkey::from_already_redacted("G".repeat(56));
         assert!(!long_owner.is_well_formed());
+
+        let full = full_executable_ref_pin_fixture(b"v1", [0x11u8; 32]);
+        assert!(full.is_well_formed());
+        let mut full_short_key = full.clone();
+        full_short_key.ref_key_hex.truncate(62);
+        assert!(!full_short_key.is_well_formed());
+        let mut full_upper_key = full.clone();
+        full_upper_key.ref_key_hex = full_upper_key.ref_key_hex.to_uppercase();
+        assert!(!full_upper_key.is_well_formed());
+        let mut full_long_tag = full;
+        full_long_tag.tag = "t".repeat(crate::observability::UNTRUSTED_DISPLAY_MAX_BYTES + 1);
+        assert!(!full_long_tag.is_well_formed());
+    }
+
+    /// A full reference pin whose resolved hash is a 16-character prefix
+    /// does not deserialize.
+    #[test]
+    fn executable_ref_pin_with_a_prefix_resolved_hash_does_not_deserialize() {
+        let pin = full_executable_ref_pin_fixture(b"v1", [0x11u8; 32]);
+        let mut value = serde_json::to_value(&pin).unwrap();
+        value["resolved_hash"] = serde_json::Value::String("1111111111111111".to_owned());
+        assert!(serde_json::from_value::<ExecutableRefPin>(value).is_err());
+    }
+
+    fn created_v2_fixture() -> EventKind {
+        let (pinned, twin) = pinned_and_twin();
+        EventKind::SaContextRuleCreatedV2 {
+            smart_account: "CDABC...XYZ12".to_owned(),
+            rule_id: 6,
+            context_type: "default".to_owned(),
+            signers_count: 2,
+            policies_count: 1,
+            valid_until: None,
+            pinned_verifier_wasm_hashes: vec![WasmHashPin::new(pinned)],
+            pinned_policy_wasm_hashes: vec![WasmHashPin::new(twin)],
+            mutable_override: false,
+            unknown_override: false,
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![Some(full_executable_ref_pin_fixture(
+                b"policy", twin,
+            ))],
+        }
+    }
+
+    fn pins_updated_v2_fixture() -> EventKind {
+        let (pinned, _) = pinned_and_twin();
+        EventKind::SaContextRulePinsUpdatedV2 {
+            smart_account: "CDABC...XYZ12".to_owned(),
+            rule_id: 6,
+            pinned_verifier_wasm_hashes: vec![WasmHashPin::new(pinned)],
+            pinned_policy_wasm_hashes: vec![],
+            mutable_override: false,
+            unknown_override: false,
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
+            reason: PinsUpdateReason::SignerAdded,
+        }
+    }
+
+    /// The version-2 pin rows round-trip byte for byte under their own
+    /// kinds, carry 64-character hashes, and serialize every pin field, empty
+    /// lists and `false` flags included.
+    #[test]
+    fn version_2_pin_rows_round_trip_with_full_hashes() {
+        let (pinned, twin) = pinned_and_twin();
+        let created = assert_round_trips_byte_identically(&created_v2_fixture());
+        assert!(
+            created.contains("\"kind\":\"sa_context_rule_created_v2\""),
+            "{created}"
+        );
+        assert!(
+            created.contains(&WasmHashPin::new(pinned).to_hex()),
+            "{created}"
+        );
+        assert!(
+            created.contains(&WasmHashPin::new(twin).to_hex()),
+            "{created}"
+        );
+        assert!(!created.contains("first8"), "{created}");
+        for field in [
+            "\"pinned_verifier_executable_refs\":[]",
+            "\"mutable_override\":false",
+            "\"unknown_override\":false",
+        ] {
+            assert!(created.contains(field), "{field} is serialized: {created}");
+        }
+        assert!(!created.contains("valid_until"), "{created}");
+
+        let updated = assert_round_trips_byte_identically(&pins_updated_v2_fixture());
+        assert!(
+            updated.contains("\"kind\":\"sa_context_rule_pins_updated_v2\""),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("\"pinned_policy_wasm_hashes\":[]"),
+            "{updated}"
+        );
+        assert!(updated.contains("\"reason\":\"signer_added\""), "{updated}");
+    }
+
+    /// A version-2 pin row without one of its required fields, or holding a
+    /// 16-character or uppercase hash, fails deserialization.
+    #[test]
+    fn version_2_pin_rows_refuse_missing_fields_and_prefix_hashes() {
+        for (ev, fields) in [
+            (
+                created_v2_fixture(),
+                &[
+                    "smart_account",
+                    "rule_id",
+                    "context_type",
+                    "signers_count",
+                    "policies_count",
+                    "pinned_verifier_wasm_hashes",
+                    "pinned_policy_wasm_hashes",
+                    "mutable_override",
+                    "unknown_override",
+                    "pinned_verifier_executable_refs",
+                    "pinned_policy_executable_refs",
+                ][..],
+            ),
+            (
+                pins_updated_v2_fixture(),
+                &[
+                    "smart_account",
+                    "rule_id",
+                    "pinned_verifier_wasm_hashes",
+                    "pinned_policy_wasm_hashes",
+                    "mutable_override",
+                    "unknown_override",
+                    "pinned_verifier_executable_refs",
+                    "pinned_policy_executable_refs",
+                    "reason",
+                ][..],
+            ),
+        ] {
+            for field in fields {
+                assert!(
+                    serde_json::from_str::<EventKind>(&json_without(&ev, field)).is_err(),
+                    "a row without `{field}` must fail deserialization"
+                );
+            }
+            for replacement in ["4242424242424242".to_owned(), "AB".repeat(32)] {
+                let mut value = serde_json::to_value(&ev).unwrap();
+                value["pinned_verifier_wasm_hashes"] =
+                    serde_json::Value::Array(vec![serde_json::Value::String(replacement.clone())]);
+                assert!(
+                    serde_json::from_value::<EventKind>(value).is_err(),
+                    "a row holding {replacement} must fail deserialization"
+                );
+            }
+        }
     }
 
     /// Round-trip: `SaContextRuleCreated` with executable-reference pins
@@ -5288,6 +6505,7 @@ mod tests {
             envelope_sha256_hex: Some("a".repeat(64)),
             nonce_prefix: "AAAAAAAA".to_owned(),
             origin: "cli".to_owned(),
+            mainnet_presence: None,
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
@@ -5316,6 +6534,7 @@ mod tests {
             envelope_sha256_hex: None,
             nonce_prefix: "AAAAAAAA".to_owned(),
             origin: "cli".to_owned(),
+            mainnet_presence: None,
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
@@ -5323,6 +6542,53 @@ mod tests {
         assert!(
             !s.contains("envelope_sha256_hex"),
             "absent envelope_sha256_hex must be skipped, not null: {s}"
+        );
+    }
+
+    /// A mainnet consent row carries its presence object, round-trips, and
+    /// a row without one omits the member rather than writing `null`.
+    #[test]
+    fn event_kind_approval_attested_carries_mainnet_presence() {
+        let presence = MainnetPresenceAudit {
+            credential_fingerprint: format!("sha256:{}", "c".repeat(64)),
+            challenge_sha256_hex: "d".repeat(64),
+            receipt_sha256_hex: "e".repeat(64),
+            policy_digest_hex: "f".repeat(64),
+            policy_sequence: 3,
+            rp_id: "localhost".to_owned(),
+            webauthn_origin: "http://localhost:4100".to_owned(),
+            user_present: true,
+            user_verified: true,
+            sign_count: 12,
+            verified_at_unix_ms: 1_700_000_000_000,
+        };
+        let ev = EventKind::ApprovalAttested {
+            approval_kind: "PaymentSimulated".to_owned(),
+            gated_tool: "stellar_pay_commit".to_owned(),
+            envelope_sha256_hex: Some("a".repeat(64)),
+            nonce_prefix: "AAAAAAAA".to_owned(),
+            origin: "cli".to_owned(),
+            mainnet_presence: Some(presence),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains("\"mainnet_presence\""), "presence object: {s}");
+        assert!(s.contains("\"sign_count\":12"), "counter: {s}");
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back);
+
+        let legacy = r#"{"kind":"approval_attested","approval_kind":"PaymentSimulated","gated_tool":"stellar_pay_commit","nonce_prefix":"AAAAAAAA","origin":"cli"}"#;
+        let parsed: EventKind = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(
+            parsed,
+            EventKind::ApprovalAttested {
+                mainnet_presence: None,
+                ..
+            }
+        ));
+        assert!(
+            !serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("mainnet_presence")
         );
     }
 
@@ -5554,6 +6820,41 @@ mod tests {
     // ── #21 / #34 audit records ──────────────────────────────────────────────
 
     #[test]
+    fn revocation_audit_round_trips_and_redacts() {
+        use crate::approval::Surface;
+        use crate::audit_log::AuditEntry;
+        for origin in [Surface::Cli, Surface::Serve, Surface::ServeRemote] {
+            let entry = AuditEntry::new_approval_revoked(
+                "PaymentSimulated",
+                "abcdefgh-secret",
+                origin,
+                Some("fixture-credential"),
+                "revocation-request",
+            );
+            let text = serde_json::to_string(&entry).unwrap();
+            assert_eq!(text.matches("\"request_id\"").count(), 1);
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(value["kind"], "approval_revoked");
+            assert_eq!(value["approval_kind"], "PaymentSimulated");
+            assert_eq!(value["nonce_prefix"], "abcdefgh");
+            assert_eq!(value["origin"], origin.as_str());
+            let back: AuditEntry = serde_json::from_str(&text).unwrap();
+            assert_eq!(back.event_kind, entry.event_kind);
+            assert_eq!(back.request_id, "revocation-request");
+            for field in ["approval_kind", "nonce_prefix", "origin"] {
+                let mut missing = value.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert!(
+                    serde_json::from_value::<AuditEntry>(missing).is_err(),
+                    "{field}"
+                );
+            }
+            assert!(!text.contains("abcdefgh-secret"));
+            assert!(!text.contains("fixture-credential"));
+        }
+    }
+
+    #[test]
     fn event_kind_value_action_submitted_round_trip() {
         let ev = EventKind::ValueActionSubmitted {
             witness: None,
@@ -5563,6 +6864,7 @@ mod tests {
                 amount: Some(1_500_000_000),
                 asset: Some("native".to_owned()),
                 destination_redacted: Some("GAAAA...ZZZZZ".to_owned()),
+                destination_sha256: None,
             }],
             opaque_reason: None,
             transaction_hash_redacted: "aabb1122...ccdd3344".to_owned(),
@@ -5645,14 +6947,20 @@ mod tests {
     fn event_kind_x402_payment_authorized_round_trip() {
         let ev = EventKind::X402PaymentAuthorized {
             witness: None,
+            signature_expiration_ledger: None,
             legs: vec![ValueLegRecord {
                 action: ValueActionKind::X402Payment,
                 amount: Some(2_500_000),
                 asset: Some("CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA".to_owned()),
                 destination_redacted: Some("GBPXX...MWIVL".to_owned()),
+                destination_sha256: None,
             }],
             network: "stellar:testnet".to_owned(),
             scheme: "exact".to_owned(),
+            policy_digest: None,
+            policy_sequence: None,
+            rule_index: None,
+            evaluated_at_ms: None,
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
@@ -5726,8 +7034,12 @@ mod tests {
         let ev = EventKind::OpaquePayloadSigned {
             payload_sha256_redacted: "dfe78222...9d11baf1".to_owned(),
             signer_redacted: RedactedStrkey::from_already_redacted("GBPXX...MWIVL"),
+            legs: Vec::new(),
         };
         let s = serde_json::to_string(&ev).unwrap();
+        let old = r#"{"kind":"opaque_payload_signed","payload_sha256_redacted":"dfe78222...9d11baf1","signer_redacted":"GBPXX...MWIVL"}"#;
+        assert_eq!(s, old, "empty legs preserve historical row bytes");
+        assert_eq!(serde_json::from_str::<EventKind>(old).unwrap(), ev);
         let back: EventKind = serde_json::from_str(&s).unwrap();
         assert_eq!(ev, back, "OpaquePayloadSigned must round-trip cleanly");
         assert!(
@@ -5756,6 +7068,41 @@ mod tests {
         assert!(
             result.is_err(),
             "missing-field deserialisation must fail for OpaquePayloadSigned"
+        );
+    }
+
+    #[test]
+    fn a_signed_payload_keeps_its_evaluated_legs() {
+        use crate::audit_log::entry::AuditEntry;
+        let legs = vec![ValueLegRecord {
+            action: ValueActionKind::Payment,
+            amount: Some(i128::MAX),
+            asset: Some("native".to_owned()),
+            destination_redacted: Some("GAAAA...AWHF".to_owned()),
+            destination_sha256: Some("ab".repeat(32)),
+        }];
+        let entry = AuditEntry::new_opaque_payload_signed(
+            "stellar_sep43_sign_transaction",
+            "stellar:testnet",
+            "dfe78222...9d11baf1",
+            RedactedStrkey::from_already_redacted("GBPXX...MWIVL"),
+            "request",
+            legs.clone(),
+            PolicyDecision::Allow,
+        );
+        let expected = EventKind::OpaquePayloadSigned {
+            payload_sha256_redacted: "dfe78222...9d11baf1".to_owned(),
+            signer_redacted: RedactedStrkey::from_already_redacted("GBPXX...MWIVL"),
+            legs,
+        };
+        assert_eq!(
+            entry.event_kind, expected,
+            "the constructor preserves every leg field"
+        );
+        let encoded = serde_json::to_string(&entry.event_kind).unwrap();
+        assert_eq!(
+            serde_json::from_str::<EventKind>(&encoded).unwrap(),
+            expected
         );
     }
 
@@ -5804,12 +7151,42 @@ mod tests {
         );
     }
 
+    /// The identity row has its own wire discriminant, carries the redacted
+    /// address and role, and no key material field exists to carry a seed.
+    #[test]
+    fn event_kind_signer_identity_enrolled_round_trip() {
+        let ev = EventKind::SignerIdentityEnrolled {
+            keyring_service: "stellar-agent-signer-default".to_owned(),
+            keyring_entry: "enrolled-identity".to_owned(),
+            public_address: RedactedStrkey::from_already_redacted("GAAAA...ZZZZZ"),
+            role: "agent".to_owned(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert_eq!(
+            s,
+            "{\"kind\":\"signer_identity_enrolled\",\"keyring_service\":\
+             \"stellar-agent-signer-default\",\"keyring_entry\":\"enrolled-identity\",\
+             \"public_address\":\"GAAAA...ZZZZZ\",\"role\":\"agent\"}"
+        );
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back);
+        let missing: Result<EventKind, _> =
+            serde_json::from_str(r#"{"kind":"signer_identity_enrolled"}"#);
+        assert!(missing.is_err());
+    }
+
     #[test]
     fn mpp_state_lifecycle_events_round_trip() {
         use crate::audit_log::AuditEntry;
         let adopted = AuditEntry::new_mpp_state_adopted("alice", 7, "adopt-request");
-        let reset =
-            AuditEntry::new_mpp_state_reset("alice", Some(9), "operator recovery", "reset-request");
+        let reset = AuditEntry::new_mpp_state_reset(
+            "alice",
+            Some(9),
+            None,
+            false,
+            "operator recovery",
+            "reset-request",
+        );
         for (entry, kind, generation_field, generation) in [
             (adopted, "mpp_state_adopted", "generation", 7),
             (reset, "mpp_state_reset", "discarded_generation", 9),
@@ -5821,7 +7198,8 @@ mod tests {
             let decoded: AuditEntry = serde_json::from_value(value).unwrap();
             assert_eq!(decoded.event_kind, entry.event_kind);
         }
-        let missing = AuditEntry::new_mpp_state_reset("alice", None, "recovery", "request");
+        let missing =
+            AuditEntry::new_mpp_state_reset("alice", None, None, false, "recovery", "request");
         let wire = serde_json::to_value(&missing).unwrap();
         assert!(wire["discarded_generation"].is_null());
         let decoded: AuditEntry = serde_json::from_value(wire).unwrap();
@@ -5836,8 +7214,37 @@ mod tests {
         let ev = EventKind::PolicyWindowStateReset {
             profile: "alice".to_owned(),
             reason: "corrupt-file recovery".to_owned(),
+            owner_authorization: None,
             wiped: None,
         };
+        assert!(
+            serde_json::to_value(&ev)
+                .unwrap()
+                .get("owner_authorization")
+                .is_none()
+        );
+        let authorized = EventKind::PolicyWindowStateReset {
+            profile: "alice".to_owned(),
+            reason: "repair".to_owned(),
+            wiped: None,
+            owner_authorization: Some(WindowResetAuthorization {
+                owner_redacted: RedactedStrkey::from_full(
+                    &stellar_strkey::ed25519::PublicKey([0x55; 32]).to_string(),
+                ),
+                store_sha256: Some("11".repeat(32)),
+                challenge: "33".repeat(32),
+                signature: "22".repeat(64),
+            }),
+        };
+        let encoded = serde_json::to_value(&authorized).unwrap();
+        assert_eq!(
+            encoded["owner_authorization"]["challenge"],
+            serde_json::Value::String("33".repeat(32))
+        );
+        assert_eq!(
+            serde_json::from_value::<EventKind>(encoded).unwrap(),
+            authorized
+        );
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
         assert_eq!(ev, back, "PolicyWindowStateReset must round-trip cleanly");
@@ -6054,6 +7461,173 @@ mod tests {
         );
     }
 
+    /// The G account of the key `[1; 32]` and its M addresses with IDs zero
+    /// and `u64::MAX`, each with the SHA-256 of its UTF-8 bytes from an
+    /// independent calculation.
+    const PAYMENT_DESTINATIONS: [(&str, &str); 3] = [
+        (
+            "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H",
+            "85a9f00609ab4eb40a277132a2a1d8b0195f9242e6d304b837f9542010feba7a",
+        ),
+        (
+            "MAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAAAAAAAAAAAABAXI",
+            "6c1fbca75b9ef827bf5c2cfa0463c0872bab256271e4c33b78d3969f1dad7a45",
+        ),
+        (
+            "MAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQD7777777777776QNE",
+            "0a74e8528a9ef1ef73cafc13768bb9870a88e8ce6e2846be7a33a84e94a19c56",
+        ),
+    ];
+
+    fn payment_leg(destination: Option<&str>) -> crate::policy::v1::value::ValueLeg {
+        crate::policy::v1::value::ValueLeg {
+            kind: crate::policy::v1::value::ActionKind::Payment,
+            amount: Some(9_223_372_036_854_775_808),
+            asset: Some("USDC:GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA".to_owned()),
+            destination: destination.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn payment_leg_hashes_match_independent_sha256_and_differ_by_id() {
+        let mut hashes = std::collections::BTreeSet::new();
+        for (destination, expected) in PAYMENT_DESTINATIONS {
+            let record = ValueLegRecord::from_payment_leg(&payment_leg(Some(destination))).unwrap();
+            assert_eq!(
+                record.destination_sha256.as_deref(),
+                Some(expected),
+                "{destination}"
+            );
+            assert_eq!(
+                record.destination_redacted,
+                Some(crate::observability::redact_strkey_first5_last5(
+                    destination
+                ))
+            );
+            hashes.insert(expected);
+        }
+        assert_eq!(hashes.len(), 3, "an ID-only change changes the hash");
+    }
+
+    #[test]
+    fn payment_leg_records_keep_the_legs_action_amount_and_asset() {
+        use crate::policy::v1::value::ActionKind;
+        let (destination, _) = PAYMENT_DESTINATIONS[2];
+        for kind in [ActionKind::Payment, ActionKind::AccountCreation] {
+            let leg = crate::policy::v1::value::ValueLeg {
+                kind,
+                ..payment_leg(Some(destination))
+            };
+            let record = ValueLegRecord::from_payment_leg(&leg).unwrap();
+            assert_eq!(record.action, ValueActionKind::from(kind));
+            assert_eq!(record.amount, Some(9_223_372_036_854_775_808));
+            assert_eq!(
+                record.asset.as_deref(),
+                Some("USDC:GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA")
+            );
+        }
+    }
+
+    #[test]
+    fn payment_leg_serialization_holds_no_complete_destination() {
+        for (destination, expected) in PAYMENT_DESTINATIONS {
+            let record = ValueLegRecord::from_payment_leg(&payment_leg(Some(destination))).unwrap();
+            let wire = serde_json::to_string(&record).unwrap();
+            assert!(!wire.contains(destination), "{wire}");
+            assert!(
+                wire.contains(&format!("\"destination_sha256\":\"{expected}\"")),
+                "{wire}"
+            );
+            let reread: ValueLegRecord = serde_json::from_str(&wire).unwrap();
+            assert_eq!(reread, record);
+        }
+    }
+
+    #[test]
+    fn payment_leg_records_refuse_a_missing_or_non_payment_destination() {
+        let (g, _) = PAYMENT_DESTINATIONS[0];
+        let corrupted = format!("{}A", &g[..55]);
+        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let lowercase = contract.to_lowercase();
+        let w = format!(
+            "{}",
+            stellar_strkey::MuxedContract {
+                contract_id: [0; 32],
+                id: 7
+            }
+        );
+        for destination in [
+            None,
+            Some(lowercase.as_str()),
+            Some(w.as_str()),
+            Some(corrupted.as_str()),
+            Some("example.com"),
+        ] {
+            let err = ValueLegRecord::from_payment_leg(&payment_leg(destination)).unwrap_err();
+            assert_eq!(err.code(), "validation.address_invalid", "{destination:?}");
+        }
+    }
+
+    /// A contract payment leg records the redacted C and the SHA-256 of the
+    /// full C, which never appears in the audit form.
+    #[test]
+    fn b1_c_payment_audit_hash() {
+        let mut hashes = std::collections::BTreeSet::new();
+        for (contract, expected) in [
+            (
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "f36ca94889cb4ccf6e7e78cd299d1524e85f2c86efa8e2998babd83afa8faf7a",
+            ),
+            (
+                "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ",
+                "141bc40836f98ac606b04502c74283d06d6b427ed329bac4686a38b6d5c108d8",
+            ),
+        ] {
+            let leg = payment_leg(Some(contract));
+            let record = ValueLegRecord::from_payment_leg(&leg).unwrap();
+            assert_eq!(
+                record.destination_sha256.as_deref(),
+                Some(expected),
+                "C hash"
+            );
+            assert_eq!(
+                record.destination_redacted,
+                Some(crate::observability::redact_strkey_first5_last5(contract))
+            );
+            assert_eq!(record.action, ValueActionKind::Payment);
+            let wire = serde_json::to_string(&record).unwrap();
+            assert!(!wire.contains(contract), "{wire}");
+            assert_eq!(ValueLegRecord::from(&leg).destination_sha256, None);
+            hashes.insert(expected);
+        }
+        assert_eq!(hashes.len(), 2, "another C changes the hash");
+    }
+
+    /// A row without the field reads as `None` and writes the same bytes.
+    /// The generic conversion records no hash, also for a payment leg.
+    #[test]
+    fn rows_without_a_destination_hash_keep_their_wire_bytes() {
+        let historical = r#"{"action":"payment","amount":"10","asset":"native","destination_redacted":"GAAQC...QDZ7H"}"#;
+        let record: ValueLegRecord = serde_json::from_str(historical).unwrap();
+        assert_eq!(record.destination_sha256, None);
+        assert_eq!(serde_json::to_string(&record).unwrap(), historical);
+        let (destination, _) = PAYMENT_DESTINATIONS[2];
+        let generic = ValueLegRecord::from(&payment_leg(Some(destination)));
+        assert_eq!(generic.destination_sha256, None);
+        let x402 = crate::policy::v1::value::ValueLeg {
+            kind: crate::policy::v1::value::ActionKind::X402Payment,
+            amount: Some(10),
+            asset: Some("native".to_owned()),
+            destination: Some(
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+            ),
+        };
+        assert_eq!(
+            serde_json::to_string(&ValueLegRecord::from(&x402)).unwrap(),
+            r#"{"action":"x402_payment","amount":"10","asset":"native","destination_redacted":"CAAAA...AD2KM"}"#
+        );
+    }
+
     #[test]
     fn counterparty_supplied_strings_are_bounded_in_records() {
         use crate::policy::v1::value::{ActionKind, ValueLeg};
@@ -6089,6 +7663,108 @@ mod tests {
         );
     }
 
+    /// Records keep the M. The audit form of a payment leg identifies the
+    /// full M0 and M17 destination by its SHA-256 and never records it in
+    /// clear text, a submission receipt carries the full M0 and M17
+    /// destination, the redacted form stays on every leg, and G, C and W legs
+    /// and legacy records keep their bytes.
+    #[test]
+    fn muxed_original_address_records() {
+        use crate::policy::v1::value::{ActionKind, ValueLeg};
+        use crate::profile::receipt::{BeginSubmissionOutcome, ReceiptStore};
+        use sha2::Digest as _;
+        let key = [0xAD; 32];
+        let m = |id: u64| {
+            format!(
+                "{}",
+                stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+            )
+        };
+        let leg_to = |destination: &str| ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(5),
+            asset: Some("native".to_owned()),
+            destination: Some(destination.to_owned()),
+        };
+        let record = |destination: &str| ValueLegRecord::from(&leg_to(destination));
+        let g = format!("{}", stellar_strkey::ed25519::PublicKey(key));
+        let sha = |text: &str| crate::hex::encode(&sha2::Sha256::digest(text.as_bytes()));
+        for id in [0, 17] {
+            let leg = ValueLegRecord::from_payment_leg(&leg_to(&m(id))).unwrap();
+            assert_eq!(leg.destination_sha256, Some(sha(&m(id))), "M{id}");
+            assert_ne!(leg.destination_sha256, Some(sha(&g)), "M{id}");
+            assert_ne!(leg.destination_sha256, Some(sha(&m(id + 1))), "M{id}");
+            let redacted = leg.destination_redacted.as_deref().unwrap();
+            assert!(redacted.contains("...") && redacted != m(id), "{redacted}");
+            let wire = serde_json::to_string(&leg).unwrap();
+            assert!(!wire.contains(&m(id)), "{wire}");
+            let back: ValueLegRecord = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, leg);
+        }
+        let c = format!("{}", stellar_strkey::Contract(key));
+        let w = format!(
+            "{}",
+            stellar_strkey::MuxedContract {
+                contract_id: key,
+                id: 17
+            }
+        );
+        for plain in [&g, &c, &w] {
+            let leg = record(plain);
+            assert_eq!(leg.destination_sha256, None, "{plain}");
+            let legacy = format!(
+                "{{\"action\":\"payment\",\"amount\":\"5\",\"asset\":\"native\",\
+                 \"destination_redacted\":\"{}\"}}",
+                crate::observability::redact_strkey_first5_last5(plain)
+            );
+            assert_eq!(serde_json::to_string(&leg).unwrap(), legacy, "{plain}");
+            let back: ValueLegRecord = serde_json::from_str(&legacy).unwrap();
+            assert_eq!(back, leg);
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ReceiptStore::open_at(dir.path(), "records").unwrap();
+        let hash = |byte: u8| format!("{byte:02x}").repeat(32);
+        for (byte, destination) in [(1, Some(m(17))), (2, Some(m(0))), (3, None)] {
+            let outcome = store
+                .begin_submission_to(
+                    &hash(byte),
+                    &hash(byte + 16),
+                    &g,
+                    i64::from(byte),
+                    0,
+                    7,
+                    None,
+                    None,
+                    &destination
+                        .clone()
+                        .map(crate::profile::receipt::PaymentDestinations::Single)
+                        .unwrap_or_default(),
+                )
+                .unwrap();
+            assert!(matches!(outcome, BeginSubmissionOutcome::Recorded));
+            let receipt = store.get(&hash(byte)).unwrap().unwrap();
+            assert_eq!(
+                receipt.destinations,
+                destination
+                    .clone()
+                    .map(crate::profile::receipt::PaymentDestinations::Single)
+                    .unwrap_or_default()
+            );
+            let wire = serde_json::to_string(&receipt).unwrap();
+            assert_eq!(wire.contains("\"destination\""), destination.is_some());
+            let mut legacy: serde_json::Value = serde_json::from_str(&wire).unwrap();
+            legacy.as_object_mut().unwrap().remove("destination");
+            let reread: crate::profile::receipt::SubmissionReceipt =
+                serde_json::from_value(legacy.clone()).unwrap();
+            assert_eq!(
+                reread.destinations,
+                crate::profile::receipt::PaymentDestinations::None
+            );
+            assert_eq!(serde_json::to_value(&reread).unwrap(), legacy);
+        }
+    }
+
     mod witness_tests {
         #![allow(clippy::unwrap_used, reason = "test assertions")]
         use super::super::*;
@@ -6102,6 +7778,8 @@ mod tests {
                 transaction_hash_redacted: "hash".into(),
                 source_redacted: "source".into(),
                 sequence: 7,
+                policy_digest: None,
+                rule_index: None,
             };
             assert_eq!(
                 serde_json::to_string(&event).unwrap(),
@@ -6136,9 +7814,14 @@ mod tests {
         fn x402_without_witness_serializes_unchanged() {
             let event = EventKind::X402PaymentAuthorized {
                 witness: None,
+                signature_expiration_ledger: None,
                 legs: vec![],
                 network: "stellar:testnet".into(),
                 scheme: "exact".into(),
+                policy_digest: None,
+                policy_sequence: None,
+                rule_index: None,
+                evaluated_at_ms: None,
             };
             assert_eq!(
                 serde_json::to_string(&event).unwrap(),
@@ -6147,6 +7830,44 @@ mod tests {
                     "\"network\":\"stellar:testnet\",\"scheme\":\"exact\"}"
                 )
             );
+        }
+        #[test]
+        fn x402_with_the_expiration_ledger_round_trips() {
+            let event = EventKind::X402PaymentAuthorized {
+                witness: None,
+                signature_expiration_ledger: Some(1_060),
+                legs: vec![],
+                network: "stellar:mainnet".into(),
+                scheme: "exact".into(),
+                policy_digest: None,
+                policy_sequence: None,
+                rule_index: None,
+                evaluated_at_ms: None,
+            };
+            let text = serde_json::to_string(&event).unwrap();
+            assert_eq!(
+                text,
+                concat!(
+                    "{\"kind\":\"x402_payment_authorized\",",
+                    "\"signature_expiration_ledger\":1060,\"legs\":[],",
+                    "\"network\":\"stellar:mainnet\",\"scheme\":\"exact\"}"
+                )
+            );
+            let decoded: EventKind = serde_json::from_str(&text).unwrap();
+            assert_eq!(decoded, event);
+            let without: EventKind = serde_json::from_str(concat!(
+                "{\"kind\":\"x402_payment_authorized\",\"legs\":[],",
+                "\"network\":\"stellar:mainnet\",\"scheme\":\"exact\"}"
+            ))
+            .unwrap();
+            let EventKind::X402PaymentAuthorized {
+                signature_expiration_ledger,
+                ..
+            } = without
+            else {
+                panic!("wrong event kind");
+            };
+            assert_eq!(signature_expiration_ledger, None);
         }
         #[test]
         fn pending_submitted_and_x402_with_witness_round_trip() {
@@ -6162,9 +7883,14 @@ mod tests {
             };
             let x402 = EventKind::X402PaymentAuthorized {
                 witness: Some(soroban.clone()),
+                signature_expiration_ledger: None,
                 legs: vec![],
                 network: "stellar:testnet".into(),
                 scheme: "exact".into(),
+                policy_digest: None,
+                policy_sequence: None,
+                rule_index: None,
+                evaluated_at_ms: None,
             };
             let json = serde_json::to_value(&x402).unwrap();
             assert_eq!(
@@ -6181,6 +7907,8 @@ mod tests {
                     transaction_hash_redacted: "hash".into(),
                     source_redacted: "source".into(),
                     sequence: 7,
+                    policy_digest: None,
+                    rule_index: None,
                 },
                 EventKind::ValueActionSubmitted {
                     witness: Some(witness.clone()),
@@ -6192,9 +7920,14 @@ mod tests {
                 },
                 EventKind::X402PaymentAuthorized {
                     witness: Some(witness.clone()),
+                    signature_expiration_ledger: None,
                     legs: vec![],
                     network: "stellar:testnet".into(),
                     scheme: "exact".into(),
+                    policy_digest: None,
+                    policy_sequence: None,
+                    rule_index: None,
+                    evaluated_at_ms: None,
                 },
             ];
             for event in events {
@@ -6222,19 +7955,32 @@ mod tests {
             truncated: false,
             generation_before: Some(4),
             generation_after: 5,
+            retained_authorizations: 0,
         };
-        let expected = "{\"previous\":\"verified\",\"entry_count\":3,\"buckets\":[{\
+        let golden = "{\"previous\":\"verified\",\"entry_count\":3,\"buckets\":[{\
             \"scope_specificity\":2,\"bucket\":\"native\",\"window_secs\":86400,\
             \"confirmed_count\":2,\
             \"confirmed_total\":\"-170141183460469231731687303715884105728\",\
             \"pending_count\":1,\
             \"pending_total\":\"170141183460469231731687303715884105727\"}],\
-            \"truncated\":false,\"generation_before\":4,\"generation_after\":5}";
+            \"truncated\":false,\"generation_before\":4,\"generation_after\":5";
+        let expected = format!("{golden}}}");
         let json = serde_json::to_string(&record).unwrap();
         assert_eq!(json, expected);
         assert_eq!(
             serde_json::from_str::<WipedAccrualRecord>(&json).unwrap(),
             record
+        );
+        let retained = WipedAccrualRecord {
+            retained_authorizations: 3,
+            ..record
+        };
+        let expected = format!("{golden},\"retained_authorizations\":3}}");
+        let json = serde_json::to_string(&retained).unwrap();
+        assert_eq!(json, expected);
+        assert_eq!(
+            serde_json::from_str::<WipedAccrualRecord>(&json).unwrap(),
+            retained
         );
     }
 
@@ -6252,6 +7998,7 @@ mod tests {
                 truncated: false,
                 generation_before: None,
                 generation_after: 1,
+                retained_authorizations: 0,
             };
             let expected = format!(
                 "{{\"previous\":\"{name}\",\"entry_count\":0,\"buckets\":[],\"truncated\":false,\
@@ -6266,10 +8013,68 @@ mod tests {
         }
     }
 
+    /// A discarding MPP reset row keeps its serialized bytes; a carrying row
+    /// adds the carried generation and, only when set, the stale flag.
+    #[test]
+    fn mpp_reset_row_carry_fields_are_additive() {
+        let golden =
+            r#"{"kind":"mpp_state_reset","profile":"alice","discarded_generation":4,"reason":"r"}"#;
+        let row: EventKind = serde_json::from_str(golden).unwrap();
+        assert!(matches!(
+            &row,
+            EventKind::MppStateReset {
+                carried_generation: None,
+                stale_carry: false,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&row).unwrap(), golden);
+
+        for (stale_carry, expected) in [
+            (
+                false,
+                r#"{"kind":"mpp_state_reset","profile":"alice","discarded_generation":4,"carried_generation":3,"reason":"r"}"#,
+            ),
+            (
+                true,
+                r#"{"kind":"mpp_state_reset","profile":"alice","discarded_generation":4,"carried_generation":1,"stale_carry":true,"reason":"r"}"#,
+            ),
+        ] {
+            let row = EventKind::MppStateReset {
+                profile: "alice".to_owned(),
+                discarded_generation: Some(4),
+                carried_generation: Some(if stale_carry { 1 } else { 3 }),
+                stale_carry,
+                reason: "r".to_owned(),
+            };
+            let json = serde_json::to_string(&row).unwrap();
+            assert_eq!(json, expected);
+            assert_eq!(serde_json::from_str::<EventKind>(&json).unwrap(), row);
+        }
+    }
+
     #[test]
     fn reset_row_without_wiped_keeps_golden_bytes() {
         let golden = r#"{"kind":"policy_window_state_reset","profile":"alice","reason":"repair"}"#;
         let row: EventKind = serde_json::from_str(golden).unwrap();
+        assert_eq!(serde_json::to_string(&row).unwrap(), golden);
+    }
+
+    /// The accounting-expiry event carries its fixed code and unknown chain
+    /// outcome under its own wire kind.
+    #[test]
+    fn accounting_expired_row_has_its_own_kind() {
+        let golden = concat!(
+            r#"{"kind":"submission_accounting_expired","decision_id":"ab","generation":4,"#,
+            r#""transaction_hash_redacted":"abcd...wxyz","observed_at_ms":10,"#,
+            r#""accounting_until_ms":9,"code":"submission.accounting_expired","#,
+            r#""chain_outcome":"unknown"}"#
+        );
+        let row: EventKind = serde_json::from_str(golden).unwrap();
+        assert!(matches!(
+            &row,
+            EventKind::SubmissionAccountingExpired { generation: 4, .. }
+        ));
         assert_eq!(serde_json::to_string(&row).unwrap(), golden);
     }
 
@@ -6292,6 +8097,7 @@ mod tests {
             transaction_hash_redacted: "abcd...wxyz".to_owned(),
             cleared_from: "ambiguous".to_owned(),
             reservation_released: true,
+            unbounded_exposure: false,
             evidence: Some("submission.time_bound_passed".to_owned()),
         };
         let json = serde_json::to_string(&with_evidence).unwrap();

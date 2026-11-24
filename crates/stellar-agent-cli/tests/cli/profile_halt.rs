@@ -122,14 +122,14 @@ impl Run {
 /// A temporary data root with one saved testnet profile whose endpoints are
 /// a connection counter.
 struct Fixture {
-    home: tempfile::TempDir,
+    home: stellar_agent_test_support::sandbox::StateSandbox,
     counter: ConnectionCounter,
     profile: Profile,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let home = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let counter = ConnectionCounter::start().unwrap();
         let rpc_url = counter.https_uri().replacen("https://", "http://", 1);
         let profile = Profile::builder_testnet_named(PROFILE, "s", "a", "n", "a")
@@ -257,7 +257,11 @@ impl Fixture {
 /// The binary in `home` with `args`, under the headless backend and with
 /// every overlay that selects another profile, endpoint or secret removed.
 fn command_in(home: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    let mut command = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home,
+    )
+    .expect("isolated CLI child");
     command
         .args(args)
         .env("STELLAR_AGENT_HOME", home)
@@ -958,19 +962,23 @@ fn halt_and_resume_write_verified_audit_rows_and_show_reports_the_state() {
     let kinds = f.audit_kinds();
     assert_eq!(
         kinds,
-        vec!["profile_halted".to_owned(), "profile_resumed".to_owned()],
-        "the log holds exactly the two operator rows"
+        vec![
+            "audit_entry_tags_started".to_owned(),
+            "profile_halted".to_owned(),
+            "profile_resumed".to_owned()
+        ],
+        "the log holds the entry-tag boundary row and exactly the two operator rows"
     );
     let rows: Vec<Value> = std::fs::read_to_string(&f.profile.audit_log_path)
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(rows[0]["profile"], PROFILE);
-    assert_eq!(rows[0]["halted_at"].as_str(), Some(halted_at.as_str()));
-    assert_eq!(rows[0]["reason"], "key leak");
     assert_eq!(rows[1]["profile"], PROFILE);
-    assert_eq!(rows[1]["was_halted"], true);
+    assert_eq!(rows[1]["halted_at"].as_str(), Some(halted_at.as_str()));
+    assert_eq!(rows[1]["reason"], "key leak");
+    assert_eq!(rows[2]["profile"], PROFILE);
+    assert_eq!(rows[2]["was_halted"], true);
 
     let log = f.profile.audit_log_path.to_string_lossy().into_owned();
     let verify = f.run(&["audit", "verify", &log, "--profile", PROFILE]);
@@ -1193,7 +1201,10 @@ fn a_resume_whose_audit_log_is_unavailable_keeps_the_halt() {
     );
     assert_eq!(
         f.audit_kinds(),
-        vec!["profile_halted".to_owned()],
+        vec![
+            "audit_entry_tags_started".to_owned(),
+            "profile_halted".to_owned()
+        ],
         "no resume is recorded"
     );
     let shown = f.run(&["profile", "show", "--profile", PROFILE]);
@@ -1423,7 +1434,11 @@ fn a_resume_whose_marker_cannot_be_removed_keeps_the_halt_with_its_row() {
     );
     assert_eq!(
         f.audit_kinds(),
-        vec!["profile_halted".to_owned(), "profile_resumed".to_owned()],
+        vec![
+            "audit_entry_tags_started".to_owned(),
+            "profile_halted".to_owned(),
+            "profile_resumed".to_owned()
+        ],
         "the row of the attempt is recorded"
     );
     let shown = f.run(&["profile", "show", "--profile", PROFILE]);
@@ -1488,13 +1503,8 @@ fn while_the_resume_row_waits_on_the_outbox_lock_the_halt_holds() {
     let marker = std::fs::read(f.marker()).unwrap();
 
     // Another appender holds the outbox lock for the resume's whole wait.
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(f.outbox_lock())
-        .unwrap();
-    lock.try_lock().unwrap();
+    let lock =
+        stellar_agent_core::audit_log::test_helpers::hold_audit_lock(&f.outbox_lock()).unwrap();
 
     let mut resume_command =
         command_in(f.home.path(), &["profile", "resume", "--profile", PROFILE]);
@@ -1535,7 +1545,6 @@ fn while_the_resume_row_waits_on_the_outbox_lock_the_halt_holds() {
     );
 
     let resume = resume.finish();
-    lock.unlock().unwrap();
     drop(lock);
     assert!(
         spawned.elapsed() >= HELD_LOCK_WAIT,

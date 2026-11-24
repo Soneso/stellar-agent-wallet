@@ -1,0 +1,20 @@
+{
+  "test_kind": "sequence",
+  "name": "account_wire_code_only",
+  "category": "extended_grammar",
+  "description": "The expectation sets only wire_code, deliberately without deny_reason, so the wire comparison runs on its own. An account denial carries its unprefixed production wire code, account.unread.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "amount_stroops": "1", "asset": "native", "destination": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+      "expected": { "kind": "Deny", "wire_code": "account.unread" }
+    }
+  ]
+}

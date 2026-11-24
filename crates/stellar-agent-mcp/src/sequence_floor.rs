@@ -149,9 +149,38 @@ pub(crate) async fn fetch_account_with_sequence_catchup(
     .await
 }
 
+/// [`fetch_account_with_sequence_catchup`] for a prepare's account read,
+/// which follows the endpoint's operational check under the `deadline` that
+/// check ran under.
+///
+/// Every account read runs under `deadline`, and the catch-up window ends at
+/// `deadline` as it ends after the last poll.
+///
+/// # Errors
+///
+/// `network.endpoint_not_ready` when an account read is still running at
+/// `deadline`; any other [`WalletError`] `fetch_account` returns.
+pub(crate) async fn fetch_account_with_sequence_catchup_within(
+    tracker: &TokioMutex<SequenceFloorTracker>,
+    client: &StellarRpcClient,
+    account_id: &str,
+    trustline_assets: &[Asset],
+    deadline: tokio::time::Instant,
+) -> Result<AccountView, WalletError> {
+    let hook = TrackerHook(tracker);
+    stellar_agent_network::sequence_floor::fetch_account_with_sequence_catchup_within(
+        Some(&hook),
+        client,
+        account_id,
+        trustline_assets,
+        deadline,
+    )
+    .await
+}
+
 /// [`fetch_account_with_sequence_catchup`] with caller-supplied poll count and
-/// interval. Production goes through the wrapper above with the module
-/// constants; tests inject millisecond-scale timing so the exhausted-window
+/// interval. Production goes through the two wrappers above with the
+/// module constants; tests inject millisecond-scale timing so the exhausted-window
 /// path runs without real multi-second sleeps.
 ///
 /// Delegates to `stellar_agent_network::sequence_floor`'s shared catch-up

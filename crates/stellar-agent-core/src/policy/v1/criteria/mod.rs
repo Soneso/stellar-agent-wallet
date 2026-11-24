@@ -8,6 +8,7 @@
 //!
 //! | Module | Struct | Kind tag |
 //! |---|---|---|
+//! | `asset_allowlist` | `AssetAllowlistCriterion` | `"asset_allowlist"` |
 //! | `per_tx_cap` | `PerTxCapCriterion` | `"per_tx_cap"` |
 //! | `approval_above` | `ApprovalAboveCriterion` | `"approval_above"` |
 //! | `per_period_cap` | `PerPeriodCapCriterion` | `"per_period_cap"` |
@@ -24,6 +25,9 @@
 //! | `home_domain_resolved` | `HomeDomainResolvedCriterion` | `"home_domain_resolved"` |
 //! | `sep10_session_active` | `Sep10SessionActiveCriterion` | `"sep10_session_active"` |
 //! | `sep45_session_active` | `Sep45SessionActiveCriterion` | `"sep45_session_active"` |
+//! | `total_budget` | `TotalBudgetCriterion` | `"total_budget"` |
+//! | `balance_floor` | `BalanceFloorCriterion` | `"balance_floor"` |
+//! | `memo_binding` | `MemoBindingCriterion` | `"memo_binding"` |
 
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
@@ -31,13 +35,18 @@ use crate::policy::{Decision, DenyReason, PolicyError};
 
 pub(crate) mod amount_extract;
 pub mod approval_above;
+/// Restricts every valued leg to pinned asset identities.
+pub mod asset_allowlist;
+pub mod balance_floor;
 pub mod bundle_aggregate_cap;
 pub mod bundle_per_period_cap;
 pub mod bundle_per_tx_cap;
 pub mod bundle_rate_limit;
 pub mod counterparty_allowlist;
+pub mod descriptor;
 pub mod home_domain_resolved;
 pub mod inner_invocation_count_cap;
+pub mod memo_binding;
 pub mod minimum_reserve;
 pub mod per_period_cap;
 pub mod per_tx_cap;
@@ -47,8 +56,10 @@ pub mod restrict_bundle_to_recognised_kinds;
 pub mod sep10_session_active;
 pub mod sep45_session_active;
 pub mod state_store;
+pub mod total_budget;
 
 pub use approval_above::ApprovalAboveCriterion;
+pub use balance_floor::BalanceFloorCriterion;
 pub use bundle_aggregate_cap::BundleAggregateCapCriterion;
 pub use bundle_per_period_cap::BundlePerPeriodCapCriterion;
 pub use bundle_per_tx_cap::BundlePerTxCapCriterion;
@@ -56,6 +67,7 @@ pub use bundle_rate_limit::BundleRateLimitCriterion;
 pub use counterparty_allowlist::CounterpartyAllowlistCriterion;
 pub use home_domain_resolved::HomeDomainResolvedCriterion;
 pub use inner_invocation_count_cap::InnerInvocationCountCapCriterion;
+pub use memo_binding::MemoBindingCriterion;
 pub use minimum_reserve::MinimumReserveCriterion;
 pub use per_period_cap::PerPeriodCapCriterion;
 pub use per_tx_cap::PerTxCapCriterion;
@@ -65,6 +77,7 @@ pub use restrict_bundle_to_recognised_kinds::RestrictBundleToRecognisedKindsCrit
 pub use sep10_session_active::Sep10SessionActiveCriterion;
 pub use sep45_session_active::Sep45SessionActiveCriterion;
 pub use state_store::{PolicyStateStore, WindowEntry, WindowLimit};
+pub use total_budget::TotalBudgetCriterion;
 
 /// A single policy criterion evaluated against an [`EvalContext`].
 ///
@@ -108,6 +121,11 @@ pub trait Criterion: Send + Sync + std::fmt::Debug + std::any::Any {
     /// type.
     fn kind(&self) -> &'static str;
 
+    /// Returns whether this criterion holds windowed accounting state.
+    fn windowed(&self) -> bool {
+        false
+    }
+
     /// Checks the criterion using the deny-only interface.
     ///
     /// An unmet threshold fails closed here. Rule evaluation uses
@@ -125,6 +143,18 @@ pub trait Criterion: Send + Sync + std::fmt::Debug + std::any::Any {
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when the evaluator
     /// encounters an internal error (e.g. state-store I/O failure).
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError>;
+
+    /// Sizes one accounting entry without changing the state store.
+    ///
+    /// # Errors
+    /// Returns an evaluation error when the entry cannot be sized.
+    fn size(
+        &self,
+        _ctx: &EvalContext<'_>,
+        _now_ms: u64,
+    ) -> Result<Option<WindowEntry>, PolicyError> {
+        Ok(None)
+    }
 
     /// Evaluates this criterion's pass, denial, or approval escalation.
     ///
@@ -168,6 +198,21 @@ pub trait Criterion: Send + Sync + std::fmt::Debug + std::any::Any {
     /// amount caps) is never enforced for that criterion.  Per-inner stateful
     /// criteria (`per_period_cap`, `rate_limit`) MUST keep the default `false`.
     fn is_bundle_level(&self) -> bool {
+        false
+    }
+
+    /// Whether this criterion records each inner transfer of a confirmed
+    /// bundle as a call of its own.
+    ///
+    /// [`crate::policy::v1::PolicyEngineV1::record_confirmed_bundle`] gives
+    /// such a criterion one context per inner, valued and classified as
+    /// [`crate::policy::v1::PolicyEngineV1::evaluate_bundle`] evaluated it, and
+    /// fails when an inner cannot be sized. The bundle evaluation therefore
+    /// refuses an unrecognized inner under a rule carrying such a criterion
+    /// before it evaluates any inner.
+    ///
+    /// Default `false`.
+    fn records_bundle_inners(&self) -> bool {
         false
     }
 
@@ -241,6 +286,14 @@ pub trait Criterion: Send + Sync + std::fmt::Debug + std::any::Any {
         _ctx: &EvalContext<'_>,
     ) -> Result<Vec<state_store::WindowEntry>, PolicyError> {
         Ok(Vec::new())
+    }
+
+    /// The amount limits this criterion configures, from its signed fields.
+    ///
+    /// Default: none. `per_tx_cap`, `per_period_cap`, `total_budget`, and the
+    /// `budget` mode of `counterparty_allowlist` override this.
+    fn descriptors(&self) -> Vec<descriptor::BucketDescriptor> {
+        Vec::new()
     }
 }
 
@@ -316,11 +369,15 @@ mod tests {
         profile: &'a Profile,
         store: &'a PolicyStateStore,
     ) -> EvalContext<'a> {
-        EvalContext::new(tool, args, "alice", profile, store)
+        EvalContext::new(tool, args, "alice", profile, store, 1_700_000_000_000)
     }
 
     #[test]
+    #[serial_test::serial]
     fn bundle_level_criteria_short_circuit_on_single_tx_context() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = ToolDescriptor::from_registration(&McpToolRegistration {
             name: "stellar_pay",
             destructive_hint: true,
@@ -396,7 +453,11 @@ mod tests {
     /// criterion (which does not override `accumulate_overlay`) must leave the
     /// overlay unchanged after being called.
     #[test]
+    #[serial_test::serial]
     fn default_accumulate_overlay_is_noop() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 
         #[derive(Debug)]
@@ -524,5 +585,25 @@ mod tests {
         assert_send_sync::<Box<dyn Criterion>>();
         // Also verify the concrete type used by the engine.
         assert_send_sync::<PerTxCapCriterion>();
+    }
+    #[test]
+    #[serial_test::serial]
+    fn criterion_size_defaults_to_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let tool = ToolDescriptor::from_registration(&McpToolRegistration {
+            name: "stellar_pay",
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind: crate::policy::ToolValueKind::MovesValue,
+        });
+        let args = serde_json::Value::Null;
+        let profile = Profile::builder_testnet("criterion", "acct", "n", "acct").build();
+        let store = PolicyStateStore::new();
+        let ctx = single_tx_ctx(&tool, &args, &profile, &store);
+        let criterion = per_tx_cap::PerTxCapCriterion::new("native".into(), 100);
+        assert!(criterion.size(&ctx, 1).unwrap().is_none());
     }
 }

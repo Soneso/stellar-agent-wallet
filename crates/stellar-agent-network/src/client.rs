@@ -24,12 +24,19 @@ use tokio::time::Instant;
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::endpoint_identity::{EndpointIdentity, check_protocol_version};
+use crate::endpoint_identity::{
+    EndpointIdentity, SigningLedgerObservation, check_protocol_version,
+};
 use crate::fees::FeeStatsView;
 use crate::redact::{quote_server_text, redact_url_authority};
 use crate::retry::{RetryPolicy, is_retryable_identity_error, rejected_status, retry_with_backoff};
 use crate::submit::MAINNET_PASSPHRASE;
 use crate::transaction_record::TransactionRecord;
+
+/// The XDR depth limit `stellar-rpc-client` encodes a `sendTransaction`
+/// envelope and decodes a refused send's result under; the wallet's own send
+/// request and its status read use the same one.
+const SEND_XDR_DEPTH_LIMIT: u32 = 500;
 
 /// The text that replaces a credential in an error or log text.
 const REDACTED_CREDENTIAL: &str = "[redacted]";
@@ -192,8 +199,19 @@ pub struct TransactionStatusView {
 /// ```
 #[non_exhaustive]
 pub struct StellarRpcClient {
-    pub(crate) inner: Client,
-    pub(crate) url: RpcEndpoint,
+    pub(crate) inner: std::sync::Arc<Client>,
+    pub(crate) url: std::sync::Arc<RpcEndpoint>,
+    id: u64,
+    #[cfg(test)]
+    identity_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The next client identity; every construction takes one, so two clients
+/// of one process never share an identity.
+static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_client_id() -> u64 {
+    NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl StellarRpcClient {
@@ -221,8 +239,47 @@ impl StellarRpcClient {
         let endpoint = RpcEndpoint::plain(url);
         let inner = Client::new(url).map_err(|e| construction_failure(&endpoint, &e))?;
         Ok(Self {
-            inner,
-            url: endpoint,
+            inner: std::sync::Arc::new(inner),
+            url: std::sync::Arc::new(endpoint),
+            id: next_client_id(),
+            #[cfg(test)]
+            identity_requests: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    pub(crate) fn share_for_witness(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            url: self.url.clone(),
+            id: self.id,
+            #[cfg(test)]
+            identity_requests: self.identity_requests.clone(),
+        }
+    }
+
+    /// The URL the transport sends requests to, which a test transport
+    /// route sets apart from [`Self::url`].
+    #[cfg(test)]
+    pub(crate) fn transport_base_url(&self) -> &str {
+        self.inner.base_url()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_test_transport(
+        endpoint_url: &str,
+        transport_url: &str,
+    ) -> Result<Self, WalletError> {
+        #[cfg(feature = "test-hooks")]
+        CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+        let endpoint = RpcEndpoint::plain(endpoint_url);
+        let inner =
+            Client::new(transport_url).map_err(|error| construction_failure(&endpoint, &error))?;
+        Ok(Self {
+            inner: std::sync::Arc::new(inner),
+            url: std::sync::Arc::new(endpoint),
+            id: next_client_id(),
+            #[cfg(test)]
+            identity_requests: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -313,9 +370,22 @@ impl StellarRpcClient {
         let endpoint = RpcEndpoint::credentialed(url, value, placement);
         let inner = built.map_err(|e| construction_failure(&endpoint, &e))?;
         Ok(Self {
-            inner,
-            url: endpoint,
+            inner: std::sync::Arc::new(inner),
+            url: std::sync::Arc::new(endpoint),
+            id: next_client_id(),
+            #[cfg(test)]
+            identity_requests: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    /// The client's process-unique identity, assigned at construction.
+    ///
+    /// The [`EndpointIdentity`] this client produces carries it, so a fact
+    /// established through one client is never taken for one established
+    /// through another, even against the same endpoint.
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Returns the configured RPC endpoint URL of this client.
@@ -450,9 +520,20 @@ impl StellarRpcClient {
         &self,
         envelope: &TransactionEnvelope,
     ) -> Result<SimulateTransactionResponse, NetworkError> {
-        self.witness_simulate(envelope)
+        crate::retry::retry_preflight_busy(None, || self.witness_simulate(envelope))
             .await
-            .map_err(|e| rpc_unreachable(&self.url, SIMULATE_TRANSACTION_FAILED, &e))
+            .map_err(|e| match e {
+                crate::retry::BusyRetryError::Rpc(e) => {
+                    rpc_unreachable(&self.url, SIMULATE_TRANSACTION_FAILED, &e)
+                }
+                crate::retry::BusyRetryError::Expired => rpc_unreachable(
+                    &self.url,
+                    SIMULATE_TRANSACTION_FAILED,
+                    &stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Custom(
+                        "deadline elapsed".to_owned(),
+                    )),
+                ),
+            })
     }
 
     /// Simulates `envelope` as [`Self::simulate_transaction_envelope`] does
@@ -463,6 +544,7 @@ impl StellarRpcClient {
     /// The request is the same: the envelope as given and no `authMode`
     /// field. The answer's `error` string holds the scrubbed form of the
     /// endpoint's text.
+    /// [`Self::simulate_transaction_envelope`] supplies busy retries around this single request.
     #[allow(
         clippy::result_large_err,
         reason = "the witness classifies the raw transport error before mapping it"
@@ -482,6 +564,23 @@ impl StellarRpcClient {
             *error = self.url.scrub(error);
         }
         Ok(response)
+    }
+
+    /// Reads the endpoint's latest ledger and keeps the raw error, so the
+    /// cross-check witness classifies it as it classifies
+    /// [`Self::witness_simulate`]'s.
+    ///
+    /// The request is `getLatestLedger` with no parameters. Its `sequence`
+    /// bounds the ledger a payment's signature expiration derives from where
+    /// no oracle simulation runs.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the witness classifies the raw transport error before mapping it"
+    )]
+    pub(crate) async fn witness_latest_ledger(
+        &self,
+    ) -> Result<stellar_rpc_client::GetLatestLedgerResponse, stellar_rpc_client::Error> {
+        self.inner.get_latest_ledger().await
     }
 
     /// Asks the endpoint what became of one transaction.
@@ -568,6 +667,109 @@ impl StellarRpcClient {
         Ok(TransactionRecord::from_raw(raw))
     }
 
+    /// Fetches one transaction via one `getTransaction` request and keeps
+    /// the answer's raw fields and coverage.
+    ///
+    /// The JSON answer is captured before any typed deserialization, so a
+    /// missing or invalid field stays absent here instead of failing the
+    /// read. String fields keep the endpoint's text; the creation time keeps
+    /// its raw JSON value for the caller's own time encoding.
+    ///
+    /// # Errors
+    ///
+    /// [`NetworkError::RpcUnreachable`] when the request fails or answers a
+    /// JSON-RPC error, and [`NetworkError::RpcResponseMalformed`] when the
+    /// result is not a JSON object. The `url` field is authority-only.
+    pub async fn get_transaction_observed(
+        &self,
+        hash: &stellar_xdr::Hash,
+    ) -> Result<ObservedTransaction, NetworkError> {
+        self.recovery_transaction(hash)
+            .await
+            .map_err(|error| match error {
+                RecoveryReadError::Rpc(error) => {
+                    rpc_unreachable(&self.url, GET_TRANSACTION_FAILED, &error)
+                }
+                _ => NetworkError::RpcResponseMalformed {
+                    method: "getTransaction".to_owned(),
+                    detail: "the result is not a JSON object".to_owned(),
+                },
+            })
+    }
+
+    pub(crate) async fn recovery_transaction(
+        &self,
+        hash: &stellar_xdr::Hash,
+    ) -> Result<ObservedTransaction, RecoveryReadError> {
+        let mut params = ObjectParams::new();
+        params
+            .insert("hash", hash)
+            .map_err(|_| RecoveryReadError::Shape)?;
+        let answer: serde_json::Value = self
+            .inner
+            .client()
+            .request("getTransaction", params)
+            .await
+            .map_err(stellar_rpc_client::Error::JsonRpc)?;
+        ObservedTransaction::from_json(&answer).ok_or(RecoveryReadError::Shape)
+    }
+
+    pub(crate) async fn recovery_health(&self) -> Result<ObservedHealth, RecoveryReadError> {
+        let answer: serde_json::Value = self
+            .inner
+            .client()
+            .request("getHealth", ObjectParams::new())
+            .await
+            .map_err(stellar_rpc_client::Error::JsonRpc)?;
+        ObservedHealth::from_json(&answer).ok_or(RecoveryReadError::Shape)
+    }
+
+    pub(crate) async fn recovery_identity(&self) -> Result<EndpointIdentity, RecoveryReadError> {
+        let network = self.inner.get_network().await?;
+        self.validate_mainnet_identity(&network)
+            .map_err(RecoveryReadError::Validation)
+    }
+
+    /// Issues `sendTransaction` for `envelope` through the RPC client's
+    /// JSON-RPC transport and returns the endpoint's answer as received, its
+    /// status included.
+    ///
+    /// The request is the one `stellar_rpc_client::Client::send_transaction`
+    /// builds: the envelope as base64 XDR at the client's depth limit, under
+    /// the `transaction` parameter. A request that produced no answer is
+    /// reported the way that method reports it,
+    /// `TransactionSubmissionFailed` prefixed with `No status yet:`, so the
+    /// submit layer's classification of a failure without an answer holds
+    /// for both. The caller reads the status.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the send retry classifies this error with is_retryable_send_error, which takes the RPC client's own error type"
+    )]
+    pub(crate) async fn send_transaction_response(
+        &self,
+        envelope: &TransactionEnvelope,
+    ) -> Result<stellar_rpc_client::SendTransactionResponse, stellar_rpc_client::Error> {
+        let mut params = ObjectParams::new();
+        params.insert(
+            "transaction",
+            stellar_xdr::WriteXdr::to_xdr_base64(
+                envelope,
+                stellar_xdr::Limits::depth(SEND_XDR_DEPTH_LIMIT),
+            )?,
+        )?;
+        #[cfg(feature = "test-hooks")]
+        record_send_attempt_for_test();
+        self.inner
+            .client()
+            .request("sendTransaction", params)
+            .await
+            .map_err(|err| {
+                stellar_rpc_client::Error::TransactionSubmissionFailed(format!(
+                    "No status yet:\n {err:#?}"
+                ))
+            })
+    }
+
     /// Asks the endpoint which network it serves and which protocol it runs,
     /// and returns that identity once it passes every check.
     ///
@@ -616,23 +818,11 @@ impl StellarRpcClient {
         expected_passphrase: &str,
         deadline: Instant,
     ) -> Result<EndpointIdentity, WalletError> {
-        let policy = RetryPolicy::default();
-        let network =
-            retry_with_backoff(&policy, deadline, is_retryable_identity_error, || async {
-                self.inner.get_network().await
-            })
-            .await
-            .map_err(|e| {
-                WalletError::Network(match rejected_status(&e) {
-                    Some(status @ (401 | 403)) => NetworkError::RpcCredentialRejected {
-                        url: self.redacted_url(),
-                        status,
-                    },
-                    _ => NetworkError::EndpointIdentityUnavailable {
-                        url: self.redacted_url(),
-                    },
-                })
-            })?;
+        #[cfg(feature = "test-hooks")]
+        IDENTITY_DEADLINES.with_borrow_mut(|deadlines| deadlines.push(deadline));
+        let network = self
+            .reported_network(&RetryPolicy::default(), deadline)
+            .await?;
 
         // Agreement with a mainnet declaration is still a mainnet write.
         if network.passphrase == MAINNET_PASSPHRASE {
@@ -646,13 +836,160 @@ impl StellarRpcClient {
                 },
             ));
         }
+        self.checked_identity(&network)
+    }
 
+    /// Checks the endpoint's identity once for a signing path and returns a
+    /// read of its latest ledger through this client.
+    ///
+    /// [`Self::endpoint_identity`] runs through this client under `deadline`.
+    /// The returned [`PreparedSigningLedgerRead`] keeps that identity, this
+    /// client, and `deadline` bound together, and each
+    /// [`PreparedSigningLedgerRead::read`] asks `getLatestLedger` through the
+    /// same client under the same deadline. A caller that needs both
+    /// endpoints' identities before it reads either height prepares both
+    /// first. Each height is the endpoint's claim: the caller compares it with
+    /// an observation from another endpoint.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::endpoint_identity`].
+    pub async fn prepare_signing_ledger_observation(
+        &self,
+        expected_passphrase: &str,
+        deadline: Instant,
+    ) -> Result<PreparedSigningLedgerRead<'_>, WalletError> {
+        let identity = self
+            .endpoint_identity(expected_passphrase, deadline)
+            .await?;
+        Ok(PreparedSigningLedgerRead {
+            identity,
+            client: self,
+            deadline,
+        })
+    }
+
+    /// Asks the endpoint which network it serves for a submission under a
+    /// mainnet grant, and returns that identity once the endpoint reports the
+    /// mainnet passphrase and passes the protocol rule.
+    ///
+    /// The same `getNetwork` request, retry classification, `deadline`, and
+    /// identity construction as [`Self::endpoint_identity`]; only the
+    /// passphrase verdict differs: mainnet is required, and every other
+    /// passphrase is refused.
+    ///
+    /// # Errors
+    ///
+    /// - [`NetworkError::RpcCredentialRejected`] and
+    ///   [`NetworkError::EndpointIdentityUnavailable`] as for
+    ///   [`Self::endpoint_identity`].
+    /// - [`NetworkError::EndpointNetworkMismatch`] if the endpoint reports a
+    ///   passphrase other than mainnet's.
+    /// - [`NetworkError::UnsupportedProtocolVersion`] if
+    ///   [`check_protocol_version`] refuses the reported version.
+    pub(crate) async fn mainnet_endpoint_identity(
+        &self,
+        deadline: Instant,
+    ) -> Result<EndpointIdentity, WalletError> {
+        self.mainnet_identity_under(&RetryPolicy::default(), deadline)
+            .await
+    }
+
+    /// The mainnet identity check, its `getNetwork` request issued under
+    /// `policy`.
+    async fn mainnet_identity_under(
+        &self,
+        policy: &RetryPolicy,
+        deadline: Instant,
+    ) -> Result<EndpointIdentity, WalletError> {
+        let network = self.reported_network(policy, deadline).await?;
+        self.validate_mainnet_identity(&network)
+    }
+
+    fn validate_mainnet_identity(
+        &self,
+        network: &stellar_rpc_client::GetNetworkResponse,
+    ) -> Result<EndpointIdentity, WalletError> {
+        if network.passphrase != MAINNET_PASSPHRASE {
+            return Err(WalletError::Network(
+                NetworkError::EndpointNetworkMismatch {
+                    expected: MAINNET_PASSPHRASE.to_owned(),
+                    server: ReportedPassphrase::from_reported(&network.passphrase),
+                },
+            ));
+        }
+        self.checked_identity(network)
+    }
+
+    /// Checks that the endpoint reports mainnet and a supported protocol.
+    ///
+    /// # Errors
+    /// Returns the identity probe errors, or `network.mainnet_write_forbidden`
+    /// without a request when mainnet writes are disabled.
+    pub async fn check_mainnet_endpoint(&self, deadline: Instant) -> Result<(), WalletError> {
+        self.mainnet_endpoint(deadline).await.map(|_| ())
+    }
+
+    /// Returns the checked identity of the mainnet endpoint.
+    ///
+    /// # Errors
+    /// Returns the identity probe errors, or `network.mainnet_write_forbidden`
+    /// without a request when mainnet writes are disabled.
+    pub async fn mainnet_endpoint(
+        &self,
+        deadline: Instant,
+    ) -> Result<EndpointIdentity, WalletError> {
+        #[cfg(feature = "mainnet-write")]
+        {
+            self.mainnet_endpoint_identity(deadline).await
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            let _ = deadline;
+            Err(NetworkError::MainnetWriteForbidden.into())
+        }
+    }
+
+    /// Issues the bounded `getNetwork` request of the identity probes, retried
+    /// as `policy` allows, and maps a failure to the probe's refusal.
+    async fn reported_network(
+        &self,
+        policy: &RetryPolicy,
+        deadline: Instant,
+    ) -> Result<stellar_rpc_client::GetNetworkResponse, WalletError> {
+        retry_with_backoff(policy, deadline, is_retryable_identity_error, || async {
+            #[cfg(test)]
+            self.identity_requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.get_network().await
+        })
+        .await
+        .map_err(|e| {
+            WalletError::Network(match rejected_status(&e) {
+                Some(status @ (401 | 403)) => NetworkError::RpcCredentialRejected {
+                    url: self.redacted_url(),
+                    status,
+                },
+                _ => NetworkError::EndpointIdentityUnavailable {
+                    url: self.redacted_url(),
+                },
+            })
+        })
+    }
+
+    /// Applies the protocol rule to a reported network whose passphrase the
+    /// caller accepted, and builds the identity on this client.
+    fn checked_identity(
+        &self,
+        network: &stellar_rpc_client::GetNetworkResponse,
+    ) -> Result<EndpointIdentity, WalletError> {
         let chain_id = Caip2::from_passphrase(&network.passphrase);
         check_protocol_version(chain_id, network.protocol_version).map_err(WalletError::Network)?;
         Ok(EndpointIdentity::checked(
             chain_id,
             network.protocol_version,
             self.redacted_url(),
+            self.id,
         ))
     }
 
@@ -667,11 +1004,199 @@ impl StellarRpcClient {
     }
 }
 
+/// The transaction hash of an accepted `sendTransaction` answer, read as
+/// `stellar_rpc_client::Client::send_transaction` reads it, with
+/// `TRY_AGAIN_LATER` kept apart.
+///
+/// # Errors
+///
+/// - `TransactionSubmissionFailed` carrying the decoded result for an
+///   `ERROR` answer, `MissingError` when it carries no result, and
+///   `InvalidResponse` when that result does not decode.
+/// - `UnexpectedTransactionStatus("TRY_AGAIN_LATER")` for a
+///   `TRY_AGAIN_LATER` answer: the endpoint did not take the transaction, and
+///   [`is_retryable_send_error`](crate::retry::is_retryable_send_error) resends it.
+/// - `Xdr` when the hash of an accepted answer does not parse.
+#[allow(
+    clippy::result_large_err,
+    reason = "the send retry classifies this error with is_retryable_send_error, which takes the RPC client's own error type"
+)]
+pub(crate) fn accepted_hash(
+    answer: stellar_rpc_client::SendTransactionResponse,
+) -> Result<stellar_xdr::Hash, stellar_rpc_client::Error> {
+    use std::str::FromStr as _;
+    let stellar_rpc_client::SendTransactionResponse {
+        hash,
+        status,
+        error_result_xdr,
+        ..
+    } = answer;
+    if status == "ERROR" {
+        let result = error_result_xdr
+            .ok_or(stellar_rpc_client::Error::MissingError)
+            .and_then(|xdr| {
+                <stellar_xdr::TransactionResult as stellar_xdr::ReadXdr>::read_xdr_base64(
+                    &mut stellar_xdr::Limited::new(
+                        xdr.as_bytes(),
+                        stellar_xdr::Limits::depth(SEND_XDR_DEPTH_LIMIT),
+                    ),
+                )
+                .map_err(|_| stellar_rpc_client::Error::InvalidResponse)
+            })
+            .map(|result| result.result)?;
+        return Err(stellar_rpc_client::Error::TransactionSubmissionFailed(
+            format!("{result:#?}"),
+        ));
+    }
+    if status == crate::retry::SEND_TRY_AGAIN_LATER {
+        return Err(stellar_rpc_client::Error::UnexpectedTransactionStatus(
+            status,
+        ));
+    }
+    Ok(stellar_xdr::Hash::from_str(&hash)?)
+}
+
+/// An endpoint identity checked for a signing path, bound to the client it
+/// was established through and to the deadline of the signing attempt.
+///
+/// [`StellarRpcClient::prepare_signing_ledger_observation`] is the only
+/// constructor. The prepared read keeps its identity, client, and deadline
+/// bound together. Each read checks the client identity before requesting a
+/// height. A read takes no client, identity, or deadline of its own, so every
+/// [`SigningLedgerObservation`] it returns carries the identity of the
+/// endpoint that reported the height, read under the original deadline.
+///
+/// The fields are private, so a value cannot be built outside this crate:
+///
+/// ```compile_fail,E0451
+/// use stellar_agent_network::{EndpointIdentity, PreparedSigningLedgerRead, StellarRpcClient};
+/// fn forge<'a>(
+///     identity: EndpointIdentity,
+///     client: &'a StellarRpcClient,
+///     deadline: tokio::time::Instant,
+/// ) -> PreparedSigningLedgerRead<'a> {
+///     PreparedSigningLedgerRead { identity, client, deadline }
+/// }
+/// ```
+///
+/// Nor can a prepared read move to another client, identity, or deadline:
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::{PreparedSigningLedgerRead, StellarRpcClient};
+/// fn rebind<'a>(prepared: &mut PreparedSigningLedgerRead<'a>, other: &'a StellarRpcClient) {
+///     prepared.client = other;
+/// }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::{EndpointIdentity, PreparedSigningLedgerRead};
+/// fn relabel(prepared: &mut PreparedSigningLedgerRead<'_>, other: EndpointIdentity) {
+///     prepared.identity = other;
+/// }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::PreparedSigningLedgerRead;
+/// fn extend(prepared: &mut PreparedSigningLedgerRead<'_>, later: tokio::time::Instant) {
+///     prepared.deadline = later;
+/// }
+/// ```
+///
+/// The import and the intended calls resolve, so the snippets above fail on
+/// the barrier they name and not on the path:
+///
+/// ```
+/// use stellar_agent_core::error::WalletError;
+/// use stellar_agent_network::{
+///     PreparedSigningLedgerRead, SigningLedgerObservation, StellarRpcClient,
+/// };
+/// async fn observe_twice(
+///     client: &StellarRpcClient,
+///     passphrase: &str,
+///     deadline: tokio::time::Instant,
+/// ) -> Result<[SigningLedgerObservation; 2], WalletError> {
+///     let prepared: PreparedSigningLedgerRead<'_> = client
+///         .prepare_signing_ledger_observation(passphrase, deadline)
+///         .await?;
+///     Ok([prepared.read().await?, prepared.read().await?])
+/// }
+/// let _ = observe_twice;
+/// ```
+pub struct PreparedSigningLedgerRead<'a> {
+    identity: EndpointIdentity,
+    client: &'a StellarRpcClient,
+    deadline: Instant,
+}
+
+impl PreparedSigningLedgerRead<'_> {
+    /// Reads the endpoint's latest ledger through the bound client, under
+    /// the bound deadline, and binds the height to the checked identity and
+    /// the local time of the answer.
+    ///
+    /// The read first checks that the identity names the bound client, and
+    /// requests no height when it does not. Each call sends one
+    /// `getLatestLedger` request, so repeated calls observe the endpoint
+    /// again without checking its identity again.
+    ///
+    /// # Errors
+    ///
+    /// [`NetworkError::RpcUnreachable`] if the identity names another client,
+    /// or if the `getLatestLedger` request does not complete within the
+    /// deadline, fails, or returns a body that does not deserialize. The
+    /// `url` field is authority-only.
+    /// [`stellar_agent_core::error::WalletStateError::ClockError`] if the local
+    /// arrival time cannot be read in store clock milliseconds.
+    pub async fn read(&self) -> Result<SigningLedgerObservation, WalletError> {
+        let client = self.client;
+        if self.identity.client_id() != client.id() {
+            return Err(WalletError::Network(NetworkError::RpcUnreachable {
+                url: client.redacted_url(),
+                reason: PREPARED_READ_CLIENT_MISMATCH.to_owned(),
+            }));
+        }
+        let latest = tokio::time::timeout_at(self.deadline, client.witness_latest_ledger())
+            .await
+            .map_err(|_| {
+                WalletError::Network(NetworkError::RpcUnreachable {
+                    url: client.redacted_url(),
+                    reason: LATEST_LEDGER_DEADLINE_ELAPSED.to_owned(),
+                })
+            })?
+            .map_err(|e| {
+                WalletError::Network(rpc_unreachable(&client.url, GET_LATEST_LEDGER_FAILED, &e))
+            })?;
+        Ok(SigningLedgerObservation::checked(
+            self.identity.clone(),
+            latest.sequence,
+            Instant::now(),
+            crate::mainnet::clock::now_ms()?,
+        ))
+    }
+}
+
+impl std::fmt::Debug for PreparedSigningLedgerRead<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedSigningLedgerRead")
+            .field("identity", &self.identity)
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(feature = "test-hooks")]
 thread_local! {
     /// Calls to [`StellarRpcClient::new`] and [`StellarRpcClient::with_credential`]
     /// on this thread, failed ones included.
     static CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SEND_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IDENTITY_DEADLINES: std::cell::RefCell<Vec<Instant>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Takes the identity deadlines received by clients on the calling test thread.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn take_identity_deadlines_for_test() -> Vec<Instant> {
+    IDENTITY_DEADLINES.take()
 }
 
 /// Returns how many times [`StellarRpcClient::new`] or
@@ -692,6 +1217,39 @@ pub fn constructions_on_this_thread() -> usize {
     CONSTRUCTIONS.with(std::cell::Cell::get)
 }
 
+/// Counts sendTransaction attempts on the calling test thread, including retries.
+/// Current-thread acceptance runtimes read the difference around one payment.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[must_use]
+pub fn send_attempts_on_this_thread() -> usize {
+    SEND_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+/// An opt-in counter shared with an isolated acceptance child.
+///
+/// The counter file lives in the acceptance home, which the marker owner in
+/// `stellar-agent-core` admits only inside a marked fixture directory.
+#[cfg(feature = "test-hooks")]
+#[allow(
+    clippy::expect_used,
+    reason = "an enabled acceptance observer must record every send"
+)]
+fn record_send_attempt_for_test() {
+    SEND_ATTEMPTS.with(|count| count.set(count.get() + 1));
+    if std::env::var_os("STELLAR_AGENT_TEST_COUNT_SENDS").is_some() {
+        use std::io::Write as _;
+        let home = stellar_agent_core::profile::schema::sandboxed_override("STELLAR_AGENT_HOME")
+            .expect("the send observer requires an isolated acceptance home");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(home.join("payment-send-attempts"))
+            .expect("acceptance send counter");
+        writeln!(file, "send").expect("append acceptance send count");
+    }
+}
+
 /// Builds the error for a transport that refuses to construct for `endpoint`.
 ///
 /// The `url` field carries the authority form (scheme://host\[:port\]). Credentials
@@ -707,6 +1265,15 @@ pub(crate) const GET_LEDGER_ENTRIES_FAILED: &str = "getLedgerEntries failed: ";
 
 /// The reason prefix of a failed `getHealth` call.
 const GET_HEALTH_FAILED: &str = "getHealth failed: ";
+
+/// The reason prefix of a failed `getLatestLedger` call.
+const GET_LATEST_LEDGER_FAILED: &str = "getLatestLedger failed: ";
+
+/// The reason of a `getLatestLedger` call its deadline cut off.
+const LATEST_LEDGER_DEADLINE_ELAPSED: &str = "getLatestLedger exceeded its deadline";
+
+/// The reason of a prepared read whose identity names another client.
+const PREPARED_READ_CLIENT_MISMATCH: &str = "the prepared read is bound to another client";
 
 /// The reason prefix of a failed `getTransaction` call.
 const GET_TRANSACTION_FAILED: &str = "getTransaction failed: ";
@@ -755,6 +1322,116 @@ pub(crate) fn unexpected_status(
     }
 }
 
+/// One endpoint's `getTransaction` answer as received, with its coverage.
+///
+/// Built by [`StellarRpcClient::get_transaction_observed`]. A field the
+/// answer omits, or holds in another JSON type, is `None`. Coverage ledgers
+/// are positive 32-bit ledger numbers or `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObservedTransaction {
+    /// The status text as received.
+    pub status: Option<String>,
+    /// The including ledger.
+    pub ledger: Option<u32>,
+    /// The raw `createdAt` value: a number, a string or another JSON value.
+    pub created_at: Option<serde_json::Value>,
+    /// The transaction hash text as received.
+    pub tx_hash: Option<String>,
+    /// The envelope XDR text as received.
+    pub envelope_xdr: Option<String>,
+    /// The result XDR text as received.
+    pub result_xdr: Option<String>,
+    /// The endpoint's latest ledger.
+    pub latest_ledger: Option<u32>,
+    /// The endpoint's oldest retained ledger.
+    pub oldest_ledger: Option<u32>,
+    /// The raw close time at the latest retention boundary.
+    pub latest_ledger_close_time: Option<serde_json::Value>,
+    /// The raw close time at the oldest retention boundary.
+    pub oldest_ledger_close_time: Option<serde_json::Value>,
+}
+
+impl ObservedTransaction {
+    /// Reads the fields of a `getTransaction` result object; `None` when
+    /// `answer` is not an object.
+    #[must_use]
+    pub fn from_json(answer: &serde_json::Value) -> Option<Self> {
+        let object = answer.as_object()?;
+        let text = |name: &str| {
+            object
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let ledger = |name: &str| {
+            object
+                .get(name)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+        };
+        let coverage = |name: &str| ledger(name).filter(|value| *value > 0);
+        Some(Self {
+            status: text("status"),
+            ledger: ledger("ledger"),
+            created_at: object
+                .get("createdAt")
+                .filter(|value| !value.is_null())
+                .cloned(),
+            tx_hash: text("txHash"),
+            envelope_xdr: text("envelopeXdr"),
+            result_xdr: text("resultXdr"),
+            latest_ledger: coverage("latestLedger"),
+            oldest_ledger: coverage("oldestLedger"),
+            latest_ledger_close_time: object.get("latestLedgerCloseTime").cloned(),
+            oldest_ledger_close_time: object.get("oldestLedgerCloseTime").cloned(),
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RecoveryReadError {
+    #[error(transparent)]
+    Rpc(Box<stellar_rpc_client::Error>),
+    #[error("the response has an invalid shape")]
+    Shape,
+    #[error(transparent)]
+    Validation(#[from] WalletError),
+}
+
+impl From<stellar_rpc_client::Error> for RecoveryReadError {
+    fn from(error: stellar_rpc_client::Error) -> Self {
+        Self::Rpc(Box::new(error))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ObservedHealth {
+    pub(crate) health: GetHealthResponse,
+    pub(crate) latest_close: u64,
+    pub(crate) oldest_close: u64,
+}
+
+impl ObservedHealth {
+    fn from_json(answer: &serde_json::Value) -> Option<Self> {
+        let time = |key: &str| {
+            let value = answer.get(key)?;
+            value.as_u64().or_else(|| value.as_str()?.parse().ok())
+        };
+        let observation = Self {
+            health: serde_json::from_value(answer.clone()).ok()?,
+            latest_close: time("latestLedgerCloseTime")?,
+            oldest_close: time("oldestLedgerCloseTime")?,
+        };
+        let health = &observation.health;
+        (health.oldest_ledger > 0
+            && health.latest_ledger >= health.oldest_ledger
+            && health.ledger_retention_window > 0
+            && observation.oldest_close > 0
+            && observation.latest_close >= observation.oldest_close)
+            .then_some(observation)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -768,6 +1445,166 @@ mod tests {
     use crate::redact::rpc_error_fixtures::{
         ECHOED_URL, ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_error,
     };
+
+    /// The enabled send observer counts in a marked home and panics with its
+    /// message in an unmarked one, which then holds no counter file.
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    #[serial_test::serial]
+    fn send_observer_counts_in_a_marked_home_and_panics_in_an_unmarked_one() {
+        use stellar_agent_test_support::env_guard::ScopedEnvVar;
+        let _enabled = ScopedEnvVar::new("STELLAR_AGENT_TEST_COUNT_SENDS", Some("1".as_ref()));
+        let home = tempfile::tempdir().unwrap();
+        let counter = home.path().join("payment-send-attempts");
+        let _home = ScopedEnvVar::new("STELLAR_AGENT_HOME", Some(home.path().as_os_str()));
+        let payload = std::panic::catch_unwind(record_send_attempt_for_test)
+            .expect_err("an unmarked home panics");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied());
+        assert_eq!(
+            message,
+            Some("the send observer requires an isolated acceptance home"),
+            "unmarked home panic message"
+        );
+        assert!(!counter.exists(), "unmarked home holds no counter");
+        stellar_agent_test_support::sandbox::mark_sandbox(home.path()).unwrap();
+        record_send_attempt_for_test();
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap(),
+            "send\n",
+            "marked home counts the send"
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_simulate_retries_busy() {
+        use stellar_baselib::{
+            account::{Account, AccountBehavior},
+            transaction::TransactionBehavior,
+            transaction_builder::{TransactionBuilder, TransactionBuilderBehavior},
+        };
+        for busy in [2, 4] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                    serde_json::json!({
+                        "latestLedger": 123, "minResourceFee": "100",
+                        "results": [{"auth": [], "xdr": "AAAAAQ=="}]
+                    }),
+                ))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(|request: &wiremock::Request| {
+                    let body: serde_json::Value = request.body_json().unwrap();
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": body["id"],
+                        "error": {"code": -32004, "message": "preflight queue full"}
+                    }))
+                })
+                .with_priority(1)
+                .up_to_n_times(busy)
+                .mount(&server)
+                .await;
+            let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+            let mut account = Account::new(&source, "0").unwrap();
+            let envelope =
+                TransactionBuilder::new(&mut account, "Test SDF Network ; September 2015", None)
+                    .fee(100_u32)
+                    .add_operation(stellar_xdr::Operation {
+                        source_account: None,
+                        body: stellar_xdr::OperationBody::Inflation,
+                    })
+                    .build_for_simulation()
+                    .to_envelope()
+                    .unwrap();
+            let result = StellarRpcClient::new(&server.uri())
+                .unwrap()
+                .simulate_transaction_envelope(&envelope)
+                .await;
+            if busy == 2 {
+                assert_eq!(result.unwrap().latest_ledger, 123);
+            } else {
+                assert!(
+                    matches!(result, Err(NetworkError::RpcUnreachable { ref reason, .. }) if reason.starts_with("simulateTransaction failed: ")),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                if busy == 2 { 3 } else { 4 }
+            );
+        }
+    }
+
+    /// Coverage ledgers survive only as positive 32-bit numbers: missing and
+    /// invalid values stay absent, equal values both survive, and the raw
+    /// time and texts are kept as received. One request per read.
+    #[tokio::test]
+    async fn transaction_coverage_missing_invalid_and_equal() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        let cases = [
+            (serde_json::json!({}), None, None),
+            (
+                serde_json::json!({"latestLedger": 500, "oldestLedger": 500}),
+                Some(500),
+                Some(500),
+            ),
+            (
+                serde_json::json!({"latestLedger": "500", "oldestLedger": -1}),
+                None,
+                None,
+            ),
+            (
+                serde_json::json!({"latestLedger": 0, "oldestLedger": 4_294_967_296_u64}),
+                None,
+                None,
+            ),
+            (
+                serde_json::json!({"latestLedger": 7.5, "oldestLedger": null}),
+                None,
+                None,
+            ),
+            (
+                serde_json::json!({"latestLedger": 900, "oldestLedger": 10}),
+                Some(900),
+                Some(10),
+            ),
+        ];
+        let hash = stellar_xdr::Hash([7; 32]);
+        for (coverage, latest, oldest) in cases {
+            let mut body = serde_json::json!({
+                "status": "NOT_FOUND",
+                "createdAt": "-5",
+                "txHash": "AB07",
+            });
+            for (name, value) in coverage.as_object().unwrap() {
+                body[name] = value.clone();
+            }
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(stellar_agent_test_support::EchoIdResponder::new(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = StellarRpcClient::new(&server.uri()).unwrap();
+            let observed = client.get_transaction_observed(&hash).await.unwrap();
+            assert_eq!(observed.latest_ledger, latest, "{coverage}");
+            assert_eq!(observed.oldest_ledger, oldest, "{coverage}");
+            assert_eq!(observed.status.as_deref(), Some("NOT_FOUND"));
+            assert_eq!(observed.created_at, Some(serde_json::json!("-5")));
+            assert_eq!(observed.tx_hash.as_deref(), Some("AB07"));
+            assert_eq!(observed.ledger, None);
+            server.verify().await;
+        }
+        assert_eq!(
+            ObservedTransaction::from_json(&serde_json::json!([1])),
+            None
+        );
+    }
 
     fn unreachable_parts(err: NetworkError) -> (String, String) {
         match err {
@@ -784,6 +1621,7 @@ mod tests {
             "",
             GET_LEDGER_ENTRIES_FAILED,
             GET_HEALTH_FAILED,
+            GET_LATEST_LEDGER_FAILED,
             GET_TRANSACTION_FAILED,
             SIMULATE_TRANSACTION_FAILED,
         ];
@@ -1207,5 +2045,118 @@ mod tests {
             "{out}"
         );
         assert!(out.ends_with("\"..."), "{out}");
+    }
+    #[cfg(not(feature = "mainnet-write"))]
+    #[test]
+    fn check_mainnet_endpoint_refuses_feature_off_without_request() {
+        let client = StellarRpcClient::new("http://127.0.0.1:1").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            client
+                .mainnet_endpoint(Instant::now() + std::time::Duration::from_secs(1))
+                .await
+        });
+        assert_eq!(
+            client
+                .identity_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), "network.mainnet_write_forbidden");
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    async fn check_mainnet_endpoint_accepts_mainnet() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                stellar_agent_test_support::signed_envelope::get_network_result(
+                    stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+                ),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        StellarRpcClient::new(&server.uri())
+            .unwrap()
+            .check_mainnet_endpoint(Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    async fn check_mainnet_endpoint_refuses_testnet() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                stellar_agent_test_support::signed_envelope::get_network_result(
+                    stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                ),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = StellarRpcClient::new(&server.uri())
+            .unwrap()
+            .check_mainnet_endpoint(Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "network.endpoint_network_mismatch");
+    }
+
+    /// A prepared read whose identity names another client sends no request
+    /// and refuses with the binding reason under the endpoint's authority. The
+    /// same client bound to its own identity reads.
+    #[tokio::test]
+    async fn prepared_read_refuses_a_mismatched_client() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                serde_json::json!({"id": "ab".repeat(32), "sequence": 1000, "protocolVersion": 29}),
+            ))
+            .mount(&server)
+            .await;
+        let client = StellarRpcClient::new(&format!("{}/rpc?token=SECRET", server.uri())).unwrap();
+        let other = StellarRpcClient::new(&server.uri()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let identity_of = |client_id| {
+            EndpointIdentity::checked(Some(Caip2::Testnet), 29, client.redacted_url(), client_id)
+        };
+
+        let mismatched = PreparedSigningLedgerRead {
+            identity: identity_of(other.id()),
+            client: &client,
+            deadline,
+        };
+        match mismatched.read().await {
+            Err(WalletError::Network(NetworkError::RpcUnreachable { url, reason })) => {
+                assert_eq!(url, server.uri());
+                assert_eq!(reason, PREPARED_READ_CLIENT_MISMATCH);
+            }
+            other => panic!("a mismatched binding must refuse: {other:?}"),
+        }
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no height is requested"
+        );
+
+        let bound = PreparedSigningLedgerRead {
+            identity: identity_of(client.id()),
+            client: &client,
+            deadline,
+        };
+        assert_eq!(bound.read().await.unwrap().ledger(), 1000);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

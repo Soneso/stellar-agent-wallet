@@ -16,11 +16,8 @@ use std::net::SocketAddr;
 pub enum RemoteConfigValidationError {
     /// `bind` does not parse as a `SocketAddr` (e.g. `"host:port"` form
     /// without a numeric IP, or a malformed address).
-    #[error("remote_approval.bind is not a valid socket address: {bind:?}")]
-    InvalidBindAddress {
-        /// The offending configured value.
-        bind: String,
-    },
+    #[error("remote_approval.bind must be an IP address and port")]
+    InvalidBindAddress,
 
     /// `rp_id` is empty.
     #[error("remote_approval.rp_id must not be empty")]
@@ -30,21 +27,15 @@ pub enum RemoteConfigValidationError {
     /// forbids IP-literal Relying Party IDs: a passkey bound to an IP
     /// address cannot be verified by a browser, which requires the RP-ID to
     /// be a registrable domain suffix of the page's origin hostname.
-    #[error("remote_approval.rp_id must be a DNS hostname, not an IP literal: {rp_id:?}")]
-    RpIdIsIpLiteral {
-        /// The offending configured value.
-        rp_id: String,
-    },
+    #[error("remote_approval.rp_id must be a DNS hostname, not an IP literal")]
+    RpIdIsIpLiteral,
 
     /// `rp_id` contains characters that cannot appear in a DNS hostname
     /// (anything outside `a`-`z`, `A`-`Z`, `0`-`9`, `-`, and `.` as a label
     /// separator), or has a malformed label (empty, or starting/ending with
     /// `-`).
-    #[error("remote_approval.rp_id is not a well-formed DNS hostname: {rp_id:?}")]
-    RpIdNotAHostname {
-        /// The offending configured value.
-        rp_id: String,
-    },
+    #[error("remote_approval.rp_id must be a well-formed DNS hostname")]
+    RpIdNotAHostname,
 }
 
 /// Validates `bind` and `rp_id` for remote-approval start, fail-closed.
@@ -59,11 +50,9 @@ pub fn validate_remote_config(
     bind: &str,
     rp_id: &str,
 ) -> Result<SocketAddr, RemoteConfigValidationError> {
-    let addr = bind.parse::<SocketAddr>().map_err(|_| {
-        RemoteConfigValidationError::InvalidBindAddress {
-            bind: bind.to_owned(),
-        }
-    })?;
+    let addr = bind
+        .parse::<SocketAddr>()
+        .map_err(|_| RemoteConfigValidationError::InvalidBindAddress)?;
 
     validate_rp_id(rp_id)?;
 
@@ -84,22 +73,16 @@ pub fn validate_rp_id(rp_id: &str) -> Result<(), RemoteConfigValidationError> {
     }
 
     if rp_id.parse::<std::net::IpAddr>().is_ok() {
-        return Err(RemoteConfigValidationError::RpIdIsIpLiteral {
-            rp_id: rp_id.to_owned(),
-        });
+        return Err(RemoteConfigValidationError::RpIdIsIpLiteral);
     }
     // Bracketed IPv6 literals (`"[::1]"`) do not parse as `IpAddr` directly;
     // reject the bracket form explicitly too.
     if rp_id.starts_with('[') && rp_id.ends_with(']') {
-        return Err(RemoteConfigValidationError::RpIdIsIpLiteral {
-            rp_id: rp_id.to_owned(),
-        });
+        return Err(RemoteConfigValidationError::RpIdIsIpLiteral);
     }
 
     if rp_id.len() > 253 || !is_well_formed_hostname(rp_id) {
-        return Err(RemoteConfigValidationError::RpIdNotAHostname {
-            rp_id: rp_id.to_owned(),
-        });
+        return Err(RemoteConfigValidationError::RpIdNotAHostname);
     }
 
     Ok(())
@@ -129,8 +112,14 @@ fn is_well_formed_hostname(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::panic, reason = "test-only")]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test-only"
+    )]
     use super::*;
+    use stellar_agent_test_support::rejected_value::{assert_refusal_text, capture_refusal};
 
     #[test]
     fn valid_config_parses() {
@@ -143,7 +132,7 @@ mod tests {
         let err = validate_remote_config("not-an-address", "wallet.internal").unwrap_err();
         assert!(matches!(
             err,
-            RemoteConfigValidationError::InvalidBindAddress { .. }
+            RemoteConfigValidationError::InvalidBindAddress
         ));
     }
 
@@ -152,7 +141,7 @@ mod tests {
         let err = validate_remote_config("0.0.0.0", "wallet.internal").unwrap_err();
         assert!(matches!(
             err,
-            RemoteConfigValidationError::InvalidBindAddress { .. }
+            RemoteConfigValidationError::InvalidBindAddress
         ));
     }
 
@@ -165,24 +154,15 @@ mod tests {
     #[test]
     fn rejects_ipv4_literal_rp_id() {
         let err = validate_remote_config("0.0.0.0:8443", "203.0.113.5").unwrap_err();
-        assert!(matches!(
-            err,
-            RemoteConfigValidationError::RpIdIsIpLiteral { .. }
-        ));
+        assert!(matches!(err, RemoteConfigValidationError::RpIdIsIpLiteral));
     }
 
     #[test]
     fn rejects_ipv6_literal_rp_id() {
         let err = validate_remote_config("0.0.0.0:8443", "::1").unwrap_err();
-        assert!(matches!(
-            err,
-            RemoteConfigValidationError::RpIdIsIpLiteral { .. }
-        ));
+        assert!(matches!(err, RemoteConfigValidationError::RpIdIsIpLiteral));
         let err2 = validate_remote_config("0.0.0.0:8443", "[::1]").unwrap_err();
-        assert!(matches!(
-            err2,
-            RemoteConfigValidationError::RpIdIsIpLiteral { .. }
-        ));
+        assert!(matches!(err2, RemoteConfigValidationError::RpIdIsIpLiteral));
     }
 
     #[test]
@@ -195,7 +175,7 @@ mod tests {
         ] {
             let err = validate_remote_config("0.0.0.0:8443", bad).unwrap_err();
             assert!(
-                matches!(err, RemoteConfigValidationError::RpIdNotAHostname { .. }),
+                matches!(err, RemoteConfigValidationError::RpIdNotAHostname),
                 "expected RpIdNotAHostname for {bad:?}, got {err:?}"
             );
         }
@@ -214,5 +194,42 @@ mod tests {
                 "expected {good:?} to be accepted"
             );
         }
+    }
+
+    #[test]
+    fn rejected_input_remote_config() {
+        capture_refusal(|| {
+            let error =
+                validate_remote_config("CREDMARKER7", "wallet.example").expect_err("invalid bind");
+            assert!(matches!(
+                error,
+                RemoteConfigValidationError::InvalidBindAddress
+            ));
+            assert_refusal_text(
+                &error,
+                "remote_approval.bind must be an IP address and port",
+            );
+            let error = validate_remote_config("127.0.0.1:8443", "CREDMARKER7!")
+                .expect_err("invalid hostname");
+            assert!(matches!(
+                error,
+                RemoteConfigValidationError::RpIdNotAHostname
+            ));
+            assert_refusal_text(
+                &error,
+                "remote_approval.rp_id must be a well-formed DNS hostname",
+            );
+            let error = validate_remote_config("127.0.0.1:8443", "[CREDMARKER7]")
+                .expect_err("bracket form");
+            assert!(matches!(
+                error,
+                RemoteConfigValidationError::RpIdIsIpLiteral
+            ));
+            assert_refusal_text(
+                &error,
+                "remote_approval.rp_id must be a DNS hostname, not an IP literal",
+            );
+            assert!(validate_remote_config("127.0.0.1:8443", "wallet.example").is_ok());
+        });
     }
 }

@@ -234,6 +234,7 @@ async fn run_create_account_preflight(
     let key_xdr = account_ledger_key_xdr(SOURCE_G);
 
     crate::common::mount_testnet_identity(mock_server).await;
+    crate::common::mount_ready_endpoint(mock_server).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(serde_json::json!({
             "entries": [
@@ -259,6 +260,7 @@ async fn run_create_account_preflight(
             // 1 XLM starting balance = 10_000_000 stroops.
             starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
             classic_base: None,
+            business_id: None,
         })
         .await
 }
@@ -267,6 +269,9 @@ async fn run_create_account_preflight(
 #[tokio::test]
 #[serial]
 async fn create_account_preflight_subentry0_insufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let fee = FEE_STROOPS;
     let starting_balance = 10_000_000_i64;
@@ -279,6 +284,9 @@ async fn create_account_preflight_subentry0_insufficient() {
 #[tokio::test]
 #[serial]
 async fn create_account_preflight_subentry0_sufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let fee = FEE_STROOPS;
     let starting_balance = 10_000_000_i64;
@@ -294,6 +302,9 @@ async fn create_account_preflight_subentry0_sufficient() {
 #[tokio::test]
 #[serial]
 async fn create_account_preflight_subentry1_insufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let fee = FEE_STROOPS;
     let starting_balance = 10_000_000_i64;
@@ -306,6 +317,9 @@ async fn create_account_preflight_subentry1_insufficient() {
 #[tokio::test]
 #[serial]
 async fn create_account_preflight_subentry1_sufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let fee = FEE_STROOPS;
     let starting_balance = 10_000_000_i64;
@@ -318,6 +332,9 @@ async fn create_account_preflight_subentry1_sufficient() {
 #[tokio::test]
 #[serial]
 async fn create_account_preflight_subentry5_insufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let fee = FEE_STROOPS;
     let starting_balance = 10_000_000_i64;
@@ -330,6 +347,9 @@ async fn create_account_preflight_subentry5_insufficient() {
 #[tokio::test]
 #[serial]
 async fn create_account_preflight_subentry5_sufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let fee = FEE_STROOPS;
     let starting_balance = 10_000_000_i64;
@@ -342,6 +362,9 @@ async fn create_account_preflight_subentry5_sufficient() {
 #[tokio::test]
 #[serial]
 async fn create_account_preflight_subentry25_insufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let fee = FEE_STROOPS;
     let starting_balance = 10_000_000_i64;
@@ -354,6 +377,9 @@ async fn create_account_preflight_subentry25_insufficient() {
 #[tokio::test]
 #[serial]
 async fn create_account_preflight_subentry25_sufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let fee = FEE_STROOPS;
     let starting_balance = 10_000_000_i64;
@@ -405,6 +431,7 @@ fn make_non_native_pay_args(amount_str: &str) -> StellarPayArgs {
         memo_hash_hex: None,
         memo_return_hex: None,
         classic_base: None,
+        business_id: None,
     }
 }
 
@@ -415,6 +442,9 @@ fn make_non_native_pay_args(amount_str: &str) -> StellarPayArgs {
 #[tokio::test]
 #[serial]
 async fn pay_nonnative_preflight_trustline_missing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use base64::Engine;
     use keyring_core::Entry;
 
@@ -433,6 +463,7 @@ async fn pay_nonnative_preflight_trustline_missing() {
 
     // Mock returns ONLY the account entry — no trustline.
     crate::common::mount_testnet_identity(&mock_server).await;
+    crate::common::mount_ready_endpoint(&mock_server).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(mock_result_account_only(
             &account_xdr,
@@ -455,6 +486,9 @@ async fn pay_nonnative_preflight_trustline_missing() {
 #[tokio::test]
 #[serial]
 async fn pay_nonnative_preflight_trustline_balance_insufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use base64::Engine;
     use keyring_core::Entry;
 
@@ -476,6 +510,7 @@ async fn pay_nonnative_preflight_trustline_balance_insufficient() {
     let tl_key = trustline_ledger_key_xdr(SOURCE_G, "USDC", USDC_ISSUER_G);
 
     crate::common::mount_testnet_identity(&mock_server).await;
+    crate::common::mount_ready_endpoint(&mock_server).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(mock_result_with_trustline(
             &account_xdr,
@@ -501,6 +536,9 @@ async fn pay_nonnative_preflight_trustline_balance_insufficient() {
 #[tokio::test]
 #[serial]
 async fn pay_nonnative_preflight_xlm_fee_insufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use base64::Engine;
     use keyring_core::Entry;
 
@@ -524,6 +562,7 @@ async fn pay_nonnative_preflight_xlm_fee_insufficient() {
     let tl_key = trustline_ledger_key_xdr(SOURCE_G, "USDC", USDC_ISSUER_G);
 
     crate::common::mount_testnet_identity(&mock_server).await;
+    crate::common::mount_ready_endpoint(&mock_server).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(mock_result_with_trustline(
             &account_xdr,
@@ -556,6 +595,9 @@ async fn pay_nonnative_preflight_xlm_fee_insufficient() {
 #[tokio::test]
 #[serial]
 async fn create_account_preflight_subentry_u32_max_returns_insufficient_balance() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     // balance = 1 stroop; reserves for u32::MAX subentries are astronomically
     // higher, so saturating_sub(reserves) = 0 < required.
@@ -605,6 +647,7 @@ async fn run_pay_native_preflight(
     // First call: getLedgerEntries for the source account (pre-flight balance check).
     // Limited to one response so the SEP-29 check picks up the second mock.
     crate::common::mount_testnet_identity(mock_server).await;
+    crate::common::mount_ready_endpoint(mock_server).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(serde_json::json!({
             "entries": [
@@ -646,6 +689,7 @@ async fn run_pay_native_preflight(
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: None,
+            business_id: None,
         })
         .await
 }
@@ -669,6 +713,7 @@ async fn run_pay_native_preflight_with_profile_fee(
     let key_xdr = account_ledger_key_xdr(SOURCE_G);
 
     crate::common::mount_testnet_identity(&mock_server).await;
+    crate::common::mount_ready_endpoint(&mock_server).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(serde_json::json!({
             "entries": [
@@ -710,6 +755,7 @@ async fn run_pay_native_preflight_with_profile_fee(
                 memo_hash_hex: None,
                 memo_return_hex: None,
                 classic_base: None,
+                business_id: None,
             })
             .await,
     )
@@ -719,6 +765,9 @@ async fn run_pay_native_preflight_with_profile_fee(
 #[tokio::test]
 #[serial]
 async fn pay_native_profile_fee_override_sets_envelope_total_fee() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let response = run_pay_native_preflight_with_profile_fee(Some(250)).await;
     let data = response
         .get("data")
@@ -735,6 +784,9 @@ async fn pay_native_profile_fee_override_sets_envelope_total_fee() {
 #[tokio::test]
 #[serial]
 async fn pay_native_profile_fee_none_uses_default_envelope_total_fee() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let response = run_pay_native_preflight_with_profile_fee(None).await;
     let data = response
         .get("data")
@@ -757,6 +809,9 @@ async fn pay_native_profile_fee_none_uses_default_envelope_total_fee() {
 #[tokio::test]
 #[serial]
 async fn pay_native_preflight_subentry0_insufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let amount = 10_000_000_i64;
     let min_balance = pay_native_min_balance(0, amount, FEE_STROOPS);
@@ -768,6 +823,9 @@ async fn pay_native_preflight_subentry0_insufficient() {
 #[tokio::test]
 #[serial]
 async fn pay_native_preflight_subentry0_sufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let amount = 10_000_000_i64;
     let min_balance = pay_native_min_balance(0, amount, FEE_STROOPS);
@@ -779,6 +837,9 @@ async fn pay_native_preflight_subentry0_sufficient() {
 #[tokio::test]
 #[serial]
 async fn pay_native_preflight_subentry1_insufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let amount = 10_000_000_i64;
     let min_balance = pay_native_min_balance(1, amount, FEE_STROOPS);
@@ -790,6 +851,9 @@ async fn pay_native_preflight_subentry1_insufficient() {
 #[tokio::test]
 #[serial]
 async fn pay_native_preflight_subentry1_sufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let amount = 10_000_000_i64;
     let min_balance = pay_native_min_balance(1, amount, FEE_STROOPS);
@@ -801,6 +865,9 @@ async fn pay_native_preflight_subentry1_sufficient() {
 #[tokio::test]
 #[serial]
 async fn pay_native_preflight_subentry5_insufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let amount = 10_000_000_i64;
     let min_balance = pay_native_min_balance(5, amount, FEE_STROOPS);
@@ -812,6 +879,9 @@ async fn pay_native_preflight_subentry5_insufficient() {
 #[tokio::test]
 #[serial]
 async fn pay_native_preflight_subentry5_sufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let amount = 10_000_000_i64;
     let min_balance = pay_native_min_balance(5, amount, FEE_STROOPS);
@@ -823,6 +893,9 @@ async fn pay_native_preflight_subentry5_sufficient() {
 #[tokio::test]
 #[serial]
 async fn pay_native_preflight_subentry25_insufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let amount = 10_000_000_i64;
     let min_balance = pay_native_min_balance(25, amount, FEE_STROOPS);
@@ -834,6 +907,9 @@ async fn pay_native_preflight_subentry25_insufficient() {
 #[tokio::test]
 #[serial]
 async fn pay_native_preflight_subentry25_sufficient() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let mock_server = MockServer::start().await;
     let amount = 10_000_000_i64;
     let min_balance = pay_native_min_balance(25, amount, FEE_STROOPS);
@@ -851,6 +927,9 @@ async fn pay_native_preflight_subentry25_sufficient() {
 #[serial]
 async fn pay_nonnative_preflight_succeeds_when_trustline_balance_sufficient_and_xlm_fee_affordable()
 {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     use base64::Engine;
     use keyring_core::Entry;
 
@@ -873,6 +952,7 @@ async fn pay_nonnative_preflight_succeeds_when_trustline_balance_sufficient_and_
     // First call: getLedgerEntries for account + trustline (pre-flight balance check).
     // Limited to one response so the SEP-29 check picks up the second mock.
     crate::common::mount_testnet_identity(&mock_server).await;
+    crate::common::mount_ready_endpoint(&mock_server).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(mock_result_with_trustline(
             &account_xdr,
@@ -917,6 +997,7 @@ async fn pay_issued_amount_simulates_tst_envelope() {
         .unwrap();
     let rpc = MockServer::start().await;
     crate::common::mount_testnet_identity(&rpc).await;
+    crate::common::mount_ready_endpoint(&rpc).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(mock_result_with_trustline(
             &account_entry_xdr(SOURCE_G, 200_000_000, 1),

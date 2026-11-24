@@ -248,7 +248,7 @@ async fn authorize(args: MppAuthorizeArgs) -> i32 {
     let profile_name = resolved.name.clone();
     let (profile, context) = match load_testnet_profile(&resolved) {
         Ok(profile) => profile,
-        Err(error) => return render_profile_error(&error, &profile_name),
+        Err(error) => return render_profile_error(&error),
     };
 
     // Halt check, fresh and resumed authorizations alike: before the keyring
@@ -407,6 +407,7 @@ async fn commit_cli(
     record: &stellar_agent_mpp::AuthorizationRecord,
     now_unix: i64,
 ) -> i32 {
+    crate::commands::submission_record::observe_intents(profile, profile_name).await;
     let engine =
         match build_v1_policy_engine("mpp charge", &profile.policy.engine, profile, profile_name) {
             Ok(engine) => engine,
@@ -459,6 +460,13 @@ async fn commit_cli(
     // charge is in the log before the signing key loads. Fail closed: no
     // drain, no signing.
     if let Err(error) = drain_consent_rows_before_signing(profile, profile_name) {
+        return render_wallet_error(&error);
+    }
+    // The identity record must serve this profile before the lazy handle can
+    // read the seed at the signing call. MPP runs on testnet only.
+    if let Err(error) =
+        stellar_agent_network::keyring::read_and_check_signer_binding(profile_name, profile, None)
+    {
         return render_wallet_error(&error);
     }
     let signer = match lazy_signer_from_keyring(
@@ -583,7 +591,7 @@ fn status(args: &MppStatusArgs) -> i32 {
     let profile_name = resolved.name.clone();
     let (profile, _context) = match load_testnet_profile(&resolved) {
         Ok(profile) => profile,
-        Err(error) => return render_profile_error(&error, &profile_name),
+        Err(error) => return render_profile_error(&error),
     };
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
@@ -613,7 +621,7 @@ fn record_receipt(args: &MppReceiptArgs) -> i32 {
     let profile_name = resolved.name.clone();
     let (profile, _context) = match load_testnet_profile(&resolved) {
         Ok(profile) => profile,
-        Err(error) => return render_profile_error(&error, &profile_name),
+        Err(error) => return render_profile_error(&error),
     };
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
@@ -689,7 +697,7 @@ async fn reconcile(args: MppReconcileArgs) -> i32 {
     let profile_name = resolved.name.clone();
     let (profile, context) = match load_testnet_profile(&resolved) {
         Ok(profile) => profile,
-        Err(error) => return render_profile_error(&error, &profile_name),
+        Err(error) => return render_profile_error(&error),
     };
 
     if init_platform_keyring_store().is_err() {
@@ -746,7 +754,7 @@ fn prune(args: &MppPruneArgs) -> i32 {
     let (profile, context) =
         match load_testnet_profile(&ResolvedProfileName::from_flag(&args.profile)) {
             Ok(profile) => profile,
-            Err(error) => return render_profile_error(&error, &args.profile),
+            Err(error) => return render_profile_error(&error),
         };
 
     let reason = match read_selected_input(
@@ -812,6 +820,7 @@ fn evaluate_policy(
     effects: &stellar_agent_core::policy::v1::ValueEffects,
 ) -> Result<ApprovalDisposition, MppError> {
     let descriptor = policy_descriptor(context, tool_name);
+    let now_ms = stellar_agent_core::policy::policy_now_ms().map_err(|_| state_error())?;
     let evaluation = engine
         .evaluate_with_value_full(
             &descriptor,
@@ -823,6 +832,7 @@ fn evaluate_policy(
             None,
             None,
             None,
+            now_ms,
         )
         .map_err(|_| state_error())?;
     match evaluation.decision {
@@ -884,10 +894,10 @@ fn testnet_context(profile: &Profile) -> Result<NetworkContext, MppProfileError>
 /// The access arm keeps the profile subsystem's own wire code — including
 /// `profile.name_mismatch` — so an agent can tell a mistyped or copied profile
 /// apart from an MPP state failure.
-fn render_profile_error(error: &MppProfileError, profile_name: &str) -> i32 {
+fn render_profile_error(error: &MppProfileError) -> i32 {
     match error {
         MppProfileError::Access(e) => {
-            print_json(&profile_access_envelope(e, profile_name));
+            print_json(&profile_access_envelope(e));
             1
         }
         MppProfileError::Network(e) => render_error(e),
@@ -961,6 +971,10 @@ fn print_success(value: impl Serialize) {
 
 #[allow(clippy::print_stdout, reason = "CLI result channel")]
 fn print_json(value: &impl Serialize) {
+    #[cfg(test)]
+    if let Ok(value) = serde_json::to_value(value) {
+        tests::RENDERED.with(|rendered| rendered.borrow_mut().push(value));
+    }
     println!(
         "{}",
         serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned())
@@ -1021,7 +1035,7 @@ fn render_wallet_error(error: &WalletError) -> i32 {
     1
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     stellar_agent_core::timefmt::now_unix_ms()
         .map(|ms| i64::try_from(ms / 1_000).unwrap_or(i64::MAX))
         .unwrap_or(i64::MAX)
@@ -1031,14 +1045,21 @@ fn redact_reference(value: &str) -> String {
     format!("{}...{}", &value[..8], &value[value.len() - 8..])
 }
 
-/// Retains a typed policy refusal across the service's MPP error boundary.
+/// Retains a typed policy refusal, a denial or a total-budget epoch refusal,
+/// across the service's MPP error boundary.
 fn accounting_error(
     error: stellar_agent_network::policy_state::WindowStoreError,
     refusal: &Mutex<Option<WalletError>>,
 ) -> stellar_agent_mpp::BeforeSignError {
-    if let stellar_agent_network::policy_state::WindowStoreError::PolicyDenied { reason } = error {
+    let typed = match error {
+        stellar_agent_network::policy_state::WindowStoreError::PolicyDenied { reason } => {
+            Some(WalletError::PolicyDenied { reason })
+        }
+        other => other.total_epoch_error().map(WalletError::Validation),
+    };
+    if let Some(typed) = typed {
         if let Ok(mut slot) = refusal.lock() {
-            *slot = Some(WalletError::PolicyDenied { reason });
+            *slot = Some(typed);
         }
         stellar_agent_mpp::BeforeSignError::PolicyRefused(state_error())
     } else {
@@ -1137,6 +1158,98 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn muxed_contract_challenge_refuses_before_state() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().expect("keyring");
+        let input = stellar_agent_mpp::ChallengeInput::Mcp {
+            challenges: vec![serde_json::json!({
+                "id": "challenge", "realm": "merchant", "method": "stellar", "intent": "charge",
+                "expires": stellar_agent_core::timefmt::format_rfc3339_utc(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(300)),
+                "request": {
+                    "amount": "10", "currency": stellar_strkey::Contract([8; 32]).to_string().as_str(),
+                    "recipient": stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string(),
+                    "methodDetails": {"network": "stellar:testnet", "feePayer": true}
+                }
+            })],
+            selected_challenge_id: None,
+            context: stellar_agent_mpp::McpRequestContext::from_params(
+                "merchant",
+                stellar_agent_mpp::McpOperationKind::Tool,
+                "charge",
+                None,
+            )
+            .expect("context"),
+        };
+        let mut ordinary = input.clone();
+        if let stellar_agent_mpp::ChallengeInput::Mcp { challenges, .. } = &mut ordinary {
+            challenges[0]["request"]["recipient"] = serde_json::json!(
+                stellar_strkey::ed25519::PublicKey([1; 32])
+                    .to_string()
+                    .as_str()
+            );
+        }
+        let now = i64::try_from(stellar_agent_core::timefmt::now_unix_ms().expect("clock") / 1000)
+            .expect("time");
+        stellar_agent_mpp::select_and_validate(&ordinary, now).expect("valid ordinary challenge");
+        let path = home.path().join("challenge.json");
+        fs::write(&path, serde_json::to_vec(&input).expect("input")).expect("write");
+        let args = MppAuthorizeArgs {
+            profile: None,
+            input_stdin: false,
+            input_file: Some(path),
+            approval_id: None,
+        };
+        let payer = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+        let profile =
+            Profile::builder_testnet("svc", payer.as_str(), "nonce-svc", "nonce-acct").build();
+        let context = NetworkContext::new(
+            "stellar:testnet".parse().expect("chain"),
+            crate::common::network::TESTNET_RPC_URL.to_owned(),
+        );
+        RENDERED.with(|rows| rows.borrow_mut().clear());
+        let now = stellar_agent_core::timefmt::now_unix_ms().expect("clock") / 1000;
+        assert_eq!(
+            prepare_and_authorize_without_state(
+                &context,
+                &args,
+                "operator",
+                profile,
+                i64::try_from(now).expect("time")
+            )
+            .await,
+            1
+        );
+        RENDERED.with(|rows| {
+            assert_eq!(
+                rows.borrow().last().expect("row")["error"]["code"],
+                "mpp.challenge_invalid"
+            )
+        });
+        assert_eq!(
+            std::fs::read_dir(home.path())
+                .expect("state")
+                .filter(|entry| entry.as_ref().expect("entry").file_name()
+                    != stellar_agent_test_support::sandbox::MARKER)
+                .count(),
+            1
+        );
+    }
+
+    thread_local! {
+        pub(super) static RENDERED: std::cell::RefCell<Vec<serde_json::Value>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
     fn put_raw(entry_ref: &stellar_agent_core::profile::schema::KeyringEntryRef, value: &str) {
         keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
             .expect("entry")
@@ -1152,6 +1265,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_attestation_loader_refuses_owner_key_forms() {
+        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use base64::Engine as _;
         use stellar_agent_core::profile::schema::KeyringEntryRef;
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
@@ -1192,7 +1309,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_context_derives_the_canonical_passphrase() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = Profile::builder_testnet_named("context", "s", "a", "n", "a")
             .with_noop_engine()
             .build();
@@ -1205,7 +1327,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_context_refuses_mainnet_with_network_error() {
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = Profile::builder_mainnet_named(
             "context",
             "https://rpc.example.invalid",
@@ -1257,6 +1384,40 @@ mod tests {
             stellar_agent_mpp::BeforeSignError::Accounting(_)
         ));
         assert!(refusal.lock().expect("refusal lock").is_none());
+    }
+
+    #[test]
+    fn accounting_epoch_refusal_preserves_its_code() {
+        use stellar_agent_network::policy_state::WindowStoreError;
+        for (error, code) in [
+            (
+                WindowStoreError::TotalEpochUnavailable {
+                    detail: "pin unreadable".to_owned(),
+                },
+                "policy.total_epoch_unavailable",
+            ),
+            (
+                WindowStoreError::TotalEpochStale,
+                "policy.total_epoch_stale",
+            ),
+            (
+                WindowStoreError::TotalEpochRetired,
+                "policy.total_epoch_retired",
+            ),
+        ] {
+            let refusal = Mutex::new(None);
+            let classified = accounting_error(error, &refusal);
+            assert!(matches!(
+                classified,
+                stellar_agent_mpp::BeforeSignError::PolicyRefused(_)
+            ));
+            let error = refusal
+                .lock()
+                .expect("refusal lock")
+                .take()
+                .expect("typed epoch refusal");
+            assert_eq!(error.code(), code);
+        }
     }
 
     #[derive(Parser)]
@@ -1501,10 +1662,15 @@ mod tests {
         });
         let encoded = URL_SAFE_NO_PAD
             .encode(stellar_agent_mpp::json::canonical_json(&request).expect("canonical request"));
+        let expires_unix = u64::try_from(now_unix() + 300).expect("positive clock");
+        let expires = stellar_agent_core::timefmt::format_rfc3339_utc(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(expires_unix),
+        );
         ChallengeInput::Http {
             www_authenticate: vec![format!(
                 "Payment id=\"cli-challenge-{round}\", realm=\"merchant.example\", \
-                 method=\"stellar\", intent=\"charge\", request={encoded}"
+                 method=\"stellar\", intent=\"charge\", request={encoded}, \
+                 expires=\"{expires}\""
             )],
             selected_challenge_id: None,
             context: stellar_agent_mpp::HttpRequestContext::new(
@@ -1602,8 +1768,8 @@ mod tests {
     }
 
     struct StageCase {
-        _home: TempDir,
         _guard: stellar_agent_test_support::StellarAgentHomeGuard,
+        _home: stellar_agent_test_support::sandbox::StateSandbox,
         _mock: wiremock::MockServer,
         profile: Profile,
         signed: Arc<std::sync::atomic::AtomicUsize>,
@@ -1615,7 +1781,13 @@ mod tests {
         seed_secret: bool,
         configure: impl FnOnce(&mut Simulate, &Path),
     ) -> StageCase {
-        let home = TempDir::new().expect("home");
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("test home");
+        assert!(
+            home.path()
+                .join(stellar_agent_test_support::sandbox::MARKER)
+                .is_file(),
+            "owned wallet root is marked before the home guard"
+        );
         let guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
         let payer = g_strkey(seed);
@@ -1645,6 +1817,7 @@ mod tests {
             .mount(&mock)
             .await;
         let profile = stage_profile(name, &payer, home.path(), &mock.uri());
+        crate::common::identity_fixture::store_signer_identity_of_seed(name, &profile, seed);
         StageCase {
             _home: home,
             _guard: guard,
@@ -1847,7 +2020,13 @@ mod tests {
 
         // `approve --id` beside this process: queue the row, then persist.
         let entry = approvals.get(&nonce).expect("pending entry").clone();
-        let outbox = AuditOutbox::for_log(&case.profile.audit_log_path);
+        let outbox = AuditOutbox::for_log(
+            &case.profile.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &case.profile.audit_log_hash_chain_key_id,
+                &case.profile.audit_log_path,
+            ),
+        );
         attest_and_persist(
             &mut approvals,
             &entry,
@@ -1855,7 +2034,9 @@ mod tests {
             &AttestationBinding::new(NAME, "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Outbox(&outbox),
-            None,
+            stellar_agent_core::approval::ConsentAuthorization::Standard(
+                &stellar_agent_core::approval::AttestedApprover::Local,
+            ),
             |_, _| Err("no grant".to_owned()),
         )
         .expect("approve");
@@ -1869,5 +2050,55 @@ mod tests {
             vec![true],
             "the consent row must be in the log when the signed entry reaches the RPC"
         );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    async fn early_observation_precedes_window_gate() {
+        use crate::commands::submission_record::intent_gate_fixture::IntentGateState;
+        let name = "intent-mpp";
+        let mut case = stage_case(name, [0x67; 32], false, |_, _| {}).await;
+        let (authorization, record) = prepare_charge(&case.profile, name, 12, None).await;
+        let state = IntentGateState::seed(name, &mut case.profile).await;
+        let audit_key = &case.profile.audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&audit_key.service, &audit_key.account)
+            .expect("fixture")
+            .delete_credential()
+            .expect("fixture");
+        let context = testnet_context(&case.profile).ok().expect("fixture");
+        for after in [false, false, true] {
+            if after {
+                state.after_retention();
+            }
+            let before = state.bytes();
+            RENDERED.with(|rendered| rendered.borrow_mut().clear());
+            assert_eq!(
+                commit_cli(
+                    &context,
+                    name,
+                    &case.profile,
+                    &authorization,
+                    &record,
+                    now_unix()
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                RENDERED.with(|rendered| {
+                    rendered.borrow().last().expect("command envelope")["error"]["code"].clone()
+                }),
+                if after {
+                    "audit.chain_key_unavailable"
+                } else {
+                    "mpp.approval_invalid"
+                }
+            );
+            state.assert_closed(&case.profile, u32::from(!after)).await;
+            assert_eq!(case.signed.load(std::sync::atomic::Ordering::SeqCst), 0);
+            if after {
+                assert_eq!(state.bytes(), before);
+            }
+        }
     }
 }

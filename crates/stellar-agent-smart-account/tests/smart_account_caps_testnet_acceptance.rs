@@ -142,14 +142,9 @@ fn fresh_deployer() -> (String, DeployerKeypair) {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 200 for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// A testnet rule manager with a signers manager, both writing to one audit
@@ -158,7 +153,7 @@ async fn fund_via_friendbot(g_strkey: &str) {
 fn fresh_rule_manager() -> (ContextRuleManager, TempDir) {
     let (manager, _signers_manager, _audit_log_path, dir) = managers_for_tests(
         TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
+        stellar_agent_test_support::testnet_secondary_rpc_url(),
         Duration::from_secs(TIMEOUT_SECS),
     );
     (manager, dir)
@@ -257,6 +252,7 @@ fn release_binary() -> std::path::PathBuf {
 /// Context rule signer cap: the 16th signer is refused before simulate/submit.
 #[tokio::test]
 async fn h1_16th_signer_refused() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Locate the release binary ─────────────────────────────────────────────
     let binary = release_binary();
     if !binary.exists() {
@@ -374,6 +370,8 @@ async fn h1_16th_signer_refused() {
         smart_account_strkey, rule_id_str, sixteenth_signer_g, TESTNET_RPC_URL, signer_env_var
     );
 
+    stellar_agent_test_support::sandbox::require_isolated_executable(&binary)
+        .expect("isolated acceptance child");
     let output = std::process::Command::new(&binary)
         .args([
             "smart-account",
@@ -804,6 +802,7 @@ async fn deploy_five_distinct_policies_h2(
 /// Context rule policy cap: the 6th policy is refused before simulate/submit.
 #[tokio::test]
 async fn h2_6th_policy_refused() {
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
     // ── Locate the release binary ─────────────────────────────────────────────
     let binary = release_binary();
     if !binary.exists() {
@@ -962,6 +961,8 @@ async fn h2_6th_policy_refused() {
         smart_account_strkey, rule_id_str, sixth_policy_strkey, TESTNET_RPC_URL, signer_env_var
     );
 
+    stellar_agent_test_support::sandbox::require_isolated_executable(&binary)
+        .expect("isolated acceptance child");
     let output = std::process::Command::new(&binary)
         .args([
             "smart-account",

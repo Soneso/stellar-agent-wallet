@@ -44,14 +44,14 @@ verification with HTTP 402 and a fresh challenge. `mppx` 0.9 reports an error
 that `@stellar/mpp` raises during verification as an internal error with HTTP
 500, so the pin stays on the 0.8 line.
 
-The committed fixture records these pins as its generation environment, and
-the check compares its whole content, provenance included.
+The committed fixture records these pins, except `viem`, as its generation
+environment, and the check compares its whole content, provenance included.
 
 The harness carries no pnpm overrides: `@stellar/stellar-sdk@16.4.1` pins
 `axios` 1.20.0 and does not depend on `toml`.
 
-The upstream packages are MIT or Apache-2.0 licensed as recorded in the frozen
-lockfile package metadata. The fixture is generated solely through their public
+The upstream packages are MIT or Apache-2.0 licensed as declared in their package
+manifests. The fixture is generated solely through their public
 challenge, credential, receipt, and sponsored-server APIs.
 
 Run from the repository root:

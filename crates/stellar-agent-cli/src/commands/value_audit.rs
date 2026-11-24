@@ -1,24 +1,26 @@
 //! Shared audit emission for value-moving CLI commands.
 //!
-//! Value verbs (pay, claim, create-account, trustline, trade) record a
-//! hash-chained, HMAC-signed `ValueActionSubmitted` row after the on-chain
-//! action confirms. Emission is NON-FATAL post-success: the transaction has
-//! already committed, so a row-write failure logs a `tracing::warn!` and never
-//! changes the command result or exit code.
+//! Value verbs (pay, claim, create-account, trustline, trade) write their
+//! hash-chained, HMAC-signed `ValueActionPending` row through the submission
+//! recorder before the send, and a confirmed submit writes no further value
+//! row. A row [`write_row_logged`] appends after the act it records is
+//! NON-FATAL: a row-write failure logs at `error` and never changes the
+//! command result or exit code.
 //!
 //! The legs carried in a row are the SAME `ValueEffects` the policy gate sized
 //! (single-derivation invariant); this module only serialises what the caller
 //! supplies and never derives value. Rows are written under the profile's audit
 //! chain-root HMAC key so `stellar-agent audit verify` covers them.
 //!
-//! # Pre-flight (fail-closed) vs. post-confirm (fail-open)
+//! # Pre-flight (fail-closed) vs. rows after the act (fail-open)
 //!
 //! [`require_value_audit_writer`] is the fail-closed pre-flight every
 //! value-moving signing verb calls BEFORE any signing key is touched or
 //! transaction submitted: it proves the audit writer is acquirable, refusing
-//! with `audit.chain_key_unavailable` if not. The verb then threads the
-//! returned writer into [`emit_value_audit_row_with_writer`] for the post-confirm
-//! row, reusing the acquired writer.
+//! with `audit.chain_key_unavailable` if not. A value verb then hands the
+//! returned writer to its submission recorder, which appends the pending row
+//! through it before the send. A row that records an act already done goes
+//! through [`write_row_logged`] on a guard of the writer.
 //!
 //! The reset ceremony acquires the keyed writer before locking the window
 //! store. Its recorder uses the strict append mapping through that writer.
@@ -38,10 +40,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use stellar_agent_core::approval::{DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF};
 use stellar_agent_core::audit_log::{
-    AuditEntry, AuditOutbox, AuditWriter, AuditWriterRegistry, BindingCheck, WriterError,
-    audit_writer_refusal, drain_lock_is_held,
+    AuditEntry, AuditWriter, AuditWriterRegistry, BindingCheck, KeyedAuditAccess, WriterError,
+    audit_writer_refusal,
 };
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
@@ -54,10 +55,11 @@ use crate::common::profile_access::ProfileOrigin;
 /// signing verbs.
 ///
 /// Callers invoke this BEFORE any signing key is touched and BEFORE any
-/// transaction is submitted (see the module docs). A verb with a post-confirm
-/// row reuses the returned writer for it ([`emit_value_audit_row_with_writer`])
-/// rather than re-acquiring it. A verb whose row is written strictly before a
-/// transmission discards the handle, and the strict write acquires again.
+/// transaction is submitted (see the module docs). A value verb hands the
+/// returned writer to its submission recorder, which writes the pending row
+/// through it rather than re-acquiring it. A verb whose row is written
+/// strictly before a transmission discards the handle, and the strict write
+/// acquires again.
 /// [`drain_consent_rows_before_signing`] discards it too: that acquisition
 /// exists for its drain.
 ///
@@ -91,6 +93,10 @@ use crate::common::profile_access::ProfileOrigin;
 ///   replaced. The registry runs that check on every keyed acquisition,
 ///   because cached writers stay live for the process lifetime and the file
 ///   can be replaced while they are open.
+/// - [`ValidationError::AuditTipAnchorMissing`], code
+///   `audit.tip_anchor_missing`, when no anchor is stored for a log that
+///   shows it was anchored before: a recorded audit binding, a chain-root
+///   sidecar, or an `audit_tip_anchored` row.
 /// - [`ValidationError::AuditLogBindingChanged`], code
 ///   `audit.log_binding_changed`, when the profile names a log path or audit
 ///   key other than the binding recorded in the keyring. The profile is
@@ -145,6 +151,58 @@ impl KeyedAcquireError {
     }
 }
 
+/// A local writer open failure, without a command refusal or logging policy.
+#[derive(Debug)]
+pub(crate) enum AuditWriterOpenError {
+    /// The keyring access or profile binding check fails.
+    Access(WalletError),
+    /// The log cannot be opened with the selected access.
+    Writer(WriterError),
+}
+
+impl std::fmt::Display for AuditWriterOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Access(error) => error.fmt(f),
+            Self::Writer(error) => error.fmt(f),
+        }
+    }
+}
+
+/// Loads the key, checks the binding, and attaches the profile's anchor store.
+/// Callers own logging and decide whether the writer is cached.
+fn load_keyed_audit_access(
+    profile: &Profile,
+    profile_name: &str,
+    binding: BindingCheck,
+) -> Result<KeyedAuditAccess, WalletError> {
+    keyed_audit_access(profile, profile_name, binding)
+}
+
+/// Opens a local writer whose drop releases the sidecar lock.
+///
+/// A loaded key supplies the profile's anchor store and drains its outbox.
+/// An unavailable key permits an unkeyed open only if the log shows no keying.
+/// Binding refusals propagate. This function neither registers nor logs.
+///
+/// # Errors
+///
+/// Returns the binding refusal or the typed writer failure.
+pub(crate) fn open_best_effort_audit_writer(
+    profile: &Profile,
+    profile_name: &str,
+    origin: ProfileOrigin,
+) -> Result<AuditWriter, AuditWriterOpenError> {
+    let access = match load_keyed_audit_access(profile, profile_name, origin.binding_check()) {
+        Ok(access) => Some(access),
+        Err(error) if is_binding_refusal(&error) => {
+            return Err(AuditWriterOpenError::Access(error));
+        }
+        Err(_) => None,
+    };
+    AuditWriter::open(profile.audit_log_path.clone(), access).map_err(AuditWriterOpenError::Writer)
+}
+
 /// Acquires the keyed writer with the caller's binding policy and keeps
 /// failures typed. Persisted profiles use [`BindingCheck::Enforce`];
 /// synthesized profiles use [`BindingCheck::CheckOnly`].
@@ -159,7 +217,7 @@ pub(crate) fn acquire_keyed_audit_writer(
     profile_name: &str,
     binding: BindingCheck,
 ) -> Result<Arc<Mutex<AuditWriter>>, KeyedAcquireError> {
-    let access = keyed_audit_access(profile, profile_name, binding).map_err(|e| {
+    let access = load_keyed_audit_access(profile, profile_name, binding).map_err(|e| {
         // A binding refusal keeps its own code and remedy.
         if is_binding_refusal(&e) {
             tracing::warn!(
@@ -178,67 +236,6 @@ pub(crate) fn acquire_keyed_audit_writer(
     })?;
     AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
         .map_err(KeyedAcquireError::Writer)
-}
-
-/// The sink an operator row is written through: the consent row of
-/// `approve --id`, and the halt and resume rows of `profile halt` and
-/// `profile resume`.
-pub(crate) enum OperatorRowSink {
-    /// This process holds the keyed writer.
-    Writer(Arc<Mutex<AuditWriter>>),
-    /// A draining writer in another process holds the log.
-    Outbox(AuditOutbox),
-}
-
-/// Returns `true` when an acquisition failure is contention for the writer's
-/// sidecar lock, the one failure [`acquire_operator_row_sink`] retries and then
-/// resolves by probing the drain lock.
-///
-/// Classified by the typed error. Every other failure, `audit.outbox_busy`
-/// included, refuses the row.
-fn is_sidecar_contention(error: &KeyedAcquireError) -> bool {
-    matches!(error, KeyedAcquireError::Writer(WriterError::FileLocked))
-}
-
-/// Acquires the sink for an operator row.
-///
-/// The keyed writer is acquired through the registry, which drains any queued
-/// rows at open. Sidecar contention is retried with the approval store's
-/// bounded retry, since a CLI command's startup advisory holds the lock
-/// briefly. Still locked, one `try_lock` on the drain lock, released at once,
-/// decides. Held means a draining writer owns the log, such as a running MCP
-/// server, and the row is queued. Free means the holder does not drain, and
-/// the row is refused with `audit.writer_locked`.
-///
-/// # Errors
-///
-/// The [`WalletError`] for any acquisition failure other than contention, and
-/// for contention with a holder that does not drain.
-pub(crate) fn acquire_operator_row_sink(
-    profile: &Profile,
-    profile_name: &str,
-) -> Result<OperatorRowSink, WalletError> {
-    let mut attempt = 0_u32;
-    let contention = loop {
-        attempt += 1;
-        match acquire_keyed_audit_writer(profile, profile_name, BindingCheck::Enforce) {
-            Ok(writer) => return Ok(OperatorRowSink::Writer(writer)),
-            Err(error) if is_sidecar_contention(&error) => {
-                if attempt >= DEFAULT_RETRY_ATTEMPTS {
-                    break error;
-                }
-                std::thread::sleep(DEFAULT_RETRY_BACKOFF);
-            }
-            Err(error) => return Err(error.into_wallet_error(profile_name)),
-        }
-    };
-    match drain_lock_is_held(&profile.audit_log_path) {
-        Ok(true) => Ok(OperatorRowSink::Outbox(AuditOutbox::for_log(
-            &profile.audit_log_path,
-        ))),
-        Ok(false) => Err(contention.into_wallet_error(profile_name)),
-        Err(error) => Err(KeyedAcquireError::Writer(error).into_wallet_error(profile_name)),
-    }
 }
 
 /// Maps a writer-acquisition failure to the wire code that names it, through
@@ -285,14 +282,14 @@ pub(crate) fn audit_writer_open_failed(profile_name: &str) -> WalletError {
 ///   fails closed with `audit.chain_key_unavailable` when the writer cannot be
 ///   acquired. An operator who authored a profile file is expected to run
 ///   `stellar-agent profile rotate-audit-key <name>` before signing.
-/// - [`crate::common::profile_access::ProfileOrigin::Synthesized`] is the zero-config quickstart path — no
-///   profile file, no `rotate-audit-key` step to run. The writer is acquired
-///   opportunistically (a `tracing::warn!` on failure, no refusal), matching
-///   the pre-existing zero-config behavior. Returns `Ok(None)` when the writer
-///   could not be acquired; the caller then skips the post-confirm row rather
-///   than treating the operation as unaudited — there was no audit guarantee
-///   to defeat here, since the operator never persisted a profile in the
-///   first place. A recorded audit binding that differs from the profile's
+/// - [`crate::common::profile_access::ProfileOrigin::Synthesized`] is the zero-config quickstart path, with no
+///   profile file and no `rotate-audit-key` step to run. The writer is
+///   acquired opportunistically: a failure to acquire it logs a
+///   `tracing::warn!` and refuses nothing. Returns `Ok(None)` when the writer
+///   could not be acquired, and the caller then skips the pending row rather
+///   than treating the operation as unaudited. No audit guarantee is defeated
+///   here, since the operator never persisted a profile in the first place.
+///   A recorded audit binding that differs from the profile's
 ///   refuses: the binding check compares without recording, and its refusal
 ///   precedes any signing.
 ///
@@ -333,12 +330,18 @@ pub(crate) fn require_value_audit_writer_for_origin(
 /// and a long-lived MCP server resolves its profile once at startup.
 ///
 /// A binding refusal is returned rather than answered with the unkeyed
-/// fallback, so nothing is written to a log the binding does not name.
+/// fallback, so nothing is written to a log the binding does not name. The
+/// unkeyed open refuses a log that shows keying (tags in force, a tagged row,
+/// a chain-root sidecar, or an anchoring row), so a keyed log is never
+/// appended to without its key.
 ///
 /// # Errors
 ///
 /// - [`ValidationError::AuditLogBindingChanged`] when the profile's audit
 ///   binding changed.
+/// - [`ValidationError::AuditLogUnusable`] with the
+///   `audit.chain_key_unavailable` detail when the key does not load and the
+///   log shows keying.
 /// - [`WalletError`] when even the unkeyed open fails, mapped as the keyed
 ///   acquisition's failures are: a log that cannot be read or written carries
 ///   [`ValidationError::AuditLogUnusable`] with the `audit.io_error` detail.
@@ -376,7 +379,7 @@ fn try_keyed_value_audit_writer(
     profile_name: &str,
     origin: ProfileOrigin,
 ) -> Result<Option<Arc<Mutex<AuditWriter>>>, WalletError> {
-    let access = match keyed_audit_access(profile, profile_name, origin.binding_check()) {
+    let access = match load_keyed_audit_access(profile, profile_name, origin.binding_check()) {
         Ok(access) => access,
         Err(e) if is_binding_refusal(&e) => return Err(e),
         Err(e) => {
@@ -397,36 +400,6 @@ fn try_keyed_value_audit_writer(
                 "value audit: could not open audit writer; writer NOT acquired"
             );
             Ok(None)
-        }
-    }
-}
-
-/// Writes `entry` through an audit writer the caller already acquired (via
-/// [`require_value_audit_writer`]).
-///
-/// Non-fatal: the write has nothing left to gate — the transaction already
-/// committed — so a failure to take the lock or append the row logs a
-/// `tracing::warn!` and returns without disturbing the caller.
-pub(crate) fn emit_value_audit_row_with_writer(
-    writer: &Arc<Mutex<AuditWriter>>,
-    profile_name: &str,
-    entry: AuditEntry,
-) {
-    match writer.lock() {
-        Ok(mut guard) => {
-            if let Err(e) = guard.write_entry(entry) {
-                tracing::warn!(
-                    profile = %profile_name,
-                    error = %e,
-                    "value audit: write_entry failed; row NOT emitted"
-                );
-            }
-        }
-        Err(_) => {
-            tracing::warn!(
-                profile = %profile_name,
-                "value audit: audit writer mutex poisoned; row NOT emitted"
-            );
         }
     }
 }
@@ -542,42 +515,6 @@ mod tests {
 
     use super::*;
 
-    /// The operator-row acquisition is classified by the typed writer error:
-    /// only sidecar contention is retried and resolved through the drain lock.
-    #[test]
-    fn only_sidecar_contention_is_resolved_through_the_drain_lock() {
-        assert!(is_sidecar_contention(&KeyedAcquireError::Writer(
-            WriterError::FileLocked
-        )));
-        for refused in [
-            KeyedAcquireError::KeyUnavailable,
-            KeyedAcquireError::BindingChanged(WalletError::Validation(
-                stellar_agent_core::error::ValidationError::AuditLogBindingChanged {
-                    profile: "p".to_owned(),
-                },
-            )),
-            KeyedAcquireError::Writer(WriterError::OutboxBusy),
-            KeyedAcquireError::Writer(WriterError::OutboxUnusable {
-                line: 1,
-                column: 1,
-                reason: "invalid JSON",
-            }),
-            KeyedAcquireError::Writer(WriterError::TipAnchorMismatch {
-                expected_count: 2,
-                expected_offset: 10,
-                actual_len: 0,
-                reason: "file is shorter than the anchor",
-            }),
-            KeyedAcquireError::Writer(WriterError::Io(std::io::Error::other("disk"))),
-            KeyedAcquireError::Writer(WriterError::TipAnchorUnavailable),
-            KeyedAcquireError::Writer(WriterError::HmacKeyMismatch {
-                profile_name: "p".to_owned(),
-            }),
-        ] {
-            assert!(!is_sidecar_contention(&refused), "{refused:?}");
-        }
-    }
-
     /// End-to-end emission through the REAL acquisition path: the row is written
     /// under the profile's audit chain-root HMAC key loaded from the (mock)
     /// keyring via [`load_audit_hmac_key`] → `AuditWriterRegistry::get_or_open`,
@@ -588,6 +525,9 @@ mod tests {
     #[test]
     #[serial]
     fn emit_value_audit_row_writes_through_real_acquisition_path() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -624,11 +564,12 @@ mod tests {
 
         assert_eq!(
             rows.len(),
-            1,
-            "one row written through the real loader path"
+            2,
+            "the open's boundary row and one row written through the real loader path"
         );
-        assert_eq!(rows[0]["kind"], "value_action_submitted", "row kind");
-        assert_eq!(rows[0]["tool"], "stellar_pay", "outer tool identity");
+        assert_eq!(rows[0]["kind"], "audit_entry_tags_started");
+        assert_eq!(rows[1]["kind"], "value_action_submitted", "row kind");
+        assert_eq!(rows[1]["tool"], "stellar_pay", "outer tool identity");
     }
 
     // ── require_value_audit_writer — the fail-closed pre-flight ──────────────
@@ -641,6 +582,9 @@ mod tests {
     #[test]
     #[serial]
     fn require_value_audit_writer_refuses_when_key_unminted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -662,12 +606,15 @@ mod tests {
 
     /// With a real 32-byte chain-root key seeded (the post-`rotate-audit-key`
     /// state), `require_value_audit_writer` returns `Ok` with a writer that
-    /// writes through to the profile's audit log — the same acquisition
+    /// writes through to the profile's audit log. It is the same acquisition
     /// [`emit_value_audit_row_strict`] performs internally, exposed so the caller can
-    /// reuse it for the post-confirm emission.
+    /// hand it to the submission recorder for the pending row.
     #[test]
     #[serial]
     fn require_value_audit_writer_returns_writer_when_key_seeded() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -695,7 +642,7 @@ mod tests {
             "req-require-1",
             None,
         );
-        emit_value_audit_row_with_writer(&writer, "require-seeded", entry);
+        writer.lock().unwrap().write_entry(entry).unwrap();
 
         let file = std::fs::File::open(&profile.audit_log_path).expect("audit.jsonl exists");
         let rows: Vec<serde_json::Value> = std::io::BufReader::new(file)
@@ -704,9 +651,11 @@ mod tests {
             .collect();
         assert_eq!(
             rows.len(),
-            1,
+            2,
             "the writer returned by require_value_audit_writer must write through"
         );
+        assert_eq!(rows[0]["kind"], "audit_entry_tags_started");
+        assert_eq!(rows[1]["request_id"], "req-require-1");
     }
 
     // ── require_value_audit_writer_for_origin — origin-aware dispatch ───────
@@ -719,6 +668,9 @@ mod tests {
     #[test]
     #[serial]
     fn for_origin_persisted_refuses_when_key_unminted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -746,6 +698,9 @@ mod tests {
     #[test]
     #[serial]
     fn for_origin_synthesized_stays_fail_open_when_key_unminted() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -773,6 +728,9 @@ mod tests {
     #[test]
     #[serial]
     fn for_origin_synthesized_returns_writer_when_key_seeded() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -805,7 +763,7 @@ mod tests {
             "req-origin-synth-1",
             None,
         );
-        emit_value_audit_row_with_writer(&writer, "origin-synth-seeded", entry);
+        writer.lock().unwrap().write_entry(entry).unwrap();
 
         let file = std::fs::File::open(&profile.audit_log_path).expect("audit.jsonl exists");
         let rows: Vec<serde_json::Value> = std::io::BufReader::new(file)
@@ -814,9 +772,11 @@ mod tests {
             .collect();
         assert_eq!(
             rows.len(),
-            1,
+            2,
             "the writer returned on the synthesized path must write through"
         );
+        assert_eq!(rows[0]["kind"], "audit_entry_tags_started");
+        assert_eq!(rows[1]["request_id"], "req-origin-synth-1");
     }
 
     // ── The pre-flight's failure mapping ─────────────────────────────────────
@@ -878,6 +838,63 @@ mod tests {
                 "audit.outbox_unusable",
             ),
             (
+                WriterError::CarrierReplaced {
+                    carrier: stellar_agent_core::audit_log::Carrier::Outbox,
+                },
+                "audit.chain_key_unavailable",
+                "audit.carrier_replaced",
+            ),
+            (
+                WriterError::CarrierGenerationChanged {
+                    held: 1,
+                    current: 2,
+                },
+                "audit.chain_key_unavailable",
+                "audit.carrier_replaced",
+            ),
+            (
+                WriterError::RetainedHistoryUnverified(
+                    stellar_agent_core::audit_log::VerifyError::HmacMismatch {
+                        file: "audit.jsonl.pruned".to_owned(),
+                    },
+                ),
+                "audit.chain_key_unavailable",
+                "audit.history_unverified",
+            ),
+            (
+                WriterError::RetiredOutboxChanged { generation: 1 },
+                "audit.chain_key_unavailable",
+                "audit.outbox_rows_missing",
+            ),
+            (
+                WriterError::CarriersUnbound,
+                "audit.chain_key_unavailable",
+                "audit.carriers_unbound",
+            ),
+            (
+                WriterError::CarrierIdentityUnavailable,
+                "audit.chain_key_unavailable",
+                "audit.carrier_identity_unavailable",
+            ),
+            (
+                WriterError::CarriersBusy,
+                "audit.chain_key_unavailable",
+                "audit.carriers_busy",
+            ),
+            (
+                WriterError::CarrierBindingIncomplete,
+                "audit.chain_key_unavailable",
+                "audit.carrier_binding_incomplete",
+            ),
+            (
+                WriterError::OutboxRowsMissing {
+                    recorded: 2,
+                    found: 1,
+                },
+                "audit.chain_key_unavailable",
+                "audit.outbox_rows_missing",
+            ),
+            (
                 WriterError::RotationBridgeUnusable {
                     archive_name: "audit.jsonl.20260913T120000000".to_owned(),
                     reason: "the archive does not end with a rotation handoff entry",
@@ -896,7 +913,9 @@ mod tests {
             ),
             (
                 WriterError::TipAnchorStore(
-                    stellar_agent_core::audit_log::TipAnchorStoreError::new("keyring locked"),
+                    stellar_agent_core::audit_log::TipAnchorStoreError::new(
+                        "anchor value is unusable",
+                    ),
                 ),
                 "audit.chain_key_unavailable",
                 "audit.tip_anchor_unavailable",
@@ -1010,6 +1029,9 @@ mod tests {
     #[test]
     #[serial]
     fn require_value_audit_writer_refuses_after_the_log_is_replaced_underneath_it() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -1072,47 +1094,60 @@ mod tests {
         );
     }
 
-    /// A log with no anchor is adopted on first use with no operator action —
-    /// the upgrade path for every profile that predates the anchor — and the
-    /// adoption is recorded in the log itself.
+    /// Appends one value row to `profile`'s log through a writer that holds
+    /// no anchor store: keyed when `key` is given, unkeyed otherwise.
+    fn seed_unanchored_log(profile: &Profile, key: Option<zeroize::Zeroizing<[u8; 32]>>) {
+        stellar_agent_core::audit_log::test_helpers::enroll_carriers(
+            &profile.audit_log_path,
+            &stellar_agent_network::keyring::KeyringTipAnchorStore::new(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        )
+        .unwrap();
+        let path = profile.audit_log_path.clone();
+        let mut writer = match key {
+            Some(key) => {
+                stellar_agent_core::audit_log::AuditWriter::open_keyed_unanchored_for_test(
+                    path, key,
+                )
+            }
+            None => stellar_agent_core::audit_log::AuditWriter::open(path, None),
+        }
+        .expect("open unanchored writer");
+        writer
+            .write_entry(AuditEntry::new_value_action_submitted(
+                "stellar_pay",
+                "stellar:testnet",
+                Vec::new(),
+                "abcd1234…wxyz5678",
+                1,
+                stellar_agent_core::audit_log::PolicyDecision::Allow,
+                None,
+                None,
+                None,
+                "req-pre-anchor",
+                None,
+            ))
+            .expect("append");
+    }
+
+    /// A log with enrolled carriers and no anchor records adoption and signs
+    /// its active root on the first keyed use.
     #[test]
     #[serial]
     fn require_value_audit_writer_adopts_an_existing_unanchored_log() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
 
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = keyed_profile("anchor-adopt", dir.path());
-
-        // A log written before the anchor existed: rows present, no anchor.
-        {
-            let key =
-                crate::commands::profile::audit_emit::load_audit_hmac_key(&profile, "test-profile")
-                    .expect("load key");
-            let mut writer =
-                stellar_agent_core::audit_log::AuditWriter::open_keyed_unanchored_for_test(
-                    profile.audit_log_path.clone(),
-                    key,
-                )
-                .expect("open unanchored writer");
-            writer
-                .write_entry(AuditEntry::new_value_action_submitted(
-                    "stellar_pay",
-                    "stellar:testnet",
-                    Vec::new(),
-                    "abcd1234…wxyz5678",
-                    1,
-                    stellar_agent_core::audit_log::PolicyDecision::Allow,
-                    None,
-                    None,
-                    None,
-                    "req-pre-anchor",
-                    None,
-                ))
-                .expect("append");
-        }
+        seed_unanchored_log(&profile, None);
 
         require_value_audit_writer(&profile, "anchor-adopt")
-            .expect("adoption must need no operator action");
+            .expect("the first keyed open adopts and signs the active root");
 
         let file = std::fs::File::open(&profile.audit_log_path).expect("audit.jsonl exists");
         let adopted = std::io::BufReader::new(file)
@@ -1123,6 +1158,39 @@ mod tests {
             .filter(|row| row["kind"] == "audit_tip_anchored" && row["reason"] == "adopted")
             .count();
         assert_eq!(adopted, 1, "adoption must leave exactly one row in the log");
+    }
+
+    /// A log a keyed writer signed carries a chain-root sidecar, which shows a
+    /// keyed writer ran there. With no anchor stored the pre-flight refuses
+    /// with `audit.tip_anchor_missing` and adopts nothing.
+    #[test]
+    #[serial]
+    fn require_value_audit_writer_refuses_a_signed_log_without_an_anchor() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock keyring store");
+
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = keyed_profile("anchor-signed-missing", dir.path());
+        let key =
+            crate::commands::profile::audit_emit::load_audit_hmac_key(&profile, "test-profile")
+                .expect("load key");
+        seed_unanchored_log(&profile, Some(key));
+        let before = std::fs::read(&profile.audit_log_path).expect("read log");
+
+        let err = require_value_audit_writer(&profile, "anchor-signed-missing")
+            .expect_err("a signed log without an anchor must refuse");
+        assert_eq!(err.code(), "audit.tip_anchor_missing", "{err}");
+        assert!(
+            err.to_string().contains("chain-root sidecar"),
+            "the refusal names its evidence: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&profile.audit_log_path).expect("read log"),
+            before,
+            "the refusal writes no row"
+        );
     }
 
     // ── Audit binding ────────────────────────────────────────────────────────
@@ -1159,6 +1227,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_pre_flight_passes_a_binding_refusal_through() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = bound_then_repointed("binding-preflight", dir.path());
@@ -1171,6 +1242,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_pre_flight_records_an_absent_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = keyed_profile("binding-preflight-absent", dir.path());
@@ -1193,6 +1267,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_strict_helper_passes_a_binding_refusal_through() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = bound_then_repointed("binding-strict", dir.path());
@@ -1210,6 +1287,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_strict_helper_under_check_only_records_no_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = keyed_profile("binding-strict-check-only", dir.path());
@@ -1242,6 +1322,9 @@ mod tests {
     #[test]
     #[serial]
     fn the_strict_helper_keeps_chain_key_unavailable_for_other_failures() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let mut profile = Profile::builder_testnet("binding-strict-nokey", "a", "n", "n").build();
@@ -1256,11 +1339,51 @@ mod tests {
         assert_eq!(err.code(), "audit.chain_key_unavailable", "{err}");
     }
 
+    /// An undecodable stored audit key refuses with
+    /// `audit.chain_key_unavailable`, and the message sends that case to
+    /// investigation and removal of the corrupt entry, since
+    /// `rotate-audit-key` refuses a key it cannot decode.
+    #[test]
+    #[serial]
+    fn an_undecodable_audit_key_names_investigation_before_minting() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let name = "undecodable-audit-key";
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let coord = &profile.audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&coord.service, &coord.account)
+            .expect("audit-key entry")
+            .set_password("not base64!")
+            .expect("store an undecodable key");
+        let Err(err) = require_value_audit_writer(&profile, name) else {
+            panic!("an undecodable audit key must refuse");
+        };
+        assert_eq!(err.code(), "audit.chain_key_unavailable", "{err}");
+        assert_eq!(
+            err.message(),
+            format!(
+                "profile '{name}' has no usable audit chain-root key; the command refuses to \
+                 proceed unaudited. A profile whose audit log carries no entry tags mints one \
+                 with `stellar-agent profile rotate-audit-key {name}`. A log under entry tags \
+                 takes rows only under its own key: restore that key to its keyring \
+                 entry, or see docs/maintainers/audit-log-recovery.md section 10. A stored key \
+                 that cannot be read or decoded is refused by the rotation too"
+            )
+        );
+    }
+
     /// The best-effort acquisition returns a binding refusal rather than
     /// opening an unkeyed writer at the repointed path.
     #[test]
     #[serial]
     fn best_effort_returns_a_binding_refusal_instead_of_an_unkeyed_writer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = bound_then_repointed("binding-best-effort", dir.path());
@@ -1280,6 +1403,9 @@ mod tests {
     #[test]
     #[serial]
     fn an_unkeyed_open_failure_reports_the_io_condition() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let blocker = dir.path().join("not-a-directory");
@@ -1305,10 +1431,57 @@ mod tests {
         );
     }
 
+    /// With a key that does not load, the unkeyed fallback refuses a log that
+    /// a keyed writer wrote, and the log is left as it was.
+    #[test]
+    #[serial]
+    fn the_best_effort_fallback_refuses_a_keyed_log() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_core::audit_log::tip_anchor::{
+            InMemoryTipAnchorStore, KeyedAuditAccess, TipAnchorStore,
+        };
+
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let mut profile =
+            Profile::builder_testnet("keyed-fallback", "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        {
+            let access = KeyedAuditAccess::new(
+                zeroize::Zeroizing::new([0x4f; 32]),
+                Arc::new(InMemoryTipAnchorStore::new()) as Arc<dyn TipAnchorStore>,
+            );
+            AuditWriter::open(profile.audit_log_path.clone(), Some(access)).expect("keyed writer");
+        }
+        let before = std::fs::read(&profile.audit_log_path).expect("log");
+
+        let Err(err) = acquire_best_effort_audit_writer(
+            &profile,
+            "keyed-fallback",
+            ProfileOrigin::Synthesized,
+        ) else {
+            panic!("an unkeyed open refuses a keyed log");
+        };
+
+        assert_eq!(err.code(), "audit.chain_key_unavailable", "{err}");
+        assert!(
+            err.message()
+                .contains("only a writer holding the profile's audit key appends to this log"),
+            "{}",
+            err.message()
+        );
+        assert_eq!(std::fs::read(&profile.audit_log_path).expect("log"), before);
+    }
+
     /// A synthesized profile's warn-only pre-flight records no binding.
     #[test]
     #[serial]
     fn a_synthesized_origin_records_no_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = keyed_profile("binding-synthesized", dir.path());
@@ -1335,6 +1508,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_synthesized_origin_refuses_a_changed_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = bound_then_repointed("binding-synthesized-changed", dir.path());
@@ -1354,6 +1530,9 @@ mod tests {
     #[test]
     #[serial]
     fn get_or_open_unkeyed_records_and_checks_no_binding() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = bound_then_repointed("binding-unkeyed", dir.path());
@@ -1428,6 +1607,7 @@ mod tests {
             anchored_path.clone(),
             None,
             Arc::new(InMemoryTipAnchorStore::new()) as Arc<dyn TipAnchorStore>,
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
         .unwrap();
         anchored.write_entry(row()).unwrap();
@@ -1441,5 +1621,57 @@ mod tests {
         assert!(logs.contains("req-refused"), "{logs}");
         assert!(logs.contains("audit write failed"), "{logs}");
         assert_eq!(std::fs::read(&anchored_path).unwrap(), b"", "no row lands");
+    }
+
+    /// Value verbs continue reporting carrier refusals under
+    /// `audit.chain_key_unavailable` with the carrier code at the head of the
+    /// message detail.
+    #[test]
+    #[serial_test::serial]
+    fn value_audit_keeps_chain_key_unavailable_with_carrier_code_head() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Upgraded keyed log with no carrier record -> `audit.chain_key_unavailable`
+        // leading detail with `audit.carriers_unbound:`.
+        let name = "value-audit-unbound";
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = dir.path().join("unbound.jsonl");
+        let coord = profile.audit_log_hash_chain_key_id.clone();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .unwrap();
+        let key = stellar_agent_network::keyring::load_hmac_key_32(&coord).unwrap();
+        {
+            let mut writer =
+                AuditWriter::open_keyed_unanchored_for_test(profile.audit_log_path.clone(), key)
+                    .unwrap();
+            writer
+                .write_entry(AuditEntry::new_profile_halted(
+                    "fixture",
+                    "2026-01-01T00:00:00Z",
+                    None,
+                    "req-unbound",
+                ))
+                .unwrap();
+        }
+        // Existing outbox file beside a keyed log without a carrier record
+        // triggers `CarriersUnbound` (same as an upgraded profile from the
+        // previous release).
+        std::fs::write(
+            stellar_agent_core::audit_log::outbox_path(&profile.audit_log_path),
+            b"",
+        )
+        .unwrap();
+        let error = require_value_audit_writer(&profile, name).unwrap_err();
+        assert_eq!(error.code(), "audit.chain_key_unavailable", "{error}");
+        assert!(
+            error
+                .message()
+                .contains("cannot be audited: audit.carriers_unbound:"),
+            "{error}"
+        );
     }
 }

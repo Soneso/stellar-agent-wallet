@@ -76,7 +76,17 @@
 //! - Stellar-Wallets-Kit `types/mod.ts` — canonical `ModuleInterface` TypeScript definition.
 //! - stellar-xdr `HashIdPreimageSorobanAuthorization` — preimage layout for
 //!   `signAuthEntry` payload computation (see `signing.rs`).
-
+//!
+//! # Feature `mainnet-write`
+//!
+//! `signing::sign_soroban_auth_entry_authorized`, the mainnet `signAuthEntry`
+//! signing under a Soroban intent authorization, exists only in builds with
+//! the `mainnet-write` feature, which also enables it in
+//! `stellar-agent-core` and `stellar-agent-network`.
+#![cfg_attr(
+    not(feature = "mainnet-write"),
+    doc = "```compile_fail\nuse stellar_agent_sep43::signing::sign_soroban_auth_entry_authorized;\n```"
+)]
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![deny(clippy::missing_errors_doc)]

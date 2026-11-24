@@ -5,10 +5,13 @@
 //! and auth digest. Signer bytes are attached through the network-crate
 //! `Signer::sign_auth_digest` sibling primitive.
 
+use crate::submit::CheckedSigningRules;
 use sha2::{Digest as _, Sha256};
+use stellar_agent_core::error::{NetworkError, WalletError};
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 use stellar_agent_core::smart_account::auth_digest::compute_auth_digest;
 use stellar_agent_core::smart_account::rule_id::{ContextRuleId, encode_context_rule_ids};
-use stellar_agent_network::signing::Signer;
+use stellar_agent_network::signing::{Signer, SmartAccountAuthDigest, SorobanAuthPayload};
 use stellar_agent_network::{StellarRpcClient, fetch_account};
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::TransactionBehavior;
@@ -27,6 +30,8 @@ use crate::error::SimulationDivergenceSubCode;
 use crate::signing::divergence::{
     EnvelopeContext, SimulationContext, detect_simulation_divergence,
 };
+use crate::signing::gate::{SignerMatch, SigningGate, SigningRequest};
+use stellar_agent_network::{AuthSubject, SignerDescriptor, SigningPayload};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Classic (Ed25519) source-account auth signature ScVal
@@ -122,11 +127,19 @@ pub struct AuthorizationSimulation {
 /// Stores the digest bytes that must be signed for OZ v0.7.2 `__check_auth`.
 /// Preserves the Soroban-side root invocation and address-credential fields
 /// needed to complete the auth entry.
+///
+/// The fields are public, so the digests are only as trustworthy as the
+/// facts they were computed from: [`Self::validate`] recomputes both from
+/// `network_id`, `nonce`, `signature_expiration_ledger`, `root_invocation`
+/// and `context_rule_ids`, and every function in this crate that signs a
+/// partial calls it before any signer key access.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PartialSorobanAuthorizationEntry {
     /// Smart-account contract address whose credentials will carry the signature.
     pub smart_account: ScAddress,
+    /// SHA-256 network ID the `signature_payload` commits to.
+    pub network_id: [u8; 32],
     /// Soroban address-credential nonce obtained from simulation.
     pub nonce: i64,
     /// Signature expiration ledger obtained from simulation.
@@ -141,6 +154,119 @@ pub struct PartialSorobanAuthorizationEntry {
     pub context_rule_ids: Vec<ContextRuleId>,
 }
 
+impl PartialSorobanAuthorizationEntry {
+    /// Checks that the entry may be signed: its network is not mainnet, and
+    /// its `signature_payload` and `auth_digest` are the values its own facts
+    /// produce.
+    ///
+    /// Recomputes `signature_payload` from `network_id`, `nonce`,
+    /// `signature_expiration_ledger` and `root_invocation`, and `auth_digest`
+    /// from that payload and `context_rule_ids`, so `network_id` cannot
+    /// misstate the network the signature commits to. `smart_account` is
+    /// part of neither digest and is not checked.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::MainnetWriteForbidden`]: `network_id` is the mainnet
+    ///   network ID.
+    /// - [`SaError::AuthEntryBindingMismatch`] with `field`
+    ///   `"signature_payload"` or `"auth_digest"`: the stored digest differs
+    ///   from the recomputed one.
+    /// - [`SaError::AuthEntryConstructionFailed`] at stage
+    ///   `"signature_payload"` or `"context_rule_ids"`: the recomputation
+    ///   could not encode its XDR input.
+    pub fn validate(&self) -> Result<(), SaError> {
+        if self.network_id == network_id_of(MAINNET_PASSPHRASE) {
+            return Err(SaError::MainnetWriteForbidden);
+        }
+        let (signature_payload, auth_digest) = derive_digests(
+            self.network_id,
+            self.nonce,
+            self.signature_expiration_ledger,
+            &self.root_invocation,
+            &self.context_rule_ids,
+        )?;
+        if signature_payload != self.signature_payload {
+            return Err(SaError::AuthEntryBindingMismatch {
+                field: "signature_payload",
+            });
+        }
+        if auth_digest != self.auth_digest {
+            return Err(SaError::AuthEntryBindingMismatch {
+                field: "auth_digest",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates the entry with [`Self::validate`] and returns the digest a
+    /// signer signs for it, built through
+    /// [`SmartAccountAuthDigest::new`] from the entry's own facts: the type 9
+    /// preimage of `network_id`, `nonce`, `signature_expiration_ledger` and
+    /// `root_invocation`, bound to `context_rule_ids`. Its bytes equal
+    /// `auth_digest`, which validation has just recomputed.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::validate`], and
+    /// [`SaError::AuthEntryConstructionFailed`] at stage `"context_rule_ids"`
+    /// or `"signature_payload"` when the typed digest cannot be built.
+    pub(crate) fn signing_digest(&self) -> Result<SmartAccountAuthDigest, SaError> {
+        self.validate()?;
+        let preimage = soroban_authorization_preimage(
+            self.network_id,
+            self.nonce,
+            self.signature_expiration_ledger,
+            self.root_invocation.clone(),
+        );
+        let rule_ids_xdr = encode_context_rule_ids(&self.context_rule_ids).map_err(|e| {
+            SaError::AuthEntryConstructionFailed {
+                stage: "context_rule_ids",
+                redacted_reason: format!("context_rule_ids XDR encode failed before signing: {e}"),
+            }
+        })?;
+        SmartAccountAuthDigest::new(&preimage, &rule_ids_xdr).map_err(|e| match e {
+            WalletError::Network(NetworkError::MainnetWriteForbidden) => {
+                SaError::MainnetWriteForbidden
+            }
+            other => SaError::AuthEntryConstructionFailed {
+                stage: "signature_payload",
+                redacted_reason: format!("auth digest construction failed before signing: {other}"),
+            },
+        })
+    }
+}
+
+/// SHA-256 of a network passphrase: the network ID a Soroban authorization
+/// preimage commits to.
+pub(crate) fn network_id_of(network_passphrase: &str) -> [u8; 32] {
+    Sha256::digest(network_passphrase.as_bytes()).into()
+}
+
+/// Refuses a passphrase that names mainnet, or whose network ID differs from
+/// the network ID `partial` commits to, validates `partial`, and returns the
+/// digest a signer signs for it.
+///
+/// The boundary for every signing function that takes a partial together
+/// with a passphrase: the passphrase drives the delegated G-key entries, the
+/// partial drives the smart-account entry, and both must name one non-mainnet
+/// network.
+fn check_partial_against_passphrase(
+    partial: &PartialSorobanAuthorizationEntry,
+    network_passphrase: &str,
+) -> Result<SmartAccountAuthDigest, SaError> {
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(SaError::MainnetWriteForbidden);
+    }
+    let digest = partial.signing_digest()?;
+    if network_id_of(network_passphrase) != partial.network_id {
+        return Err(SaError::AuthEntryBindingMismatch {
+            field: "network_id",
+        });
+    }
+    Ok(digest)
+}
+
 /// Builds pre-signature state for a smart-account-targeted invocation.
 ///
 /// This is the call-site-of-record that prepares the auth digest later signed
@@ -150,13 +276,9 @@ pub struct PartialSorobanAuthorizationEntry {
 ///
 /// # Sub-invocations
 ///
-/// The `prepared_sub_invocations` parameter carries the sub-invocations list
-/// from Soroban-RPC's `simulateTransaction` response. For single-contract
-/// invocations (all non-multicall paths), this is `VecM::default()` (empty).
-/// For the multicall router path, the simulate response returns the router's
-/// sub-invocations (one per inner); passing them here ensures the auth digest
-/// is computed over the correct `SorobanAuthorizedInvocation` tree, which
-/// matches what the on-chain `__check_auth` will re-hash.
+/// The root invocation carries no sub-invocations. A caller that signs a
+/// tree with sub-invocations uses
+/// [`build_authorization_entry_with_sub_invocations`].
 ///
 /// # Refusal path
 ///
@@ -166,13 +288,24 @@ pub struct PartialSorobanAuthorizationEntry {
 /// - Wallet-internal XDR encode/conversion failure returns
 ///   [`SaError::AuthEntryConstructionFailed`] with the corresponding stage.
 ///
+/// # Divergence check
+///
+/// [`detect_simulation_divergence`] compares `simulation.context` with
+/// `envelope`. In [`crate::submit::submit_signed_invoke`] the two sides come
+/// from different sources: `simulation.context.auth_contexts` holds the node
+/// fingerprints of the simulated invocation tree, and
+/// `envelope.auth_contexts` those of the tree the wallet signs (its own root
+/// with the accepted subtree). A tree the wallet does not sign therefore
+/// refuses here, as a second check behind the root binding and the declared
+/// sub-invocations that `submit_signed_invoke` applies first.
+///
 /// # Errors
 ///
 /// - [`SaError::RuleIdMismatch`] — index-alignment failures between `rule_ids`
 ///   and the simulation auth-context list.
-/// - [`SaError::SimulationDivergence`] — simulation context diverges from the
-///   to-be-submitted envelope (tamper detection: checks both cryptographic binding
-///   and simulation-context consistency).
+/// - [`SaError::SimulationDivergence`]: the simulation context differs from
+///   the envelope context: rule IDs, the per-node auth-context fingerprints
+///   of the simulated and the signed tree, network, sequence or fee envelope.
 /// - [`SaError::AuthEntryConstructionFailed`] — wallet-internal XDR encoding
 ///   or container-conversion failure during auth-entry assembly. Stage values:
 ///   `"context_rule_ids"` (rule-IDs encode), `"auth_contexts_args"` (args
@@ -202,11 +335,12 @@ pub async fn build_authorization_entry(
 /// Identical to [`build_authorization_entry`] but allows the caller to inject
 /// a pre-constructed `sub_invocations` tree into the root invocation.
 ///
-/// Used by the multicall path (`submit_multicall_bundle`) where the
-/// Soroban-RPC simulate response returns sub-invocations for each inner
-/// contract call. Threading these into the auth digest ensures the wallet
-/// signs the correct invocation tree, matching what the on-chain
-/// `__check_auth` will re-verify.
+/// Used by [`crate::submit::submit_signed_invoke`], which passes the
+/// simulated sub-invocations only after they matched the caller's
+/// [`crate::submit::DeclaredSubInvocations`]: a router's token transfer from
+/// the wallet, a DeFindex deposit's transfers, or a multicall router's
+/// wallet-authorized calls. The auth digest then covers the same tree the
+/// on-chain `__check_auth` re-verifies.
 ///
 /// # Errors
 ///
@@ -254,28 +388,52 @@ pub async fn build_authorization_entry_with_sub_invocations(
         args,
         sub_invocations,
     )?;
-    let signature_payload = compute_signature_payload(
+    let (signature_payload, auth_digest) = derive_digests(
         simulation.network_id,
         simulation.nonce,
         simulation.signature_expiration_ledger,
-        root_invocation.clone(),
+        &root_invocation,
+        &rule_ids,
     )?;
-    let rule_ids_xdr =
-        encode_context_rule_ids(&rule_ids).map_err(|e| SaError::AuthEntryConstructionFailed {
-            stage: "context_rule_ids",
-            redacted_reason: format!("context_rule_ids XDR encode failed before signing: {e}"),
-        })?;
-    let auth_digest = compute_auth_digest(&signature_payload, &rule_ids_xdr);
 
     Ok(PartialSorobanAuthorizationEntry {
         smart_account: target_contract,
+        network_id: simulation.network_id,
         nonce: simulation.nonce,
         signature_expiration_ledger: simulation.signature_expiration_ledger,
         root_invocation,
         signature_payload,
-        auth_digest: *auth_digest.as_bytes(),
+        auth_digest,
         context_rule_ids: rule_ids,
     })
+}
+
+/// Derives the Soroban authorization `signature_payload` and the
+/// smart-account `auth_digest` from the facts they commit to.
+///
+/// The one derivation shared by the builder and by
+/// [`PartialSorobanAuthorizationEntry::validate`], so a partial validates
+/// exactly when its digests are the ones the builder would produce.
+fn derive_digests(
+    network_id: [u8; 32],
+    nonce: i64,
+    signature_expiration_ledger: u32,
+    root_invocation: &SorobanAuthorizedInvocation,
+    rule_ids: &[ContextRuleId],
+) -> Result<([u8; 32], [u8; 32]), SaError> {
+    let signature_payload = compute_signature_payload(
+        network_id,
+        nonce,
+        signature_expiration_ledger,
+        root_invocation.clone(),
+    )?;
+    let rule_ids_xdr =
+        encode_context_rule_ids(rule_ids).map_err(|e| SaError::AuthEntryConstructionFailed {
+            stage: "context_rule_ids",
+            redacted_reason: format!("context_rule_ids XDR encode failed before signing: {e}"),
+        })?;
+    let auth_digest = compute_auth_digest(&signature_payload, &rule_ids_xdr);
+    Ok((signature_payload, *auth_digest.as_bytes()))
 }
 
 fn root_contract_invocation(
@@ -307,18 +465,31 @@ fn root_contract_invocation(
     })
 }
 
+/// The envelope type 9 preimage a smart-account auth entry is signed over:
+/// `network_id`, the entry's `nonce` and `signature_expiration_ledger`, and
+/// its root `invocation`.
+pub(crate) fn soroban_authorization_preimage(
+    network_id: [u8; 32],
+    nonce: i64,
+    signature_expiration_ledger: u32,
+    invocation: SorobanAuthorizedInvocation,
+) -> HashIdPreimage {
+    HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+        network_id: Hash(network_id),
+        nonce,
+        signature_expiration_ledger,
+        invocation,
+    })
+}
+
 fn compute_signature_payload(
     network_id: [u8; 32],
     nonce: i64,
     signature_expiration_ledger: u32,
     invocation: SorobanAuthorizedInvocation,
 ) -> Result<[u8; 32], SaError> {
-    let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
-        network_id: Hash(network_id),
-        nonce,
-        signature_expiration_ledger,
-        invocation,
-    });
+    let preimage =
+        soroban_authorization_preimage(network_id, nonce, signature_expiration_ledger, invocation);
     let preimage_xdr =
         preimage
             .to_xdr(Limits::none())
@@ -343,17 +514,20 @@ fn compute_signature_payload(
 /// `context_rule_ids` and verifies the signature; a sponsor-rewritten
 /// `context_rule_ids` produces a different digest and the verification fails.
 ///
-/// The function calls [`Signer::public_key`] once to derive the user's
-/// Stellar address, then [`Signer::sign_auth_digest`] once to produce the
-/// 64-byte ed25519 signature, then assembles the on-chain canonical
-/// `AuthPayload` ScVal and wraps it
-/// in [`SorobanCredentials::Address`].
+/// The function first validates `partial` with
+/// [`PartialSorobanAuthorizationEntry::validate`], then calls
+/// [`Signer::public_key`] once to derive the user's Stellar address, then
+/// [`Signer::sign_auth_digest`] once to produce the 64-byte ed25519
+/// signature, then assembles the on-chain canonical `AuthPayload` ScVal and
+/// wraps it in [`SorobanCredentials::Address`].
 ///
-/// # Single call site
+/// # Call sites
 ///
-/// This is the single call site of [`Signer::sign_auth_digest`] across the
-/// workspace. Any additional caller is architecturally invalid — smart-account
-/// code paths must not invoke the `sign_tx_payload` primitive.
+/// One of the three call sites of [`Signer::sign_auth_digest`] in the
+/// workspace, beside [`complete_authorization_entry_multi_signer`] and the
+/// crate-internal mixed-signer collector; each validates its partial before
+/// any signer key access. Smart-account code paths must not invoke the
+/// `sign_tx_payload` primitive.
 ///
 /// # AuthPayload shape (OZ canonical)
 ///
@@ -372,8 +546,15 @@ fn compute_signature_payload(
 /// alphabetically (`context_rule_ids` precedes `signers`) per the on-chain
 /// canonical encoding rule.
 ///
+/// Consumes the manager's checked rule set. The account, network and rule IDs
+/// must match the entry, or `AuthEntryBindingMismatch` refuses before key access.
+///
 /// # Errors
 ///
+/// - [`SaError::MainnetWriteForbidden`] and
+///   [`SaError::AuthEntryBindingMismatch`]: `partial` fails
+///   [`PartialSorobanAuthorizationEntry::validate`]; no signer method was
+///   called.
 /// - [`SaError::AuthEntryConstructionFailed`] with `stage = "auth_payload"` —
 ///   signer `public_key()` fetch or `sign_auth_digest()` failure, or any of
 ///   the bounded ScVal/ScMap/VecM/BytesM conversions used to build the
@@ -382,25 +563,66 @@ fn compute_signature_payload(
 ///   pubkey/signature byte widths) but the result type is preserved for
 ///   trait uniformity and for the future hardware-signer paths where the
 ///   upstream `WalletError` propagation is the substantive failure case.
+///
+/// The gate checks the credential, signer and payload before each signature.
+/// Authorization consumes the cancellation proof, so later failures retain the charge.
 pub async fn complete_authorization_entry(
+    gate: &SigningGate,
+    checked_rules: CheckedSigningRules,
     partial: PartialSorobanAuthorizationEntry,
     signer: &(dyn Signer + Send + Sync),
 ) -> Result<SorobanAuthorizationEntry, SaError> {
-    let pubkey = signer
-        .public_key()
-        .await
+    complete_authorization_entry_within_budget(gate, checked_rules, partial, signer, None).await
+}
+
+/// [`complete_authorization_entry`] with each signer call bounded by `budget`
+/// when there is one, at [`SIGN_AUTH_DIGEST_STAGE`] (see
+/// [`sign_within_budget`]).
+///
+/// # Errors
+///
+/// The errors of [`complete_authorization_entry`], and the deadline refusal
+/// of [`sign_within_budget`].
+///
+/// The gate checks the credential, signer and payload before each signature.
+/// Authorization consumes the cancellation proof, so later failures retain the charge.
+pub(crate) async fn complete_authorization_entry_within_budget(
+    gate: &SigningGate,
+    checked_rules: CheckedSigningRules,
+    partial: PartialSorobanAuthorizationEntry,
+    signer: &(dyn Signer + Send + Sync),
+    budget: Option<PreSubmitBudget>,
+) -> Result<SorobanAuthorizationEntry, SaError> {
+    checked_rules.check_binding(
+        &partial.smart_account,
+        partial.network_id,
+        &partial.context_rule_ids,
+    )?;
+    let digest = partial.signing_digest()?;
+
+    let pubkey = sign_within_budget(budget, SIGN_AUTH_DIGEST_STAGE, signer.public_key())
+        .await?
         .map_err(|e| SaError::AuthEntryConstructionFailed {
             stage: "auth_payload",
             redacted_reason: format!("signer public_key fetch failed before signing: {e}"),
         })?;
 
-    let signature_bytes = signer
-        .sign_auth_digest(&partial.auth_digest)
-        .await
-        .map_err(|e| SaError::AuthEntryConstructionFailed {
-            stage: "auth_payload",
-            redacted_reason: format!("auth-digest signing failed: {e}"),
-        })?;
+    gate.authorize(SigningRequest {
+        subject: AuthSubject::smart_account(&partial.smart_account)
+            .map_err(|field| SaError::IntentBindingMismatch { field })?,
+        signer: SignerMatch::Exact(SignerDescriptor::Delegated { account: pubkey.0 }),
+        payload: SigningPayload::AuthDigest(*digest.as_bytes()),
+    })?;
+    let signature_bytes = sign_within_budget(
+        budget,
+        SIGN_AUTH_DIGEST_STAGE,
+        signer.sign_auth_digest(&digest),
+    )
+    .await?
+    .map_err(|e| SaError::AuthEntryConstructionFailed {
+        stage: "auth_payload",
+        redacted_reason: format!("auth-digest signing failed: {e}"),
+    })?;
 
     let auth_payload =
         build_auth_payload_scval(pubkey.0, &signature_bytes, &partial.context_rule_ids)?;
@@ -665,7 +887,15 @@ fn build_multi_signer_auth_payload_scval(
 /// per signer to the wire payload + chain XDR. This choice is intentional
 /// (audit-trail completeness over minimal wire size).
 ///
+/// Consumes the manager's checked rule set. The account, network and rule IDs
+/// must match the entry, or `AuthEntryBindingMismatch` refuses before key access.
+///
 /// # Errors
+///
+/// Returns [`SaError::MainnetWriteForbidden`] or
+/// [`SaError::AuthEntryBindingMismatch`] when `partial` fails
+/// [`PartialSorobanAuthorizationEntry::validate`], before any signer method
+/// is called.
 ///
 /// Returns [`SaError::AuthEntryConstructionFailed`] with `stage = "auth_payload"` on:
 /// - `signers` is empty.
@@ -673,10 +903,51 @@ fn build_multi_signer_auth_payload_scval(
 /// - Any signer's `sign_auth_digest()` fails.
 /// - Any XDR encoding failure.
 ///
+///
+/// The gate checks the credential, signer and payload before each signature.
+/// Authorization consumes the cancellation proof, so later failures retain the charge.
 pub async fn complete_authorization_entry_multi_signer(
+    gate: &SigningGate,
+    checked_rules: CheckedSigningRules,
     partial: PartialSorobanAuthorizationEntry,
     signers: &[&(dyn Signer + Send + Sync)],
 ) -> Result<SorobanAuthorizationEntry, SaError> {
+    complete_authorization_entry_multi_signer_within_budget(
+        gate,
+        checked_rules,
+        partial,
+        signers,
+        None,
+    )
+    .await
+}
+
+/// [`complete_authorization_entry_multi_signer`] with each signer call
+/// bounded by `budget` when there is one, at [`SIGN_AUTH_DIGEST_STAGE`] (see
+/// [`sign_within_budget`]): a signature cut at the deadline is followed by no
+/// other signer's.
+///
+/// # Errors
+///
+/// The errors of [`complete_authorization_entry_multi_signer`], and the
+/// deadline refusal of [`sign_within_budget`].
+///
+/// The gate checks the credential, signer and payload before each signature.
+/// Authorization consumes the cancellation proof, so later failures retain the charge.
+pub(crate) async fn complete_authorization_entry_multi_signer_within_budget(
+    gate: &SigningGate,
+    checked_rules: CheckedSigningRules,
+    partial: PartialSorobanAuthorizationEntry,
+    signers: &[&(dyn Signer + Send + Sync)],
+    budget: Option<PreSubmitBudget>,
+) -> Result<SorobanAuthorizationEntry, SaError> {
+    checked_rules.check_binding(
+        &partial.smart_account,
+        partial.network_id,
+        &partial.context_rule_ids,
+    )?;
+    let digest = partial.signing_digest()?;
+
     if signers.is_empty() {
         return Err(SaError::AuthEntryConstructionFailed {
             stage: "auth_payload",
@@ -691,22 +962,29 @@ pub async fn complete_authorization_entry_multi_signer(
     // `complete_authorization_entry_mixed`.
     let mut descriptors: Vec<AuthPayloadSigner> = Vec::with_capacity(signers.len());
     for signer in signers {
-        let pubkey =
-            signer
-                .public_key()
-                .await
-                .map_err(|e| SaError::AuthEntryConstructionFailed {
-                    stage: "auth_payload",
-                    redacted_reason: format!("signer public_key fetch failed: {e}"),
-                })?;
-
-        let signature_bytes = signer
-            .sign_auth_digest(&partial.auth_digest)
-            .await
+        let pubkey = sign_within_budget(budget, SIGN_AUTH_DIGEST_STAGE, signer.public_key())
+            .await?
             .map_err(|e| SaError::AuthEntryConstructionFailed {
                 stage: "auth_payload",
-                redacted_reason: format!("auth-digest signing failed: {e}"),
+                redacted_reason: format!("signer public_key fetch failed: {e}"),
             })?;
+
+        gate.authorize(SigningRequest {
+            subject: AuthSubject::smart_account(&partial.smart_account)
+                .map_err(|field| SaError::IntentBindingMismatch { field })?,
+            signer: SignerMatch::Exact(SignerDescriptor::Delegated { account: pubkey.0 }),
+            payload: SigningPayload::AuthDigest(*digest.as_bytes()),
+        })?;
+        let signature_bytes = sign_within_budget(
+            budget,
+            SIGN_AUTH_DIGEST_STAGE,
+            signer.sign_auth_digest(&digest),
+        )
+        .await?
+        .map_err(|e| SaError::AuthEntryConstructionFailed {
+            stage: "auth_payload",
+            redacted_reason: format!("auth-digest signing failed: {e}"),
+        })?;
 
         descriptors.push(AuthPayloadSigner::Delegated {
             pubkey: pubkey.0,
@@ -811,17 +1089,79 @@ pub(crate) struct MixedSigner<'a> {
 /// The returned vector is `[smart_account_entry, delegated_g_key_entry*]`; its
 /// length is `1 + (number of Delegated signers)`.
 ///
+/// # Mainnet and network binding
+///
+/// This is the boundary for [`sign_with_ed25519_rule`] and for the
+/// External-Ed25519 arm of `submit_signed_invoke`. Before any signer key
+/// access it refuses a mainnet `network_passphrase`, validates `partial`
+/// with [`PartialSorobanAuthorizationEntry::validate`], and refuses a
+/// `network_passphrase` whose network ID differs from `partial.network_id`,
+/// so the smart-account entry and the delegated G-key entries are signed for
+/// one network.
+///
 /// # Errors
 ///
-/// Returns [`SaError::AuthEntryConstructionFailed`] with `stage = "auth_payload"`
-/// when `signers` is empty, when any signer's `public_key()` / `sign_auth_digest()`
-/// fails, or on any XDR encoding failure.
+/// - [`SaError::MainnetWriteForbidden`]: `network_passphrase` is the mainnet
+///   passphrase, or `partial.network_id` is the mainnet network ID.
+/// - [`SaError::AuthEntryBindingMismatch`]: `partial` fails validation
+///   (`field` `"signature_payload"` or `"auth_digest"`), or
+///   `network_passphrase` names another network than `partial.network_id`
+///   (`field` `"network_id"`).
+/// - [`SaError::AuthEntryConstructionFailed`] with `stage = "auth_payload"`
+///   when `signers` is empty, when any signer's `public_key()` /
+///   `sign_auth_digest()` fails, or on any XDR encoding failure.
+///
+/// The gate checks the credential, signer and payload before each signature.
+/// Authorization consumes the cancellation proof, so later failures retain the charge.
 pub(crate) async fn collect_mixed_signer_entries(
+    gate: &SigningGate,
+    checked_rules: CheckedSigningRules,
     partial: PartialSorobanAuthorizationEntry,
     signers: &[MixedSigner<'_>],
     signature_expiration_ledger: u32,
     network_passphrase: &str,
 ) -> Result<Vec<SorobanAuthorizationEntry>, SaError> {
+    collect_mixed_signer_entries_within_budget(
+        gate,
+        checked_rules,
+        partial,
+        signers,
+        signature_expiration_ledger,
+        network_passphrase,
+        None,
+    )
+    .await
+}
+
+/// [`collect_mixed_signer_entries`] with each signer call bounded by `budget`
+/// when there is one (see [`sign_within_budget`]): the auth-digest
+/// signatures at [`SIGN_AUTH_DIGEST_STAGE`], the delegated G-key entries at
+/// [`SIGN_DELEGATED_ENTRY_STAGE`]. A signature cut at the deadline is
+/// followed by no other.
+///
+/// # Errors
+///
+/// The errors of [`collect_mixed_signer_entries`], and the deadline refusal
+/// of [`sign_within_budget`].
+///
+/// The gate checks the credential, signer and payload before each signature.
+/// Authorization consumes the cancellation proof, so later failures retain the charge.
+pub(crate) async fn collect_mixed_signer_entries_within_budget(
+    gate: &SigningGate,
+    checked_rules: CheckedSigningRules,
+    partial: PartialSorobanAuthorizationEntry,
+    signers: &[MixedSigner<'_>],
+    signature_expiration_ledger: u32,
+    network_passphrase: &str,
+    budget: Option<PreSubmitBudget>,
+) -> Result<Vec<SorobanAuthorizationEntry>, SaError> {
+    checked_rules.check_binding(
+        &partial.smart_account,
+        partial.network_id,
+        &partial.context_rule_ids,
+    )?;
+    let digest = check_partial_against_passphrase(&partial, network_passphrase)?;
+
     if signers.is_empty() {
         return Err(SaError::AuthEntryConstructionFailed {
             stage: "auth_payload",
@@ -829,30 +1169,46 @@ pub(crate) async fn collect_mixed_signer_entries(
         });
     }
 
-    let auth_digest: [u8; 32] = partial.auth_digest;
+    let auth_digest: [u8; 32] = *digest.as_bytes();
     let smart_account = partial.smart_account.clone();
 
     // Build the AuthPayload descriptors: sign the shared auth_digest with each
     // signer's raw ed25519 key and route by kind.
     let mut descriptors: Vec<AuthPayloadSigner> = Vec::with_capacity(signers.len());
     for entry in signers {
-        let pubkey =
-            entry
-                .signer
-                .public_key()
-                .await
-                .map_err(|e| SaError::AuthEntryConstructionFailed {
-                    stage: "auth_payload",
-                    redacted_reason: format!("signer public_key fetch failed: {e}"),
-                })?;
-        let signature_bytes = entry
-            .signer
-            .sign_auth_digest(&auth_digest)
-            .await
+        let pubkey = sign_within_budget(budget, SIGN_AUTH_DIGEST_STAGE, entry.signer.public_key())
+            .await?
             .map_err(|e| SaError::AuthEntryConstructionFailed {
                 stage: "auth_payload",
-                redacted_reason: format!("auth-digest signing failed: {e}"),
+                redacted_reason: format!("signer public_key fetch failed: {e}"),
             })?;
+        let descriptor = match &entry.kind {
+            MixedSignerKind::Delegated => SignerDescriptor::Delegated { account: pubkey.0 },
+            MixedSignerKind::ExternalEd25519 { verifier } => SignerDescriptor::External {
+                verifier: stellar_agent_core::sc_address::scaddress_to_strkey(verifier).map_err(
+                    |_| SaError::IntentBindingMismatch {
+                        field: "auth_subjects",
+                    },
+                )?,
+                key_data_sha256: Sha256::digest(pubkey.0).into(),
+            },
+        };
+        gate.authorize(SigningRequest {
+            subject: AuthSubject::smart_account(&partial.smart_account)
+                .map_err(|field| SaError::IntentBindingMismatch { field })?,
+            signer: SignerMatch::Exact(descriptor),
+            payload: SigningPayload::AuthDigest(*digest.as_bytes()),
+        })?;
+        let signature_bytes = sign_within_budget(
+            budget,
+            SIGN_AUTH_DIGEST_STAGE,
+            entry.signer.sign_auth_digest(&digest),
+        )
+        .await?
+        .map_err(|e| SaError::AuthEntryConstructionFailed {
+            stage: "auth_payload",
+            redacted_reason: format!("auth-digest signing failed: {e}"),
+        })?;
 
         let descriptor = match &entry.kind {
             MixedSignerKind::Delegated => AuthPayloadSigner::Delegated {
@@ -890,12 +1246,30 @@ pub(crate) async fn collect_mixed_signer_entries(
         if !matches!(entry.kind, MixedSignerKind::Delegated) {
             continue;
         }
+        let public_key = sign_within_budget(
+            budget,
+            SIGN_DELEGATED_ENTRY_STAGE,
+            entry.signer.public_key(),
+        )
+        .await?
+        .map_err(|error| SaError::AuthEntryConstructionFailed {
+            stage: "auth_payload",
+            redacted_reason: format!("delegated entry: signer public_key fetch failed: {error}"),
+        })?;
+        let address = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+            public_key.0,
+        ))));
+        let invocation = delegated_g_key_invocation(&smart_account, &auth_digest)?;
+        let nonce = gate.delegated_nonce(&address, &invocation)?;
         let delegated = build_and_sign_delegated_g_key_entry(
+            gate,
+            nonce,
             &smart_account,
             &auth_digest,
             signature_expiration_ledger,
             entry.signer,
             network_passphrase,
+            budget,
         )
         .await?;
         entries.push(delegated);
@@ -925,8 +1299,23 @@ pub(crate) async fn collect_mixed_signer_entries(
 /// — which produces a raw ed25519 signature over exactly those 32 bytes — is the
 /// correct primitive.
 ///
+/// # Mainnet
+///
+/// The mixed-signer collector is this function's mainnet and network-binding
+/// boundary: it refuses a mainnet passphrase, a mainnet
+/// `simulation.network_id` and a passphrase naming another network than the
+/// simulation before any signer key access. Building the partial touches no
+/// key, so this function carries no check of its own.
+///
+/// Consumes the manager's checked rule set. The account, network and rule IDs
+/// must match the entry, or `AuthEntryBindingMismatch` refuses before key access.
+///
 /// # Errors
 ///
+/// - [`SaError::MainnetWriteForbidden`]: `network_passphrase` or
+///   `simulation.network_id` names mainnet.
+/// - [`SaError::AuthEntryBindingMismatch`]: `network_passphrase` names
+///   another network than `simulation.network_id`.
 /// - [`SaError::RuleIdMismatch`] — `rule_ids` empty or misaligned with the
 ///   simulation auth-context list.
 /// - [`SaError::SimulationDivergence`] — the simulation context diverges from
@@ -939,7 +1328,12 @@ pub(crate) async fn collect_mixed_signer_entries(
               collapsing into a struct would hide the per-call lifetime contracts of the \
               borrowed signer and simulation/envelope references"
 )]
+///
+/// The gate checks the credential, signer and payload before each signature.
+/// Authorization consumes the cancellation proof, so later failures retain the charge.
 pub async fn sign_with_ed25519_rule(
+    gate: &SigningGate,
+    checked_rules: CheckedSigningRules,
     target_contract: ScAddress,
     function_name: ScSymbol,
     args: Vec<ScVal>,
@@ -966,86 +1360,26 @@ pub async fn sign_with_ed25519_rule(
         kind: MixedSignerKind::ExternalEd25519 { verifier },
     }];
 
-    collect_mixed_signer_entries(partial, &signers, expiry, network_passphrase).await
+    collect_mixed_signer_entries(
+        gate,
+        checked_rules,
+        partial,
+        &signers,
+        expiry,
+        network_passphrase,
+    )
+    .await
 }
 
-/// Builds and signs the secondary "Delegated G-key" auth entry that OZ
-/// smart accounts require alongside the smart-account auth entry whenever
-/// the validating context rule includes `Signer::Delegated(addr)` where
-/// `addr` is a Stellar G-key.
-///
-/// # Why this entry exists
-///
-/// The OpenZeppelin `do_check_auth` for `Signer::Delegated(addr)` calls
-/// `addr.require_auth_for_args((auth_digest,))`.
-/// The Soroban host requires this nested auth call to be satisfied by an
-/// explicit `SorobanAuthorizationEntry` whose credentials are the G-key.
-/// Source-account auto-auth from the SEP-23 envelope signature does NOT
-/// propagate into nested __check_auth calls.
-///
-/// The simulator does not auto-discover this entry (per OZ docs:
-/// "authorization entry for that signer is not included in the simulation
-/// output"); the wallet must construct it manually.
-///
-/// # Design notes
-///
-/// 1. **Smart-account entry's signers-map signature value.** An empty-bytes
-///    placeholder would also pass, since the OpenZeppelin
-///    `authenticate(Delegated, ...)` path ignores the `sig_data` parameter
-///    on the Delegated branch. This wallet places the actual
-///    ed25519 signature over `auth_digest` (per
-///    [`build_auth_payload_scval`]). Storing the real signature
-///    preserves a uniform signature shape across all signer types at the
-///    cost of one extra ed25519 sign per mutating operation.
-/// 2. **Auth-entry construction style.** This wallet constructs the entry via
-///    raw `stellar_xdr::*` types inline rather than through a higher-level
-///    helper that encapsulates nonce generation + preimage construction +
-///    signature shape assembly. The inline form keeps the on-chain wire shape
-///    explicit.
-/// 3. **Nonce source.** The wallet uses `rand_core::OsRng` (CSPRNG) for the
-///    nonce, giving collision-resistance under same-millisecond retries rather
-///    than a millisecond-timestamp source.
-///
-/// # Errors
-///
-/// - [`SaError::AuthEntryConstructionFailed`] (`stage = "auth_payload"`)
-///   if XDR encoding, ScVal construction, or `Signer` operations fail.
-pub(crate) async fn build_and_sign_delegated_g_key_entry(
+/// Builds the invocation shared by planning and delegated signing.
+pub(crate) fn delegated_g_key_invocation(
     smart_account: &ScAddress,
     auth_digest: &[u8; 32],
-    signature_expiration_ledger: u32,
-    signer: &(dyn Signer + Send + Sync),
-    network_passphrase: &str,
-) -> Result<SorobanAuthorizationEntry, SaError> {
-    use stellar_xdr::{
-        AccountId, BytesM, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, PublicKey,
-        ScBytes, SorobanAddressCredentials, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
-        SorobanCredentials, Uint256, WriteXdr,
-    };
-
-    let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
+) -> Result<SorobanAuthorizedInvocation, SaError> {
+    let auth_payload_err = |redacted_reason| SaError::AuthEntryConstructionFailed {
         stage: "auth_payload",
-        redacted_reason: reason,
+        redacted_reason,
     };
-
-    // The G-key whose require_auth_for_args call must be authorised.
-    // In the single-signer flow the manager's signer doubles as both the
-    // smart-account-rule signer AND the Delegated G-key.
-    let pubkey = signer.public_key().await.map_err(|e| {
-        auth_payload_err(format!(
-            "delegated entry: signer public_key fetch failed: {e}"
-        ))
-    })?;
-    let g_key_address = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
-        pubkey.0,
-    ))));
-
-    // root_invocation: __check_auth(auth_digest) on the smart account.
-    //
-    // OZ's authenticate(Delegated) calls
-    // `addr.require_auth_for_args((auth_digest,))` from inside __check_auth.
-    // The require_auth-for-args context is therefore (current_contract =
-    // smart_account, function = __check_auth, args = (auth_digest,)).
     let auth_digest_bytesm: BytesM = auth_digest.to_vec().try_into().map_err(|e| {
         auth_payload_err(format!("delegated entry: encode auth_digest BytesM: {e:?}"))
     })?;
@@ -1062,53 +1396,96 @@ pub(crate) async fn build_and_sign_delegated_g_key_entry(
         ))
     })?;
 
-    let invocation = SorobanAuthorizedInvocation {
+    Ok(SorobanAuthorizedInvocation {
         function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
             contract_address: smart_account.clone(),
             function_name: check_auth_sym,
             args: check_auth_args,
         }),
         sub_invocations: VecM::default(),
+    })
+}
+
+/// Signs the admitted account-key entry for the smart account's delegated signer.
+///
+/// The entry authorizes `__check_auth(auth_digest)` with the plan's frozen nonce.
+/// The gate checks its credential, signer and payload before the signer runs.
+/// Once authorization succeeds, every later failure retains the charge.
+///
+/// # Errors
+/// Refuses mainnet, an unplanned signing, expired budget, or encoding and signer errors.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the explicit nonce and gate bind this signing to its plan"
+)]
+pub(crate) async fn build_and_sign_delegated_g_key_entry(
+    gate: &SigningGate,
+    nonce: i64,
+    smart_account: &ScAddress,
+    auth_digest: &[u8; 32],
+    signature_expiration_ledger: u32,
+    signer: &(dyn Signer + Send + Sync),
+    network_passphrase: &str,
+    budget: Option<PreSubmitBudget>,
+) -> Result<SorobanAuthorizationEntry, SaError> {
+    use stellar_xdr::{
+        AccountId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, PublicKey,
+        SorobanAddressCredentials, SorobanCredentials, Uint256,
     };
 
-    // Fresh CSPRNG-sourced nonce for the Delegated entry. Soroban requires
-    // distinct (address, nonce) pairs across all auth entries in a single
-    // transaction; the smart-account entry's nonce comes from RPC simulate,
-    // and this entry must not collide with it. Sourced from `OsRng` for
-    // collision-resistance under retry: an earlier revision derived the
-    // nonce from the `auth_digest` tail bytes, but auth_digest is itself
-    // deterministic given the same simulate output, so same-ledger retry
-    // would produce colliding nonces. The value is non-secret. Same RNG
-    // source as `deployment/deploy.rs::generate_random_hex_8` (8-byte OsRng).
-    let nonce: i64 = {
-        use rand_core::RngCore as _;
-        let mut bytes = [0_u8; 8];
-        rand_core::OsRng.fill_bytes(&mut bytes);
-        i64::from_le_bytes(bytes)
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(SaError::MainnetWriteForbidden);
+    }
+
+    let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
+        stage: "auth_payload",
+        redacted_reason: reason,
     };
+
+    // The G-key whose require_auth_for_args call must be authorised.
+    // In the single-signer flow the manager's signer doubles as both the
+    // smart-account-rule signer AND the Delegated G-key.
+    let pubkey = sign_within_budget(budget, SIGN_DELEGATED_ENTRY_STAGE, signer.public_key())
+        .await?
+        .map_err(|e| {
+            auth_payload_err(format!(
+                "delegated entry: signer public_key fetch failed: {e}"
+            ))
+        })?;
+    let g_key_address = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        pubkey.0,
+    ))));
+
+    let invocation = delegated_g_key_invocation(smart_account, auth_digest)?;
 
     // Compute the Soroban auth-entry signature_payload.
-    let network_id: [u8; 32] = Sha256::digest(network_passphrase.as_bytes()).into();
+    let network_id = network_id_of(network_passphrase);
     let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
         network_id: Hash(network_id),
         nonce,
         signature_expiration_ledger,
         invocation: invocation.clone(),
     });
-    let preimage_xdr = preimage.to_xdr(Limits::none()).map_err(|e| {
-        auth_payload_err(format!(
-            "delegated entry: signature_payload XDR encode: {e:?}"
-        ))
-    })?;
-    let signature_payload: [u8; 32] = Sha256::digest(preimage_xdr).into();
+    let signature_payload = SorobanAuthPayload::from_preimage(&preimage)
+        .map_err(|e| auth_payload_err(format!("delegated entry: signature_payload: {e}")))?;
 
-    // Sign with the dedicated Soroban-address-auth primitive. Distinct
-    // call-site from `sign_tx_payload` and `sign_auth_digest` per the
-    // Signer trait's call-site discipline.
-    let signature_bytes = signer
-        .sign_soroban_address_auth_payload(&signature_payload)
-        .await
-        .map_err(|e| auth_payload_err(format!("delegated entry: signing failed: {e}")))?;
+    gate.authorize(SigningRequest {
+        subject: AuthSubject::account_key(&g_key_address)
+            .map_err(|field| SaError::IntentBindingMismatch { field })?,
+        signer: SignerMatch::Exact(SignerDescriptor::AccountKey {
+            public_key: pubkey.0,
+        }),
+        payload: SigningPayload::AddressPayload(*signature_payload.as_bytes()),
+    })?;
+
+    // Sign with the Soroban-address-auth primitive.
+    let signature_bytes = sign_within_budget(
+        budget,
+        SIGN_DELEGATED_ENTRY_STAGE,
+        signer.sign_soroban_address_auth_payload(&signature_payload),
+    )
+    .await?
+    .map_err(|e| auth_payload_err(format!("delegated entry: signing failed: {e}")))?;
 
     // Stellar source-account auth signature shape:
     // ScVal::Vec([ScVal::Map([{public_key: BytesN<32>, signature: BytesN<64>}])])
@@ -1182,9 +1559,16 @@ impl PreSubmitBudget {
         Ok(())
     }
 
+    /// The refusal of a submission bounded by this deadline whose send-by
+    /// instant passed at `stage`, before anything was sent; reported at
+    /// `"auth_payload"`, as the RPC stages are.
+    pub(crate) fn send_refusal(self, stage: stellar_agent_network::PreSendStage) -> SaError {
+        self.elapsed(stage.label(), "auth_payload")
+    }
+
     /// The refusal of a pre-submit stage `stage` that met the deadline,
     /// reported at `elapse_stage`.
-    fn elapsed(self, stage: &'static str, elapse_stage: &'static str) -> SaError {
+    pub(crate) fn elapsed(self, stage: &'static str, elapse_stage: &'static str) -> SaError {
         SaError::AuthEntryConstructionFailed {
             stage: elapse_stage,
             redacted_reason: format!(
@@ -1203,9 +1587,10 @@ impl PreSubmitBudget {
 /// the rule-lock acquisition, the signer-set baseline read of each checked
 /// rule, the pinned-hash drift check of each checked rule, the signer-set
 /// comparison of each checked rule, the initial fetch, the initial simulate,
-/// the re-fetch and the re-simulate. Time spent in an earlier stage
-/// (including the off-chain auth-entry signing step between simulate and
-/// re-simulate) shrinks the budget left for a later one. A stage can
+/// the unsigned recovery simulate, each authorization signature (see
+/// [`sign_within_budget`]), the re-fetch,
+/// the re-simulate and the envelope signature. Time spent in an earlier
+/// stage shrinks the budget left for a later one. A stage can
 /// therefore elapse because earlier stages consumed the collective budget,
 /// not because that stage itself ran long; the timeout message says
 /// "collective" for that reason.
@@ -1234,6 +1619,42 @@ pub(crate) async fn bound_pre_submit_stage<T>(
         "sa_submit_timing: pre-submit stage elapsed"
     );
     outcome
+}
+
+/// The stage of an authorization signature over a smart account's auth
+/// digest, and of the key read that precedes it.
+pub(crate) const SIGN_AUTH_DIGEST_STAGE: &str = "sign_auth_digest";
+
+/// The stage of a delegated G-key entry's signature, and of the key read
+/// that precedes it.
+pub(crate) const SIGN_DELEGATED_ENTRY_STAGE: &str = "sign_delegated_entry";
+
+/// Runs one signer call under `budget` when there is one, as pre-submit
+/// stage `stage` reported at `"auth_payload"`; `None` runs it unbounded.
+///
+/// A software key signs without yielding, so the deadline is checked before
+/// the call; the call is cut at the deadline; and a call that completes at or
+/// after it is refused as well. A signature that finishes after the deadline
+/// is therefore never used, and the refusal ends the signing: no further
+/// signer call and no send follows it.
+///
+/// # Errors
+///
+/// [`SaError::AuthEntryConstructionFailed`] with stage `"auth_payload"` and
+/// `stage` named in the reason when the deadline has passed before the call
+/// returns.
+pub(crate) async fn sign_within_budget<T>(
+    budget: Option<PreSubmitBudget>,
+    stage: &'static str,
+    call: impl std::future::Future<Output = T>,
+) -> Result<T, SaError> {
+    let Some(budget) = budget else {
+        return Ok(call.await);
+    };
+    budget.check_at(stage, "auth_payload")?;
+    let answer = bound_pre_submit_stage(budget, stage, "auth_payload", call).await?;
+    budget.check_at(stage, "auth_payload")?;
+    Ok(answer)
 }
 
 /// Re-simulates the InvokeHostFunction op with the signed smart-account
@@ -1326,13 +1747,18 @@ pub(crate) async fn resimulate_with_signed_auth(
         budget,
         "simulate_resimulate",
         "auth_payload",
-        server.simulate_transaction_envelope(&resim_envelope, None),
+        stellar_agent_network::retry::retry_preflight_busy(Some(budget.deadline), || {
+            server.simulate_transaction_envelope(&resim_envelope, None)
+        }),
     )
     .await?
-    .map_err(|e| {
-        auth_payload_err(format!(
+    .map_err(|e| match e {
+        stellar_agent_network::retry::BusyRetryError::Rpc(e) => auth_payload_err(format!(
             "re-simulate: simulate_transaction_envelope failed: {e}"
-        ))
+        )),
+        stellar_agent_network::retry::BusyRetryError::Expired => {
+            budget.elapsed("simulate_resimulate", "auth_payload")
+        }
     })?;
 
     if let Some(sim_error) = &resim_response.error {
@@ -1340,7 +1766,11 @@ pub(crate) async fn resimulate_with_signed_auth(
             phase: "simulate",
             redacted_reason: format!(
                 "re-simulate returned error: {}",
-                crate::managers::rules::augment_with_oz_error_name(sim_error)
+                crate::managers::rules::refusal_text(
+                    sim_error,
+                    &resim_response.events,
+                    &resim_envelope
+                )
             ),
         });
     }
@@ -1372,7 +1802,13 @@ pub mod test_helpers {
     use sha2::{Digest as _, Sha256};
     use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 
-    use super::AuthorizationSimulation;
+    use stellar_xdr::{ScAddress, ScSymbol, VecM};
+
+    use super::{
+        AuthorizationSimulation, PartialSorobanAuthorizationEntry, derive_digests, network_id_of,
+        root_contract_invocation,
+    };
+    use crate::SaError;
     use crate::signing::divergence::{
         AuthContextFingerprint, EnvelopeContext, FeeEnvelopeContext, NetworkContext,
         SequenceContext, SimulationContext,
@@ -1451,6 +1887,58 @@ pub mod test_helpers {
             fee_envelope: simulation.context.fee_envelope.clone(),
         }
     }
+
+    /// Returns a [`PartialSorobanAuthorizationEntry`] for `smart_account`
+    /// whose digests are derived for the network of `network_passphrase` and
+    /// for `rule_ids`, so it passes
+    /// [`PartialSorobanAuthorizationEntry::validate`] unless the passphrase
+    /// names mainnet.
+    ///
+    /// The root invocation is a no-argument `execute` call on
+    /// `smart_account`; the nonce and expiration are the stable values of
+    /// [`baseline_authorization_simulation`] (42 / 9999).
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::AuthEntryConstructionFailed`] if the digest inputs cannot
+    /// be XDR-encoded, which bounded fixture inputs never trigger.
+    pub fn partial_authorization_entry(
+        smart_account: ScAddress,
+        network_passphrase: &str,
+        rule_ids: Vec<ContextRuleId>,
+    ) -> Result<PartialSorobanAuthorizationEntry, SaError> {
+        let network_id = network_id_of(network_passphrase);
+        let function_name =
+            ScSymbol::try_from("execute").map_err(|e| SaError::AuthEntryConstructionFailed {
+                stage: "auth_contexts_args",
+                redacted_reason: format!("fixture function symbol encode failed: {e:?}"),
+            })?;
+        let root_invocation = root_contract_invocation(
+            smart_account.clone(),
+            function_name,
+            Vec::new(),
+            VecM::default(),
+        )?;
+        let nonce = 42;
+        let signature_expiration_ledger = 9999;
+        let (signature_payload, auth_digest) = derive_digests(
+            network_id,
+            nonce,
+            signature_expiration_ledger,
+            &root_invocation,
+            &rule_ids,
+        )?;
+        Ok(PartialSorobanAuthorizationEntry {
+            smart_account,
+            network_id,
+            nonce,
+            signature_expiration_ledger,
+            root_invocation,
+            signature_payload,
+            auth_digest,
+            context_rule_ids: rule_ids,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1466,6 +1954,13 @@ mod tests {
     use crate::signing::divergence::{
         AuthContextFingerprint, FeeEnvelopeContext, NetworkContext, SequenceContext,
     };
+    use crate::signing::intent_test_helpers as admission_fixture;
+    use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+    use stellar_agent_network::SignerDescriptor;
+    use stellar_agent_network::signing::test_doubles::CountingSigner;
+
+    /// A non-mainnet network other than testnet.
+    const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
 
     fn contract_address(byte: u8) -> ScAddress {
         ScAddress::Contract(stellar_xdr::ContractId(Hash([byte; 32])))
@@ -1502,7 +1997,7 @@ mod tests {
         };
         let simulation = AuthorizationSimulation {
             context,
-            network_id: [9; 32],
+            network_id: network_id_of(TESTNET_PASSPHRASE),
             nonce: 123,
             signature_expiration_ledger: 456,
         };
@@ -1811,7 +2306,12 @@ mod tests {
     /// `complete_authorization_entry_multi_signer` refuses immediately when the
     /// `signers` slice is empty, without touching the partial entry.
     #[tokio::test]
+    #[serial_test::serial]
     async fn multi_signer_complete_empty_signers_guard() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let (simulation, envelope) = contexts();
         let partial = build_authorization_entry(
             contract_address(2),
@@ -1824,9 +2324,14 @@ mod tests {
         .await
         .unwrap();
 
-        let err = complete_authorization_entry_multi_signer(partial, &[])
-            .await
-            .unwrap_err();
+        let err = complete_authorization_entry_multi_signer(
+            &admission_fixture::gate(vec![]),
+            crate::submit::checked_rules_for_test(&partial),
+            partial,
+            &[],
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -1855,7 +2360,12 @@ mod tests {
     /// map contains two entries sorted by pubkey, each with a valid 64-byte
     /// signature that cryptographically verifies against the same auth_digest.
     #[tokio::test]
+    #[serial_test::serial]
     async fn multi_signer_complete_two_signers_assembles_correct_auth_payload() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
         use stellar_agent_network::SoftwareSigningKey;
 
@@ -1887,9 +2397,21 @@ mod tests {
         let s_a: &(dyn stellar_agent_network::signing::Signer + Send + Sync) = &signer_a;
         let s_b: &(dyn stellar_agent_network::signing::Signer + Send + Sync) = &signer_b;
 
-        let entry = complete_authorization_entry_multi_signer(partial, &[s_a, s_b])
-            .await
-            .unwrap();
+        let entry = complete_authorization_entry_multi_signer(
+            &admission_fixture::partial_gate(
+                &partial,
+                vec![
+                    SignerDescriptor::Delegated { account: pk_a },
+                    SignerDescriptor::Delegated { account: pk_b },
+                ],
+                false,
+            ),
+            crate::submit::checked_rules_for_test(&partial),
+            partial,
+            &[s_a, s_b],
+        )
+        .await
+        .unwrap();
 
         // Credentials shape.
         let SorobanCredentials::Address(addr_creds) = entry.credentials else {
@@ -1979,7 +2501,12 @@ mod tests {
     /// against the signer's public key applied to the Soroban preimage of the
     /// entry's own nonce / expiration.
     #[tokio::test]
+    #[serial_test::serial]
     async fn delegated_g_key_entry_shape_and_signature_verify() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
         use sha2::{Digest as _, Sha256};
         use stellar_agent_network::SoftwareSigningKey;
@@ -1994,11 +2521,14 @@ mod tests {
         let pk = signer.public_key().await.unwrap().0;
 
         let entry = build_and_sign_delegated_g_key_entry(
+            &admission_fixture::delegated_gate(&smart_account, &auth_digest, expiry, pk, 1),
+            1,
             &smart_account,
             &auth_digest,
             expiry,
             &signer,
             network_passphrase,
+            None,
         )
         .await
         .unwrap();
@@ -2211,7 +2741,12 @@ mod tests {
     /// pubkey when applied to the auth-digest (cryptographic closure:
     /// signature ↔ auth_digest ↔ context_rule_ids binding).
     #[tokio::test]
+    #[serial_test::serial]
     async fn complete_authorization_entry_signs_and_assembles_authpayload() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
         use stellar_agent_network::SoftwareSigningKey;
 
@@ -2236,9 +2771,18 @@ mod tests {
         let saved_nonce = partial.nonce;
         let saved_expiry = partial.signature_expiration_ledger;
 
-        let entry = complete_authorization_entry(partial, &signer)
-            .await
-            .unwrap();
+        let entry = complete_authorization_entry(
+            &admission_fixture::partial_gate(
+                &partial,
+                vec![SignerDescriptor::Delegated { account: pubkey.0 }],
+                false,
+            ),
+            crate::submit::checked_rules_for_test(&partial),
+            partial,
+            &signer,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(entry.root_invocation.sub_invocations.len(), 0);
 
@@ -2472,7 +3016,12 @@ mod tests {
     /// smart-account entry, no G-key), and a mixed set yields one smart-account
     /// entry plus exactly one G-key entry per Delegated signer.
     #[tokio::test]
+    #[serial_test::serial]
     async fn collect_mixed_signer_entries_gkey_only_for_delegated() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         use stellar_agent_network::SoftwareSigningKey;
 
         let (simulation, envelope) = contexts();
@@ -2505,6 +3054,8 @@ mod tests {
                 },
             }];
             let entries = collect_mixed_signer_entries(
+                &admission_fixture::mixed_gate(&partial, &signers).await,
+                crate::submit::checked_rules_for_test(&partial),
                 partial,
                 &signers,
                 simulation.signature_expiration_ledger,
@@ -2539,6 +3090,8 @@ mod tests {
                 },
             ];
             let entries = collect_mixed_signer_entries(
+                &admission_fixture::mixed_gate(&partial, &signers).await,
+                crate::submit::checked_rules_for_test(&partial),
                 partial,
                 &signers,
                 simulation.signature_expiration_ledger,
@@ -2572,6 +3125,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── sign_within_budget ────────────────────────────────────────────────────
+
+    /// Asserts the deadline refusal of `stage`.
+    fn assert_signing_refusal(outcome: Result<u32, SaError>, stage: &str) {
+        match outcome {
+            Err(SaError::AuthEntryConstructionFailed {
+                stage: "auth_payload",
+                redacted_reason,
+            }) => assert!(
+                redacted_reason
+                    .starts_with(&format!("{stage} exceeded collective pre-submit budget")),
+                "{redacted_reason}"
+            ),
+            other => panic!("expected the deadline refusal of {stage}, got {other:?}"),
+        }
+    }
+
+    /// A signer call that signs without yielding and completes only after
+    /// the deadline, on the one poll the deadline timer cannot cut, is
+    /// refused: its signature is not used.
+    #[tokio::test]
+    async fn a_signer_call_completing_past_the_deadline_is_refused() {
+        let budget = PreSubmitBudget {
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+            total: std::time::Duration::from_secs(1),
+        };
+
+        let outcome = sign_within_budget(Some(budget), SIGN_AUTH_DIGEST_STAGE, async {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            7_u32
+        })
+        .await;
+
+        assert_signing_refusal(outcome, SIGN_AUTH_DIGEST_STAGE);
+    }
+
+    /// A deadline already passed refuses before the signer call runs.
+    #[tokio::test]
+    async fn a_passed_deadline_refuses_before_the_signer_call_runs() {
+        let budget = PreSubmitBudget {
+            deadline: tokio::time::Instant::now(),
+            total: std::time::Duration::from_secs(1),
+        };
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let outcome = sign_within_budget(Some(budget), SIGN_DELEGATED_ENTRY_STAGE, async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            7_u32
+        })
+        .await;
+
+        assert_signing_refusal(outcome, SIGN_DELEGATED_ENTRY_STAGE);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the signer is not called"
+        );
     }
 
     // ── bound_pre_submit_stage ────────────────────────────────────────────────
@@ -2742,6 +3354,1002 @@ mod tests {
         assert_eq!(
             redacted_reason,
             "pin_plan exceeded collective pre-submit budget of 4s"
+        );
+    }
+
+    // ── Mainnet refusal and network binding before any key access ───────────
+
+    /// A validated partial for the smart account `contract_address(7)` over
+    /// rule 42, derived for the network of `network_passphrase`.
+    fn partial_on(network_passphrase: &str) -> PartialSorobanAuthorizationEntry {
+        test_helpers::partial_authorization_entry(
+            contract_address(7),
+            network_passphrase,
+            vec![ContextRuleId::new(42)],
+        )
+        .unwrap()
+    }
+
+    /// A testnet partial whose `auth_digest` differs from the recomputed one.
+    fn tampered_testnet_partial() -> PartialSorobanAuthorizationEntry {
+        let mut partial = partial_on(TESTNET_PASSPHRASE);
+        partial.auth_digest[0] ^= 0x01;
+        partial
+    }
+
+    fn external_signer(signer: &CountingSigner) -> [MixedSigner<'_>; 1] {
+        [MixedSigner {
+            signer,
+            kind: MixedSignerKind::ExternalEd25519 {
+                verifier: contract_address(0xC1),
+            },
+        }]
+    }
+
+    #[test]
+    fn validate_accepts_a_testnet_partial_from_the_builder_derivation() {
+        partial_on(TESTNET_PASSPHRASE).validate().unwrap();
+    }
+
+    /// The typed digest a signer receives for a validated partial equals the
+    /// partial's `auth_digest`, and equals `SmartAccountAuthDigest::new` over
+    /// the partial's own preimage and rule ids.
+    #[test]
+    fn signing_digest_equals_the_validated_auth_digest() {
+        let partial = partial_on(TESTNET_PASSPHRASE);
+        let digest = partial.signing_digest().unwrap();
+        assert_eq!(*digest.as_bytes(), partial.auth_digest);
+
+        let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+            network_id: Hash(partial.network_id),
+            nonce: partial.nonce,
+            signature_expiration_ledger: partial.signature_expiration_ledger,
+            invocation: partial.root_invocation.clone(),
+        });
+        let rule_ids_xdr = encode_context_rule_ids(&partial.context_rule_ids).unwrap();
+        assert_eq!(
+            SmartAccountAuthDigest::new(&preimage, &rule_ids_xdr).unwrap(),
+            digest
+        );
+    }
+
+    /// No typed digest exists for a mainnet partial or a tampered one.
+    #[test]
+    fn signing_digest_refuses_a_mainnet_or_tampered_partial() {
+        assert!(matches!(
+            partial_on(MAINNET_PASSPHRASE).signing_digest(),
+            Err(SaError::MainnetWriteForbidden)
+        ));
+        assert!(matches!(
+            tampered_testnet_partial().signing_digest(),
+            Err(SaError::AuthEntryBindingMismatch {
+                field: "auth_digest"
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_refuses_a_mainnet_network_id() {
+        let partial = partial_on(MAINNET_PASSPHRASE);
+
+        assert!(matches!(
+            partial.validate(),
+            Err(SaError::MainnetWriteForbidden)
+        ));
+    }
+
+    #[test]
+    fn validate_refuses_a_changed_signature_payload() {
+        let mut partial = partial_on(TESTNET_PASSPHRASE);
+        partial.signature_payload[31] ^= 0x01;
+
+        assert!(matches!(
+            partial.validate(),
+            Err(SaError::AuthEntryBindingMismatch {
+                field: "signature_payload"
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_refuses_a_changed_auth_digest() {
+        assert!(matches!(
+            tampered_testnet_partial().validate(),
+            Err(SaError::AuthEntryBindingMismatch {
+                field: "auth_digest"
+            })
+        ));
+    }
+
+    /// The network ID cannot be restated without the digests: a testnet
+    /// partial relabelled as futurenet no longer validates.
+    #[test]
+    fn validate_refuses_a_network_id_the_digests_were_not_computed_for() {
+        let mut partial = partial_on(TESTNET_PASSPHRASE);
+        partial.network_id = network_id_of(FUTURENET_PASSPHRASE);
+
+        assert!(matches!(
+            partial.validate(),
+            Err(SaError::AuthEntryBindingMismatch {
+                field: "signature_payload"
+            })
+        ));
+    }
+
+    /// The context-rule IDs are bound into `auth_digest`: a rewritten rule
+    /// list no longer validates.
+    #[test]
+    fn validate_refuses_changed_context_rule_ids() {
+        let mut partial = partial_on(TESTNET_PASSPHRASE);
+        partial.context_rule_ids = vec![ContextRuleId::new(43)];
+
+        assert!(matches!(
+            partial.validate(),
+            Err(SaError::AuthEntryBindingMismatch {
+                field: "auth_digest"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn complete_authorization_entry_refuses_a_different_checked_rule() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let partial = partial_on(TESTNET_PASSPHRASE);
+        let mut other = partial.clone();
+        other.context_rule_ids = vec![ContextRuleId::new(999)];
+        let checked = crate::submit::checked_rules_for_test(&other);
+        let signer = CountingSigner::new([0x46; 32]);
+        let error = complete_authorization_entry(
+            &admission_fixture::gate(vec![]),
+            checked,
+            partial,
+            &signer,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SaError::AuthEntryBindingMismatch {
+                    field: "checked_signing_rules"
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn multi_signer_completion_refuses_a_different_checked_account() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let partial = partial_on(TESTNET_PASSPHRASE);
+        let mut other = partial.clone();
+        other.smart_account = contract_address(0x99);
+        let checked = crate::submit::checked_rules_for_test(&other);
+        let signer = CountingSigner::new([0x46; 32]);
+        let error = complete_authorization_entry_multi_signer(
+            &admission_fixture::gate(vec![]),
+            checked,
+            partial,
+            &[&signer],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SaError::AuthEntryBindingMismatch {
+                    field: "checked_signing_rules"
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ed25519_rule_signing_refuses_a_different_checked_network() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let (simulation, envelope) = contexts();
+        let checked = crate::submit::checked_context_for_test(
+            &contract_address(7),
+            [0x99; 32],
+            &[ContextRuleId::new(42)],
+        );
+        let signer = CountingSigner::new([0x46; 32]);
+        let error = sign_with_ed25519_rule(
+            &admission_fixture::gate(vec![]),
+            checked,
+            contract_address(7),
+            symbol("transfer"),
+            vec![],
+            vec![ContextRuleId::new(42)],
+            &simulation,
+            &envelope,
+            &signer,
+            contract_address(0xc1),
+            TESTNET_PASSPHRASE,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SaError::AuthEntryBindingMismatch {
+                    field: "checked_signing_rules"
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn complete_authorization_entry_signs_a_testnet_partial() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let signer = CountingSigner::new([0x41; 32]);
+
+        complete_authorization_entry(
+            &admission_fixture::partial_gate(
+                &partial_on(TESTNET_PASSPHRASE),
+                vec![SignerDescriptor::Delegated {
+                    account: ed25519_dalek::SigningKey::from_bytes(&[0x41; 32])
+                        .verifying_key()
+                        .to_bytes(),
+                }],
+                false,
+            ),
+            crate::submit::checked_rules_for_test(&partial_on(TESTNET_PASSPHRASE)),
+            partial_on(TESTNET_PASSPHRASE),
+            &signer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(signer.public_key_calls(), 1);
+        assert_eq!(signer.sign_calls(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn complete_authorization_entry_refuses_a_mainnet_partial_before_any_key_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let signer = CountingSigner::new([0x41; 32]);
+
+        let err = complete_authorization_entry(
+            &admission_fixture::gate(vec![]),
+            crate::submit::checked_rules_for_test(&partial_on(MAINNET_PASSPHRASE)),
+            partial_on(MAINNET_PASSPHRASE),
+            &signer,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, SaError::MainnetWriteForbidden), "{err:?}");
+        assert_eq!(err.wire_code(), "network.mainnet_write_forbidden");
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn complete_authorization_entry_refuses_a_tampered_digest_before_any_key_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let signer = CountingSigner::new([0x41; 32]);
+
+        let err = complete_authorization_entry(
+            &admission_fixture::gate(vec![]),
+            crate::submit::checked_rules_for_test(&tampered_testnet_partial()),
+            tampered_testnet_partial(),
+            &signer,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                SaError::AuthEntryBindingMismatch {
+                    field: "auth_digest"
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.wire_code(), "sa.auth_entry_binding_mismatch");
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn complete_authorization_entry_multi_signer_signs_a_testnet_partial() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let a = CountingSigner::new([0x42; 32]);
+        let b = CountingSigner::new([0x43; 32]);
+
+        complete_authorization_entry_multi_signer(
+            &admission_fixture::partial_gate(
+                &partial_on(TESTNET_PASSPHRASE),
+                vec![
+                    SignerDescriptor::Delegated {
+                        account: ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
+                            .verifying_key()
+                            .to_bytes(),
+                    },
+                    SignerDescriptor::Delegated {
+                        account: ed25519_dalek::SigningKey::from_bytes(&[0x43; 32])
+                            .verifying_key()
+                            .to_bytes(),
+                    },
+                ],
+                false,
+            ),
+            crate::submit::checked_rules_for_test(&partial_on(TESTNET_PASSPHRASE)),
+            partial_on(TESTNET_PASSPHRASE),
+            &[&a, &b],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(a.key_accesses() + b.key_accesses(), 4);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn complete_authorization_entry_multi_signer_refuses_a_mainnet_partial_before_any_key_access()
+     {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let a = CountingSigner::new([0x42; 32]);
+        let b = CountingSigner::new([0x43; 32]);
+
+        let err = complete_authorization_entry_multi_signer(
+            &admission_fixture::gate(vec![]),
+            crate::submit::checked_rules_for_test(&partial_on(MAINNET_PASSPHRASE)),
+            partial_on(MAINNET_PASSPHRASE),
+            &[&a, &b],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, SaError::MainnetWriteForbidden), "{err:?}");
+        assert_eq!(a.key_accesses() + b.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn complete_authorization_entry_multi_signer_refuses_a_tampered_digest_before_any_key_access()
+     {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let a = CountingSigner::new([0x42; 32]);
+        let b = CountingSigner::new([0x43; 32]);
+
+        let err = complete_authorization_entry_multi_signer(
+            &admission_fixture::gate(vec![]),
+            crate::submit::checked_rules_for_test(&tampered_testnet_partial()),
+            tampered_testnet_partial(),
+            &[&a, &b],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                SaError::AuthEntryBindingMismatch {
+                    field: "auth_digest"
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(a.key_accesses() + b.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn collect_mixed_signer_entries_signs_a_testnet_partial_with_the_testnet_passphrase() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let signer = CountingSigner::new([0x44; 32]);
+
+        let entries = collect_mixed_signer_entries(
+            &admission_fixture::partial_gate(
+                &partial_on(TESTNET_PASSPHRASE),
+                vec![admission_fixture::external(
+                    &contract_address(0xc1),
+                    ed25519_dalek::SigningKey::from_bytes(&[0x44; 32])
+                        .verifying_key()
+                        .to_bytes(),
+                )],
+                false,
+            ),
+            crate::submit::checked_rules_for_test(&partial_on(TESTNET_PASSPHRASE)),
+            partial_on(TESTNET_PASSPHRASE),
+            &external_signer(&signer),
+            9999,
+            TESTNET_PASSPHRASE,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(signer.key_accesses(), 2);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn collect_mixed_signer_entries_refuses_the_mainnet_passphrase_before_any_key_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let signer = CountingSigner::new([0x44; 32]);
+
+        let err = collect_mixed_signer_entries(
+            &admission_fixture::gate(vec![]),
+            crate::submit::checked_rules_for_test(&partial_on(TESTNET_PASSPHRASE)),
+            partial_on(TESTNET_PASSPHRASE),
+            &external_signer(&signer),
+            9999,
+            MAINNET_PASSPHRASE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, SaError::MainnetWriteForbidden), "{err:?}");
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn collect_mixed_signer_entries_refuses_a_mainnet_partial_before_any_key_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let signer = CountingSigner::new([0x44; 32]);
+
+        let err = collect_mixed_signer_entries(
+            &admission_fixture::gate(vec![]),
+            crate::submit::checked_rules_for_test(&partial_on(MAINNET_PASSPHRASE)),
+            partial_on(MAINNET_PASSPHRASE),
+            &external_signer(&signer),
+            9999,
+            TESTNET_PASSPHRASE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, SaError::MainnetWriteForbidden), "{err:?}");
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn collect_mixed_signer_entries_refuses_a_tampered_digest_before_any_key_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let signer = CountingSigner::new([0x44; 32]);
+
+        let err = collect_mixed_signer_entries(
+            &admission_fixture::gate(vec![]),
+            crate::submit::checked_rules_for_test(&tampered_testnet_partial()),
+            tampered_testnet_partial(),
+            &external_signer(&signer),
+            9999,
+            TESTNET_PASSPHRASE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                SaError::AuthEntryBindingMismatch {
+                    field: "auth_digest"
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn collect_mixed_signer_entries_refuses_a_passphrase_of_another_network_before_any_key_access()
+     {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let signer = CountingSigner::new([0x44; 32]);
+
+        let err = collect_mixed_signer_entries(
+            &admission_fixture::gate(vec![]),
+            crate::submit::checked_rules_for_test(&partial_on(TESTNET_PASSPHRASE)),
+            partial_on(TESTNET_PASSPHRASE),
+            &external_signer(&signer),
+            9999,
+            FUTURENET_PASSPHRASE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                SaError::AuthEntryBindingMismatch {
+                    field: "network_id"
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.wire_code(), "sa.auth_entry_binding_mismatch");
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    /// The rule signer reaches the collector's mainnet refusal before any key
+    /// access; the function has no check of its own.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sign_with_ed25519_rule_refuses_the_mainnet_passphrase_before_any_key_access() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let (simulation, envelope) = contexts();
+        let signer = CountingSigner::new([0x45; 32]);
+
+        let err = sign_with_ed25519_rule(
+            &admission_fixture::gate(vec![]),
+            crate::submit::checked_context_for_test(
+                &contract_address(7),
+                simulation.network_id,
+                &[ContextRuleId::new(42)],
+            ),
+            contract_address(7),
+            symbol("transfer"),
+            vec![],
+            vec![ContextRuleId::new(42)],
+            &simulation,
+            &envelope,
+            &signer,
+            contract_address(0xC1),
+            MAINNET_PASSPHRASE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, SaError::MainnetWriteForbidden), "{err:?}");
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn build_and_sign_delegated_g_key_entry_signs_on_testnet() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let signer = CountingSigner::new([0x46; 32]);
+        let partial = partial_on(TESTNET_PASSPHRASE);
+
+        build_and_sign_delegated_g_key_entry(
+            &admission_fixture::delegated_gate(
+                &partial.smart_account,
+                &partial.auth_digest,
+                9999,
+                ed25519_dalek::SigningKey::from_bytes(&[0x46; 32])
+                    .verifying_key()
+                    .to_bytes(),
+                1,
+            ),
+            1,
+            &partial.smart_account,
+            &partial.auth_digest,
+            9999,
+            &signer,
+            TESTNET_PASSPHRASE,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(signer.key_accesses(), 2);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn build_and_sign_delegated_g_key_entry_refuses_the_mainnet_passphrase_before_any_key_access()
+     {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let signer = CountingSigner::new([0x46; 32]);
+        let partial = partial_on(TESTNET_PASSPHRASE);
+
+        let err = build_and_sign_delegated_g_key_entry(
+            &admission_fixture::gate(vec![]),
+            1,
+            &partial.smart_account,
+            &partial.auth_digest,
+            9999,
+            &signer,
+            MAINNET_PASSPHRASE,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, SaError::MainnetWriteForbidden), "{err:?}");
+        assert_eq!(signer.key_accesses(), 0);
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_gate_refuses_what_the_plan_does_not_name() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        admission_fixture::assert_envelope_bounds_refuse_before_signing().await;
+        let partial = partial_on(TESTNET_PASSPHRASE);
+        let seed = [0x51; 32];
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let mut other = partial.clone();
+        other.smart_account = contract_address(8);
+        assert_eq!(partial.auth_digest, other.auth_digest);
+        let mut other_nonce = partial.clone();
+        other_nonce.nonce += 1;
+        (other_nonce.signature_payload, other_nonce.auth_digest) = derive_digests(
+            other_nonce.network_id,
+            other_nonce.nonce,
+            other_nonce.signature_expiration_ledger,
+            &other_nonce.root_invocation,
+            &other_nonce.context_rule_ids,
+        )
+        .unwrap();
+        for changed in [
+            other_nonce.clone(),
+            other,
+            test_helpers::partial_authorization_entry(
+                contract_address(8),
+                TESTNET_PASSPHRASE,
+                vec![ContextRuleId::new(42)],
+            )
+            .unwrap(),
+        ] {
+            let signer = CountingSigner::new(seed);
+            let gate = admission_fixture::partial_gate(
+                &partial,
+                vec![SignerDescriptor::Delegated { account: key }],
+                false,
+            );
+            let error = complete_authorization_entry(
+                &gate,
+                crate::submit::checked_rules_for_test(&changed),
+                changed.clone(),
+                &signer,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                SaError::IntentBindingMismatch {
+                    field: "signing_request"
+                }
+            ));
+            assert_eq!(signer.sign_calls(), 0);
+            assert!(gate.take_unexposed().is_some());
+            let gate = admission_fixture::partial_gate(
+                &partial,
+                vec![admission_fixture::external(&contract_address(0xc1), key)],
+                false,
+            );
+            let error = collect_mixed_signer_entries(
+                &gate,
+                crate::submit::checked_rules_for_test(&changed),
+                changed.clone(),
+                &external_signer(&signer),
+                changed.signature_expiration_ledger,
+                TESTNET_PASSPHRASE,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                SaError::IntentBindingMismatch {
+                    field: "signing_request"
+                }
+            ));
+            assert_eq!(signer.sign_calls(), 0);
+            assert!(gate.take_unexposed().is_some());
+        }
+        let signer = CountingSigner::new(seed);
+        let gate = admission_fixture::partial_gate(
+            &partial,
+            vec![admission_fixture::external(&contract_address(0xc2), key)],
+            false,
+        );
+        let result = collect_mixed_signer_entries(
+            &gate,
+            crate::submit::checked_rules_for_test(&partial),
+            partial.clone(),
+            &external_signer(&signer),
+            partial.signature_expiration_ledger,
+            TESTNET_PASSPHRASE,
+        )
+        .await;
+        assert_eq!(signer.sign_calls(), 0);
+        assert!(matches!(
+            result,
+            Err(SaError::IntentBindingMismatch {
+                field: "signing_request"
+            })
+        ));
+        assert!(gate.take_unexposed().is_some());
+        let signer = CountingSigner::new(seed);
+        let gate = admission_fixture::partial_gate(
+            &partial,
+            vec![SignerDescriptor::Delegated { account: key }],
+            false,
+        );
+        complete_authorization_entry(
+            &gate,
+            crate::submit::checked_rules_for_test(&partial),
+            partial.clone(),
+            &signer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(signer.sign_calls(), 1);
+        assert!(gate.exposure().is_some());
+        assert!(gate.take_unexposed().is_none());
+        let error = complete_authorization_entry(
+            &gate,
+            crate::submit::checked_rules_for_test(&other_nonce),
+            other_nonce,
+            &signer,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SaError::IntentBindingMismatch {
+                field: "signing_request"
+            }
+        ));
+        assert_eq!(signer.sign_calls(), 1);
+        let error = complete_authorization_entry(
+            &gate,
+            crate::submit::checked_rules_for_test(&partial),
+            partial,
+            &signer,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SaError::IntentBindingMismatch {
+                field: "signing_request"
+            }
+        ));
+        assert_eq!(signer.sign_calls(), 1);
+    }
+
+    /// The signed re-simulation names the code the RPC 30.0.1 events confirm,
+    /// with the same variant, phase and wire code.
+    #[tokio::test]
+    async fn resimulation_refusal_names_the_code_on_rpc30() {
+        use crate::managers::rules::event_reason_tests::{
+            RPC30_ERROR, SAC, SMART_ACCOUNT, address, address_entry, read_only_server,
+            refusal_result, rpc30_events,
+        };
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let server = read_only_server(&source, refusal_result(RPC30_ERROR, &rpc30_events())).await;
+        let rpc = Client::new(&server.uri()).unwrap();
+        let rpc_client = StellarRpcClient::new(&server.uri()).unwrap();
+        let error = resimulate_with_signed_auth(
+            &rpc,
+            &rpc_client,
+            &address(SAC),
+            ScSymbol::try_from("transfer").unwrap(),
+            VecM::default(),
+            vec![address_entry(address(SMART_ACCOUNT), &address(SAC), vec![])],
+            &source,
+            TESTNET_PASSPHRASE,
+            PreSubmitBudget {
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                total: std::time::Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.wire_code(), "sa.deployment_failed");
+        match error {
+            SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason,
+            } => assert_eq!(
+                redacted_reason,
+                "re-simulate returned error: Error(Contract, #3221) [OZ:SpendingLimitExceeded]"
+            ),
+            other => panic!("expected the simulate refusal, got {other:?}"),
+        }
+    }
+
+    async fn busy_resimulation(
+        server: &wiremock::MockServer,
+        budget: PreSubmitBudget,
+    ) -> Result<stellar_rpc_client::SimulateTransactionResponse, SaError> {
+        use crate::managers::rules::event_reason_tests::{
+            SAC, SMART_ACCOUNT, address, address_entry,
+        };
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        resimulate_with_signed_auth(
+            &Client::new(&server.uri()).unwrap(),
+            &StellarRpcClient::new(&server.uri()).unwrap(),
+            &address(SAC),
+            ScSymbol::try_from("transfer").unwrap(),
+            VecM::default(),
+            vec![address_entry(address(SMART_ACCOUNT), &address(SAC), vec![])],
+            &source,
+            TESTNET_PASSPHRASE,
+            budget,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn busy_resimulation_fails_as_transport() {
+        use crate::managers::rules::event_reason_tests::{
+            RPC30_ERROR, busy_replies, read_only_server, refusal_result, rpc30_events,
+        };
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        for busy in [1, 4] {
+            let server =
+                read_only_server(&source, refusal_result(RPC30_ERROR, &rpc30_events())).await;
+            busy_replies(&server, busy).await;
+            let budget = PreSubmitBudget {
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                total: std::time::Duration::from_secs(30),
+            };
+            let error = crate::managers::rules::event_reason_tests::drive_busy_paused(
+                busy_resimulation(&server, budget),
+            )
+            .await
+            .unwrap_err();
+            if busy == 1 {
+                assert!(
+                    matches!(error, SaError::DeploymentFailed { phase: "simulate", ref redacted_reason } if redacted_reason.contains("[OZ:SpendingLimitExceeded]")),
+                    "{error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        error,
+                        SaError::AuthEntryConstructionFailed {
+                            stage: "auth_payload",
+                            ..
+                        }
+                    ),
+                    "{error:?}"
+                );
+                assert!(tokio::time::Instant::now() < budget.deadline);
+            }
+            assert_eq!(
+                stellar_agent_test_support::rpc_request_count(&server, "simulateTransaction").await,
+                if busy == 1 { 2 } else { 4 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resimulation_expiry_keeps_the_stage_error() {
+        use crate::managers::rules::event_reason_tests::{
+            busy_replies, read_only_server, successful_read_result,
+        };
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let server = read_only_server(&source, successful_read_result()).await;
+        wiremock::Mock::given(wiremock::matchers::body_partial_json(
+            serde_json::json!({"method": "simulateTransaction"}),
+        ))
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": body["id"], "result": successful_read_result()
+                }))
+                .set_delay(std::time::Duration::from_secs(3))
+        })
+        .with_priority(2)
+        .mount(&server)
+        .await;
+        busy_replies(&server, 1).await;
+        let start = tokio::time::Instant::now();
+        let budget = PreSubmitBudget {
+            deadline: start + std::time::Duration::from_secs(2),
+            total: std::time::Duration::from_secs(2),
+        };
+        let error = busy_resimulation(&server, budget).await.unwrap_err();
+        assert_eq!(
+            serde_json::to_value(&error).unwrap(),
+            serde_json::to_value(budget.elapsed("simulate_resimulate", "auth_payload")).unwrap()
+        );
+        assert!(start.elapsed() < std::time::Duration::from_millis(2500));
+    }
+
+    #[tokio::test]
+    async fn busy_resimulation_reuses_the_envelope() {
+        use crate::managers::rules::event_reason_tests::{
+            RPC30_ERROR, busy_replies, read_only_server, refusal_result, rpc30_events,
+        };
+        let source = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let server = read_only_server(&source, refusal_result(RPC30_ERROR, &rpc30_events())).await;
+        busy_replies(&server, 2).await;
+        let budget = PreSubmitBudget {
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            total: std::time::Duration::from_secs(30),
+        };
+        let error = busy_resimulation(&server, budget).await.unwrap_err();
+        assert!(matches!(
+            error,
+            SaError::DeploymentFailed {
+                phase: "simulate",
+                ..
+            }
+        ));
+        let bodies: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.body_json().unwrap())
+            .collect();
+        let envelopes: Vec<_> = bodies
+            .iter()
+            .filter(|r| r["method"] == "simulateTransaction")
+            .map(|r| &r["params"]["transaction"])
+            .collect();
+        assert_eq!(envelopes.len(), 3);
+        assert!(envelopes.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            stellar_agent_test_support::rpc_request_count(&server, "getLedgerEntries").await,
+            1
         );
     }
 }

@@ -16,25 +16,25 @@ Shared dependency pins live in `[workspace.dependencies]` in the root `Cargo.tom
 The layers below order normal workspace dependencies, including optional and target-gated dependencies.
 Crate names omit the `stellar-agent-` prefix.
 A crate depends on lower layers; the listed composite exceptions depend on earlier members of their own layer.
-Neither binary depends on the other, and no published library depends on a binary.
+The CLI package depends on the MCP library. No library depends on the CLI package.
 
 | Layer | Members and rules |
 | --- | --- |
 | Foundations | `xdr-limits`, `soroban-auth`, `sep5`, `windows-identity`, `loopback-http`, `toolsets`, `mcp-macros`, and `test-support` have no normal workspace dependencies. |
-| Core | `core` uses `xdr-limits`, optional `test-support`, and `windows-identity` on Windows. `headless-keyring` uses `windows-identity` on Windows. `sep10` and `sep45` use `xdr-limits`. |
-| Network and installation | `network` builds on `core`, `headless-keyring`, and `xdr-limits`. `toolsets-install` uses `toolsets` and `core`. |
-| Domain libraries | `nonce`, `pool`, `claimable`, `smart-account`, `defi`, `stablecoin`, `sep7`, `sep48`, `sep53`, `anchor`, `x402-identity`, and `toolsets-runtime` depend only on earlier layers. |
-| Composite libraries | `sep43`, `x402`, `mpp`, `dex`, `defindex`, `webauthn-bridge`, `approval-ui`, and `approval-remote`. Within this layer, `x402` and `mpp` depend on `sep43`; `approval-remote` depends on `approval-ui`. |
-| Binaries | `cli` and `mcp` consume library crates. |
-| Acceptance | `smart-account-acceptance` is a test-only leaf above the binaries. |
+| Core | `core` uses `xdr-limits`, `soroban-auth`, optional `test-support`, and `windows-identity` on Windows. `headless-keyring` uses `windows-identity` on Windows. |
+| Network and installation | `network` builds on `core`, `headless-keyring`, `soroban-auth`, `xdr-limits`, and optional `test-support`. `toolsets-install` uses `toolsets` and `core`. `sep45` uses `core` and `xdr-limits`. |
+| Domain libraries | `nonce`, `pool`, `claimable`, `smart-account`, `defi`, `stablecoin`, `sep7`, `sep10`, `sep48`, `sep53`, `anchor`, and `toolsets-runtime` depend only on earlier layers. |
+| Composite libraries | `sep43`, `x402`, `x402-identity`, `mpp`, `dex`, `defindex`, `webauthn-bridge`, `approval-ui`, and `approval-remote`. Within this layer, `x402` and `mpp` depend on `sep43`; `approval-remote` depends on `approval-ui`. |
+| Server library and binary | `mcp` is a library over the layers above. `cli` builds the one executable and depends on `mcp`. |
+| Acceptance | `smart-account-acceptance` is a test-only leaf above `mcp`; it does not depend on `cli`. |
 
 `defi` defines contract pins, typed previews, and adapter interfaces.
 `dex` and `defindex` implement its trade and vault adapters through `smart-account` submission.
-`stablecoin` supplies classic trustline helpers over `core` and `network`; the binaries wire the trustline commands.
+`stablecoin` supplies classic trustline helpers over `core` and `network`; `cli` and `mcp` wire the trustline commands.
 
 ## Workspace lints
 
-Each crate inherits `[workspace.lints]` through `[lints] workspace = true`.
+Every crate except `stellar-agent-sep7` inherits `[workspace.lints]` through `[lints] workspace = true`.
 
 ```toml
 [workspace.lints.rust]
@@ -54,30 +54,35 @@ print_stderr = "deny"
 dbg_macro = "deny"
 ```
 
-Production code has four scoped `unsafe_code` allow sites across three areas: Windows identity and DPAPI, the CLI audit verifier's POSIX user check, and MCP Linux process hardening.
+The workspace denies `unsafe_code`.
+Each production exception is a scoped `unsafe_code` allow around an operating system call.
 Tests have additional scoped allowances.
 Errors use typed results; output uses JSON envelopes and redacting logs.
 Scoped allowances document necessary exceptions.
 The [lint gate](building.md#lint) enforces these rules.
 
-## The two binaries
+## The one executable
 
 `stellar-agent-cli` builds `stellar-agent` from `src/main.rs`.
 The external-command convention also makes it discoverable as `stellar agent ...`.
-`stellar-agent-mcp` builds the MCP server, with a library entry point used by integration tests.
+It selects the server role before tool startup: `stellar-agent mcp serve`, or a
+run under the file name `stellar-agent-mcp`, enters the public server entry of
+the `stellar-agent-mcp` library. That library has no executable target.
+Releases and the deployment install the executable under both names as
+byte-equal copies.
 
 MCP directly links `sep7`, `sep43`, `sep48`, `sep53`, `anchor`, `x402`, and `x402-identity`.
-Both binaries link `mpp`, which uses `sep43`.
-`sep10` reaches MCP through `x402-identity`; neither binary links `sep45`.
+The CLI and MCP crates both link `mpp`, which uses `sep43`.
+`sep10` reaches MCP through `x402-identity`; the executable does not link `sep45`.
 
-Both binaries share the release archive referenced by their `package.metadata.binstall` blocks.
+The CLI's `package.metadata.binstall` block installs `stellar-agent` from the release archive, which holds both names.
 See [Getting started](../getting-started.md) for installation and [Building](building.md#building) for source builds.
 
 ## Per-crate responsibility
 
 | Crate | Responsibility |
 | --- | --- |
-| `stellar-agent-core` | Typed amounts, errors, envelopes, profiles, policy engines, approvals, and audit records. Its `policy`, `approval`, and `audit_log` modules provide synchronous evaluation and stores, including the TOML approval store with its exclusive lifetime lock. Owns the receipt store, audit tip anchor, binding, and consent outbox. Tokio bounds unlock lifetimes and sequential RPC deadlines. |
+| `stellar-agent-core` | Typed amounts, errors, envelopes, profiles, policy engines, approvals, and audit records. Its `policy`, `approval`, and `audit_log` modules provide synchronous evaluation and stores, including the TOML approval store with its exclusive lifetime lock. Owns the receipt store, audit tip anchor, binding, and consent outbox. Wallet unlock and seed access are synchronous and runtime-free; Tokio bounds sequential RPC deadlines. |
 | `stellar-agent-network` | Async Stellar RPC client, account views, assembly, SEP-29 checks, hardware signers, and Friendbot. Enforces endpoint identity, signature-network binding, witnesses, and submission recording. Owns keyring initialization, the policy window store, counterparty cache, and sequence-floor hook. The idempotent-submit APIs are library-only; shipped verbs use `submit_transaction_and_wait`. |
 | `stellar-agent-claimable` | Claimable-balance domain logic: balance-id normalization, predicate evaluation, entry and trustline fetch, and claim preview; drives the `claim` verb. |
 | `stellar-agent-sep5` | SEP-5 / BIP-44 HD ed25519 key derivation (`m/44'/148'/index'`, SLIP-0010 hardened) from a BIP-39 mnemonic or seed; no I/O or RNG. |
@@ -93,33 +98,33 @@ See [Getting started](../getting-started.md) for installation and [Building](bui
 | `stellar-agent-headless-keyring` | Explicitly selected file-backed credential store with sidecar locks. Uses XChaCha20-Poly1305 with an operator-supplied key or Windows DPAPI. Configuration failures refuse access. |
 | `stellar-agent-pool` | SEP-5-derived channel-account pool with in-pool sequence management for concurrent submission without `tx_bad_seq`. |
 | `stellar-agent-sep7` | Inbound `web+stellar:` URI parse and anti-phishing origin-domain signature verification; never signs, submits, or auto-POSTs. |
-| `stellar-agent-sep10` | SEP-10 web-auth client: challenge parse and validation, JWT session, HTTP challenge fetch and submit, ephemeral-key flow. |
+| `stellar-agent-sep10` | SEP-10 web-auth client: challenge parse and validation, JWT session, HTTP challenge fetch and submit, ephemeral-key flow, and the authorized mainnet completion that takes a message-use receipt. |
 | `stellar-agent-sep43` | SEP-43 `ModuleInterface` dispatch substrate (`get_address`, `sign_transaction`, `sign_auth_entry`, `sign_message`, `get_network`). |
 | `stellar-agent-sep45` | SEP-45 contract-account web-auth: challenge validation, JWT session, ephemeral and persistent auth-entry signing. |
 | `stellar-agent-sep48` | SEP-48 contract-interface typed-arg preview and SEP-47 contract-interface discovery; non-authoritative display only. |
 | `stellar-agent-sep53` | SEP-53 prefixed message sign and verify over ed25519. |
 | `stellar-agent-anchor` | Privacy-first anchor client: SEP-6 `/info` discovery and SEP-24 interactive-URL hand-off with same-domain SSRF bind; never opens or follows the URL. |
 | `stellar-agent-toolsets` | `TOOLSET.md` format parse, capability-manifest validation, and the pre-canonicalization argument-validation guard; format and parse substrate only. |
-| `stellar-agent-toolsets-install` | Toolset install and uninstall with hash verification, ed25519 publisher signature and trust set, safe tar extraction, attestation gate, and atomic pin record. |
-| `stellar-agent-toolsets-runtime` | Capability-to-tool matrix, gated resolver, signing denylist, and the enforcement forming the toolset isolation boundary. |
+| `stellar-agent-toolsets-install` | Toolset install and uninstall with hash verification, ed25519 publisher signature and trust set, safe tar extraction, attestation gate, toolsets directory lock, and an atomic pin record authenticated by an HMAC under the installation's pin key. |
+| `stellar-agent-toolsets-runtime` | Capability-to-tool matrix, gated resolver, signing denylist, pin and manifest-digest verification, and the enforcement bounding what the toolset dispatcher routes (not the server's native tools). |
 | `stellar-agent-defi` | DeFi-adapter substrate: contract-pin framework, the typed-preview trait, and the dispatch-verb seam (`lend`/`trade`/`vault`/`bridge`); ships no live verb. |
-| `stellar-agent-defindex` | DeFindex vault adapter: typed deposit and withdraw with mandatory `min_out`, role disclosure, upgradable-flag refusal gate; drives the `vault` verb. |
+| `stellar-agent-defindex` | DeFindex vault adapter: typed deposit and withdraw with a mandatory minimum-output floor (`amounts_min`, `min_amounts_out`), role disclosure, upgradable-flag refusal gate; drives the `vault` verb. |
 | `stellar-agent-dex` | Soroswap router-direct swap adapter with absolute `amount_out_min`, pre-sign slippage re-verify, token canonicalization, bounded deadline, venue allowlist and router pin; drives `trade`/`quote`. |
 | `stellar-agent-stablecoin` | Stablecoin substrate: USDC/EURC issuer pins, denomination resolver, USDT hard-refusal, clawback disclosure, typed trustline preview; backs the `trustline` verb. |
-| `stellar-agent-x402` | Payer-side x402 Exact-Stellar payment payload builder (validate, build, simulate, sign, re-simulate, finalize). |
-| `stellar-agent-x402-identity` | SEP-10 counterparty-identity pre-payment gate for x402, returning a JWT Bearer companion bound at the HTTP layer; never mutates the payment XDR. |
+| `stellar-agent-x402` | Payer-side x402 Exact-Stellar payment payload builder (validate, build, simulate, sign, re-simulate, finalize), and the authorized mainnet path that consumes the payment intent before signed re-simulation and returns the release authorization. |
+| `stellar-agent-x402-identity` | SEP-10 counterparty-identity pre-payment gate for x402, returning a JWT Bearer companion bound at the HTTP layer; never mutates the payment XDR. It also holds the authorized mainnet gate that binds the authentication to the approved payment and returns the receipt continuation. |
 | `stellar-agent-mpp` | Strict testnet sponsored MPP charge parsing, request binding, simulation, one-shot payer authorization, durable lifecycle, credential encoding, receipt observation, and ledger reconciliation; shared by CLI and MCP. |
 | `stellar-agent-mcp-macros` | Proc-macro crate exporting `#[mcp_tool_router]`, which scans `#[mcp_tool_item(...)]` markers and emits `inventory::submit!` tool-registry entries. |
-| `stellar-agent-mcp` | MCP stdio server library and binary: `WalletServer`, the bounded stdio transport, per-family tool modules, and the inventory-collected tool registry feeding the policy engine. |
-| `stellar-agent-cli` | The `stellar-agent` CLI binary (discovered as `stellar agent ...`); a clap dispatch layer over the library crates. |
+| `stellar-agent-mcp` | MCP stdio server library, run by the `stellar-agent` executable: `WalletServer`, the bounded stdio transport, per-family tool modules, and the inventory-collected tool registry feeding the policy engine. |
+| `stellar-agent-cli` | The `stellar-agent` executable (discovered as `stellar agent ...`): a clap dispatch layer over the library crates, and the MCP server under `mcp serve` or the `stellar-agent-mcp` name. |
 | `stellar-agent-test-support` | Dev-only harness: log-capture and secret-leakage assertions, in-memory keyring mock, XDR and strkey fixtures, HTTP and contract doubles, live-network testnet helpers. |
 | `stellar-agent-smart-account-acceptance` | Unpublished member holding the smart-account live testnet suites that drive a browser, the MCP server, the WebAuthn bridge, or the SEP-48, DeFi, and DeFindex crates. Its `testnet-integration` feature activates every dependency, so offline builds compile an empty library. |
 
 ## Crate kinds
 
-The workspace contains two binary packages, the `mcp-macros` procedural macro, ordinary libraries, and test helpers.
-`test-support` serves test code; `core` and the acceptance member enable it through optional dependencies.
-`windows-identity` builds on every platform; `core` and `headless-keyring` gate their dependency to Windows.
+The workspace contains one binary package, the `mcp-macros` procedural macro, ordinary libraries, and test helpers.
+`test-support` serves test code; `core`, `network`, `defi`, and the acceptance member enable it through optional dependencies.
+`windows-identity` builds on every platform; `core`, `headless-keyring`, and `cli` gate their dependency to Windows.
 The acceptance member's dependencies activate through its test feature.
 
 ### Approval error taxonomy
@@ -138,7 +143,8 @@ Each MCP tool carries `#[mcp_tool_item(...)]` inside a `#[mcp_tool_router]` impl
 The macro emits an `inventory::submit!` registration; `WalletServer::new` collects the records into the descriptor map.
 Duplicate names are fatal startup errors.
 
-Gated handlers call `PolicyEngine::evaluate_full` or `evaluate_with_value_full` with a descriptor and arguments.
+The MCP gate evaluates each gated call through `PolicyEngine::evaluate_in_snapshot` with a descriptor and arguments.
+On mainnet it runs the mainnet evaluation over the same snapshot.
 The result includes the decision and sized value effects, which submission recording uses without deriving them again.
 The profile selects Noop or the signature-verified V1 engine.
 See the [payment flow](../architecture.md#one-agent-payment-end-to-end) for the order of checks, approval, and submission.
@@ -152,7 +158,7 @@ MCP handlers and CLI `pay`, `claim`, `accounts create`, and `trustline` construc
 
 ### In-process state
 
-`WalletServer` holds a nonce replay window and a sequence-floor tracker behind separate Tokio mutexes.
+`WalletServer` holds a nonce replay window, a prepared-payment map, and a sequence-floor tracker behind separate Tokio mutexes.
 The replay window belongs to one server instance; the nonce boot salt belongs to the process.
 The tracker records the highest confirmed sequence per source in a bounded map with oldest-entry eviction.
 
@@ -172,11 +178,13 @@ See [Two sessions on one profile](security-internals.md#two-sessions-on-one-prof
 ## CLI dispatch
 
 The CLI uses a clap `Subcommand` tree in `main.rs`, dispatching to command `run` functions over library crates.
-Its top-level commands are `approve`, `tx`, `audit`, `accounts`, `balances`, `counterparty`, `friendbot`, `fees`, `pay`, `mpp`, `pool`, `profile`, `credentials`, `vault`, `trade`, `trustline`, `claim`, `toolsets`, and `smart-account`.
+Its top-level commands are `mcp`, `approve`, `tx`, `audit`, `accounts`, `balances`, `counterparty`, `friendbot`, `fees`, `pay`, `mpp`, `pool`, `profile`, `credentials`, `vault`, `trade`, `trustline`, `claim`, `toolsets`, and `smart-account`.
 
-Before dispatch, `main` installs redacting logs and scans the active profile's audit log for context rules referencing retired verifier hashes.
+Before dispatch, `main` installs redacting logs and scans the active profile's audit log for context rules that reference revoked or retired verifier hashes or hold an incomplete pin record.
+`profile init`, `profile enable-mainnet`, and the `profile policy` verbs skip the scan, and a profile that does not load skips it silently.
 This local advisory makes no network calls and never aborts startup.
 Commands render a JSON `Envelope`; success exits with `0`, and errors exit with `1`.
+Some verbs add exit codes of their own, such as `3` and `65` from `profile policy-check`; the [profile reference](../cli-reference/profile-and-governance.md) defines them.
 
 ## Security detail
 

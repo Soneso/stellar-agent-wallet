@@ -129,7 +129,11 @@ fn write_temp_toml(content: &str) -> (tempfile::NamedTempFile, std::path::PathBu
 /// revocable session key that can sign for millennia. The bounds check prevents
 /// this at profile-load, never reaching the manager layer.
 #[test]
+#[serial_test::serial]
 fn t7a_u32_max_horizon_rejected() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let toml = toml_with_horizon(u32::MAX as u64);
     let (_file, path) = write_temp_toml(&toml);
 
@@ -141,18 +145,15 @@ fn t7a_u32_max_horizon_rejected() {
         "T-7a: error must be InvalidHorizonBound; got: {err:?}"
     );
 
-    if let ProfileLoadError::InvalidHorizonBound {
-        ref name,
-        value,
-        upper_bound,
-    } = err
-    {
-        assert_eq!(name, "test-profile", "T-7a: name must match");
-        assert_eq!(value, u32::MAX, "T-7a: value must be u32::MAX");
+    if let ProfileLoadError::InvalidHorizonBound { upper_bound } = err {
         assert_eq!(upper_bound, 10_000, "T-7a: upper_bound must be 10,000");
     }
 
     let msg = err.to_string();
+    assert!(
+        !msg.contains(&u32::MAX.to_string()) && !msg.contains("test-profile"),
+        "T-7a: error message must name neither the value nor the profile; got: {msg}"
+    );
     assert!(
         msg.contains("10000") || msg.contains("10,000"),
         "T-7a: error message must reference upper_bound 10_000; got: {msg}"
@@ -164,7 +165,11 @@ fn t7a_u32_max_horizon_rejected() {
 /// T-7b: `session_rule_max_horizon_ledgers = 10001` (just above the bound) is
 /// rejected with `ProfileLoadError::InvalidHorizonBound`.
 #[test]
+#[serial_test::serial]
 fn t7b_just_above_bound_rejected() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let toml = toml_with_horizon(10_001);
     let (_file, path) = write_temp_toml(&toml);
 
@@ -181,7 +186,11 @@ fn t7b_just_above_bound_rejected() {
 
 /// T-7c: `session_rule_max_horizon_ledgers = 10000` (exactly the bound) is accepted.
 #[test]
+#[serial_test::serial]
 fn t7c_exactly_at_bound_accepted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let toml = toml_with_horizon(10_000);
     let (_file, path) = write_temp_toml(&toml);
 
@@ -199,7 +208,11 @@ fn t7c_exactly_at_bound_accepted() {
 
 /// T-7d: `session_rule_max_horizon_ledgers = 500` (well within bounds) is accepted.
 #[test]
+#[serial_test::serial]
 fn t7d_small_value_accepted() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let toml = toml_with_horizon(500);
     let (_file, path) = write_temp_toml(&toml);
 
@@ -218,7 +231,11 @@ fn t7d_small_value_accepted() {
 /// T-7e: A profile TOML without `session_rule_max_horizon_ledgers` is accepted;
 /// the field defaults to `None` (callers use `DEFAULT_SESSION_RULE_HORIZON_LEDGERS`).
 #[test]
+#[serial_test::serial]
 fn t7e_field_absent_defaults_to_none() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (_file, path) = write_temp_toml(TOML_WITHOUT_HORIZON);
 
     let profile = load_from_path("test-profile", &path, None)

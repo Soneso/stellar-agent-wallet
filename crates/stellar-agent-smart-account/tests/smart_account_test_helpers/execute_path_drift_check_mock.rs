@@ -32,7 +32,6 @@
 )]
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -42,7 +41,9 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::reader::AuditReader;
-use stellar_agent_core::audit_log::schema::{EventKind, ExecutableRefPin, PinsUpdateReason};
+use stellar_agent_core::audit_log::schema::{
+    EventKind, ExecutableRefPin, PinsUpdateReason, WasmHashPin,
+};
 use stellar_agent_core::audit_log::signer_set::{
     BaselineReason, ObservedSignerSet, SignerEntryV2, SignerIdentityV2, SignerPubkey,
     SignerSetSnapshotV2, SignerSetView, ThresholdObservation, account_digest,
@@ -67,9 +68,11 @@ use stellar_agent_smart_account::managers::signers::{
 };
 use stellar_agent_smart_account::signers::THRESHOLD_POLICY_WASM_HASHES;
 use stellar_agent_smart_account::submit::{
-    MigratingRule, PinCheck, SubmitInvokeArgs, SubmitInvokeResult, submit_signed_invoke,
+    DeclaredSubInvocations, MigratingRule, PinCheck, SubmitInvokeArgs, SubmitInvokeResult,
+    submit_signed_invoke,
 };
 use stellar_agent_smart_account::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
+use stellar_agent_test_support::second_loopback_host;
 use stellar_agent_test_support::signed_envelope::{
     account_id_for_seed, get_network_result, send_transaction_hash_hex,
 };
@@ -99,6 +102,7 @@ const TAG: &[u8] = b"verifier";
 
 /// A URL no test may dial: the refusals below happen before network I/O.
 const UNROUTABLE_RPC: &str = "http://pin-check-must-not-be-dialed.invalid";
+const UNROUTABLE_SECONDARY_RPC: &str = "http://pin-check-secondary-must-not-be-dialed.invalid";
 
 // ── Addresses and hashes ──────────────────────────────────────────────────────
 
@@ -126,8 +130,8 @@ fn policy_p() -> ScAddress {
     contract(0x30)
 }
 
-fn first8(hash: &[u8; 32]) -> String {
-    hex::encode(&hash[..8])
+fn full(hash: &[u8; 32]) -> WasmHashPin {
+    WasmHashPin::new(*hash)
 }
 
 /// The allowlisted WebAuthn v0.7.2 verifier hash.
@@ -140,8 +144,8 @@ fn ed25519_hash() -> [u8; 32] {
     VERIFIER_ALLOWLIST[2].wasm_hash
 }
 
-/// A first-8 no live contract in these fixtures has.
-const FOREIGN_FIRST8: &str = "0101010101010101";
+/// A hash no live contract in these fixtures has.
+const FOREIGN_HASH: WasmHashPin = WasmHashPin::new([0x01; 32]);
 
 fn smart_account_redacted() -> String {
     redact_strkey_first5_last5(&strkey(&smart_account()))
@@ -1003,7 +1007,7 @@ struct Harness {
     manager: Arc<SignersManager>,
     timeouts: Timeouts,
     _dir: tempfile::TempDir,
-    _secondary: MockServer,
+    secondary: MockServer,
 }
 
 /// The two timeouts of a [`Harness`].
@@ -1133,14 +1137,14 @@ impl Harness {
         let manager = Arc::new(
             SignersManager::new(SignersManagerConfig::new(
                 primary.uri(),
-                secondary.uri(),
+                second_loopback_host(&secondary.uri()),
                 Arc::clone(&audit),
                 log_path.clone(),
                 PASSPHRASE.to_owned(),
                 "pin-check-mock".to_owned(),
                 timeouts.client,
                 CHAIN_ID.to_owned(),
-            ))
+            ).with_intent_admission(stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission()))
             .unwrap(),
         );
         Self {
@@ -1159,12 +1163,17 @@ impl Harness {
             manager,
             timeouts,
             _dir: dir,
-            _secondary: secondary,
+            secondary,
         }
     }
 
-    /// A rule manager over the primary endpoint with this harness's signers
-    /// manager and audit writer, the production configuration.
+    /// The secondary endpoint, on a host apart from the primary's.
+    fn secondary_uri(&self) -> String {
+        second_loopback_host(&self.secondary.uri())
+    }
+
+    /// A rule manager over both endpoints with this harness's signers manager
+    /// and audit writer, the production configuration.
     fn rule_manager(&self) -> ContextRuleManager {
         ContextRuleManager::new(
             ContextRuleManagerConfig::new(
@@ -1173,6 +1182,8 @@ impl Harness {
                 self.timeouts.budget,
                 CHAIN_ID.to_owned(),
             )
+            .with_intent_admission(stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission())
+            .with_secondary_rpc_url(self.secondary_uri())
             .with_signers_manager(Arc::clone(&self.manager))
             .with_audit_writer(Arc::clone(&self.audit)),
         )
@@ -1464,26 +1475,26 @@ impl Harness {
             .unwrap();
     }
 
-    /// Writes the `SaContextRuleCreated` pin record of `rule_id`.
+    /// Writes the `SaContextRuleCreatedV2` pin record of `rule_id`.
     fn pin_created(
         &self,
         rule_id: u32,
-        verifier_first8: Vec<String>,
-        policy_first8: Vec<String>,
+        verifier_hashes: Vec<WasmHashPin>,
+        policy_hashes: Vec<WasmHashPin>,
         verifier_refs: Vec<Option<ExecutableRefPin>>,
         policy_refs: Vec<Option<ExecutableRefPin>>,
     ) {
-        self.write(AuditEntry::new_sa_context_rule_created(
+        self.write(AuditEntry::new_sa_context_rule_created_v2(
             smart_account_redacted(),
             rule_id,
             "default",
             1,
-            u32::try_from(policy_first8.len()).unwrap(),
+            u32::try_from(policy_hashes.len()).unwrap(),
             None,
             CHAIN_ID,
             "req-install",
-            verifier_first8,
-            policy_first8,
+            verifier_hashes,
+            policy_hashes,
             false,
             false,
             verifier_refs,
@@ -1502,7 +1513,7 @@ impl Harness {
     fn pins_updated_rows(&self) -> Vec<AuditEntry> {
         self.rows()
             .into_iter()
-            .filter(|e| matches!(e.event_kind, EventKind::SaContextRulePinsUpdated { .. }))
+            .filter(|e| matches!(e.event_kind, EventKind::SaContextRulePinsUpdatedV2 { .. }))
             .collect()
     }
 
@@ -1561,13 +1572,18 @@ impl Harness {
         let rule_ids = [ContextRuleId::new(rule_id)];
         let smart_account = strkey(&smart_account());
         let uri = self.primary.uri();
+        let secondary_uri = self.secondary_uri();
         submit_signed_invoke(
             SubmitInvokeArgs::builder()
+                .admission(stellar_agent_network::SigningAdmission::NoValue(
+                    stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+                ))
                 .target_contract(&smart_account)
                 .auth_rule_ids(&rule_ids)
                 .host_function(noop())
                 .signer(&signer)
                 .primary_rpc_url(&uri)
+                .secondary_rpc_url(&secondary_uri)
                 .network_passphrase(PASSPHRASE)
                 .chain_id(CHAIN_ID)
                 .timeout(self.timeouts.budget)
@@ -1591,23 +1607,66 @@ impl Harness {
         request_id: Option<&str>,
         recorder: Option<&dyn SubmissionRecorder>,
     ) -> Result<SubmitInvokeResult, SaError> {
-        let signer = SoftwareSigningKey::new_from_bytes(SEED);
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new(SEED);
+        self.submit_invocation_with_signing(function, rule_ids, request_id, recorder, &signer, 0)
+            .await
+    }
+
+    async fn submit_invocation_with_signing(
+        &self,
+        function: &str,
+        rule_ids: &[u32],
+        request_id: Option<&str>,
+        recorder: Option<&dyn SubmissionRecorder>,
+        signer: &stellar_agent_network::signing::test_doubles::CountingSigner,
+        arm: u8,
+    ) -> Result<SubmitInvokeResult, SaError> {
+        use stellar_agent_smart_account::managers::authorization::{
+            AuthorizationInfo, Combinator, SignerGroup,
+        };
+        let key = stellar_agent_network::Signer::public_key(signer)
+            .await
+            .unwrap()
+            .0;
+        let authorization = AuthorizationInfo::new(
+            vec![
+                SignerGroup::new("first".into(), vec![key], 1).unwrap(),
+                SignerGroup::new("second".into(), vec![key], 1).unwrap(),
+            ],
+            Combinator::And,
+        );
+        let signers: [&(dyn stellar_agent_network::Signer + Send + Sync); 1] = [signer];
         let rule_ids: Vec<ContextRuleId> =
             rule_ids.iter().copied().map(ContextRuleId::new).collect();
         let smart_account = strkey(&smart_account());
         let uri = self.primary.uri();
+        let secondary_uri = self.secondary_uri();
+        // The submission declares the subtree the mock reports for
+        // `function`, so `pair` signs its two-context tree.
+        let declared_calls: Vec<InvokeContractArgs> = sub_invocations(function)
+            .iter()
+            .map(|sub| match &sub.function {
+                SorobanAuthorizedFunction::ContractFn(call) => call.clone(),
+                other => panic!("the mock reports contract calls only: {other:?}"),
+            })
+            .collect();
         submit_signed_invoke(
             SubmitInvokeArgs::builder()
                 .target_contract(&smart_account)
                 .auth_rule_ids(&rule_ids)
                 .host_function(invocation(function))
-                .signer(&signer)
+                .sub_invocations(DeclaredSubInvocations::Calls(&declared_calls))
+                .signer(signer)
+                .maybe_authorization((arm == 2).then_some(&authorization))
+                .signers(&signers)
+                .maybe_ed25519_rule_signer((arm == 1).then_some(stellar_agent_smart_account::submit::Ed25519RuleSigner { signer, verifier: verifier_v() }))
                 .primary_rpc_url(&uri)
+                .secondary_rpc_url(&secondary_uri)
                 .network_passphrase(PASSPHRASE)
                 .chain_id(CHAIN_ID)
                 .timeout(self.timeouts.budget)
                 .op_label("pin_check_mock")
-                .maybe_submission_recorder(recorder)
+                .admission(recorder.map_or(stellar_agent_network::SigningAdmission::NoValue(stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission()), stellar_agent_network::SigningAdmission::Recorded))
                 .maybe_pin_check(request_id.map(|request_id| PinCheck {
                     signers_manager: &self.manager,
                     request_id,
@@ -1759,19 +1818,71 @@ fn chain_with_rule_one(verifier_hash: [u8; 32]) -> Chain {
 
 // ── Drift refusals ────────────────────────────────────────────────────────────
 
+/// Asserts that the drift refusal `err` holds no form of the `observed`
+/// executable hash, which differs from the pin, in its Display, Debug or
+/// serialized envelope, its first eight bytes included unless the pin
+/// shares them, and that the one drift row `request_id` wrote carries the
+/// observed hash's first eight bytes. Returns the row's executable summary.
+fn assert_the_drift_row_alone_keeps_the_observed_hash(
+    h: &Harness,
+    err: &SaError,
+    request_id: &str,
+    observed: &WasmHashPin,
+) -> Option<String> {
+    let pinned = match err {
+        SaError::VerifierHashDrift { pinned_hash, .. }
+        | SaError::PolicyHashDrift { pinned_hash, .. } => pinned_hash,
+        other => panic!("expected a drift refusal; got {other:?}"),
+    };
+    assert_ne!(pinned, observed, "the observed hash differs from the pin");
+    let rendered = format!("{err}\n{err:?}\n{}", serde_json::to_string(err).unwrap());
+    assert!(!rendered.contains(&observed.to_hex()), "{rendered}");
+    if observed.first8_display() != pinned.first8_display() {
+        assert!(!rendered.contains(&observed.first8_display()), "{rendered}");
+    }
+    let rows: Vec<(String, Option<String>)> = h
+        .rows()
+        .into_iter()
+        .filter(|entry| entry.request_id == request_id)
+        .filter_map(|entry| match entry.event_kind {
+            EventKind::SaVerifierHashDrift {
+                observed_hash_first8,
+                observed_executable,
+                ..
+            }
+            | EventKind::SaPolicyHashDrift {
+                observed_hash_first8,
+                observed_executable,
+                ..
+            } => Some((observed_hash_first8, observed_executable)),
+            _ => None,
+        })
+        .collect();
+    let [(observed_first8, executable)] = rows.as_slice() else {
+        panic!("one drift row for {request_id}: {rows:?}");
+    };
+    assert_eq!(observed_first8, &observed.first8_display());
+    executable.clone()
+}
+
 /// A live verifier that differs from the rule's pin refuses the submission
 /// before its invocation is simulated, and the drift row carries the
 /// caller's request id. The rule's baseline is present, so the refusal is
 /// the pin check's, and the signer-set comparison after it never runs: the
 /// only simulation is the pin check's primary rule read.
 #[tokio::test]
+#[serial_test::serial]
 async fn verifier_drift_refuses_before_simulation_with_the_callers_request_id() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![FOREIGN_FIRST8.to_owned()],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![FOREIGN_HASH],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -1783,18 +1894,22 @@ async fn verifier_drift_refuses_before_simulation_with_the_callers_request_id() 
     match &err {
         SaError::VerifierHashDrift {
             rule_id,
-            pinned_hash_first8,
-            observed_hash_first8,
+            pinned_hash,
             request_id,
             ..
         } => {
             assert_eq!(*rule_id, 1);
-            assert_eq!(pinned_hash_first8, FOREIGN_FIRST8);
-            assert_eq!(observed_hash_first8, &first8(&webauthn_hash()));
+            assert_eq!(*pinned_hash, FOREIGN_HASH);
             assert_eq!(request_id, "req-verifier-drift");
         }
         other => panic!("expected VerifierHashDrift; got {other:?}"),
     }
+    assert_the_drift_row_alone_keeps_the_observed_hash(
+        &h,
+        &err,
+        "req-verifier-drift",
+        &full(&webauthn_hash()),
+    );
     let drift_rows: Vec<AuditEntry> = h
         .rows()
         .into_iter()
@@ -1820,13 +1935,18 @@ async fn verifier_drift_refuses_before_simulation_with_the_callers_request_id() 
 /// A live policy that differs from the rule's pin refuses the same way,
 /// after the baseline read and before the comparison.
 #[tokio::test]
+#[serial_test::serial]
 async fn policy_drift_refuses_before_simulation_with_the_callers_request_id() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![FOREIGN_FIRST8.to_owned()],
+        vec![full(&webauthn_hash())],
+        vec![FOREIGN_HASH],
         vec![],
         vec![],
     );
@@ -1835,18 +1955,22 @@ async fn policy_drift_refuses_before_simulation_with_the_callers_request_id() {
     match &err {
         SaError::PolicyHashDrift {
             rule_id,
-            pinned_hash_first8,
-            observed_hash_first8,
+            pinned_hash,
             request_id,
             ..
         } => {
             assert_eq!(*rule_id, 1);
-            assert_eq!(pinned_hash_first8, FOREIGN_FIRST8);
-            assert_eq!(observed_hash_first8, &first8(&KNOWN_WASM_HASH));
+            assert_eq!(*pinned_hash, FOREIGN_HASH);
             assert_eq!(request_id, "req-policy-drift");
         }
         other => panic!("expected PolicyHashDrift; got {other:?}"),
     }
+    assert_the_drift_row_alone_keeps_the_observed_hash(
+        &h,
+        &err,
+        "req-policy-drift",
+        &full(&KNOWN_WASM_HASH),
+    );
     let drift_rows: Vec<AuditEntry> = h
         .rows()
         .into_iter()
@@ -1869,10 +1993,178 @@ async fn policy_drift_refuses_before_simulation_with_the_callers_request_id() {
     assert_eq!(h.sends(), 0);
 }
 
+/// The forms of `hash` a refusal of its observation never holds: the full
+/// hex, the first eight bytes and the first eight hex characters.
+fn hash_markers(hash: &[u8; 32]) -> [String; 3] {
+    let whole = hex::encode(hash);
+    [whole.clone(), whole[..16].to_owned(), whole[..8].to_owned()]
+}
+
+/// The `no drift` events of `kind` in `logs`, as captured lines.
+fn match_events<'a>(logs: &'a str, kind: &str) -> Vec<&'a str> {
+    let message = format!("verify_pinned_{kind}_against_chain: executable matches pin (no drift)");
+    logs.lines()
+        .filter(|line| line.contains(&message))
+        .collect()
+}
+
+/// Two rules share verifier V; rule 1 pins its live hash and rule 2 pins
+/// another. The submission checks one observation of V against both pins
+/// and refuses with rule 2's drift, so rule 1's match event names no part of
+/// the observation: the refusal's Display, Debug, source chain, serialized
+/// form and MCP envelope and every captured event hold neither the observed
+/// hash, whole, as its first eight bytes or as its first eight hex
+/// characters, nor the executable summary. The match event of rule 1 is
+/// logged with its rule id, and rule 2 logs none.
+#[test]
+#[serial_test::serial]
+fn a_verifier_matching_rule_one_and_drifting_from_rule_two_logs_no_observed_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let observed = webauthn_hash();
+    let (err, logs) = rpc_mock_helpers::wallet_traced(async {
+        let chain = Chain::default()
+            .with_rule(
+                1,
+                rule(1, vec![external_signer(&verifier_v(), &[0x11; 32])], vec![]),
+            )
+            .with_rule(
+                2,
+                rule(2, vec![external_signer(&verifier_v(), &[0x12; 32])], vec![]),
+            )
+            .with_entry(wasm_instance(&verifier_v(), observed));
+        let h = Harness::new(chain).await;
+        h.baseline_v2(1);
+        h.baseline_v2(2);
+        h.pin_created(1, vec![full(&observed)], vec![], vec![], vec![]);
+        h.pin_created(2, vec![FOREIGN_HASH], vec![], vec![], vec![]);
+        let err = h
+            .submit_invocation("pair", &[1, 2], Some("req-verifier-two-pins"), None)
+            .await
+            .unwrap_err();
+        assert_eq!(h.primary_instance_reads(&verifier_v()), 1);
+        assert_eq!(h.sends(), 0);
+        err
+    });
+    match &err {
+        SaError::VerifierHashDrift {
+            rule_id,
+            pinned_hash,
+            request_id,
+            ..
+        } => {
+            assert_eq!(*rule_id, 2);
+            assert_eq!(*pinned_hash, FOREIGN_HASH);
+            assert_eq!(request_id, "req-verifier-two-pins");
+        }
+        other => panic!("expected VerifierHashDrift; got {other:?}"),
+    }
+    let events = match_events(&logs, "verifier");
+    let [event] = events.as_slice() else {
+        panic!("one verifier match event, rule 1's: {events:?}");
+    };
+    assert!(event.contains("\"rule_id\":1"), "{event}");
+    let markers = hash_markers(&observed);
+    let markers: Vec<&str> = markers.iter().map(String::as_str).collect();
+    rpc_mock_helpers::assert_refusal_holds_no_marker(&err, &logs, &markers, &["wasm"]);
+}
+
+/// Two rules share policy P; rule 1 pins its live hash and rule 2 pins
+/// another. The submission refuses with rule 2's policy drift, and rule 1's
+/// match event names no part of the observation in any channel the
+/// verifier case of
+/// [`a_verifier_matching_rule_one_and_drifting_from_rule_two_logs_no_observed_hash`]
+/// reads. The match event of rule 1 is logged with its rule id, and rule 2
+/// logs none.
+#[test]
+#[serial_test::serial]
+fn a_policy_matching_rule_one_and_drifting_from_rule_two_logs_no_observed_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let observed = KNOWN_WASM_HASH;
+    let (err, logs) = rpc_mock_helpers::wallet_traced(async {
+        let chain = Chain::default()
+            .with_rule(
+                1,
+                rule(
+                    1,
+                    vec![external_signer(&verifier_v(), &[0x11; 32])],
+                    vec![policy_p()],
+                ),
+            )
+            .with_rule(
+                2,
+                rule(
+                    2,
+                    vec![external_signer(&verifier_v(), &[0x12; 32])],
+                    vec![policy_p()],
+                ),
+            )
+            .with_entry(wasm_instance(&verifier_v(), webauthn_hash()))
+            .with_wasm(&policy_p(), observed)
+            .with_threshold(&policy_p(), 1, 1)
+            .with_threshold(&policy_p(), 2, 1);
+        let h = Harness::new(chain).await;
+        h.baseline_v2(1);
+        h.baseline_v2(2);
+        h.pin_created(
+            1,
+            vec![full(&webauthn_hash())],
+            vec![full(&observed)],
+            vec![],
+            vec![],
+        );
+        h.pin_created(
+            2,
+            vec![full(&webauthn_hash())],
+            vec![FOREIGN_HASH],
+            vec![],
+            vec![],
+        );
+        let err = h
+            .submit_invocation("pair", &[1, 2], Some("req-policy-two-pins"), None)
+            .await
+            .unwrap_err();
+        assert_eq!(h.primary_instance_reads(&policy_p()), 1);
+        assert_eq!(h.sends(), 0);
+        err
+    });
+    match &err {
+        SaError::PolicyHashDrift {
+            rule_id,
+            pinned_hash,
+            request_id,
+            ..
+        } => {
+            assert_eq!(*rule_id, 2);
+            assert_eq!(*pinned_hash, FOREIGN_HASH);
+            assert_eq!(request_id, "req-policy-two-pins");
+        }
+        other => panic!("expected PolicyHashDrift; got {other:?}"),
+    }
+    let events = match_events(&logs, "policy");
+    let [event] = events.as_slice() else {
+        panic!("one policy match event, rule 1's: {events:?}");
+    };
+    assert!(event.contains("\"rule_id\":1"), "{event}");
+    let markers = hash_markers(&observed);
+    let markers: Vec<&str> = markers.iter().map(String::as_str).collect();
+    rpc_mock_helpers::assert_refusal_holds_no_marker(&err, &logs, &markers, &["wasm"]);
+}
+
 /// A pinned external reference whose tag now resolves to another hash
-/// refuses with the observed executable named.
+/// refuses naming the pin; the drift row names the observed executable.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_repointed_external_reference_refuses_with_the_observed_executable() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = Chain::default()
         .with_rule(
             1,
@@ -1884,7 +2176,7 @@ async fn a_repointed_external_reference_refuses_with_the_observed_executable() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
+        vec![full(&webauthn_hash())],
         vec![],
         vec![Some(reference_pin(webauthn_hash()))],
         vec![],
@@ -1892,27 +2184,26 @@ async fn a_repointed_external_reference_refuses_with_the_observed_executable() {
 
     let err = h.submit(&[1], Some("req-ref-drift")).await.unwrap_err();
     match &err {
-        SaError::VerifierHashDrift {
-            pinned_hash_first8,
-            observed_hash_first8,
-            observed_executable: Some(observed_executable),
-            ..
-        } => {
-            assert_eq!(pinned_hash_first8, &first8(&webauthn_hash()));
-            assert_eq!(observed_hash_first8, &first8(&ed25519_hash()));
-            assert!(
-                observed_executable.starts_with("external reference owner ")
-                    && observed_executable.contains(&format!(
-                        "tag \"verifier\" resolved {}",
-                        first8(&ed25519_hash())
-                    )),
-                "{observed_executable}"
-            );
+        SaError::VerifierHashDrift { pinned_hash, .. } => {
+            assert_eq!(pinned_hash, &full(&webauthn_hash()));
         }
-        other => {
-            panic!("expected VerifierHashDrift {{ observed_executable: Some(..) }}; got {other:?}")
-        }
+        other => panic!("expected VerifierHashDrift; got {other:?}"),
     }
+    let observed_executable = assert_the_drift_row_alone_keeps_the_observed_hash(
+        &h,
+        &err,
+        "req-ref-drift",
+        &full(&ed25519_hash()),
+    )
+    .expect("the drift row carries the executable summary");
+    assert!(
+        observed_executable.starts_with("external reference owner ")
+            && observed_executable.contains(&format!(
+                "tag \"verifier\" resolved {}",
+                full(&ed25519_hash())
+            )),
+        "{observed_executable}"
+    );
     assert_eq!(h.sends(), 0);
 }
 
@@ -1921,13 +2212,18 @@ async fn a_repointed_external_reference_refuses_with_the_observed_executable() {
 /// An RPC failure while observing a pinned contract refuses as unavailable,
 /// naming the inner code, and nothing is simulated or sent.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_rpc_failure_during_the_check_refuses_and_sends_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -1960,13 +2256,18 @@ async fn an_rpc_failure_during_the_check_refuses_and_sends_nothing() {
 /// rule is never fetched. The migrating rule's baseline is read like any
 /// rule's, so the error is `sa.audit_log` under it too.
 #[tokio::test]
+#[serial_test::serial]
 async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash()), first8(&ed25519_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash()), full(&ed25519_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -1983,17 +2284,12 @@ async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&h.log_path)
-        .unwrap()
-        .write_all(b"not an audit row\n")
-        .unwrap();
+    rewrite_the_last_row(&h.log_path);
     let err = h.submit(&[1], Some("req-integrity")).await.unwrap_err();
     assert!(matches!(err, SaError::AuditLog(_)), "{err:?}");
     assert_eq!(err.wire_code(), "sa.audit_log");
@@ -2015,7 +2311,12 @@ async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
 
 /// A rule without a pin record signs: the check fetches the rule and passes.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_rule_without_a_pin_record_signs() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
     h.baseline_v2(1);
     let result = h.submit(&[1], Some("req-unpinned")).await.unwrap();
@@ -2029,7 +2330,12 @@ async fn a_rule_without_a_pin_record_signs() {
 
 /// Rule 0 alone signs without a check, and the check never runs for it.
 #[tokio::test]
+#[serial_test::serial]
 async fn rule_zero_only_signs_without_a_check() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(Chain::default()).await;
     h.submit(&[0], None).await.unwrap();
     assert!(!h.simulated("get_context_rule"));
@@ -2039,24 +2345,29 @@ async fn rule_zero_only_signs_without_a_check() {
 /// A pins-updated row newer than the created row is the record the check
 /// reads: the live verifier matches it and the submission signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_newer_pins_updated_row_is_the_record_the_check_reads() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(chain_with_rule_one(ed25519_hash())).await;
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
-    h.write(AuditEntry::new_sa_context_rule_pins_updated(
+    h.write(AuditEntry::new_sa_context_rule_pins_updated_v2(
         smart_account_redacted(),
         1,
         PinsUpdateReason::VerifierMigrated,
         CHAIN_ID,
         "req-migration",
-        vec![first8(&ed25519_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&ed25519_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         false,
         false,
         vec![],
@@ -2069,7 +2380,12 @@ async fn a_newer_pins_updated_row_is_the_record_the_check_reads() {
 /// One observation per contract per call: a verifier shared by two checked
 /// rules is read once from the primary endpoint.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_verifier_shared_by_two_rules_is_observed_once() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = Chain::default()
         .with_rule(
             1,
@@ -2083,8 +2399,8 @@ async fn a_verifier_shared_by_two_rules_is_observed_once() {
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
     h.baseline_v2(2);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
-    h.pin_created(2, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(2, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
 
     h.submit_invocation("pair", &[1, 2], Some("req-shared"), None)
         .await
@@ -2111,11 +2427,15 @@ fn unroutable_args<'a>(
     pin_check: Option<PinCheck<'a>>,
 ) -> SubmitInvokeArgs<'a> {
     SubmitInvokeArgs::builder()
+        .admission(stellar_agent_network::SigningAdmission::NoValue(
+            stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+        ))
         .target_contract("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
         .auth_rule_ids(rule_ids)
         .host_function(noop())
         .signer(signer)
         .primary_rpc_url(UNROUTABLE_RPC)
+        .secondary_rpc_url(UNROUTABLE_SECONDARY_RPC)
         .network_passphrase(PASSPHRASE)
         .chain_id(CHAIN_ID)
         .timeout(Duration::from_secs(10))
@@ -2133,7 +2453,12 @@ fn stage_of(err: &SaError) -> &'static str {
 
 /// A non-zero rule without a check is refused before any network I/O.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_non_zero_rule_without_a_check_is_refused_before_io() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
     for ids in [vec![3], vec![0, 3], vec![3, 0]] {
         let rule_ids: Vec<ContextRuleId> = ids.into_iter().map(ContextRuleId::new).collect();
@@ -2147,7 +2472,12 @@ async fn a_non_zero_rule_without_a_check_is_refused_before_io() {
 /// The migrating-rule exemption is accepted only when the migrating rule is
 /// the only authorizing rule.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_migrating_rule_must_be_the_only_authorizing_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(Chain::default()).await;
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
     for ids in [vec![2, 3], vec![3], vec![2, 2], vec![]] {
@@ -2206,14 +2536,31 @@ fn signer_add_chain() -> Chain {
 
 /// A [`signer_add_chain`] harness with rule 1's version-2 baseline recorded
 /// from the served chain, and a pin record when `pinned`.
+/// Overwrites the log's last row in place with bytes of the same length.
+///
+/// The damage lies inside the writer's verified bound, so every bounded audit
+/// read refuses the log. A line appended past that bound would be ignored by
+/// the readers instead.
+fn rewrite_the_last_row(path: &std::path::Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let body_end = bytes.len() - 1;
+    assert_eq!(bytes[body_end], b'\n', "the log ends in a complete row");
+    let row_start = bytes[..body_end]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    bytes[row_start..body_end].fill(b'#');
+    std::fs::write(path, bytes).unwrap();
+}
+
 async fn signer_add_harness(pinned: bool) -> Harness {
     let h = Harness::new(signer_add_chain()).await;
     h.baseline_v2(1);
     if pinned {
         h.pin_created(
             1,
-            vec![first8(&webauthn_hash())],
-            vec![first8(&KNOWN_WASM_HASH)],
+            vec![full(&webauthn_hash())],
+            vec![full(&KNOWN_WASM_HASH)],
             vec![],
             vec![],
         );
@@ -2279,29 +2626,36 @@ async fn add_signer_value(
         .await
 }
 
-fn pins_updated_fields(entry: &AuditEntry) -> (Vec<String>, Vec<String>, bool, PinsUpdateReason) {
+fn pins_updated_fields(
+    entry: &AuditEntry,
+) -> (Vec<WasmHashPin>, Vec<WasmHashPin>, bool, PinsUpdateReason) {
     match &entry.event_kind {
-        EventKind::SaContextRulePinsUpdated {
+        EventKind::SaContextRulePinsUpdatedV2 {
             rule_id: 1,
-            pinned_verifier_wasm_hashes_first8,
-            pinned_policy_wasm_hashes_first8,
+            pinned_verifier_wasm_hashes,
+            pinned_policy_wasm_hashes,
             unknown_override,
             reason,
             ..
         } => (
-            pinned_verifier_wasm_hashes_first8.clone(),
-            pinned_policy_wasm_hashes_first8.clone(),
+            pinned_verifier_wasm_hashes.clone(),
+            pinned_policy_wasm_hashes.clone(),
             *unknown_override,
             *reason,
         ),
-        other => panic!("expected SaContextRulePinsUpdated for rule 1; got {other:?}"),
+        other => panic!("expected SaContextRulePinsUpdatedV2 for rule 1; got {other:?}"),
     }
 }
 
 /// An External signer added on the rule's existing verifier leaves the
 /// verifier pins unchanged and writes the pins-updated row.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_signer_on_the_existing_verifier_keeps_the_pins_and_writes_the_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     add_external_signer(&h, &verifier_v(), "req-add-same", false)
         .await
@@ -2311,8 +2665,8 @@ async fn a_signer_on_the_existing_verifier_keeps_the_pins_and_writes_the_row() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].request_id, "req-add-same");
     let (verifiers, policies, unknown_override, reason) = pins_updated_fields(&rows[0]);
-    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(verifiers, vec![full(&webauthn_hash())]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert!(!unknown_override);
     assert_eq!(reason, PinsUpdateReason::SignerAdded);
 }
@@ -2320,7 +2674,12 @@ async fn a_signer_on_the_existing_verifier_keeps_the_pins_and_writes_the_row() {
 /// An External signer added on a second distinct verifier writes a two-pin
 /// record, and the next checked signing verb refuses it as unavailable.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_signer_on_a_second_verifier_writes_two_pins_and_the_next_verb_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     add_external_signer(&h, &verifier_w(), "req-add-second", false)
         .await
@@ -2331,9 +2690,9 @@ async fn a_signer_on_a_second_verifier_writes_two_pins_and_the_next_verb_refuses
     let (verifiers, policies, _, reason) = pins_updated_fields(&rows[0]);
     assert_eq!(
         verifiers,
-        vec![first8(&webauthn_hash()), first8(&ed25519_hash())]
+        vec![full(&webauthn_hash()), full(&ed25519_hash())]
     );
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::SignerAdded);
 
     let err = h.submit(&[1], Some("req-after-second")).await.unwrap_err();
@@ -2352,7 +2711,12 @@ async fn a_signer_on_a_second_verifier_writes_two_pins_and_the_next_verb_refuses
 /// reference, so the pin is the recorded one. The list stays unchanged, the
 /// pins row is written, and the rule signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_passkey_signer_added_to_a_pinned_rule_pins_its_verifier() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     add_signer_value(&h, passkey_signer(), "req-add-passkey", false)
         .await
@@ -2364,10 +2728,10 @@ async fn a_passkey_signer_added_to_a_pinned_rule_pins_its_verifier() {
     let (verifiers, policies, _, reason) = pins_updated_fields(&rows[0]);
     assert_eq!(
         verifiers,
-        vec![first8(&webauthn_hash())],
+        vec![full(&webauthn_hash())],
         "the passkey's verifier has the pin verifier V has"
     );
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::SignerAdded);
     assert!(verifier_refs_of(&rows[0]).is_empty());
 
@@ -2379,7 +2743,12 @@ async fn a_passkey_signer_added_to_a_pinned_rule_pins_its_verifier() {
 /// the unknown-hash override is set; with it, the add proceeds, the override
 /// row names the rule, and the record carries the override flag.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_unknown_new_verifier_needs_the_override() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     let err = add_external_signer(&h, &contract(0x22), "req-add-unknown", false)
         .await
@@ -2418,31 +2787,38 @@ async fn an_unknown_new_verifier_needs_the_override() {
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 1);
     let (verifiers, _, unknown_override, _) = pins_updated_fields(&rows[0]);
-    assert_eq!(
-        verifiers,
-        vec![first8(&webauthn_hash()), first8(&[0xdd; 32])]
-    );
+    assert_eq!(verifiers, vec![full(&webauthn_hash()), full(&[0xdd; 32])]);
     assert!(unknown_override);
 }
 
 /// A signer add on a rule without a pin record writes no pins-updated row and
-/// observes no new verifier.
+/// checks the added verifier status.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_signer_add_on_an_unpinned_rule_writes_no_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     add_external_signer(&h, &verifier_w(), "req-add-unpinned", false)
         .await
         .unwrap();
     assert!(h.pins_updated_rows().is_empty());
     assert_eq!(h.sends(), 1);
-    assert_eq!(h.primary_instance_reads(&verifier_w()), 0);
+    assert_eq!(h.primary_instance_reads(&verifier_w()), 1);
 }
 
 /// A confirmed signer add on an unknown verifier under the override writes
 /// `SaSignerAddedV2`, then the override row naming the rule, then the
 /// pins-updated row.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_signer_add_writes_the_override_row_between_the_add_and_the_pins() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     add_external_signer(&h, &contract(0x22), "req-add-order", true)
         .await
@@ -2453,7 +2829,7 @@ async fn a_signer_add_writes_the_override_row_between_the_add_and_the_pins() {
         vec![
             "sa_signer_added_v2",
             "unknown_override(rule Some(1))",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
 }
@@ -2463,7 +2839,12 @@ async fn a_signer_add_writes_the_override_row_between_the_add_and_the_pins() {
 /// confirmation ledger, and records a `SaSignerAddedV2` row carrying the new
 /// id and the full resulting set.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_signer_add_over_a_version_2_baseline_records_the_confirmed_set() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     let id = add_external_signer(&h, &verifier_v(), "req-add-v2", false)
         .await
@@ -2524,7 +2905,12 @@ async fn a_signer_add_over_a_version_2_baseline_records_the_confirmed_set() {
 /// override and whose second is undecodable refuses before submission, and
 /// the override applied to the first is written nowhere.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_refused_batch_writes_no_override_row_for_an_admitted_verifier() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     let undecodable = contract(0x23);
     h.set_entry(undecodable_instance(&undecodable));
@@ -2601,7 +2987,7 @@ fn migration_step(
 ) -> SignerMigrationStep {
     SignerMigrationStep::new_for_test(
         signer_id,
-        first8(&from),
+        from,
         remove_signer_call(signer_id),
         add_signer_call(external_signer(add_verifier, key)),
     )
@@ -2614,7 +3000,7 @@ fn plan_of(from: [u8; 32], to: [u8; 32], steps: Vec<SignerMigrationStep>) -> Mig
         from,
         to,
         verifier_w(),
-        vec![RuleMigration::new_for_test(1, first8(&from), steps)],
+        vec![RuleMigration::new_for_test(1, from, steps)],
         VerifierAuditStatus::Unaudited,
         "req-migration-plan",
     )
@@ -2702,18 +3088,18 @@ fn the_row(h: &Harness, request_id: &str, kind: &str) -> AuditEntry {
 /// The verifier executable-reference pins of a pins-updated row.
 fn verifier_refs_of(entry: &AuditEntry) -> Vec<Option<ExecutableRefPin>> {
     match &entry.event_kind {
-        EventKind::SaContextRulePinsUpdated {
+        EventKind::SaContextRulePinsUpdatedV2 {
             pinned_verifier_executable_refs,
             ..
         } => pinned_verifier_executable_refs.clone(),
-        other => panic!("expected SaContextRulePinsUpdated; got {other:?}"),
+        other => panic!("expected SaContextRulePinsUpdatedV2; got {other:?}"),
     }
 }
 
 /// The rows of a completed pair, in order.
 const PAIR_ROWS: [&str; 4] = [
     "sa_signer_removed_v2",
-    "sa_context_rule_pins_updated",
+    "sa_context_rule_pins_updated_v2",
     "sa_signer_added_v2",
     "sa_verifier_migrated",
 ];
@@ -2724,7 +3110,12 @@ const PAIR_ROWS: [&str; 4] = [
 /// comparison to its last row: a `signers list` started after the removal
 /// was sent completes after the pair.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_migration_pair_records_its_rows_in_order_under_the_rule_lock() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     on_send_one_pair(&h);
     h.delay_poll(Duration::from_secs(2));
@@ -2798,10 +3189,10 @@ async fn a_migration_pair_records_its_rows_in_order_under_the_rule_lock() {
         added.event_kind
     );
 
-    let pins = the_row(&h, "req-pair", "sa_context_rule_pins_updated");
+    let pins = the_row(&h, "req-pair", "sa_context_rule_pins_updated_v2");
     let (verifiers, policies, _, reason) = pins_updated_fields(&pins);
-    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(verifiers, vec![full(&ed25519_hash())]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
     assert!(verifier_refs_of(&pins).is_empty());
 
@@ -2847,7 +3238,12 @@ fn assert_first_pair_refused_unsent(
 /// identity on the destination, and an audit log that fails its integrity
 /// check.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_migration_pair_refuses_before_any_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let plan = migration_plan(webauthn_hash(), ed25519_hash());
 
     let h = Harness::new(signer_add_chain()).await;
@@ -2928,12 +3324,7 @@ async fn a_migration_pair_refuses_before_any_send() {
     }
 
     let h = signer_add_harness(false).await;
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&h.log_path)
-        .unwrap()
-        .write_all(b"not an audit row\n")
-        .unwrap();
+    rewrite_the_last_row(&h.log_path);
     let result = migrate(&h, &plan, "req-integrity").await;
     let err = result.failed_step_error.as_ref().expect("the pair refused");
     assert!(matches!(err, SaError::AuditLog(_)), "{err:?}");
@@ -2948,7 +3339,12 @@ async fn a_migration_pair_refuses_before_any_send() {
 /// pending add. Running it through `signers add` completes the pair, keeps
 /// the repointed pin and lets the rule sign.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_add_refused_after_the_removal_returns_the_pending_add_that_completes_the_pair() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     on_send_one_pair(&h);
     h.set_simulated_return("add_signer", ScVal::Void);
@@ -2991,7 +3387,7 @@ async fn an_add_refused_after_the_removal_returns_the_pending_add_that_completes
     );
     assert_eq!(
         row_kinds(&h.rows(), "req-add-refused"),
-        vec!["sa_signer_removed_v2", "sa_context_rule_pins_updated"]
+        vec!["sa_signer_removed_v2", "sa_context_rule_pins_updated_v2"]
     );
 
     h.set_simulated_return("add_signer", ScVal::U32(SIMULATED_SIGNER_ID));
@@ -3012,12 +3408,12 @@ async fn an_add_refused_after_the_removal_returns_the_pending_add_that_completes
     assert_eq!(id, SIMULATED_SIGNER_ID);
     assert_eq!(
         row_kinds(&h.rows(), "req-recovery"),
-        vec!["sa_signer_added_v2", "sa_context_rule_pins_updated"]
+        vec!["sa_signer_added_v2", "sa_context_rule_pins_updated_v2"]
     );
-    let pins = the_row(&h, "req-recovery", "sa_context_rule_pins_updated");
+    let pins = the_row(&h, "req-recovery", "sa_context_rule_pins_updated_v2");
     let (verifiers, policies, _, reason) = pins_updated_fields(&pins);
-    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(verifiers, vec![full(&ed25519_hash())]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::SignerAdded);
 
     h.submit(&[1], Some("req-after-recovery")).await.unwrap();
@@ -3028,7 +3424,12 @@ async fn an_add_refused_after_the_removal_returns_the_pending_add_that_completes
 /// `write` with the removal's hash and the pending add; the add is not
 /// submitted.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_removal_whose_row_is_refused_stops_the_pair_with_the_pending_add() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     on_send_one_pair(&h);
     h.poison_audit_writer_at("sendTransaction");
@@ -3063,7 +3464,12 @@ async fn a_removal_whose_row_is_refused_stops_the_pair_with_the_pending_add() {
 /// uses, and the pending `signers add` then pins the destination as the
 /// rule's only verifier, so the rule signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn the_refresh_drops_the_dead_source_pin_and_the_recovery_add_signs() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     on_send_one_pair(&h);
     h.poison_audit_writer_at("sendTransaction");
@@ -3106,14 +3512,18 @@ async fn the_refresh_drops_the_dead_source_pin_and_the_recovery_add_signs() {
         vec![
             "sa_signer_set_diverged",
             "sa_signer_set_baselined_v2",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
-    let dropped = the_row(&h, "req-refresh-dead-pin", "sa_context_rule_pins_updated");
+    let dropped = the_row(
+        &h,
+        "req-refresh-dead-pin",
+        "sa_context_rule_pins_updated_v2",
+    );
     let (verifiers, policies, _, reason) = pins_updated_fields(&dropped);
     assert!(verifiers.is_empty(), "the dead source pin is dropped");
     assert!(verifier_refs_of(&dropped).is_empty());
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::BaselineRefreshed);
 
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
@@ -3132,12 +3542,12 @@ async fn the_refresh_drops_the_dead_source_pin_and_the_recovery_add_signs() {
     let pinned = the_row(
         &h,
         "req-recovery-after-refresh",
-        "sa_context_rule_pins_updated",
+        "sa_context_rule_pins_updated_v2",
     );
     let (verifiers, _, _, reason) = pins_updated_fields(&pinned);
     assert_eq!(
         verifiers,
-        vec![first8(&ed25519_hash())],
+        vec![full(&ed25519_hash())],
         "the destination is the rule's only verifier pin"
     );
     assert_eq!(reason, PinsUpdateReason::SignerAdded);
@@ -3148,9 +3558,9 @@ async fn the_refresh_drops_the_dead_source_pin_and_the_recovery_add_signs() {
 
 /// The verifier, policy and override fields of a pins-updated row.
 struct PinRecordFields {
-    verifiers: Vec<String>,
+    verifiers: Vec<WasmHashPin>,
     verifier_refs: Vec<Option<ExecutableRefPin>>,
-    policies: Vec<String>,
+    policies: Vec<WasmHashPin>,
     policy_refs: Vec<Option<ExecutableRefPin>>,
     mutable_override: bool,
     unknown_override: bool,
@@ -3159,25 +3569,25 @@ struct PinRecordFields {
 
 fn pin_record_fields(entry: &AuditEntry) -> PinRecordFields {
     match &entry.event_kind {
-        EventKind::SaContextRulePinsUpdated {
-            pinned_verifier_wasm_hashes_first8,
+        EventKind::SaContextRulePinsUpdatedV2 {
+            pinned_verifier_wasm_hashes,
             pinned_verifier_executable_refs,
-            pinned_policy_wasm_hashes_first8,
+            pinned_policy_wasm_hashes,
             pinned_policy_executable_refs,
             mutable_override,
             unknown_override,
             reason,
             ..
         } => PinRecordFields {
-            verifiers: pinned_verifier_wasm_hashes_first8.clone(),
+            verifiers: pinned_verifier_wasm_hashes.clone(),
             verifier_refs: pinned_verifier_executable_refs.clone(),
-            policies: pinned_policy_wasm_hashes_first8.clone(),
+            policies: pinned_policy_wasm_hashes.clone(),
             policy_refs: pinned_policy_executable_refs.clone(),
             mutable_override: *mutable_override,
             unknown_override: *unknown_override,
             reason: *reason,
         },
-        other => panic!("expected SaContextRulePinsUpdated; got {other:?}"),
+        other => panic!("expected SaContextRulePinsUpdatedV2; got {other:?}"),
     }
 }
 
@@ -3193,7 +3603,12 @@ fn pin_record_fields(entry: &AuditEntry) -> PinRecordFields {
 /// no pins row, and the recovery add pins the destination beside the kept
 /// policy reference, so the rule signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let mut chain = Chain::default()
         .with_rule(1, signer_add_rule_before())
         .with_wasm(&verifier_v(), webauthn_hash())
@@ -3207,7 +3622,7 @@ async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags()
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
     let policy_refs = vec![Some(reference_pin(KNOWN_WASM_HASH))];
-    h.write(AuditEntry::new_sa_context_rule_created(
+    h.write(AuditEntry::new_sa_context_rule_created_v2(
         smart_account_redacted(),
         1,
         "default",
@@ -3216,8 +3631,8 @@ async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags()
         None,
         CHAIN_ID,
         "req-install-references",
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         true,
         true,
         vec![Some(reference_pin(webauthn_hash()))],
@@ -3256,13 +3671,13 @@ async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags()
         vec![
             "sa_signer_set_diverged",
             "sa_signer_set_baselined_v2",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
     let dropped = pin_record_fields(&the_row(
         &h,
         "req-refresh-references",
-        "sa_context_rule_pins_updated",
+        "sa_context_rule_pins_updated_v2",
     ));
     assert!(dropped.verifiers.is_empty(), "{:?}", dropped.verifiers);
     assert!(
@@ -3270,7 +3685,7 @@ async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags()
         "{:?}",
         dropped.verifier_refs
     );
-    assert_eq!(dropped.policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(dropped.policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(dropped.policy_refs, policy_refs);
     assert!(
         dropped.mutable_override,
@@ -3305,9 +3720,9 @@ async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags()
     let pinned = pin_record_fields(&the_row(
         &h,
         "req-recovery-references",
-        "sa_context_rule_pins_updated",
+        "sa_context_rule_pins_updated_v2",
     ));
-    assert_eq!(pinned.verifiers, vec![first8(&ed25519_hash())]);
+    assert_eq!(pinned.verifiers, vec![full(&ed25519_hash())]);
     assert_eq!(pinned.policy_refs, policy_refs);
     h.submit(&[1], Some("req-after-references")).await.unwrap();
     assert_eq!(h.sends(), 3);
@@ -3317,7 +3732,12 @@ async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags()
 /// keeps its record through a refresh: only a record with exactly one
 /// verifier pin is dropped.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_refresh_keeps_a_two_verifier_record_of_a_rule_without_external_signers() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = Chain::default()
         .with_rule(
             1,
@@ -3329,8 +3749,8 @@ async fn a_refresh_keeps_a_two_verifier_record_of_a_rule_without_external_signer
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash()), first8(&ed25519_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash()), full(&ed25519_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -3357,12 +3777,17 @@ async fn a_refresh_keeps_a_two_verifier_record_of_a_rule_without_external_signer
 /// that changed is the drift check's finding, and only a rule without
 /// `External` signers drops its verifier pin.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_refresh_keeps_the_verifier_pin_of_a_rule_with_a_live_external_signer() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     h.pin_created(
         1,
-        vec![FOREIGN_FIRST8.to_owned()],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![FOREIGN_HASH],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -3390,7 +3815,12 @@ async fn a_refresh_keeps_the_verifier_pin_of_a_rule_with_a_live_external_signer(
 /// already names the destination: the removal is on chain, so the
 /// recovery's `signers add` finds the destination's pin recorded.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_removal_whose_confirmed_state_is_wrong_stops_with_the_record_repointed() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     let result = migrate(
         &h,
@@ -3415,11 +3845,11 @@ async fn a_removal_whose_confirmed_state_is_wrong_stops_with_the_record_repointe
     );
     assert_eq!(
         row_kinds(&h.rows(), "req-remove-wrong"),
-        vec!["sa_signer_set_diverged", "sa_context_rule_pins_updated"]
+        vec!["sa_signer_set_diverged", "sa_context_rule_pins_updated_v2"]
     );
-    let pins = the_row(&h, "req-remove-wrong", "sa_context_rule_pins_updated");
+    let pins = the_row(&h, "req-remove-wrong", "sa_context_rule_pins_updated_v2");
     let (verifiers, _, _, reason) = pins_updated_fields(&pins);
-    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
+    assert_eq!(verifiers, vec![full(&ed25519_hash())]);
     assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
 }
 
@@ -3432,7 +3862,12 @@ async fn a_removal_whose_confirmed_state_is_wrong_stops_with_the_record_repointe
 /// comparison on both endpoints, the drift check's read on the primary and
 /// the removal's observation on both endpoints.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_change_after_the_removal_refuses_the_add_before_it_is_sent() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     on_send_one_pair(&h);
     h.replace_rule_after_reads(
@@ -3479,7 +3914,12 @@ async fn a_change_after_the_removal_refuses_the_add_before_it_is_sent() {
 /// row, and no pending add, since the add confirmed. The error names the
 /// refresh.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_add_whose_confirmed_state_is_wrong_refuses_without_a_pending_add() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     h.on_send(
         "remove_signer",
@@ -3521,7 +3961,12 @@ async fn an_add_whose_confirmed_state_is_wrong_refuses_without_a_pending_add() {
 /// row holds both restored signers on the destination and no source signer.
 /// The pin record is repointed once, by the first pair.
 #[tokio::test]
+#[serial_test::serial]
 async fn two_pairs_on_one_rule_each_compare_against_the_newest_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     let plan = migration_plan_two_signers(&h, &verifier_w());
     for signer_id in [1, 2] {
@@ -3562,7 +4007,7 @@ async fn two_pairs_on_one_rule_each_compare_against_the_newest_row() {
         row_kinds(&h.rows(), "req-two-pairs"),
         vec![
             "sa_signer_removed_v2",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_signer_added_v2",
             "sa_verifier_migrated",
             "sa_signer_removed_v2",
@@ -3586,9 +4031,9 @@ async fn two_pairs_on_one_rule_each_compare_against_the_newest_row() {
         final_state.signers[2].identity,
         external_identity(&verifier_w(), &[0x12; 32])
     );
-    let pins = the_row(&h, "req-two-pairs", "sa_context_rule_pins_updated");
+    let pins = the_row(&h, "req-two-pairs", "sa_context_rule_pins_updated_v2");
     let (verifiers, _, _, reason) = pins_updated_fields(&pins);
-    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
+    assert_eq!(verifiers, vec![full(&ed25519_hash())]);
     assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
 }
 
@@ -3596,7 +4041,12 @@ async fn two_pairs_on_one_rule_each_compare_against_the_newest_row() {
 /// stops at its plan check after the first pair completed: step 1, one
 /// successful step, no pending add, two sends.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_second_pair_whose_plan_does_not_match_stops_after_the_first() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     let plan = migration_plan_two_signers(&h, &verifier_v());
     on_send_one_pair(&h);
@@ -3618,12 +4068,17 @@ async fn a_second_pair_whose_plan_does_not_match_stops_after_the_first() {
 /// the migration away from it, and the confirmed pair writes the record
 /// naming the destination.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_migration_skips_the_verifier_check_of_the_migrating_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     h.pin_created(
         1,
-        vec![FOREIGN_FIRST8.to_owned()],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![FOREIGN_HASH],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -3651,20 +4106,25 @@ async fn a_migration_skips_the_verifier_check_of_the_migrating_rule() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].request_id, "req-migrate");
     let (verifiers, policies, _, reason) = pins_updated_fields(&rows[0]);
-    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(verifiers, vec![full(&ed25519_hash())]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
 }
 
 /// The migrating rule's policies are still checked: a policy that differs
 /// from the pin refuses the first step with its own code, unwrapped.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_migration_still_checks_the_migrating_rules_policies() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![FOREIGN_FIRST8.to_owned()],
+        vec![full(&webauthn_hash())],
+        vec![FOREIGN_HASH],
         vec![],
         vec![],
     );
@@ -3690,7 +4150,12 @@ async fn a_migration_still_checks_the_migrating_rules_policies() {
 /// A migration on a rule without a pin record writes no pins-updated row,
 /// and records both state rows of the pair.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_migration_on_an_unpinned_rule_writes_no_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(false).await;
     on_send_one_pair(&h);
     let result = migrate(
@@ -3718,7 +4183,12 @@ async fn a_migration_on_an_unpinned_rule_writes_no_row() {
 /// A secondary endpoint one ledger behind the removal's confirmation for
 /// one read is read again, and the pair completes with its rows.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_secondary_behind_the_removal_is_read_again_and_the_pair_completes() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = signer_add_harness(true).await;
     on_send_one_pair(&h);
     h.secondary_ledgers
@@ -3760,13 +4230,18 @@ async fn a_secondary_behind_the_removal_is_read_again_and_the_pair_completes() {
 /// destination, no state row is written, and the pending add carries the
 /// hash with the removal unconfirmed.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_unresolved_removal_repoints_the_record_and_returns_the_pending_add() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_timeout(signer_add_chain(), Duration::from_secs(2)).await;
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -3802,11 +4277,15 @@ async fn an_unresolved_removal_repoints_the_record_and_returns_the_pending_add()
     assert!(result.failed_step_remove_tx_hash.is_none());
     assert_eq!(
         row_kinds(&h.rows(), "req-remove-unresolved"),
-        vec!["sa_context_rule_pins_updated"]
+        vec!["sa_context_rule_pins_updated_v2"]
     );
-    let pins = the_row(&h, "req-remove-unresolved", "sa_context_rule_pins_updated");
+    let pins = the_row(
+        &h,
+        "req-remove-unresolved",
+        "sa_context_rule_pins_updated_v2",
+    );
     let (verifiers, _, _, reason) = pins_updated_fields(&pins);
-    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
+    assert_eq!(verifiers, vec![full(&ed25519_hash())]);
     assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
 }
 
@@ -3816,17 +4295,27 @@ async fn an_unresolved_removal_repoints_the_record_and_returns_the_pending_add()
 /// authorized by any rule other than 0 before any network I/O: it has no
 /// manager to run the drift check through.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_rule_manager_without_a_signers_manager_refuses_a_non_zero_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     use stellar_agent_smart_account::managers::rules::{
         ContextRuleManager, ContextRuleManagerConfig,
     };
 
-    let manager = ContextRuleManager::new(ContextRuleManagerConfig::new(
-        UNROUTABLE_RPC.to_owned(),
-        PASSPHRASE.to_owned(),
-        Duration::from_secs(10),
-        CHAIN_ID.to_owned(),
-    ))
+    let manager = ContextRuleManager::new(
+        ContextRuleManagerConfig::new(
+            UNROUTABLE_RPC.to_owned(),
+            PASSPHRASE.to_owned(),
+            Duration::from_secs(10),
+            CHAIN_ID.to_owned(),
+        )
+        .with_intent_admission(
+            stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+        ),
+    )
     .unwrap();
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
     let err = manager
@@ -3992,20 +4481,20 @@ async fn remove_policy_under(
         .await
 }
 
-fn policy_pins_of(entry: &AuditEntry) -> (Vec<String>, bool, PinsUpdateReason) {
+fn policy_pins_of(entry: &AuditEntry) -> (Vec<WasmHashPin>, bool, PinsUpdateReason) {
     match &entry.event_kind {
-        EventKind::SaContextRulePinsUpdated {
+        EventKind::SaContextRulePinsUpdatedV2 {
             rule_id: 1,
-            pinned_policy_wasm_hashes_first8,
+            pinned_policy_wasm_hashes,
             unknown_override,
             reason,
             ..
         } => (
-            pinned_policy_wasm_hashes_first8.clone(),
+            pinned_policy_wasm_hashes.clone(),
             *unknown_override,
             *reason,
         ),
-        other => panic!("expected SaContextRulePinsUpdated for rule 1; got {other:?}"),
+        other => panic!("expected SaContextRulePinsUpdatedV2 for rule 1; got {other:?}"),
     }
 }
 
@@ -4022,10 +4511,15 @@ fn after_threshold_attach(policies: Vec<ScAddress>) -> AfterSend {
 /// record gains its pin, and the next checked verb compares the live policy
 /// with it.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_policy_added_to_a_pinned_rule_is_pinned_and_checked() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.after_send_state(&after_threshold_attach(vec![policy_p()]));
     add_policy(&h, &policy_p(), "req-policy-add", false)
         .await
@@ -4035,7 +4529,7 @@ async fn a_policy_added_to_a_pinned_rule_is_pinned_and_checked() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].request_id, "req-policy-add");
     let (policies, _, reason) = policy_pins_of(&rows[0]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
 
     h.set_entry(wasm_instance(&policy_p(), [0xab; 32]));
@@ -4052,14 +4546,19 @@ async fn a_policy_added_to_a_pinned_rule_is_pinned_and_checked() {
 /// A second policy with another hash yields a two-pin record, which the
 /// next checked verb refuses as unavailable.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_second_policy_writes_two_pins_and_the_next_verb_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![policy_p()]).await;
     h.set_threshold(&policy_p(), 1, 1);
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4073,7 +4572,7 @@ async fn a_second_policy_writes_two_pins_and_the_next_verb_refuses() {
     let (policies, _, reason) = policy_pins_of(&rows[0]);
     assert_eq!(
         policies,
-        vec![first8(&KNOWN_WASM_HASH), first8(&spending_limit_hash())]
+        vec![full(&KNOWN_WASM_HASH), full(&spending_limit_hash())]
     );
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
 
@@ -4094,10 +4593,15 @@ async fn a_second_policy_writes_two_pins_and_the_next_verb_refuses() {
 /// the unknown-hash override is set; with it, the add proceeds, the override
 /// row names the rule and the record carries the override flag.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_unknown_new_policy_needs_the_override() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     let err = add_policy(&h, &policy_r(), "req-policy-unknown", false)
         .await
         .unwrap_err();
@@ -4136,13 +4640,18 @@ async fn an_unknown_new_policy_needs_the_override() {
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 1);
     let (policies, unknown_override, _) = policy_pins_of(&rows[0]);
-    assert_eq!(policies, vec![first8(&[0xdd; 32])]);
+    assert_eq!(policies, vec![full(&[0xdd; 32])]);
     assert!(unknown_override);
 }
 
 /// A policy add on a rule without a pin record writes no pins-updated row.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_policy_add_on_an_unpinned_rule_writes_no_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
     add_policy(&h, &policy_r(), "req-policy-unpinned", false)
@@ -4156,10 +4665,15 @@ async fn a_policy_add_on_an_unpinned_rule_writes_no_row() {
 /// under the rule's lock, the override row naming the rule and the
 /// pins-updated row, then `SaPolicyAdded` and the raw-invocation row.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_policy_add_writes_the_override_row_before_the_policy_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.after_send(1, rule_one_with_policies(vec![policy_r()]));
     add_policy(&h, &policy_r(), "req-policy-order", true)
         .await
@@ -4169,7 +4683,7 @@ async fn a_policy_add_writes_the_override_row_before_the_policy_row() {
         row_kinds(&h.rows(), "req-policy-order"),
         vec![
             "unknown_override(rule Some(1))",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_added",
             "sa_raw_invocation",
         ]
@@ -4179,14 +4693,19 @@ async fn a_policy_add_writes_the_override_row_before_the_policy_row() {
 /// Removing the pinned policy clears its pin, and a later add of a policy
 /// with another hash writes a fresh one-pin record the next verb accepts.
 #[tokio::test]
+#[serial_test::serial]
 async fn removing_the_pinned_policy_clears_its_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![policy_p()]).await;
     h.set_threshold(&policy_p(), 1, 1);
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4206,7 +4725,7 @@ async fn removing_the_pinned_policy_clears_its_pin() {
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 2);
     let (policies, _, reason) = policy_pins_of(&rows[1]);
-    assert_eq!(policies, vec![first8(&spending_limit_hash())]);
+    assert_eq!(policies, vec![full(&spending_limit_hash())]);
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
 
     h.submit(&[1], Some("req-after-replace")).await.unwrap();
@@ -4216,12 +4735,17 @@ async fn removing_the_pinned_policy_clears_its_pin() {
 /// the policy differs from its pin, so a replacement policy gets a one-pin
 /// record the next verb accepts.
 #[tokio::test]
+#[serial_test::serial]
 async fn removing_a_drifted_only_policy_drops_its_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![policy_p()]).await;
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4253,7 +4777,7 @@ async fn removing_a_drifted_only_policy_drops_its_pin() {
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 2);
     let (policies, _, reason) = policy_pins_of(&rows[1]);
-    assert_eq!(policies, vec![first8(&spending_limit_hash())]);
+    assert_eq!(policies, vec![full(&spending_limit_hash())]);
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
 
     h.baseline_v2(1);
@@ -4267,14 +4791,19 @@ async fn removing_a_drifted_only_policy_drops_its_pin() {
 /// simple-threshold policy whose threshold change it must record. The pin
 /// record and the chain are unchanged.
 #[tokio::test]
+#[serial_test::serial]
 async fn removing_an_unreadable_only_policy_refuses_before_submission() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![policy_p()]).await;
     h.set_threshold(&policy_p(), 1, 1);
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4297,14 +4826,19 @@ async fn removing_an_unreadable_only_policy_refuses_before_submission() {
 /// policy's hash, not the first one, and the next verb checks the policy
 /// that stays.
 #[tokio::test]
+#[serial_test::serial]
 async fn removing_one_of_two_policies_drops_the_pin_of_its_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![policy_p(), policy_q()]).await;
     h.set_threshold(&policy_p(), 1, 1);
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH), first8(&spending_limit_hash())],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH), full(&spending_limit_hash())],
         vec![],
         vec![],
     );
@@ -4315,7 +4849,7 @@ async fn removing_one_of_two_policies_drops_the_pin_of_its_hash() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].request_id, "req-remove-second");
     let (policies, _, reason) = policy_pins_of(&rows[0]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::PolicyRemoved);
 
     h.submit(&[1], Some("req-after-remove-second"))
@@ -4326,14 +4860,19 @@ async fn removing_one_of_two_policies_drops_the_pin_of_its_hash() {
 /// Removing a policy no pin covers, from a rule that keeps a pinned policy,
 /// leaves the record alone, so the policy that stays is still checked.
 #[tokio::test]
+#[serial_test::serial]
 async fn removing_an_unpinned_policy_beside_a_pinned_one_keeps_the_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![policy_p(), policy_r()]).await;
     h.set_threshold(&policy_p(), 1, 1);
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4357,13 +4896,18 @@ async fn removing_an_unpinned_policy_beside_a_pinned_one_keeps_the_pin() {
 /// removal confirms and writes no row, and the next verb refuses the rule,
 /// which holds two policy pins and no policy.
 #[tokio::test]
+#[serial_test::serial]
 async fn removing_a_policy_no_pin_of_two_matches_writes_no_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![policy_r()]).await;
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH), first8(&spending_limit_hash())],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH), full(&spending_limit_hash())],
         vec![],
         vec![],
     );
@@ -4392,19 +4936,79 @@ async fn removing_a_policy_no_pin_of_two_matches_writes_no_row() {
     assert_eq!(h.sends(), 1);
 }
 
+/// Removing a policy no pin covers, from a rule with several policies whose
+/// single policy pin matches none of them, writes no pin update, and its
+/// event names the rule and the policy id but not the removed policy's hash,
+/// whole or as its first eight bytes: the next verb refuses the rule's
+/// policies against that pin.
+#[test]
+#[serial_test::serial]
+fn removing_a_policy_no_pin_matches_logs_no_hash_and_the_next_verb_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let removed = [0xdd_u8; 32];
+    let (err, logs) = rpc_mock_helpers::wallet_traced(async {
+        let h = policy_harness(vec![policy_q(), policy_r()]).await;
+        h.baseline_v2(1);
+        h.pin_created(
+            1,
+            vec![full(&webauthn_hash())],
+            vec![full(&KNOWN_WASM_HASH)],
+            vec![],
+            vec![],
+        );
+        h.after_send(1, rule_one_with_policies(vec![policy_q()]));
+        remove_policy(&h, 1, "req-remove-unmatched").await.unwrap();
+        assert_eq!(h.sends(), 1);
+        assert!(h.pins_updated_rows().is_empty());
+        h.submit(&[1], Some("req-after-remove-unmatched"))
+            .await
+            .unwrap_err()
+    });
+    assert!(
+        matches!(err, SaError::PolicyHashDrift { rule_id: 1, .. }),
+        "{err:?}"
+    );
+    let event = logs
+        .lines()
+        .find(|line| {
+            line.contains(
+                "remove_policy: no policy pin is the removed policy's; no pin update is written",
+            )
+        })
+        .unwrap_or_else(|| panic!("the removal event is captured: {logs}"));
+    assert!(
+        event.contains("\"rule_id\":1") && event.contains("\"policy_id\":1"),
+        "{event}"
+    );
+    rpc_mock_helpers::assert_refusal_holds_no_marker(
+        &err,
+        &logs,
+        &[&hex::encode(removed), &hex::encode(&removed[..8])],
+        &[],
+    );
+}
+
 // ── Policy pins with no policy on chain ───────────────────────────────────────
 
 /// A record pinning a policy on a rule with no policy on chain refuses the
 /// submission with the caller's request id before its invocation is
 /// simulated; nothing is sent and no drift row is written.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_policy_pin_with_no_live_policy_refuses_and_sends_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4432,10 +5036,15 @@ async fn a_policy_pin_with_no_live_policy_refuses_and_sends_nothing() {
 
 /// A record without policy pins on a rule with no policy on chain signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_rule_without_policies_or_policy_pins_signs() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.submit(&[1], Some("req-no-policy")).await.unwrap();
     assert_eq!(h.sends(), 1);
 }
@@ -4443,13 +5052,18 @@ async fn a_rule_without_policies_or_policy_pins_signs() {
 /// A policy added to a rule with no policy on chain replaces the record's
 /// stale policy pin with its own, and the next verb signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_policy_added_with_no_live_policy_replaces_a_stale_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4462,7 +5076,7 @@ async fn a_policy_added_with_no_live_policy_replaces_a_stale_pin() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].request_id, "req-repin");
     let (policies, _, reason) = policy_pins_of(&rows[0]);
-    assert_eq!(policies, vec![first8(&spending_limit_hash())]);
+    assert_eq!(policies, vec![full(&spending_limit_hash())]);
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
     assert_eq!(h.sends(), 1);
 
@@ -4473,13 +5087,18 @@ async fn a_policy_added_with_no_live_policy_replaces_a_stale_pin() {
 /// The same repair from the two-pin record a removal of the last policy
 /// leaves: the add pins exactly the added policy, and the next verb signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_policy_added_after_the_last_of_two_pinned_policies_replaces_both_pins() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH), first8(&spending_limit_hash())],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH), full(&spending_limit_hash())],
         vec![],
         vec![],
     );
@@ -4491,7 +5110,7 @@ async fn a_policy_added_after_the_last_of_two_pinned_policies_replaces_both_pins
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 1);
     let (policies, _, reason) = policy_pins_of(&rows[0]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
 
     h.submit(&[1], Some("req-after-repin-two")).await.unwrap();
@@ -4503,13 +5122,18 @@ async fn a_policy_added_after_the_last_of_two_pinned_policies_replaces_both_pins
 /// external reference leaves the reference list empty, and the next verb
 /// signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_policy_added_with_no_live_policy_drops_a_stale_reference_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![Some(reference_pin(KNOWN_WASM_HASH))],
     );
@@ -4521,16 +5145,16 @@ async fn a_policy_added_with_no_live_policy_drops_a_stale_reference_pin() {
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 1);
     match &rows[0].event_kind {
-        EventKind::SaContextRulePinsUpdated {
+        EventKind::SaContextRulePinsUpdatedV2 {
             rule_id: 1,
-            pinned_policy_wasm_hashes_first8,
+            pinned_policy_wasm_hashes,
             pinned_policy_executable_refs,
             reason,
             ..
         } => {
             assert_eq!(
-                pinned_policy_wasm_hashes_first8,
-                &vec![first8(&spending_limit_hash())]
+                pinned_policy_wasm_hashes,
+                &vec![full(&spending_limit_hash())]
             );
             assert!(
                 pinned_policy_executable_refs.is_empty(),
@@ -4538,7 +5162,7 @@ async fn a_policy_added_with_no_live_policy_drops_a_stale_reference_pin() {
             );
             assert_eq!(*reason, PinsUpdateReason::PolicyAdded);
         }
-        other => panic!("expected SaContextRulePinsUpdated for rule 1; got {other:?}"),
+        other => panic!("expected SaContextRulePinsUpdatedV2 for rule 1; got {other:?}"),
     }
 
     h.submit(&[1], Some("req-after-repin-reference"))
@@ -4552,14 +5176,19 @@ async fn a_policy_added_with_no_live_policy_drops_a_stale_reference_pin() {
 /// a policy failure is recorded after it: the first failure code, verifiers
 /// before policies, whatever each kind's final status.
 #[tokio::test]
+#[serial_test::serial]
 async fn verify_pins_names_the_verifier_failure_beside_a_drifted_policy() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let undecodable_policy = contract(0x33);
     let h = policy_harness(vec![undecodable_policy.clone(), policy_p()]).await;
     h.set_entry(undecodable_instance(&undecodable_policy));
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![FOREIGN_FIRST8.to_owned()],
+        vec![full(&webauthn_hash())],
+        vec![FOREIGN_HASH],
         vec![],
         vec![],
     );
@@ -4577,10 +5206,10 @@ async fn verify_pins_names_the_verifier_failure_beside_a_drifted_policy() {
         .unwrap();
     assert_eq!(result.verifier_pin_status, PinStatus::Unavailable);
     assert_eq!(result.policy_pin_status, PinStatus::Drift);
-    assert!(result.observed_verifier_first8.is_empty());
+    assert!(result.observed_verifier_hashes.is_empty());
     assert_eq!(
-        result.observed_policy_first8,
-        vec![first8(&KNOWN_WASM_HASH)]
+        result.observed_policy_hashes,
+        vec![Some(full(&KNOWN_WASM_HASH))]
     );
     assert_eq!(result.unavailable_wire_code, Some("sa.deployment_failed"));
     assert_eq!(h.sends(), 0);
@@ -4589,12 +5218,17 @@ async fn verify_pins_names_the_verifier_failure_beside_a_drifted_policy() {
 /// `verify-pins` reports a pinned policy with no policy on chain as policy
 /// drift with no observed policy, beside the matching verifier.
 #[tokio::test]
+#[serial_test::serial]
 async fn verify_pins_reports_drift_for_a_policy_pin_with_no_live_policy() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4610,9 +5244,9 @@ async fn verify_pins_reports_drift_for_a_policy_pin_with_no_live_policy() {
         .unwrap();
     assert_eq!(result.verifier_pin_status, PinStatus::Match);
     assert_eq!(result.policy_pin_status, PinStatus::Drift);
-    assert!(result.observed_policy_first8.is_empty());
+    assert!(result.observed_policy_hashes.is_empty());
     assert!(result.observed_policy_executable.is_empty());
-    assert_eq!(result.pinned_policy_first8, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(result.pinned_policy_hashes, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(result.unavailable_wire_code, None);
     assert_eq!(h.sends(), 0);
 }
@@ -4621,7 +5255,12 @@ async fn verify_pins_reports_drift_for_a_policy_pin_with_no_live_policy() {
 /// record pinning a policy on a rule with no policy on chain refuses the
 /// first step with its own code, unwrapped.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_migration_refuses_a_rule_whose_pinned_policy_is_absent() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = Chain::default()
         .with_rule(
             1,
@@ -4640,8 +5279,8 @@ async fn a_migration_refuses_a_rule_whose_pinned_policy_is_absent() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4831,7 +5470,12 @@ fn rows_of(h: &Harness, request_id: &str) -> Vec<AuditEntry> {
 /// A rule whose newest state row is version 1 refuses every signer verb
 /// with `sa.signer_set_baseline_legacy` before any RPC, and writes nothing.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_version_1_baseline_refuses_each_signer_verb_before_any_rpc() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     for verb in VERBS {
         let h = Harness::new(verb_chain()).await;
         h.baseline_v1(1);
@@ -4857,7 +5501,12 @@ async fn a_version_1_baseline_refuses_each_signer_verb_before_any_rpc() {
 /// every signer verb with `sa.signer_set_diverged` without a transaction
 /// hash: the divergence row is written and nothing is sent.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_chain_change_before_submission_refuses_each_signer_verb() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     for verb in VERBS {
         let h = verb_harness().await;
         let mut changed = verb_signers();
@@ -4896,7 +5545,12 @@ async fn a_chain_change_before_submission_refuses_each_signer_verb() {
 /// Each signer verb whose confirmed state is the intended change records it
 /// as its version-2 state row, carrying the full resulting set.
 #[tokio::test]
+#[serial_test::serial]
 async fn each_confirmed_signer_verb_records_its_version_2_state_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     for verb in VERBS {
         let h = verb_harness().await;
         h.after_send_state(&verb.intended());
@@ -4946,7 +5600,12 @@ async fn each_confirmed_signer_verb_records_its_version_2_state_row() {
 /// verb with `sa.signer_set_diverged` carrying the transaction hash; the
 /// divergence row is written and no state row.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_confirmed_state_that_is_not_the_intended_change_refuses_each_signer_verb() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     for verb in VERBS {
         let h = verb_harness().await;
         h.after_send_state(&verb.unintended());
@@ -4980,7 +5639,12 @@ async fn a_confirmed_state_that_is_not_the_intended_change_refuses_each_signer_v
 /// the one the simulation returned refuses with the transaction hash and
 /// records no state row: the reported id must be the chain's.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_add_the_chain_assigns_another_id_refuses_with_the_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verb_harness().await;
     let mut signers = verb_signers();
     signers.push((8, delegated_account(0x20)));
@@ -5009,7 +5673,12 @@ async fn an_add_the_chain_assigns_another_id_refuses_with_the_hash() {
 /// whatever order the chain assigned the ids in, and writes one row per
 /// signer in that order.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_batch_returns_the_observed_ids_in_input_order() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verb_harness().await;
     let mut signers = verb_signers();
     signers.extend([(8, delegated_account(0x21)), (9, delegated_account(0x20))]);
@@ -5043,7 +5712,12 @@ async fn a_batch_returns_the_observed_ids_in_input_order() {
 /// A secondary endpoint one ledger behind the confirmation for one read is
 /// read again after a pause, and the confirmed state is recorded.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_secondary_behind_for_one_read_is_read_again_and_the_row_is_written() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verb_harness().await;
     h.after_send_state(&Verb::Add.intended());
     h.secondary_ledgers
@@ -5075,7 +5749,12 @@ async fn a_secondary_behind_for_one_read_is_read_again_and_the_row_is_written() 
 /// `observe` with the transaction hash, naming the endpoint; no state row
 /// is written.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_secondary_that_stays_behind_fails_at_stage_observe() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_timeout(verb_chain(), Duration::from_secs(2)).await;
     h.baseline_v2(1);
     h.after_send_state(&Verb::Add.intended());
@@ -5108,7 +5787,12 @@ async fn a_secondary_that_stays_behind_fails_at_stage_observe() {
 /// named in the refusal when the `confirmation_recording` budget ends while
 /// one of its reads is outstanding.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_slow_secondary_behind_the_confirmation_is_named_when_the_budget_ends() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_timeout(verb_chain(), Duration::from_secs(3)).await;
     h.baseline_v2(1);
     h.after_send_state(&Verb::Add.intended());
@@ -5139,7 +5823,12 @@ async fn a_slow_secondary_behind_the_confirmation_is_named_when_the_budget_ends(
 /// threshold read is behind repeats its whole observation, rule and
 /// threshold, and the confirmed threshold is recorded.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_secondary_threshold_read_behind_repeats_its_observation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verb_harness().await;
     h.after_send_state(&Verb::SetThreshold.intended());
     h.secondary_ledgers
@@ -5183,7 +5872,12 @@ async fn a_secondary_threshold_read_behind_repeats_its_observation() {
 /// the repeat of their observations refuses the recording at stage
 /// `observe`: the threshold policy was identified from the earlier list.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_policy_list_changed_during_a_repeated_observation_refuses_at_stage_observe() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verb_harness().await;
     h.after_send_state(&Verb::SetThreshold.intended());
     for ledgers in [&h.primary_ledgers, &h.secondary_ledgers] {
@@ -5224,7 +5918,12 @@ async fn a_policy_list_changed_during_a_repeated_observation_refuses_at_stage_ob
 /// `observe` with `network.rpc_divergence`: the repeated reads are compared
 /// across the endpoints again, and no state row is written.
 #[tokio::test]
+#[serial_test::serial]
 async fn endpoints_that_disagree_after_a_repeated_observation_refuse_at_stage_observe() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_secondary(verb_chain(), verb_chain()).await;
     h.baseline_v2(1);
     h.after_send_state(&Verb::SetThreshold.intended());
@@ -5285,7 +5984,7 @@ async fn verifierless_pinned_rule() -> Harness {
         .with_threshold(&policy_p(), 1, 1);
     let h = Harness::with_timeout(chain, Duration::from_secs(2)).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
     h
 }
 
@@ -5330,7 +6029,12 @@ fn assert_return_shape_refusal(err: &SaError, expected_reason: &str) {
 /// before it is signed: nothing is sent, and no pin or state row is
 /// written.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_add_whose_simulated_return_is_not_a_u32_refuses_before_signing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verifierless_pinned_rule().await;
     h.set_simulated_return("add_signer", ScVal::Void);
     h.after_send(1, verifierless_rule_with_the_passkey());
@@ -5365,7 +6069,12 @@ async fn an_add_whose_simulated_return_is_not_a_u32_refuses_before_signing() {
 /// signs with the passkey verifier matching its pin, and a later change of
 /// that verifier's executable is refused by the drift check.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_confirmed_passkey_add_that_fails_to_record_still_pins_its_verifier() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     for batch in [false, true] {
         let h = verifierless_pinned_harness().await;
         h.after_send(1, verifierless_rule_with_the_passkey());
@@ -5409,14 +6118,14 @@ async fn a_confirmed_passkey_add_that_fails_to_record_still_pins_its_verifier() 
         assert_eq!(h.sends(), 1, "batch {batch}");
         assert_eq!(
             row_kinds(&h.rows(), &request_id),
-            vec!["sa_context_rule_pins_updated"],
+            vec!["sa_context_rule_pins_updated_v2"],
             "batch {batch}"
         );
         let rows = h.pins_updated_rows();
         assert_eq!(rows.len(), 1, "batch {batch}");
         let (verifiers, policies, _, reason) = pins_updated_fields(&rows[0]);
-        assert_eq!(verifiers, vec![first8(&webauthn_hash())], "batch {batch}");
-        assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)], "batch {batch}");
+        assert_eq!(verifiers, vec![full(&webauthn_hash())], "batch {batch}");
+        assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)], "batch {batch}");
         assert_eq!(reason, PinsUpdateReason::SignerAdded, "batch {batch}");
 
         // The secondary catches up; both endpoints now serve the confirmed
@@ -5459,16 +6168,17 @@ async fn a_confirmed_passkey_add_that_fails_to_record_still_pins_its_verifier() 
             .await
             .unwrap_err();
         match &err {
-            SaError::VerifierHashDrift {
-                pinned_hash_first8,
-                observed_hash_first8,
-                ..
-            } => {
-                assert_eq!(pinned_hash_first8, &first8(&webauthn_hash()));
-                assert_eq!(observed_hash_first8, &first8(&ed25519_hash()));
+            SaError::VerifierHashDrift { pinned_hash, .. } => {
+                assert_eq!(pinned_hash, &full(&webauthn_hash()));
             }
             other => panic!("batch {batch}: expected VerifierHashDrift; got {other:?}"),
         }
+        assert_the_drift_row_alone_keeps_the_observed_hash(
+            &h,
+            &err,
+            "req-pinned-verifier-drift",
+            &full(&ed25519_hash()),
+        );
         assert_eq!(err.wire_code(), "sa.verifier_hash_drift");
     }
 }
@@ -5477,7 +6187,12 @@ async fn a_confirmed_passkey_add_that_fails_to_record_still_pins_its_verifier() 
 /// observed version-2 view, the smallest `latestLedger` any of its reads
 /// reported, and the hash of the matched row.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_signer_set_check_over_a_version_2_row_freezes_the_view_ledger_and_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verb_harness().await;
     // Rule read, then threshold read, per endpoint; the secondary's
     // threshold read reports the smallest ledger.
@@ -5519,7 +6234,12 @@ async fn a_signer_set_check_over_a_version_2_row_freezes_the_view_ledger_and_row
 /// after the send) fails at stage `write` with the hash, marks the writer
 /// degraded, and records no state row.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_signer_add_whose_row_is_refused_fails_at_stage_write() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = verb_harness().await;
     h.after_send_state(&Verb::Add.intended());
     h.poison_audit_writer_at("sendTransaction");
@@ -5545,7 +6265,12 @@ async fn a_signer_add_whose_row_is_refused_fails_at_stage_write() {
 /// writer poisoned after the state read) fails at stage `write` without a
 /// transaction hash.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_list_whose_baseline_row_is_refused_fails_at_stage_write() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(verb_chain()).await;
     h.poison_audit_writer_at("get_context_rule");
 
@@ -5570,7 +6295,12 @@ async fn a_list_whose_baseline_row_is_refused_fails_at_stage_write() {
 /// threshold, and a removal refuses before submission: another policy
 /// decides which signers suffice.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_removal_on_a_weighted_only_rule_refuses_before_submission() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let weighted = contract(0x35);
     let chain = Chain::default()
         .with_rule(1, rule_with_ids(1, verb_signers(), vec![weighted.clone()]))
@@ -5599,7 +6329,12 @@ async fn a_removal_on_a_weighted_only_rule_refuses_before_submission() {
 /// and records its state row, and a threshold change refuses before
 /// submission.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_policyless_rule_accepts_a_removal_and_refuses_a_threshold_change() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let policyless = || Chain::default().with_rule(1, rule_with_ids(1, verb_signers(), vec![]));
     let h = Harness::new(policyless()).await;
     h.baseline_v2(1);
@@ -5628,7 +6363,12 @@ async fn a_policyless_rule_accepts_a_removal_and_refuses_a_threshold_change() {
 /// `signers list` on a policyless rule records a version-2 baseline with no
 /// threshold, at the ledger the rule reads reported.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_list_on_a_policyless_rule_writes_a_version_2_baseline_without_a_threshold() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h =
         Harness::new(Chain::default().with_rule(1, rule_with_ids(1, verb_signers(), vec![]))).await;
     let outcome = h
@@ -5666,7 +6406,12 @@ async fn a_list_on_a_policyless_rule_writes_a_version_2_baseline_without_a_thres
 /// `signers list` over an existing state row reports how the chain compares
 /// with it and writes nothing.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_list_over_an_existing_row_reports_the_comparison_and_writes_nothing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let list = |h: &Harness| {
         let manager = Arc::clone(&h.manager);
         async move {
@@ -5712,7 +6457,12 @@ async fn a_list_over_an_existing_row_reports_the_comparison_and_writes_nothing()
 /// `signers refresh` over a version-1 baseline the chain matches records the
 /// version-2 baseline and reports `matched`.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_refresh_over_a_matching_version_1_baseline_records_version_2() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(verb_chain()).await;
     h.baseline_v1(1);
     let outcome = h
@@ -5745,7 +6495,12 @@ async fn a_refresh_over_a_matching_version_1_baseline_records_version_2() {
 /// the divergence row and refuses without `accept_divergence`; with it, the
 /// divergence row is written, then the version-2 baseline.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_refresh_over_a_diverged_version_1_baseline_needs_the_flag() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(verb_chain()).await;
     h.baseline_v1(1);
     h.set_threshold(&policy_p(), 1, 3);
@@ -5801,7 +6556,12 @@ async fn a_refresh_over_a_diverged_version_1_baseline_needs_the_flag() {
 /// reports `not_comparable`, `refresh` refuses without the flag writing no
 /// row, and with it records the version-2 baseline only.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_contract_delegate_reads_in_version_2_and_is_not_comparable_with_version_1() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let delegate = contract(0x55);
     let chain = || {
         Chain::default()
@@ -5902,7 +6662,12 @@ async fn a_contract_delegate_reads_in_version_2_and_is_not_comparable_with_versi
 /// Two attached policies that both run a simple-threshold executable refuse
 /// the observation: the wallet cannot tell which threshold applies.
 #[tokio::test]
+#[serial_test::serial]
 async fn two_allowlisted_threshold_policies_refuse_the_observation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let p2 = contract(0x36);
     let chain = Chain::default()
         .with_rule(
@@ -5921,9 +6686,9 @@ async fn two_allowlisted_threshold_policies_refuse_the_observation() {
         .unwrap_err();
     match &err {
         SaError::ThresholdPolicyIdentificationFailed {
-            observed_wasm_hashes_summary,
+            observed_policy_count,
             ..
-        } => assert_eq!(observed_wasm_hashes_summary.count, 2),
+        } => assert_eq!(*observed_policy_count, 2),
         other => panic!("expected ThresholdPolicyIdentificationFailed; got {other:?}"),
     }
     assert!(!h.simulated("get_threshold"));
@@ -5934,7 +6699,12 @@ async fn two_allowlisted_threshold_policies_refuse_the_observation() {
 /// simple-threshold policy; the rule's simple-threshold policy beside it is
 /// observed.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_policy_without_an_instance_is_readable_and_not_the_threshold_policy() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let absent = contract(0x37);
     let chain = Chain::default()
         .with_rule(
@@ -5966,7 +6736,12 @@ async fn a_policy_without_an_instance_is_readable_and_not_the_threshold_policy()
 /// value refuse with `network.rpc_divergence` before submission, and a
 /// first `signers list` records no baseline.
 #[tokio::test]
+#[serial_test::serial]
 async fn the_endpoints_disagreeing_on_the_threshold_refuse_with_rpc_divergence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let secondary = || verb_chain().with_threshold(&policy_p(), 1, 3);
     let h = Harness::with_secondary(verb_chain(), secondary()).await;
     h.baseline_v2(1);
@@ -6008,7 +6783,12 @@ async fn the_endpoints_disagreeing_on_the_threshold_refuse_with_rpc_divergence()
 /// The two endpoints disagreeing on the rule's policy list refuse the
 /// observation with `network.rpc_divergence` before any threshold read.
 #[tokio::test]
+#[serial_test::serial]
 async fn the_endpoints_disagreeing_on_the_policy_list_refuse_with_rpc_divergence() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let q = contract(0x31);
     let secondary = verb_chain()
         .with_rule(
@@ -6156,12 +6936,18 @@ async fn simulate_install(
 
 /// A rule manager over the harness's endpoints with no signers manager.
 fn rule_manager_without_signers_manager(h: &Harness) -> ContextRuleManager {
-    ContextRuleManager::new(ContextRuleManagerConfig::new(
-        h.primary.uri(),
-        PASSPHRASE.to_owned(),
-        Duration::from_secs(10),
-        CHAIN_ID.to_owned(),
-    ))
+    ContextRuleManager::new(
+        ContextRuleManagerConfig::new(
+            h.primary.uri(),
+            PASSPHRASE.to_owned(),
+            Duration::from_secs(10),
+            CHAIN_ID.to_owned(),
+        )
+        .with_intent_admission(
+            stellar_agent_smart_account::signing::intent_test_helpers::shared_no_value_admission(),
+        )
+        .with_secondary_rpc_url(h.secondary_uri()),
+    )
     .unwrap()
 }
 
@@ -6207,12 +6993,17 @@ fn install_state_mismatch(err: &SaError) -> (Option<u32>, &str) {
     }
 }
 
-/// A confirmed install writes the override row, the `SaContextRuleCreated`
+/// A confirmed install writes the override row, the `SaContextRuleCreatedV2`
 /// row, the baseline with reason `confirmed_install` recording the served
 /// rule at the confirmation ledger, then `sa.ok`; the next `signers list`
 /// matches the baseline.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_confirmed_install_records_its_baseline_after_the_created_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(
         vec![
@@ -6238,7 +7029,7 @@ async fn a_confirmed_install_records_its_baseline_after_the_created_row() {
         row_kinds(&h.rows(), "req-install"),
         vec![
             "unknown_override(rule Some(1))",
-            "sa_context_rule_created",
+            "sa_context_rule_created_v2",
             "sa_signer_set_baselined_v2",
             "sa_raw_invocation",
         ]
@@ -6263,7 +7054,12 @@ async fn a_confirmed_install_records_its_baseline_after_the_created_row() {
 /// An install that attaches the simple-threshold policy baselines the
 /// policy with the threshold of its install parameter.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_install_with_the_simple_threshold_policy_baselines_its_threshold() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(
         vec![delegated_account(0x13)],
@@ -6302,7 +7098,7 @@ fn assert_mismatch_without_baseline(h: &Harness, err: &SaError, request_id: &str
     assert_eq!(err.wire_code(), "sa.install_state_mismatch");
     assert_eq!(
         row_kinds(&h.rows(), request_id),
-        vec!["sa_context_rule_created", "sa_raw_invocation"]
+        vec!["sa_context_rule_created_v2", "sa_raw_invocation"]
     );
     assert_eq!(raw_wire_code(h, request_id), "sa.install_state_mismatch");
     assert_eq!(h.sends(), 1);
@@ -6311,7 +7107,12 @@ fn assert_mismatch_without_baseline(h: &Harness, err: &SaError, request_id: &str
 /// A served threshold value other than the install parameter's refuses with
 /// `sa.install_state_mismatch` and writes no baseline.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_install_whose_served_threshold_differs_refuses_with_the_rule_id() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(
         vec![delegated_account(0x13)],
@@ -6336,7 +7137,12 @@ async fn an_install_whose_served_threshold_differs_refuses_with_the_rule_id() {
 /// same threshold value, refuses: the comparison covers the policy, not the
 /// value alone.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_install_whose_served_threshold_policy_differs_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(
         vec![delegated_account(0x13)],
@@ -6361,7 +7167,12 @@ async fn an_install_whose_served_threshold_policy_differs_refuses() {
 /// equal count, refuse: the comparison covers every identity, not the
 /// count alone.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_install_whose_served_signers_differ_in_one_identity_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(
         vec![
@@ -6390,7 +7201,12 @@ async fn an_install_whose_served_signers_differ_in_one_identity_refuses() {
 /// refusal. Neither the override row nor the created row is written, since
 /// no rule exists.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_install_whose_return_carries_no_rule_id_refuses_without_one() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.set_simulated_return("add_context_rule", ScVal::Void);
     h.after_send_state(&installed(
@@ -6426,7 +7242,12 @@ async fn an_install_whose_return_carries_no_rule_id_refuses_without_one() {
 /// writer poisoned after the created row) fails at stage `write` with the
 /// transaction hash; the created row stays and no baseline is written.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_install_whose_baseline_row_is_refused_fails_at_stage_write() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(vec![delegated_account(0x13)], vec![], &[]));
     h.poison_audit_writer_at("get_context_rule");
@@ -6453,7 +7274,7 @@ async fn an_install_whose_baseline_row_is_refused_fails_at_stage_write() {
     assert!(h.manager.audit_writer_degraded());
     assert_eq!(
         row_kinds(&h.rows(), "req-install-poisoned"),
-        vec!["sa_context_rule_created"]
+        vec!["sa_context_rule_created_v2"]
     );
     assert_eq!(h.sends(), 1);
 }
@@ -6462,7 +7283,12 @@ async fn an_install_whose_baseline_row_is_refused_fails_at_stage_write() {
 /// recording budget fails the install's baseline at stage `observe` with the
 /// transaction hash; the created row and the refusal's raw row are written.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_install_whose_secondary_stays_behind_fails_at_stage_observe() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_timeout(install_chain(), Duration::from_secs(2)).await;
     h.after_send_state(&installed(vec![delegated_account(0x13)], vec![], &[]));
     *h.secondary_ledgers.after_send.lock().unwrap() = Some(PRE_SEND_LEDGER);
@@ -6490,7 +7316,7 @@ async fn an_install_whose_secondary_stays_behind_fails_at_stage_observe() {
     }
     assert_eq!(
         row_kinds(&h.rows(), "req-install-behind"),
-        vec!["sa_context_rule_created", "sa_raw_invocation"]
+        vec!["sa_context_rule_created_v2", "sa_raw_invocation"]
     );
     assert_eq!(
         raw_wire_code(&h, "req-install-behind"),
@@ -6501,7 +7327,12 @@ async fn an_install_whose_secondary_stays_behind_fails_at_stage_observe() {
 /// Without a signers manager an install and its simulation refuse with
 /// `sa.signers_manager_not_configured` and no rule id, before any RPC.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_install_and_its_simulation_without_a_signers_manager_refuse_before_any_rpc() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     let manager = rule_manager_without_signers_manager(&h);
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
@@ -6571,7 +7402,12 @@ fn assert_build_refusal(h: &Harness, err: &SaError, reason: &str) {
 /// simple-threshold policy refuses an install and its simulation before
 /// either is simulated.
 #[tokio::test]
+#[serial_test::serial]
 async fn two_simple_threshold_policies_refuse_an_install_and_its_simulation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     let definition = || {
         install_definition(
@@ -6598,7 +7434,12 @@ async fn two_simple_threshold_policies_refuse_an_install_and_its_simulation() {
 /// A simple-threshold install parameter that is not the threshold map
 /// refuses an install and its simulation before either is simulated.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_malformed_threshold_parameter_refuses_an_install_and_its_simulation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     let definition = || {
         install_definition(
@@ -6626,7 +7467,12 @@ async fn a_malformed_threshold_parameter_refuses_an_install_and_its_simulation()
 /// A definition that lists a policy address twice refuses an install and its
 /// simulation before either is simulated.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_policy_address_listed_twice_refuses_an_install_before_submission() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     let definition = || {
         install_definition(
@@ -6649,7 +7495,12 @@ async fn a_policy_address_listed_twice_refuses_an_install_before_submission() {
 
 /// An `External` signer with empty key data refuses before submission.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_external_signer_with_empty_key_data_refuses_an_install_before_submission() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     let err = install(
         &h,
@@ -6676,7 +7527,12 @@ async fn an_external_signer_with_empty_key_data_refuses_an_install_before_submis
 /// A signer delegated to a contract installs, and the baseline records its
 /// full contract identity.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_contract_delegate_installs_and_its_baseline_carries_it() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let delegate = contract(0x77);
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(vec![contract_delegate(&delegate)], vec![], &[]));
@@ -6774,10 +7630,15 @@ fn observation(policy: &ScAddress, threshold: u32) -> Option<ThresholdObservatio
 /// lock. The policy row and the raw row follow, and the next `signers list`
 /// matches.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_threshold_attach_records_the_threshold_before_the_policy_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.after_send_state(&rule_one_after(vec![policy_p()], &[(policy_p(), 2)]));
     let policy_id = add_policy_with(&h, &policy_p(), threshold_param(2), "req-attach", false)
         .await
@@ -6787,7 +7648,7 @@ async fn a_threshold_attach_records_the_threshold_before_the_policy_row() {
         row_kinds(&h.rows(), "req-attach"),
         vec![
             "sa_threshold_changed_v2",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_added",
             "sa_raw_invocation",
         ]
@@ -6817,7 +7678,12 @@ fn assert_refused_before_submission(h: &Harness, err: &SaError, function: &str, 
 /// Attaching the simple-threshold policy to a rule that already has one
 /// refuses before submission.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_threshold_attach_on_a_rule_with_a_threshold_policy_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![policy_p2()], &[(policy_p2(), 1)]).await;
     h.baseline_v2(1);
     let err = add_policy_with(
@@ -6844,7 +7710,12 @@ async fn a_threshold_attach_on_a_rule_with_a_threshold_policy_refuses() {
 /// diverged row and returns `sa.signer_set_diverged` without a transaction
 /// hash.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_threshold_attach_on_a_rule_whose_signers_changed_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
     h.set_rule(
@@ -6888,7 +7759,12 @@ async fn a_threshold_attach_on_a_rule_whose_signers_changed_refuses() {
 /// An attach of the simple-threshold policy whose install parameter is not
 /// the threshold map refuses before submission.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_threshold_attach_with_a_malformed_parameter_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
     let err = add_policy_with(&h, &policy_p(), ScVal::Void, "req-attach-malformed", false)
@@ -6905,10 +7781,15 @@ async fn a_threshold_attach_with_a_malformed_parameter_refuses() {
 /// with `sa.signer_set_diverged` carrying the hash; the pins row and the
 /// policy row are still written, and no threshold row.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_confirmed_threshold_attach_whose_threshold_differs_refuses_with_the_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.after_send_state(&rule_one_after(vec![policy_p()], &[(policy_p(), 3)]));
     let err = add_policy_with(
         &h,
@@ -6934,7 +7815,7 @@ async fn a_confirmed_threshold_attach_whose_threshold_differs_refuses_with_the_h
         row_kinds(&h.rows(), "req-attach-differs"),
         vec![
             "sa_signer_set_diverged",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_added",
             "sa_raw_invocation",
         ]
@@ -6950,10 +7831,15 @@ async fn a_confirmed_threshold_attach_whose_threshold_differs_refuses_with_the_h
 /// not a `u32` is refused before it is signed. Nothing is sent, no pin,
 /// policy or threshold row is written, and the raw row carries the refusal.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_threshold_attach_whose_simulated_return_is_not_a_u32_refuses_before_signing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.set_simulated_return("add_policy", ScVal::Void);
     h.after_send_state(&rule_one_after(vec![policy_p()], &[(policy_p(), 2)]));
     let err = add_policy_with(
@@ -6978,7 +7864,12 @@ async fn a_threshold_attach_whose_simulated_return_is_not_a_u32_refuses_before_s
 /// An attach of the simple-threshold policy refuses a rule with no state
 /// row and a rule whose state row is version 1, before submission.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_threshold_attach_without_a_version_2_baseline_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     let err = add_policy_with(
         &h,
@@ -7012,10 +7903,15 @@ async fn a_threshold_attach_without_a_version_2_baseline_refuses() {
 /// Nothing is sent, no pin or policy row is written, and the raw row
 /// carries the refusal.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_direct_attach_whose_simulated_return_is_not_a_u32_refuses_before_signing() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.set_simulated_return("add_policy", ScVal::Void);
     h.after_send(1, rule_one_with_policies(vec![policy_q()]));
     let err = add_policy_with(&h, &policy_q(), ScVal::Void, "req-direct-void", false)
@@ -7035,10 +7931,15 @@ async fn a_direct_attach_whose_simulated_return_is_not_a_u32_refuses_before_sign
 /// A spending-limit attach records no signer-set state row and keeps its
 /// pin rows, which precede the policy row.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_spending_limit_attach_writes_no_state_row_and_keeps_its_pin_rows() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.after_send(1, rule_one_with_policies(vec![policy_q()]));
     add_policy_with(&h, &policy_q(), ScVal::Void, "req-attach-limit", false)
         .await
@@ -7046,7 +7947,7 @@ async fn a_spending_limit_attach_writes_no_state_row_and_keeps_its_pin_rows() {
     assert_eq!(
         row_kinds(&h.rows(), "req-attach-limit"),
         vec![
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_added",
             "sa_raw_invocation",
         ]
@@ -7058,7 +7959,12 @@ async fn a_spending_limit_attach_writes_no_state_row_and_keeps_its_pin_rows() {
 /// `sa.signers_manager_not_configured` naming the target rule, before any
 /// RPC.
 #[tokio::test]
+#[serial_test::serial]
 async fn the_policy_verbs_without_a_signers_manager_refuse_before_any_rpc() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![policy_p()], &[(policy_p(), 1)]).await;
     let manager = rule_manager_without_signers_manager(&h);
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
@@ -7110,13 +8016,18 @@ async fn the_policy_verbs_without_a_signers_manager_refuse_before_any_rpc() {
 /// under the rule's lock. The policy row and the raw row follow, and the
 /// next `signers list` matches.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_threshold_detach_records_the_cleared_threshold_before_the_policy_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![policy_p()], &[(policy_p(), 2)]).await;
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -7126,7 +8037,7 @@ async fn a_threshold_detach_records_the_cleared_threshold_before_the_policy_row(
         row_kinds(&h.rows(), "req-detach"),
         vec![
             "sa_threshold_changed_v2",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_removed",
             "sa_raw_invocation",
         ]
@@ -7149,13 +8060,18 @@ async fn a_threshold_detach_records_the_cleared_threshold_before_the_policy_row(
 /// `sa.signer_set_diverged` carrying the hash; the pins row and the policy
 /// row are written, and no threshold row.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_confirmed_threshold_detach_whose_threshold_stays_refuses_with_the_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![policy_p()], &[(policy_p(), 2)]).await;
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -7176,7 +8092,7 @@ async fn a_confirmed_threshold_detach_whose_threshold_stays_refuses_with_the_has
         row_kinds(&h.rows(), "req-detach-stays"),
         vec![
             "sa_signer_set_diverged",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_removed",
             "sa_raw_invocation",
         ]
@@ -7190,7 +8106,12 @@ async fn a_confirmed_threshold_detach_whose_threshold_stays_refuses_with_the_has
 /// detach. The policy's executable changes after the comparison's two
 /// reads, one per endpoint of the shared chain.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_detach_whose_policy_starts_identifying_after_the_comparison_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = Chain::default()
         .with_rule(1, rule_one_with_policies(vec![policy_p()]))
         .with_entry(wasm_instance(&verifier_v(), webauthn_hash()))
@@ -7220,7 +8141,12 @@ async fn a_detach_whose_policy_starts_identifying_after_the_comparison_refuses()
 /// detach of one of them is accepted: the row records no previous threshold
 /// and the remaining policy's threshold; the next `signers list` matches.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_rule_with_two_threshold_policies_detaches_one_of_them() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(
         vec![policy_p(), policy_p2()],
         &[(policy_p(), 1), (policy_p2(), 2)],
@@ -7262,7 +8188,12 @@ async fn a_rule_with_two_threshold_policies_detaches_one_of_them() {
 /// signers changed since its state row refuses before submission with
 /// `sa.signer_set_diverged` without a hash, and writes one diverged row.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_repair_detach_on_a_rule_whose_signers_changed_refuses_before_submission() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(
         vec![policy_p(), policy_p2()],
         &[(policy_p(), 1), (policy_p2(), 2)],
@@ -7305,7 +8236,12 @@ async fn a_repair_detach_on_a_rule_whose_signers_changed_refuses_before_submissi
 /// is not the remaining policy's threshold refuses with
 /// `sa.signer_set_diverged` carrying the hash, and writes no threshold row.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_repair_detach_whose_confirmed_state_is_not_the_remaining_policy_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(
         vec![policy_p(), policy_p2()],
         &[(policy_p(), 1), (policy_p2(), 2)],
@@ -7339,7 +8275,12 @@ async fn a_repair_detach_whose_confirmed_state_is_not_the_remaining_policy_refus
 /// A rule with three simple-threshold policies refuses the detach of one of
 /// them before submission: one detach cannot leave it observable.
 #[tokio::test]
+#[serial_test::serial]
 async fn three_threshold_policies_refuse_the_detach() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(
         vec![policy_p(), policy_p2(), policy_p3()],
         &[(policy_p(), 1), (policy_p2(), 2), (policy_p3(), 3)],
@@ -7350,9 +8291,9 @@ async fn three_threshold_policies_refuse_the_detach() {
     match &err {
         SaError::ThresholdPolicyIdentificationFailed {
             rule_id: 1,
-            observed_wasm_hashes_summary,
+            observed_policy_count,
             ..
-        } => assert_eq!(observed_wasm_hashes_summary.count, 3),
+        } => assert_eq!(*observed_policy_count, 3),
         other => panic!("expected ThresholdPolicyIdentificationFailed; got {other:?}"),
     }
     assert_refused_before_submission(&h, &err, "remove_policy", "req-three");
@@ -7363,7 +8304,12 @@ async fn three_threshold_policies_refuse_the_detach() {
 /// a baselined rule does not hold refuses after the comparison. Both refuse
 /// before submission.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_missing_rule_and_an_unattached_policy_id_refuse_the_removal() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![policy_p()], &[(policy_p(), 1)]).await;
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
     let missing_rule = h
@@ -7380,10 +8326,7 @@ async fn a_missing_rule_and_an_unattached_policy_id_refuse_the_removal() {
         .await
         .unwrap_err();
     assert!(
-        matches!(
-            missing_rule,
-            SaError::SignerSetMissingBaseline { rule_id: 9, .. }
-        ),
+        matches!(missing_rule, SaError::SignerSetMissingBaseline { .. }),
         "{missing_rule:?}"
     );
     assert_refused_before_submission(
@@ -7406,7 +8349,8 @@ async fn a_missing_rule_and_an_unattached_policy_id_refuse_the_removal() {
             assert_eq!(*phase, "simulate");
             assert_eq!(
                 redacted_reason,
-                "remove_policy: policy 5 is not attached to rule 1"
+                "policy_id must identify a policy attached to the selected rule; list the rule \
+                 policies and choose an attached policy ID."
             );
         }
         other => panic!("expected DeploymentFailed; got {other:?}"),
@@ -7424,7 +8368,12 @@ async fn a_missing_rule_and_an_unattached_policy_id_refuse_the_removal() {
 /// confirmation, so it is read again after a pause, and the baseline is
 /// written from the caught-up reads.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_install_whose_secondary_lags_one_read_is_baselined() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(install_chain()).await;
     h.after_send_state(&installed(vec![delegated_account(0x13)], vec![], &[]));
     h.secondary_ledgers
@@ -7456,7 +8405,12 @@ async fn an_install_whose_secondary_lags_one_read_is_baselined() {
 /// confirmation, so the endpoint's observation is repeated after a pause,
 /// and the threshold row is written from the caught-up reads.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_threshold_attach_whose_secondary_threshold_read_lags_is_recorded() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
     h.after_send_state(&rule_one_after(vec![policy_p()], &[(policy_p(), 2)]));
@@ -7522,7 +8476,12 @@ fn diverged_rows(h: &Harness, request_id: &str) -> Vec<u32> {
 /// second rule alone refuses with that rule's diverged row and sends
 /// nothing.
 #[tokio::test]
+#[serial_test::serial]
 async fn every_distinct_auth_rule_is_read_and_compared() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(two_rule_chain()).await;
     h.baseline_v2(1);
     h.baseline_v2(2);
@@ -7565,16 +8524,16 @@ async fn every_distinct_auth_rule_is_read_and_compared() {
 /// before any RPC: the rule is never fetched, nothing is simulated or sent,
 /// and no baseline row is written.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_missing_baseline_never_signs_or_baselines() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(two_rule_chain()).await;
     let err = h.submit(&[1], Some("req-no-baseline")).await.unwrap_err();
     match &err {
-        SaError::SignerSetMissingBaseline {
-            rule_id,
-            request_id,
-            ..
-        } => {
-            assert_eq!(*rule_id, 1);
+        SaError::SignerSetMissingBaseline { request_id, .. } => {
             assert_eq!(request_id, "req-no-baseline");
         }
         other => panic!("expected SignerSetMissingBaseline; got {other:?}"),
@@ -7595,7 +8554,12 @@ async fn a_missing_baseline_never_signs_or_baselines() {
 /// A version-1 row on an auth rule is compared through the observation's
 /// version-1 projection, and the submission signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_version_1_row_on_an_auth_rule_compares_and_signs() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(verb_chain()).await;
     h.baseline_v1(1);
     h.submit(&[1], Some("req-v1-auth-rule")).await.unwrap();
@@ -7614,7 +8578,12 @@ async fn a_version_1_row_on_an_auth_rule_compares_and_signs() {
 /// `sa.signer_set_diverged`, writes the diverged row under the caller's
 /// request id, and sends nothing.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_identity_change_on_an_auth_rule_refuses_with_the_diverged_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(two_rule_chain()).await;
     h.baseline_v2(2);
     h.set_rule(2, &rule_two_with_another_key());
@@ -7644,7 +8613,12 @@ async fn an_identity_change_on_an_auth_rule_refuses_with_the_diverged_row() {
 /// submission refuses with `sa.audit_log`; each sends nothing, and the two
 /// identities differ.
 #[tokio::test]
+#[serial_test::serial]
 async fn rpc_disagreement_and_a_poisoned_writer_refuse_distinctly() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let mut secondary = two_rule_chain();
     secondary.rules.insert(2, rule_two_with_another_key());
     let h = Harness::with_secondary(two_rule_chain(), secondary).await;
@@ -7680,7 +8654,12 @@ async fn rpc_disagreement_and_a_poisoned_writer_refuse_distinctly() {
 /// pin check read the rule, and nothing is sent. The read's own timeout (the
 /// signers manager's) is longer than its delay, so the budget ends first.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_slow_comparison_elapses_at_signer_set_compare() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_budget(verb_chain(), Duration::from_secs(1)).await;
     h.baseline_v2(1);
     h.delay_simulated("get_threshold", Duration::from_secs(5));
@@ -7710,7 +8689,12 @@ async fn a_slow_comparison_elapses_at_signer_set_compare() {
 /// A budget that is spent by the time the baseline read returns elapses at
 /// stage `baseline_read`, before any RPC.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_spent_budget_elapses_at_baseline_read() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_budget(verb_chain(), Duration::ZERO).await;
     h.baseline_v2(1);
     let err = h.submit(&[1], Some("req-zero-budget")).await.unwrap_err();
@@ -7736,7 +8720,12 @@ async fn a_spent_budget_elapses_at_baseline_read() {
 /// once the pre-submit budget ends, before any RPC; once the holder drops
 /// the lock, the same submission signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_held_rule_lock_refuses_at_rule_lock_until_it_is_released() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_budget(two_rule_chain(), Duration::from_secs(1)).await;
     h.baseline_v2(1);
     let holder = stellar_agent_smart_account::test_helpers::hold_rule_lock(
@@ -7774,7 +8763,12 @@ async fn a_held_rule_lock_refuses_at_rule_lock_until_it_is_released() {
 /// sent submission stalls in its confirmation poll, a `signers list` on the
 /// same rule takes the lock and completes first.
 #[tokio::test]
+#[serial_test::serial]
 async fn the_submit_path_releases_its_locks_before_the_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(two_rule_chain()).await;
     h.baseline_v2(1);
     h.delay_poll(Duration::from_secs(2));
@@ -7804,16 +8798,21 @@ async fn the_submit_path_releases_its_locks_before_the_send() {
 /// drifted verifier on another, and a drifted verifier on one rule refuses
 /// before a signer-set divergence on another.
 #[tokio::test]
+#[serial_test::serial]
 async fn coexisting_faults_refuse_in_the_check_order() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(two_rule_chain()).await;
     h.baseline_v2(2);
-    h.pin_created(2, vec![FOREIGN_FIRST8.to_owned()], vec![], vec![], vec![]);
+    h.pin_created(2, vec![FOREIGN_HASH], vec![], vec![], vec![]);
     let err = h
         .submit_invocation("pair", &[1, 2], Some("req-baseline-first"), None)
         .await
         .unwrap_err();
     assert!(
-        matches!(err, SaError::SignerSetMissingBaseline { rule_id: 1, .. }),
+        matches!(err, SaError::SignerSetMissingBaseline { .. }),
         "{err:?}"
     );
     assert!(h.primary_log.simulated().is_empty());
@@ -7830,7 +8829,7 @@ async fn coexisting_faults_refuse_in_the_check_order() {
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
     h.baseline_v2(2);
-    h.pin_created(1, vec![FOREIGN_FIRST8.to_owned()], vec![], vec![], vec![]);
+    h.pin_created(1, vec![FOREIGN_HASH], vec![], vec![], vec![]);
     h.set_rule(2, &rule_two_with_another_key());
     let err = h
         .submit_invocation("pair", &[1, 2], Some("req-drift-first"), None)
@@ -7847,7 +8846,12 @@ async fn coexisting_faults_refuse_in_the_check_order() {
 /// Rule 0 beside rule 1 is neither locked nor compared: a held lock on rule
 /// 0 does not stop the submission, and only rule 1 is read.
 #[tokio::test]
+#[serial_test::serial]
 async fn rule_zero_beside_rule_one_checks_rule_one_only() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = two_rule_chain().with_rule(0, rule(0, vec![delegated_signer()], vec![]));
     let h = Harness::with_timeout(chain, Duration::from_secs(2)).await;
     h.baseline_v2(1);
@@ -7875,7 +8879,12 @@ async fn rule_zero_beside_rule_one_checks_rule_one_only() {
 /// and sends nothing. The read's own timeout is longer than its delay, so
 /// the budget ends first.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_rule_verbs_slow_comparison_elapses_at_signer_set_compare() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_budget(verb_chain(), Duration::from_secs(1)).await;
     h.baseline_v2(1);
     h.delay_simulated("get_threshold", Duration::from_secs(5));
@@ -7914,12 +8923,52 @@ async fn a_rule_verbs_slow_comparison_elapses_at_signer_set_compare() {
 /// Counts the submissions recorded as sent and settled.
 #[derive(Default)]
 struct CountingRecorder {
+    refuse_admission: bool,
+    admissions: AtomicUsize,
+    cancellations: AtomicUsize,
+    bound_pre_sends: AtomicUsize,
     pre_sends: AtomicUsize,
     outcomes: AtomicUsize,
 }
 
 #[async_trait::async_trait]
 impl SubmissionRecorder for CountingRecorder {
+    async fn admit_signed_intent(
+        &self,
+        plan: &stellar_agent_network::SignedIntentPlan,
+    ) -> Result<stellar_agent_network::IntentProof, stellar_agent_core::WalletError> {
+        self.admissions.fetch_add(1, Ordering::SeqCst);
+        if self.refuse_admission {
+            return Err(stellar_agent_core::WalletError::PolicyDenied {
+                reason: Box::new(stellar_agent_core::policy::DenyReason::RateLimitExceeded {
+                    window: "1m".into(),
+                    max_calls: 1,
+                    calls_in_window: 1,
+                }),
+            });
+        }
+        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission()
+            .admit(plan)
+            .await
+    }
+    async fn cancel_unexposed(
+        &self,
+        proof: stellar_agent_network::IntentProof,
+    ) -> Result<(), stellar_agent_core::WalletError> {
+        self.cancellations.fetch_add(1, Ordering::SeqCst);
+        stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission()
+            .cancel_unexposed(proof)
+            .await
+    }
+    async fn pre_send_bound(
+        &self,
+        intent: &stellar_agent_network::SubmissionIntent,
+        _: &stellar_agent_network::IntentBinding<'_>,
+    ) -> Result<(), stellar_agent_core::WalletError> {
+        self.bound_pre_sends.fetch_add(1, Ordering::SeqCst);
+        self.pre_send(intent).await
+    }
+
     async fn pre_send(
         &self,
         _intent: &stellar_agent_network::SubmissionIntent,
@@ -7937,10 +8986,55 @@ impl SubmissionRecorder for CountingRecorder {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn cap_refusal_precedes_any_signed_authorization() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    for arm in [1, 2] {
+        let h = Harness::new(two_rule_chain()).await;
+        h.baseline_v2(1);
+        let recorder = CountingRecorder {
+            refuse_admission: true,
+            ..CountingRecorder::default()
+        };
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new(SEED);
+        let result = h
+            .submit_invocation_with_signing(
+                "noop",
+                &[1],
+                Some("cap-refusal"),
+                Some(&recorder),
+                &signer,
+                arm,
+            )
+            .await;
+        assert_eq!(signer.sign_calls(), 0);
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.wire_code(),
+            "policy.deny.rate_limit_exceeded",
+            "arm {arm}: {error:?}"
+        );
+        assert_eq!(signer.sign_calls(), 0);
+        assert_eq!(h.sends(), 0);
+        assert_eq!(recorder.admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(recorder.bound_pre_sends.load(Ordering::SeqCst), 0);
+        assert_eq!(recorder.cancellations.load(Ordering::SeqCst), 0);
+    }
+}
+
 /// A missing-baseline refusal, a divergence refusal and a drift refusal
 /// each leave no submission record; a submission that signs leaves one.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_refused_submission_leaves_no_record_and_a_sent_one_does() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let recorder = CountingRecorder::default();
 
     let h = Harness::new(two_rule_chain()).await;
@@ -7960,12 +9054,15 @@ async fn a_refused_submission_leaves_no_record_and_a_sent_one_does() {
 
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![FOREIGN_FIRST8.to_owned()], vec![], vec![], vec![]);
+    h.pin_created(1, vec![FOREIGN_HASH], vec![], vec![], vec![]);
     let drift = h
         .submit_invocation("noop", &[1], Some("req-record-drift"), Some(&recorder))
         .await
         .unwrap_err();
     assert_eq!(drift.wire_code(), "sa.verifier_hash_drift");
+    assert_eq!(recorder.admissions.load(Ordering::SeqCst), 0);
+    assert_eq!(recorder.cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(recorder.bound_pre_sends.load(Ordering::SeqCst), 0);
     assert_eq!(recorder.pre_sends.load(Ordering::SeqCst), 0);
     assert_eq!(recorder.outcomes.load(Ordering::SeqCst), 0);
 
@@ -7974,6 +9071,9 @@ async fn a_refused_submission_leaves_no_record_and_a_sent_one_does() {
     h.submit_invocation("noop", &[1], Some("req-record-sent"), Some(&recorder))
         .await
         .unwrap();
+    assert_eq!(recorder.admissions.load(Ordering::SeqCst), 1);
+    assert_eq!(recorder.cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(recorder.bound_pre_sends.load(Ordering::SeqCst), 1);
     assert_eq!(recorder.pre_sends.load(Ordering::SeqCst), 1);
     assert_eq!(recorder.outcomes.load(Ordering::SeqCst), 1);
 }
@@ -8029,7 +9129,12 @@ async fn attach_threshold_under(
 /// `sa.signer_set_missing_baseline` naming rule 2. Nothing is sent, and the
 /// only rule read is the entry's comparison of rule 1.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_attach_under_an_unbaselined_auth_rule_refuses_missing_baseline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(attach_chain()).await;
     h.baseline_v2(1);
     h.after_send_state(&after_attach_on_rule_one());
@@ -8038,12 +9143,7 @@ async fn an_attach_under_an_unbaselined_auth_rule_refuses_missing_baseline() {
         .await
         .unwrap_err();
     match &err {
-        SaError::SignerSetMissingBaseline {
-            rule_id,
-            request_id,
-            ..
-        } => {
-            assert_eq!(*rule_id, 2);
+        SaError::SignerSetMissingBaseline { request_id, .. } => {
             assert_eq!(request_id, "req-attach-auth-unbaselined");
         }
         other => panic!("expected SignerSetMissingBaseline; got {other:?}"),
@@ -8058,7 +9158,12 @@ async fn an_attach_under_an_unbaselined_auth_rule_refuses_missing_baseline() {
 /// recorded refuses with `sa.signer_set_diverged` naming rule 2, writes the
 /// diverged row under the call's request id, and sends nothing.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_attach_under_a_diverged_auth_rule_refuses_with_the_diverged_row() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(attach_chain()).await;
     h.baseline_v2(1);
     h.baseline_v2(2);
@@ -8088,7 +9193,12 @@ async fn an_attach_under_a_diverged_auth_rule_refuses_with_the_diverged_row() {
 /// the submission compares rule 2, and the threshold row records the
 /// attach.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_attach_under_a_baselined_auth_rule_compares_it_and_signs() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(attach_chain()).await;
     h.baseline_v2(1);
     h.baseline_v2(2);
@@ -8190,7 +9300,12 @@ async fn set_spending_limit_of(
 /// refuses with `sa.signer_set_missing_baseline` naming rule 2, and nothing
 /// is sent.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_spending_limit_retune_under_an_unbaselined_admin_rule_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(spending_limit_chain()).await;
     h.set_simulated_return("get_spending_limit_data", spending_limit_data(1_000, 100));
 
@@ -8198,7 +9313,7 @@ async fn a_spending_limit_retune_under_an_unbaselined_admin_rule_refuses() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, SaError::SignerSetMissingBaseline { rule_id: 2, .. }),
+        matches!(err, SaError::SignerSetMissingBaseline { .. }),
         "{err:?}"
     );
     assert!(
@@ -8213,7 +9328,12 @@ async fn a_spending_limit_retune_under_an_unbaselined_admin_rule_refuses() {
 /// keeps rule 2's lock, the retune refuses at stage `rule_lock` naming rule
 /// 2 once the manager's timeout ends, before any RPC.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_spending_limit_retune_waits_for_its_admin_rules_lock() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_timeout(spending_limit_chain(), Duration::from_millis(300)).await;
     h.set_simulated_return("get_spending_limit_data", spending_limit_data(1_000, 100));
     let holder = stellar_agent_smart_account::test_helpers::hold_rule_lock(
@@ -8283,9 +9403,9 @@ async fn add_racing_signer(h: &Harness, request_id: &str) -> Result<u32, SaError
         .await
 }
 
-/// The verifier and policy pins of the newest `SaContextRulePinsUpdated` row
+/// The verifier and policy pins of the newest `SaContextRulePinsUpdatedV2` row
 /// of rule 1.
-fn last_rule_one_pins(h: &Harness) -> (Vec<String>, Vec<String>) {
+fn last_rule_one_pins(h: &Harness) -> (Vec<WasmHashPin>, Vec<WasmHashPin>) {
     let rows = h.pins_updated_rows();
     let last = rows.last().expect("rule 1 has a pins-updated row");
     let (verifiers, policies, _, _) = pins_updated_fields(last);
@@ -8327,14 +9447,14 @@ fn assert_the_added_verifier_pin_survives(h: &Harness, removal: &str, add: &str)
     let (verifiers, policies) = last_rule_one_pins(h);
     assert_eq!(
         verifiers,
-        vec![first8(&webauthn_hash())],
+        vec![full(&webauthn_hash())],
         "the newest pin record keeps the added verifier's pin"
     );
     assert!(policies.is_empty(), "{policies:?}");
     let mut blocks = contiguous_blocks(h, &[removal, add]);
     assert_eq!(
         blocks[1],
-        vec!["sa_signer_added_v2", "sa_context_rule_pins_updated"]
+        vec!["sa_signer_added_v2", "sa_context_rule_pins_updated_v2"]
     );
     blocks.swap_remove(0)
 }
@@ -8346,12 +9466,17 @@ fn assert_the_added_verifier_pin_survives(h: &Harness, removal: &str, add: &str)
 /// add plans from the removal's record, so the newest record keeps the
 /// add's verifier pin.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_direct_removal_racing_a_verifier_add_keeps_the_added_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(spending_limit_chain()).await;
     h.pin_created(
         1,
         vec![],
-        vec![first8(&spending_limit_hash())],
+        vec![full(&spending_limit_hash())],
         vec![],
         vec![],
     );
@@ -8382,7 +9507,7 @@ async fn a_direct_removal_racing_a_verifier_add_keeps_the_added_pin() {
     assert_eq!(
         removal_block,
         vec![
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_removed",
             "sa_raw_invocation",
         ]
@@ -8404,9 +9529,14 @@ fn threshold_race_chain() -> Chain {
 /// records the cleared threshold and its pins row. The add's block lands
 /// after the removal's, never inside it.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_threshold_detach_racing_a_verifier_add_keeps_the_added_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(threshold_race_chain()).await;
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
     h.baseline_v2(1);
     h.baseline_v2(2);
     h.delay_entry_read(
@@ -8438,7 +9568,7 @@ async fn a_threshold_detach_racing_a_verifier_add_keeps_the_added_pin() {
         removal_block,
         vec![
             "sa_threshold_changed_v2",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_removed",
             "sa_raw_invocation",
         ]
@@ -8450,12 +9580,17 @@ async fn a_threshold_detach_racing_a_verifier_add_keeps_the_added_pin() {
 /// meanwhile waits on the lock, then plans from the record that holds the
 /// add's pin.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_signer_add_racing_a_direct_removal_keeps_its_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(spending_limit_chain()).await;
     h.pin_created(
         1,
         vec![],
-        vec![first8(&spending_limit_hash())],
+        vec![full(&spending_limit_hash())],
         vec![],
         vec![],
     );
@@ -8509,7 +9644,12 @@ fn crossed_spending_limit_chain() -> Chain {
 /// Once it is released the first takes both locks and completes, then the
 /// second: neither holds one lock while it waits on the other.
 #[tokio::test]
+#[serial_test::serial]
 async fn crossed_retunes_complete_without_a_deadlock() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::with_timeout(crossed_spending_limit_chain(), Duration::from_secs(2)).await;
     h.baseline_v2(1);
     h.baseline_v2(2);
@@ -8553,7 +9693,12 @@ async fn crossed_retunes_complete_without_a_deadlock() {
 /// rule without a state row refuses with `sa.signer_set_missing_baseline`
 /// before submission.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_direct_attach_without_a_baseline_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = policy_harness(vec![]).await;
     let err = add_policy(&h, &policy_q(), "req-direct-missing", false)
         .await
@@ -8566,7 +9711,12 @@ async fn a_direct_attach_without_a_baseline_refuses() {
 /// `sa.signer_set_baseline_legacy` before submission, before the policy's
 /// install parameter is parsed.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_direct_attach_over_a_version_1_baseline_refuses() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = threshold_policy_harness(vec![policy_p2()], &[(policy_p2(), 1)]).await;
     h.baseline_v1(1);
     let err = add_policy_with(&h, &policy_q(), ScVal::Void, "req-direct-legacy", false)
@@ -8603,7 +9753,7 @@ fn absent_verifier_pin_chain() -> Chain {
 async fn absent_verifier_pin_harness() -> Harness {
     let h = Harness::new(absent_verifier_pin_chain()).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
     h
 }
 
@@ -8623,7 +9773,12 @@ async fn refresh(
 /// verifier. The refusal follows the pin check's rule read and precedes any
 /// simulation. The same rule without a pin record signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_live_verifier_the_record_does_not_pin_refuses_the_submission() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = absent_verifier_pin_harness().await;
     let err = h
         .submit(&[1], Some("req-verifier-absent"))
@@ -8661,7 +9816,12 @@ async fn a_live_verifier_the_record_does_not_pin_refuses_the_submission() {
 /// `verify-pins` reports a live verifier the pin record does not pin as
 /// verifier drift with no observed hash, beside the matching policy.
 #[tokio::test]
+#[serial_test::serial]
 async fn verify_pins_reports_drift_for_a_live_verifier_the_record_does_not_pin() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = absent_verifier_pin_harness().await;
     let result = h
         .rule_manager()
@@ -8674,7 +9834,7 @@ async fn verify_pins_reports_drift_for_a_live_verifier_the_record_does_not_pin()
         .await
         .unwrap();
     assert_eq!(result.verifier_pin_status, PinStatus::Drift);
-    assert!(result.observed_verifier_first8.is_empty());
+    assert!(result.observed_verifier_hashes.is_empty());
     assert_eq!(result.policy_pin_status, PinStatus::Match);
     assert_eq!(result.unavailable_wire_code, None);
     assert_eq!(h.sends(), 0);
@@ -8685,18 +9845,26 @@ async fn verify_pins_reports_drift_for_a_live_verifier_the_record_does_not_pin()
 /// keeping the policy pin, reports one verifier pinned, and the next
 /// submission signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_refresh_pins_the_live_verifier_of_a_record_that_pins_none() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = absent_verifier_pin_harness().await;
     let outcome = refresh(&h, RefreshOptions::new(false), "req-repair")
         .await
         .unwrap();
     assert_eq!(
         row_kinds(&h.rows(), "req-repair"),
-        vec!["sa_signer_set_baselined_v2", "sa_context_rule_pins_updated"]
+        vec![
+            "sa_signer_set_baselined_v2",
+            "sa_context_rule_pins_updated_v2"
+        ]
     );
     let (verifiers, policies, _, reason) = pins_updated_fields(&h.pins_updated_rows()[0]);
-    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(verifiers, vec![full(&webauthn_hash())]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::BaselineRefreshed);
     assert_eq!(outcome.previous_baseline, PreviousBaseline::Matched);
     assert!(outcome.verifier_pinned);
@@ -8710,7 +9878,12 @@ async fn a_refresh_pins_the_live_verifier_of_a_record_that_pins_none() {
 /// and writes no pins row. With it the refresh records the chain and pins
 /// the live verifier, and the next submission signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_diverged_refresh_pins_the_live_verifier_only_with_the_flag() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = absent_verifier_pin_harness().await;
     h.set_rule(
         1,
@@ -8743,11 +9916,11 @@ async fn a_diverged_refresh_pins_the_live_verifier_only_with_the_flag() {
         vec![
             "sa_signer_set_diverged",
             "sa_signer_set_baselined_v2",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
     let (verifiers, _, _, _) = pins_updated_fields(&h.pins_updated_rows()[0]);
-    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
+    assert_eq!(verifiers, vec![full(&webauthn_hash())]);
     h.submit(&[1], Some("req-after-diverged-repair"))
         .await
         .unwrap();
@@ -8759,13 +9932,18 @@ async fn a_diverged_refresh_pins_the_live_verifier_only_with_the_flag() {
 /// none: each refresh writes the baseline only. A pinned verifier that
 /// changed stays the drift check's finding.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_refresh_leaves_a_record_with_a_verifier_pin_or_no_record_alone() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(absent_verifier_pin_chain()).await;
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -8782,8 +9960,8 @@ async fn a_refresh_leaves_a_record_with_a_verifier_pin_or_no_record_alone() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![FOREIGN_FIRST8.to_owned()],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![FOREIGN_HASH],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -8816,7 +9994,12 @@ async fn a_refresh_leaves_a_record_with_a_verifier_pin_or_no_record_alone() {
 
 /// Two External signers on one verifier address share one pin.
 #[tokio::test]
+#[serial_test::serial]
 async fn two_signers_on_one_verifier_are_pinned_once() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = absent_verifier_pin_chain().with_rule(
         1,
         rule_with_ids(
@@ -8831,7 +10014,7 @@ async fn two_signers_on_one_verifier_are_pinned_once() {
     );
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
     let outcome = refresh(&h, RefreshOptions::new(false), "req-refresh-shared")
         .await
         .unwrap();
@@ -8839,7 +10022,7 @@ async fn two_signers_on_one_verifier_are_pinned_once() {
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 1);
     let (verifiers, _, _, _) = pins_updated_fields(&rows[0]);
-    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
+    assert_eq!(verifiers, vec![full(&webauthn_hash())]);
     h.submit(&[1], Some("req-after-shared-refresh"))
         .await
         .unwrap();
@@ -8871,7 +10054,12 @@ fn absent_verifier_pin_chain_on(verifier: &ScAddress, entries: Vec<Value>) -> Ch
 /// write. With it the override row sits between the baseline row and the
 /// pins row, and the next submission signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_refresh_pins_an_unknown_verifier_only_with_its_override() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let unknown = [0xdd; 32];
     let h = Harness::new(absent_verifier_pin_chain_on(
         &verifier_w(),
@@ -8879,7 +10067,7 @@ async fn a_refresh_pins_an_unknown_verifier_only_with_its_override() {
     ))
     .await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
 
     let err = refresh(&h, RefreshOptions::new(false), "req-refresh-unknown-no")
         .await
@@ -8904,11 +10092,11 @@ async fn a_refresh_pins_an_unknown_verifier_only_with_its_override() {
         vec![
             "sa_signer_set_baselined_v2",
             "unknown_override(rule Some(1))",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
     let (verifiers, _, unknown_override, _) = pins_updated_fields(&h.pins_updated_rows()[0]);
-    assert_eq!(verifiers, vec![first8(&unknown)]);
+    assert_eq!(verifiers, vec![full(&unknown)]);
     assert!(unknown_override);
     h.submit(&[1], Some("req-after-unknown-refresh"))
         .await
@@ -8920,7 +10108,12 @@ async fn a_refresh_pins_an_unknown_verifier_only_with_its_override() {
 /// is mutable, and is pinned only with the mutable-verifier override, with
 /// its reference pin.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_refresh_pins_a_mutable_verifier_only_with_its_override() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let h = Harness::new(absent_verifier_pin_chain_on(
         &verifier_v(),
         vec![
@@ -8930,7 +10123,7 @@ async fn a_refresh_pins_a_mutable_verifier_only_with_its_override() {
     ))
     .await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
 
     let err = refresh(&h, RefreshOptions::new(false), "req-refresh-mutable-no")
         .await
@@ -8954,27 +10147,24 @@ async fn a_refresh_pins_a_mutable_verifier_only_with_its_override() {
         vec![
             "sa_signer_set_baselined_v2",
             "mutable_override(rule Some(1))",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
     match &h.pins_updated_rows()[0].event_kind {
-        EventKind::SaContextRulePinsUpdated {
-            pinned_verifier_wasm_hashes_first8,
+        EventKind::SaContextRulePinsUpdatedV2 {
+            pinned_verifier_wasm_hashes,
             pinned_verifier_executable_refs,
             mutable_override,
             ..
         } => {
-            assert_eq!(
-                pinned_verifier_wasm_hashes_first8,
-                &vec![first8(&webauthn_hash())]
-            );
+            assert_eq!(pinned_verifier_wasm_hashes, &vec![full(&webauthn_hash())]);
             assert_eq!(
                 pinned_verifier_executable_refs,
                 &vec![Some(reference_pin(webauthn_hash()))]
             );
             assert!(*mutable_override);
         }
-        other => panic!("expected SaContextRulePinsUpdated; got {other:?}"),
+        other => panic!("expected SaContextRulePinsUpdatedV2; got {other:?}"),
     }
     h.submit(&[1], Some("req-after-mutable-refresh"))
         .await
@@ -8988,7 +10178,12 @@ async fn a_refresh_pins_a_mutable_verifier_only_with_its_override() {
 /// refuses before any write. The reference still needs its mutable-verifier
 /// override before the comparison of the two pins is reached.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_refresh_refuses_a_wasm_verifier_and_a_reference_on_one_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = absent_verifier_pin_chain()
         .with_rule(
             1,
@@ -9006,7 +10201,7 @@ async fn a_refresh_refuses_a_wasm_verifier_and_a_reference_on_one_hash() {
         .with_entry(tag_entry(webauthn_hash()));
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
 
     let err = refresh(&h, RefreshOptions::new(false), "req-refresh-mixed-pins-no")
         .await
@@ -9042,7 +10237,12 @@ async fn a_refresh_refuses_a_wasm_verifier_and_a_reference_on_one_hash() {
 /// records one reference pin and writes the mutable-contract override row
 /// of each address. The next submission signs.
 #[tokio::test]
+#[serial_test::serial]
 async fn two_references_on_one_tag_share_one_pin_and_record_both_overrides() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = absent_verifier_pin_chain()
         .with_rule(
             1,
@@ -9061,7 +10261,7 @@ async fn two_references_on_one_tag_share_one_pin_and_record_both_overrides() {
         .with_entry(tag_entry(webauthn_hash()));
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
 
     let outcome = refresh(
         &h,
@@ -9076,27 +10276,24 @@ async fn two_references_on_one_tag_share_one_pin_and_record_both_overrides() {
             "sa_signer_set_baselined_v2",
             "mutable_override(rule Some(1))",
             "mutable_override(rule Some(1))",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
     match &h.pins_updated_rows()[0].event_kind {
-        EventKind::SaContextRulePinsUpdated {
-            pinned_verifier_wasm_hashes_first8,
+        EventKind::SaContextRulePinsUpdatedV2 {
+            pinned_verifier_wasm_hashes,
             pinned_verifier_executable_refs,
             mutable_override,
             ..
         } => {
-            assert_eq!(
-                pinned_verifier_wasm_hashes_first8,
-                &vec![first8(&webauthn_hash())]
-            );
+            assert_eq!(pinned_verifier_wasm_hashes, &vec![full(&webauthn_hash())]);
             assert_eq!(
                 pinned_verifier_executable_refs,
                 &vec![Some(reference_pin(webauthn_hash()))]
             );
             assert!(*mutable_override);
         }
-        other => panic!("expected SaContextRulePinsUpdated; got {other:?}"),
+        other => panic!("expected SaContextRulePinsUpdatedV2; got {other:?}"),
     }
     assert!(outcome.verifier_pinned);
     h.submit(&[1], Some("req-after-one-tag-refresh"))
@@ -9110,7 +10307,12 @@ async fn two_references_on_one_tag_share_one_pin_and_record_both_overrides() {
 /// pin, and the next submission signs. One probe reads the address's
 /// instance as often as the refresh of a rule with one signer on it does.
 #[tokio::test]
+#[serial_test::serial]
 async fn two_signers_on_one_mutable_verifier_are_probed_once() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let entries = || {
         vec![
             external_ref_instance(&verifier_v()),
@@ -9119,7 +10321,7 @@ async fn two_signers_on_one_mutable_verifier_are_probed_once() {
     };
     let single = Harness::new(absent_verifier_pin_chain_on(&verifier_v(), entries())).await;
     single.baseline_v2(1);
-    single.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    single.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
     refresh(
         &single,
         RefreshOptions::new(false).with_accept_mutable_verifier(true),
@@ -9147,7 +10349,7 @@ async fn two_signers_on_one_mutable_verifier_are_probed_once() {
     }
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
     let outcome = refresh(
         &h,
         RefreshOptions::new(false).with_accept_mutable_verifier(true),
@@ -9161,11 +10363,11 @@ async fn two_signers_on_one_mutable_verifier_are_probed_once() {
         vec![
             "sa_signer_set_baselined_v2",
             "mutable_override(rule Some(1))",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
     let (verifiers, _, _, _) = pins_updated_fields(&h.pins_updated_rows()[0]);
-    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
+    assert_eq!(verifiers, vec![full(&webauthn_hash())]);
     assert!(outcome.verifier_pinned);
     h.submit(&[1], Some("req-after-one-address-refresh"))
         .await
@@ -9177,7 +10379,12 @@ async fn two_signers_on_one_mutable_verifier_are_probed_once() {
 /// pin: the refresh refuses before any write, even with the override the
 /// second verifier needs.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_refresh_refuses_live_verifiers_running_two_executables() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
     let chain = absent_verifier_pin_chain()
         .with_rule(
             1,
@@ -9194,7 +10401,7 @@ async fn a_refresh_refuses_live_verifiers_running_two_executables() {
         .with_entry(wasm_instance(&verifier_w(), [0xdd; 32]));
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
 
     let err = refresh(
         &h,
@@ -9217,4 +10424,915 @@ async fn a_refresh_refuses_live_verifiers_running_two_executables() {
         other => panic!("expected MultiplePinnedHashesUnsupported; got {other:?}"),
     }
     assert!(row_kinds(&h.rows(), "req-refresh-two-hashes").is_empty());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_revoked_pinned_verifier_refuses_before_simulation() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let h = Harness::new(chain_with_rule_one([0xee; 32])).await;
+    h.baseline_v2(1);
+    h.pin_created(
+        1,
+        vec![full(&[0xee; 32])],
+        vec![full(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    let error = h.submit(&[1], Some("revoked-signing")).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SaError::VerifierWasmRevoked {
+                rule_id: Some(1),
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.wire_code(), "sa.verifier_wasm_revoked");
+    assert!(!h.simulated("noop"));
+    assert_eq!(h.sends(), 0);
+    assert!(
+        !h.rows()
+            .iter()
+            .any(|entry| matches!(entry.event_kind, EventKind::SaVerifierHashDrift { .. }))
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_revoked_new_verifier_is_refused_with_every_override() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    for pinned in [false, true] {
+        let h = Harness::new(signer_add_chain().with_wasm(&verifier_w(), [0xee; 32])).await;
+        h.baseline_v2(1);
+        if pinned {
+            h.pin_created(
+                1,
+                vec![full(&webauthn_hash())],
+                vec![full(&KNOWN_WASM_HASH)],
+                vec![],
+                vec![],
+            );
+        }
+        let signer = SoftwareSigningKey::new_from_bytes(SEED);
+        let error = h
+            .manager
+            .add_signer(
+                smart_account(),
+                1,
+                external_signer(&verifier_w(), &[0x33; 32]),
+                &signer,
+                "revoked-add".to_owned(),
+                true,
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SaError::VerifierWasmRevoked {
+                    rule_id: Some(1),
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(h.sends(), 0);
+        assert!(h.pins_updated_rows().is_empty());
+        assert!(!h.rows().iter().any(|entry| matches!(
+            entry.event_kind,
+            EventKind::SaUnknownContractOverride { .. }
+                | EventKind::SaMutableContractOverride { .. }
+        )));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_migration_away_from_a_revoked_verifier_signs() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let h = Harness::new(signer_add_chain().with_wasm(&verifier_v(), [0xee; 32])).await;
+    h.baseline_v2(1);
+    h.pin_created(
+        1,
+        vec![full(&[0xee; 32])],
+        vec![full(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    on_send_one_pair(&h);
+    let result = migrate(
+        &h,
+        &migration_plan([0xee; 32], ed25519_hash()),
+        "revoked-repair",
+    )
+    .await;
+    assert!(
+        result.failed_step_error.is_none(),
+        "{:?}",
+        result.failed_step_error
+    );
+    assert_eq!(h.sends(), 2);
+    assert_eq!(row_kinds(&h.rows(), "revoked-repair"), PAIR_ROWS);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn quorum_collection_refuses_a_revoked_signing_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    use stellar_agent_smart_account::managers::auth_entry::test_helpers::{
+        baseline_authorization_simulation, matching_envelope_context,
+    };
+    use stellar_agent_smart_account::managers::authorization::{
+        AuthorizationInfo, Combinator, SignerGroup, plan_quorum_signatures,
+    };
+    let h = Harness::new(chain_with_rule_one([0xee; 32])).await;
+    h.pin_created(
+        1,
+        vec![full(&[0xee; 32])],
+        vec![full(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new(SEED);
+    let rule = ContextRuleId::new(1);
+    let result: Result<_, SaError> = async {
+        let checked = h
+            .manager
+            .check_signing_rules(&smart_account(), &[rule], "quorum-status")
+            .await?;
+        let simulation =
+            baseline_authorization_simulation(PASSPHRASE, "stellar:testnet", vec![rule]);
+        let envelope = matching_envelope_context(&simulation);
+        let authz = AuthorizationInfo::new(
+            vec![SignerGroup::new("one".to_owned(), vec![SEED], 1).unwrap()],
+            Combinator::And,
+        );
+        plan_quorum_signatures(
+            checked,
+            &authz,
+            &[&signer],
+            smart_account(),
+            "noop".try_into().unwrap(),
+            vec![],
+            vec![rule],
+            &simulation,
+            &envelope,
+            PASSPHRASE,
+            9999,
+        )
+        .await
+        .map_err(|error| SaError::AuthEntryConstructionFailed {
+            stage: "quorum_signatures",
+            redacted_reason: error.to_string(),
+        })
+    }
+    .await;
+    let error = result.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SaError::VerifierWasmRevoked {
+                rule_id: Some(1),
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.wire_code(), "sa.verifier_wasm_revoked");
+    assert_eq!(signer.key_accesses(), 0);
+}
+
+// ── Pins that share an eight-byte prefix ─────────────────────────────────────
+
+/// A pinned executable hash outside every allowlist.
+const PINNED: [u8; 32] = [0x42; 32];
+
+/// `hash` with every byte from position 8 onward set to `fill`: an executable
+/// that shares the eight-byte display prefix of `hash` and is another code.
+fn twin_of(hash: [u8; 32], fill: u8) -> [u8; 32] {
+    let mut twin = hash;
+    twin[8..].fill(fill);
+    twin
+}
+
+/// A migration whose destination shares the source's eight-byte prefix
+/// repoints the record to the destination's full hash. The destination
+/// then signs, and the source executable on the destination address
+/// refuses as drift naming both full hashes.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_migration_to_an_equal_prefix_destination_pins_its_full_hash() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let twin = twin_of(PINNED, 0x43);
+    let h = Harness::new(
+        signer_add_chain()
+            .with_wasm(&verifier_v(), PINNED)
+            .with_wasm(&verifier_w(), twin),
+    )
+    .await;
+    h.baseline_v2(1);
+    h.pin_created(
+        1,
+        vec![full(&PINNED)],
+        vec![full(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    on_send_one_pair(&h);
+
+    let result = migrate(&h, &migration_plan(PINNED, twin), "req-migrate-twin").await;
+    assert!(
+        result.failed_step_error.is_none(),
+        "{:?}",
+        result.failed_step_error
+    );
+    assert_eq!(row_kinds(&h.rows(), "req-migrate-twin"), PAIR_ROWS);
+    let pins = the_row(&h, "req-migrate-twin", "sa_context_rule_pins_updated_v2");
+    let (verifiers, policies, _, reason) = pins_updated_fields(&pins);
+    assert_eq!(verifiers, vec![full(&twin)]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
+    assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
+
+    h.submit(&[1], Some("req-after-twin-migration"))
+        .await
+        .unwrap();
+    assert_eq!(h.sends(), 3);
+
+    h.set_entry(wasm_instance(&verifier_w(), PINNED));
+    let err = h
+        .submit(&[1], Some("req-source-after-migration"))
+        .await
+        .unwrap_err();
+    match &err {
+        SaError::VerifierHashDrift {
+            rule_id: 1,
+            pinned_hash,
+            ..
+        } => {
+            assert_eq!(pinned_hash, &full(&twin));
+        }
+        other => panic!("expected VerifierHashDrift; got {other:?}"),
+    }
+    assert_the_drift_row_alone_keeps_the_observed_hash(
+        &h,
+        &err,
+        "req-source-after-migration",
+        &full(&PINNED),
+    );
+    assert_eq!(h.sends(), 3);
+}
+
+/// Two live verifiers whose hashes share an eight-byte prefix are two
+/// executables: the refresh refuses with the multi-pin refusal before it
+/// writes the baseline or any other row.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_refresh_refuses_live_verifiers_whose_hashes_share_only_a_prefix() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let twin = twin_of(PINNED, 0x43);
+    let chain = Chain::default()
+        .with_rule(
+            1,
+            rule_with_ids(
+                1,
+                vec![
+                    (0, delegated_signer()),
+                    (1, external_signer(&verifier_v(), &[0x22; 32])),
+                    (2, external_signer(&verifier_w(), &[0x23; 32])),
+                ],
+                vec![policy_p()],
+            ),
+        )
+        .with_wasm(&verifier_v(), PINNED)
+        .with_wasm(&verifier_w(), twin)
+        .with_wasm(&policy_p(), KNOWN_WASM_HASH)
+        .with_threshold(&policy_p(), 1, 1);
+    let h = Harness::new(chain).await;
+    h.baseline_v2(1);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
+
+    let err = refresh(
+        &h,
+        RefreshOptions::new(false).with_accept_unknown_verifier(true),
+        "req-refresh-twins",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SaError::MultiplePinnedHashesUnsupported {
+                kind: "verifier",
+                rule_id: 1,
+                count: 2,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(row_kinds(&h.rows(), "req-refresh-twins").is_empty());
+    assert!(h.pins_updated_rows().is_empty());
+}
+
+/// A signer add, single or batched, on a verifier whose hash shares only a
+/// prefix with a recorded pin appends a distinct full pin.
+#[tokio::test]
+#[serial_test::serial]
+async fn signer_adds_keep_equal_prefix_verifier_pins_distinct() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let twin = twin_of(PINNED, 0x43);
+    let second_twin = twin_of(PINNED, 0x44);
+    let third = contract(0x26);
+    for batch in [false, true] {
+        let h = Harness::new(
+            signer_add_chain()
+                .with_wasm(&verifier_v(), PINNED)
+                .with_wasm(&verifier_w(), twin)
+                .with_wasm(&third, second_twin),
+        )
+        .await;
+        h.baseline_v2(1);
+        h.pin_created(
+            1,
+            vec![full(&PINNED)],
+            vec![full(&KNOWN_WASM_HASH)],
+            vec![],
+            vec![],
+        );
+        let request_id = format!("req-add-twin-{batch}");
+        let expected = if batch {
+            let added = vec![
+                external_signer(&verifier_w(), &[0x33; 32]),
+                external_signer(&third, &[0x34; 32]),
+            ];
+            h.after_send(
+                1,
+                signer_add_rule_after(vec![(7, added[0].clone()), (8, added[1].clone())]),
+            );
+            let signer = SoftwareSigningKey::new_from_bytes(SEED);
+            h.manager
+                .batch_add_signers(
+                    smart_account(),
+                    1,
+                    added,
+                    &signer,
+                    request_id.clone(),
+                    false,
+                    true,
+                )
+                .await
+                .unwrap();
+            vec![full(&PINNED), full(&twin), full(&second_twin)]
+        } else {
+            add_external_signer(&h, &verifier_w(), &request_id, true)
+                .await
+                .unwrap();
+            vec![full(&PINNED), full(&twin)]
+        };
+        let rows = h.pins_updated_rows();
+        assert_eq!(rows.len(), 1, "batch {batch}");
+        let (verifiers, _, unknown_override, reason) = pins_updated_fields(&rows[0]);
+        assert_eq!(verifiers, expected, "batch {batch}");
+        assert!(unknown_override, "batch {batch}");
+        assert_eq!(reason, PinsUpdateReason::SignerAdded, "batch {batch}");
+    }
+}
+
+/// From two policy pins that share an eight-byte prefix, the removal drops
+/// only the pin equal to the removed policy's full hash, with the reference
+/// aligned to it. The policy that stays signs against its kept pin.
+#[tokio::test]
+#[serial_test::serial]
+async fn removing_a_policy_drops_only_the_full_hash_match_of_two_equal_prefix_pins() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let twin = twin_of(PINNED, 0x43);
+    let policy_s = contract(0x33);
+    let chain = Chain::default()
+        .with_rule(
+            1,
+            rule_one_with_policies(vec![policy_r(), policy_s.clone()]),
+        )
+        .with_entry(wasm_instance(&verifier_v(), webauthn_hash()))
+        .with_entry(wasm_instance(&policy_r(), PINNED))
+        .with_entry(external_ref_instance(&policy_s))
+        .with_entry(tag_entry(twin));
+    let h = Harness::new(chain).await;
+    h.baseline_v2(1);
+    let twin_reference = Some(reference_pin(twin));
+    h.pin_created(
+        1,
+        vec![full(&webauthn_hash())],
+        vec![full(&twin), full(&PINNED)],
+        vec![],
+        vec![twin_reference.clone(), None],
+    );
+    h.after_send(1, rule_one_with_policies(vec![policy_s.clone()]));
+    remove_policy(&h, 0, "req-remove-twin-policy")
+        .await
+        .unwrap();
+
+    let rows = h.pins_updated_rows();
+    assert_eq!(rows.len(), 1);
+    let kept = pin_record_fields(&rows[0]);
+    assert_eq!(kept.policies, vec![full(&twin)]);
+    assert_eq!(kept.policy_refs, vec![twin_reference]);
+    assert_eq!(kept.reason, PinsUpdateReason::PolicyRemoved);
+
+    h.submit(&[1], Some("req-after-twin-policy-removal"))
+        .await
+        .unwrap();
+}
+
+// ── Incomplete pin records ───────────────────────────────────────────────────
+
+/// Writes a version-1 `SaContextRuleCreated` row for `rule_id` pinning the
+/// eight-byte prefixes of `verifier` and `policy`: an incomplete record.
+fn pin_created_prefix(h: &Harness, rule_id: u32, verifier: [u8; 32], policy: [u8; 32]) {
+    h.write(AuditEntry::new_sa_context_rule_created(
+        smart_account_redacted(),
+        rule_id,
+        "default",
+        1,
+        1,
+        None,
+        CHAIN_ID,
+        "req-install-prefix",
+        vec![hex::encode(&verifier[..8])],
+        vec![hex::encode(&policy[..8])],
+        false,
+        false,
+        vec![],
+        vec![],
+    ));
+}
+
+/// Signing under a rule whose pin record holds eight-byte prefixes refuses
+/// with `sa.wasm_pin_incomplete` before the signer signs anything and before
+/// anything is simulated or sent, although the live code matches the
+/// prefixes.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_incomplete_pin_record_refuses_signing_with_no_signature_and_no_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
+    h.baseline_v2(1);
+    pin_created_prefix(&h, 1, webauthn_hash(), KNOWN_WASM_HASH);
+
+    let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new(SEED);
+    let rule_ids = [ContextRuleId::new(1)];
+    let smart_account = strkey(&smart_account());
+    let uri = h.primary.uri();
+    let secondary_uri = h.secondary_uri();
+    let err = submit_signed_invoke(
+        SubmitInvokeArgs::builder()
+            .admission(stellar_agent_network::SigningAdmission::NoValue(
+                stellar_agent_smart_account::signing::intent_test_helpers::no_value_admission(),
+            ))
+            .target_contract(&smart_account)
+            .auth_rule_ids(&rule_ids)
+            .host_function(noop())
+            .signer(&signer)
+            .primary_rpc_url(&uri)
+            .secondary_rpc_url(&secondary_uri)
+            .network_passphrase(PASSPHRASE)
+            .chain_id(CHAIN_ID)
+            .timeout(h.timeouts.budget)
+            .op_label("pin_check_mock")
+            .pin_check(PinCheck {
+                signers_manager: &h.manager,
+                request_id: "req-incomplete-sign",
+                migrating_rule: None,
+            })
+            .build(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err.wire_code(), "sa.wasm_pin_incomplete", "{err:?}");
+    assert!(
+        matches!(err, SaError::WasmPinIncomplete { rule_id: 1, .. }),
+        "{err:?}"
+    );
+    // The submission reads the source account from the signer's public key
+    // before its checks; no signing method is ever called.
+    assert_eq!(signer.sign_calls(), 0, "the signer signs nothing");
+    assert!(!h.simulated("noop"), "the invocation is never simulated");
+    assert_eq!(h.sends(), 0, "nothing is sent");
+    assert!(
+        !h.rows().iter().any(|row| matches!(
+            row.event_kind,
+            EventKind::SaVerifierHashDrift { .. } | EventKind::SaPolicyHashDrift { .. }
+        )),
+        "an incomplete record is not drift"
+    );
+}
+
+/// A migration of a rule whose pin record holds eight-byte prefixes refuses
+/// its first pair with `sa.wasm_pin_incomplete` before the signer signs
+/// anything and before the removal is sent, and writes no signer or pin row.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_incomplete_pin_record_refuses_a_migration_with_no_signature_and_no_send() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let h = signer_add_harness(false).await;
+    pin_created_prefix(&h, 1, webauthn_hash(), KNOWN_WASM_HASH);
+    on_send_one_pair(&h);
+
+    let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new(SEED);
+    let result = migration_plan(webauthn_hash(), ed25519_hash())
+        .submit(&signer, &h.manager, "req-incomplete-migrate")
+        .await;
+
+    assert_first_pair_refused_unsent(
+        &h,
+        &result,
+        "sa.wasm_pin_incomplete",
+        "req-incomplete-migrate",
+    );
+    assert!(
+        matches!(
+            result.failed_step_error,
+            Some(SaError::WasmPinIncomplete { rule_id: 1, .. })
+        ),
+        "{:?}",
+        result.failed_step_error
+    );
+    // The submission reads the source account from the signer's public key
+    // before its checks; no signing method is ever called.
+    assert_eq!(signer.sign_calls(), 0, "the signer signs nothing");
+    assert!(
+        !h.simulated("remove_signer"),
+        "the removal is never simulated"
+    );
+    assert!(
+        h.pins_updated_rows().is_empty(),
+        "no pin row repoints an incomplete record"
+    );
+}
+
+/// The refused-value marker of the argument refusals below.
+const REFUSED_NUMBER: u32 = 424_242;
+
+/// Asserts that a warning with `message` fired and carries `reason` as its
+/// error, and that no warning holds the refused number.
+fn assert_failure_event(
+    capture: &stellar_agent_test_support::log_capture::WarningCapture,
+    message: &str,
+    reason: &str,
+) {
+    let events = capture.seen();
+    let event = events
+        .iter()
+        .find(|event| event.get("message").is_some_and(|m| m == message))
+        .unwrap_or_else(|| panic!("expected the {message:?} event: {events:?}"));
+    assert_eq!(event["error"], reason, "{event:?}");
+    assert!(
+        !format!("{events:?}").contains(&REFUSED_NUMBER.to_string()),
+        "{events:?}"
+    );
+}
+
+/// Asserts that `error` holds the refused number in no rendered form.
+fn assert_no_refused_number(error: &SaError) {
+    let forms = format!(
+        "{error}\n{error:?}\n{}",
+        serde_json::to_string(error).unwrap()
+    );
+    assert!(!forms.contains(&REFUSED_NUMBER.to_string()), "{forms}");
+}
+
+/// A rule whose only policy is the weighted-threshold policy, with
+/// `threshold`, two signers of weight one, and the reads the weight checks
+/// use.
+async fn weighted_harness(threshold: u32) -> Harness {
+    let weighted = contract(0x35);
+    let chain = Chain::default()
+        .with_rule(1, rule_with_ids(1, verb_signers(), vec![weighted.clone()]))
+        .with_wasm(
+            &weighted,
+            stellar_agent_smart_account::weighted_threshold_policy::WEIGHTED_THRESHOLD_POLICY_WASM_HASHES[0],
+        )
+        .with_threshold(&weighted, 1, threshold);
+    let h = Harness::new(chain).await;
+    let weights: VecM<ScMapEntry> = vec![
+        ScMapEntry {
+            key: delegated_account(0x10),
+            val: ScVal::U32(1),
+        },
+        ScMapEntry {
+            key: delegated_account(0x11),
+            val: ScVal::U32(1),
+        },
+    ]
+    .try_into()
+    .unwrap();
+    h.set_simulated_return("get_signer_weights", ScVal::Map(Some(ScMap(weights))));
+    h
+}
+
+/// A threshold above the fetched weight sum is refused with the check; the
+/// error and its failure event hold the requested threshold in no form.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_threshold_above_the_weight_sum_stays_out_of_the_refusal() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let (capture, _guard) = stellar_agent_test_support::log_capture::WarningCapture::capture(None);
+    let h = weighted_harness(2).await;
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+
+    let error = h
+        .manager
+        .set_weighted_threshold(
+            smart_account(),
+            1,
+            REFUSED_NUMBER,
+            &[ContextRuleId::new(1)],
+            &signer,
+            "req-weighted-threshold".to_owned(),
+        )
+        .await
+        .unwrap_err();
+
+    let expected = "weighted-threshold policy install refused: --new-threshold must be non-zero \
+                    and must not exceed the sum of current signer weights; lower the threshold \
+                    or increase signer weights.";
+    assert_eq!(error.to_string(), expected);
+    assert_no_refused_number(&error);
+    assert_failure_event(
+        &capture,
+        "set_weighted_threshold: operation failed",
+        expected,
+    );
+    assert_eq!(h.sends(), 0);
+}
+
+/// A weight that drops the fetched sum below the threshold is refused with
+/// the check; the error and its failure event hold the requested weight in
+/// no form.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_weight_below_the_threshold_stays_out_of_the_refusal() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let (capture, _guard) = stellar_agent_test_support::log_capture::WarningCapture::capture(None);
+    let h = weighted_harness(500_000).await;
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    let target = stellar_agent_smart_account::weighted_threshold_policy::WeightedThresholdSignerInput::Delegated {
+        g_strkey: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
+    };
+
+    let error = h
+        .manager
+        .set_signer_weight(
+            smart_account(),
+            1,
+            target,
+            REFUSED_NUMBER,
+            &[ContextRuleId::new(1)],
+            &signer,
+            "req-weighted-weight".to_owned(),
+        )
+        .await
+        .unwrap_err();
+
+    let expected = "weighted-threshold policy install refused: --new-weight must keep the sum of \
+                    signer weights at or above the current threshold; lower the threshold first \
+                    or choose a sufficient weight.";
+    assert_eq!(error.to_string(), expected);
+    assert_no_refused_number(&error);
+    assert_failure_event(&capture, "set_signer_weight: operation failed", expected);
+    assert_eq!(h.sends(), 0);
+}
+
+/// The text of the missing-baseline refusal, which names no rule.
+const MISSING_BASELINE: &str = "rule_id must identify a rule with a recorded signer-set \
+                                baseline; run 'smart-account signers list --rule-id <RULE_ID>' \
+                                to record one before retrying.";
+
+/// A missing baseline of a spending-limit retune's admin rule is refused
+/// with the check; the error and the operation's failure event hold the
+/// rule id in no form.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_missing_baseline_of_a_spending_limit_retune_names_no_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let (capture, _guard) = stellar_agent_test_support::log_capture::WarningCapture::capture(None);
+    let h = Harness::new(spending_limit_chain()).await;
+    h.set_simulated_return("get_spending_limit_data", spending_limit_data(1_000, 100));
+
+    let error = set_spending_limit_under(&h, &[REFUSED_NUMBER], "req-retune-unbaselined")
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), MISSING_BASELINE);
+    assert_no_refused_number(&error);
+    assert_failure_event(
+        &capture,
+        "set_spending_limit: operation failed",
+        MISSING_BASELINE,
+    );
+    assert_eq!(h.sends(), 0);
+}
+
+/// A signer verb on a rule without a baseline is refused with the check;
+/// the error and the verb's failure event hold the rule id in no form.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_missing_baseline_of_a_signer_verb_names_no_rule() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let (capture, _guard) = stellar_agent_test_support::log_capture::WarningCapture::capture(None);
+    let chain = Chain::default().with_rule(
+        REFUSED_NUMBER,
+        rule_with_ids(REFUSED_NUMBER, verb_signers(), vec![]),
+    );
+    let h = Harness::new(chain).await;
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+
+    let error = h
+        .manager
+        .remove_signer(
+            smart_account(),
+            REFUSED_NUMBER,
+            2,
+            &signer,
+            "req-verb-unbaselined".to_owned(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), MISSING_BASELINE);
+    assert_no_refused_number(&error);
+    assert_failure_event(&capture, "signer verb failed", MISSING_BASELINE);
+    assert_eq!(h.sends(), 0);
+}
+
+/// A non-positive limit is refused by the library check with the shared
+/// text before any request.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_non_positive_limit_stays_out_of_the_refusal() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    use stellar_agent_smart_account::managers::signers::SPENDING_LIMIT_POSITIVE_REASON;
+
+    let h = Harness::new(spending_limit_chain()).await;
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+
+    let error = h
+        .manager
+        .set_spending_limit(
+            smart_account(),
+            1,
+            &[ContextRuleId::new(1)],
+            -i128::from(REFUSED_NUMBER),
+            &signer,
+            "req-negative-limit".to_owned(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            SaError::SpendingLimitInstallRefused { reason }
+                if reason == SPENDING_LIMIT_POSITIVE_REASON
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        SPENDING_LIMIT_POSITIVE_REASON,
+        "--limit must be positive; supply a positive spending limit."
+    );
+    assert_no_refused_number(&error);
+}
+
+/// A supplied operation id that differs from the derived one is refused
+/// with the check; the error and every event hold the id in no form, whole
+/// or as the first or last eight hex digits.
+#[test]
+#[serial_test::serial]
+fn a_mismatched_operation_id_stays_out_of_the_refusal() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    use stellar_agent_smart_account::error::TimelockExecuteFailureReason;
+    use stellar_agent_smart_account::timelock::{
+        TimelockExecuteArgs, TimelockOperationId, execute,
+    };
+    use stellar_agent_test_support::log_capture::RedactionStrictSubscriber;
+
+    let mut supplied = [0x42u8; 32];
+    supplied[..4].copy_from_slice(&[0x63, 0x72, 0x65, 0x64]);
+    supplied[28..].copy_from_slice(&[0x6d, 0x61, 0x72, 0x6b]);
+    let supplied_id = TimelockOperationId::from_bytes(supplied);
+    let forbidden = [
+        hex::encode(supplied),
+        "63726564".to_owned(),
+        "6d61726b".to_owned(),
+    ];
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let h = runtime.block_on(Harness::new(Chain::default()));
+    h.set_simulated_return("get_operation_ledger", ScVal::U32(100));
+    let derived: BytesM = vec![0x11u8; 32].try_into().unwrap();
+    h.set_simulated_return("hash_operation", ScVal::Bytes(derived.into()));
+
+    let primary = h.primary.uri();
+    let secondary = h.secondary_uri();
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    let contract = strkey(&policy_p());
+    let args = TimelockExecuteArgs::builder()
+        .submission_recorder(
+            &stellar_agent_smart_account::signing::intent_test_helpers::NoLimitRecorder,
+        )
+        .timelock_contract_strkey(&contract)
+        .target_strkey(&contract)
+        .function("upgrade")
+        .salt([5u8; 32])
+        .signer(&signer)
+        .primary_rpc_url(&primary)
+        .secondary_rpc_url(&secondary)
+        .network_passphrase(PASSPHRASE)
+        .audit_writer(&h.audit)
+        .request_id("req-operation-mismatch")
+        .expected_operation_id(&supplied_id)
+        .build();
+
+    let capture = RedactionStrictSubscriber::new(forbidden.clone());
+    let error = capture.run(|| runtime.block_on(execute(args)).unwrap_err());
+
+    assert!(
+        matches!(
+            &error,
+            SaError::TimelockExecuteFailed {
+                failure_reason: TimelockExecuteFailureReason::OperationIdMismatch,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "timelock execute failed (operation_id_mismatch): operation_id must match the operation \
+         derived from the scheduled target, function, arguments, salt and predecessor; check \
+         --operation-id, --target, --function, --salt and predecessor against the scheduled \
+         operation."
+    );
+    let forms = format!("{error:?}\n{}", serde_json::to_string(&error).unwrap());
+    for form in &forbidden {
+        assert!(!forms.contains(form), "{form} in {forms}");
+    }
+    capture.assert_clean();
+    assert_eq!(h.sends(), 0);
 }

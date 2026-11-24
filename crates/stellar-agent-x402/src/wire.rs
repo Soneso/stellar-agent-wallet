@@ -76,7 +76,7 @@ pub struct PaymentRequirements {
     pub asset: String,
     /// Payment amount in atomic token units (e.g. for USDC: 1 USDC = 10_000_000).
     pub amount: String,
-    /// Recipient address (G-, C-, or M-strkey; muxed recipients are accepted).
+    /// Recipient address (G-, C-, M-, or W-strkey; muxed recipients are accepted).
     pub pay_to: String,
     /// Maximum ledger window in seconds for payment validity.
     pub max_timeout_seconds: u32,
@@ -181,8 +181,8 @@ pub fn decode_payment_required(header: &str) -> Result<PaymentRequirements, X402
     let bytes =
         BASE64_STANDARD
             .decode(header.trim())
-            .map_err(|e| X402Error::InvalidPaymentRequired {
-                detail: format!("base64 decode failed: {e}"),
+            .map_err(|_| X402Error::InvalidPaymentRequired {
+                detail: "PAYMENT-REQUIRED must be standard base64".to_owned(),
             })?;
     serde_json::from_slice(&bytes).map_err(|e| X402Error::InvalidPaymentRequired {
         detail: format!("the PAYMENT-REQUIRED payload {}", describe_json_error(&e)),
@@ -202,8 +202,8 @@ pub fn decode_payment_response(header: &str) -> Result<SettleResponse, X402Error
     let bytes =
         BASE64_STANDARD
             .decode(header.trim())
-            .map_err(|e| X402Error::ReceiptParseFailed {
-                detail: format!("base64 decode failed: {e}"),
+            .map_err(|_| X402Error::ReceiptParseFailed {
+                detail: "PAYMENT-RESPONSE must be standard base64".to_owned(),
             })?;
     serde_json::from_slice(&bytes).map_err(|e| X402Error::ReceiptParseFailed {
         detail: format!("the PAYMENT-RESPONSE payload {}", describe_json_error(&e)),
@@ -234,14 +234,7 @@ pub fn decode_payment_response(header: &str) -> Result<SettleResponse, X402Error
 /// ```
 #[must_use]
 pub fn describe_json_error(error: &serde_json::Error) -> String {
-    use serde_json::error::Category;
-    let what = match error.classify() {
-        Category::Syntax => "is not valid JSON",
-        Category::Eof => "ends before the value is complete",
-        Category::Data => "has a missing field or a field of the wrong type or value",
-        Category::Io => "could not be read",
-    };
-    format!("{what} (line {}, column {})", error.line(), error.column())
+    stellar_agent_core::redact::describe_json_error(error)
 }
 
 #[cfg(test)]
@@ -469,5 +462,28 @@ mod tests {
             req.extra["unknownField"],
             serde_json::Value::String("someValue".to_owned())
         );
+    }
+
+    #[test]
+    fn base64_header_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        let input = format!("{CREDENTIAL_MARKER}!");
+        for (error, code, expected) in [
+            (
+                decode_payment_required(&input).unwrap_err(),
+                "x402.invalid_payment_required",
+                "invalid payment-required: PAYMENT-REQUIRED must be standard base64",
+            ),
+            (
+                decode_payment_response(&input).unwrap_err(),
+                "x402.receipt_parse_failed",
+                "receipt parse failed: PAYMENT-RESPONSE must be standard base64",
+            ),
+        ] {
+            assert_eq!(error.wire_code(), code);
+            assert_eq!(error.to_string(), expected);
+            assert_no_marker(&error, CREDENTIAL_MARKER);
+            assert_no_marker(&error, "symbol");
+        }
     }
 }

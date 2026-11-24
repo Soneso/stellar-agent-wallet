@@ -23,7 +23,7 @@
 //!
 //! # Clock-skew tolerance
 //!
-//! `now_ms` is derived from `std::time::SystemTime::now()`. Host-dated pending
+//! `now_ms` is the evaluation instant [`EvalContext::now_ms`]. Host-dated pending
 //! entries up to 30 seconds in the future are tolerated; beyond that,
 //! [`PolicyError::CriterionEvaluationFailed`] is returned.
 //!
@@ -54,11 +54,11 @@
 //! configured asset (see [`crate::policy::v1::value`]).
 //!
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::policy::v1::EvalContext;
+use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
+use crate::policy::v1::criteria::descriptor::{BucketDescriptor, BucketKind};
 use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
 use crate::policy::v1::value::{ValueGate, asset_normalise, classify_value};
 use crate::policy::{DenyReason, PolicyError};
@@ -87,6 +87,9 @@ pub struct Window {
     secs: u64,
     label: &'static str,
 }
+
+/// The longest supported accounting window, in seconds.
+pub const MAX_SUPPORTED_WINDOW_SECS: u64 = 604_800;
 
 impl Window {
     /// Parses a window string.
@@ -133,14 +136,11 @@ impl Window {
                 label: "1d",
             }),
             "1w" => Ok(Self {
-                secs: 604_800,
+                secs: MAX_SUPPORTED_WINDOW_SECS,
                 label: "1w",
             }),
-            other => Err(PolicyError::PolicyFileParseFailed {
-                detail: format!(
-                    "per_period_cap: unsupported window '{}'; accepted: 1m, 5m, 1h, 1d, 1w",
-                    other
-                ),
+            _ => Err(PolicyError::PolicyFileParseFailed {
+                detail: "per_period_cap: unsupported window; accepted: 1m, 5m, 1h, 1d, 1w".into(),
             }),
         }
     }
@@ -221,9 +221,34 @@ impl PerPeriodCapCriterion {
     pub fn max_stroops(&self) -> i128 {
         self.max_stroops
     }
+
+    /// Returns the configured asset identifier.
+    #[must_use]
+    pub fn asset(&self) -> &str {
+        &self.asset
+    }
+
+    /// Returns the rolling window.
+    #[must_use]
+    pub fn window(&self) -> Window {
+        self.window
+    }
 }
 
 impl Criterion for PerPeriodCapCriterion {
+    fn windowed(&self) -> bool {
+        true
+    }
+
+    fn descriptors(&self) -> Vec<BucketDescriptor> {
+        vec![BucketDescriptor::accumulating(
+            BucketKind::Period,
+            &self.asset,
+            self.max_stroops,
+            &self.state_key(""),
+        )]
+    }
+
     fn kind(&self) -> &'static str {
         "per_period_cap"
     }
@@ -238,7 +263,6 @@ impl Criterion for PerPeriodCapCriterion {
     ///
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when:
     /// - The required amount field is missing or unparseable.
-    /// - [`SystemTime`] is before UNIX epoch (should not occur in practice).
     /// - The state store detects clock skew exceeding 30 seconds.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
         let tool_name = ctx.tool.name.as_str();
@@ -272,7 +296,7 @@ impl Criterion for PerPeriodCapCriterion {
                             "per_period_cap: debit leg of tool '{tool_name}' carries no asset"
                         ),
                     })?;
-            if asset_normalise(leg_asset) != criterion_asset {
+            if !assets_equivalent(leg_asset, &criterion_asset, &ctx.profile.network_passphrase) {
                 continue;
             }
             let amount = leg
@@ -283,7 +307,10 @@ impl Criterion for PerPeriodCapCriterion {
                     ),
                 })?;
             matched = true;
-            sum = sum.saturating_add(amount);
+            let Some(next) = sum.checked_add(amount) else {
+                return Ok(Some(self.overflow_refusal()));
+            };
+            sum = next;
         }
 
         // The configured asset is not moved by this call — criterion not applicable.
@@ -303,8 +330,10 @@ impl Criterion for PerPeriodCapCriterion {
     /// call.
     ///
     /// Only accumulates for `InnerOpDescriptor::TokenTransfer` inners whose
-    /// asset matches `self.asset` (after normalisation).  `Generic` inners and
-    /// asset-mismatched inners contribute 0.
+    /// asset is equivalent to `self.asset` under the profile's network
+    /// passphrase: a native alias, the same pinned identity, or the Stellar
+    /// Asset Contract of either.  `Generic` inners and inners of another
+    /// asset contribute 0.
     ///
     /// The amount is accumulated as `i128` (no clamp): both the overlay and
     /// the on-chain token quantity it accounts for are `i128`.
@@ -321,7 +350,11 @@ impl Criterion for PerPeriodCapCriterion {
 
         let criterion_asset = asset_normalise(&self.asset);
         let inner_asset = asset_normalise(asset);
-        if criterion_asset != inner_asset {
+        if !assets_equivalent(
+            &inner_asset,
+            &criterion_asset,
+            &ctx.profile.network_passphrase,
+        ) {
             // Asset mismatch: this inner does not count toward this criterion.
             return;
         }
@@ -337,8 +370,20 @@ impl Criterion for PerPeriodCapCriterion {
     /// criterion's asset (e.g. the single-tx path of a multicall bundle, whose
     /// per-inner debits are recorded by `BundlePerPeriodCapCriterion` instead).
     fn record_confirmed(&self, ctx: &EvalContext<'_>) -> Result<Vec<WindowEntry>, PolicyError> {
+        let entry = self.size(ctx, ctx.now_ms)?;
+        if let Some(entry) = &entry {
+            ctx.state_store
+                .append(entry.key(), entry.timestamp_ms(), entry.amount())
+                .map_err(|error| PolicyError::CriterionEvaluationFailed {
+                    detail: format!("per_period_cap: record_confirmed state store error: {error}"),
+                })?;
+        }
+        Ok(entry.into_iter().collect())
+    }
+
+    fn size(&self, ctx: &EvalContext<'_>, now_ms: u64) -> Result<Option<WindowEntry>, PolicyError> {
         let crate::policy::v1::value::ValueClass::Value(effects) = &ctx.value else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let criterion_asset = asset_normalise(&self.asset);
         let mut sum: i128 = 0;
@@ -350,35 +395,43 @@ impl Criterion for PerPeriodCapCriterion {
             let Some(leg_asset) = leg.asset.as_deref() else {
                 continue;
             };
-            if asset_normalise(leg_asset) != criterion_asset {
+            if !assets_equivalent(leg_asset, &criterion_asset, &ctx.profile.network_passphrase) {
                 continue;
             }
             let Some(amount) = leg.amount else {
                 continue;
             };
             matched = true;
-            sum = sum.saturating_add(amount);
+            sum =
+                sum.checked_add(amount)
+                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                        detail: "per_period_cap: sum overflows".to_owned(),
+                    })?;
         }
         if !matched {
-            return Ok(Vec::new());
+            return Ok(None);
         }
-        let now_ms = system_time_to_ms()?;
-        let state_key = StateKey::new(ctx.profile_name, 1, &criterion_asset, self.window.as_secs());
-        ctx.state_store
-            .append(&state_key, now_ms, sum)
-            .map_err(|e| PolicyError::CriterionEvaluationFailed {
-                detail: format!("per_period_cap: record_confirmed state store error: {e}"),
-            })?;
-        Ok(vec![WindowEntry::new(
-            state_key,
+        Ok(Some(WindowEntry::new(
+            self.state_key(ctx.profile_name),
             now_ms,
             sum,
             self.window_limit(),
-        )])
+        )))
     }
 }
 
 impl PerPeriodCapCriterion {
+    /// The bucket each recorded entry charges: scope specificity 1, the
+    /// normalized asset, and the window.
+    fn state_key(&self, profile_name: &str) -> StateKey {
+        StateKey::new(
+            profile_name,
+            1,
+            &asset_normalise(&self.asset),
+            self.window.as_secs(),
+        )
+    }
+
     /// The limit every entry this criterion records carries, so the durable
     /// reservation write re-applies the comparison `check_window` makes.
     ///
@@ -408,16 +461,15 @@ impl PerPeriodCapCriterion {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyError::CriterionEvaluationFailed`] when [`SystemTime`]
-    /// is before UNIX epoch, or the state store detects clock skew exceeding
-    /// 30 seconds.
+    /// Returns [`PolicyError::CriterionEvaluationFailed`] when the state store
+    /// detects clock skew exceeding 30 seconds against `ctx.now_ms`.
     fn check_window(
         &self,
         ctx: &EvalContext<'_>,
         criterion_asset: &str,
         attempted_stroops: i128,
     ) -> Result<Option<DenyReason>, PolicyError> {
-        let now_ms = system_time_to_ms()?;
+        let now_ms = ctx.now_ms;
 
         let state_key = StateKey::new(
             ctx.profile_name,
@@ -429,27 +481,40 @@ impl PerPeriodCapCriterion {
             self.window.as_secs(),
         );
 
-        let (period_used_stroops_recorded, _) = ctx
-            .state_store
-            .query_window(&state_key, now_ms)
-            .map_err(|e| PolicyError::CriterionEvaluationFailed {
-                detail: format!("per_period_cap: state store error: {e}"),
-            })?;
+        let period_used_stroops_recorded = match ctx.state_store.query_window(&state_key, now_ms) {
+            Ok((amount, _)) => amount,
+            Err(super::state_store::StateStoreError::SumOverflow) => {
+                return Ok(Some(self.overflow_refusal()));
+            }
+            Err(e) => {
+                return Err(PolicyError::CriterionEvaluationFailed {
+                    detail: format!("per_period_cap: state store error: {e}"),
+                });
+            }
+        };
 
         // Add any overlay amount accumulated from earlier inners in the same
         // multicall bundle.  On the single-tx path (bundle = None) the overlay
         // contributes 0.
-        let bundle_accumulated_stroops: i128 = ctx
+        let Some(bundle_accumulated_stroops) = ctx
             .bundle
-            .map(|view| view.overlay.get(&state_key))
-            .unwrap_or(0);
+            .map(|view| view.overlay.checked_get(&state_key))
+            .unwrap_or(Some(0))
+        else {
+            return Ok(Some(self.overflow_refusal()));
+        };
 
-        let period_used_stroops =
-            period_used_stroops_recorded.saturating_add(bundle_accumulated_stroops);
+        let Some(period_used_stroops) =
+            period_used_stroops_recorded.checked_add(bundle_accumulated_stroops)
+        else {
+            return Ok(Some(self.overflow_refusal()));
+        };
 
         // Would-exceed check: period_used + attempted > max?
-        let would_use = period_used_stroops.saturating_add(attempted_stroops);
-        if would_use > self.max_stroops {
+        if period_used_stroops
+            .checked_add(attempted_stroops)
+            .is_none_or(|sum| sum > self.max_stroops)
+        {
             return Ok(Some(DenyReason::PerPeriodCapExceeded {
                 asset: self.asset.clone(),
                 window: self.window.label().to_owned(),
@@ -461,26 +526,19 @@ impl PerPeriodCapCriterion {
 
         Ok(None)
     }
+
+    fn overflow_refusal(&self) -> DenyReason {
+        DenyReason::PerPeriodCapOverflow {
+            asset: self.asset.clone(),
+            window: self.window.label().to_owned(),
+            max_stroops: self.max_stroops,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Returns the current time as unix-milliseconds.
-///
-/// # Errors
-///
-/// Returns [`PolicyError::CriterionEvaluationFailed`] when `SystemTime::now()`
-/// is before the UNIX epoch (should not occur on any supported platform).
-fn system_time_to_ms() -> Result<u64, PolicyError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .map_err(|e| PolicyError::CriterionEvaluationFailed {
-            detail: format!("per_period_cap: system clock is before UNIX epoch: {e}"),
-        })
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
@@ -515,6 +573,11 @@ mod tests {
         ToolDescriptor::from_registration(&reg)
     }
 
+    /// The fixture evaluation instant every context of this module carries.
+    fn now_ms() -> u64 {
+        1_700_000_000_000
+    }
+
     /// Constructs a standard testnet `Profile` for criterion tests.
     fn make_profile() -> Profile {
         Profile::builder_testnet("alice", "acct", "n-svc", "n-acct").build()
@@ -545,12 +608,18 @@ mod tests {
             sep45_sessions: None,
             state_store: store,
             bundle: None,
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: now_ms(),
         }
     }
 
     #[test]
     #[serial]
     fn empty_window_allows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -565,6 +634,9 @@ mod tests {
     #[test]
     #[serial]
     fn window_with_history_still_under_cap_allows() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -573,7 +645,7 @@ mod tests {
 
         // Pre-seed 200 XLM spent (within a 1-day window).
         let key = StateKey::new("alice", 1, "native", 86_400);
-        let now = system_time_to_ms().unwrap();
+        let now = now_ms();
         store.append(&key, now - 1_000, 2_000_000_000).unwrap(); // 200 XLM
 
         // Try to spend another 100 XLM → total 300 XLM < 500 XLM cap.
@@ -589,6 +661,9 @@ mod tests {
     #[test]
     #[serial]
     fn would_exceed_cap_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -596,7 +671,7 @@ mod tests {
         let criterion = PerPeriodCapCriterion::new("native".into(), w, 5_000_000_000);
 
         let key = StateKey::new("alice", 1, "native", 86_400);
-        let now = system_time_to_ms().unwrap();
+        let now = now_ms();
         // Pre-seed 450 XLM spent.
         store.append(&key, now - 1_000, 4_500_000_000).unwrap(); // 450 XLM
 
@@ -613,6 +688,9 @@ mod tests {
     #[test]
     #[serial]
     fn confirmed_ledger_time_ahead_of_host_is_counted_by_the_gate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -623,7 +701,7 @@ mod tests {
         );
         let key = StateKey::new("alice", 1, "native", 3_600);
         store
-            .append(&key, system_time_to_ms().unwrap() + 3_600_000, 600_000_000)
+            .append(&key, now_ms() + 3_600_000, 600_000_000)
             .unwrap();
         let allowed = json!({ "amount": "40 XLM", "asset": "native" });
         assert!(
@@ -647,6 +725,9 @@ mod tests {
     #[test]
     #[serial]
     fn clock_skew_over_30s_returns_evaluation_failed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -654,7 +735,7 @@ mod tests {
         let criterion = PerPeriodCapCriterion::new("native".into(), w, 1_000_000_000);
 
         let key = StateKey::new("alice", 1, "native", 3_600);
-        let now = system_time_to_ms().unwrap();
+        let now = now_ms();
         // Insert an entry 31 seconds in the future (clock skew violation).
         store.append_pending(&key, now + 31_000, 1).unwrap();
 
@@ -680,6 +761,9 @@ mod tests {
     #[test]
     #[serial]
     fn asset_mismatch_criterion_does_not_apply() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -700,6 +784,9 @@ mod tests {
     #[test]
     #[serial]
     fn create_account_starting_balance_participates_in_period_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_create_account");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -718,6 +805,9 @@ mod tests {
     #[test]
     #[serial]
     fn exact_period_cap_boundary_is_allowed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -736,12 +826,15 @@ mod tests {
     #[test]
     #[serial]
     fn exact_period_cap_boundary_with_existing_history_is_allowed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
         let w = Window::parse("1d").unwrap();
         let key = StateKey::new("alice", 1, "native", w.as_secs());
-        let now_ms = system_time_to_ms().unwrap();
+        let now_ms = now_ms();
         store.append(&key, now_ms, 1).unwrap();
 
         let criterion = PerPeriodCapCriterion::new("native".into(), w, 1_000_000_000);
@@ -758,6 +851,9 @@ mod tests {
     #[test]
     #[serial]
     fn xlm_configured_period_cap_matches_native_tool_asset() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -779,6 +875,9 @@ mod tests {
     #[test]
     #[serial]
     fn evaluate_with_bundle_overlay_single_tx_none_sees_zero_overlay() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -787,7 +886,7 @@ mod tests {
 
         // Pre-seed 400 XLM in the state store.
         let key = StateKey::new("alice", 1, "native", 86_400);
-        let now = system_time_to_ms().unwrap();
+        let now = now_ms();
         store.append(&key, now - 1_000, 4_000_000_000).unwrap(); // 400 XLM
 
         // Single-tx attempt of 50 XLM — bundle=None should see 400+50=450 XLM total,
@@ -807,6 +906,9 @@ mod tests {
     #[test]
     #[serial]
     fn evaluate_with_bundle_overlay_accumulated_stroops_added_to_window() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::bundle::{BundleStateOverlay, BundleView};
 
         let tool = make_tool("stellar_pay");
@@ -817,7 +919,7 @@ mod tests {
 
         // Pre-seed 400 XLM in the state store.
         let key = StateKey::new("alice", 1, "native", 86_400);
-        let now = system_time_to_ms().unwrap();
+        let now = now_ms();
         store.append(&key, now - 1_000, 4_000_000_000).unwrap(); // 400 XLM
 
         // Overlay simulates 80 XLM already approved in earlier inners.
@@ -845,6 +947,9 @@ mod tests {
             sep45_sessions: None,
             state_store: &store,
             bundle: Some(&view),
+            policy_digest: [0; 32],
+            provisional: false,
+            now_ms: now_ms(),
         };
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -861,6 +966,9 @@ mod tests {
     #[test]
     #[serial]
     fn pay_simulate_amount_in_stroops_shape_cap_under_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -885,6 +993,9 @@ mod tests {
     #[test]
     #[serial]
     fn pay_commit_authoritative_args_shape_cap_over_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay_commit");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -912,6 +1023,9 @@ mod tests {
     #[test]
     #[serial]
     fn create_account_simulate_resolved_only_shape_cap_over_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_create_account");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -936,6 +1050,9 @@ mod tests {
     #[test]
     #[serial]
     fn create_account_commit_authoritative_args_shape_cap_over_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_create_account_commit");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -960,6 +1077,9 @@ mod tests {
     #[test]
     #[serial]
     fn legacy_amount_only_shape_still_evaluates_identically() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -979,6 +1099,9 @@ mod tests {
     #[test]
     #[serial]
     fn version_crossing_numeric_amount_stroops_still_parses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1017,6 +1140,9 @@ mod tests {
     #[test]
     #[serial]
     fn moves_value_tool_with_unpopulated_effects_denies_unsizable() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool_with_kind(
             "stellar_dex_trade",
             crate::policy::ToolValueKind::MovesValue,
@@ -1038,6 +1164,9 @@ mod tests {
     #[test]
     #[serial]
     fn opaque_sign_call_denies_unsizable_on_single_tx() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let tool = make_tool("stellar_sep43_sign_transaction");
         let profile = make_profile();
         let store = PolicyStateStore::new();
@@ -1058,6 +1187,9 @@ mod tests {
     #[test]
     #[serial]
     fn two_leg_native_value_aggregates_over_cap_denies() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_multicall");
@@ -1080,7 +1212,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("GBBB".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, now_ms())
             .with_value(ValueClass::Value(ValueEffects::new(vec![leg_a, leg_b])));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -1099,6 +1231,9 @@ mod tests {
     #[test]
     #[serial]
     fn debit_leg_amount_beyond_i64_max_denies_without_clamp() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_multicall");
@@ -1115,7 +1250,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("GAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, now_ms())
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -1133,6 +1268,9 @@ mod tests {
     #[test]
     #[serial]
     fn cap_aggregates_only_debit_legs_not_inflow_legs() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_dex_trade");
@@ -1156,7 +1294,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("CAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, now_ms())
             .with_value(ValueClass::Value(ValueEffects::new(vec![outflow, inflow])));
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
@@ -1176,6 +1314,9 @@ mod tests {
     #[test]
     #[serial]
     fn window_total_above_i64_max_denies_at_exact_cap_boundary() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_multicall");
@@ -1186,7 +1327,7 @@ mod tests {
         // Pre-record a window total strictly above i64::MAX.
         let recorded_total: i128 = i128::from(i64::MAX) + 1_000_000_000;
         let key = StateKey::new("alice", 1, "native", w.as_secs());
-        let now_ms = system_time_to_ms().unwrap();
+        let now_ms = now_ms();
         store.append(&key, now_ms - 1_000, recorded_total).unwrap();
 
         // Cap set to exactly (recorded_total + attempted) - 1: the attempted
@@ -1201,7 +1342,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("GAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, now_ms)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
 
         let result = criterion.evaluate(&ctx).unwrap();
@@ -1221,6 +1362,9 @@ mod tests {
     #[test]
     #[serial]
     fn window_total_above_i64_max_allows_when_still_under_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use crate::policy::v1::value::{ActionKind, ValueClass, ValueEffects, ValueLeg};
 
         let tool = make_tool("stellar_multicall");
@@ -1230,7 +1374,7 @@ mod tests {
 
         let recorded_total: i128 = i128::from(i64::MAX) + 1_000_000_000;
         let key = StateKey::new("alice", 1, "native", w.as_secs());
-        let now_ms = system_time_to_ms().unwrap();
+        let now_ms = now_ms();
         store.append(&key, now_ms - 1_000, recorded_total).unwrap();
 
         // Cap set to exactly (recorded_total + attempted): the attempted debit
@@ -1245,7 +1389,7 @@ mod tests {
             asset: Some("native".to_owned()),
             destination: Some("GAAA".to_owned()),
         };
-        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store)
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, now_ms)
             .with_value(ValueClass::Value(ValueEffects::single(leg)));
 
         let result = criterion.evaluate(&ctx).unwrap();

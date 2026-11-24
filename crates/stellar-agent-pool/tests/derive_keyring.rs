@@ -70,10 +70,33 @@ fn load_pool_master_seed_all_branches() {
     let result = load_pool_master_seed_from_keyring(SERVICE, ACCOUNT);
     match result {
         Err(PoolError::InitFailed { detail }) => {
-            assert_eq!(detail, "keyring entry 'pool-test-svc' was not found");
+            assert_eq!(
+                detail,
+                "the configured keyring entry must exist; provision or select the required entry."
+            );
         }
         other => panic!("expected InitFailed for missing entry, got: {other:?}"),
     }
+
+    // ── Case 2b: neither failure names the configured coordinate ─────────────
+    for (no_store, event) in [
+        (false, "keyring get_password failed for pool master seed"),
+        (true, "keyring entry open failed for pool master seed"),
+    ] {
+        keyring_mock::install().expect("reinstall fresh store");
+        if no_store {
+            keyring_core::unset_default_store();
+        }
+        let mut error = None;
+        let logs = stellar_agent_test_support::log_capture::with_captured_trace_logs(|| {
+            error = load_pool_master_seed_from_keyring("credmarker7", ACCOUNT).err();
+        });
+        assert!(logs.contains(event), "{logs}");
+        let error = error.expect("the load must fail");
+        let rendered = format!("{error} {error:?} {logs}");
+        assert!(!rendered.contains("credmarker7"), "{rendered}");
+    }
+    keyring_mock::install().expect("reinstall fresh store");
 
     // ── Case 3: stored value is not valid base64 ──────────────────────────────
     keyring_mock::install().expect("reinstall fresh store");

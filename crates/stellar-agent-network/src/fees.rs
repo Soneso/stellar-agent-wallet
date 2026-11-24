@@ -2,10 +2,19 @@
 //!
 //! Provides fee-stats fetching, percentile selection, and classic-fee
 //! resolution for transaction construction.
+//! Selects verified contract total fee bounds and checks full transaction totals.
 
 use serde::{Deserialize, Serialize};
-use stellar_agent_core::error::{FeeSource, NetworkError, ValidationError, WalletError};
-use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_core::error::{
+    DerivedFee, FeeSource, NetworkError, ValidationError, WalletError,
+};
+use stellar_agent_core::profile::schema::{Profile, ProviderRole};
+use stellar_agent_core::{
+    mainnet::verified_policy::VerifiedPolicy,
+    policy::v1::schema::DEFAULT_CONTRACT_TRANSFER_MAX_FEE_STROOPS,
+    profile::caip2::Caip2,
+    sac_payment::{ContractTransferFeeCap, SacPaymentError},
+};
 use stellar_rpc_client::{FeeStat, GetFeeStatsResponse};
 
 use crate::client::StellarRpcClient;
@@ -14,34 +23,25 @@ use crate::client::StellarRpcClient;
 /// CLI and MCP handlers and accepted by the staged decoder.
 pub const CLASSIC_SINGLE_OPERATION_COUNT: u32 = 1;
 
-/// Allowed public Stellar RPC host names for explicit RPC URL overrides.
-pub const ALLOWED_RPC_HOSTS: &[&str] = &[
-    "soroban-testnet.stellar.org",
-    "mainnet.sorobanrpc.com",
-    "soroban-mainnet.stellar.org",
-];
-
-/// Errors returned by [`validate_rpc_url`].
+/// Errors returned by [`validate_rpc_url`] and [`validate_profile_rpc_url`].
+///
+/// Each variant names the rule the URL breaks and never the URL or any part
+/// of it, because an RPC URL can carry a credential.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RpcUrlError {
-    /// The URL could not be parsed.
-    #[error("invalid RPC URL: {0}")]
-    InvalidUrl(String),
+    /// The URL could not be parsed as an absolute URL with a host.
+    #[error("invalid RPC URL: it must be an absolute URL with a host")]
+    InvalidUrl,
     /// The URL scheme is not HTTPS.
-    #[error("non-HTTPS RPC URL not allowed: {0}")]
-    NonHttps(String),
+    #[error("non-HTTPS RPC URL not allowed: the URL must use https")]
+    NonHttps,
     /// The URL contains embedded credentials.
     #[error("RPC URL must not contain embedded credentials")]
     CredentialsInUrl,
-    /// The URL's host is not in the allow-list.
-    #[error("RPC host '{host}' not in allow-list (allowed: {allowed})")]
-    HostNotAllowed {
-        /// Rejected host.
-        host: String,
-        /// Human-readable list of allowed hosts.
-        allowed: String,
-    },
+    /// The URL does not match any endpoint configured on the active profile.
+    #[error("RPC URL is not a configured endpoint of the active profile")]
+    NotConfiguredEndpoint,
 }
 
 /// Per-fee-class distribution returned by `getFeeStats`. Stroops are
@@ -245,6 +245,9 @@ pub struct ClassicFeeSelection {
     pub selected_fee_percentile: String,
 }
 
+/// The argument a refused fee choice names; the rejected text never appears.
+const FEE_FIELD: &str = "--fee";
+
 /// Parses `<integer>`, `auto`, `auto:pNN`, or `None`.
 ///
 /// # Errors
@@ -267,7 +270,7 @@ pub fn parse_classic_fee_choice(raw: Option<&str>) -> Result<ClassicFeeChoice, W
         .map(ClassicFeeChoice::Explicit)
         .map_err(|_| {
             WalletError::Validation(ValidationError::AmountMalformed {
-                input: value.to_owned(),
+                field: FEE_FIELD.into(),
             })
         })
 }
@@ -296,7 +299,7 @@ pub async fn resolve_classic_fee_selection(
             let selected = percentile.select(&stats.inclusion_fee);
             let per_op_stroops = u32::try_from(selected).map_err(|_| {
                 WalletError::Validation(ValidationError::AmountOutOfRange {
-                    amount: selected.to_string(),
+                    field: "the selected percentile fee".into(),
                 })
             })?;
             Ok(ClassicFeeSelection {
@@ -308,12 +311,15 @@ pub async fn resolve_classic_fee_selection(
 }
 
 /// Names the source of the per-operation fee a parsed choice resolves to,
-/// for the fee-cap refusal of [`check_classic_fee_cap`].
+/// for the fee-cap refusals of [`check_classic_fee_cap`] and of
+/// [`rebuild_canonical`](crate::operation_entry::rebuild_canonical).
 ///
 /// `default_source` is the source of the fee a [`ClassicFeeChoice::ProfileDefault`]
 /// choice resolves to: [`FeeSource::ProfileDefault`] for a stage that reads
 /// `classic_fee_per_op_stroops`, [`FeeSource::CommandDefault`] for a stage
-/// that uses its built-in default fee.
+/// that uses its built-in default fee, [`FeeSource::Envelope`] for a stage
+/// that pays a prepared envelope's fee. The rebuild takes it from the
+/// request's `default_fee_source`.
 #[must_use]
 pub fn classic_fee_source(choice: ClassicFeeChoice, default_source: FeeSource) -> FeeSource {
     match choice {
@@ -322,6 +328,22 @@ pub fn classic_fee_source(choice: ClassicFeeChoice, default_source: FeeSource) -
         ClassicFeeChoice::Auto(percentile) => FeeSource::Selected {
             percentile: percentile.label().to_owned(),
         },
+    }
+}
+
+/// Like [`classic_fee_source`], naming `explicit_argument` when the caller
+/// passed an explicit per-operation fee (for example `"fee"` over MCP).
+#[must_use]
+pub fn classic_fee_source_for_argument(
+    choice: ClassicFeeChoice,
+    default_source: FeeSource,
+    explicit_argument: &'static str,
+) -> FeeSource {
+    match classic_fee_source(choice, default_source) {
+        FeeSource::Explicit => FeeSource::ExplicitArgument {
+            argument: explicit_argument,
+        },
+        other => other,
     }
 }
 
@@ -344,6 +366,48 @@ pub fn check_built_fee_cap(
         classic_fee_source(choice, FeeSource::CommandDefault),
         profile,
     )
+}
+
+/// Selects the signed full transaction fee bound for contract transfers.
+///
+/// Testnet uses the default when verified metadata has no cap. Mainnet requires
+/// explicit verified consent. Classic per-operation limits do not enter this lookup.
+///
+/// # Errors
+/// Returns `validation.contract_transfer_fee_cap_required` on mainnet without
+/// a cap in the verified policy.
+pub fn contract_transfer_fee_cap(
+    chain: Caip2,
+    policy: Option<&VerifiedPolicy>,
+) -> Result<ContractTransferFeeCap, WalletError> {
+    match policy.and_then(VerifiedPolicy::contract_transfer_max_fee_stroops) {
+        Some(stroops) => Ok(ContractTransferFeeCap {
+            stroops,
+            signed: true,
+        }),
+        None if chain.is_mainnet() => Err(SacPaymentError::FeeConsentRequired.into()),
+        None => Ok(ContractTransferFeeCap {
+            stroops: DEFAULT_CONTRACT_TRANSFER_MAX_FEE_STROOPS,
+            signed: false,
+        }),
+    }
+}
+
+/// Checks the full transaction fee, including resources and restoration.
+///
+/// Equality passes. This arithmetic check accepts caller-supplied bounds;
+/// the cap's descriptive `signed` flag grants no authority.
+///
+/// # Errors
+/// Returns `validation.contract_transfer_fee_exceeded` above the cap.
+pub fn check_contract_transfer_fee_cap(
+    total_stroops: u64,
+    cap: ContractTransferFeeCap,
+) -> Result<(), WalletError> {
+    if total_stroops > u64::from(cap.stroops) {
+        return Err(SacPaymentError::FeeExceeded.into());
+    }
+    Ok(())
 }
 
 /// Checks a classic per-operation fee against the profile's
@@ -369,7 +433,47 @@ pub fn check_classic_fee_cap(
             ValidationError::MainnetFeeCapRequired,
         )),
         Some(cap) if per_op > cap => Err(WalletError::Validation(ValidationError::FeeAboveCap {
-            per_op,
+            per_op: DerivedFee::new(per_op, &fee_source),
+            cap,
+            fee_source,
+        })),
+        _ => Ok(()),
+    }
+}
+
+/// Returns the tighter stored and signed classic fee cap.
+#[must_use]
+pub fn effective_classic_fee_cap(profile: &Profile, signed: u32) -> u32 {
+    profile
+        .classic_max_fee_per_op_stroops
+        .map_or(signed, |cap| cap.min(signed))
+}
+
+/// Checks the tighter of the signed and profile classic fee caps.
+///
+/// # Errors
+/// Refuses a fee above the effective cap or a mainnet fee without any cap.
+pub fn check_classic_fee_cap_signed(
+    per_op: u32,
+    fee_source: FeeSource,
+    profile: &Profile,
+    signed: Option<u32>,
+) -> Result<(), WalletError> {
+    let cap = match (profile.classic_max_fee_per_op_stroops, signed) {
+        (Some(profile_cap), Some(signed)) => {
+            if profile_cap > signed {
+                tracing::warn!("profile classic fee cap exceeds signed cap; using signed cap");
+            }
+            Some(effective_classic_fee_cap(profile, signed))
+        }
+        (profile, signed) => profile.or(signed),
+    };
+    match cap {
+        None if profile.chain_id.is_mainnet() => Err(WalletError::Validation(
+            ValidationError::MainnetFeeCapRequired,
+        )),
+        Some(cap) if per_op > cap => Err(WalletError::Validation(ValidationError::FeeAboveCap {
+            per_op: DerivedFee::new(per_op, &fee_source),
             cap,
             fee_source,
         })),
@@ -386,14 +490,45 @@ pub async fn fetch_fee_stats(client: &StellarRpcClient) -> Result<FeeStatsView, 
     client.get_fee_stats().await
 }
 
-/// Validates an RPC URL override against the production allow-list.
+/// Validates an explicit RPC URL override as an HTTPS URL without credentials.
 ///
 /// # Errors
 ///
-/// Returns [`RpcUrlError`] if the URL is malformed, non-HTTPS, credentialed,
-/// or not allow-listed.
+/// Returns [`RpcUrlError`] if the URL is malformed, non-HTTPS, or credentialed.
 pub fn validate_rpc_url(url: &str) -> Result<(), RpcUrlError> {
     validate_rpc_url_inner(url, false)
+}
+
+/// Validates that `url` carries no credentials and has the same scheme, host,
+/// and port as an endpoint configured on `profile` (`rpc_url`,
+/// `secondary_rpc_url`, or `oracle_provider_url`).
+///
+/// # Errors
+///
+/// Returns [`RpcUrlError::InvalidUrl`] when `url` is not an absolute URL with a
+/// host, [`RpcUrlError::CredentialsInUrl`] when `url` carries embedded
+/// credentials, or [`RpcUrlError::NotConfiguredEndpoint`] when no endpoint
+/// configured on `profile` shares its scheme, host, and port.
+pub fn validate_profile_rpc_url(url: &str, profile: &Profile) -> Result<(), RpcUrlError> {
+    let parsed = url::Url::parse(url).map_err(|_| RpcUrlError::InvalidUrl)?;
+    if parsed.username() != "" || parsed.password().is_some() {
+        return Err(RpcUrlError::CredentialsInUrl);
+    }
+    let target = url_origin(&parsed).ok_or(RpcUrlError::InvalidUrl)?;
+    let configured = [
+        ProviderRole::Primary,
+        ProviderRole::Secondary,
+        ProviderRole::Oracle,
+    ]
+    .into_iter()
+    .filter_map(|role| profile.role_url(role))
+    .filter_map(|configured_url| url::Url::parse(configured_url).ok())
+    .any(|configured_url| url_origin(&configured_url) == Some(target));
+    if configured {
+        Ok(())
+    } else {
+        Err(RpcUrlError::NotConfiguredEndpoint)
+    }
 }
 
 /// Validates an RPC URL override, additionally allowing loopback addresses.
@@ -425,20 +560,23 @@ fn parse_percentile(raw: &str) -> Result<FeePercentile, WalletError> {
         "p95" => Ok(FeePercentile::P95),
         "p99" => Ok(FeePercentile::P99),
         _ => Err(WalletError::Validation(ValidationError::AmountMalformed {
-            input: format!("auto:{raw}"),
+            field: FEE_FIELD.into(),
         })),
     }
 }
 
+fn url_origin(url: &url::Url) -> Option<(&str, &str, Option<u16>)> {
+    url.host_str()
+        .map(|host| (url.scheme(), host, url.port_or_known_default()))
+}
+
 fn validate_rpc_url_inner(url: &str, allow_loopback: bool) -> Result<(), RpcUrlError> {
-    let parsed = url::Url::parse(url).map_err(|e| RpcUrlError::InvalidUrl(e.to_string()))?;
+    let parsed = url::Url::parse(url).map_err(|_| RpcUrlError::InvalidUrl)?;
     if parsed.username() != "" || parsed.password().is_some() {
         return Err(RpcUrlError::CredentialsInUrl);
     }
 
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| RpcUrlError::InvalidUrl("missing host".to_owned()))?;
+    let host = parsed.host_str().ok_or(RpcUrlError::InvalidUrl)?;
 
     // `url::Url::host_str` returns IPv6 hosts in bracketed form (`[::1]`), so the
     // loopback set matches that form rather than a bare `::1`.
@@ -448,17 +586,10 @@ fn validate_rpc_url_inner(url: &str, allow_loopback: bool) -> Result<(), RpcUrlE
     }
 
     if parsed.scheme() != "https" {
-        return Err(RpcUrlError::NonHttps(url.to_owned()));
+        return Err(RpcUrlError::NonHttps);
     }
 
-    if ALLOWED_RPC_HOSTS.contains(&host) {
-        Ok(())
-    } else {
-        Err(RpcUrlError::HostNotAllowed {
-            host: host.to_owned(),
-            allowed: ALLOWED_RPC_HOSTS.join(", "),
-        })
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -466,6 +597,137 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used, reason = "test assertions")]
 
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn contract_fee_lookup_uses_only_verified_metadata() {
+        use crate::{check_contract_transfer_fee_cap, contract_transfer_fee_cap};
+        use ed25519_dalek::SigningKey;
+        use stellar_agent_core::policy::v1::{
+            PolicyEngineV1,
+            canonical::canonical_bytes,
+            criteria::state_store::PolicyStateStore,
+            loader::load_signed_policy_text,
+            signature::{digest, sign},
+            verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+        };
+
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.toml");
+        let window = dir.path().join("state.window");
+        let key = SigningKey::from_bytes(&[31; 32]);
+        let public = key.verifying_key().to_bytes();
+        let profile = testnet(Some(100));
+        assert_eq!(
+            contract_transfer_fee_cap(Caip2::Testnet, None).unwrap(),
+            ContractTransferFeeCap {
+                stroops: 1_000_000,
+                signed: false
+            }
+        );
+        assert_eq!(
+            contract_transfer_fee_cap(mainnet(Some(100)).chain_id, None)
+                .unwrap_err()
+                .code(),
+            "validation.contract_transfer_fee_cap_required"
+        );
+        for version in [1, 2] {
+            for cap in [None, Some(0), Some(1_000_000), Some(u32::MAX)] {
+                let sequence = if version == 2 { "sequence = 1\n" } else { "" };
+                let field = cap.map_or_else(String::new, |value| {
+                    format!("contract_transfer_max_fee_stroops = {value}\n")
+                });
+                let body =
+                    format!("version = {version}\nscope = \"profile:fees\"\n{sequence}{field}");
+                let signed = format!(
+                    "{body}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                    stellar_strkey::ed25519::PublicKey(public),
+                    stellar_agent_core::hex::encode(&sign(
+                        &digest(&canonical_bytes(&body).unwrap()),
+                        &key
+                    ))
+                );
+                std::fs::write(&path, &signed).unwrap();
+                let policy = load_verified_policy(
+                    &PolicyLoad {
+                        path: &path,
+                        profile: &profile,
+                        profile_name: "fees",
+                        owner_pubkey: &public,
+                        owner_source: OwnerKeySource::Keyring,
+                        window_path: &window,
+                    },
+                    PolicyStateStore::new(),
+                    PinMode::CompareOnly,
+                )
+                .unwrap();
+                let selected = contract_transfer_fee_cap(profile.chain_id, Some(&policy)).unwrap();
+                assert_eq!(
+                    selected,
+                    ContractTransferFeeCap {
+                        stroops: cap.unwrap_or(1_000_000),
+                        signed: cap.is_some()
+                    }
+                );
+                match cap {
+                    Some(value) => {
+                        assert_eq!(
+                            contract_transfer_fee_cap(Caip2::Mainnet, Some(&policy))
+                                .unwrap()
+                                .stroops,
+                            value
+                        );
+                        assert!(
+                            check_contract_transfer_fee_cap(u64::from(value), selected).is_ok()
+                        );
+                    }
+                    None => assert_eq!(
+                        contract_transfer_fee_cap(Caip2::Mainnet, Some(&policy))
+                            .unwrap_err()
+                            .code(),
+                        "validation.contract_transfer_fee_cap_required"
+                    ),
+                }
+                let document =
+                    load_signed_policy_text(&signed, "fees", &public, &profile.network_passphrase)
+                        .unwrap();
+                let descriptive = VerifiedPolicy::for_test(
+                    [0; 32],
+                    std::sync::Arc::new(PolicyEngineV1::new(document, "fees".into())),
+                );
+                assert_eq!(
+                    contract_transfer_fee_cap(Caip2::Mainnet, Some(&descriptive))
+                        .unwrap_err()
+                        .code(),
+                    "validation.contract_transfer_fee_cap_required"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn contract_fee_checker_preserves_total_width() {
+        for signed in [false, true] {
+            for cap in [0, 1_000_000, u32::MAX] {
+                let bound = ContractTransferFeeCap {
+                    stroops: cap,
+                    signed,
+                };
+                assert!(crate::check_contract_transfer_fee_cap(u64::from(cap), bound).is_ok());
+                for total in [u64::from(cap) + 1, u64::from(u32::MAX) + 1, u64::MAX] {
+                    assert_eq!(
+                        crate::check_contract_transfer_fee_cap(total, bound)
+                            .unwrap_err()
+                            .code(),
+                        "validation.contract_transfer_fee_exceeded"
+                    );
+                }
+            }
+        }
+    }
 
     fn testnet(cap: Option<u32>) -> Profile {
         Profile::builder_testnet_named("fees", "signer", "fees", "nonce", "fees")
@@ -488,39 +750,57 @@ mod tests {
 
     fn above_cap_text(result: Result<(), WalletError>) -> String {
         match result {
-            Err(WalletError::Validation(ValidationError::FeeAboveCap {
-                per_op: 501,
-                cap: 500,
-                ..
-            })) => result.unwrap_err().to_string(),
+            Err(WalletError::Validation(ValidationError::FeeAboveCap { cap: 500, .. })) => {
+                result.unwrap_err().to_string()
+            }
             other => panic!("expected FeeAboveCap for 501 over 500, got {other:?}"),
         }
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_without_cap_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let error = check_classic_fee_cap(100, FeeSource::Explicit, &mainnet(None)).unwrap_err();
         assert_eq!(error.code(), "validation.mainnet_fee_cap_required");
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_with_cap_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(check_classic_fee_cap(100, FeeSource::Explicit, &mainnet(Some(10_000))).is_ok());
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_without_cap_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(check_classic_fee_cap(u32::MAX, FeeSource::Explicit, &testnet(None)).is_ok());
     }
 
     #[test]
+    #[serial_test::serial]
     fn fee_equal_to_cap_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(check_classic_fee_cap(500, FeeSource::Envelope, &testnet(Some(500))).is_ok());
         assert!(check_classic_fee_cap(500, FeeSource::Envelope, &mainnet(Some(500))).is_ok());
     }
 
     #[test]
+    #[serial_test::serial]
     fn fee_above_cap_names_its_source() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = testnet(Some(500));
         let selected = FeeSource::Selected {
             percentile: "p95".to_owned(),
@@ -531,14 +811,22 @@ mod tests {
             "fees.percentile_exceeds_cap"
         );
         assert!(above_cap_text(check(selected)).starts_with("auto-selected per-operation fee 501"));
-        assert!(above_cap_text(check(FeeSource::Explicit)).starts_with("the explicit"));
-        assert!(above_cap_text(check(FeeSource::ProfileDefault)).starts_with("the profile's"));
+        assert_eq!(
+            above_cap_text(check(FeeSource::Explicit)),
+            "--fee must be a per-operation stroop amount within classic_max_fee_per_op_stroops; \
+             lower --fee or raise classic_max_fee_per_op_stroops."
+        );
+        assert_eq!(
+            above_cap_text(check(FeeSource::ProfileDefault)),
+            "classic_fee_per_op_stroops must not exceed classic_max_fee_per_op_stroops; lower \
+             classic_fee_per_op_stroops or raise classic_max_fee_per_op_stroops."
+        );
         assert!(above_cap_text(check(FeeSource::CommandDefault)).starts_with("the default"));
         assert!(above_cap_text(check(FeeSource::Envelope)).starts_with("the envelope's"));
         let mainnet = mainnet(Some(500));
         assert!(
             above_cap_text(check_classic_fee_cap(501, FeeSource::Explicit, &mainnet))
-                .starts_with("the explicit")
+                .starts_with("--fee must be")
         );
     }
 
@@ -565,5 +853,93 @@ mod tests {
             classic_fee_source(ClassicFeeChoice::ProfileDefault, FeeSource::ProfileDefault),
             FeeSource::ProfileDefault
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn fee_source_for_argument_names_explicit_surface_argument() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        assert_eq!(
+            classic_fee_source_for_argument(
+                ClassicFeeChoice::Explicit(200),
+                FeeSource::ProfileDefault,
+                "fee",
+            ),
+            FeeSource::ExplicitArgument { argument: "fee" }
+        );
+        assert_eq!(
+            classic_fee_source_for_argument(
+                ClassicFeeChoice::Auto(FeePercentile::P95),
+                FeeSource::ProfileDefault,
+                "fee",
+            ),
+            FeeSource::Selected {
+                percentile: "p95".to_owned(),
+            }
+        );
+        assert_eq!(
+            classic_fee_source_for_argument(
+                ClassicFeeChoice::ProfileDefault,
+                FeeSource::ProfileDefault,
+                "fee",
+            ),
+            FeeSource::ProfileDefault
+        );
+
+        let profile = testnet(Some(500));
+        let err = check_classic_fee_cap(
+            501,
+            FeeSource::ExplicitArgument { argument: "fee" },
+            &profile,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "fees.percentile_exceeds_cap");
+        assert_eq!(
+            err.to_string(),
+            "fee must be a per-operation stroop amount within classic_max_fee_per_op_stroops; \
+             lower fee or raise classic_max_fee_per_op_stroops."
+        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, "501");
+        assert_eq!(
+            DerivedFee::new(424_242, &FeeSource::ExplicitArgument { argument: "fee" }).stroops(),
+            None
+        );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn effective_fee_cap_is_tighter_cap() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut profile = Profile::builder_mainnet_named(
+            "fees",
+            "https://rpc.example.invalid",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .build();
+        for (configured, expected) in [(None, 500), (Some(900), 500), (Some(200), 200)] {
+            profile.classic_max_fee_per_op_stroops = configured;
+            assert_eq!(effective_classic_fee_cap(&profile, 500), expected);
+            assert!(
+                check_classic_fee_cap_signed(expected, FeeSource::Envelope, &profile, Some(500))
+                    .is_ok()
+            );
+            assert_eq!(
+                check_classic_fee_cap_signed(
+                    expected + 1,
+                    FeeSource::Envelope,
+                    &profile,
+                    Some(500)
+                )
+                .unwrap_err()
+                .code(),
+                "fees.percentile_exceeds_cap"
+            );
+        }
     }
 }

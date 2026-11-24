@@ -65,7 +65,10 @@
 //!
 //! # Secret-material discipline
 //!
-//! No error variant carries raw secret material.  Fields named `account_id`,
+//! Errors name the rejected argument, field, position or check, never its value.
+//! The rule covers Display, Debug, every source in the error chain, guidance,
+//! logs, MCP stderr and CLI output, including usage diagnostics.
+//! No error variant carries raw secret material. Fields named `account_id`,
 //! `destination`, etc. hold public identifiers only.  No variant accepts or
 //! stores private key bytes, mnemonic words, raw signature bytes, or any
 //! other material classified as secret.  Each field-carrying variant documents
@@ -412,6 +415,13 @@ impl WalletError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ApprovalFailure {
+    /// No retained approval has the requested public nonce.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.unknown"`.
+    #[error("No retained approval has this approval ID.")]
+    Unknown,
     /// The pending approval does not exist.
     ///
     /// # Wire code
@@ -419,6 +429,16 @@ pub enum ApprovalFailure {
     /// `"approval.not_found"`.
     #[error("{detail}")]
     NotFound {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The durable approval has been revoked.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.revoked"`.
+    #[error("{detail}")]
+    Revoked {
         /// Non-secret operator-facing diagnostic.
         detail: String,
     },
@@ -632,6 +652,239 @@ pub enum ApprovalFailure {
         /// Non-secret operator-facing diagnostic.
         detail: String,
     },
+    /// The presented attestation does not prove the approval record: it does
+    /// not verify, it covers a different subject, or its version does not
+    /// cover the approval's kind and lifetime.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.attestation_invalid"`.
+    #[error("{detail}")]
+    AttestationInvalid {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The pending approval's envelope does not decode, or the stored digest
+    /// is not the digest of the stored envelope, so no surface can show what
+    /// an attestation would approve.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.entry_inconsistent"`.
+    #[error("{detail}")]
+    EntryInconsistent {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The protected record of spent rule approvals cannot be used.
+    #[error(
+        "the record of spent rule approvals is unavailable ({reason}); the rule was not installed"
+    )]
+    SpentRecordUnavailable {
+        /// A fixed description of the failed operation, without the stored value.
+        reason: &'static str,
+    },
+    /// The operator credential behind a remote approval or a remote-approval
+    /// request is not authorized at this check: its ID is absent from the
+    /// profile's current `[remote_approval] allowed_credentials` list, or the
+    /// operator-credential store holds no record for it.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.operator_credential_revoked"`.
+    #[error("{detail}")]
+    OperatorCredentialRevoked {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The current remote-approval authorization cannot be established: the
+    /// profile or the operator-credential store cannot be read, remote
+    /// approval is disabled or absent, or the profile's chain or relying
+    /// party ID differs from the one the caller serves. A remote approval or
+    /// request refuses rather than relying on an earlier copy.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.remote_authorization_unavailable"`.
+    #[error("{detail}")]
+    RemoteAuthorizationUnavailable {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// A mainnet consent lacks a verified WebAuthn assertion from an approval
+    /// credential in the owner-signed policy: a terminal, local-HMAC or
+    /// remote approval reached a mainnet binding.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_required"`.
+    #[error(
+        "Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page."
+    )]
+    PresenceRequired,
+    /// A mainnet presence assertion is malformed, names a credential the
+    /// signed policy does not list, or fails a signature, challenge, origin
+    /// or flag check.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_invalid"`.
+    #[error("The mainnet presence assertion is invalid; start a new approval ceremony.")]
+    PresenceInvalid,
+    /// The consent details a page renders differ from the current entry or
+    /// policy: when a mainnet challenge is requested or its assertion
+    /// returns, and when an approval on any other chain arrives from the
+    /// local or remote inbox with a view digest that is absent or is not the
+    /// digest of the current entry. Nothing is attested.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_changed"`.
+    #[error("The consent details have changed; reload the approval page and review them again.")]
+    PresenceChanged,
+    /// The presence challenge's deadline has passed on either clock, or the
+    /// wall clock moved before its issue time.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_expired"`.
+    #[error("The mainnet presence challenge has expired; start a new approval ceremony.")]
+    PresenceExpired,
+    /// No outstanding presence challenge matches the request.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_consumed"`.
+    #[error(
+        "The mainnet presence challenge is unavailable or already used; start a new approval ceremony."
+    )]
+    PresenceConsumed,
+    /// The current owner-signed mainnet approval policy cannot be loaded and
+    /// verified, lists no approval credential, or differs from the policy the
+    /// ceremony bound.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_policy_unavailable"`.
+    #[error(
+        "The current owner-signed mainnet approval policy cannot be verified; restore a valid policy and start a new approval ceremony."
+    )]
+    PresencePolicyUnavailable,
+    /// The policy-state lock that the current owner-signed mainnet approval
+    /// policy load requires stays busy through the final retry. The pin
+    /// freshness check has not run, so retrying the operation can succeed.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_policy_busy"`.
+    #[error(
+        "The owner-signed mainnet approval policy is in use by another request; retry the request."
+    )]
+    PresencePolicyBusy,
+    /// A signed-origin listener's identity names a policy digest or
+    /// certificate pin other than the current owner-signed policy's.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.listener_policy_stale"`.
+    #[error(
+        "The approval listener serves an earlier owner-signed mainnet policy; restart it under the current policy."
+    )]
+    ListenerPolicyStale,
+    /// The leaf certificate a signed-origin listener would serve does not
+    /// match the certificate pin of the owner-signed policy.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.cert_pin_mismatch"`.
+    #[error(
+        "The served certificate does not match the owner-signed pin; install the pinned certificate or sign a new pin."
+    )]
+    CertPinMismatch,
+    /// The profile's remote approval `rp_id` is not the host of the
+    /// owner-signed approval origin.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.origin_profile_mismatch"`.
+    #[error(
+        "The profile's remote approval rp_id is not the host of the owner-signed approval origin."
+    )]
+    OriginProfileMismatch,
+    /// A local consent page or command ceremony reached a mainnet consent
+    /// whose owner-signed policy names an approval origin, where only the
+    /// signed origin serves consent.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.origin_signed_remote"`.
+    #[error(
+        "The owner-signed policy serves mainnet consent at its approval origin; approve there."
+    )]
+    OriginSignedRemote,
+    /// Another approval listener holds the remote approval socket.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.listener_busy"`.
+    #[error(
+        "Another approval listener holds the remote approval socket; approve in the running inbox."
+    )]
+    ListenerBusy,
+    /// A configured TLS field is absent or unusable.
+    #[error("Remote approval TLS configuration is unavailable: {detail}")]
+    RemoteTlsUnavailable {
+        /// The affected configuration field and its non-secret problem.
+        detail: String,
+    },
+    /// No local browser with WebAuthn user verification can run the
+    /// ceremony.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_browser_required"`.
+    #[error(
+        "Mainnet consent requires a local browser with WebAuthn user verification; no approval is recorded."
+    )]
+    PresenceBrowserRequired,
+    /// The presence ceremony cannot start or complete.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_unavailable"`.
+    #[error("The mainnet presence ceremony cannot start or complete; no approval is recorded.")]
+    PresenceUnavailable,
+    /// The operator canceled the presence ceremony.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_canceled"`.
+    #[error("Mainnet consent is canceled; no approval is recorded.")]
+    PresenceCanceled,
+    /// A remote approval surface reached a mainnet consent.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.mainnet_remote_unsupported"`.
+    #[error(
+        "Mainnet consent uses the local passkey page; remote approval is unavailable for mainnet."
+    )]
+    MainnetRemoteUnsupported,
+    /// Delivery evidence is unavailable; storage recovery retains the approval.
+    ///
+    /// The approval ends by expiry or revocation. Another ceremony refuses `approval.already_attested`.
+    #[error(
+        "delivery of this approval's consent row (generation {generation}, row {sequence}) cannot be confirmed"
+    )]
+    ConsentUndelivered {
+        /// The queue generation of the consent row.
+        generation: u64,
+        /// The row's position in that generation.
+        sequence: u64,
+    },
+    /// Every retained consent evidence slot is occupied.
+    #[error("Consent evidence capacity is full; retry after an existing approval ends.")]
+    EvidenceCapacity,
 }
 
 impl ApprovalFailure {
@@ -639,7 +892,9 @@ impl ApprovalFailure {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::Unknown => "approval.unknown",
             Self::NotFound { .. } => "approval.not_found",
+            Self::Revoked { .. } => "approval.revoked",
             Self::Expired { .. } => "approval.expired",
             Self::AlreadyAttested { .. } => "approval.already_attested",
             Self::UserMismatch { .. } => "approval.user_mismatch",
@@ -661,6 +916,32 @@ impl ApprovalFailure {
             Self::WriterLocked { .. } => "approval.writer_locked",
             Self::StoreOpenFailed { .. } => "approval.store_open_failed",
             Self::GcFailed { .. } => "approval.gc_failed",
+            Self::AttestationInvalid { .. } => "approval.attestation_invalid",
+            Self::EntryInconsistent { .. } => "approval.entry_inconsistent",
+            Self::SpentRecordUnavailable { .. } => "approval.spent_record_unavailable",
+            Self::OperatorCredentialRevoked { .. } => "approval.operator_credential_revoked",
+            Self::RemoteAuthorizationUnavailable { .. } => {
+                "approval.remote_authorization_unavailable"
+            }
+            Self::PresenceRequired => "approval.presence_required",
+            Self::PresenceInvalid => "approval.presence_invalid",
+            Self::PresenceChanged => "approval.presence_changed",
+            Self::PresenceExpired => "approval.presence_expired",
+            Self::PresenceConsumed => "approval.presence_consumed",
+            Self::PresencePolicyUnavailable => "approval.presence_policy_unavailable",
+            Self::PresencePolicyBusy => "approval.presence_policy_busy",
+            Self::ListenerPolicyStale => "approval.listener_policy_stale",
+            Self::CertPinMismatch => "approval.cert_pin_mismatch",
+            Self::OriginProfileMismatch => "approval.origin_profile_mismatch",
+            Self::OriginSignedRemote => "approval.origin_signed_remote",
+            Self::ListenerBusy => "approval.listener_busy",
+            Self::RemoteTlsUnavailable { .. } => "approve.remote_tls_unavailable",
+            Self::PresenceBrowserRequired => "approval.presence_browser_required",
+            Self::PresenceUnavailable => "approval.presence_unavailable",
+            Self::PresenceCanceled => "approval.presence_canceled",
+            Self::MainnetRemoteUnsupported => "approval.mainnet_remote_unsupported",
+            Self::ConsentUndelivered { .. } => "approval.consent_undelivered",
+            Self::EvidenceCapacity => "approval.evidence_capacity",
         }
     }
 }
@@ -692,6 +973,67 @@ pub enum CapKind {
 // Validation errors
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// What a [`ValidationError::AddressInvalid`] refusal names: an argument or
+/// field that must hold a Stellar account address, or a fixed sentence that
+/// describes a failed check and the form it expects.
+///
+/// It never holds the rejected value. [`Self::argument`] renders the name
+/// with the expected account-address form; [`Self::check`] renders its
+/// sentence as written, because a check on a hex id, a symbol, a rule id, or
+/// a contract address expects a form other than a `G...` or `M...` strkey.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressField {
+    text: Cow<'static, str>,
+    form: AddressFieldForm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressFieldForm {
+    Argument,
+    Check,
+}
+
+impl AddressField {
+    /// An argument or field that must hold a `G...` or `M...` account
+    /// address, such as `--destination` or `op_source`.
+    #[must_use]
+    pub fn argument(name: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            text: name.into(),
+            form: AddressFieldForm::Argument,
+        }
+    }
+
+    /// A fixed sentence that names the argument or the check and states the
+    /// expected form, such as `--salt must be a 64-char lowercase hex string`.
+    #[must_use]
+    pub fn check(sentence: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            text: sentence.into(),
+            form: AddressFieldForm::Check,
+        }
+    }
+
+    /// The stored argument name or complete check sentence.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for AddressField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.form {
+            AddressFieldForm::Argument => write!(
+                f,
+                "{} is not a valid Stellar account address (expected a G... or M... strkey)",
+                self.text
+            ),
+            AddressFieldForm::Check => f.write_str(&self.text),
+        }
+    }
+}
+
 /// Errors arising from user-supplied input validation.
 ///
 /// These are returned before any network call or signing operation when the
@@ -700,12 +1042,40 @@ pub enum CapKind {
 ///
 /// # Secret-material policy
 ///
-/// No field in any variant carries secret material.  All `String` fields hold
-/// user-visible public data (amounts, destination account IDs, asset codes,
-/// rule identifiers, profile names).
+/// No field in any variant carries secret material or a value the wallet
+/// rejected. A refusal of caller input names the argument, the field, or the
+/// check; the `String` fields that remain hold public data the wallet
+/// accepted (destination account IDs, asset codes, rule identifiers).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ValidationError {
+    /// A closed refusal from offline contract payment validation.
+    #[error(transparent)]
+    SacPayment(#[from] crate::sac_payment::SacPaymentError),
+
+    /// The verified policy's installation bindings do not match the selected profile.
+    #[error("profile.mainnet_enablement_invalid: {binding}")]
+    MainnetEnablementInvalid {
+        /// The mismatched binding, without secret material.
+        binding: &'static str,
+    },
+
+    /// A mainnet profile names no usable oracle endpoint.
+    ///
+    /// Mainnet enablement and every mainnet write require
+    /// `oracle_provider_url` with a matching `providers.oracle` record, so
+    /// an endpoint of another operator can confirm what the primary endpoint
+    /// reports. The profile loader checks the record itself: its host, its
+    /// operator, and its independence assertion.
+    ///
+    /// # Wire code
+    ///
+    /// `"profile.mainnet_oracle_required"`.
+    #[error("{}", gap.text())]
+    MainnetOracleRequired {
+        /// What the profile lacks.
+        gap: MainnetOracleGap,
+    },
     /// The amount was specified without explicit units (e.g. `"100"` instead
     /// of `"100 XLM"` or `"100.0000000"`).
     #[error("amount must specify units (e.g. '100 XLM' or '100.0000000')")]
@@ -714,11 +1084,11 @@ pub enum ValidationError {
     /// The amount string exceeds the seven-decimal-place precision allowed by
     /// the Stellar protocol.
     ///
-    /// `amount` holds the user-entered amount string (e.g. `"1.12345678"`).
-    #[error("amount '{amount}' exceeds the maximum precision of 7 decimal places")]
+    /// `field` names the amount argument or field, never the rejected value.
+    #[error("{field} exceeds the maximum precision of 7 decimal places")]
     AmountPrecisionExceeded {
-        /// The user-entered amount string that exceeded protocol precision.
-        amount: String,
+        /// The amount argument or field. Values never appear.
+        field: Cow<'static, str>,
     },
 
     /// A destination account requires a memo but none was provided.
@@ -731,14 +1101,15 @@ pub enum ValidationError {
         destination: String,
     },
 
-    /// The supplied memo type is not valid for the requested operation.
+    /// The supplied memo is not valid for its memo type.
     ///
-    /// `memo_type` holds the memo-type string as supplied by the caller
-    /// (e.g. `"MEMO_HASH"`, `"invalid"`).
+    /// `memo_type` is fixed text naming the memo type and the check it failed
+    /// (e.g. `"HASH (must be exactly 64 hex characters)"`); the memo itself
+    /// never appears.
     #[error("memo type '{memo_type}' is not valid for this operation")]
     MemoInvalidType {
-        /// The memo-type string as supplied by the caller.
-        memo_type: String,
+        /// The memo type and the failed check, as fixed text.
+        memo_type: Cow<'static, str>,
     },
 
     /// More than one memo variant was supplied simultaneously.
@@ -753,60 +1124,74 @@ pub enum ValidationError {
     #[error("at most one memo variant may be provided; multiple memo fields were set")]
     MemoMutuallyExclusive,
 
-    /// A Stellar account address could not be parsed.
+    /// A text memo holds a control character (C0, DEL or C1) or a
+    /// bidirectional override or isolate (U+202A to U+202E, U+2066 to U+2069).
     ///
-    /// `input` holds the raw input string provided by the user or calling
-    /// code (e.g. `"GABC"`).  This is a public identifier; it is safe to
-    /// display.
-    #[error("address '{input}' is not a valid Stellar account address")]
+    /// `code_point` names the first such character as `U+XXXX`; the memo
+    /// itself is not echoed.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.memo_control_character"`.
+    #[error(
+        "memo text holds the control character {code_point}; control and \
+         bidirectional-override characters are refused"
+    )]
+    MemoControlCharacter {
+        /// The first refused character, as `U+XXXX`.
+        code_point: String,
+    },
+
+    /// A Stellar address or an address-shaped argument cannot be parsed.
+    ///
+    /// `field` names the argument or describes the check, never the rejected
+    /// value. An argument renders with the expected `G...` or `M...` form; a
+    /// check renders its own sentence, which states the form it expects.
+    #[error("{field}")]
     AddressInvalid {
-        /// The raw input string that failed to parse as a Stellar address.
-        input: String,
+        /// The argument or the fixed check sentence. Values never appear.
+        field: AddressField,
     },
 
-    /// An asset descriptor could not be parsed.
+    /// An asset descriptor cannot be parsed.
     ///
-    /// `input` holds the raw asset string provided by the user or calling
-    /// code (e.g. `"USDC:invalid"`).
-    #[error("asset '{input}' is not a valid asset descriptor")]
+    /// `field` names the argument or check, never the rejected value.
+    #[error("{field} is not a valid asset descriptor")]
     AssetInvalid {
-        /// The raw input string that failed to parse as an asset descriptor.
-        input: String,
+        /// The argument, field, or fixed check description. Values never appear.
+        field: Cow<'static, str>,
     },
 
-    /// A named profile was not found in the wallet configuration.
-    ///
-    /// `name` holds the profile name as supplied by the caller.
-    #[error("profile '{name}' was not found in the wallet configuration")]
-    ProfileNotFound {
-        /// The profile name that was not found.
-        name: String,
-    },
+    /// The requested profile is absent from the wallet configuration.
+    #[error(
+        "the requested profile was not found in the wallet configuration; `stellar-agent profile list` shows the profiles"
+    )]
+    ProfileNotFound,
 
     /// An amount string failed numeric parsing.
     ///
-    /// `input` holds the raw input string provided by the user or calling
-    /// code (e.g. `"abc XLM"`, `"100.5.0 XLM"`, empty string).  This is
-    /// a user-supplied value with no secret material.
+    /// `field` names the amount argument or field (e.g. `"--amount"`), never
+    /// the rejected value.
     ///
     /// This variant covers syntactic invalidity.  For semantic invalidity
     /// (precision exceeded, out of range) see [`ValidationError::AmountPrecisionExceeded`]
     /// and [`ValidationError::AmountOutOfRange`].
-    #[error("amount '{input}' could not be parsed as a valid amount")]
+    #[error("{field} could not be parsed as a valid amount")]
     AmountMalformed {
-        /// The raw input string that failed to parse.
-        input: String,
+        /// The amount argument or field. Values never appear.
+        field: Cow<'static, str>,
     },
 
     /// An amount label differs from the unit required by its asset.
-    #[error("amount '{input}' has unit '{supplied}'; expected unit '{expected}'")]
+    ///
+    /// The supplied unit is not shown; `expected` is the code of the asset
+    /// the wallet accepted.
+    #[error("{field} has the wrong unit; expected unit '{expected}'")]
     AmountUnitMismatch {
-        /// The supplied amount string.
-        input: String,
+        /// The amount argument or field. Values never appear.
+        field: Cow<'static, str>,
         /// The unit required by the parsed asset.
         expected: String,
-        /// The unit supplied with the amount.
-        supplied: String,
     },
 
     /// An amount is outside the representable `i64` stroop range.
@@ -819,30 +1204,24 @@ pub enum ValidationError {
     /// checks or the stable wire code `validation.amount_out_of_range`
     /// loses its parse-level semantics.
     ///
-    /// `amount` holds the amount string that overflowed (e.g.
-    /// `"99999999999999999999 XLM"`).  This is a user-supplied value with
-    /// no secret material.
-    #[error("amount '{amount}' is outside the representable i64 stroop range")]
+    /// `field` names the amount argument or field, never the rejected value.
+    #[error("{field} is outside the representable i64 stroop range")]
     AmountOutOfRange {
-        /// The amount string that overflowed the `i64` stroop range.
-        amount: String,
+        /// The amount argument or field. Values never appear.
+        field: Cow<'static, str>,
     },
 
     /// The `--output` flag value is not a recognised output format.
     ///
-    /// `input` holds the raw string supplied by the user or calling code
-    /// (e.g. `"xml"`, `" json"` with a leading space, `""`).  Accepted
-    /// values are `"json"` and `"table"` (case-insensitive).
+    /// Accepted values are `"json"` and `"table"` (case-insensitive); the
+    /// rejected value is not shown.
     ///
     /// This variant is produced by [`crate::envelope::OutputFormat::parse`]
     /// when the supplied string does not match a known format.  It is also
     /// the code emitted in an error envelope when a CLI flag value is
     /// rejected before the command runs.
-    #[error("output format '{input}' is not recognised; accepted values are 'json' and 'table'")]
-    OutputFormatInvalid {
-        /// The raw input string that did not match a known output format.
-        input: String,
-    },
+    #[error("the output format is not recognised; accepted values are 'json' and 'table'")]
+    OutputFormatInvalid,
 
     /// A plugin name failed audit-log construction validation.
     ///
@@ -1019,10 +1398,7 @@ pub enum ValidationError {
     RelayerNotImplemented,
 
     /// The `--valid-until` argument could not be parsed as `none` or a `u32`
-    /// ledger sequence.
-    ///
-    /// `input` holds the raw value provided by the caller (e.g. `"foo"`,
-    /// `"99999999999"`). This is a user-visible non-secret string.
+    /// ledger sequence. The rejected value is not shown.
     ///
     /// Distinct from [`ValidationError::AddressInvalid`]: `--valid-until`
     /// accepts a ledger sequence or the literal `"none"` — it is not an
@@ -1032,11 +1408,8 @@ pub enum ValidationError {
     /// # Wire code
     ///
     /// `"validation.valid_until_invalid"`.
-    #[error("--valid-until '{input}' is not 'none' or a valid u32 ledger sequence")]
-    ValidUntilInvalid {
-        /// The raw input string that failed to parse.
-        input: String,
-    },
+    #[error("--valid-until is not 'none' or a valid u32 ledger sequence")]
+    ValidUntilInvalid,
 
     /// A component configuration value could not be parsed or resolved.
     ///
@@ -1091,13 +1464,9 @@ pub enum ValidationError {
     ///
     /// `"audit.log_not_found"`.
     #[error(
-        "audit log not found at {path}; nothing has been written to the audit \
-         log yet, or the log path is incorrect"
+        "log_path must name an existing audit log file; choose an existing file and retry audit verify."
     )]
-    AuditLogNotFound {
-        /// Display path of the missing primary audit-log file.
-        path: String,
-    },
+    AuditLogNotFound,
 
     /// A mainnet profile names no RPC endpoint.
     ///
@@ -1110,14 +1479,9 @@ pub enum ValidationError {
     ///
     /// `"validation.mainnet_rpc_url_required"`.
     #[error(
-        "the mainnet profile `{name}` requires an explicit RPC endpoint; set `rpc_url` in \
-         the profile file, or pass `--rpc-url` to `profile init`; no public mainnet default \
-         exists"
+        "the mainnet profile requires an explicit RPC endpoint; set rpc_url in the profile file, or pass --rpc-url to profile init"
     )]
-    MainnetRpcUrlRequired {
-        /// The mainnet profile that names no RPC endpoint.
-        name: String,
-    },
+    MainnetRpcUrlRequired,
 
     /// A provider attestation requires correction in the profile file.
     #[error("profile '{name}': {source}")]
@@ -1129,8 +1493,7 @@ pub enum ValidationError {
         source: crate::profile::schema::ProviderAttestationError,
     },
 
-    /// A profile-creation command refused to overwrite an existing profile
-    /// file.
+    /// A profile-creation command refuses to overwrite an occupied destination.
     ///
     /// `stellar-agent profile init` never clobbers an existing `<name>.toml`:
     /// the existence check happens before any write, and the write itself
@@ -1143,14 +1506,9 @@ pub enum ValidationError {
     ///
     /// `"validation.profile_already_exists"`.
     #[error(
-        "profile '{name}' already exists at {path}; choose a different --profile name or remove the file"
+        "the profile destination already exists; choose a different --profile name or remove the existing entry"
     )]
-    ProfileAlreadyExists {
-        /// The profile name that already has a persisted TOML file.
-        name: String,
-        /// Display path of the existing profile file.
-        path: String,
-    },
+    ProfileAlreadyExists,
 
     /// The network flag must assert the loaded profile's chain.
     #[error(
@@ -1248,8 +1606,9 @@ pub enum ValidationError {
     /// profile's state while every message names the requested one. The
     /// refusal is produced by
     /// [`profile_name_mismatch_refusal`](crate::profile::name::profile_name_mismatch_refusal);
-    /// `detail` carries its rendered message, which names both profiles,
-    /// quotes the offending field, and states the recovery.
+    /// `detail` carries its rendered message, which names the offending
+    /// field and states the recovery without repeating either profile name or
+    /// the field's stored value.
     ///
     /// # Wire code
     ///
@@ -1261,19 +1620,110 @@ pub enum ValidationError {
     /// another profile". The two have unrelated recovery.
     #[error("{detail}")]
     ProfileNameMismatch {
-        /// The rendered refusal: both names, the offending field, and the
-        /// recovery path.
+        /// The rendered refusal: the offending field and the recovery path,
+        /// without either profile name or the stored field value.
         detail: String,
     },
 
     /// The profile's keyring references conflict with its host-local scope.
     #[error("{detail}")]
     ProfileKeyScopeConflict {
-        /// Selected profile name.
+        /// Resolved profile name, or empty when the requested name has no file.
         profile: String,
         /// Snake-case finding kind.
         kind: &'static str,
         /// Bounded, path-redacted finding text.
+        detail: String,
+    },
+
+    /// Committed queued operator rows are missing, changed, or reordered.
+    #[error("{detail}")]
+    AuditOutboxRowsMissing {
+        /// Diagnostic led by the outbox-loss code and its recovery command.
+        detail: String,
+    },
+
+    /// The audit outbox holds its cap of queued rows. Nothing is queued.
+    #[error("{detail}")]
+    AuditOutboxFull {
+        /// Diagnostic led by the outbox-capacity code.
+        detail: String,
+    },
+
+    /// A queued row would exceed the audit log's row cap. Nothing is queued.
+    #[error("{detail}")]
+    AuditOutboxRowTooLarge {
+        /// Diagnostic led by the row-size code.
+        detail: String,
+    },
+
+    /// The consent evidence files do not match the trusted owner state.
+    #[error("{detail}")]
+    AuditOutboxEvidenceUnusable {
+        /// Diagnostic led by the evidence code; it names only a static reason.
+        detail: String,
+    },
+
+    /// An outbox-loss acknowledgement finds no committed loss.
+    #[error("{detail}")]
+    AuditOutboxLossNotFound {
+        /// Diagnostic describing the refused acknowledgement.
+        detail: String,
+    },
+
+    /// A held audit carrier lock file is not the recorded file, or the outbox
+    /// moved to a new generation while a holder waited.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.carrier_replaced"`.
+    #[error("{detail}")]
+    AuditCarrierReplaced {
+        /// Diagnostic led by `audit.carrier_replaced`.
+        detail: String,
+    },
+
+    /// A keyed audit log has no recorded carrier identities.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.carriers_unbound"`.
+    #[error("{detail}")]
+    AuditCarriersUnbound {
+        /// Diagnostic led by `audit.carriers_unbound`.
+        detail: String,
+    },
+
+    /// The platform cannot identify a held audit carrier lock file.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.carrier_identity_unavailable"`.
+    #[error("{detail}")]
+    AuditCarrierIdentityUnavailable {
+        /// Diagnostic led by `audit.carrier_identity_unavailable`.
+        detail: String,
+    },
+
+    /// Another process holds an audit carrier lock file required for recovery.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.carriers_busy"`.
+    #[error("{detail}")]
+    AuditCarriersBusy {
+        /// Diagnostic led by `audit.carriers_busy`.
+        detail: String,
+    },
+
+    /// A staged outbox generation remains from an unfinished carrier binding.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.carrier_binding_incomplete"`.
+    #[error("{detail}")]
+    AuditCarrierBindingIncomplete {
+        /// Diagnostic led by `audit.carrier_binding_incomplete`.
         detail: String,
     },
 
@@ -1283,9 +1733,14 @@ pub enum ValidationError {
     /// `stellar-agent profile init` mints the audit-log keyring-coordinate
     /// REFERENCE only — no key material — so an init-minted profile has no
     /// audit chain-root key until `stellar-agent profile rotate-audit-key`
-    /// mints one. This is the fail-closed pre-flight: the verb proves the
-    /// audit writer is acquirable BEFORE any signing key is touched or
-    /// transaction submitted, refusing here instead of proceeding unaudited.
+    /// mints one. That first mint applies only to a log without entry tags:
+    /// a log under entry tags takes rows only under its own key, so the
+    /// message sends a missing key on such a log to restoring it. A
+    /// stored key that cannot be read or decoded is refused by that verb too.
+    /// This is the fail-closed
+    /// pre-flight: the verb proves the audit writer is acquirable BEFORE any
+    /// signing key is touched or transaction submitted, refusing here instead
+    /// of proceeding unaudited.
     ///
     /// Distinct from [`ValidationError::AuditLogNotFound`]: that variant is
     /// `stellar-agent audit verify` finding no log file to verify (a read-path
@@ -1299,8 +1754,12 @@ pub enum ValidationError {
     ///
     /// `"audit.chain_key_unavailable"`.
     #[error(
-        "profile '{profile}' has no audit chain-root key available; the command refuses to \
-         proceed unaudited: run `stellar-agent profile rotate-audit-key {profile}` to mint one"
+        "profile '{profile}' has no usable audit chain-root key; the command refuses to proceed \
+         unaudited. A profile whose audit log carries no entry tags mints one with \
+         `stellar-agent profile rotate-audit-key {profile}`. A log under entry tags takes \
+         rows only under its own key: restore that key to its keyring entry, or see \
+         docs/maintainers/audit-log-recovery.md section 10. A stored key that cannot be read or \
+         decoded is refused by the rotation too"
     )]
     AuditChainKeyUnavailable {
         /// The profile name whose audit chain-root key is unavailable.
@@ -1383,6 +1842,36 @@ pub enum ValidationError {
         reason: String,
     },
 
+    /// A verb that writes audit rows refused because no tip anchor is stored
+    /// for the profile's audit log while the log shows one was.
+    ///
+    /// The evidence is a fact that outlives the anchor: an audit binding
+    /// recorded before this use, a chain-root sidecar on the active log file,
+    /// or an `audit_tip_anchored` row in it. Deleting the anchor and truncating
+    /// the log would otherwise be adopted as a fresh log, and the removed rows
+    /// would leave no trace. A log written only by unkeyed writers carries none
+    /// of these facts and is adopted on its first keyed use.
+    ///
+    /// Recovery requires establishing why the anchor is gone, then
+    /// `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.tip_anchor_missing"`.
+    #[error(
+        "profile '{profile}' has an audit log with no tip anchor stored for it, although \
+         {evidence}; the command refuses to proceed against a log whose anchor was removed. \
+         Investigate, then run \
+         `stellar-agent audit reanchor --profile {profile} --acknowledge-rollback` to accept \
+         the current tip"
+    )]
+    AuditTipAnchorMissing {
+        /// The profile name whose audit log has no anchor.
+        profile: String,
+        /// What shows the log was anchored before, in the writer's own words.
+        evidence: String,
+    },
+
     /// A verb that writes audit rows refused because the profile's audit log
     /// could not be used, for a reason that is about the LOG rather than about
     /// the chain-root key or its registration.
@@ -1439,6 +1928,27 @@ pub enum ValidationError {
         current: String,
         /// Coordinates the anchor would move to.
         proposed: String,
+    },
+
+    /// `audit reanchor` found entries past the last entry with a valid entry
+    /// tag and was run without `--acknowledge-unauthenticated-tail`.
+    ///
+    /// Once a log's entry tags are in force, an entry without a valid tag was
+    /// not written by a writer holding the profile's audit key. The repair
+    /// keeps such entries and covers them with an `audit_entries_quarantined`
+    /// row only when the operator says so; nothing is written otherwise.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.acknowledgement_required"`.
+    #[error(
+        "profile '{profile}' audit log ends in {count} entries without a valid entry tag; nothing was written. Re-run `stellar-agent audit reanchor --profile {profile}` with --acknowledge-unauthenticated-tail to keep them as quarantined entries once you have established where they came from"
+    )]
+    AuditUnauthenticatedTailNotAcknowledged {
+        /// The profile whose audit log ends in unauthenticated entries.
+        profile: String,
+        /// The number of entries past the last authenticated entry.
+        count: u64,
     },
 
     /// A keyed audit writer refused because the profile's audit binding in the
@@ -1499,40 +2009,43 @@ pub enum ValidationError {
         field: &'static str,
     },
 
-    /// A signing verb was asked to read a secret from a named environment
-    /// variable, but that variable is not set in this process's environment.
-    ///
-    /// `var` holds the environment variable name supplied by the operator
-    /// (e.g. `"DEPLOYER_SECRET"`). It is a non-secret identifier — the name of
-    /// the variable, never its value.
+    /// A profile key operation targets the reserved installation namespace.
     ///
     /// # Wire code
     ///
-    /// `"validation.secret_env_not_set"`.
-    #[error("environment variable '{var}' is not set in this process's environment")]
-    SecretEnvNotSet {
-        /// The environment variable name that is not set. Names the variable,
-        /// never its value.
-        var: String,
+    /// `"validation.installation_key_coordinate"`.
+    #[error(
+        "`{field}` names the reserved service `stellar-agent-toolsets`. Point `{field}` at its own profile keyring coordinate"
+    )]
+    InstallationKeyCoordinate {
+        /// The profile field whose coordinate is refused.
+        field: &'static str,
     },
 
-    /// A named environment variable was set but its value is not a valid
-    /// ed25519 `S...` strkey.
-    ///
-    /// `var` holds the environment variable name supplied by the operator. The
-    /// variable's value is never included in the error — only the variable
-    /// name — so no secret material can leak through the wire envelope even
-    /// when the value is malformed.
+    /// A keyring writer targets a policy pin coordinate.
     ///
     /// # Wire code
     ///
-    /// `"validation.secret_env_invalid"`.
-    #[error("environment variable '{var}' does not contain a valid S-strkey")]
-    SecretEnvInvalid {
-        /// The environment variable name whose value failed to parse. Names the
-        /// variable, never its value.
-        var: String,
+    /// `"validation.policy_pin_coordinate"`.
+    #[error(
+        "`{field}` names a policy pin; a policy pin changes only through a verified policy load"
+    )]
+    PolicyPinCoordinate {
+        /// The field whose coordinate is refused.
+        field: &'static str,
     },
+
+    /// The secret environment variable named by the argument is not set.
+    ///
+    /// Wire code: `validation.secret_env_not_set`.
+    #[error("the secret environment variable named by the argument is not set")]
+    SecretEnvNotSet,
+
+    /// The secret environment variable holds a value that is not an S-strkey.
+    ///
+    /// Wire code: `validation.secret_env_invalid`.
+    #[error("the secret environment variable named by the argument must contain a valid S-strkey")]
+    SecretEnvInvalid,
 
     /// A value-moving signing verb was invoked without any signer-source flag.
     ///
@@ -1553,6 +2066,23 @@ pub enum ValidationError {
         /// accepts. Non-secret text.
         detail: String,
     },
+
+    /// A mainnet signing verb was given `--secret-env`.
+    ///
+    /// Mainnet signing never reads a seed from the process environment: an
+    /// exported seed stays readable in the environment of the process and of
+    /// every process the shell starts for their whole life. The verb refuses
+    /// before the write context, any keyring read or any request. The message
+    /// names no variable.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.mainnet_secret_env_refused"`.
+    #[error(
+        "mainnet signing does not read a seed from the environment; omit --secret-env to \
+         sign with the enrolled seed in the keyring, or pass --sign-with-ledger"
+    )]
+    MainnetSecretEnvRefused,
 
     /// A mainnet profile sets no per-operation classic fee cap.
     ///
@@ -1583,8 +2113,9 @@ pub enum ValidationError {
     /// `"fees.percentile_exceeds_cap"`.
     #[error("{}", fee_above_cap_text(*per_op, *cap, fee_source))]
     FeeAboveCap {
-        /// Per-operation fee in stroops the stage would sign or send.
-        per_op: u32,
+        /// Per-operation fee in stroops that the stage refuses to sign or
+        /// send, when the wallet derived it.
+        per_op: DerivedFee,
         /// The profile's per-operation cap in stroops.
         cap: u32,
         /// Where the per-operation fee came from.
@@ -1598,15 +2129,307 @@ pub enum ValidationError {
     ///
     /// `"validation.fee_total_overflow"`.
     #[error(
-        "per-operation fee {per_op} stroops times {op_count} operations exceeds the \
-         transaction fee limit; lower classic_fee_per_op_stroops"
+        "classic_fee_per_op_stroops multiplied by the operation count must fit in u32; \
+         lower classic_fee_per_op_stroops."
     )]
     FeeTotalOverflow {
-        /// Per-operation fee in stroops.
-        per_op: u32,
         /// Operations in the transaction.
         op_count: u32,
     },
+
+    /// The persisted policy window-state of a mainnet profile cannot be
+    /// verified, so neither its spend history nor its authorizations are
+    /// known.
+    ///
+    /// No verb recovers such state; create a profile under a new name.
+    ///
+    /// # Wire code
+    ///
+    /// `"policy.window_state_unverifiable"`.
+    #[cfg(feature = "mainnet-write")]
+    #[error(
+        "policy.window_state_unverifiable: the policy window-state of mainnet profile \
+         '{profile}' cannot be verified ({defect}). No verb recovers such state; create a profile under a new name."
+    )]
+    WindowStateUnverifiable {
+        /// Selected profile name.
+        profile: String,
+        /// Stable label of the defect found.
+        defect: &'static str,
+    },
+
+    /// The selected network disagrees with authenticated spending state.
+    #[error(
+        "the profile network disagrees with authenticated spending state. Restore the profile's network, or create a profile under a new name."
+    )]
+    WindowChainMismatch,
+
+    /// Retained spending state lacks authenticated network provenance.
+    #[error(
+        "spending state has no complete authenticated network provenance. No verb recovers such state; create a profile under a new name."
+    )]
+    WindowChainUnverifiable,
+
+    /// The window reset requires the policy owner's signature.
+    #[error(
+        "profile '{profile}' reset-window-state requires the policy owner's signature through --owner-secret-env; the reset changes no window state"
+    )]
+    ResetWindowStateOwnerRequired {
+        /// Selected profile name.
+        profile: String,
+    },
+
+    /// The supplied seed does not derive to the pinned policy owner.
+    #[error(
+        "profile '{profile}' reset-window-state owner {derived} does not match pinned owner {pinned}; the reset changes no window state"
+    )]
+    ResetWindowStateOwnerMismatch {
+        /// Selected profile name.
+        profile: String,
+        /// The public key derived from the supplied seed.
+        derived: String,
+        /// The public key named by the verified policy pin.
+        pinned: String,
+    },
+
+    /// The owner's signature does not verify over the reset statement.
+    #[error(
+        "profile '{profile}' reset-window-state owner signature does not verify over this reset; the reset changes no window state"
+    )]
+    ResetWindowStateSignatureInvalid {
+        /// Selected profile name.
+        profile: String,
+    },
+
+    /// The window-state reset of a mainnet profile refused because a mainnet
+    /// authorization is still open.
+    ///
+    /// # Wire code
+    ///
+    /// `"profile.reset_window_state_open_authorizations"`.
+    #[cfg(feature = "mainnet-write")]
+    #[error(
+        "profile '{profile}' holds {open} open mainnet authorization(s); reset-window-state \
+         refuses until each is used or expires"
+    )]
+    ResetWindowStateOpenAuthorizations {
+        /// Selected profile name.
+        profile: String,
+        /// Number of effective open authorizations.
+        open: usize,
+    },
+
+    /// The window-state reset refused because the store's authenticated
+    /// format version is newer than any this build reads.
+    ///
+    /// A newer build wrote the file, and its contents cannot be judged here,
+    /// so the reset changes nothing; the build that wrote it reads the file.
+    ///
+    /// # Wire code
+    ///
+    /// `"profile.reset_window_state_newer_version"`.
+    #[error(
+        "the policy window-state of profile '{profile}' cannot be reset: policy window-state \
+         version must be supported by this build; use the build that wrote the file"
+    )]
+    ResetWindowStateNewerVersion {
+        /// Selected profile name.
+        profile: String,
+    },
+
+    /// A mainnet value call names no business id.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.business_id_required"`.
+    #[error(
+        "business_id is required: name the operation with 1 to 64 printable ASCII bytes, \
+         without spaces"
+    )]
+    BusinessIdRequired,
+
+    /// The business id is longer than 64 bytes or holds a byte outside
+    /// printable ASCII without the space.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.business_id_invalid"`.
+    #[error(
+        "business_id must hold 1 to 64 printable ASCII bytes, without spaces; choose another id"
+    )]
+    BusinessIdInvalid,
+
+    /// The business id names a retained operation with another intent, or the
+    /// operation's envelope differs from the one it recorded.
+    ///
+    /// # Wire code
+    ///
+    /// `"operation.business_id_conflict"`.
+    #[error(
+        "business_id names a retained operation with another intent; choose another business_id"
+    )]
+    OperationBusinessIdConflict,
+
+    /// A commit repeats a business id other than the one its preparation
+    /// opened.
+    ///
+    /// # Wire code
+    ///
+    /// `"operation.business_id_mismatch"`.
+    #[error(
+        "business_id differs from the one the preparation returned; repeat the prepared business_id"
+    )]
+    OperationBusinessIdMismatch,
+
+    /// A status call names neither a transaction hash nor a business id, or
+    /// names two that identify different operations.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.usage_error"`.
+    #[error("{detail}")]
+    StatusSelectors {
+        /// Which selector rule the call broke.
+        detail: &'static str,
+    },
+
+    /// A mainnet status call names a business id that no retained operation
+    /// or tombstone carries.
+    ///
+    /// # Wire code
+    ///
+    /// `"operation.unknown"`.
+    #[error("no retained operation has this business_id")]
+    OperationUnknown,
+
+    /// The window-state reset refused because an operation has not reached a
+    /// terminal state.
+    ///
+    /// # Wire code
+    ///
+    /// `"reset.operations_open"`.
+    #[error(
+        "the spending window holds {open} open operation(s); the reset refuses until each ends"
+    )]
+    ResetOperationsOpen {
+        /// Number of operations outside a terminal state.
+        open: usize,
+    },
+
+    /// Total-budget accounting cannot read the policy pin. The window may be
+    /// empty.
+    ///
+    /// # Wire code
+    ///
+    /// `"policy.total_epoch_unavailable"`.
+    #[error("total-budget accounting requires a readable policy pin ({detail})")]
+    TotalEpochUnavailable {
+        /// Why the pin cannot be read.
+        detail: String,
+    },
+
+    /// A total-budget debit names a policy other than the pinned one.
+    ///
+    /// # Wire code
+    ///
+    /// `"policy.total_epoch_stale"`.
+    #[error("the total-budget debit was sized under a policy other than the pinned one")]
+    TotalEpochStale,
+
+    /// The policy pinned when an earlier build's spending window was loaded
+    /// admits no further total-budget debit.
+    ///
+    /// # Wire code
+    ///
+    /// `"policy.total_epoch_retired"`.
+    #[error(
+        "the spending window cannot account for total-budget debits recorded by an earlier \
+         build; sign and install a new policy"
+    )]
+    TotalEpochRetired,
+
+    /// The unlisted-recipient allowance is spent, and the authorization runs
+    /// under policy authority. A per-payment approval covers the payment.
+    ///
+    /// # Wire code
+    ///
+    /// `"policy.approval_required"`.
+    #[error("the unlisted-recipient allowance is spent; this payment needs a per-payment approval")]
+    UnlistedApprovalRequired,
+
+    /// A spending sum exceeds its representation, so nothing was recorded.
+    ///
+    /// # Wire code
+    ///
+    /// `"policy.accounting_overflow"`.
+    #[error("the spending sum overflows; nothing was recorded")]
+    AccountingOverflow,
+
+    /// An accounting contributor or native fee is invalid.
+    ///
+    /// # Wire code
+    ///
+    /// `"policy.accounting_invalid"`.
+    #[error("a policy accounting amount or fee is invalid")]
+    AccountingInvalid,
+
+    /// The reset refuses while approvals remain inside their waiting windows.
+    ///
+    /// # Wire code
+    ///
+    /// `"reset.approvals_pending"`.
+    #[error("the spending window holds {pending} pending approval(s)")]
+    ResetApprovalsPending {
+        /// Number of pending approvals inside their waiting windows.
+        pending: usize,
+    },
+
+    /// The audit row of an operation step could not be appended, so the step
+    /// was not committed.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.append_failed"`.
+    #[error(
+        "the audit row of the operation step could not be appended ({detail}); nothing was recorded"
+    )]
+    AuditAppendFailed {
+        /// Non-secret writer failure detail.
+        detail: String,
+    },
+}
+
+/// What keeps a mainnet profile's oracle from being usable.
+///
+/// Carried by [`ValidationError::MainnetOracleRequired`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MainnetOracleGap {
+    /// The profile sets no `oracle_provider_url`.
+    UrlMissing,
+    /// The profile sets `oracle_provider_url` but holds no
+    /// `providers.oracle` record.
+    RecordMissing,
+}
+
+impl MainnetOracleGap {
+    /// The refusal text: what is missing and how to supply it.
+    #[must_use]
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::UrlMissing => {
+                "the mainnet profile sets no oracle_provider_url; mainnet enablement and \
+                 mainnet writes require an oracle endpoint run by another operator; set \
+                 oracle_provider_url and its providers.oracle record in the profile file"
+            }
+            Self::RecordMissing => {
+                "the mainnet profile sets oracle_provider_url without a providers.oracle \
+                 record; mainnet enablement and mainnet writes require the record; add \
+                 providers.oracle with the oracle's operator and host and \
+                 independent_of_primary = true to the profile file"
+            }
+        }
+    }
 }
 
 /// Where a classic per-operation fee came from.
@@ -1621,8 +2444,14 @@ pub enum FeeSource {
         /// Percentile label, such as `p95`.
         percentile: String,
     },
-    /// Given explicitly by the caller.
+    /// Given explicitly by the caller through the CLI `--fee` flag.
     Explicit,
+    /// Given explicitly by the caller through a named surface argument
+    /// (for example `fee` over MCP).
+    ExplicitArgument {
+        /// Surface argument name (for example `"fee"`).
+        argument: &'static str,
+    },
     /// The profile's `classic_fee_per_op_stroops`, or the wallet default when
     /// the profile sets none.
     ProfileDefault,
@@ -1633,22 +2462,58 @@ pub enum FeeSource {
     Envelope,
 }
 
-fn fee_above_cap_text(per_op: u32, cap: u32, fee_source: &FeeSource) -> String {
+/// The per-operation fee a cap refusal reports.
+///
+/// A fee the caller or the profile chose is the refused value, so the wallet
+/// keeps no copy of it; a fee the wallet derived stays for the diagnostic.
+/// [`DerivedFee::new`] is the only constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DerivedFee(Option<u32>);
+
+impl DerivedFee {
+    /// Keeps `per_op` unless `fee_source` names a fee the caller or the
+    /// profile chose.
+    #[must_use]
+    pub fn new(per_op: u32, fee_source: &FeeSource) -> Self {
+        match fee_source {
+            FeeSource::Explicit
+            | FeeSource::ExplicitArgument { .. }
+            | FeeSource::ProfileDefault => Self(None),
+            FeeSource::Selected { .. } | FeeSource::CommandDefault | FeeSource::Envelope => {
+                Self(Some(per_op))
+            }
+        }
+    }
+
+    /// The derived fee in stroops, or `None` for a chosen fee.
+    #[must_use]
+    pub fn stroops(self) -> Option<u32> {
+        self.0
+    }
+}
+
+fn explicit_fee_above_cap_text(argument: &str) -> String {
+    format!(
+        "{argument} must be a per-operation stroop amount within \
+         classic_max_fee_per_op_stroops; lower {argument} or raise \
+         classic_max_fee_per_op_stroops."
+    )
+}
+
+fn fee_above_cap_text(per_op: DerivedFee, cap: u32, fee_source: &FeeSource) -> String {
+    let per_op = per_op.stroops().unwrap_or_default();
     match fee_source {
         FeeSource::Selected { percentile } => format!(
             "auto-selected per-operation fee {per_op} stroops (percentile {percentile}) exceeds \
              the profile cap of {cap} stroops; raise classic_max_fee_per_op_stroops or accept a \
              lower fee percentile"
         ),
-        FeeSource::Explicit => format!(
-            "the explicit per-operation fee {per_op} stroops exceeds the profile cap of {cap} \
-             stroops; lower the fee or raise classic_max_fee_per_op_stroops"
-        ),
-        FeeSource::ProfileDefault => format!(
-            "the profile's per-operation fee {per_op} stroops (classic_fee_per_op_stroops) \
-             exceeds the profile cap of {cap} stroops; lower classic_fee_per_op_stroops or \
-             raise classic_max_fee_per_op_stroops"
-        ),
+        FeeSource::Explicit => explicit_fee_above_cap_text("--fee"),
+        FeeSource::ExplicitArgument { argument } => explicit_fee_above_cap_text(argument),
+        FeeSource::ProfileDefault => "classic_fee_per_op_stroops must not exceed \
+             classic_max_fee_per_op_stroops; lower classic_fee_per_op_stroops or raise \
+             classic_max_fee_per_op_stroops."
+            .to_owned(),
         FeeSource::CommandDefault => format!(
             "the default per-operation fee {per_op} stroops exceeds the profile cap of {cap} \
              stroops; pass an explicit fee within the cap or raise \
@@ -1661,7 +2526,28 @@ fn fee_above_cap_text(per_op: u32, cap: u32, fee_source: &FeeSource) -> String {
     }
 }
 
+/// The report code for a queued consent row, not an error.
+pub const AUDIT_OUTBOX_QUEUED: &str = "audit.outbox_queued";
+
 impl ValidationError {
+    /// An [`Self::AddressInvalid`] that names an argument or field which must
+    /// hold a `G...` or `M...` account address. See [`AddressField::argument`].
+    #[must_use]
+    pub fn address_argument(name: impl Into<Cow<'static, str>>) -> Self {
+        Self::AddressInvalid {
+            field: AddressField::argument(name),
+        }
+    }
+
+    /// An [`Self::AddressInvalid`] whose fixed sentence names the argument or
+    /// the check and the form it expects. See [`AddressField::check`].
+    #[must_use]
+    pub fn address_check(sentence: impl Into<Cow<'static, str>>) -> Self {
+        Self::AddressInvalid {
+            field: AddressField::check(sentence),
+        }
+    }
+
     /// Returns the stable wire-format subcode for this validation error.
     ///
     /// Always prefixed with `"validation."` when accessed through
@@ -1669,19 +2555,21 @@ impl ValidationError {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
+            Self::SacPayment(reason) => reason.code(),
             Self::AmountUnitsRequired => "validation.amount_units_required",
             Self::AmountPrecisionExceeded { .. } => "validation.amount_precision_exceeded",
             Self::MemoRequired { .. } => "validation.memo_required",
             Self::MemoInvalidType { .. } => "validation.memo_invalid_type",
             Self::MemoMutuallyExclusive => "validation.memo_mutually_exclusive",
+            Self::MemoControlCharacter { .. } => "validation.memo_control_character",
             Self::AddressInvalid { .. } => "validation.address_invalid",
             Self::AssetInvalid { .. } => "validation.asset_invalid",
-            Self::ProfileNotFound { .. } => "validation.profile_not_found",
+            Self::ProfileNotFound => "validation.profile_not_found",
             Self::AmountMalformed { .. } | Self::AmountUnitMismatch { .. } => {
                 "validation.amount_malformed"
             }
             Self::AmountOutOfRange { .. } => "validation.amount_out_of_range",
-            Self::OutputFormatInvalid { .. } => "validation.output_format_invalid",
+            Self::OutputFormatInvalid => "validation.output_format_invalid",
             Self::InvalidPluginName { .. } => "validation.invalid_plugin_name",
             Self::PasskeyOnlyRuleNoDelegatedFallback { .. } => {
                 "validation.passkey_only_rule_no_delegated_fallback"
@@ -1693,7 +2581,7 @@ impl ValidationError {
             Self::BundleTooLarge { .. } => "validation.bundle_too_large",
             Self::UnsupportedFeeMode { .. } => "validation.unsupported_fee_mode",
             Self::RelayerNotImplemented => "validation.relayer_not_implemented",
-            Self::ValidUntilInvalid { .. } => "validation.valid_until_invalid",
+            Self::ValidUntilInvalid => "validation.valid_until_invalid",
             Self::ConfigInvalid { .. } => "validation.config_invalid",
             Self::RuleNameTooLong { .. } => "validation.rule_name_too_long",
             // Audit taxonomy code on a validation-class variant: the code names
@@ -1726,26 +2614,82 @@ impl ValidationError {
             // Audit taxonomy code on a validation-class variant: see
             // `AuditLogNotFound` above for the same rationale.
             Self::AuditTipAnchorMismatch { .. } => "audit.tip_anchor_mismatch",
+            // Audit taxonomy code on a validation-class variant: see
+            // `AuditLogNotFound` above for the same rationale.
+            Self::AuditTipAnchorMissing { .. } => "audit.tip_anchor_missing",
+            Self::AuditOutboxRowsMissing { .. } => "audit.outbox_rows_missing",
+            Self::AuditOutboxFull { .. } => "audit.outbox_full",
+            Self::AuditOutboxRowTooLarge { .. } => "audit.outbox_row_too_large",
+            Self::AuditOutboxEvidenceUnusable { .. } => "audit.outbox_evidence_unusable",
+            Self::AuditOutboxLossNotFound { .. } => "audit.outbox_loss_not_found",
+            Self::AuditCarrierReplaced { .. } => "audit.carrier_replaced",
+            Self::AuditCarriersUnbound { .. } => "audit.carriers_unbound",
+            Self::AuditCarrierIdentityUnavailable { .. } => "audit.carrier_identity_unavailable",
+            Self::AuditCarriersBusy { .. } => "audit.carriers_busy",
+            Self::AuditCarrierBindingIncomplete { .. } => "audit.carrier_binding_incomplete",
             // Same wire code as the two variants above by design — see this
             // variant's doc comment for why the code stays unified while the
             // remedy in the message differs.
             Self::AuditLogUnusable { .. } => "audit.chain_key_unavailable",
             Self::AuditReanchorNotAcknowledged { .. }
+            | Self::AuditUnauthenticatedTailNotAcknowledged { .. }
             | Self::AuditBindingChangeNotAcknowledged { .. } => {
                 "validation.acknowledgement_required"
             }
             // Audit taxonomy code on a validation-class variant: see
             // `AuditLogNotFound` above for the same rationale.
             Self::AuditLogBindingChanged { .. } => "audit.log_binding_changed",
+            Self::InstallationKeyCoordinate { .. } => "validation.installation_key_coordinate",
+            Self::PolicyPinCoordinate { .. } => "validation.policy_pin_coordinate",
             Self::KeyMatchesOwnerPublicKey { .. } => "validation.key_matches_owner_public_key",
             Self::SecretEnvNotSet { .. } => "validation.secret_env_not_set",
             Self::SecretEnvInvalid { .. } => "validation.secret_env_invalid",
             Self::SignerSourceRequired { .. } => "validation.signer_source_required",
+            Self::MainnetSecretEnvRefused => "validation.mainnet_secret_env_refused",
+            Self::MainnetEnablementInvalid { .. } => "profile.mainnet_enablement_invalid",
+            // Profile taxonomy code on a validation-class variant: see
+            // `ProfileNameMismatch` above for the same rationale.
+            Self::MainnetOracleRequired { .. } => "profile.mainnet_oracle_required",
             Self::MainnetFeeCapRequired => "validation.mainnet_fee_cap_required",
             // Fee taxonomy code on a validation-class variant: the code names
             // the subsystem (fees.*) while the category stays Validation.
             Self::FeeAboveCap { .. } => "fees.percentile_exceeds_cap",
             Self::FeeTotalOverflow { .. } => "validation.fee_total_overflow",
+            Self::WindowChainMismatch => "policy.window_chain_mismatch",
+            Self::WindowChainUnverifiable => "policy.window_chain_unverifiable",
+            Self::ResetWindowStateOwnerRequired { .. } => {
+                "profile.reset_window_state_owner_required"
+            }
+            Self::ResetWindowStateOwnerMismatch { .. } => {
+                "profile.reset_window_state_owner_mismatch"
+            }
+            Self::ResetWindowStateSignatureInvalid { .. } => {
+                "profile.reset_window_state_signature_invalid"
+            }
+            Self::ResetWindowStateNewerVersion { .. } => "profile.reset_window_state_newer_version",
+            #[cfg(feature = "mainnet-write")]
+            Self::WindowStateUnverifiable { .. } => "policy.window_state_unverifiable",
+            #[cfg(feature = "mainnet-write")]
+            Self::ResetWindowStateOpenAuthorizations { .. } => {
+                "profile.reset_window_state_open_authorizations"
+            }
+            Self::BusinessIdRequired => "validation.business_id_required",
+            Self::BusinessIdInvalid => "validation.business_id_invalid",
+            // Operation and reset taxonomy codes on validation-class variants:
+            // each names the store section that refuses the caller's request.
+            Self::OperationBusinessIdConflict => "operation.business_id_conflict",
+            Self::OperationBusinessIdMismatch => "operation.business_id_mismatch",
+            Self::StatusSelectors { .. } => "validation.usage_error",
+            Self::OperationUnknown => "operation.unknown",
+            Self::ResetOperationsOpen { .. } => "reset.operations_open",
+            Self::TotalEpochUnavailable { .. } => "policy.total_epoch_unavailable",
+            Self::TotalEpochStale => "policy.total_epoch_stale",
+            Self::TotalEpochRetired => "policy.total_epoch_retired",
+            Self::UnlistedApprovalRequired => "policy.approval_required",
+            Self::AccountingOverflow => "policy.accounting_overflow",
+            Self::AccountingInvalid => "policy.accounting_invalid",
+            Self::ResetApprovalsPending { .. } => "reset.approvals_pending",
+            Self::AuditAppendFailed { .. } => "audit.append_failed",
         }
     }
 }
@@ -1787,6 +2731,16 @@ pub enum NetworkError {
         /// Absolute sequence difference when comparing account sequences.
         sequence_delta: Option<u64>,
     },
+
+    /// A field of the transaction, the ledger state the resolver rereads for
+    /// it, or the intent digest it matches differs from the canonical intent
+    /// its operation record stores. The reread state is the claimable balance
+    /// of a claim: its asset or amount differs, or the entry is gone.
+    #[error(
+        "the transaction or the ledger state it reads differs from the intent its operation \
+         stored; the wallet did not sign or send. Prepare the action again under its business id"
+    )]
+    IntentDivergence,
 
     /// The RPC endpoint did not respond within the configured timeout.
     ///
@@ -1840,11 +2794,45 @@ pub enum NetworkError {
         account_id: String,
     },
 
-    /// A mainnet write operation was attempted; every mainnet write is
-    /// structurally refused in this alpha, regardless of the configured
-    /// policy engine or enrolled keys.
-    #[error("mainnet writes are structurally refused in this alpha")]
+    /// A mainnet write reached a path that cannot carry a mainnet
+    /// authorization: a build without the `mainnet-write` feature, an
+    /// operation outside the mainnet scope, a staged mode, or an ordinary
+    /// signing or submission entry. The configured policy engine and enrolled
+    /// keys do not change this refusal.
+    #[error("this mainnet write is structurally refused")]
     MainnetWriteForbidden,
+
+    /// A mainnet authorization did not match the action it was presented for,
+    /// or a fact it binds does not hold at the moment of use.
+    ///
+    /// The text names no precondition, proof fact, or endpoint detail: the
+    /// refusing check is logged for the operator, and the agent learns only
+    /// that the authorization was refused. Distinct from
+    /// [`NetworkError::MainnetWriteForbidden`], which a build without mainnet
+    /// writes reports before any authorization exists.
+    #[error("the mainnet write was refused before submission; nothing was sent")]
+    MainnetAuthorizationRefused,
+
+    /// The process uses a headless keyring backend, and mainnet needs a
+    /// platform keyring.
+    ///
+    /// A headless backend keeps every keyring entry, the audit tip anchor
+    /// among them, in one file on the same host with no generation or
+    /// freshness witness. Restoring an older copy of that file together with a
+    /// truncated audit log makes the two agree again, so the anchor cannot
+    /// prove the log was not rolled back. Mainnet readiness and
+    /// `profile enable-mainnet` refuse such a process. Testnet use of the
+    /// headless backends is unaffected.
+    #[error(
+        "mainnet needs a platform keyring; this process uses the {backend} keyring backend \
+         (STELLAR_AGENT_KEYRING_BACKEND), which serves testnet only. Unset \
+         STELLAR_AGENT_KEYRING_BACKEND and run with the platform keyring"
+    )]
+    MainnetKeyringBackendUnsupported {
+        /// The selected backend: `headless-env`, `headless-dpapi`, or
+        /// `unrecognized` for a value that names neither.
+        backend: &'static str,
+    },
 
     /// The Horizon API returned an unexpected HTTP status code.
     ///
@@ -1958,15 +2946,53 @@ pub enum NetworkError {
         url: String,
     },
 
+    /// A read before the send did not answer within the pre-send budget.
+    ///
+    /// The reads that precede a send, the endpoint identity probe and the
+    /// signer-set read among them, share one fixed budget that starts with
+    /// the first of them. The submission's own timeout bounds only the send
+    /// and the confirmation poll. A read the budget cuts, or one that fails
+    /// at or after the budget's end, refuses with this error, and nothing is
+    /// sent.
+    ///
+    /// `read` is the wallet's fixed name for the read and never carries
+    /// endpoint text.
+    #[error(
+        "the {read} did not answer within the pre-send budget of {budget_secs} s; nothing was sent"
+    )]
+    PreSendTimeout {
+        /// The wallet's fixed name for the read.
+        read: String,
+        /// The pre-send budget in seconds.
+        budget_secs: u64,
+    },
+
+    /// The RPC endpoint is not ready for a transaction: it reports a status
+    /// other than healthy, it does not supply a valid close time for its
+    /// latest ledger, or that close time lies too far from the host clock.
+    ///
+    /// A value ceremony reads the account it signs against only after the
+    /// endpoint passes this check, so a stalled or lagging endpoint never
+    /// supplies the sequence, the fee, or the policy views of an envelope.
+    ///
+    /// The reason names the failed check and never carries the endpoint URL
+    /// or a credential; text the endpoint supplies enters it scrubbed.
+    #[error("the endpoint is not ready for a transaction: {reason}")]
+    EndpointNotReady {
+        /// Which check failed and what it observed.
+        reason: String,
+    },
+
     /// A mainnet RPC endpoint reports a protocol version outside the range
     /// this release supports.
     ///
     /// A release adds a protocol version to its supported range only after
     /// its testnet acceptance tests ran against that version. On testnet and
     /// on any other network, a version outside the range is logged as a
-    /// warning instead. While every mainnet write is refused, an endpoint
-    /// reporting mainnet is refused with
-    /// [`NetworkError::MainnetWriteForbidden`] before this check runs.
+    /// warning instead. Ordinary submission refuses an endpoint reporting
+    /// mainnet with [`NetworkError::MainnetWriteForbidden`] before this check
+    /// runs; authorized mainnet submission refuses a version outside the
+    /// range.
     #[error(
         "the RPC endpoint runs protocol version {protocol_version}, outside the supported \
          range {supported_min} to {supported_max}; not submitting"
@@ -1980,31 +3006,25 @@ pub enum NetworkError {
         supported_max: u32,
     },
 
-    /// A signature on the envelope was produced under the mainnet network id.
+    /// A signature on the envelope verifies under the mainnet network id
+    /// while the endpoint serves another network.
     ///
-    /// Every mainnet write is structurally refused, including one reaching a
-    /// non-mainnet endpoint: an envelope signed for mainnet is a mainnet
-    /// authorisation regardless of where it is relayed.
+    /// An envelope signed for mainnet is a mainnet authorization wherever it
+    /// is relayed.
     #[error(
-        "the envelope carries a signature produced for mainnet; \
-         mainnet writes are structurally refused in this alpha"
+        "the envelope carries a signature produced for mainnet and the endpoint \
+         serves another network; not submitting"
     )]
     EnvelopeSignedForMainnet,
 
     /// A signature on the envelope verifies under neither the endpoint's
     /// network id nor mainnet's, for any ed25519 signer of the transaction's
     /// source accounts.
-    ///
-    /// `hint` is the `DecoratedSignature` hint as 8 lowercase hex characters —
-    /// the last four bytes of a public key, which is public material.
     #[error(
-        "the envelope signature with hint {hint} does not verify under the network \
-         the endpoint serves, for any signer of the transaction's source accounts"
+        "transaction_xdr must contain signatures that verify against a source-account \
+         signer on the selected network; rebuild and sign the envelope for that network."
     )]
-    EnvelopeSignatureUnverifiable {
-        /// The `DecoratedSignature` hint, 8 lowercase hex characters.
-        hint: String,
-    },
+    EnvelopeSignatureUnverifiable,
 
     /// The envelope carries no signatures at all.
     ///
@@ -2061,6 +3081,23 @@ pub enum NetworkError {
         /// The HTTP status of the answer, 401 or 403.
         status: u16,
     },
+
+    /// An account read answers from a ledger below the readiness ledger of
+    /// the same endpoint, so the answer cannot describe the observed state.
+    ///
+    /// # Wire code
+    ///
+    /// `"account.ledger_regressed"`.
+    #[error(
+        "the account read answers from ledger {latest_ledger}, below the endpoint's readiness \
+         ledger {readiness_ledger}"
+    )]
+    AccountLedgerRegressed {
+        /// The latest ledger of the account answer.
+        latest_ledger: u32,
+        /// The latest ledger of the readiness report.
+        readiness_ledger: u32,
+    },
 }
 
 /// Safe classifications of an unavailable cross-check witness.
@@ -2075,9 +3112,13 @@ pub enum WitnessUnavailableReason {
     )]
     OracleNotConfigured,
     /// The asset has no threshold.
+    ///
+    /// On mainnet a token threshold applies only from the signed policy, so
+    /// the remedy names both tables.
     #[error(
-        "cross-check unavailable: the profile sets no cross-check threshold for asset \
-         '{asset}'; add it to [cross_check_thresholds] in the profile file"
+        "cross-check unavailable: no cross-check threshold applies to asset '{asset}'; on \
+         mainnet add it to [mainnet.cross_check_thresholds] of the signed policy, on other \
+         networks to [cross_check_thresholds] in the profile file"
     )]
     NoThresholdForAsset {
         /// Canonical asset without a threshold.
@@ -2149,6 +3190,20 @@ pub enum WitnessUnavailableReason {
     InvalidAnswer {
         /// Redacted oracle authority.
         authority: String,
+    },
+    /// The transaction the witness is bound to does not match the
+    /// observations it compares: its source, its sequence, its operation, its
+    /// memo, or a Soroban payment's authorization differs from what the action
+    /// read, or its economic value differs from the value the requirement rule
+    /// decides on.
+    #[error(
+        "cross-check refused: the transaction's {part} does not match the observations the \
+         witness compares; the wallet did not sign or send. Build the action again"
+    )]
+    EnvelopeMismatch {
+        /// `source`, `sequence`, `operation`, `memo`, `value`, `envelope`, or
+        /// `authorization`.
+        part: &'static str,
     },
 }
 
@@ -2223,12 +3278,16 @@ impl NetworkError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::WitnessUnavailable { .. } => "network.witness_unavailable",
-            Self::WitnessDivergence { .. } => "simulation.divergence",
+            Self::WitnessDivergence { .. } | Self::IntentDivergence => "simulation.divergence",
             Self::RpcTimeout { .. } => "network.rpc_timeout",
             Self::RpcUnreachable { .. } => "network.rpc_unreachable",
             Self::FriendbotMainnetForbidden => "network.friendbot_mainnet_forbidden",
             Self::AccountNotFound { .. } => "network.account_not_found",
             Self::MainnetWriteForbidden => "network.mainnet_write_forbidden",
+            Self::MainnetAuthorizationRefused => "network.mainnet_authorization_refused",
+            Self::MainnetKeyringBackendUnsupported { .. } => {
+                "network.mainnet_keyring_backend_unsupported"
+            }
             Self::HorizonUnavailable { .. } => "network.horizon_unavailable",
             Self::RpcResponseMalformed { .. } => "network.rpc_response_malformed",
             Self::RpcDivergence { .. } => "network.rpc_divergence",
@@ -2238,6 +3297,8 @@ impl NetworkError {
             }
             Self::EndpointNetworkMismatch { .. } => "network.endpoint_network_mismatch",
             Self::EndpointIdentityUnavailable { .. } => "network.endpoint_identity_unavailable",
+            Self::EndpointNotReady { .. } => "network.endpoint_not_ready",
+            Self::PreSendTimeout { .. } => "network.pre_send_timeout",
             Self::UnsupportedProtocolVersion { .. } => "network.unsupported_protocol_version",
             Self::EnvelopeSignedForMainnet => "network.envelope_signed_for_mainnet",
             Self::EnvelopeSignatureUnverifiable { .. } => "network.envelope_signature_unverifiable",
@@ -2245,6 +3306,7 @@ impl NetworkError {
             Self::RpcCredentialInvalid { .. }
             | Self::RpcCredentialUnusable { .. }
             | Self::RpcCredentialRejected { .. } => "network.rpc_credential_refused",
+            Self::AccountLedgerRegressed { .. } => "account.ledger_regressed",
         }
     }
 }
@@ -2270,13 +3332,42 @@ pub const MAINNET_SIGNING_REFUSAL_DETAIL: &str =
 // Auth errors
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Why a keyring read found no usable entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyringMissingCause {
+    /// The store holds no entry at the configured coordinate.
+    MissingEntry,
+    /// The session has no platform credential store.
+    NoDefaultStore,
+    /// The entry exists and its value is not an S-strkey.
+    InvalidSecret,
+}
+
+impl std::fmt::Display for KeyringMissingCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::MissingEntry => {
+                "the configured keyring entry must exist; provision or select the required entry."
+            }
+            Self::NoDefaultStore => {
+                "a platform keychain must be available for this session; start and unlock macOS \
+                 Keychain, GNOME Keyring, KWallet, or Windows Credential Manager."
+            }
+            Self::InvalidSecret => {
+                "the configured keyring entry must hold an S-strkey; provision or select the \
+                 required entry."
+            }
+        })
+    }
+}
+
 /// Errors arising from keyring access or signing authentication.
 ///
 /// # Secret-material policy
 ///
-/// No field in any variant carries secret material.  The `name` field in
-/// `KeyringNotFound` holds a keyring label (a non-secret identifier).
-#[derive(Debug, Error)]
+/// No field in any variant carries secret material or a keyring coordinate.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum AuthError {
     /// The keyring is locked and must be unlocked before use.
@@ -2324,13 +3415,14 @@ pub enum AuthError {
     )]
     KeyringInteractiveSessionRequired,
 
-    /// The specified keyring entry was not found.
+    /// A keyring read found no usable entry.
     ///
-    /// `name` holds the keyring entry label as supplied by the caller.
-    #[error("keyring entry '{name}' was not found")]
+    /// `cause` tells the conditions apart; the error holds no keyring
+    /// coordinate.
+    #[error("{cause}")]
     KeyringNotFound {
-        /// The keyring entry label that was not found.
-        name: String,
+        /// Why the read found no usable entry.
+        cause: KeyringMissingCause,
     },
 
     /// The headless keyring backend the environment selects cannot be set up
@@ -2366,6 +3458,42 @@ pub enum AuthError {
         reason: &'static str,
     },
 
+    /// The enrolled signer identity cannot serve as a mainnet signer: the
+    /// stored profile disagrees with the loaded one, or the identity record
+    /// is absent, unreadable, or names another key, role, profile, chain or owner.
+    ///
+    /// `reason` is one of `disk_disagreement`, `missing`, `malformed`,
+    /// `unsupported_version`, `malformed_key`, `unsupported_role`,
+    /// `pin_mismatch`, `public_key_mismatch`, `fee_source_mismatch`,
+    /// `bound_elsewhere`, `unbound`, `owner_required`, `owner_mismatch`, or
+    /// `binding_signature_invalid`.
+    ///
+    /// For `public_key_mismatch` and `fee_source_mismatch`, `enrolled` carries
+    /// the profile's enrolled signer G-strkey so the refusal tells the operator
+    /// which address to pass as the source, and `source_flag`, when set, names
+    /// the flag that takes it. `--repair-identity` appears only
+    /// for missing or malformed record reasons, and `bind-signer` only for
+    /// unbound signer or rotated-owner reasons.
+    ///
+    /// # Wire code
+    ///
+    /// `"auth.enrolled_identity_unusable"`.
+    #[error(
+        "{}",
+        format_enrolled_identity_unusable(profile, reason, enrolled.as_deref(), *source_flag)
+    )]
+    EnrolledIdentityUnusable {
+        /// The selected profile name.
+        profile: String,
+        /// Which rule the identity breaks.
+        reason: &'static str,
+        /// The enrolled signer G-strkey for source-mismatch reasons.
+        enrolled: Option<String>,
+        /// The verb's source flag a source-mismatch refusal names, such as
+        /// `--source` or `--from`. `None` names no flag.
+        source_flag: Option<&'static str>,
+    },
+
     /// The resolved signer differs from the mainnet profile's enrolled key.
     #[error("signer `{derived}` is not the enrolled signer `{enrolled}` of profile `{profile}`")]
     EnrolledSignerMismatch {
@@ -2384,17 +3512,16 @@ pub enum AuthError {
     /// `--expect-rule-signer`, or a description such as `the expected signing
     /// account`, `the cached signing public key`, or `the keyring entry's
     /// account`. `expected` holds a G-strkey, the caller's original hex public
-    /// key, or a redacted account. `got` holds the public key derived from
+    /// key, or an expected input kind. `got` holds the public key derived from
     /// the signing key (software) or fetched from the device (hardware).
     /// When the lazy keyring construction rejects an invalid G-strkey,
-    /// `expected` holds the redacted input and `got` holds `invalid public
-    /// account`.
+    /// `expected` holds `a G-strkey` and `got` holds `invalid public account`.
     /// None carries secret material.
     #[error("signing key public key '{got}' does not match {what} '{expected}'")]
     SignerKeyMismatch {
         /// The identity `expected` stands for, rendered in the message.
         what: &'static str,
-        /// The caller-supplied, profile, or cached public identity.
+        /// The caller-supplied, profile, or cached public identity, or expected kind.
         expected: String,
         /// The public key derived from or fetched via the signing key, or the
         /// invalid public account sentinel.
@@ -2424,6 +3551,42 @@ pub enum AuthError {
     },
 }
 
+fn format_enrolled_identity_unusable(
+    profile: &str,
+    reason: &str,
+    enrolled: Option<&str>,
+    source_flag: Option<&str>,
+) -> String {
+    match reason {
+        "public_key_mismatch" | "fee_source_mismatch" => match enrolled {
+            Some(address) => {
+                let flag = source_flag.map_or_else(String::new, |flag| format!(" with `{flag}`"));
+                format!(
+                    "the enrolled signer identity of profile `{profile}` cannot be used \
+                     ({reason}); the enrolled signer is `{address}`; pass it as the source{flag}"
+                )
+            }
+            None => format!(
+                "the enrolled signer identity of profile `{profile}` cannot be used ({reason}); \
+                 pass the profile's enrolled signer as the source"
+            ),
+        },
+        "missing" | "malformed" | "unsupported_version" | "malformed_key" | "unsupported_role" => {
+            format!(
+                "the enrolled signer identity of profile `{profile}` cannot be used ({reason}); \
+                 run `stellar-agent profile enroll-signer --profile {profile} --repair-identity`"
+            )
+        }
+        "unbound" | "owner_mismatch" | "binding_signature_invalid" => format!(
+            "the enrolled signer identity of profile `{profile}` cannot be used ({reason}); \
+             run `stellar-agent profile bind-signer --profile {profile} --owner-secret-env <VAR>`"
+        ),
+        _ => {
+            format!("the enrolled signer identity of profile `{profile}` cannot be used ({reason})")
+        }
+    }
+}
+
 impl AuthError {
     /// Returns the stable wire-format subcode for this auth error.
     #[must_use]
@@ -2437,6 +3600,7 @@ impl AuthError {
             Self::HardwareUserRefused => "auth.hardware_user_refused",
             Self::EnrolledSignerUnpinned { .. } => "auth.enrolled_signer_unpinned",
             Self::EnrolledSignerMismatch { .. } => "auth.enrolled_signer_mismatch",
+            Self::EnrolledIdentityUnusable { .. } => "auth.enrolled_identity_unusable",
             Self::SignerKeyMismatch { .. } => "auth.signer_key_mismatch",
             Self::SignerKindMismatch { .. } => "auth.signer_kind_mismatch",
         }
@@ -2599,9 +3763,52 @@ pub enum WalletStateError {
         /// no secret material.
         detail: String,
     },
+
+    /// The system clock cannot supply a Unix timestamp in milliseconds.
+    ///
+    /// Raised by the clock the mainnet authorization store, the signing
+    /// points, and the submit gate share. The wire code is the one every
+    /// command reports for a clock it cannot read.
+    ///
+    /// # Wire code
+    ///
+    /// `"wallet.clock_error"`.
+    #[error("system clock error: {detail}")]
+    ClockError {
+        /// Operator-safe diagnostic string. Carries no secret material.
+        detail: String,
+    },
 }
 
 impl WalletStateError {
+    /// The `wallet.clock_error` refusal for a clock read that failed with a
+    /// [`crate::wallet::WalletLifecycleError`], carrying the lifecycle error's
+    /// text. The lifecycle error carries no secret material.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::error::WalletStateError;
+    /// use stellar_agent_core::wallet::WalletLifecycleError;
+    ///
+    /// let lifecycle = WalletLifecycleError::ClockError {
+    ///     detail: "system clock is before UNIX_EPOCH".to_owned(),
+    ///     source: None,
+    /// };
+    /// let error = WalletStateError::clock_error(&lifecycle);
+    /// assert_eq!(error.code(), "wallet.clock_error");
+    /// assert_eq!(
+    ///     error.to_string(),
+    ///     "system clock error: wallet clock error: system clock is before UNIX_EPOCH"
+    /// );
+    /// ```
+    #[must_use]
+    pub fn clock_error(error: &crate::wallet::WalletLifecycleError) -> Self {
+        Self::ClockError {
+            detail: error.to_string(),
+        }
+    }
+
     /// Returns the stable wire-format subcode for this wallet-state error.
     #[must_use]
     pub fn code(&self) -> &'static str {
@@ -2617,6 +3824,7 @@ impl WalletStateError {
             Self::PlatformAuthenticatorError { .. } => "wallet_state.platform_authenticator_error",
             Self::PasskeyCredentialNotFound => "wallet_state.passkey_credential_not_found",
             Self::UnlockFailed { .. } => "wallet_state.unlock_failed",
+            Self::ClockError { .. } => "wallet.clock_error",
         }
     }
 }
@@ -3012,6 +4220,38 @@ pub enum SubmissionError {
         detail: String,
     },
 
+    /// The submission receipt store could not be read, so the wallet cannot
+    /// show that an approval nonce is unspent and sends nothing.
+    ///
+    /// This check writes no record; it refuses before any signing.
+    ///
+    /// # Field semantics
+    ///
+    /// `detail` is a non-secret diagnostic of the read failure.
+    ///
+    /// # Wire code
+    ///
+    /// `submission.record_unavailable`
+    #[error("the submission receipt store could not be read, so nothing was sent: {detail}")]
+    ReceiptStoreUnreadable {
+        /// A non-secret diagnostic of the read failure.
+        detail: String,
+    },
+
+    /// A settlement audit delivery named a decision identifier that the
+    /// verified spending-window state does not hold.
+    ///
+    /// Only an authenticated accounting decision authorizes a settlement
+    /// audit event. Receipt contents and copied identifiers establish none, so
+    /// delivery refuses before any audit append. The message carries no
+    /// rejected value.
+    ///
+    /// # Wire code
+    ///
+    /// `submission.settlement_unverifiable`
+    #[error("Authenticated settlement evidence is unavailable.")]
+    SettlementUnverifiable,
+
     /// The hash the endpoint returned for the accepted transaction differs
     /// from the hash computed locally from the envelope.
     ///
@@ -3045,6 +4285,95 @@ pub enum SubmissionError {
         /// reading the field directly must apply redaction before logging.
         server: String,
     },
+
+    /// Smart account intent accounting cannot establish a durable charge.
+    #[error(
+        "Smart-account intent recording is unavailable ({class}). Existing exposed charges remain."
+    )]
+    IntentRecordUnavailable {
+        /// The fixed failure class.
+        class: &'static str,
+    },
+
+    /// The signing request or envelope differs from the admitted authority.
+    #[error(
+        "The signing request or final transaction does not match its admitted intent ({field}). Existing exposed charges remain."
+    )]
+    IntentBindingMismatch {
+        /// The fixed mismatching field.
+        field: &'static str,
+    },
+
+    /// The spending window cannot hold another operation record, or an
+    /// attempt's envelope exceeds its allowance.
+    ///
+    /// `detail` names the exceeded limit: `envelope_size`, `file_size`,
+    /// `intent_size`, `record_size` or `waiting_operations`.
+    ///
+    /// # Wire code
+    ///
+    /// `"operation.capacity"`.
+    #[error(
+        "the operation exceeds the spending window's capacity ({detail}); nothing was recorded"
+    )]
+    OperationCapacity {
+        /// The fixed name of the exceeded limit.
+        detail: &'static str,
+    },
+
+    /// The operation already has an attempt in progress.
+    ///
+    /// # Wire code
+    ///
+    /// `"operation.attempt_open"`.
+    #[error("the operation already has an attempt in progress; wait for its outcome")]
+    OperationAttemptOpen,
+
+    /// The operation has used every attempt it may make.
+    ///
+    /// # Wire code
+    ///
+    /// `"operation.attempt_limit"`.
+    #[error("the operation has used all of its attempts; start a new operation")]
+    OperationAttemptLimit,
+
+    /// The recovery evidence of an unknown outcome does not decide it yet.
+    ///
+    /// `detail` is the fixed diagnostic class, such as `missing_field`.
+    ///
+    /// # Wire code
+    ///
+    /// `"recovery.evidence_pending"`.
+    #[error("the outcome stays unknown: the recovery evidence is pending ({detail})")]
+    RecoveryEvidencePending {
+        /// The fixed diagnostic class.
+        detail: &'static str,
+    },
+
+    /// The two recovery endpoints give differing or invalid deciding answers.
+    ///
+    /// `detail` is the fixed diagnostic class, such as `status_result_mismatch`.
+    ///
+    /// # Wire code
+    ///
+    /// `"recovery.endpoint_disagreement"`.
+    #[error("the outcome stays unknown: the recovery endpoints disagree ({detail})")]
+    RecoveryEndpointDisagreement {
+        /// The fixed diagnostic class.
+        detail: &'static str,
+    },
+
+    /// A successor attempt lacks the committed non-inclusion proof or the
+    /// projection of its predecessor's decision.
+    ///
+    /// # Wire code
+    ///
+    /// `"recovery.retry_refused"`.
+    #[error(
+        "the operation may not retry: its last attempt has no committed and projected \
+         non-inclusion proof"
+    )]
+    RecoveryRetryRefused,
 }
 
 impl SubmissionError {
@@ -3059,8 +4388,22 @@ impl SubmissionError {
             Self::FeeBumpInnerRejected { .. } => "submission.feebump_inner_rejected",
             Self::AuthMismatch { .. } => "submission.auth_mismatch",
             Self::OnChainFailed { .. } => "submission.on_chain_failed",
-            Self::RecordUnavailable { .. } => "submission.record_unavailable",
+            Self::RecordUnavailable { .. } | Self::ReceiptStoreUnreadable { .. } => {
+                "submission.record_unavailable"
+            }
+            Self::SettlementUnverifiable => "submission.settlement_unverifiable",
             Self::HashMismatch { .. } => "submission.hash_mismatch",
+            Self::IntentRecordUnavailable { .. } => "submission.intent_record_unavailable",
+            Self::IntentBindingMismatch { .. } => "submission.intent_binding_mismatch",
+            // Operation taxonomy codes on submission-class variants: the code
+            // names the operation store that refuses the attempt.
+            Self::OperationCapacity { .. } => "operation.capacity",
+            Self::OperationAttemptOpen => "operation.attempt_open",
+            Self::OperationAttemptLimit => "operation.attempt_limit",
+            // Recovery taxonomy codes name the two-endpoint outcome recovery.
+            Self::RecoveryEvidencePending { .. } => "recovery.evidence_pending",
+            Self::RecoveryEndpointDisagreement { .. } => "recovery.endpoint_disagreement",
+            Self::RecoveryRetryRefused => "recovery.retry_refused",
         }
     }
 }
@@ -3179,8 +4522,29 @@ mod tests {
         reason = "test-only panic in an unreachable match arm; documented in the arm body"
     )]
     fn validation_code_round_trip() {
+        assert_eq!(AUDIT_OUTBOX_QUEUED, "audit.outbox_queued");
         // Construct every variant; ensure the match is exhaustive.
         let cases: &[(ValidationError, &'static str)] = &[
+            (
+                ValidationError::SacPayment(crate::sac_payment::SacPaymentError::FeeExceeded),
+                "validation.contract_transfer_fee_exceeded",
+            ),
+            (
+                ValidationError::MainnetEnablementInvalid { binding: "profile" },
+                "profile.mainnet_enablement_invalid",
+            ),
+            (
+                ValidationError::MainnetOracleRequired {
+                    gap: MainnetOracleGap::UrlMissing,
+                },
+                "profile.mainnet_oracle_required",
+            ),
+            (
+                ValidationError::MainnetOracleRequired {
+                    gap: MainnetOracleGap::RecordMissing,
+                },
+                "profile.mainnet_oracle_required",
+            ),
             (
                 ValidationError::NetworkFlagMismatch {
                     flag: "testnet".into(),
@@ -3195,7 +4559,7 @@ mod tests {
             ),
             (
                 ValidationError::AmountPrecisionExceeded {
-                    amount: "1.12345678".to_owned(),
+                    field: "--amount".into(),
                 },
                 "validation.amount_precision_exceeded",
             ),
@@ -3207,57 +4571,60 @@ mod tests {
             ),
             (
                 ValidationError::MemoInvalidType {
-                    memo_type: "MEMO_HASH".to_owned(),
+                    memo_type: "HASH (must be exactly 64 hex characters)".into(),
                 },
                 "validation.memo_invalid_type",
             ),
             (
-                ValidationError::AddressInvalid {
-                    input: "GABC".to_owned(),
-                },
+                ValidationError::address_argument("address"),
+                "validation.address_invalid",
+            ),
+            (
+                ValidationError::address_check("--salt must be a 64-char lowercase hex string"),
                 "validation.address_invalid",
             ),
             (
                 ValidationError::AssetInvalid {
-                    input: "USDC:bad".to_owned(),
+                    field: "asset".into(),
                 },
                 "validation.asset_invalid",
             ),
             (
-                ValidationError::ProfileNotFound {
-                    name: "default".to_owned(),
-                },
+                ValidationError::ProfileNotFound,
                 "validation.profile_not_found",
             ),
             (
                 ValidationError::AmountMalformed {
-                    input: "abc XLM".to_owned(),
+                    field: "--amount".into(),
                 },
                 "validation.amount_malformed",
             ),
             (
                 ValidationError::AmountUnitMismatch {
-                    input: "100 XLM".to_owned(),
+                    field: "--amount".into(),
                     expected: "TST".to_owned(),
-                    supplied: "XLM".to_owned(),
                 },
                 "validation.amount_malformed",
             ),
             (
                 ValidationError::AmountOutOfRange {
-                    amount: "99999999999999999999".to_owned(),
+                    field: "--amount".into(),
                 },
                 "validation.amount_out_of_range",
             ),
             (
-                ValidationError::OutputFormatInvalid {
-                    input: "xml".to_owned(),
-                },
+                ValidationError::OutputFormatInvalid,
                 "validation.output_format_invalid",
             ),
             (
                 ValidationError::MemoMutuallyExclusive,
                 "validation.memo_mutually_exclusive",
+            ),
+            (
+                ValidationError::MemoControlCharacter {
+                    code_point: "U+001B".to_owned(),
+                },
+                "validation.memo_control_character",
             ),
             (
                 ValidationError::InvalidPluginName {
@@ -3319,9 +4686,7 @@ mod tests {
                 "validation.relayer_not_implemented",
             ),
             (
-                ValidationError::ValidUntilInvalid {
-                    input: "foo".to_owned(),
-                },
+                ValidationError::ValidUntilInvalid,
                 "validation.valid_until_invalid",
             ),
             (
@@ -3338,12 +4703,7 @@ mod tests {
                 },
                 "validation.rule_name_too_long",
             ),
-            (
-                ValidationError::AuditLogNotFound {
-                    path: "/tmp/audit.jsonl".to_owned(),
-                },
-                "audit.log_not_found",
-            ),
+            (ValidationError::AuditLogNotFound, "audit.log_not_found"),
             (
                 ValidationError::ProviderAttestationInvalid {
                     name: "mainnet".into(),
@@ -3356,16 +4716,11 @@ mod tests {
                 "validation.provider_attestation_invalid",
             ),
             (
-                ValidationError::MainnetRpcUrlRequired {
-                    name: "mainnet".to_owned(),
-                },
+                ValidationError::MainnetRpcUrlRequired,
                 "validation.mainnet_rpc_url_required",
             ),
             (
-                ValidationError::ProfileAlreadyExists {
-                    name: "default".to_owned(),
-                    path: "/home/user/.local/share/stellar-agent/profiles/default.toml".to_owned(),
-                },
+                ValidationError::ProfileAlreadyExists,
                 "validation.profile_already_exists",
             ),
             (
@@ -3402,9 +4757,8 @@ mod tests {
             ),
             (
                 ValidationError::ProfileNameMismatch {
-                    detail: "profile 'alice' was selected, but its \
-                             policy_owner_key_id.service is \
-                             'stellar-agent-owner-default'"
+                    detail: "the selected profile's policy_owner_key_id.service names a \
+                             different profile"
                         .to_owned(),
                 },
                 "profile.name_mismatch",
@@ -3437,6 +4791,73 @@ mod tests {
                 "audit.tip_anchor_mismatch",
             ),
             (
+                ValidationError::AuditTipAnchorMissing {
+                    profile: "default".to_owned(),
+                    evidence: "an audit binding is recorded for the profile".to_owned(),
+                },
+                "audit.tip_anchor_missing",
+            ),
+            (
+                ValidationError::AuditOutboxRowsMissing {
+                    detail: "missing queued rows".to_owned(),
+                },
+                "audit.outbox_rows_missing",
+            ),
+            (
+                ValidationError::AuditOutboxFull {
+                    detail: "queue at its cap".to_owned(),
+                },
+                "audit.outbox_full",
+            ),
+            (
+                ValidationError::AuditOutboxRowTooLarge {
+                    detail: "row over the cap".to_owned(),
+                },
+                "audit.outbox_row_too_large",
+            ),
+            (
+                ValidationError::AuditOutboxEvidenceUnusable {
+                    detail: "owner rollback".to_owned(),
+                },
+                "audit.outbox_evidence_unusable",
+            ),
+            (
+                ValidationError::AuditOutboxLossNotFound {
+                    detail: "no queued-row loss".to_owned(),
+                },
+                "audit.outbox_loss_not_found",
+            ),
+            (
+                ValidationError::AuditCarrierReplaced {
+                    detail: "audit.carrier_replaced: lock replaced".to_owned(),
+                },
+                "audit.carrier_replaced",
+            ),
+            (
+                ValidationError::AuditCarriersUnbound {
+                    detail: "audit.carriers_unbound: bind carriers".to_owned(),
+                },
+                "audit.carriers_unbound",
+            ),
+            (
+                ValidationError::AuditCarrierIdentityUnavailable {
+                    detail: "audit.carrier_identity_unavailable: no file id".to_owned(),
+                },
+                "audit.carrier_identity_unavailable",
+            ),
+            (
+                ValidationError::AuditCarriersBusy {
+                    detail: "audit.carriers_busy: stop wallet processes".to_owned(),
+                },
+                "audit.carriers_busy",
+            ),
+            (
+                ValidationError::AuditCarrierBindingIncomplete {
+                    detail: "audit.carrier_binding_incomplete: rerun bind-carriers".to_owned(),
+                },
+                "audit.carrier_binding_incomplete",
+            ),
+            (
                 ValidationError::AuditLogUnusable {
                     profile: "default".to_owned(),
                     detail: "audit.writer_locked: the lock is held".to_owned(),
@@ -3448,6 +4869,13 @@ mod tests {
                     profile: "default".to_owned(),
                     current: "12:3400".to_owned(),
                     proposed: "9:2600".to_owned(),
+                },
+                "validation.acknowledgement_required",
+            ),
+            (
+                ValidationError::AuditUnauthenticatedTailNotAcknowledged {
+                    profile: "default".to_owned(),
+                    count: 2,
                 },
                 "validation.acknowledgement_required",
             ),
@@ -3465,21 +4893,29 @@ mod tests {
                 "validation.acknowledgement_required",
             ),
             (
+                ValidationError::PolicyPinCoordinate {
+                    field: "keyring_coordinate",
+                },
+                "validation.policy_pin_coordinate",
+            ),
+            (
+                ValidationError::InstallationKeyCoordinate {
+                    field: "attestation_key_id",
+                },
+                "validation.installation_key_coordinate",
+            ),
+            (
                 ValidationError::KeyMatchesOwnerPublicKey {
                     field: "attestation_key_id",
                 },
                 "validation.key_matches_owner_public_key",
             ),
             (
-                ValidationError::SecretEnvNotSet {
-                    var: "DEPLOYER_SECRET".to_owned(),
-                },
+                ValidationError::SecretEnvNotSet,
                 "validation.secret_env_not_set",
             ),
             (
-                ValidationError::SecretEnvInvalid {
-                    var: "DEPLOYER_SECRET".to_owned(),
-                },
+                ValidationError::SecretEnvInvalid,
                 "validation.secret_env_invalid",
             ),
             (
@@ -3491,32 +4927,131 @@ mod tests {
                 "validation.signer_source_required",
             ),
             (
+                ValidationError::MainnetSecretEnvRefused,
+                "validation.mainnet_secret_env_refused",
+            ),
+            (
                 ValidationError::MainnetFeeCapRequired,
                 "validation.mainnet_fee_cap_required",
             ),
             (
                 ValidationError::FeeAboveCap {
-                    per_op: 500,
+                    per_op: DerivedFee::new(500, &FeeSource::Envelope),
                     cap: 400,
                     fee_source: FeeSource::Envelope,
                 },
                 "fees.percentile_exceeds_cap",
             ),
             (
-                ValidationError::FeeTotalOverflow {
-                    per_op: u32::MAX,
-                    op_count: 3,
-                },
+                ValidationError::FeeTotalOverflow { op_count: 3 },
                 "validation.fee_total_overflow",
+            ),
+            (
+                ValidationError::ResetWindowStateOwnerRequired {
+                    profile: "default".to_owned(),
+                },
+                "profile.reset_window_state_owner_required",
+            ),
+            (
+                ValidationError::ResetWindowStateOwnerMismatch {
+                    profile: "default".to_owned(),
+                    derived: "derived".to_owned(),
+                    pinned: "pinned".to_owned(),
+                },
+                "profile.reset_window_state_owner_mismatch",
+            ),
+            (
+                ValidationError::ResetWindowStateSignatureInvalid {
+                    profile: "default".to_owned(),
+                },
+                "profile.reset_window_state_signature_invalid",
+            ),
+            (
+                ValidationError::ResetWindowStateNewerVersion {
+                    profile: "default".to_owned(),
+                },
+                "profile.reset_window_state_newer_version",
+            ),
+            (
+                ValidationError::WindowChainMismatch,
+                "policy.window_chain_mismatch",
+            ),
+            (
+                ValidationError::WindowChainUnverifiable,
+                "policy.window_chain_unverifiable",
+            ),
+            (
+                ValidationError::BusinessIdRequired,
+                "validation.business_id_required",
+            ),
+            (
+                ValidationError::BusinessIdInvalid,
+                "validation.business_id_invalid",
+            ),
+            (
+                ValidationError::OperationBusinessIdConflict,
+                "operation.business_id_conflict",
+            ),
+            (
+                ValidationError::OperationBusinessIdMismatch,
+                "operation.business_id_mismatch",
+            ),
+            (
+                ValidationError::ResetOperationsOpen { open: 2 },
+                "reset.operations_open",
+            ),
+            (
+                ValidationError::TotalEpochUnavailable {
+                    detail: "absent".to_owned(),
+                },
+                "policy.total_epoch_unavailable",
+            ),
+            (ValidationError::TotalEpochStale, "policy.total_epoch_stale"),
+            (
+                ValidationError::TotalEpochRetired,
+                "policy.total_epoch_retired",
+            ),
+            (
+                ValidationError::UnlistedApprovalRequired,
+                "policy.approval_required",
+            ),
+            (
+                ValidationError::AccountingOverflow,
+                "policy.accounting_overflow",
+            ),
+            (
+                ValidationError::AccountingInvalid,
+                "policy.accounting_invalid",
+            ),
+            (
+                ValidationError::ResetApprovalsPending { pending: 2 },
+                "reset.approvals_pending",
+            ),
+            (
+                ValidationError::AuditAppendFailed {
+                    detail: "the log is full".to_owned(),
+                },
+                "audit.append_failed",
             ),
         ];
 
         for (variant, expected_code) in cases {
             let wallet_err = WalletError::Validation(match variant {
+                ValidationError::SacPayment(reason) => ValidationError::SacPayment(reason.clone()),
+                ValidationError::WindowChainMismatch => ValidationError::WindowChainMismatch,
+                ValidationError::WindowChainUnverifiable => {
+                    ValidationError::WindowChainUnverifiable
+                }
+                ValidationError::MainnetEnablementInvalid { binding } => {
+                    ValidationError::MainnetEnablementInvalid { binding }
+                }
+                ValidationError::MainnetOracleRequired { gap } => {
+                    ValidationError::MainnetOracleRequired { gap: *gap }
+                }
                 ValidationError::AmountUnitsRequired => ValidationError::AmountUnitsRequired,
-                ValidationError::AmountPrecisionExceeded { amount } => {
+                ValidationError::AmountPrecisionExceeded { field } => {
                     ValidationError::AmountPrecisionExceeded {
-                        amount: amount.clone(),
+                        field: field.clone(),
                     }
                 }
                 ValidationError::MemoRequired { destination } => ValidationError::MemoRequired {
@@ -3527,36 +5062,32 @@ mod tests {
                         memo_type: memo_type.clone(),
                     }
                 }
-                ValidationError::AddressInvalid { input } => ValidationError::AddressInvalid {
-                    input: input.clone(),
+                ValidationError::AddressInvalid { field } => ValidationError::AddressInvalid {
+                    field: field.clone(),
                 },
-                ValidationError::AssetInvalid { input } => ValidationError::AssetInvalid {
-                    input: input.clone(),
+                ValidationError::AssetInvalid { field } => ValidationError::AssetInvalid {
+                    field: field.clone(),
                 },
-                ValidationError::ProfileNotFound { name } => {
-                    ValidationError::ProfileNotFound { name: name.clone() }
-                }
-                ValidationError::AmountMalformed { input } => ValidationError::AmountMalformed {
-                    input: input.clone(),
+                ValidationError::ProfileNotFound => ValidationError::ProfileNotFound,
+                ValidationError::AmountMalformed { field } => ValidationError::AmountMalformed {
+                    field: field.clone(),
                 },
-                ValidationError::AmountUnitMismatch {
-                    input,
-                    expected,
-                    supplied,
-                } => ValidationError::AmountUnitMismatch {
-                    input: input.clone(),
-                    expected: expected.clone(),
-                    supplied: supplied.clone(),
-                },
-                ValidationError::AmountOutOfRange { amount } => ValidationError::AmountOutOfRange {
-                    amount: amount.clone(),
-                },
-                ValidationError::OutputFormatInvalid { input } => {
-                    ValidationError::OutputFormatInvalid {
-                        input: input.clone(),
+                ValidationError::AmountUnitMismatch { field, expected } => {
+                    ValidationError::AmountUnitMismatch {
+                        field: field.clone(),
+                        expected: expected.clone(),
                     }
                 }
+                ValidationError::AmountOutOfRange { field } => ValidationError::AmountOutOfRange {
+                    field: field.clone(),
+                },
+                ValidationError::OutputFormatInvalid => ValidationError::OutputFormatInvalid,
                 ValidationError::MemoMutuallyExclusive => ValidationError::MemoMutuallyExclusive,
+                ValidationError::MemoControlCharacter { code_point } => {
+                    ValidationError::MemoControlCharacter {
+                        code_point: code_point.clone(),
+                    }
+                }
                 ValidationError::InvalidPluginName { reason } => {
                     ValidationError::InvalidPluginName {
                         reason: reason.clone(),
@@ -3603,11 +5134,7 @@ mod tests {
                     }
                 }
                 ValidationError::RelayerNotImplemented => ValidationError::RelayerNotImplemented,
-                ValidationError::ValidUntilInvalid { input } => {
-                    ValidationError::ValidUntilInvalid {
-                        input: input.clone(),
-                    }
-                }
+                ValidationError::ValidUntilInvalid => ValidationError::ValidUntilInvalid,
                 ValidationError::ConfigInvalid { component, reason } => {
                     ValidationError::ConfigInvalid {
                         component,
@@ -3620,24 +5147,15 @@ mod tests {
                         max: *max,
                     }
                 }
-                ValidationError::AuditLogNotFound { path } => {
-                    ValidationError::AuditLogNotFound { path: path.clone() }
-                }
+                ValidationError::AuditLogNotFound => ValidationError::AuditLogNotFound,
                 ValidationError::ProviderAttestationInvalid { name, source } => {
                     ValidationError::ProviderAttestationInvalid {
                         name: name.clone(),
                         source: source.clone(),
                     }
                 }
-                ValidationError::MainnetRpcUrlRequired { name } => {
-                    ValidationError::MainnetRpcUrlRequired { name: name.clone() }
-                }
-                ValidationError::ProfileAlreadyExists { name, path } => {
-                    ValidationError::ProfileAlreadyExists {
-                        name: name.clone(),
-                        path: path.clone(),
-                    }
-                }
+                ValidationError::MainnetRpcUrlRequired => ValidationError::MainnetRpcUrlRequired,
+                ValidationError::ProfileAlreadyExists => ValidationError::ProfileAlreadyExists,
                 ValidationError::NetworkFlagMismatch {
                     flag,
                     profile,
@@ -3704,6 +5222,60 @@ mod tests {
                         reason: reason.clone(),
                     }
                 }
+                ValidationError::AuditTipAnchorMissing { profile, evidence } => {
+                    ValidationError::AuditTipAnchorMissing {
+                        profile: profile.clone(),
+                        evidence: evidence.clone(),
+                    }
+                }
+                ValidationError::AuditOutboxRowsMissing { detail } => {
+                    ValidationError::AuditOutboxRowsMissing {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditOutboxFull { detail } => ValidationError::AuditOutboxFull {
+                    detail: detail.clone(),
+                },
+                ValidationError::AuditOutboxRowTooLarge { detail } => {
+                    ValidationError::AuditOutboxRowTooLarge {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditOutboxEvidenceUnusable { detail } => {
+                    ValidationError::AuditOutboxEvidenceUnusable {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditOutboxLossNotFound { detail } => {
+                    ValidationError::AuditOutboxLossNotFound {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditCarrierReplaced { detail } => {
+                    ValidationError::AuditCarrierReplaced {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditCarriersUnbound { detail } => {
+                    ValidationError::AuditCarriersUnbound {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditCarrierIdentityUnavailable { detail } => {
+                    ValidationError::AuditCarrierIdentityUnavailable {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditCarriersBusy { detail } => {
+                    ValidationError::AuditCarriersBusy {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditCarrierBindingIncomplete { detail } => {
+                    ValidationError::AuditCarrierBindingIncomplete {
+                        detail: detail.clone(),
+                    }
+                }
                 ValidationError::AuditLogUnusable { profile, detail } => {
                     ValidationError::AuditLogUnusable {
                         profile: profile.clone(),
@@ -3719,6 +5291,12 @@ mod tests {
                     current: current.clone(),
                     proposed: proposed.clone(),
                 },
+                ValidationError::AuditUnauthenticatedTailNotAcknowledged { profile, count } => {
+                    ValidationError::AuditUnauthenticatedTailNotAcknowledged {
+                        profile: profile.clone(),
+                        count: *count,
+                    }
+                }
                 ValidationError::AuditLogBindingChanged { profile } => {
                     ValidationError::AuditLogBindingChanged {
                         profile: profile.clone(),
@@ -3730,19 +5308,24 @@ mod tests {
                         missing,
                     }
                 }
+                ValidationError::PolicyPinCoordinate { field } => {
+                    ValidationError::PolicyPinCoordinate { field }
+                }
+                ValidationError::InstallationKeyCoordinate { field } => {
+                    ValidationError::InstallationKeyCoordinate { field }
+                }
                 ValidationError::KeyMatchesOwnerPublicKey { field } => {
                     ValidationError::KeyMatchesOwnerPublicKey { field }
                 }
-                ValidationError::SecretEnvNotSet { var } => {
-                    ValidationError::SecretEnvNotSet { var: var.clone() }
-                }
-                ValidationError::SecretEnvInvalid { var } => {
-                    ValidationError::SecretEnvInvalid { var: var.clone() }
-                }
+                ValidationError::SecretEnvNotSet => ValidationError::SecretEnvNotSet,
+                ValidationError::SecretEnvInvalid => ValidationError::SecretEnvInvalid,
                 ValidationError::SignerSourceRequired { detail } => {
                     ValidationError::SignerSourceRequired {
                         detail: detail.clone(),
                     }
+                }
+                ValidationError::MainnetSecretEnvRefused => {
+                    ValidationError::MainnetSecretEnvRefused
                 }
                 ValidationError::MainnetFeeCapRequired => ValidationError::MainnetFeeCapRequired,
                 ValidationError::FeeAboveCap {
@@ -3754,10 +5337,82 @@ mod tests {
                     cap: *cap,
                     fee_source: fee_source.clone(),
                 },
-                ValidationError::FeeTotalOverflow { per_op, op_count } => {
+                ValidationError::FeeTotalOverflow { op_count } => {
                     ValidationError::FeeTotalOverflow {
-                        per_op: *per_op,
                         op_count: *op_count,
+                    }
+                }
+                ValidationError::ResetWindowStateOwnerRequired { profile } => {
+                    ValidationError::ResetWindowStateOwnerRequired {
+                        profile: profile.clone(),
+                    }
+                }
+                ValidationError::ResetWindowStateOwnerMismatch {
+                    profile,
+                    derived,
+                    pinned,
+                } => ValidationError::ResetWindowStateOwnerMismatch {
+                    profile: profile.clone(),
+                    derived: derived.clone(),
+                    pinned: pinned.clone(),
+                },
+                ValidationError::ResetWindowStateSignatureInvalid { profile } => {
+                    ValidationError::ResetWindowStateSignatureInvalid {
+                        profile: profile.clone(),
+                    }
+                }
+                ValidationError::ResetWindowStateNewerVersion { profile } => {
+                    ValidationError::ResetWindowStateNewerVersion {
+                        profile: profile.clone(),
+                    }
+                }
+                #[cfg(feature = "mainnet-write")]
+                ValidationError::WindowStateUnverifiable { profile, defect } => {
+                    ValidationError::WindowStateUnverifiable {
+                        profile: profile.clone(),
+                        defect,
+                    }
+                }
+                #[cfg(feature = "mainnet-write")]
+                ValidationError::ResetWindowStateOpenAuthorizations { profile, open } => {
+                    ValidationError::ResetWindowStateOpenAuthorizations {
+                        profile: profile.clone(),
+                        open: *open,
+                    }
+                }
+                ValidationError::BusinessIdRequired => ValidationError::BusinessIdRequired,
+                ValidationError::BusinessIdInvalid => ValidationError::BusinessIdInvalid,
+                ValidationError::OperationBusinessIdConflict => {
+                    ValidationError::OperationBusinessIdConflict
+                }
+                ValidationError::OperationBusinessIdMismatch => {
+                    ValidationError::OperationBusinessIdMismatch
+                }
+                ValidationError::StatusSelectors { detail } => {
+                    ValidationError::StatusSelectors { detail }
+                }
+                ValidationError::OperationUnknown => ValidationError::OperationUnknown,
+                ValidationError::ResetOperationsOpen { open } => {
+                    ValidationError::ResetOperationsOpen { open: *open }
+                }
+                ValidationError::TotalEpochUnavailable { detail } => {
+                    ValidationError::TotalEpochUnavailable {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::TotalEpochStale => ValidationError::TotalEpochStale,
+                ValidationError::TotalEpochRetired => ValidationError::TotalEpochRetired,
+                ValidationError::UnlistedApprovalRequired => {
+                    ValidationError::UnlistedApprovalRequired
+                }
+                ValidationError::AccountingOverflow => ValidationError::AccountingOverflow,
+                ValidationError::AccountingInvalid => ValidationError::AccountingInvalid,
+                ValidationError::ResetApprovalsPending { pending } => {
+                    ValidationError::ResetApprovalsPending { pending: *pending }
+                }
+                ValidationError::AuditAppendFailed { detail } => {
+                    ValidationError::AuditAppendFailed {
+                        detail: detail.clone(),
                     }
                 }
             });
@@ -3771,13 +5426,39 @@ mod tests {
         }
     }
 
+    /// A fee the caller or the profile chose stays out of every rendering of
+    /// the cap and overflow refusals; a derived fee stays in the diagnostic.
+    #[test]
+    fn chosen_fees_stay_out_of_cap_refusals() {
+        for fee_source in [
+            FeeSource::Explicit,
+            FeeSource::ExplicitArgument { argument: "fee" },
+            FeeSource::ProfileDefault,
+        ] {
+            let per_op = DerivedFee::new(424_242, &fee_source);
+            assert_eq!(per_op.stroops(), None, "{fee_source:?}");
+            let error = ValidationError::FeeAboveCap {
+                per_op,
+                cap: 100,
+                fee_source,
+            };
+            stellar_agent_test_support::rejected_value::assert_no_marker(&error, "424242");
+        }
+        let derived = ValidationError::FeeAboveCap {
+            per_op: DerivedFee::new(424_242, &FeeSource::Envelope),
+            cap: 100,
+            fee_source: FeeSource::Envelope,
+        };
+        assert!(derived.to_string().contains("424242"), "{derived}");
+    }
+
     /// Each fee source names its own remedy, and the mainnet and overflow
     /// refusals carry their fixed texts.
     #[test]
     fn fee_cap_texts_name_the_fee_source() {
         let text = |fee_source: FeeSource| {
             ValidationError::FeeAboveCap {
-                per_op: 500,
+                per_op: DerivedFee::new(500, &fee_source),
                 cap: 400,
                 fee_source,
             }
@@ -3793,14 +5474,18 @@ mod tests {
         );
         assert_eq!(
             text(FeeSource::Explicit),
-            "the explicit per-operation fee 500 stroops exceeds the profile cap of 400 stroops; \
-             lower the fee or raise classic_max_fee_per_op_stroops"
+            "--fee must be a per-operation stroop amount within classic_max_fee_per_op_stroops; \
+             lower --fee or raise classic_max_fee_per_op_stroops."
+        );
+        assert_eq!(
+            text(FeeSource::ExplicitArgument { argument: "fee" }),
+            "fee must be a per-operation stroop amount within classic_max_fee_per_op_stroops; \
+             lower fee or raise classic_max_fee_per_op_stroops."
         );
         assert_eq!(
             text(FeeSource::ProfileDefault),
-            "the profile's per-operation fee 500 stroops (classic_fee_per_op_stroops) exceeds \
-             the profile cap of 400 stroops; lower classic_fee_per_op_stroops or raise \
-             classic_max_fee_per_op_stroops"
+            "classic_fee_per_op_stroops must not exceed classic_max_fee_per_op_stroops; lower \
+             classic_fee_per_op_stroops or raise classic_max_fee_per_op_stroops."
         );
         assert_eq!(
             text(FeeSource::CommandDefault),
@@ -3818,17 +5503,35 @@ mod tests {
              fee cap in the profile file"
         );
         assert_eq!(
-            ValidationError::FeeTotalOverflow {
-                per_op: 75_400_000,
-                op_count: 57,
-            }
-            .to_string(),
-            "per-operation fee 75400000 stroops times 57 operations exceeds the transaction fee \
-             limit; lower classic_fee_per_op_stroops"
+            ValidationError::FeeTotalOverflow { op_count: 57 }.to_string(),
+            "classic_fee_per_op_stroops multiplied by the operation count must fit in u32; lower \
+             classic_fee_per_op_stroops."
         );
     }
 
     // ── Network errors ───────────────────────────────────────────────────────
+
+    /// The missing-threshold remedy names the signed table for mainnet and
+    /// the profile table for other networks.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertion")]
+    fn missing_threshold_remedy_names_the_table_of_each_network() {
+        let asset = crate::asset_id::CanonicalAsset::contract(
+            &stellar_strkey::Contract([3; 32]).to_string(),
+        )
+        .expect("a contract address");
+        assert_eq!(
+            WitnessUnavailableReason::NoThresholdForAsset {
+                asset: asset.clone()
+            }
+            .to_string(),
+            format!(
+                "cross-check unavailable: no cross-check threshold applies to asset '{asset}'; \
+                 on mainnet add it to [mainnet.cross_check_thresholds] of the signed policy, \
+                 on other networks to [cross_check_thresholds] in the profile file"
+            )
+        );
+    }
 
     fn witness_errors() -> Vec<NetworkError> {
         use crate::cross_check::{WitnessEntry, WitnessField};
@@ -3862,6 +5565,7 @@ mod tests {
                 attempts: 3,
             },
             WitnessUnavailableReason::InvalidAnswer { authority },
+            WitnessUnavailableReason::EnvelopeMismatch { part: "sequence" },
         ]
         .into_iter()
         .map(|reason| NetworkError::WitnessUnavailable { reason })
@@ -3914,6 +5618,16 @@ mod tests {
                 "network.mainnet_write_forbidden",
             ),
             (
+                NetworkError::MainnetAuthorizationRefused,
+                "network.mainnet_authorization_refused",
+            ),
+            (
+                NetworkError::MainnetKeyringBackendUnsupported {
+                    backend: "headless-env",
+                },
+                "network.mainnet_keyring_backend_unsupported",
+            ),
+            (
                 NetworkError::HorizonUnavailable { status: 503 },
                 "network.horizon_unavailable",
             ),
@@ -3931,6 +5645,19 @@ mod tests {
                 "network.endpoint_identity_unavailable",
             ),
             (
+                NetworkError::EndpointNotReady {
+                    reason: "endpoint reports status \"catching up\"".to_owned(),
+                },
+                "network.endpoint_not_ready",
+            ),
+            (
+                NetworkError::PreSendTimeout {
+                    read: "endpoint identity probe".to_owned(),
+                    budget_secs: 30,
+                },
+                "network.pre_send_timeout",
+            ),
+            (
                 NetworkError::UnsupportedProtocolVersion {
                     protocol_version: 31,
                     supported_min: 28,
@@ -3943,9 +5670,7 @@ mod tests {
                 "network.envelope_signed_for_mainnet",
             ),
             (
-                NetworkError::EnvelopeSignatureUnverifiable {
-                    hint: "0a1b2c3d".to_owned(),
-                },
+                NetworkError::EnvelopeSignatureUnverifiable,
                 "network.envelope_signature_unverifiable",
             ),
             (NetworkError::EnvelopeUnsigned, "network.envelope_unsigned"),
@@ -4071,6 +5796,15 @@ mod tests {
                 },
                 "auth.enrolled_signer_mismatch",
             ),
+            (
+                AuthError::EnrolledIdentityUnusable {
+                    profile: "mainnet".into(),
+                    reason: "missing",
+                    enrolled: None,
+                    source_flag: None,
+                },
+                "auth.enrolled_identity_unusable",
+            ),
             (AuthError::KeyringLocked, "auth.keyring_locked"),
             (
                 AuthError::KeyringPlatformError {
@@ -4085,7 +5819,7 @@ mod tests {
             ),
             (
                 AuthError::KeyringNotFound {
-                    name: "main".to_owned(),
+                    cause: crate::error::KeyringMissingCause::MissingEntry,
                 },
                 "auth.keyring_not_found",
             ),
@@ -4117,6 +5851,122 @@ mod tests {
 
         let wallet_err = WalletError::Auth(AuthError::KeyringLocked);
         assert_eq!(wallet_err.category(), ErrorCategory::Auth);
+    }
+
+    #[test]
+    fn enrolled_identity_unusable_formats_mismatch_with_address() {
+        let address = "GAQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCB5Q";
+        for reason in ["public_key_mismatch", "fee_source_mismatch"] {
+            for (source_flag, tail) in [
+                (None, "pass it as the source"),
+                (Some("--from"), "pass it as the source with `--from`"),
+                (Some("--sponsor"), "pass it as the source with `--sponsor`"),
+            ] {
+                let with_addr = AuthError::EnrolledIdentityUnusable {
+                    profile: "ops".into(),
+                    reason,
+                    enrolled: Some(address.into()),
+                    source_flag,
+                };
+                assert_eq!(with_addr.code(), "auth.enrolled_identity_unusable");
+                let msg = with_addr.to_string();
+                assert!(msg.contains(reason), "{msg}");
+                assert!(msg.contains(address), "{msg}");
+                assert!(msg.ends_with(tail), "{msg}");
+                assert!(!msg.contains("--repair-identity"), "{msg}");
+                assert!(!msg.contains("bind-signer"), "{msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn enrolled_identity_unusable_formats_mismatch_without_address() {
+        for reason in ["public_key_mismatch", "fee_source_mismatch"] {
+            let without_addr = AuthError::EnrolledIdentityUnusable {
+                profile: "ops".into(),
+                reason,
+                enrolled: None,
+                source_flag: None,
+            };
+            let fallback_msg = without_addr.to_string();
+            assert!(fallback_msg.contains(reason), "{fallback_msg}");
+            assert!(
+                fallback_msg.contains("pass the profile's enrolled signer as the source"),
+                "{fallback_msg}"
+            );
+            assert!(
+                !fallback_msg.contains("--repair-identity"),
+                "{fallback_msg}"
+            );
+            assert!(!fallback_msg.contains("bind-signer"), "{fallback_msg}");
+        }
+    }
+
+    #[test]
+    fn enrolled_identity_unusable_formats_repair_identity_reasons() {
+        for reason in [
+            "missing",
+            "malformed",
+            "unsupported_version",
+            "malformed_key",
+            "unsupported_role",
+        ] {
+            let err = AuthError::EnrolledIdentityUnusable {
+                profile: "ops".into(),
+                reason,
+                enrolled: None,
+                source_flag: None,
+            };
+            let msg = err.to_string();
+            assert!(msg.contains(reason), "{msg}");
+            assert!(
+                msg.contains("stellar-agent profile enroll-signer --profile ops --repair-identity"),
+                "{msg}"
+            );
+            assert!(!msg.contains("bind-signer"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn enrolled_identity_unusable_formats_bind_signer_reasons() {
+        for reason in ["unbound", "owner_mismatch", "binding_signature_invalid"] {
+            let err = AuthError::EnrolledIdentityUnusable {
+                profile: "ops".into(),
+                reason,
+                enrolled: None,
+                source_flag: None,
+            };
+            let msg = err.to_string();
+            assert!(msg.contains(reason), "{msg}");
+            assert!(
+                msg.contains(
+                    "stellar-agent profile bind-signer --profile ops --owner-secret-env <VAR>"
+                ),
+                "{msg}"
+            );
+            assert!(!msg.contains("--repair-identity"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn enrolled_identity_unusable_formats_other_reasons_without_commands() {
+        for reason in [
+            "disk_disagreement",
+            "pin_mismatch",
+            "bound_elsewhere",
+            "owner_required",
+        ] {
+            let err = AuthError::EnrolledIdentityUnusable {
+                profile: "ops".into(),
+                reason,
+                enrolled: None,
+                source_flag: None,
+            };
+            let msg = err.to_string();
+            assert!(msg.contains(reason), "{msg}");
+            assert!(!msg.contains("--repair-identity"), "{msg}");
+            assert!(!msg.contains("bind-signer"), "{msg}");
+        }
     }
 
     /// Round-trip coverage for `SubmissionError::TxTimeout` and related variants.
@@ -4191,10 +6041,10 @@ mod tests {
             ),
             (
                 "the keyring entry's account",
-                "GABC1\u{2026}C1234",
+                "a G-strkey",
                 "invalid public account",
                 "signing key public key 'invalid public account' does not match the keyring \
-                 entry's account 'GABC1\u{2026}C1234'",
+                 entry's account 'a G-strkey'",
             ),
         ];
         for (what, expected, got, message) in cases {
@@ -4243,6 +6093,12 @@ mod tests {
                     detail: "invalid TTL 601s: TTL exceeds the maximum".to_owned(),
                 },
                 "wallet_state.unlock_failed",
+            ),
+            (
+                WalletStateError::ClockError {
+                    detail: "system clock is before UNIX_EPOCH".to_owned(),
+                },
+                "wallet.clock_error",
             ),
         ];
 
@@ -4325,6 +6181,30 @@ mod tests {
             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned();
         let cases: Vec<(SubmissionError, &'static str)> = vec![
             (
+                SubmissionError::IntentRecordUnavailable {
+                    class: "window_unavailable",
+                },
+                "submission.intent_record_unavailable",
+            ),
+            (
+                SubmissionError::IntentBindingMismatch { field: "signers" },
+                "submission.intent_binding_mismatch",
+            ),
+            (
+                SubmissionError::OperationCapacity {
+                    detail: "envelope_size",
+                },
+                "operation.capacity",
+            ),
+            (
+                SubmissionError::OperationAttemptOpen,
+                "operation.attempt_open",
+            ),
+            (
+                SubmissionError::OperationAttemptLimit,
+                "operation.attempt_limit",
+            ),
+            (
                 SubmissionError::SequenceNumberStale,
                 "submission.sequence_number_stale",
             ),
@@ -4373,6 +6253,16 @@ mod tests {
                 "submission.record_unavailable",
             ),
             (
+                SubmissionError::ReceiptStoreUnreadable {
+                    detail: "receipt store is not readable".to_owned(),
+                },
+                "submission.record_unavailable",
+            ),
+            (
+                SubmissionError::SettlementUnverifiable,
+                "submission.settlement_unverifiable",
+            ),
+            (
                 SubmissionError::HashMismatch {
                     local: full_hash.clone(),
                     server: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -4383,6 +6273,13 @@ mod tests {
         ];
 
         assert_code_round_trips!(&cases);
+
+        let unverifiable = WalletError::Submission(SubmissionError::SettlementUnverifiable);
+        assert_eq!(unverifiable.code(), "submission.settlement_unverifiable");
+        assert_eq!(
+            unverifiable.to_string(),
+            "Authenticated settlement evidence is unavailable."
+        );
 
         let wallet_err = WalletError::Submission(SubmissionError::SequenceNumberStale);
         assert_eq!(wallet_err.category(), ErrorCategory::Submission);
@@ -4479,6 +6376,191 @@ mod tests {
             detail: "test".to_owned(),
         });
         assert_eq!(wallet_err.category(), ErrorCategory::Internal);
+    }
+
+    /// Every recovery refusal and the account regression keep their own codes
+    /// through the wallet error envelope, and their texts carry the detail.
+    #[test]
+    fn recovery_codes_round_trip() {
+        let cases: Vec<(WalletError, &'static str, ErrorCategory)> = vec![
+            (
+                SubmissionError::RecoveryEvidencePending {
+                    detail: "missing_field",
+                }
+                .into(),
+                "recovery.evidence_pending",
+                ErrorCategory::Submission,
+            ),
+            (
+                SubmissionError::RecoveryEndpointDisagreement {
+                    detail: "status_result_mismatch",
+                }
+                .into(),
+                "recovery.endpoint_disagreement",
+                ErrorCategory::Submission,
+            ),
+            (
+                SubmissionError::RecoveryRetryRefused.into(),
+                "recovery.retry_refused",
+                ErrorCategory::Submission,
+            ),
+            (
+                NetworkError::AccountLedgerRegressed {
+                    latest_ledger: 99,
+                    readiness_ledger: 100,
+                }
+                .into(),
+                "account.ledger_regressed",
+                ErrorCategory::Network,
+            ),
+        ];
+        for (error, code, category) in cases {
+            assert_eq!(error.code(), code, "{error:?}");
+            assert_eq!(error.category(), category, "{error:?}");
+        }
+        let regressed = NetworkError::AccountLedgerRegressed {
+            latest_ledger: 99,
+            readiness_ledger: 100,
+        };
+        assert_ne!(regressed.code(), "network.rpc_unreachable");
+        assert!(regressed.to_string().contains("ledger 99"), "{regressed}");
+        assert!(regressed.to_string().contains("ledger 100"), "{regressed}");
+        let pending = SubmissionError::RecoveryEvidencePending {
+            detail: "invalid_time",
+        };
+        assert!(pending.to_string().contains("invalid_time"), "{pending}");
+        let disagreement = SubmissionError::RecoveryEndpointDisagreement {
+            detail: "fee_invalid",
+        };
+        assert!(
+            disagreement.to_string().contains("fee_invalid"),
+            "{disagreement}"
+        );
+    }
+
+    /// Every operation store refusal keeps its code through the wallet error
+    /// envelope, and the store's defect code is the internal one.
+    #[test]
+    fn operation_codes_round_trip() {
+        let cases: Vec<(WalletError, &'static str, ErrorCategory)> = vec![
+            (
+                ValidationError::BusinessIdRequired.into(),
+                "validation.business_id_required",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::BusinessIdInvalid.into(),
+                "validation.business_id_invalid",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::OperationBusinessIdConflict.into(),
+                "operation.business_id_conflict",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::OperationBusinessIdMismatch.into(),
+                "operation.business_id_mismatch",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::StatusSelectors { detail: "neither" }.into(),
+                "validation.usage_error",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::OperationUnknown.into(),
+                "operation.unknown",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::ResetOperationsOpen { open: 1 }.into(),
+                "reset.operations_open",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::TotalEpochUnavailable {
+                    detail: "absent".to_owned(),
+                }
+                .into(),
+                "policy.total_epoch_unavailable",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::TotalEpochStale.into(),
+                "policy.total_epoch_stale",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::TotalEpochRetired.into(),
+                "policy.total_epoch_retired",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::UnlistedApprovalRequired.into(),
+                "policy.approval_required",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::AccountingOverflow.into(),
+                "policy.accounting_overflow",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::AccountingInvalid.into(),
+                "policy.accounting_invalid",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::ResetApprovalsPending { pending: 1 }.into(),
+                "reset.approvals_pending",
+                ErrorCategory::Validation,
+            ),
+            (
+                ValidationError::AuditAppendFailed {
+                    detail: "disk full".to_owned(),
+                }
+                .into(),
+                "audit.append_failed",
+                ErrorCategory::Validation,
+            ),
+            (
+                SubmissionError::OperationCapacity {
+                    detail: "file_size",
+                }
+                .into(),
+                "operation.capacity",
+                ErrorCategory::Submission,
+            ),
+            (
+                SubmissionError::OperationAttemptOpen.into(),
+                "operation.attempt_open",
+                ErrorCategory::Submission,
+            ),
+            (
+                SubmissionError::OperationAttemptLimit.into(),
+                "operation.attempt_limit",
+                ErrorCategory::Submission,
+            ),
+            (
+                InternalError::UnexpectedState {
+                    detail: "a 37th commit id".to_owned(),
+                }
+                .into(),
+                "internal.unexpected_state",
+                ErrorCategory::Internal,
+            ),
+        ];
+        for (error, code, category) in cases {
+            assert_eq!(error.code(), code, "{error:?}");
+            assert_eq!(error.category(), category, "{error:?}");
+        }
+        let capacity = SubmissionError::OperationCapacity {
+            detail: "envelope_size",
+        };
+        assert!(capacity.to_string().contains("envelope_size"), "{capacity}");
+        let open = ValidationError::ResetOperationsOpen { open: 3 };
+        assert!(open.to_string().contains("3 open operation"), "{open}");
     }
 
     // ── WalletError::SmartAccount variant ────────────────────────────────────
@@ -4611,23 +6693,19 @@ mod tests {
         let cases = [
             WalletError::Validation(ValidationError::AmountUnitsRequired),
             WalletError::Validation(ValidationError::AmountPrecisionExceeded {
-                amount: "1.12345678".to_owned(),
+                field: "--amount".into(),
             }),
             WalletError::Validation(ValidationError::MemoRequired {
                 destination: "GABCDEFGHIJKLMNOPQRSTUVWXYZ012345678901234567890123456".to_owned(),
             }),
             WalletError::Validation(ValidationError::MemoInvalidType {
-                memo_type: "MEMO_HASH".to_owned(),
+                memo_type: "HASH (must be exactly 64 hex characters)".into(),
             }),
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: "GABC".to_owned(),
-            }),
+            WalletError::Validation(ValidationError::address_argument("address")),
             WalletError::Validation(ValidationError::AssetInvalid {
-                input: "BAD:ASSET".to_owned(),
+                field: "asset".into(),
             }),
-            WalletError::Validation(ValidationError::ProfileNotFound {
-                name: "my-profile".to_owned(),
-            }),
+            WalletError::Validation(ValidationError::ProfileNotFound),
             WalletError::Validation(ValidationError::InvalidPluginName {
                 reason: "invalid character".to_owned(),
             }),
@@ -4638,17 +6716,14 @@ mod tests {
                 reason: "pass an explicit stroops value".to_owned(),
             }),
             WalletError::Validation(ValidationError::RelayerNotImplemented),
-            WalletError::Validation(ValidationError::SecretEnvNotSet {
-                var: "DEPLOYER_SECRET".to_owned(),
-            }),
-            WalletError::Validation(ValidationError::SecretEnvInvalid {
-                var: "DEPLOYER_SECRET".to_owned(),
-            }),
+            WalletError::Validation(ValidationError::SecretEnvNotSet),
+            WalletError::Validation(ValidationError::SecretEnvInvalid),
             WalletError::Validation(ValidationError::SignerSourceRequired {
                 detail: "no signer-source flag specified; pass --secret-env <VAR> \
                          or --sign-with-ledger"
                     .to_owned(),
             }),
+            WalletError::Validation(ValidationError::MainnetSecretEnvRefused),
         ];
         for err in &cases {
             let msg = err.message();
@@ -4675,6 +6750,7 @@ mod tests {
                 NetworkError::WitnessUnavailable {
                     reason: WitnessUnavailableReason::OracleNotConfigured
                         | WitnessUnavailableReason::NoThresholdForAsset { .. }
+                        | WitnessUnavailableReason::EnvelopeMismatch { .. }
                 } | NetworkError::WitnessDivergence { .. }
             );
             assert_eq!(
@@ -4705,15 +6781,21 @@ mod tests {
             WalletError::Network(NetworkError::EndpointIdentityUnavailable {
                 url: "https://rpc.example.com".to_owned(),
             }),
+            WalletError::Network(NetworkError::EndpointNotReady {
+                reason: "ledger 100 closed 61 s ago; the endpoint or the host clock is behind"
+                    .to_owned(),
+            }),
+            WalletError::Network(NetworkError::PreSendTimeout {
+                read: "signer-set read".to_owned(),
+                budget_secs: 30,
+            }),
             WalletError::Network(NetworkError::UnsupportedProtocolVersion {
                 protocol_version: 31,
                 supported_min: 28,
                 supported_max: 30,
             }),
             WalletError::Network(NetworkError::EnvelopeSignedForMainnet),
-            WalletError::Network(NetworkError::EnvelopeSignatureUnverifiable {
-                hint: "0a1b2c3d".to_owned(),
-            }),
+            WalletError::Network(NetworkError::EnvelopeSignatureUnverifiable),
             WalletError::Network(NetworkError::EnvelopeUnsigned),
             WalletError::Network(NetworkError::FriendbotAccountAlreadyFunded {
                 account_id: "GABCDEFGHIJKLMNOPQR".to_owned(),
@@ -4736,6 +6818,38 @@ mod tests {
         assert_eq!(
             err.message(),
             "account 'GABCDEFGHIJKLMNOPQR' already holds the Friendbot starting balance; Friendbot funds only an account below it"
+        );
+    }
+
+    /// The pre-send budget refusal names the read and the budget, says that
+    /// nothing was sent, and carries the `network.pre_send_timeout` code.
+    #[test]
+    fn pre_send_timeout_names_the_read_and_the_budget() {
+        let err = WalletError::Network(NetworkError::PreSendTimeout {
+            read: "endpoint identity probe".to_owned(),
+            budget_secs: 30,
+        });
+        assert_eq!(err.code(), "network.pre_send_timeout");
+        assert_eq!(
+            err.message(),
+            "the endpoint identity probe did not answer within the pre-send budget of 30 s; \
+             nothing was sent"
+        );
+    }
+
+    /// The not-ready refusal carries its reason after a fixed prefix and the
+    /// `network.endpoint_not_ready` code.
+    #[test]
+    fn endpoint_not_ready_names_the_reason() {
+        let err = WalletError::Network(NetworkError::EndpointNotReady {
+            reason: "ledger 100 closed 61 s ago; the endpoint or the host clock is behind"
+                .to_owned(),
+        });
+        assert_eq!(err.code(), "network.endpoint_not_ready");
+        assert_eq!(
+            err.message(),
+            "the endpoint is not ready for a transaction: ledger 100 closed 61 s ago; the \
+             endpoint or the host clock is behind"
         );
     }
 
@@ -4857,7 +6971,7 @@ mod tests {
             }),
             WalletError::Auth(AuthError::KeyringInteractiveSessionRequired),
             WalletError::Auth(AuthError::KeyringNotFound {
-                name: "main".to_owned(),
+                cause: crate::error::KeyringMissingCause::MissingEntry,
             }),
             WalletError::Auth(AuthError::KeyringConfigInvalid {
                 detail: "STELLAR_AGENT_HEADLESS_KEYRING_KEY: value has base64 padding".to_owned(),
@@ -4946,13 +7060,41 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used, reason = "test assertion")]
     fn approval_failure_wire_codes_and_messages() {
+        let revoked = WalletError::Approval(ApprovalFailure::Revoked {
+            detail: "this approval has been revoked".to_owned(),
+        });
+        let envelope = serde_json::to_value(crate::envelope::Envelope::<()>::err(&revoked))
+            .expect("error envelope");
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], "approval.revoked");
+        assert_eq!(
+            envelope["error"]["message"],
+            "this approval has been revoked"
+        );
+        let tls = WalletError::Approval(ApprovalFailure::RemoteTlsUnavailable {
+            detail: "cert_path is absent".to_owned(),
+        });
+        assert_eq!(tls.code(), "approve.remote_tls_unavailable");
+        assert_eq!(tls.category(), ErrorCategory::Approval);
+        assert_eq!(
+            tls.to_string(),
+            "Remote approval TLS configuration is unavailable: cert_path is absent"
+        );
+        assert_eq!(tls.message(), tls.to_string());
         let cases = [
             (
                 ApprovalFailure::NotFound {
                     detail: "operator diagnostic".to_owned(),
                 },
                 "approval.not_found",
+            ),
+            (
+                ApprovalFailure::Revoked {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.revoked",
             ),
             (
                 ApprovalFailure::Expired {
@@ -5080,6 +7222,30 @@ mod tests {
                 },
                 "approval.gc_failed",
             ),
+            (
+                ApprovalFailure::AttestationInvalid {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.attestation_invalid",
+            ),
+            (
+                ApprovalFailure::EntryInconsistent {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.entry_inconsistent",
+            ),
+            (
+                ApprovalFailure::OperatorCredentialRevoked {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.operator_credential_revoked",
+            ),
+            (
+                ApprovalFailure::RemoteAuthorizationUnavailable {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.remote_authorization_unavailable",
+            ),
         ];
         for (failure, code) in cases {
             let error = WalletError::Approval(failure);
@@ -5090,7 +7256,145 @@ mod tests {
         }
     }
 
+    #[test]
+    fn spent_record_failure_wire_code_and_message() {
+        let error = WalletError::Approval(ApprovalFailure::SpentRecordUnavailable {
+            reason: "it cannot be read",
+        });
+        assert_eq!(error.code(), "approval.spent_record_unavailable");
+        assert_eq!(error.category(), ErrorCategory::Approval);
+        assert_eq!(
+            error.to_string(),
+            "the record of spent rule approvals is unavailable (it cannot be read); the rule was not installed"
+        );
+    }
+
+    #[test]
+    fn mainnet_presence_failure_wire_codes_and_messages() {
+        let cases = [
+            (
+                ApprovalFailure::PresenceRequired,
+                "approval.presence_required",
+                "Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page.",
+            ),
+            (
+                ApprovalFailure::PresenceInvalid,
+                "approval.presence_invalid",
+                "The mainnet presence assertion is invalid; start a new approval ceremony.",
+            ),
+            (
+                ApprovalFailure::PresenceChanged,
+                "approval.presence_changed",
+                "The consent details have changed; reload the approval page and review them again.",
+            ),
+            (
+                ApprovalFailure::PresenceExpired,
+                "approval.presence_expired",
+                "The mainnet presence challenge has expired; start a new approval ceremony.",
+            ),
+            (
+                ApprovalFailure::PresenceConsumed,
+                "approval.presence_consumed",
+                "The mainnet presence challenge is unavailable or already used; start a new approval ceremony.",
+            ),
+            (
+                ApprovalFailure::PresencePolicyUnavailable,
+                "approval.presence_policy_unavailable",
+                "The current owner-signed mainnet approval policy cannot be verified; restore a valid policy and start a new approval ceremony.",
+            ),
+            (
+                ApprovalFailure::PresencePolicyBusy,
+                "approval.presence_policy_busy",
+                "The owner-signed mainnet approval policy is in use by another request; retry the request.",
+            ),
+            (
+                ApprovalFailure::ListenerPolicyStale,
+                "approval.listener_policy_stale",
+                "The approval listener serves an earlier owner-signed mainnet policy; restart it under the current policy.",
+            ),
+            (
+                ApprovalFailure::CertPinMismatch,
+                "approval.cert_pin_mismatch",
+                "The served certificate does not match the owner-signed pin; install the pinned certificate or sign a new pin.",
+            ),
+            (
+                ApprovalFailure::OriginProfileMismatch,
+                "approval.origin_profile_mismatch",
+                "The profile's remote approval rp_id is not the host of the owner-signed approval origin.",
+            ),
+            (
+                ApprovalFailure::OriginSignedRemote,
+                "approval.origin_signed_remote",
+                "The owner-signed policy serves mainnet consent at its approval origin; approve there.",
+            ),
+            (
+                ApprovalFailure::ListenerBusy,
+                "approval.listener_busy",
+                "Another approval listener holds the remote approval socket; approve in the running inbox.",
+            ),
+            (
+                ApprovalFailure::PresenceBrowserRequired,
+                "approval.presence_browser_required",
+                "Mainnet consent requires a local browser with WebAuthn user verification; no approval is recorded.",
+            ),
+            (
+                ApprovalFailure::PresenceUnavailable,
+                "approval.presence_unavailable",
+                "The mainnet presence ceremony cannot start or complete; no approval is recorded.",
+            ),
+            (
+                ApprovalFailure::PresenceCanceled,
+                "approval.presence_canceled",
+                "Mainnet consent is canceled; no approval is recorded.",
+            ),
+            (
+                ApprovalFailure::MainnetRemoteUnsupported,
+                "approval.mainnet_remote_unsupported",
+                "Mainnet consent uses the local passkey page; remote approval is unavailable for mainnet.",
+            ),
+            (
+                ApprovalFailure::ConsentUndelivered {
+                    generation: 3,
+                    sequence: 7,
+                },
+                "approval.consent_undelivered",
+                "delivery of this approval's consent row (generation 3, row 7) cannot be confirmed",
+            ),
+            (
+                ApprovalFailure::EvidenceCapacity,
+                "approval.evidence_capacity",
+                "Consent evidence capacity is full; retry after an existing approval ends.",
+            ),
+        ];
+        for (failure, code, message) in cases {
+            let error = WalletError::Approval(failure);
+            assert_eq!(error.code(), code);
+            assert_eq!(error.category(), ErrorCategory::Approval);
+            assert_eq!(error.to_string(), message);
+            assert_eq!(error.message(), message);
+        }
+    }
+
     // ── category() consistency ────────────────────────────────────────────────
+
+    #[test]
+    fn evidence_codes_and_remedy() {
+        let capacity = WalletError::Approval(ApprovalFailure::EvidenceCapacity);
+        assert_eq!(capacity.code(), "approval.evidence_capacity");
+        assert_eq!(
+            capacity.to_string(),
+            "Consent evidence capacity is full; retry after an existing approval ends."
+        );
+        let undelivered = WalletError::Approval(ApprovalFailure::ConsentUndelivered {
+            generation: 3,
+            sequence: 7,
+        });
+        assert_eq!(undelivered.code(), "approval.consent_undelivered");
+        assert_eq!(
+            undelivered.to_string(),
+            "delivery of this approval's consent row (generation 3, row 7) cannot be confirmed"
+        );
+    }
 
     /// Every WalletError variant must return the category matching its wrapper.
     #[test]
@@ -5221,4 +7525,151 @@ mod tests {
     //
     // The key contract: adding a new variant is not a breaking change for
     // callers that use `_ => ...` fallbacks.
+
+    /// The two mainnet refusals keep distinct codes: a build without mainnet
+    /// writes refuses before any authorization exists, a refused
+    /// authorization reports its own code, and the latter's text names no
+    /// precondition, proof fact, or endpoint detail.
+    #[test]
+    fn mainnet_authorization_refusal_is_distinct_and_generic() {
+        let refused = WalletError::Network(NetworkError::MainnetAuthorizationRefused);
+        let forbidden = WalletError::Network(NetworkError::MainnetWriteForbidden);
+        assert_eq!(refused.code(), "network.mainnet_authorization_refused");
+        assert_eq!(forbidden.code(), "network.mainnet_write_forbidden");
+        assert_eq!(refused.category(), ErrorCategory::Network);
+        let text = refused.to_string();
+        assert_eq!(
+            text,
+            "the mainnet write was refused before submission; nothing was sent"
+        );
+        for forbidden_word in [
+            "precondition",
+            "endpoint",
+            "policy",
+            "approval",
+            "audit",
+            "digest",
+            "http",
+            "rpc",
+            "ledger",
+            "nonce",
+        ] {
+            assert!(
+                !text.to_ascii_lowercase().contains(forbidden_word),
+                "{forbidden_word}: {text}"
+            );
+        }
+    }
+
+    /// The mainnet window-state refusals name their codes, the defect or the
+    /// open count, and the available remedy.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    fn mainnet_window_state_refusals_carry_codes_and_remedy() {
+        let unverifiable = WalletError::Validation(ValidationError::WindowStateUnverifiable {
+            profile: "main".to_owned(),
+            defect: "hmac_invalid",
+        });
+        assert_eq!(unverifiable.code(), "policy.window_state_unverifiable");
+        assert_eq!(unverifiable.category(), ErrorCategory::Validation);
+        let text = unverifiable.to_string();
+        assert!(text.contains("hmac_invalid"), "{text}");
+        assert!(
+            text.contains("No verb recovers such state; create a profile under a new name."),
+            "{text}"
+        );
+        let open = WalletError::Validation(ValidationError::ResetWindowStateOpenAuthorizations {
+            profile: "main".to_owned(),
+            open: 2,
+        });
+        assert_eq!(
+            open.code(),
+            "profile.reset_window_state_open_authorizations"
+        );
+        assert!(open.to_string().contains("2 open mainnet"), "{open}");
+    }
+
+    use stellar_agent_test_support::rejected_value::{
+        CREDENTIAL_MARKER, assert_no_marker, seed_marker,
+    };
+
+    #[test]
+    fn address_and_asset_errors_name_the_field() {
+        let address = ValidationError::address_argument("--destination");
+        assert_eq!(
+            address.to_string(),
+            "--destination is not a valid Stellar account address (expected a G... or M... strkey)"
+        );
+        assert_eq!(address.code(), "validation.address_invalid");
+        let check =
+            ValidationError::address_check("--operation-id must be a 64-char lowercase hex string");
+        assert_eq!(
+            check.to_string(),
+            "--operation-id must be a 64-char lowercase hex string"
+        );
+        assert_eq!(check.code(), "validation.address_invalid");
+        let asset = ValidationError::AssetInvalid {
+            field: "asset".into(),
+        };
+        assert_eq!(asset.to_string(), "asset is not a valid asset descriptor");
+        assert_eq!(asset.code(), "validation.asset_invalid");
+        for err in [&address, &check, &asset] {
+            assert_no_marker(err, &seed_marker());
+            assert_no_marker(err, CREDENTIAL_MARKER);
+        }
+    }
+
+    #[test]
+    fn amount_and_flag_errors_name_the_field() {
+        let cases = [
+            (
+                ValidationError::AmountMalformed {
+                    field: "--amount".into(),
+                },
+                "--amount could not be parsed as a valid amount",
+            ),
+            (
+                ValidationError::AmountUnitMismatch {
+                    field: "--amount".into(),
+                    expected: "TST".to_owned(),
+                },
+                "--amount has the wrong unit; expected unit 'TST'",
+            ),
+            (
+                ValidationError::AmountPrecisionExceeded {
+                    field: "--amount".into(),
+                },
+                "--amount exceeds the maximum precision of 7 decimal places",
+            ),
+            (
+                ValidationError::AmountOutOfRange {
+                    field: "--amount".into(),
+                },
+                "--amount is outside the representable i64 stroop range",
+            ),
+            (
+                ValidationError::OutputFormatInvalid,
+                "the output format is not recognised; accepted values are 'json' and 'table'",
+            ),
+            (
+                ValidationError::ValidUntilInvalid,
+                "--valid-until is not 'none' or a valid u32 ledger sequence",
+            ),
+        ];
+        for (err, expected) in &cases {
+            assert_eq!(err.to_string(), *expected);
+            assert_no_marker(err, &seed_marker());
+        }
+    }
+
+    #[test]
+    fn profile_not_found_names_no_profile() {
+        let err = crate::profile::loader::ProfileLoadError::NotFound.to_validation_error();
+        assert_eq!(
+            err.to_string(),
+            "the requested profile was not found in the wallet configuration; `stellar-agent profile list` shows the profiles"
+        );
+        assert_eq!(err.code(), "validation.profile_not_found");
+        assert_no_marker(&err, &seed_marker());
+    }
 }

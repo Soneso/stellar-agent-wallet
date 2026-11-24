@@ -18,6 +18,8 @@
 
 use serde::{Deserialize, Serialize};
 use stellar_agent_core::amount::StellarAmount;
+use stellar_agent_core::approval::{ClassicIntent, IntentPayload};
+use stellar_agent_network::mainnet::canonical::{CanonicalPart, CanonicalRefusal, exact_asset};
 use stellar_xdr::{Asset, ClaimableBalanceEntry, ClaimableBalanceEntryExt, Claimant};
 
 use crate::entry::TrustlineState;
@@ -185,19 +187,77 @@ impl ClaimPreview {
     }
 }
 
+/// A claim a canonical intent no longer authorizes.
+#[derive(Debug, thiserror::Error)]
+pub enum IntentClaimRefusal {
+    /// The balance read now differs from the intent's balance id, asset or
+    /// amount, or the intent is not a claim.
+    #[error(transparent)]
+    Changed(#[from] CanonicalRefusal),
+    /// The claimant or predicate guard refuses.
+    #[error(transparent)]
+    Claim(#[from] ClaimError),
+}
+
+/// The preview of `entry` for the claim `intent` names, at `now`, once the
+/// guards of a rebuilt claim pass.
+///
+/// The entry read now must hold the intent's balance id, asset and amount.
+/// The asset compares in its canonical width, as the envelope matcher reads
+/// it, so a four-character code in the twelve-byte form refuses. The
+/// intent's claimant must appear on it, and the predicate of its first
+/// matching claimant must hold at `now`; a later claimant entry for the same
+/// account does not count.
+///
+/// # Errors
+///
+/// [`IntentClaimRefusal::Changed`] for another intent kind, balance, asset or
+/// amount; [`IntentClaimRefusal::Claim`] with the errors of
+/// [`ClaimPreview::build`], [`require_claimant`] and
+/// [`require_predicate_satisfied`].
+pub fn require_intent_claim(
+    entry: &ClaimableBalanceEntry,
+    intent: &ClassicIntent,
+    now: u64,
+) -> Result<ClaimPreview, IntentClaimRefusal> {
+    let changed = |part| IntentClaimRefusal::Changed(CanonicalRefusal::Mismatch(part));
+    let IntentPayload::Claim {
+        balance_id,
+        asset,
+        amount_stroops,
+        claimant,
+    } = intent.payload()
+    else {
+        return Err(changed(CanonicalPart::Operation));
+    };
+    let entry_asset =
+        exact_asset(&entry.asset).ok_or_else(|| changed(CanonicalPart::ClaimFacts))?;
+    let preview = ClaimPreview::build(entry, claimant, now)?;
+    if &preview.balance_id_hex72 != balance_id {
+        return Err(changed(CanonicalPart::BalanceId));
+    }
+    if &entry_asset != asset {
+        return Err(changed(CanonicalPart::ClaimFacts));
+    }
+    if preview.amount_stroops != *amount_stroops {
+        return Err(changed(CanonicalPart::ClaimFacts));
+    }
+    require_claimant(&preview)?;
+    require_predicate_satisfied(&preview)?;
+    Ok(preview)
+}
+
 /// Refuses unless `preview.is_claimant` is `true`.
 ///
 /// # Errors
 ///
 /// Returns [`ClaimError::NotClaimant`] when the account is not a claimant on
 /// the entry.
-pub fn require_claimant(preview: &ClaimPreview, account: &str) -> Result<(), ClaimError> {
+pub fn require_claimant(preview: &ClaimPreview) -> Result<(), ClaimError> {
     if preview.is_claimant {
         Ok(())
     } else {
-        Err(ClaimError::NotClaimant {
-            account: account.to_owned(),
-        })
+        Err(ClaimError::NotClaimant)
     }
 }
 
@@ -331,13 +391,14 @@ mod tests {
     )]
 
     use stellar_xdr::{
-        AccountId as XdrAccountId, AlphaNum4, AssetCode4, ClaimPredicate,
+        AccountId as XdrAccountId, AlphaNum4, AlphaNum12, AssetCode4, AssetCode12, ClaimPredicate,
         ClaimableBalanceEntryExtensionV1, ClaimableBalanceEntryExtensionV1Ext,
         Claimant as XdrClaimant, ClaimantV0, Hash, PublicKey as XdrPublicKey,
         Uint256 as XdrUint256, VecM,
     };
 
     use super::*;
+    use stellar_agent_core::approval::IntentAsset;
 
     const CLAIMANT_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
     const OTHER_G: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
@@ -559,7 +620,7 @@ mod tests {
             ClaimableBalanceEntryExt::V0,
         );
         let preview = ClaimPreview::build(&entry, CLAIMANT_G, 1_000).unwrap();
-        assert!(require_claimant(&preview, CLAIMANT_G).is_ok());
+        assert!(require_claimant(&preview).is_ok());
     }
 
     #[test]
@@ -571,8 +632,19 @@ mod tests {
             ClaimableBalanceEntryExt::V0,
         );
         let preview = ClaimPreview::build(&entry, CLAIMANT_G, 1_000).unwrap();
-        let err = require_claimant(&preview, CLAIMANT_G).expect_err("must refuse");
+        let err = require_claimant(&preview).expect_err("must refuse");
         assert_eq!(err.code(), "claim.not_claimant");
+        assert_eq!(
+            err.to_string(),
+            "claim.not_claimant: the source account must appear as a claimant on this balance"
+        );
+        let rendered = format!("{err:?}");
+        for form in [
+            CLAIMANT_G.to_owned(),
+            stellar_agent_core::observability::redact_strkey_first5_last5(CLAIMANT_G),
+        ] {
+            assert!(!rendered.contains(&form), "{rendered}");
+        }
     }
 
     // ─── require_predicate_satisfied ────────────────────────────────────────
@@ -717,5 +789,149 @@ mod tests {
             StellarAmount::from_stroops(1_500_000).as_xlm_decimal_string(),
             "0.1500000"
         );
+    }
+
+    /// The claim intent of balance `[7; 32]` holding `asset` and `amount`,
+    /// claimed by `CLAIMANT_G`.
+    fn claim_intent(asset: IntentAsset, amount: i64) -> ClassicIntent {
+        stellar_agent_network::operation_entry::classic_intent(
+            stellar_agent_network::operation_entry::IntentBaseFacts {
+                chain_id: "stellar:mainnet",
+                source: CLAIMANT_G,
+                policy_digest: [0x11; 32],
+                signed_fee_cap: Some(1_000),
+                profile_fee_cap: None,
+                fee_choice: stellar_agent_network::fees::ClassicFeeChoice::ProfileDefault,
+                memo: stellar_agent_core::approval::MemoFact::None,
+            },
+            IntentPayload::Claim {
+                balance_id: format!("00000000{}", "07".repeat(32)),
+                asset,
+                amount_stroops: amount,
+                claimant: CLAIMANT_G.to_owned(),
+            },
+        )
+        .unwrap()
+    }
+
+    /// A rebuilt claim passes only on an entry with the intent's balance,
+    /// asset and amount, on which the claimant's first entry has a predicate
+    /// that holds now. A later entry for the same account whose predicate
+    /// holds does not admit the claim. A four-character code in the
+    /// twelve-byte form refuses before its predicate is read.
+    #[test]
+    fn claim_rebuild_checks_facts_and_first_predicate() {
+        let usdc = IntentAsset::Issued {
+            code: "USDC".to_owned(),
+            issuer: ISSUER_G.to_owned(),
+        };
+        let intent = claim_intent(usdc.clone(), 70);
+        let entry = |asset: Asset, amount: i64, claimants| {
+            entry_with_claimants(asset, amount, claimants, ClaimableBalanceEntryExt::V0)
+        };
+        let open = || vec![(CLAIMANT_G, ClaimPredicate::Unconditional)];
+        let preview =
+            require_intent_claim(&entry(usdc_asset(), 70, open()), &intent, 1_000).unwrap();
+        assert_eq!(preview.amount_stroops, 70);
+
+        let mut wide_code = [0u8; 12];
+        wide_code[..4].copy_from_slice(b"USDC");
+        let wide = Asset::CreditAlphanum12(AlphaNum12 {
+            asset_code: AssetCode12(wide_code),
+            issuer: g_account_id(ISSUER_G),
+        });
+        let shown =
+            ClaimPreview::build(&entry(wide.clone(), 70, open()), CLAIMANT_G, 1_000).unwrap();
+        assert_eq!(shown.asset_code.as_deref(), Some("USDC"));
+
+        let changed = |part| CanonicalRefusal::Mismatch(part);
+        let mut other_balance = entry(usdc_asset(), 70, open());
+        other_balance.balance_id =
+            stellar_xdr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([8; 32]));
+        for (name, read, expected) in [
+            (
+                "amount",
+                entry(usdc_asset(), 71, open()),
+                CanonicalPart::ClaimFacts,
+            ),
+            (
+                "asset",
+                entry(Asset::Native, 70, open()),
+                CanonicalPart::ClaimFacts,
+            ),
+            (
+                "twelve-byte form",
+                entry(wide.clone(), 70, open()),
+                CanonicalPart::ClaimFacts,
+            ),
+            (
+                "twelve-byte form before the predicate",
+                entry(
+                    wide,
+                    70,
+                    vec![(CLAIMANT_G, ClaimPredicate::BeforeRelativeTime(1))],
+                ),
+                CanonicalPart::ClaimFacts,
+            ),
+            ("balance", other_balance, CanonicalPart::BalanceId),
+        ] {
+            match require_intent_claim(&read, &intent, 1_000) {
+                Err(IntentClaimRefusal::Changed(refusal)) => {
+                    assert_eq!(refusal, changed(expected), "{name}");
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        let native = claim_intent(IntentAsset::Native, 70);
+        assert!(require_intent_claim(&entry(Asset::Native, 70, open()), &native, 1_000).is_ok());
+
+        let first_expired = entry(
+            usdc_asset(),
+            70,
+            vec![
+                (CLAIMANT_G, ClaimPredicate::BeforeAbsoluteTime(500)),
+                (CLAIMANT_G, ClaimPredicate::Unconditional),
+            ],
+        );
+        assert!(matches!(
+            require_intent_claim(&first_expired, &intent, 1_000),
+            Err(IntentClaimRefusal::Claim(
+                ClaimError::PredicateNotSatisfied { .. }
+            ))
+        ));
+        assert!(require_intent_claim(&first_expired, &intent, 499).is_ok());
+        let other_claimant = entry(
+            usdc_asset(),
+            70,
+            vec![(OTHER_G, ClaimPredicate::Unconditional)],
+        );
+        assert!(matches!(
+            require_intent_claim(&other_claimant, &intent, 1_000),
+            Err(IntentClaimRefusal::Claim(ClaimError::NotClaimant))
+        ));
+
+        let payment = stellar_agent_network::operation_entry::classic_intent(
+            stellar_agent_network::operation_entry::IntentBaseFacts {
+                chain_id: "stellar:mainnet",
+                source: CLAIMANT_G,
+                policy_digest: [0x11; 32],
+                signed_fee_cap: Some(1_000),
+                profile_fee_cap: None,
+                fee_choice: stellar_agent_network::fees::ClassicFeeChoice::ProfileDefault,
+                memo: stellar_agent_core::approval::MemoFact::None,
+            },
+            IntentPayload::Pay {
+                destination: OTHER_G.to_owned(),
+                asset: IntentAsset::Native,
+                amount_stroops: 70,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            require_intent_claim(&entry(Asset::Native, 70, open()), &payment, 1_000),
+            Err(IntentClaimRefusal::Changed(CanonicalRefusal::Mismatch(
+                CanonicalPart::Operation
+            )))
+        ));
     }
 }

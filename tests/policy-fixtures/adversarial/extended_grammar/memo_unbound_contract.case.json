@@ -1,0 +1,28 @@
+{
+  "test_kind": "sequence",
+  "name": "memo_unbound_contract",
+  "category": "extended_grammar",
+  "description": "A memo binding constrains only its destinations: a payment without a memo to a C address or to an unbound G address allows, while the bound G address refuses.",
+  "tool": {
+    "name": "stellar_pay",
+    "destructive_hint": true,
+    "read_only_hint": false,
+    "chain_id_required": true,
+    "chain_id": "stellar:testnet"
+  },
+  "profile_name": "default",
+  "steps": [
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "CABQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGCK3" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GALBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMKWB" },
+      "expected": { "kind": "Allow" }
+    },
+    {
+      "args": { "amount_stroops": "10", "asset": "native", "destination": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G" },
+      "expected": { "kind": "Deny", "deny_reason": "memo_binding_mismatch", "wire_code": "policy.deny.memo_binding_mismatch", "reason": { "MemoBindingMismatch": { "kind": "id" } } }
+    }
+  ]
+}

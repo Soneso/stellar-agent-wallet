@@ -47,6 +47,8 @@
 ///   with a different network passphrase than the client is configured for.
 /// - **HTTP client** (`InvalidWebAuthEndpoint`, `SessionAccountMismatch`) —
 ///   endpoint URL parsing and session integrity.
+/// - **Mainnet** (`MainnetSigningForbidden`): a client or a signing on
+///   mainnet.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Sep45Error {
@@ -538,6 +540,28 @@ pub enum Sep45Error {
         /// The `sub` value the server returned.
         found: String,
     },
+
+    // ── Mainnet ──────────────────────────────────────────────────────────────
+    /// A client or a challenge signing targeted mainnet.
+    ///
+    /// A signed SEP-45 challenge authenticates the client account to the web
+    /// auth server, so it is refused structurally on mainnet before any key
+    /// is generated or used and before any request. The `detail` carries the
+    /// canonical `network.mainnet_write_forbidden` wire code so this refusal
+    /// correlates with the other signing guards.
+    ///
+    /// # Errors
+    ///
+    /// Returned by [`crate::client::Sep45Client::new`],
+    /// [`crate::ephemeral::auth_with_ephemeral_key`] and
+    /// [`crate::ephemeral::sign_authorization_entries`] for the mainnet
+    /// passphrase.
+    #[error("mainnet signing forbidden: {detail}")]
+    MainnetSigningForbidden {
+        /// Non-secret description of the refusal, carrying the canonical
+        /// `network.mainnet_write_forbidden` wire code.
+        detail: String,
+    },
 }
 
 impl Sep45Error {
@@ -629,6 +653,7 @@ impl Sep45Error {
             Self::NetworkPassphraseMismatch { .. } => "sep45.network_passphrase_mismatch",
             Self::InvalidWebAuthEndpoint { .. } => "sep45.invalid_web_auth_endpoint",
             Self::SessionAccountMismatch { .. } => "sep45.session_account_mismatch",
+            Self::MainnetSigningForbidden { .. } => "sep45.mainnet_signing_forbidden",
             _ => "sep45.unknown_error",
         }
     }
@@ -939,6 +964,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wire_code_mainnet_signing_forbidden() {
+        assert_eq!(
+            Sep45Error::MainnetSigningForbidden {
+                detail: "network.mainnet_write_forbidden".to_owned(),
+            }
+            .wire_code(),
+            "sep45.mainnet_signing_forbidden"
+        );
+    }
+
     /// None of the `Sep45Error` Display or Debug representations should contain
     /// raw key bytes, signature bytes, or seed material.
     #[test]
@@ -1049,6 +1085,9 @@ mod tests {
             Sep45Error::SessionAccountMismatch {
                 expected: String::new(),
                 found: String::new(),
+            },
+            Sep45Error::MainnetSigningForbidden {
+                detail: String::new(),
             },
         ];
         for variant in variants {

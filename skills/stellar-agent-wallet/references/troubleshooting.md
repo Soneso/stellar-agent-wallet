@@ -1,5 +1,11 @@
 # Troubleshooting (wire and error codes)
 
+Errors, guidance, logs, MCP stderr and CLI output never repeat a rejected value. Diagnostics name the argument, field, position or check and the accepted form. The rule covers policy semantics, policy keys outside the schema, credential registries and names, URLs, configuration values, profile names that resolve to no profile and CLI usage errors. File syntax errors report line and column.
+
+
+See [Mainnet configurations and scope](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 Reference for the stable wire and error codes the Stellar Agent Wallet returns,
 and the action an agent should take for each. The wallet places fixed controls
 between every tool call and any network or signing action: a policy engine, an
@@ -25,14 +31,24 @@ Tool and command results use a uniform envelope:
   JSON array, and `stellar_dex_trade`, `stellar_dex_quote`,
   `stellar_defindex_vault_deposit`, and `stellar_defindex_vault_withdraw` return
   an object carrying `status`. Their business errors use the envelope.
-- Some refusals use the JSON-RPC error channel instead of the envelope: invalid
-  arguments, a `chain_id` mismatch, and the toolset capability refusals.
+- Arguments that do not match the tool's input schema (a missing or unknown
+  field, or a field of the wrong type) return a tool result with
+  `isError: true` and the text
+  `<tool>: the arguments have a missing field or a field of the wrong type or value`.
+- Some refusals use the JSON-RPC error channel instead of the envelope.
+  Arguments that match the schema but fail a value check, and a `chain_id`
+  mismatch, return JSON-RPC error -32602. The toolset capability refusals are
+  JSON-RPC errors too.
   `toolset.first_invoke_approval_required` is a JSON-RPC error too, and its error
   data carries the `approval_nonce`.
 - By default every CLI command prints exactly one envelope on stdout and exits
-  `0` on success, `1` on any error. An argument the parser refuses (an unknown flag,
-  a missing required flag, a malformed value) returns `validation.usage_error`
-  with the parser's message; correct the invocation and retry. `--help` and
+  `0` on success, `1` on an error. Three `profile` commands add codes:
+  `profile policy-check` exits `3` or `65`, `profile apply-fragment` exits `65`
+  on a refusal, and `profile enable-mainnet --state` exits `3` when the
+  enablement is absent. An argument the parser refuses (an unknown flag,
+  a missing required flag, a malformed value) returns `validation.usage_error`.
+  The message names the error class and the schema-defined argument, never the
+  rejected text; correct the invocation and retry. `--help` and
   `--version` print text, not an envelope.
 
 At the MCP boundary, account, strkey, and contract-id fields inside an error are
@@ -46,6 +62,8 @@ key names. Typed value events retain each leg's amount, asset, and redacted dest
   Most MCP tools require it and it must match the active profile. The
   exceptions follow.
   - `stellar_x402_parse_receipt` and `stellar_toolset_list` take no `chain_id`.
+  - `stellar_approval_status` and `stellar_signed_intents_list` take no
+    `chain_id` and reject it as an unknown field.
   - The five `stellar_mpp_*` tools reject it as an unknown field and act on the
     profile chain.
   - `stellar_toolset_invoke` accepts an optional `chain_id` and forwards it to
@@ -76,35 +94,374 @@ amount, asset, or memo before building the transaction.
 | `validation.asset_invalid` | The descriptor is neither `native` or `XLM` nor `CODE:ISSUER` with a 1 to 12 character alphanumeric code and a valid G-strkey issuer. | Fix the descriptor and resend. |
 | `validation.memo_invalid_type` | A hash or return memo is not exactly 64 hex characters, or, on `stellar-agent pay`, a text memo is longer than 28 bytes. The MCP tools refuse a longer text memo as an invalid argument before this check. | Resend a 64-character hex value for a hash or return memo, or shorten the text memo to 28 bytes. |
 | `validation.memo_mutually_exclusive` | More than one memo field is set. The CLI parser refuses two memo flags as `validation.usage_error`. | Send one memo field only. |
+| `validation.contract_payment_unavailable` | The destination is a C contract or W muxed contract, or the envelope is one `transfer(Account, Contract, I128)` invocation proven for the asset argument. Message: "Contract payments are not available on this payment surface." It refuses before any account read, approval, nonce, signing or request. On mainnet the mainnet mode, feature and admission refusals come first. | Pay a G or M account. No payment surface executes a contract payment yet. |
+| `validation.contract_payment_memo_unsupported` | A C contract or W muxed contract destination carries a text, id, hash, or return memo, or a contract transfer envelope carries a memo. Message: "The network rejects a memo on a contract invocation. Use a W address to carry an id on a network at protocol 30 or later. W payments are not available in this implementation." On mainnet the mainnet refusals come first. | Remove the memo; the payment is still refused with `validation.contract_payment_unavailable`. |
+| `validation.contract_payment_invalid` | An envelope holding one `transfer(Account, Contract, I128)` invocation is not proven for the asset argument, or the asset argument is invalid. CLI `--sign-only` and `--submit-only`, MCP and toolset commit, the paired commit evaluation and the mainnet resolver return it. The paired evaluation has no asset, so it always returns this code. Message: "The contract payment facts or fee arithmetic are invalid." On mainnet the mainnet refusals come first. | Pay a G or M account. No payment surface executes a contract payment yet. |
 
 The two MCP payment tools return the four amount codes as a JSON-RPC
 invalid-params error whose message starts with the code, and
 `validation.asset_invalid` as one whose message starts with `invalid asset:`
 followed by the code. `stellar_pay` returns the two memo codes in the result
-envelope; `stellar_pay_commit` reports a memo refusal as `nonce.expired`.
+envelope; `stellar_pay_commit` reports either of them as `nonce.expired`.
+
+## Business-id codes
+
+Every mainnet value call names its operation with a business id: the MCP
+`business_id` argument and the CLI `--business-id` flag.
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `validation.business_id_required` | A mainnet value call has no business id. | Resend with an id that names this operation, such as an invoice number. Keep it for every retry of the same operation. |
+| `validation.business_id_invalid` | The id is longer than 64 bytes or holds a character outside printable ASCII, a space included. | Resend with 1 to 64 printable ASCII characters and no space. |
+| `operation.business_id_conflict` | The id already names an operation with another intent, or a commit names an envelope that operation does not bind. Nothing signs or sends. | Use a new id for a new operation. Retry the earlier operation only with its original arguments. |
+| `operation.business_id_mismatch` | A commit names an id other than its preparation's. Nothing signs or sends. | Commit with the id the preparation used. |
+| `operation.capacity` | The profile's operation store holds no room for a new record. | Finish or reconcile waiting operations, then retry. |
+
+A retry under a retained id succeeds with `status: "replayed"` and the stored
+`operation` instead of new work. Follow its `next`. `none` means the
+operation ended, and `wait` means it is in flight or of unknown outcome:
+reconcile with `stellar_transaction_status` or `stellar-agent tx status`.
+On mainnet a status read alone leaves an unknown outcome `pending` until its
+accounting horizon. Then the receipt becomes `ambiguous` with
+`submission.accounting_expired`, and the chain outcome stays unknown. Only a
+checked recovery decision of the primary endpoint and the oracle settles it.
+`approve` means it awaits approval, and `retry` means a further attempt may
+run.
+
+| Code | Meaning | What to do |
+|---|---|---|
+| `recovery.retry_refused` | The operation is `not_included`, but the checked decision of its last attempt is not yet projected onto that attempt's receipt. Nothing signs or sends. | Do not resend under a new id. Wait for the projection, or ask the operator. |
 
 ## Policy-engine codes
 
 The policy engine evaluates every gated call before any signing, returning
 Allow, Deny, or RequireApproval. Reads the decision needs, such as the source
-account, can run first. The Noop engine allows everything on testnet,
-allows read-only on mainnet, and refuses destructive tools on mainnet. The V1
+account, can run first. The Noop engine allows every testnet action except
+`smart-account multicall`, allows read-only actions on mainnet, and refuses
+that command on testnet and destructive tools on mainnet with
+`policy.engine_required`. The V1
 engine is first-match, default-deny over signed, typed criteria.
 
 | Code | Meaning | Agent action |
 |---|---|---|
 | `policy.deny.<reason>` | A V1 criterion denied the call (`<reason>` is the typed reason: `per_tx_cap_exceeded`, `per_period_cap_exceeded`, `rate_limit_exceeded`, `counterparty_denied`, `minimum_reserve_breached`, `no_matching_rule`). The payload carries the redacted reason. | Do not retry as-is; the policy forbids this operation. Report the reason to the operator. Only the operator can change policy. |
-| `policy.deny.unsizable_value_effect` | A value rule matched a tool whose value cannot be sized, including the raw signing tools. | Size the call through a supported verb, or ask the operator to set `allow_opaque_signing = true` on the matched rule if raw signing is intended. |
+| `policy.deny.unsizable_value_effect` | A value rule matched a tool whose value cannot be sized, including the raw signing tools. For a SEP-43 transaction tool it also means: the transaction holds an offer, pool deposit, sponsorship, wallet clawback or unvalued contract call without the tool rule's opt-in; or it merges an account or changes a signer, master weight or threshold, which always refuses. | Size the call through a supported verb, or ask the operator to set `allow_opaque_signing = true` on the matched rule if raw signing is intended. A merge or authority change cannot be signed through these tools. |
+| `sep43.invalid_xdr` (SEP-43 transaction tools) | The envelope is malformed or legacy V0, an operation amount is negative, the resource fee exceeds the transaction fee, or a valued transaction has a text memo that is not UTF-8. A wallet-sourced pool share `ChangeTrust` makes a transaction valued, as a credit `ChangeTrust` does. The message names the operation index, kind and field for a negative amount. | Rebuild the transaction. Not retryable with the same bytes. |
+| `policy.deny.unlisted_budget_exceeded` | A payment to an unlisted recipient exceeds the `unlisted` budget's per-payment or per-period bound; over MCP the message names the bound, its maximum, and the attempted amount, and the CLI message names no amount. This code refuses off mainnet only. On mainnet the same excess requests a per-payment approval with `policy.approval_required`. | Do not retry unchanged. A smaller payment fits the per-payment bound; the period bound frees as earlier unlisted payments leave the window. Listing the recipient is an operator policy change. |
+| `policy.deny.total_budget_exhausted` | The payment would exceed a `total_budget` allocation, which never renews; over MCP the message names the maximum and the remaining amount, and the CLI message names no amount. | Do not retry; waiting frees nothing. Only the operator can sign a new policy, which starts a new allocation. |
+| `policy.total_epoch_stale` | A total-budget debit was sized under a policy other than the pinned one. | Prepare the payment again. |
+| `policy.total_epoch_unavailable` | Total-budget accounting cannot read the policy pin. | Report it to the operator. |
+| `policy.total_epoch_retired` | The pinned policy admits no further total-budget debit from the spending window it loaded. | Report it to the operator, who signs and installs a new policy. |
+| `policy.deny.memo_binding_mismatch` | A bound destination needs a memo of the named kind and its exact value. | Re-prepare with the exact memo the destination requires. Do not guess a value. |
+| `account.unread` | A `balance_floor` lacks a usable observed balance or complete native-exposure facts: no read, a future read, deficient release coverage, an unquantifiable retained obligation, or retained history that cannot prove complete exposure. A mainnet MCP commit also refuses when the preparation tool's rule carries a floor and the commit tool's rule carries none, or a lower one. | A failed account read returns its own network code. An `account.unread` refusal of a commit whose preparation succeeded can come from the floor rules: compare the floors on both tool names, and put the same floor on both. A store without the native coverage marker gets it at its next write, and floor use resumes with a balance read that closes 300 seconds later. Otherwise do not retry; report it to the operator: re-signing or resetting cannot reconstruct lost history. |
+| `account.stale` | The floor's account read is older than 120,000 ms. | Repeat the operation, which reads the account again. |
+| `policy.accounting_invalid` | An accounting contributor is negative, or the durable store receives a malformed native debit or fee. | Do not retry unchanged. Re-prepare from authenticated action facts; for stored history, ask the operator to inspect the record through the existing recovery commands. Re-signing does not repair invalid history. |
+| `policy.accounting_overflow` | Checked accounting arithmetic overflowed: an unlisted or native amount, fee, or aggregate exceeds its accounting range. | Do not retry unchanged. |
+| `account.floor_refused` | The payment would leave the native balance, after reservations, debit, and fee, below the floor. | Do not retry unchanged; pay less or ask the operator to fund the account. |
 | `trustline.clawback_opt_in_required` | Trusting a clawback-enabled issuer requires a recorded operator opt-in. | Ask the operator to run the printed `stellar-agent approve --id <nonce> --profile <name>` opt-in, then re-invoke. |
-| `policy.approval_required` | A two-phase signing verb reached its commit step without a valid operator approval, or the attestation was absent, invalid, or expired. This single code intentionally covers every approval-path failure mode (missing, expired, wrong-kind, hash mismatch, HMAC mismatch) so callers cannot probe which. | Ask the operator to run `stellar-agent approve --id <nonce> --profile <name>`, then re-submit the commit with the returned `approval_nonce` and `approval_attestation`. Use the approval nonce from simulation, which checks both tool names. If the request expires or no request exists, simulate again and review the new response. |
-| `policy.approval_required_unsupported` | The policy returned RequireApproval for a single-shot sign tool (no simulate/commit split: SEP-43 sign verbs, `stellar_sep43_sign_and_submit_transaction`, SEP-53 `sign_message`, x402 `create_payment` / `authenticated_payment`). The wallet refuses fail-closed rather than sign without approval. | Cannot proceed via the agent. Ask the operator to either adjust policy so this operation does not require approval, or perform it through a two-phase tool (`stellar_pay`, `stellar_create_account`, `stellar_trustline`, `stellar_claim`, `stellar_rule_create` and their `*_commit`). |
-| `policy.engine_required` | The active engine cannot decide the call. Fires for the Noop engine on a destructive tool on `stellar:mainnet`, and for V1 engine errors such as a missing or unverifiable policy document. | Do not retry on mainnet (writes are structurally refused in this alpha; use `stellar:testnet`). Otherwise the profile needs a valid V1 policy installed by the operator. |
+| `policy.approval_required` | A two-phase signing verb reached its commit step without a valid operator approval, or the attestation was absent, invalid, or expired. This code covers missing, expired, wrong-kind, hash mismatch, and HMAC mismatch approvals, so callers cannot probe which. Live rejected and consumed approvals use `policy.approval_rejected` and `policy.approval_consumed`. On testnet, CLI `pay`, `claim`, sponsored `accounts create`, and `trustline` also return it for an approval decision, with a message that points to MCP. | Ask the operator to run `stellar-agent approve --id <nonce> --profile <name>`, then re-submit the commit with the returned `approval_nonce` and `approval_attestation`. Use the approval nonce from simulation, which checks both tool names. If the request expires or no request exists, simulate again and review the new response. |
+| `policy.approval_required_unsupported` | The policy requires approval for a tool without an approval flow: the SEP-43 auth-entry and message verbs, SEP-53 `sign_message`, or a DeFi tool (`stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw`). For the auth-entry verb this includes a `stellar_pay_commit` approval requirement on one of its token transfers. The SEP-43 transaction tools refuse with it for a transaction that is not one payment, path payment, account creation or trustline change. An x402 address mismatch without proof under RequireApproval also uses this refusal. The wallet refuses fail-closed rather than sign without approval. | Cannot proceed via the agent. Ask the operator to either adjust policy so this operation does not require approval, or perform it through a two-phase tool (`stellar_pay`, `stellar_create_account`, `stellar_trustline`, `stellar_claim`, `stellar_rule_create` and their `*_commit`). On mainnet, Allow without proof pays in one call. RequireApproval without proof queues. After owner approval, repeat with both approval arguments. The operator approves with `stellar-agent approve --id <nonce> --profile <name>`. Testnet x402 approvals use the terminal command. |
+| `policy.engine_required` | The active engine cannot decide the call. Fires for the Noop engine on a destructive tool on `stellar:mainnet`, and for V1 engine errors such as a missing or unverifiable policy document. The CLI off mainnet also reports accounting errors with this code. | Report the refusal to the operator. The profile needs a valid V1 policy and admitted context. Do not switch networks. |
 | `policy.unexpected_decision` | Forward-compatibility catch-all for an engine decision the gate does not recognize. Fail-closed. | Treat as a hard refusal. Report to the operator; do not retry. |
 
-Separately, every write or signing command refuses `stellar:mainnet` before any
-RPC call or signing with `network.mainnet_write_forbidden`, except MPP, which
-refuses with `mpp.network_forbidden`. Read-only commands accept mainnet. Action: run write and signing operations on `stellar:testnet` in
-this alpha.
+### Mainnet refusal recovery
+
+`network.mainnet_write_forbidden` identifies a feature-off build, excluded
+operation, or unavailable admitted context. CLI missing engine, verified policy,
+or enablement is an entry refusal with the prerequisite named.
+CLI engine construction preserves `policy.engine_selection_unsigned`,
+`profile.mainnet_enablement_invalid`, `policy.window_chain_mismatch`, and
+`policy.window_chain_unverifiable`.
+Enrolled Noop owner discovery preserves keyring codes.
+Other failures use `policy.engine_unavailable` or `trustline.policy_engine_unavailable`.
+Evaluation failure uses `policy.engine_required`. On mainnet, an accounting
+error keeps `policy.accounting_invalid` or `policy.accounting_overflow`.
+Unknown decisions use `policy.unexpected_decision`.
+Policy denials retain `policy.deny.*`. A balance floor denial retains
+`account.unread`, `account.stale`, or `account.floor_refused`.
+
+`network.mainnet_keyring_backend_unsupported` means
+`STELLAR_AGENT_KEYRING_BACKEND` is set to any value. Mainnet readiness and
+`profile enable-mainnet` refuse such a process before the
+keyring initializes; mainnet needs the platform keyring. Do not retry and do
+not switch networks. Report it to the operator.
+
+After `network.mainnet_authorization_refused`, report the refusal to the operator.
+Do not switch networks. A retry requires fresh preparation and fresh approval.
+The operator reads the failed check in the `precondition` field of the warn-level
+log entry `mainnet authorization refused`. Its `path` identifies the consumer.
+The stable snake-case precondition labels are not additional wire codes.
+`STELLAR_AGENT_LOG` overrides `RUST_LOG`; the default is `info` on stderr.
+
+After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
+Stale policy or enablement reports `network.mainnet_write_forbidden` with
+`enablement or policy changed, restart the server`. Missing startup authority
+instead identifies its prerequisite.
+
+The core and classic MCP message is
+`the mainnet write was refused before submission; nothing was sent`.
+CLI messages distinguish these boundaries:
+
+- Signature: `the mainnet write was refused; the signature was withheld and nothing was sent`.
+- Submission: `the mainnet write was refused; the submission was refused after signing and nothing was sent`.
+
+Other signature-stage errors append `The signature was withheld and nothing was sent.`
+Other post-signing errors retain their outcome semantics. A signer can run
+before signature rejection. Submission refusal can follow signing.
+A submission timeout has an unknown outcome and requires reconciliation.
+
+Live rejected MCP approvals use `policy.approval_rejected`. On testnet a live
+consumed approval or an approval held by a submission receipt uses
+`policy.approval_consumed`. Missing, expired, invalid, or unverifiable approvals
+use `policy.approval_required`, including expired tombstones.
+
+On mainnet a commit verifies the presented attestation against the wallet's
+durable approval record, never against the approval inbox. A revoked approval
+returns `approval.revoked`. A verified approval whose queued consent has no
+delivered evidence returns `approval.consent_undelivered`. On mainnet a
+repeated proof of a completed payment answers `policy.approval_required`; only a
+submission receipt or a proof of another operation answers
+`policy.approval_consumed`.
+Authorization consumption followed by a pre-send recording failure consumes
+the durable approval record and ends the operation unsent. A retry under the
+same `business_id` returns that stored outcome; a retry under another
+`business_id` refuses with `policy.approval_required`.
+CLI approval errors use `approval.*` codes.
+
+The x402 payment tools report these mainnet refusals:
+
+- The SEP-10 and identity libraries refuse mainnet in their ordinary entries
+  with `sep10.mainnet_signing_forbidden` and `identity.mainnet_signing_forbidden`.
+  The authorized completion, which exists only in builds with the
+  `mainnet-write` feature, refuses with `sep10.mainnet_authorization_refused`
+  or `identity.mainnet_authorization_refused`. The MCP tool maps these signing
+  and authorization refusals to `network.mainnet_write_forbidden` and
+  `network.mainnet_authorization_refused`, respectively.
+- For the plain tool, authorization refusals use
+  `network.mainnet_authorization_refused`. Policy denials keep `policy.deny.*`.
+  Other payment errors keep their own codes.
+- For the authenticated tool, authorization refusals identify the withheld
+  payment payload. Policy, endpoint, and witness errors keep their codes. Other
+  payment-build failures use `x402.payment_build_failed`. Other identity
+  failures keep their `identity.*` codes, such as `identity.sep10_auth_failed`
+  after a failed challenge submission.
+- `the mainnet authorization for this SEP-10 authentication was refused; no signed challenge was submitted`
+  means the authenticated tool withheld the SEP-10 challenge.
+- `the mainnet authorization for this payment was refused; the payment payload was withheld`
+  means the authenticated tool withheld the payment payload. A withheld payment
+  payload does not establish that no signature exists. The configured RPC can
+  already have received the signed authorization during re-simulation.
+- Call 2 rechecks the startup binding and refuses a changed one with
+  `network.mainnet_write_forbidden`: `enablement or policy changed, restart the server`.
+  After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
+- After release authorization is consumed, the tool consumes the pending
+  approval. A failed or absent pending-record consume withholds the payload.
+  The `payment withheld at terminal approval` prefix marks a refusal after the
+  signed re-simulation. Report it to the operator; the payment authorization is
+  spent.
+- On mainnet a repeated proof of a completed payment answers
+  `policy.approval_required`; only a submission receipt or a proof of another
+  operation answers `policy.approval_consumed`. For a new payment, run call 1
+  again and ask the operator for a new approval.
+- After a failed SEP-10 challenge submission, the Message record stays used and
+  the approval stays pending. A repeat of the same call 2 refuses with
+  `network.mainnet_authorization_refused`. Run call 1 again and ask the operator
+  for a fresh approval.
+- A challenge that names another client account refuses before the Message
+  record is minted. The approval stays unspent, and the same call 2 can be
+  repeated.
+- `identity.home_domain_invalid` means `home_domain` is not a lowercase LDH
+  name, for example `Anchor.Example.com`. Pass the lowercase domain. On mainnet,
+  call 1 refuses it before any approval is stored.
+
+### Mainnet refusal order
+
+A mainnet write passes four states in this order: nothing sent or signed,
+unsigned requests sent, signed locally, signed material sent. The states refer
+to the transaction or payment signature. Authenticated x402 also signs and
+submits a SEP-10 challenge with an ephemeral key inside the second state. Each
+item names the checks that can refuse in that state, grouped by class, and the
+codes they report. Inside an item, the order of the checks differs by command and
+tool.
+
+1. Nothing sent or signed.
+   - Entry: the compiled feature, an explicit nondefault mainnet profile with matching stored configuration and an oracle, full mode and keyring access (CLI), the asset and amount (CLI, classic MCP), envelope and address decoding (classic MCP).
+   - Policy: the V1 engine; the CLI, classic MCP, and x402 also check the verified policy and enablement here.
+   - URL: client construction and its credential (CLI, classic MCP, plain x402).
+   - x402 reads: Each call of both x402 tools can leave this state before policy evaluation through two unsigned reads. A W payee triggers the endpoint identity request. A first matching rule with `balance_floor` or `minimum_reserve` triggers the payer account read.
+   - x402 under RequireApproval: call 1 sends nothing else and ends here. Under Allow, call 1 is the signing call.
+   - Plain x402 call 2 sends nothing else before the payment build. Its checks up to there: requirements, `chain_id`, the approval pair, enrollment and address, local policy evaluation, forced approval, the attestation, audit readiness, the signing handle.
+   - Authenticated x402 call 2 runs the same checks through the attestation, plus the home domain, the audit pre-flight, and identity audit readiness. It leaves this state at the identity exchange.
+   - Codes: `network.mainnet_write_forbidden`, profile and validation codes, `policy.engine_unavailable` and `trustline.policy_engine_unavailable` (CLI), keyring codes, `network.rpc_unreachable`, `network.rpc_credential_refused`, `simulation.divergence` (classic MCP), JSON-RPC invalid params, `x402.*` requirement codes, `identity.home_domain_invalid`, `policy.approval_required`, `policy.approval_rejected`, `policy.approval_consumed`, `policy.deny.*`, `policy.engine_required`, `policy.unexpected_decision`, `auth.enrolled_*`, `audit.*`, approval-store codes.
+2. Unsigned requests sent: the endpoint identity probe, the endpoint readiness reads, account and chain reads, the oracle simulation or latest-ledger read, the unsigned payment simulation (x402).
+   - URL: endpoint identity, protocol version.
+   - Entry: the remaining input decoding (CLI, classic MCP).
+   - Policy: the engine rebuilt after the reconcile pass (CLI), the rebuilt envelope (classic MCP), the policy evaluation, and the fee cap and the operation conditions (CLI, classic MCP). Policy also checks the required witness, the oracle's ledger bound below the threshold on mainnet, and the health read (x402).
+   - Authorization: the attestation or the browser confirmation, audit readiness, the nonce, signer enrollment, the resolver's sealed checks (CLI, classic MCP); the payment intent authorization (x402).
+   - Authenticated x402: the bound SEP-10 authentication runs in this state, and its signed challenge reaches the web-auth server before the payment checks. Payment audit readiness, the signing handle, the payment asset, and client construction follow it.
+   - Codes: `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.unsupported_protocol_version`, `network.endpoint_not_ready` (CLI, classic MCP), `network.rpc_credential_refused`, `network.rpc_unreachable` (authenticated x402), read codes, keyring codes, `simulation.divergence`, `network.mainnet_write_forbidden` (CLI), `profile.mainnet_enablement_invalid`, `policy.engine_unavailable`, `trustline.policy_engine_unavailable`, `policy.deny.*`, `policy.engine_required`, `policy.unexpected_decision`, fee-cap codes, `trustline.*`, `network.witness_unavailable`, `approval.presence_*`, `policy.approval_required`, `policy.approval_rejected`, `policy.approval_consumed`, `audit.*`, `nonce.*`, `auth.enrolled_*`, `identity.*`, `x402.rpc_simulate_failed`, `x402.unexpected_auth_entries`, `x402.invalid_asset_address` (authenticated x402), `x402.payment_build_failed` (authenticated), `network.mainnet_authorization_refused`.
+3. Signed locally, no signed material sent.
+   - Authorization: the signer and the signature check.
+   - Submission (CLI, classic MCP): the shared checks before the send: authorization, envelope shape, endpoint identity recheck, signature network binding, transaction hash, pre-send record, consumption proof.
+   - x402: the entry signature, the audit row, and the intent consumption before the re-simulation.
+   - Codes: `network.mainnet_authorization_refused`, keyring and signer codes, `audit.*`, `protocol.xdr_codec_failed`, endpoint and protocol codes, `submission.record_unavailable`, `submission.tx_already_submitted`, `policy.deny.*`, `x402.transaction_build_failed`, `x402.payment_build_failed` (authenticated).
+4. Signed material sent.
+   - Submission (CLI, classic MCP): the send and the confirmation; reconcile an unknown outcome.
+   - x402: the signed re-simulation sends the signed authorization to the configured RPC. After it, the re-simulation answer checks, the release authorization, the payload encoding, the release consumption, and the pending-approval consumption withhold the payload.
+   - Codes: `submission.*`, `x402.rpc_simulate_failed`, `x402.transaction_build_failed`, `x402.unexpected_auth_entries`, `x402.payment_build_failed` (authenticated), encoding codes, approval-store codes, `network.mainnet_authorization_refused` (payload withheld).
+
+A code can appear in more than one state. For the plain x402 tool, the message
+prefix names the stage: `payment withheld before signed transmission`,
+`at intent transmit gate`, `after intent authorization`, `at payload encoding`,
+`at payload release`, or `at terminal approval`. A withheld payment payload
+does not mean the configured RPC saw no signed authorization. For authenticated
+x402, a refusal after the identity exchange does not mean the web-auth server
+saw nothing: the wallet can already have submitted the signed SEP-10 challenge.
+
+Every mainnet x402 error reply after the transmit gate passes appends
+`; the signed authorization may have reached the configured RPC and is valid
+through ledger <L>`. The `x402_payment_authorized` row records the same ledger
+as `signature_expiration_ledger`. The authorization can still settle until ledger
+`L`, so a new payment for the same resource before then can pay twice. Wait
+until the network passes ledger `L`, or ask the resource server whether the
+payment settled, before paying again.
+
+The boundary key maps what the plain x402 tool reports to the state of the
+call. The message prefix is in the error message. The `failure_stage` label is
+in the `x402_authorization_withheld` audit row.
+
+| Reported marker | Kind | State when the check refused |
+|---|---|---|
+| `payment withheld before signed transmission` | message prefix | Nothing sent or signed, unsigned requests sent, or signed locally |
+| `payment withheld at intent transmit gate` | message prefix | Signed locally, no signed material sent |
+| `payment withheld after intent authorization` | message prefix | Signed locally, no signed material sent, or signed material sent |
+| `payment withheld at payload encoding` | message prefix | Signed material sent |
+| `payment withheld at payload release` | message prefix | Signed material sent |
+| `payment withheld at terminal approval` | message prefix | Signed material sent |
+| `anchor_unavailable` | `failure_stage` | Signed locally, no signed material sent |
+| `resimulation` | `failure_stage` | Signed material sent |
+| `response_processing` | `failure_stage` | Signed locally, no signed material sent (a refused mainnet intent consumption), or signed material sent |
+| `encoding` | `failure_stage` | Signed material sent |
+| `payload_release` | `failure_stage` | Signed material sent |
+| `terminal_approval` | `failure_stage` | Signed material sent |
+
+
+### Library and substrate refusals
+
+Wallet entry guards and library boundaries have distinct codes.
+Setup and policy cannot admit excluded signing surfaces.
+
+| Code, reason, or message | Meaning |
+|---|---|
+| `network.witness_unavailable` | A required independent witness cannot be established. Resolver-detected witness gaps instead use `network.mainnet_authorization_refused`. |
+| `wallet.clock_error` | The authorization clock cannot provide a valid time. |
+| `network.witness_unavailable`: `cross-check refused: the transaction's {part} does not match the observations the witness compares` | The witness binds another envelope or intent. The message names `source`, `sequence`, `operation`, `memo`, `value`, `envelope`, or `authorization` as `{part}`. The wallet refuses signing and sending. Build the action again. |
+| `validation.mainnet_secret_env_refused` | A mainnet `pay`, `claim` or `accounts create` was given `--secret-env`. Mainnet signing reads no seed from the environment; omit the flag to sign with the enrolled seed in the keyring, or pass `--sign-with-ledger`. The refusal occurs before the write context, any keyring read or any request. The startup advisory can still read and append to the local audit log. |
+| `wallet.process_hardening_failed` | On Linux the CLI could not mark its process non-dumpable; the command did not run. The message names the `errno`. |
+| `wallet.runtime_unavailable` | The CLI could not start its async runtime; the command did not run. |
+| `sep43.mainnet_signing_forbidden` | An ordinary SEP-43 library signing path refuses mainnet. |
+| `sep43.mainnet_authorization_refused` | The authorized SEP-43 primitive refuses its bound authority. Public SEP-43 tools are excluded on mainnet. |
+| `sep45.mainnet_signing_forbidden` | SEP-45 refuses mainnet signing in either build. |
+| `feebump.mainnet_signing_forbidden` | The fee-bump signing path refuses mainnet. |
+| `sa.quorum.mainnet_write_forbidden` | Smart-account quorum writes refuse mainnet. |
+| `sa.credentials.mainnet_write_forbidden` | CLI smart-account credentials refuse mainnet writes. |
+
+### Policy and setup diagnostics
+
+These are policy-library and setup codes. CLI engine construction preserves
+`policy.engine_selection_unsigned`, `profile.mainnet_enablement_invalid`,
+`policy.window_chain_mismatch`, and
+`policy.window_chain_unverifiable`. Enrolled Noop owner discovery preserves keyring codes.
+Other build failures use `policy.engine_unavailable` or `trustline.policy_engine_unavailable`.
+
+| Code | Meaning or remedy |
+|---|---|
+| `policy.engine_selection_unsigned` | The profile engine selection lacks matching owner authorization. Sign the V2 `engine` selector with `profile sign-policy --profile <NAME> --secret-env <VAR>`, then set the matching profile selector and restart MCP. Both `v1` and `noop` require this ceremony. |
+| `profile.reset_window_state_owner_required` | A pin or enrolled owner requires an owner signature, including without mainnet enablement. Run reset with `--owner-secret-env <VAR>`. Use the pinned owner, or the enrolled owner when no pin exists. |
+| `policy.engine_required` | Noop refuses destructive mainnet policy decisions. Surface entry checks can refuse earlier. |
+| `policy.engine_unavailable` | The policy engine cannot be built. Enabled mainnet refuses `test_owner_key` before pin advancement. |
+| `policy.mainnet_table_on_testnet` | The policy contains `[mainnet]` on a testnet profile. |
+| `policy.sequence_rollback` | The policy is older than the installation pin, or uses v1 after a pin exists. |
+| `policy.pin_absent` | An installation with a mainnet enablement nonce has no readable pin, so every mainnet write and `profile enable-mainnet` refuse; no wallet command establishes a missing pin. Not agent-recoverable. When the message names a missing policy-state lock file, the pin entry still exists: a command that builds the V1 policy engine, such as starting the MCP server, recreates the lock file, and the nonce stays. When the pin itself is missing, the operator removes the keyring entry with service `stellar-agent-policy-window-<NAME>` and account `default-mainnet-enablement` with the platform keyring tool, runs `profile enable-mainnet --profile <NAME>`, which pins the installed signed policy and stores a new nonce, and signs the rebound policy at a higher sequence. That enablement trusts the installed signed policy and its owner, as a first enablement does. |
+| `policy.owner_rotation_required` | A higher sequence changes owner without a previous-owner statement. Sign with `--previous-owner-secret-env` and install the policy before enrollment. |
+| `policy.owner_rotation_invalid` | The statement names other owners or does not verify for this policy body. Review and sign it with the pinned owner's seed. |
+| `enroll_owner_key.rotation_statement_required` | Enrolling a key other than the pinned owner requires an installed policy signed by the new owner and carrying a valid statement from the pinned owner. The message names the cause. No owner entry changes. Re-enrolling the pinned owner key needs no statement. Lock, pin, keyring and policy errors keep their own codes. |
+| `policy.sequence_fork` | The pinned sequence has a different digest or owner. |
+| `policy.state_lock_busy` | The state lock remains held through the bounded acquisition attempts. |
+| `policy.state_lock_io` | The lock cannot be opened. The detail identifies the I/O failure. |
+| `policy.mainnet_minimum_unmet` | The enabled policy fails a named minimum requirement. |
+| `policy.pin_unusable` | The installation pin cannot be read or is malformed. |
+| `profile.mainnet_enablement_invalid` | The message names the failed binding: `mainnet_table`, `profile`, `source`, `default`, `on_disk`, `chain_id`, `on_disk_host`, `merged_host`, `on_disk_oracle_host`, `merged_oracle_host`, or `nonce_digest`. |
+| `profile.enable_mainnet_profile_flag_required` | Supply an explicit `--profile`. |
+| `profile.enable_mainnet_default_refused` | Select a dedicated profile whose name is not `default`. |
+| `profile.enable_mainnet_not_mainnet` | Select a mainnet profile. |
+| `profile.enable_mainnet_precondition` | A ceremony prerequisite or effect failed. The message names the failed check with its accepted form or cause, or carries the underlying error text. |
+| `profile.mainnet_oracle_required` | The mainnet profile sets no `oracle_provider_url`. Enablement refuses before any keyring read, and every mainnet write before any signature; the MCP server applies an oracle change from its next start, where a removed oracle fails the enablement with `on_disk_oracle_host`. Set `oracle_provider_url` and its `providers.oracle` record in the profile file. |
+| `profile.enable_mainnet_nonce_exists` | Use `--rotate` to replace the installation nonce. |
+| `sign_policy.sequence_exhausted` | The maximum of body and pinned sequence is `i64::MAX`. |
+| `profile.enroll_signer_identity_incomplete` | Follow the reported repair or enrollment remedy. |
+| `enroll_signer.repair_unpinned` | Identity repair requires the stored public-key pin. |
+| `enroll_signer.identity_conflict` | The stored identity conflicts with the enrolled signer. |
+| `auth.enrolled_identity_unusable` | `missing` means no record beside the seed, as an interrupted enrollment leaves it; `bound_elsewhere` means another profile or chain; `unbound` means no mainnet owner binding; `owner_required` means the mainnet check ran without an established owner; `owner_mismatch` means another owner; `binding_signature_invalid` means the owner signature does not verify. `public_key_mismatch` means the source is not the enrolled signer; `fee_source_mismatch` means a fee bump's fee source is not. The message names the remedy for its reason. For `public_key_mismatch` and `fee_source_mismatch` it names the enrolled signer address: pass that address as the source. On the CLI it also names the verb's source flag: `--source` on `pay` and `claim`, `--from` on `trustline`, and `--sponsor` on `accounts create`. For `missing`, `malformed`, `unsupported_version`, `malformed_key`, and `unsupported_role` it names `stellar-agent profile enroll-signer --profile <NAME> --repair-identity`. For `unbound`, `owner_mismatch`, and `binding_signature_invalid` it names `stellar-agent profile bind-signer --profile <NAME> --owner-secret-env <VAR>`; run it with the established owner. The other reasons name no command. Use the original profile for a foreign binding. Ledger enrollment is unavailable. |
+| `profile.reset_window_state_newer_version` | This build cannot reset an unsupported newer state format. |
+| `profile.reset_window_state_owner_mismatch` | The supplied seed must derive to the selected owner. The pin takes precedence over the enrolled key. |
+| `sign_policy.owner_key_older_form` | Enroll the owner public key again with `profile enroll-owner-key --force`. |
+| `policy.window_state_unverifiable` | Enabled-mainnet state cannot be verified. No verb recovers such state; create a profile under a new name. |
+| `policy.window_chain_mismatch` | The profile network disagrees with authenticated spending state. Restore the profile's network, or create a profile under a new name. |
+| `policy.window_chain_unverifiable` | Spending state lacks complete authenticated network provenance. No verb recovers such state; create a profile under a new name. |
+| `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |
+| `profile.reset_window_state_signature_invalid` | The owner's signature does not verify over this reset. Run the reset again with the selected owner's seed in `--owner-secret-env`. |
+| `policy.reset_consent_replayed` | The latest reset already consumes this request id. Run the reset again; each run signs a fresh reset statement with a fresh request id. |
+| `approval.presence_required` | Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page. |
+| `approval.presence_policy_unavailable` | The current owner-signed mainnet policy cannot be verified, lists no approval credential, or changed since the consent was recorded. |
+| `approval.presence_policy_busy` | `approval.presence_policy_busy` means the required policy-state lock stays busy; the listener returns retriable HTTP 503 `store_busy`; retry the operation. |
+| `approval.listener_policy_stale` | The approval listener serves an earlier owner-signed mainnet policy; restart it under the current policy. |
+| `approval.origin_signed_remote` | The owner-signed policy serves mainnet consent at its approval origin; approve there. |
+| `approval.mainnet_remote_unsupported` | Remote mainnet approval requires a signed approval origin. |
+| `approve.remote_tls_unavailable` | Configure both TLS paths and a readable, matching PEM pair; the message names the field. |
+| `approval.cert_pin_mismatch` | The served leaf key differs from the policy's SPKI pin. |
+| `approval.origin_profile_mismatch` | The profile RP differs from the signed origin's host. |
+| `approval.listener_busy` | The configured socket is occupied; use the running inbox. |
+| `approve.yes_refused_on_mainnet` | On mainnet, `--yes` refuses before store access in either build. |
+| `accounts.create.generate_refused_on_mainnet` | Mainnet creation requires a destination public key. Generated-key creation is a testnet convenience. |
+| `approval.presence_invalid` | The passkey assertion fails verification; start a fresh consent. |
+| `approval.presence_changed` | The pending request or policy differs from the displayed consent; reload it. |
+| `approval.presence_expired` | The presence deadline expires; start a fresh consent. |
+| `approval.presence_consumed` | The challenge is consumed; start a fresh consent. |
+| `approval.presence_unavailable` | The presence ceremony cannot start or complete; check the local browser and authenticator. The consent page binds `127.0.0.1` and `[::1]` on one port, so a host without IPv6 loopback cannot start it. |
+| `approval.presence_canceled` | The presence ceremony is canceled; no approval is recorded. |
+| `approval.presence_browser_required` | The ceremony requires a local browser; no approval is recorded. |
+
+### Policy denial codes
+
+| Code | Meaning |
+|---|---|
+| `policy.deny.asset_not_allowlisted` | Asset outside the rule's allowlist. |
+| `policy.deny.per_tx_cap_exceeded` | Transaction cap exceeded. |
+| `policy.deny.per_period_cap_exceeded` | Period cap exceeded. |
+| `policy.deny.rate_limit_exceeded` | Rate limit exceeded. |
+| `policy.deny.counterparty_denied` | Counterparty restriction failed. |
+| `policy.deny.minimum_reserve_breached` | Minimum reserve breached. |
+| `policy.deny.owner_signature_stale` | Owner signature stale. |
+| `policy.deny.no_matching_rule` | No rule matches this policy-tool name and action. |
+| `policy.deny.counterparty_kind_unsupported` | Counterparty kind cannot be evaluated. |
+| `policy.deny.evaluation_error` | Policy evaluation failed. |
+| `policy.deny.unsizable_value_effect` | Value effect cannot be sized. |
+| `policy.deny.explicit_rule_deny` | Matching rule denies the action. |
+| `policy.deny.inner_invocation_count_cap_exceeded` | Invocation-count cap exceeded. |
+| `policy.deny.bundle_aggregate_cap_exceeded` | Bundle aggregate cap exceeded. |
+| `policy.deny.bundle_contains_generic_kind` | Bundle contains a generic invocation kind. |
+| `policy.deny.bundle_denied` | Bundle restriction failed. |
+| `policy.deny.quorum_not_satisfied` | Required quorum absent. |
+| `policy.deny.home_domain_not_resolved` | Required home domain unresolved. |
+| `policy.deny.sep10.session_missing` | Required SEP-10 session absent. |
+| `policy.deny.sep45.session_missing` | Required SEP-45 session absent. |
+| `policy.deny.unlisted_budget_exceeded` | Unlisted-recipient budget exceeded. |
+| `policy.deny.total_budget_exhausted` | Total allocation exhausted. |
+| `policy.deny.memo_binding_mismatch` | Bound memo missing or different. |
+| `account.unread` | Floor account read or exposure coverage unavailable. |
+| `account.stale` | Floor account read too old. |
+| `account.floor_refused` | Native balance floor would be breached. |
 
 ## Network-binding codes (submit layer)
 
@@ -122,17 +479,23 @@ own check comes after the nonce is consumed.
 | Code | Meaning | Agent action |
 |---|---|---|
 | `network.endpoint_network_mismatch` | The endpoint serves a different network than the one declared (an RPC URL and a `chain_id` / network passphrase that disagree). | Do not retry as-is. Report to the operator: the profile's `rpc_url` and its network do not name the same chain. |
-| `network.endpoint_identity_unavailable` | The endpoint's network identity could not be established within the submission timeout, or its `getNetwork` answer did not parse. A transport failure is retried with bounded backoff; an answer that does not parse is not retried. The probe never falls back to the declared network. | Nothing was sent. Treat the endpoint as unusable and surface it to the operator; do not switch to a different endpoint on your own. |
+| `network.endpoint_identity_unavailable` | The endpoint's network identity could not be established within the check's deadline, or its `getNetwork` answer did not parse. A transport failure is retried with bounded backoff; an answer that does not parse is not retried. The probe never falls back to the declared network. | No transaction or payment was sent. Treat the endpoint as unusable and surface it to the operator; do not switch to a different endpoint on your own. |
+| `network.pre_send_timeout` | A read the submit layer makes before the send, the endpoint identity probe or the signer-set read, did not answer within the 30-second pre-send budget. The message names the read. `--timeout-seconds` and `submit_timeout_seconds` do not change the budget. | Nothing was sent, so no reconciliation is needed. Retry once the endpoint answers promptly; if the refusal persists, report the named read to the operator. Do not switch to a different endpoint on your own. |
+| `network.endpoint_not_ready` | The endpoint reports a status other than healthy, its latest-ledger read failed, or its latest ledger closed more than 60 seconds from the host clock. The message names the reason. The classic MCP prepare tools and CLI `pay`, `claim`, sponsored `accounts create`, and `trustline` run this check before they sign. | No transaction was signed or sent. Retry once the endpoint is current; if the refusal persists, report the reason to the operator and check the host clock. Do not switch to a different endpoint on your own. |
 | `network.rpc_credential_refused` | RPC credential invalid or rejected. | See below. |
-| `network.unsupported_protocol_version` | A mainnet endpoint runs a protocol version outside the range this release supports (protocols 29 and 30). The message names the version and the range. While mainnet writes are refused, a mainnet endpoint is refused with `network.mainnet_write_forbidden` before this check. On testnet and other networks the same version is a logged warning, not a refusal. | Nothing was sent. Report the version to the operator; do not switch to a different endpoint on your own. |
-| `network.envelope_signed_for_mainnet` | A signature on the envelope was made for mainnet, not for the network the endpoint serves. | Do not retry; the envelope cannot be relayed onto this chain. Re-run the simulate step for the intended network. |
+| `network.unsupported_protocol_version` | A mainnet endpoint runs a protocol version outside the range this release supports (protocols 29 and 30). The message names the version and the range. Ordinary submission refuses mainnet before this check. Authorized submission enforces it. On testnet and other networks the same version is a logged warning, not a refusal. | No transaction or payment was sent. Report the version to the operator; do not switch to a different endpoint on your own. |
+| `network.envelope_signed_for_mainnet` | A signature fails under the endpoint network and verifies under mainnet. | Do not retry; the envelope cannot be relayed onto this chain. Re-run the simulate step for the intended network. |
 | `network.envelope_signature_unverifiable` | A signature verifies under neither the endpoint's network nor mainnet, or no eligible ed25519 signer accounts for it (hash-x and pre-auth-tx signers contribute no ed25519 key). | Do not retry the same envelope. Re-run the simulate step and sign with a key the source account lists as a signer. |
 | `network.envelope_unsigned` | The envelope carries no signature, or on a fee-bump the outer or the inner transaction carries none; typically a build-only envelope handed straight to a submit step. | Sign the envelope first, then submit. On a fee-bump, both the inner transaction and the fee source must sign. |
-| `network.account_not_found` | A transaction-source or operation-source account on the envelope is absent from the ledger, so its signer set cannot be read. | Nothing was sent. Confirm the account exists and is funded on the target network. |
+| `network.account_not_found` | A transaction-source or operation-source account on the envelope is absent from the ledger, so its signer set cannot be read. Both SEP-43 transaction tools read it before the policy decision. The SEP-43 transaction and auth-entry tools also refuse with it when the wallet account of a payment decision is absent. An absent recipient does not refuse. | Nothing was signed or sent. Confirm the account exists and is funded on the target network. |
 
 `network.rpc_credential_refused` means the credential is empty, exceeds 1024 bytes,
 holds a control character, or an endpoint answers a request with HTTP 401 or 403.
 A rejected request is not retried. No transaction was sent.
+
+For the x402 payment tools, a payment endpoint refusal occurs before the payer
+signs. For authenticated payment, the SEP-10 challenge can already have been
+signed and submitted.
 Report it to the operator, who reruns
 `stellar-agent profile enroll-rpc-credential --role <role> --force` and checks the
 placement against the provider's documentation.
@@ -142,6 +505,15 @@ placement against the provider's documentation.
 | Code | Meaning | Agent action |
 |---|---|---|
 | `network.friendbot_account_already_funded` | Friendbot refuses to fund the account because its XLM balance is at or above the Friendbot starting balance (10,000 XLM on the SDF testnet). `stellar-agent friendbot`, `accounts create --fund-with-friendbot`, and `stellar_friendbot` report it; the message names the account. An existing account below the starting balance receives that amount instead. | Do not retry. The account is usable as it is: continue with it, or fund a new account if you need a fresh account. |
+
+## Claim codes
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `claim.invalid_balance_id` | The balance id is not the 72-hex V0 form, the bare 64-hex hash, or a `B...` strkey. | Correct the id; it is checked before any request. |
+| `claim.balance_not_found` | The ledger holds no claimable balance for this id: it was already claimed, or the id is wrong. CLI `claim`, `--build-only` included, and MCP `stellar_claim` report it before signing. | Do not retry with the same id. Confirm the id with whoever created the balance. |
+| `claim.not_claimant` | The source account is not a claimant on the balance. | Use a claimant account as the source. |
+| `claim.predicate_not_satisfied` | The claimant's predicate does not hold now; the message names the claimability window. | Retry inside the window. |
 
 ## Submission codes (unresolved outcomes)
 
@@ -155,53 +527,117 @@ transaction hash the message redacts.
 The rule for all of them is the same: **reconcile, never rebuild or resubmit.**
 At most one transaction per source account and sequence can ever apply, and the
 wallet cannot tell whether the recorded one did. A second submission at that
-sequence is refused until the first is settled, and a different fee does not get
-around it. No recovery path sends a transaction again.
+sequence is refused while the first one's receipt remains pending, and a
+different fee does not get around it. No recovery path sends a transaction
+again.
 
 | Code | Meaning | Agent action |
 |---|---|---|
-| `submission.tx_timeout` | The submission ended without a confirmed outcome: the deadline passed, the endpoint reported an unexpected status, or a transport failure struck during or after the send. It may still apply; the message says to settle it by its transaction hash and not to resubmit. `details` carries `tx_hash`, `timeout_seconds`, `outcome: "unknown"`, `reconcile_with`, and `envelope_hash` where the reporting surface holds the signed bytes. | Call `stellar_transaction_status` with `details.tx_hash` (CLI: `stellar-agent tx status <HASH>`). Do not re-simulate, rebuild, or resubmit. |
-| `submission.tx_already_submitted` | A pending record already holds this transaction's source account and sequence, or the spending window already holds these signed bytes. Nothing was sent. `details.tx_hash` names the transaction to reconcile. | Reconcile `details.tx_hash` first. Once it is settled, the sequence is free and a fresh simulate-and-commit proceeds. |
+| `submission.intent_record_unavailable` | Intent recording is unavailable for a smart-account signing. Existing exposed charges remain. | Report it to the operator. Retry after the repair. |
+| `submission.intent_binding_mismatch` | A signing request or final transaction differs from its admitted intent. Existing exposed charges remain. | Report it to the operator. Do not resubmit that transaction. |
+| `submission.tx_timeout` | The submission ended without a confirmed outcome: the deadline passed, the endpoint reported an unexpected status, or a transport failure struck during or after the send. On a mainnet profile it also reports a failure or a refusal the primary endpoint reported and the oracle did not confirm. It may still apply; the message says to settle it by its transaction hash and not to resubmit. `details` carries `tx_hash`, `timeout_seconds`, `outcome: "unknown"`, `reconcile_with`, and `envelope_hash` where the reporting surface holds the signed bytes. | Call `stellar_transaction_status` with `details.tx_hash` (CLI: `stellar-agent tx status <HASH>`). Do not re-simulate, rebuild, or resubmit. |
+| `submission.tx_already_submitted` | A pending record already holds this transaction's source account and sequence, or the spending window already holds these signed bytes. Nothing was sent. `details.tx_hash` names the transaction to reconcile. | Reconcile `details.tx_hash` first. Once its receipt is no longer pending, that receipt no longer holds the source account and sequence. A fresh simulate-and-commit must still pass the spending window's duplicate and cap checks. |
 | `submission.hash_mismatch` | The endpoint reported a transaction hash that does not describe the transaction that was sent. `details` carries both hashes. | Reconcile `details.tx_hash`. Report the mismatch to the operator: the endpoint is not describing what it was handed. |
-| `submission.record_unavailable` | A receipt, spending-window, or audit-record failure. Before submission, this means that attempt sent nothing; a pending-row anchor failure carries `audit.tip_anchor_unavailable` in the message. During status recovery, it concerns an existing submission and does not establish whether it was sent. | Report to the operator. After repair, repeat `stellar_transaction_status` for an existing submission; do not rebuild or resubmit it. Retry submission only when the failure is known to precede the send. |
-| `submission.tx_malformed` | The endpoint refused the transaction outright, reporting a validation error for the envelope (for example the fee was below the current floor). The wallet never sends those bytes again and releases the reservation. | A fresh simulate-and-commit is the next step; the sequence is free. |
-| `policy.approval_consumed` | The approval presented was already spent on a submission. | Check that transaction's status before asking for the action again. Do not re-present the same approval. |
+| `submission.record_unavailable` | A receipt, spending-window, or audit-record failure. Before submission, this means that attempt sent nothing; a pending-row anchor failure carries `audit.tip_anchor_unavailable` in the message. During status recovery, it concerns an existing submission and does not establish whether it was sent. From `stellar_sep43_sign_transaction`, it means the approval could not be spent, so no signature was returned. | Report to the operator. After repair, repeat `stellar_transaction_status` for an existing submission; do not rebuild or resubmit it. Retry submission only when the failure is known to precede the send. |
+| `submission.tx_malformed` | The endpoint refused the transaction outright, reporting a validation error for the envelope (for example the fee was below the current floor). The wallet never sends those bytes again. A reported failure or missing transaction does not release possible spending: the record stays `pending`. The reservation keeps counting through its accounting horizon or, without a time bound, until the operator clears it with both acknowledgement flags. On a mainnet profile a refusal is reported as `submission.tx_timeout` instead, because no second endpoint confirms it. | The error carries no `details` object. Report it to the operator. Once the accounting horizon has passed or the operator has cleared the record, a fresh attempt must still pass the spending window's duplicate and cap checks. Do not resubmit the same bytes. |
+| `policy.approval_consumed` | The approval presented was already spent. A classic approval was spent on a submission. A `stellar_sep43_sign_transaction` approval is spent when the signature is returned, and the caller holds that signature. A consumed x402 approval cannot be replayed. Its stored digest identifies the final envelope on mainnet or signed authorization entries on testnet. It is not a chain transaction hash. On mainnet the code also answers a proof of another operation, such as a call under another `business_id`. | Do not re-present the same approval. For another operation, present it only under the `business_id` of the call that prepared it. For a classic approval, check that transaction's status before asking for the action again. For an x402 payment, request a new payment intent with call 1 and a fresh approval. |
 
 What `stellar_transaction_status` reports, and what it means:
 
-- `chain_status: "SUCCESS"`: the payment went through. Report it as done.
-- `chain_status: "FAILED"`: the transaction applied and failed. Nothing moved.
+A reported failure or missing transaction does not release possible spending.
+
+- `chain_status: "SUCCESS"`: the endpoint reports that the payment went
+  through. Report it as done. A time-bounded spend keeps counting through the
+  transaction's accounting horizon, and no submitted row is written. A testnet
+  classic envelope carries no time bound, so the hold of a testnet commit that
+  reserved spending stays open, with `record.reservation_open: true`, until the
+  operator clears it with both acknowledgement flags. A commit that reserved
+  nothing answers `record.reservation_open: false`.
+- `chain_status: "FAILED"`: the endpoint reports that the transaction applied
+  and failed. The record keeps its status, and the reservation keeps counting
+  through its accounting horizon. Without a time bound it counts until the
+  operator clears it with both acknowledgement flags.
 - `chain_status: "NOT_FOUND"` with `record.status: "pending"`: nothing is
-  settled. The transaction can still apply. Wait and call again.
-- `chain_status: "NOT_FOUND"` with `record.status: "ambiguous"` and a
-  `record.release_code`: the transaction can no longer apply.
-  `submission.sequence_consumed` means another transaction used its sequence;
-  `submission.time_bound_passed` means its time bound passed, which needs an
-  envelope that carries one. The reservation is released and a
-  `value_action_failed` row is written under that code. A fresh
+  established. The transaction can still apply. Wait and call again.
+- On a mainnet profile, an authenticated classic attempt reports `chain_status`
+  from cached recovery evidence, or `UNKNOWN` without it, and sends no
+  additional transaction lookup. Its `recovery` field carries each attempt's
+  typed result: `Included`, `NeverApplicable`, or `NeedsEvidence`. A checked
+  recovery decision settles it once this host's clock is at least six seconds
+  past the envelope's maxTime. The decision needs identical answers from the
+  primary endpoint and the oracle, and the profile's audit writer. An unmanaged
+  record keeps its primary lookup; that answer's `FAILED` or `NOT_FOUND` decides
+  nothing alone, and the oracle the enablement binds is asked as well.
+  Reconciliation runs only after the
+  enablement verifies: a stored `rpc_url` or `oracle_provider_url` removed or
+  moved to another host refuses with `profile.mainnet_enablement_invalid`
+  (`network.mainnet_write_forbidden` on a running server), and a profile
+  without an enablement record answers from the stored state and the
+  primary's lookup, keeping the receipt status and the reservation. A time-bounded
+  reservation ends at its accounting horizon. Once its execution bound has
+  passed, an eligible receipt clears with `stellar-agent tx receipt clear
+  <ENVELOPE_HASH> --acknowledge`, and the bounded spend stays charged through
+  the horizon. An untimed hold clears with `--acknowledge
+  --acknowledge-unbounded`.
+- `record.status: "ambiguous"` with `record.release_code:
+  "submission.accounting_expired"`: the accounting horizon has passed. The
+  horizon is the later of the signed time bound and the first local success
+  observation, plus each affected window's duration. The reservation has
+  ended with the outcome unknown, and no failed row is written. A fresh
   simulate-and-commit is the next step.
+- A transaction without a time bound keeps its reservation until the operator
+  clears it with `--acknowledge --acknowledge-unbounded`, on every network and
+  whatever the endpoint reports.
 - `chain_status: "NOT_FOUND"` with `record.status: "ambiguous"` and no
-  `release_code`: the endpoint can no longer answer for it at all, and only the
-  operator can resolve it, with
-  `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`.
-- `chain_status: "NOT_FOUND"` with `record.status: "failed"`: the endpoint
-  reported a validation error for the envelope or previously reported an
-  on-chain `FAILED` that has left its retained history. The wallet never sends
-  those bytes again. A fresh simulate-and-commit is the next step.
+  `release_code`: the endpoint can no longer answer for it at all. A
+  time-bounded reservation still ends at its accounting horizon. Once its
+  execution bound has passed, an eligible receipt clears with
+  `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`, and the
+  bounded spend stays charged through the horizon. An untimed hold clears with
+  `--acknowledge --acknowledge-unbounded`.
+- A validation error for the envelope at the send, such as
+  `submission.tx_malformed` on testnet, records no failure. The record stays
+  `pending`. The reservation keeps counting through its accounting horizon,
+  or, without a time bound, until the operator clears it with both
+  acknowledgement flags. The wallet never sends those bytes again.
 - No `record`, and a `reservation` with `operator_required: true`: the receipt
-  is missing and the endpoint can no longer answer for the transaction. Only
-  the operator resolves it, with `tx receipt clear`.
+  is missing and the endpoint can no longer answer for the transaction. A
+  time-bounded reservation still ends at its accounting horizon. Once its
+  execution bound has passed, `tx receipt clear --acknowledge` clears the
+  receipt while the endpoint still reports `NOT_FOUND` below its retention
+  floor. On mainnet the oracle is asked as well and can refuse the clear. The
+  bounded spend stays charged through the horizon. An untimed hold clears
+  with `--acknowledge --acknowledge-unbounded`.
 
 Read `record.status` and `record.release_code`, not `record.reservation_open`.
 An action the policy engine sized no value for takes no reservation at all, so
 `reservation_open` is `false` for it from the start and says nothing about
 whether the submission settled.
 
-`tx receipt clear --acknowledge` reconciles before it clears. It refuses with
-`submission.still_pending` while a sent transaction's time bound is open and
-its sequence unconsumed. A failed ledger-time read refuses sent, timed
+`tx receipt clear --acknowledge` reconciles before it clears. `--acknowledge`
+records the operator's decision; clearing establishes no chain outcome. It
+refuses with `submission.still_pending` while a sent or held transaction's time
+bound is open on this host's clock. On mainnet, the verb first requires the
+enablement to verify and refuses with `profile.mainnet_enablement_invalid`
+before any endpoint is asked when it does not, including on a profile without
+an enablement record. It then asks the oracle the enablement binds. An oracle
+that cannot be reached, or does not answer by
+the verb's deadline, refuses with `network.rpc_unreachable`, and the message
+names the cause: wait, or ask the operator to check the oracle. An oracle
+that reports another network or an unsupported protocol refuses with
+`submission.not_clearable`: its answer does not count. The verb also refuses
+the oracle's `SUCCESS`, and its `FAILED` for a held reservation, with
+`submission.not_clearable`. A failed ledger-time read
+refuses sent, timed
 submissions with `network.rpc_unreachable`; other failed reconciliation reads
-also refuse. Both are operator conditions: wait, or ask the operator.
+also refuse. Both are operator conditions: wait, or ask the operator. An
+authenticated hold without a time bound needs `--acknowledge-unbounded` as well
+on every network, whatever its record says and whatever the endpoint or the
+oracle reports; without it the clear refuses with
+`submission.unbounded_exposure`, and with it the hold is released. A clear
+of such a hold stopped after the release finishes when it is run again with
+both flags. On a mainnet profile a sent `pending`, `ambiguous` or `failed`
+record without a time bound and with no hold needs the same flag.
 
 An operator policy that lists tools explicitly must include
 `stellar_transaction_status`, or a timed-out submission cannot be resolved
@@ -226,6 +662,7 @@ the replay window is wiped on process restart.
 | `nonce.ttl_exceeded` | The requested TTL exceeds the profile maximum. | Request a shorter TTL within the profile bound. |
 | `nonce.ttl_too_short` | The requested TTL is below the minimum floor. | Request a longer TTL at or above the floor. |
 | `nonce.key_too_short` | The keyring nonce key has fewer than 32 bytes. | Operator must repair the keyring nonce key. Not agent-recoverable. |
+| `nonce.key_too_long` | The keyring nonce key decodes to more than 32 bytes. The key is exactly 32 bytes. | Operator must repair the keyring nonce key. Not agent-recoverable. |
 | `nonce.input_too_long` | A length-prefixed field (`tool_name` or `chain_id`) exceeds the encoding bound. | Use a valid registered tool name and a valid CAIP-2 `chain_id`. |
 | `nonce.serialise_failed` | Base64 encode/decode of the nonce failed. | Pass the nonce string exactly as returned by simulate. |
 | `nonce.mint_failed` | The simulate step could not mint the single-use nonce, almost always because the profile's keyring nonce key is missing or unreadable. This fires at simulate time, before any commit, so an unpopulated keyring blocks the flow at the first write step, not at commit. | Not agent-recoverable: the operator must populate the profile's keyring nonce key. Report to the operator. |
@@ -250,6 +687,7 @@ signing tools remain uncovered.
 | Code | Meaning | Agent action |
 |---|---|---|
 | `simulation.divergence` | Entry or envelope disagreement. | Re-simulate; see below. |
+| `simulation.deadline_invalid` | The commit's envelope has no valid on-chain deadline, or it has passed. | Simulate again and commit the fresh envelope. |
 | `network.witness_unavailable` | Required oracle witness unavailable. | See below. |
 
 For a cross-check, `simulation.divergence` means the primary and oracle disagree
@@ -257,8 +695,9 @@ on a ledger entry the decision uses. The message names the entry and field.
 For the x402 payment tools the entry is the `soroban simulation`, and the field
 is one of `result`, `authorization count`, `credentials`, `address`, `signature`,
 `invocation`, `resource fee ceiling`, `ledger skew`, or `expiration`.
-Nothing is signed or sent. Re-simulate and retry; report persistent disagreements
-to the operator. Envelope-decode and rebuild producers of this code remain.
+A witness refusal precedes the payer signature. Authenticated identity exchange
+can already be complete. Re-simulate and retry; report persistent disagreements
+to the operator. Envelope decoding and envelope rebuild also produce this code.
 
 The x402 witness runs before the health read, which keeps the deadline of
 `submit_timeout_seconds`. A witness that overruns it surfaces at the health read,
@@ -268,16 +707,27 @@ as `x402.rpc_simulate_failed` in `stellar_x402_create_payment` and as
 `network.witness_unavailable` means the required oracle or asset threshold is
 missing, or the oracle cannot be constructed, identified, or read successfully.
 Its message gives a safe reason and at most the oracle authority.
+It also reports an envelope mismatch when the witness binds another envelope or
+intent. The operator then builds the action again.
 The operator corrects `oracle_provider_url`, `[providers.oracle]`, or
-`[cross_check_thresholds]`. Retry after a transient failure.
+`[cross_check_thresholds]`. On mainnet a token threshold applies only when
+the signed policy's `[mainnet.cross_check_thresholds]` names the asset, so the
+operator signs it there. Retry after a transient failure.
 
 ## Fee-cap codes
 
 | Code | Meaning | Agent action |
 |---|---|---|
 | `fees.percentile_exceeds_cap` | Fee exceeds cap. | Follow the remedy below. |
-| `validation.mainnet_fee_cap_required` | Mainnet cap missing. | Operator sets the cap. |
+| `validation.mainnet_fee_cap_required` | Mainnet cap missing. | Operator sets the signed cap. |
 | `validation.fee_total_overflow` | Pool fee overflows. | Lower the profile fee. |
+| `validation.contract_transfer_fee_exceeded` | A SEP-43 transaction's full fee, resources included, exceeds the contract transfer fee cap. Without a signed cap off mainnet, the bound is 1,000,000 stroops. | Prepare the transaction again with a lower fee. |
+
+## Memo codes
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `validation.memo_control_character` | A text memo holds a control character (U+0000 to U+001F, U+007F to U+009F) or a Unicode format character (category Cf), line separator (U+2028), or paragraph separator (U+2029), on any network. The format characters include U+200C and U+200D. The message names the character, not the memo. | Send the memo without that character. |
 
 `fees.percentile_exceeds_cap` means the per-operation fee exceeds
 `classic_max_fee_per_op_stroops`. The message names the source: an auto-selected
@@ -290,10 +740,14 @@ fee, pass an explicit fee within the cap, or prepare again with a fee within
 the cap. Raising the cap or lowering `classic_fee_per_op_stroops` is an
 operator decision.
 
-`validation.mainnet_fee_cap_required` means a covered stage refused because a
-mainnet profile sets no `classic_max_fee_per_op_stroops`. Nothing was signed
-or sent. This is not agent-recoverable. The operator sets the cap in the
-profile file; `profile init --network mainnet` writes `10000`.
+`validation.mainnet_fee_cap_required` means an action has no effective classic
+fee cap. Nothing was sent. This is not agent-recoverable. The operator sets the
+signed cap, which the enabled-policy minimum requires. The effective cap is the
+smaller signed/profile value, or the one available value. MCP preparation checks
+the effective cap, and the resolver independently reevaluates it.
+A higher profile cap warns. Resolver fee failures become
+`network.mainnet_authorization_refused`. Over-cap fees retain
+`fees.percentile_exceeds_cap`; total overflow uses `validation.fee_total_overflow`.
 
 `validation.fee_total_overflow` means the `pool init` per-operation fee times
 the operation count exceeds the transaction fee limit. Nothing was built,
@@ -307,36 +761,46 @@ An existing checkpoint remains resumable, without consuming a retry attempt.
 four-part capability gate. Two signing tools are reachable, only through gated
 capabilities: `stellar_pay_commit` (`sign-payment`) and
 `stellar_rule_create_commit` (`sign-rule-create`). Each needs a first-invoke
-grant plus its per-action approval. No other signing tool is reachable through
-a toolset. The routed tool's own policy gate still applies.
+grant. Rule creation also needs its per-action approval. A payment needs one
+when the stricter of the routed and outer policy decisions requires approval.
+No other signing tool is reachable through
+a toolset. The routed tool's own policy gate still applies. The dispatcher is a
+destructive tool. On a mainnet profile it admits only the exact `stellar_pay`
+and `stellar_pay_commit` actions after setup; every other action refuses.
 
 | Code | Meaning | Agent action |
 |---|---|---|
-| `toolset.first_invoke_approval_required` | The first time a toolset uses a signing-adjacent capability with no matching grant, a one-time gate fires and queues an approval. | Ask the operator to approve the queued entry with `stellar-agent approve --id <nonce> --profile <name>`. Once approved, a time-boxed grant suppresses only this re-prompt; the per-action payment approval still fires on every payment. |
+| `toolset.first_invoke_approval_required` | The first time a toolset uses a signing-adjacent capability with no matching grant, a one-time gate fires and queues an approval. | Ask the operator to approve the queued entry with `stellar-agent approve --id <nonce> --profile <name>`. Once approved, a time-boxed grant suppresses only this re-prompt. A payment still needs a per-action approval when the routed payment rule or the outer toolset rule requires approval. |
 | `toolset.unknown_action` | The action is not in the toolset's capability-to-tool matrix. | Call `stellar_toolset_list` to see the toolset's invocable actions; use one of those. |
 | `toolset.capability_not_declared` | The toolset's manifest does not declare the capability needed to grant this action. | The toolset cannot perform this action. Report to the operator; do not retry. |
 | `toolset.tool_not_allowed` | The resolved tool is excluded by the toolset's `allowed_tools` narrowing. | The toolset is configured not to use that tool. Report to the operator. |
 | `toolset.not_installed` | The named toolset is not installed. | Verify the toolset name with `stellar_toolset_list`; install via the operator if missing. |
+| `toolset.pin_unverifiable` | The toolset's pin record does not verify under the installation's pin key: it was edited, written under another key, or carries no authentication tag. Nothing it states is trusted. | Not agent-recoverable. Ask the operator to uninstall the toolset and install it again from its signed package. |
+| `toolset.content_digest_mismatch` | The toolset's `TOOLSET.md` on disk differs from the digest in its pin record, or cannot be read. Through MCP this refusal is an internal error whose message starts `toolset.enforcement_error: toolset.content_digest_mismatch`. | Not agent-recoverable. Report to the operator, who reinstalls the toolset. |
 | `toolset.gated_missing_envelope` | A toolset sign-payment route was called without `args.envelope_xdr`. | Run `stellar_pay` (simulate) first and pass its `envelope_xdr` into the gated invoke. |
 | `toolset.args_not_object` | `args` was not a JSON object. | Pass `args` as a JSON object. |
 | `toolset.args_validation` / `toolset.args_deserialise` / `toolset.gated_args_deserialise` | The toolset arguments failed validation or deserialization. | Fix the argument shape to match the routed tool's schema and retry. |
-| `toolset.route_missing` / `toolset.gated_route_missing` | No tool route resolved for the action. | Re-check the action name with `stellar_toolset_list`. |
+| `toolset.route_missing` / `toolset.gated_route_missing` | The toolset matrix names a tool this binary has no routing arm for. The answer is an internal error. An unknown action name answers `toolset.unknown_action` instead. | Not agent-recoverable. Report it to the operator. |
+| `toolset.coordination_busy` | An install, uninstall, or grant write holds a lock the gated call needs. A payment call answers this business code. A rule-creation call answers an internal error whose message starts `toolset.enforcement_error:` and holds the nested `toolset.coordination_busy`. | Retry once the install, uninstall, or grant write ends. |
 
 ## MCP server availability
 
 | Code | Meaning | Agent action |
 |---|---|---|
-| `mcp.disabled_per_profile` | The active profile sets `mcp_disabled = true`, the operator kill-switch. The server refuses to start (exits non-zero); no tool calls are served. | The MCP surface is disabled for this profile. Ask the operator to select a profile with the MCP surface enabled, or clear the kill-switch. The `mcp-resource://profiles/<name>` resource reports `mcp_disabled`. |
+| `mcp.disabled_per_profile` | The active profile sets `mcp_disabled = true`, the operator kill-switch. The server refuses to start (exits 1); no tool calls are served. | The MCP surface is disabled for this profile. Ask the operator to select a profile with the MCP surface enabled, or clear the kill-switch. The `mcp-resource://profiles/<name>` resource reports `mcp_disabled`. |
 
-Other startup failures (no supported platform keyring backend, an unloadable
-profile, a duplicate tool registration) also cause the process to exit non-zero
-before serving any request. These are operator-side environment problems, not
+Other startup failures (an unloadable profile, a duplicate tool registration,
+a V1 profile without a keyring backend, a registered backend that refuses the
+enrolled-owner read) also cause the process to exit 1 before serving any
+request. A refused argument or an unusable profile name exits 2. Without a
+keyring backend, a profile that does not select the V1 engine starts, and its
+signing tools refuse at call time. These are operator-side environment problems, not
 agent-recoverable at runtime.
 
 ## Halted-profile codes
 
 The operator stops a profile with `stellar-agent profile halt <name>` and lifts
-the stop with `stellar-agent profile resume <name>`. Both binaries read the
+the stop with `stellar-agent profile resume <name>`. The CLI and the MCP server read the
 profile's halt marker before every action that signs or submits, and the MCP
 server reads it before every tool that is not read-only. The CLI verbs that
 only record or reconcile local state (`mpp receipt record`,
@@ -355,17 +819,20 @@ the operator. A running MCP server applies a halt from its next call.
 | Code | Meaning | Agent action |
 |---|---|---|
 | `keyring.error` | A platform keyring read failed while loading the nonce key or an HMAC key on a two-phase verb. | Often the active profile names a keyring entry that holds no secret yet (the first-run testnet fallback profile uses placeholder coordinates). Only read-only tools that never touch the keyring still work: the simulate step already fails at nonce mint (`nonce.mint_failed`) when the nonce key is missing, so the flow stops there, before any commit. The operator must populate the keyring entry. Report to the operator. |
-| `auth.keyring_interactive_session_required` | Windows Credential Manager requires an interactive logon session; the process is running non-interactively (service, SSH, scheduled task). | Not retryable in-place. The operator must either run from an interactive desktop session or opt into the headless keyring store (`STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi` or `headless-env`, see profiles-and-keys.md). Report to the operator. |
+| `auth.keyring_interactive_session_required` | Windows Credential Manager requires an interactive logon session; the process is running non-interactively (service, SSH, scheduled task). | Not retryable in-place. The operator must either run from an interactive desktop session or opt into the headless keyring store (`STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi` or `headless-env`, see [profiles-and-keys.md](profiles-and-keys.md)). Report to the operator. |
+| `auth.keyring_platform_error` | A credential store operation failed. The message names the operation, the store, and the cause, such as `credential store operation failed` or `credential store access denied`, and never a secret or a keyring coordinate. When `profile rotate-audit-key` refuses at the anchor write it owes, the message also says that the audit key was not rotated and names the command to rerun. | Not agent-recoverable. Report the message. The operator resolves the cause it names (for an access failure, by restoring access to the named store, or by the remedy the message carries), then reruns the command. |
 | `auth.keyring_config_invalid` | The headless keyring store cannot be set up from the environment. `STELLAR_AGENT_KEYRING_BACKEND` names an unknown backend, or `STELLAR_AGENT_HEADLESS_KEYRING_KEY` is missing or malformed: base64 padding, the standard alphabet, or not 32 bytes. The backend may also be unsupported on the platform, or the state directory undeterminable. The message names the cause, never the key. | Not agent-recoverable. Report the message; the operator fixes the environment variable, for example by encoding the key as URL-safe base64 without padding (43 characters). |
 | `io.audit_writer_setup` | A smart-account verb could not load its profile file: the file is missing, unreadable, malformed, or of an unsupported schema version. A name mismatch, a non-overlayable field, the mainnet rules, and the endpoint rule keep their own codes. | Not agent-recoverable. Report the message; the operator corrects the profile file. An audit directory that cannot be created, or a writer lock another process holds, reports `audit.chain_key_unavailable` with the `audit.io_error` or `audit.writer_locked` detail instead. |
 
-A missing or empty **signer** keyring entry on a single-shot SEP-43 sign tool
-surfaces as `sep43.wallet_unlock_failed` under the standard envelope, not a
-`keyring.*` code. At the auth layer a missing keyring entry maps to
+The enrolled-signer loader reports `auth.enrolled_identity_unusable`
+(`missing`) when the **signer** identity record is absent. After the record
+passes validation, a missing or empty signer keyring entry on a single-shot
+SEP-43 sign tool surfaces as `sep43.wallet_unlock_failed` under the standard
+envelope, not a `keyring.*` code. At the auth layer a missing seed maps to
 `auth.keyring_not_found`. In every case the operator must enroll the secret for
-the active profile. An RPC credential entry reports `auth.keyring_not_found`
-with its `service/account`; the operator stores it with
-`stellar-agent profile enroll-rpc-credential`.
+the active profile. A missing RPC credential entry reports `auth.keyring_not_found`,
+and the message names no keyring coordinate. The operator stores the credential
+with `stellar-agent profile enroll-rpc-credential`.
 
 Keyring failures on the attestation key during a commit do not surface as a
 keyring code: they are folded into the uniform `policy.approval_required` so the
@@ -377,6 +844,8 @@ approval path cannot be probed. Recovery is the same as for any
 `audit verify` emits the verifier's code and diagnostic text.
 A missing log has a remediation message.
 Profile and ownership pre-checks carry their own codes.
+The recovery runbook that the rows below name is
+[audit-log-recovery.md](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/maintainers/audit-log-recovery.md).
 
 | Code | Meaning | Agent action |
 |---|---|---|
@@ -384,48 +853,95 @@ Profile and ownership pre-checks carry their own codes.
 | `audit.rotation_gap` | A file in the rotation chain is missing or its handoff is invalid. | Report the gap. Have the operator investigate the handoff and recover and verify the complete rotation set. |
 | `audit.hmac_mismatch` | A chain-root HMAC fails verification with the supplied key. | Report the mismatch. Have the operator investigate the key and log provenance. |
 | `audit.hmac_sidecar_missing` | HMAC verification requires a missing sidecar. | Report the missing sidecar. Have the operator recover it from a trusted source. |
+| `audit.entry_tag_invalid` | With `--profile`, an entry past the log's entry-tag boundary carries no valid entry tag (`missing` or `mismatch` at the named line): it was not written by a writer holding the profile's audit key. | Stop using the log as verified evidence past that line. Report it; the operator inspects the entries and follows the unauthenticated-tail recovery in the audit-log recovery runbook. |
 | `audit.parse_error` | A log entry cannot be parsed. | Report the line and diagnostic. Have the operator inspect the malformed entry before trusting the log. |
 | `audit.signer_set_canonical_body` | A signer-set audit entry violates canonical-body invariants. | Report the diagnostic. Have the operator investigate the malformed signer-set evidence. |
 | `audit.partial_rotation` | The audit files show an incomplete rotation. | Stop and report the recovery hint. Have the operator follow the audit recovery runbook. |
 | `audit.tip_anchor_mismatch` | The log does not contain the chain tip recorded in the keyring anchor. | Follow the `audit.tip_anchor_mismatch` action in the [Audit-key code table](#audit-key-code). |
+| `audit.tip_anchor_missing` | No anchor is stored for the profile's log, but a recorded audit binding, a chain-root sidecar, or an `audit_tip_anchored` row shows one was written. The message says `anchor: missing`. | Follow the `audit.tip_anchor_missing` action in the [Audit-key code table](#audit-key-code). |
+| `audit.carrier_replaced` | An audit lock file is not the one the keyring records for the log: it was renamed, replaced, restored, or the audit directory moved. When the detail says the outbox generation changed while a holder waited, a carrier binding ran meanwhile. | Not agent-recoverable. The operator stops every wallet process and runs `stellar-agent audit bind-carriers --profile <NAME>`. A generation change needs only a retry of the refused call. |
+| `audit.carriers_unbound` | The log has keyed history but no carrier record, so its lock files cannot be checked. | Not agent-recoverable. The operator stops every wallet process and runs `stellar-agent audit bind-carriers --profile <NAME>` once. |
+| `audit.carrier_identity_unavailable` | The platform reports no identity for a held audit lock file. | Not agent-recoverable. The operator moves the audit directory to a supported filesystem and platform, then runs `stellar-agent audit bind-carriers --profile <NAME>`. |
+| `audit.carriers_busy` | An audit verb, such as `audit bind-carriers` or a recovery verb, could not take all three audit lock files with one try-lock each: a wallet process holds one. A value verb whose first keyed open meets the same condition refuses with `audit.chain_key_unavailable`, with `audit.carriers_busy` at the head of the detail. | Not agent-recoverable. The operator stops every wallet process and reruns the verb. |
+| `audit.carrier_binding_incomplete` | An `audit bind-carriers` run stopped before it installed the new outbox generation; every other open refuses until it finishes. | Not agent-recoverable. The operator stops every wallet process and reruns `stellar-agent audit bind-carriers --profile <NAME>`. |
+| `audit.outbox_rows_missing`, `audit.outbox_busy` | Profile verification finds a missing or changed committed queue prefix, or cannot take the outbox lock. | Follow the corresponding action in the [Audit-key code table](#audit-key-code). |
+| `audit.outbox_unusable`, `audit.outbox_evidence_unusable` | Profile verification authenticates tagged rows, owner state, and both evidence files under the stored key. A queued row or the evidence files do not authenticate. | Report it. The operator follows the recovery runbook. |
 | `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`, `audit.path_contract`, `audit.log_not_found`, `audit.io_error` | Verification cannot accept or read the requested path or file set. | Report the diagnostic. Have the operator check the log path, file type, archive count, existence, and access before retrying. |
 
 ## Approval codes
 
-The table covers failures from `approve`, `approve gc`, `approve list`, `approve serve`, and the shared attestation API.
+The table covers failures from `approve`, `approve revoke`, `approve gc`, `approve list`, `approve serve`, and the shared attestation API.
 CLI envelopes carry `error.code` and a plain diagnostic message.
 Authentication, validation, and audit failures on these paths carry their own codes.
 The MCP server's direct JSON-RPC approval errors use their message form.
 `approve operator` codes are outside this list.
 
-These failures carry `approval.*` codes:
+These outcomes carry `approval.*`, `approve.*`, and audit outbox codes:
 
 | Code | Meaning | Agent action |
 |---|---|---|
 | `approval.expired` | The pending approval's lifetime has ended. | Request a fresh simulation and ask the operator to review the new approval. |
-| `approval.not_found` | The selected store has no pending entry for the nonce. | Check the profile and nonce. Request a new approval if the entry is unavailable. |
+| `approval.unknown` | `approve status` or MCP `stellar_approval_status` holds no entry for the nonce, or the entry was collected. `approve --id` and `approve revoke` report the same case as `approval.not_found`. | Check the profile and nonce. Request a fresh simulation if the approval is gone. |
+| `approval.not_found` | The selected store has no pending entry for the nonce. On a testnet profile `approve revoke` answers every nonce with this code, because testnet preparation opens no durable record. On a CLI mainnet value verb after the passkey ceremony, no durable approval record names the consent: `no durable approval record and inbox entry name this nonce`. | Check the profile and nonce. Request a new approval if the entry is unavailable. For the CLI case, run the verb again with a new `--business-id` for a fresh approval. |
+| `approval.revoked` | The durable approval was revoked: `this approval has been revoked`. A CLI mainnet value verb refuses after the passkey ceremony and exits 1 before signing. | Stop the requested action. Proceed only after fresh operator consent under a new `--business-id`. |
 | `approval.denied` | The operator declines the CLI prompt or closes its input. | Stop the requested action. Proceed only after fresh operator consent. |
 | `approval.user_mismatch` | The approving identity is not authorized for the pending entry. | Have the authorized operator approve through the trusted local or enrolled remote surface. |
 | `approval.already_attested` | Consent is already recorded for this entry. | Use the recorded consent for the pending action. |
+| `approval.attestation_invalid` | The presented attestation does not prove the approval record. It does not verify, it covers another subject, or its version does not cover the approval's kind and lifetime. | Report it. The operator approves the request again. An MCP commit reports this state as `policy.approval_required`. |
+| `approval.consent_undelivered` | Exact Delivered evidence is missing for this approval's queued row. | Preserve the grant and evidence; repair delivery, then retry the existing grant within its lifetime. |
+| `approval.evidence_capacity` | All 4,096 evidence slots are occupied. | Retry after an existing approval ends; capacity refusal evicts no live grant. |
+| `audit.outbox_evidence_unusable` | The authenticated evidence image cannot be selected or used. | Preserve both images and keyring state; repair the named condition, then retry the existing grant. |
+| `audit.outbox_queued` | Consent succeeded and its audit row is queued. | Exit status is zero; consumers establish delivery before use when the kind enforces it. |
 | `approval.rejected` | The operator refused this approval. | Stop the requested action. |
-| `approval.consumed` | This approval has already been used. | Request a new simulation before seeking another approval. |
+| `approval.consumed` | This approval has already been used. On a CLI mainnet value verb after the passkey ceremony, a submission receipt names the approval and its attempt is no checked non-inclusion of the admitted canonical operation (`this approval was already spent on a submission`), or its durable record belongs to another operation (`this approval belongs to another operation`). The verb exits 1 before signing. | Request a new simulation before seeking another approval. For the CLI case, check the earlier submission's status when a receipt names the approval; for another operation, run the verb again with a new `--business-id`. |
+| `approval.operator_credential_revoked` | The remote operator credential that approved the entry is missing from the profile's `allowed_credentials` list or from the operator-credential store, so its approvals do not count. | Stop. Ask the operator to approve the action again through a surface they still authorize. |
+| `approval.remote_authorization_unavailable` | The profile's remote-approval authorization or the operator-credential store cannot be read, or the profile does not enable remote approval for that chain and relying-party ID. A remote approval cannot be honored while this holds. | Report the code. Have the operator repair the profile or the credential store, then request fresh consent. |
+| `approval.spent_record_unavailable` | The platform keyring record of spent rule approvals cannot be read or written, does not parse, is busy, holds 16 live approvals, or is past this approval's expiry. The commit installs nothing. | Restore keyring access, retry when the record is busy, or wait for an approval to expire when the record is full. Report an unparseable record, or one past the expiry of a fresh approval, to the operator: correct the clock if it ran ahead, wait out the approval lifetime, then remove the keyring entry. Removing it earlier re-opens replay for live approvals. |
+| `approval.entry_inconsistent` | The pending payment, claim, or trustline request's stored digest is not the digest of its stored envelope, or its envelope does not decode; or a rule proposal's stored digest is not the digest of what it shows; or the pending MPP charge shows terms that do not match what it would authorize, holds no binding digests, or at commit shows another transport, authority, or target than the prepared request. No surface approves it. | Stop. Report it: the approval store was changed outside the wallet, or the rule proposal holds a digest of another version. Request a fresh simulation for the intended action. |
+| `approve.credential_enroll_code_exhausted` | A signed-origin credential enrollment receives five wrong enrollment codes, then a sixth attempt. No policy credential is exported. | Have the operator restart `approve credential enroll --origin-from` for a new code and type it carefully on the page. |
+| `approve.credential_enroll_origin_missing` | The unsigned policy body passed to `approve credential enroll --origin-from` lacks `approval_origin` and `approval_cert_spki_sha256`. | Have the operator add both keys to the bootstrap body, or enroll locally without `--origin-from`. |
 | `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.record_failed`, `approval.uid_unavailable`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`, `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed` | Approval validation, attestation, storage, or expired-entry collection refuses. | Report the code and diagnostic. Have the operator resolve the approval state, key, identity, clock, or store condition before requesting fresh consent. |
+
+A localhost ceremony binds `127.0.0.1` and `[::1]` on one port and does not
+start when either address cannot be held. It keeps its own refusal code:
+`approval.presence_unavailable` for mainnet consent,
+`approve.credential_enroll_unavailable` for approval credential enrollment,
+`internal.unexpected_state` with `approve.serve_bind` in the message for the
+mainnet inbox, `internal.unexpected_state` with
+`approve.operator_enroll_interactive_start_failed` in the message for
+operator enrollment, and `credentials.bridge_start_failed` for passkey
+registration. The last three messages describe the pair refusal: a held
+fixed `--port` names the family and the port, a missing loopback family
+names the family and the error kind, and an exhausted search for a free
+port reports the attempt count. Free the port on both families, or run the
+ceremony on a host with IPv6 loopback.
 
 ## Audit-key code
 
+The recovery runbook that the rows below name is
+[audit-log-recovery.md](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/maintainers/audit-log-recovery.md).
+
 | Code | Meaning | Agent action |
 |---|---|---|
-| `audit.tip_anchor_mismatch` | Acquiring the audit writer proved the profile's audit log no longer contains the chain tip its keyring-held anchor names. The log was restored from an older copy, truncated, or substituted, or it was replaced, truncated or overwritten while a long-lived process held the original open. The chain walk alone does not catch this: it verifies a prefix, which an older copy satisfies. A log that moved FORWARD past its anchor is not this code; that case is absorbed silently. The message says which of the shapes it was. When a row was refused mid-flight the anchor ends up one entry ahead of an otherwise clean log, which is a row the wallet owed and did not write. The MPP verbs answer with this code too, in place of `mpp.state_unavailable`. | Not agent-recoverable, and do NOT retry: the refusal is stable until an operator acts. Report it. The operator must establish why the log changed, then run `stellar-agent audit reanchor --profile <name> --acknowledge-rollback` (stopping the MCP server first if it holds that profile's audit writer). |
-| `audit.writer_locked` | A verb that needs the audit writer (`audit reanchor`, `profile rotate-audit-key`, `approve serve` at startup) found the writer's exclusive lock held by another process, normally a running `stellar-agent-mcp` server. `approve --id` queues its consent row in the audit outbox beside a process that drains it: the MCP server or `approve serve` of this version. Beside one that does not, for example an older server, it refuses with this code. | Not agent-recoverable. The operator must stop the MCP server, run the verb, and start the server again. For `approve --id` beside an older server, restart that server on the current version. |
+| `audit.tip_anchor_mismatch` | Acquiring the audit writer proved that the profile's audit log does not contain the chain tip its keyring-held anchor names. The log was restored from an older copy, truncated, or substituted, or it was replaced, truncated or overwritten while a long-lived process held the original open. The chain walk alone does not catch this: it verifies a prefix, which an older copy satisfies. A log that moved FORWARD past its anchor is not this code before the log's `audit_entry_tags_started` row; that case is absorbed once and counted in that row. Past that row, a forward move whose entries lack valid entry tags is this code with reason `unauthenticated_tail`. The message says which of the shapes it was. When a row was refused mid-flight the anchor ends up one entry ahead of an otherwise clean log, which is a row the wallet owed and did not write. The MPP verbs answer with this code too, in place of `mpp.state_unavailable`. | Not agent-recoverable, and do NOT retry: the refusal is stable until an operator acts. Report it. The operator must establish why the log changed, then run `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`, adding `--acknowledge-unauthenticated-tail` for reason `unauthenticated_tail` (stopping the MCP server first if it holds that profile's audit writer). |
+| `audit.tip_anchor_missing` | Acquiring the audit writer found no tip anchor in the keyring for a log that shows it was anchored: the audit binding is recorded, the active file has a chain-root sidecar, or the log holds an `audit_tip_anchored` row. The refusal names which. The anchor entry was deleted, or a crash fell between a file's first keyed entry and its first anchor write. Adopting the log as found would accept a truncation without a trace, so nothing is written. The MPP verbs answer with this code too. | Not agent-recoverable, and do NOT retry. Report it. The operator establishes why the anchor is gone, then runs `stellar-agent audit reanchor --profile <name> --acknowledge-rollback` (stopping the MCP server first if it holds that profile's audit writer). |
+| `audit.writer_locked` | A verb that needs the audit writer (`profile rotate-audit-key`, `approve serve` at startup) found the writer's exclusive lock held by another process, normally a running `stellar-agent-mcp` server. `approve --id` queues its consent row in the audit outbox beside a process that drains the outbox. Beside a process that does not, it refuses with this code. | Not agent-recoverable. The operator must stop the MCP server, run the verb, and start the server again. |
 | `audit.outbox_busy` | The audit outbox lock stayed held for its 2 s wait: another process was appending to or draining the outbox. `approve --id` refuses with it and persists nothing; a drain refuses the acquisition it runs in. | Retry once. If it persists, report it; the operator follows the recovery runbook. |
-| `audit.outbox_unusable` | A complete line of the audit outbox does not parse as an audit entry, so every drain, and every keyed acquisition, refuses. The outbox is left unchanged. | Not agent-recoverable. Report it; the operator inspects the outbox, moves it aside, and re-queues the intact lines per the recovery runbook. |
+| `audit.outbox_unusable` | A queued line of the audit outbox does not parse, does not authenticate, sits out of place, or holds a row that is not an operator row (`approval_attested`, `approval_attested_remote`, `profile_halted`, `profile_resumed`), so every drain, and every keyed acquisition, refuses. The message names the line and the reason. The outbox is left unchanged. | Not agent-recoverable. Report it; the operator inspects the outbox, moves it aside, and acknowledges the loss per the recovery runbook. |
 | `x402.transmit_gate_refused` | The x402 transmit gate refused, so the signed authorization was never sent. The x402 tools answer the gate's own `audit.*` code instead; this code reaches a caller only from a gate that keeps no reason of its own. | Report it. Do not retry blindly. |
-| `audit.rotation_bridge_unusable` | Opening the audit log needs the rotation-handoff entry from the newest archive to seed the active file's chain, and that archive's last entry is not a handoff naming it: the archive was truncated, or a foreign file sits in the audit directory under a rotated-sibling name. | Not agent-recoverable. Report it; the operator inspects the audit directory per the recovery runbook. |
-| `audit.log_binding_changed` | The profile names an audit log path or audit key other than the binding recorded for it in the keyring, or the recorded binding cannot be parsed. Every keyed audit writer refuses before the audit key loads. Value-moving verbs and tools, on the zero-config profile too, exit with this code before signing, as do the read-only smart-account verbs, `approve --id <nonce>`, `approve serve`, `audit verify --profile`, `profile rotate-audit-key`, and `profile reset-window-state`. `credentials add-passkey` and the other `profile` enroll and rotate verbs skip their audit row and continue. Nothing is created at the path the profile names. The MPP state verbs report this as `mpp.state_unavailable`. | Not agent-recoverable, and do NOT retry. Report it. The operator must establish who changed the profile and why, then run `stellar-agent audit reanchor --profile <name> --acknowledge-binding-change`, adding `--acknowledge-rollback` when the command says so. The zero-config profile has no profile file, and `audit reanchor` loads only a profile file: restore the `default.toml` that recorded the binding, or write one that names the log, then run the reanchor. |
-| `validation.key_matches_owner_public_key` | A symmetric key (attestation, audit chain, nonce, policy window state, MPP state, or counterparty cache) is the profile's owner public key, or its keyring coordinate sits in the owner namespace (`stellar-agent-owner-...`). The message names the profile field, never key material. `audit verify`, `pool init`, `accounts deploy-c`, the counterparty commands, the MCP nonce check, and the `profile` rotate verbs report this code. The MCP approval gate keeps answering `policy.approval_required` and logs this code at `warn`. The value verbs report it under `audit.chain_key_unavailable`, and the MPP state store under `mpp.state_unavailable`. A policy window key refusal arrives inside the caller's code, for example `trustline.policy_engine_unavailable`. | Not agent-recoverable. Report it. The operator points the field at its own coordinate in the profile file and mints the key with its rotate verb. |
-| `validation.acknowledgement_required` | `audit reanchor` was run without an acknowledgement flag it needs: `--acknowledge-rollback` for a rolled-back log, `--acknowledge-binding-change` for a changed audit binding, or both. The message names the missing flag. It changed nothing. | Not an agent action at all. Accepting a rolled-back audit log or a changed binding is an operator judgement. |
-| `audit.chain_key_unavailable` (detail begins `audit.writer_locked`, `audit.rotation_bridge_unusable`, `audit.chain_broken`, `audit.tip_anchor_unavailable`, `audit.io_error`, `audit.parse_error`, `audit.partial_rotation`, `audit.outbox_unusable`, or `audit.outbox_busy`) | The pre-flight refused on a condition about the audit LOG rather than about the chain-root key. The message names the condition; the sub-code at the head of the detail is what to match on. | Not agent-recoverable and do NOT rotate the audit key: none of these is fixed by minting or rotating one. Report the detail; the operator follows the recovery runbook section for that sub-code. |
-| `audit.chain_key_unavailable` | A verb that writes audit rows proved the profile's audit chain-root key is NOT acquirable, before touching a signer or submitting anything. This covers the value-moving signing verbs (`pay`, `claim`, `accounts create` sponsored mode, `trustline`, `trade`, `vault`, and their MCP equivalents), the x402 payment tools, `stellar_sep43_sign_and_submit_transaction`, and `stellar_mpp_charge_commit`. It also covers the smart-account signing verbs and `smart-account rules verify-pins`, `signers list`, and `signers refresh`, which load no signer and refuse before any RPC. `profile init` mints the audit-log keyring coordinate only, no key material. This pre-flight fails closed only for a persisted profile. The zero-config synthesized profile `pay`/`claim`/`accounts create` fall back to when no profile was NAMED and no `default.toml` exists stays fail-open here. A profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused with `profile.load_failed` instead. The SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) runs the same pre-flight. | Not agent-recoverable. The operator must run `stellar-agent profile rotate-audit-key <name>`, then retry. |
+| `audit.rotation_bridge_unusable` (detail sub-code under `audit.chain_key_unavailable`, or `internal.unexpected_state` from the audit verbs) | Opening the audit log needs the rotation-handoff entry from the newest archive to seed the active file's chain, and that archive's last entry is not a handoff naming it: the archive was truncated, or a foreign file sits in the audit directory under a rotated-sibling name. | Not agent-recoverable. Report it; the operator inspects the audit directory per the recovery runbook. |
+| `audit.log_binding_changed` | The profile names an audit log path or audit key other than the binding recorded for it in the keyring, or the recorded binding cannot be parsed. Every keyed audit writer refuses before the audit key loads. Value-moving verbs and tools, on the zero-config profile too, exit with this code before signing, as do the read-only smart-account verbs, `approve --id <nonce>`, `approve serve`, `audit verify --profile`, `credentials add-passkey` (before its ceremony), `profile rotate-audit-key`, and `profile reset-window-state`. The other `profile` enroll and rotate verbs skip their audit row and continue. Nothing is created at the path the profile names. `profile reset-mpp-state` and the one-time adoption of version 1 MPP state report it as `mpp.state_unavailable`. The MPP verbs that write an audit row before returning keep this code. | Not agent-recoverable, and do NOT retry. Report it. The operator must establish who changed the profile and why, then run `stellar-agent audit reanchor --profile <name> --acknowledge-binding-change`, adding `--acknowledge-rollback` when the command says so. The zero-config profile has no profile file, and `audit reanchor` loads only a profile file: restore the `default.toml` that recorded the binding, or write one that names the log, then run the reanchor. |
+| `validation.key_matches_owner_public_key` | A symmetric key (attestation, audit chain, nonce, policy window state, MPP state, or counterparty cache) is the profile's owner public key, or its keyring coordinate sits in the owner namespace (`stellar-agent-owner-...`). The message names the profile field, never key material. `audit verify`, `pool init`, `accounts deploy-c`, the counterparty commands, the MCP nonce check, and the `profile` rotate verbs report this code. The MCP approval gate answers `policy.approval_required` and logs this code at `warn`. The value verbs report it under `audit.chain_key_unavailable`, and the MPP state store under `mpp.state_unavailable`. A policy window key refusal arrives inside the caller's code, for example `trustline.policy_engine_unavailable`. | Not agent-recoverable. Report it. The operator points the field at its own coordinate in the profile file and mints the key with its rotate verb. |
+| `validation.acknowledgement_required` | `audit reanchor` was run without an acknowledgement flag it needs: `--acknowledge-rollback` for a rolled-back log, `--acknowledge-binding-change` for a changed audit binding, `--acknowledge-unauthenticated-tail` for entries past the last authenticated entry, or a combination. The message names the missing flag. It changed nothing. | Not an agent action at all. Accepting a rolled-back audit log or a changed binding is an operator judgment. |
+| `audit.outbox_rows_missing` | Committed queued operator rows are missing, changed, or reordered, or a complete line sits past the commitment. Keyed acquisition and queued operator rows refuse. | Report it. The operator inspects the queue and runs `audit acknowledge-outbox-loss --profile <NAME> --reason <TEXT>`, then approves affected actions again. |
+| `audit.outbox_full` | The audit outbox holds its 64 queued rows. Nothing was queued. | Retry after the process that holds the audit log drains the outbox. |
+| `audit.outbox_row_too_large` | The queued row would exceed 1 MiB in the audit log. Nothing was queued. | Not agent-recoverable. Report it. |
+| `internal.unexpected_state` (`audit.key_replaced`) | The writer loaded an audit key that a rotation replaced. No row was written. | Retry the command, which loads the stored key. |
+| `internal.unexpected_state` (`audit.resign_incomplete`) | `profile rotate-audit-key` rotated the key, and a chain-root re-sign failed. | Report it. The operator reruns `profile rotate-audit-key`. |
+| `audit.outbox_loss_not_found` | No committed outbox loss remains to acknowledge. | No acknowledgement is written. Inspect the current condition; do not discard queued rows. |
+| `audit.chain_key_unavailable` (detail begins `audit.chain_key_unavailable` and ends `only a writer holding the profile's audit key appends to this log`) | A writer without the profile's audit key refused a log under entry tags: tags in force, or a row in the active file that carries an entry tag. A writer without the key and without the anchor store also refuses a log with a chain-root sidecar or an anchoring row. Read-only verbs whose audit key does not load, and `profile rotate-audit-key` with the key entry removed, answer this way. | Not agent-recoverable. Report it; the operator restores access to the profile's audit key. Do not mint a new one over a log under entry tags. |
+| `audit.chain_key_unavailable` (detail begins `audit.writer_locked`, `audit.rotation_bridge_unusable`, `audit.history_unverified`, `audit.chain_broken`, `audit.tip_anchor_unavailable`, `audit.io_error`, `audit.parse_error`, `audit.partial_rotation`, `audit.outbox_unusable`, `audit.outbox_rows_missing`, `audit.outbox_busy`, `audit.key_replaced`, an `audit.carrier_*` or `audit.carriers_*` code, `audit.row_too_large`, or `audit.path_contract`) | The pre-flight refused on a condition about the audit LOG rather than about the chain-root key. The message names the condition; the sub-code at the head of the detail is what to match on. | Not agent-recoverable. Report the detail; the operator follows the recovery runbook section for that sub-code. For `audit.history_unverified`, section 11 covers investigation and recovery. An archive without a root tag requires a history check before `profile rotate-audit-key` re-signs it. |
+| `audit.chain_key_unavailable` | A verb that writes audit rows proved the profile's audit chain-root key is NOT acquirable, before touching a signer or submitting anything. This covers the value-moving signing verbs (`pay`, `claim`, `accounts create` sponsored mode, `trustline`, `trade`, `vault`, and their MCP equivalents), the x402 payment tools, `stellar_sep43_sign_and_submit_transaction`, and `stellar_mpp_charge_commit`. It also covers the smart-account signing verbs and `smart-account rules verify-pins`, `signers list`, and `signers refresh`, which load no signer and refuse before any RPC. `profile init` mints the audit-log keyring coordinate only, no key material. This pre-flight fails closed only for a persisted profile. The zero-config synthesized profile `pay`/`claim`/`accounts create` fall back to when no profile was NAMED and no `default.toml` exists stays fail-open here. A profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused with `profile.load_failed` instead. `stellar_sep43_sign_transaction`, `stellar_sep43_sign_auth_entry`, `stellar_sep43_sign_message`, and `stellar_sep53_sign_message` run the same pre-flight. | Not agent-recoverable. Report it. For a profile with no audit key, the operator runs `stellar-agent profile rotate-audit-key <name>`, then retries. That first mint applies only to a log without entry tags. A stored key that cannot be read or decoded is refused by that command too: the operator investigates, and if the stored audit key is corrupt, restores it from a copy of that keyring entry. A log under entry tags without a copy of its key takes no new key in place; the operator follows the recovery runbook, which moves the log aside as evidence first. Do not mint a new key over a log under entry tags. |
 
 This is distinct from `io.audit_writer_setup` above, which reports a smart-account
 verb whose profile cannot be resolved for its audit writer. An audit directory
@@ -435,6 +951,13 @@ detail.
 
 For `audit.tip_anchor_unavailable`, restore keyring access and retry. Keyed
 appends retry once immediately and keep an owed repair after two failures.
+The audit verbs `profile rotate-audit-key`, `audit reanchor`,
+`audit bind-carriers`, `audit acknowledge-outbox-loss`, and `audit verify`
+report a keyring refusal on this state under the keyring's `auth.*` code, such
+as `auth.keyring_platform_error`. Any other store failure keeps this sub-code.
+On those verbs this sub-code means a value the keyring holds for the log, the
+anchor or a companion entry, is unusable, not that the keyring is unreachable.
+Report it to the operator.
 The window reset and x402 gate refuse while repair fails. A submission recorded
 through the pending row reports `submission.record_unavailable` with this
 sub-code. A rotation-spanning outage can require `audit reanchor` after restart.
@@ -445,18 +968,21 @@ sub-code. A rotation-spanning outage can require `audit reanchor` after restart.
 |---|---|---|
 | `validation.provider_attestation_invalid` | A provider record is missing, malformed, or disagrees with its endpoint or independence assertion. A credential reference or placement is malformed, names a wallet key's keyring entry, or meets an insecure endpoint, a URL with userinfo, or a repeated query parameter. A mainnet secondary or oracle record names the primary's operator. | Correct the named field in the profile file. Mainnet requires a record for each configured secondary or oracle URL, and a `[providers.primary]` record. |
 | `network.rpc_divergence` | SEP-29 memo flag disagreement. | Re-simulate; report if persistent. |
-| `profile.load_failed` | The profile the operator NAMED through `--profile` or `STELLAR_AGENT_PROFILE` could not be loaded. Most often no such file exists. On the value-moving verbs (`pay`, `claim`, `accounts create`, `accounts deploy-c`, `trade`, `vault`, and the four `smart-account deploy-*` commands; `trustline` uses `trustline.profile_load_failed`) a malformed TOML or an unsupported schema version produces this same code with a different cause in the message. Every other command reports those two as `validation.config_invalid` and an absent file as `validation.profile_not_found`; the smart-account verbs report both, and an absent file, as `io.audit_writer_setup`. Do not treat this code as the only shape a load failure takes. On every command, a mainnet profile without `rpc_url` reports `validation.mainnet_rpc_url_required`, and an endpoint URL that breaks the endpoint rule reports `validation.config_invalid`. An invalid provider attestation reports `validation.provider_attestation_invalid`. `pay`, `claim`, and `accounts create` substitute the in-memory zero-config profile ONLY when no name was given at all. So a named profile is never silently replaced by it, including `--profile default` on a host with no `default.toml`. | Not agent-recoverable by retry. Report the name in the message to the operator. Either it is a typo (or a stale `STELLAR_AGENT_PROFILE`) and the correct name should be used. Or the profile has not been created yet and the operator must run `stellar-agent profile init --profile <name>`. Do not re-run without a name to make the error go away. That silently switches which policy engine governs the call. |
-| `profile.non_overlayable_field` | A profile field was supplied outside the file (an environment variable, an overlay, or a command-line flag) that its class does not allow there, including a value equal to the file's. Overlays may set `submit_timeout_seconds` on every chain; `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, `mcp_signer_default`, the threshold, fee, and scan-bound keys on testnet only; and `mcp_disabled` only to `true`. Every other key, keyring coordinates and `audit_log_path` included, comes from the file only. The message names the field. | Not agent-recoverable by retry. Drop the flag or input that supplies the field; the value comes from the profile file only. Report an environment variable or overlay to the operator. |
+| `validation.address_invalid` | `{field} is not a valid Stellar account address (expected a G... or M... strkey)`. The message names the argument or check. | Correct the named argument. |
+| `validation.asset_invalid` | `{field} is not a valid asset descriptor`. The message names the argument or check. | Supply a supported asset descriptor. |
+| `validation.profile_not_found` | ``the requested profile was not found in the wallet configuration; `stellar-agent profile list` shows the profiles``. | List profiles and select the intended one. |
+| `profile.load_failed` | `the requested profile failed to load: ...`. A syntax error says `the profile file is not valid TOML: line N, column N`. A schema error says `the profile document is not valid: ...` and names a safe key path when available. The profile the operator names through `--profile` or `STELLAR_AGENT_PROFILE` cannot load. Most often no such file exists. On the value-moving verbs (`pay`, `claim`, `accounts create`, `accounts deploy-c`, `trade`, `vault`, and the four `smart-account deploy-*` commands; `trustline` uses `trustline.profile_load_failed`) a malformed TOML or an unsupported schema version produces this same code with a different cause in the message. Every other command reports those two as `validation.config_invalid` and an absent file as `validation.profile_not_found`; the smart-account verbs report both, and an absent file, as `io.audit_writer_setup`. Do not treat this code as the only shape a load failure takes. On every command, a mainnet profile without `rpc_url` reports `validation.mainnet_rpc_url_required`, and an endpoint URL that breaks the endpoint rule reports `validation.config_invalid`. An invalid provider attestation reports `validation.provider_attestation_invalid`. `pay`, `claim`, and `accounts create` substitute the in-memory zero-config profile ONLY when no name was given at all. So a named profile is never silently replaced by it, including `--profile default` on a host with no `default.toml`. | Not agent-recoverable by retry. Report the selected profile and the safe diagnostic to the operator. Either it is a typo (or a stale `STELLAR_AGENT_PROFILE`) and the correct name should be used. Or the profile has not been created yet and the operator must run `stellar-agent profile init --profile <name>`. Do not re-run without a name to make the error go away. That silently switches which policy engine governs the call. |
+| `profile.non_overlayable_field` | A profile field was supplied outside the file (an environment variable, an overlay, or a command-line flag) that its class does not allow there, including a value equal to the file's. Overlays may set `submit_timeout_seconds` on every chain; `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, `mcp_signer_default`, the threshold, fee, and scan-bound keys on testnet only; and `mcp_disabled` only to `true`. Every other key, keyring coordinates and `audit_log_path` included, comes from the file only. The two message-signing tools refuse an `mcp_signer_default` overlay on testnet too. The message names the field. | Not agent-recoverable by retry. Drop the flag or input that supplies the field; the value comes from the profile file only. Report an environment variable or overlay to the operator. |
 | `profile.network_flag_mismatch` | `--network` names a chain other than the loaded profile's. The flag asserts the chain and never selects one. | Remove `--network`, or select a profile on that chain with `--profile <name>`. |
 | `auth.enrolled_signer_unpinned` | The mainnet profile's `mcp_signer_default.account` is the placeholder or malformed, so the profile has no enrolled signer identity. | Not agent-recoverable. Report it to the operator, who corrects a malformed `mcp_signer_default.account` and runs `stellar-agent profile enroll-signer --profile <name>`. |
 | `auth.enrolled_signer_mismatch` | The resolved signer's key differs from the mainnet profile's enrolled identity. | Do not retry with another key. Use the enrolled seed, Ledger account, or keyring entry, and report both keys in the message to the operator. |
 | `profile.mainnet_requires_explicit_profile` | The environment or the default source selected a mainnet profile. | Pass `--profile <name>`. For a mainnet `default.toml`, pass `--profile default`; keep the filename because its identity binds the keyring entries. |
-| `profile.key_scope_conflict` | A profile shares a wallet or derived entry with a sibling, two of its fields collide, an overlay names another scope, or its owner account is not `default`. An unreadable selected document or profiles directory also triggers it. Mainnet refuses; testnet warns. Unreadable siblings only warn. Backups in the profiles directory count as siblings. | Do not retry under another name. Give this profile its own entry when it claims another profile's coordinate; correct the sibling file when it claims this profile's canonical entry. Read the offending field with `profile show`. Moving an enrolled reference orphans the stored key; enroll or rotate at its replacement. |
-| `profile.name_mismatch` | The profile FILE that was loaded belongs to a different profile: its `policy_owner_key_id.service` names another profile, or carries no `stellar-agent-owner-` prefix at all. Both binaries refuse it: the MCP server at startup, the CLI at every command that loads a profile. The refusal applies because the signed policy file and the owner-key keyring entry resolve through the name the FILE carries. The approval store, audit log, and policy-window state key on the name that was ASKED for. Almost always a copied or renamed `<name>.toml`. Distinct from `validation.config_invalid`, which covers the profile CONFIGURATION being unusable: a name that is not a valid path component, a malformed TOML, an unsupported schema version, an out-of-range field. None of these conditions is covered by this code. Here the file parses and the name is valid; it simply belongs to another profile. | Not agent-recoverable by retry, and do NOT retry under a different profile name. Report the message to the operator: it names both profiles and quotes the offending field. Recovery is `stellar-agent profile init --profile <name>` for a genuinely new profile, or correcting `policy_owner_key_id.service` to `stellar-agent-owner-<name>`. `stellar-agent profile show <name>` still displays the file so the field can be read. |
+| `profile.key_scope_conflict` | A profile shares a wallet or derived entry with a sibling, two of its fields collide, an overlay names another scope, its owner account is not `default`, or a mainnet profile's `policy_window_state_key_id` is not its default entry. An unreadable selected document or profiles directory also triggers it. Mainnet refuses; testnet warns. Unreadable siblings only warn. The two message-signing tools refuse a signer-scope conflict and an unreadable sibling on every chain. Backups in the profiles directory count as siblings. | Do not retry under another name. Give this profile its own entry when it claims another profile's coordinate; correct the sibling file when it claims this profile's canonical entry. Read the offending field with `profile show`. Moving an enrolled reference orphans the stored key; enroll or rotate at its replacement. |
+| `profile.name_mismatch` | The profile FILE that was loaded belongs to a different profile: its `policy_owner_key_id.service` names another profile, or carries no `stellar-agent-owner-` prefix at all. The CLI and the MCP server refuse it: the MCP server at startup, the CLI at every command that loads a profile. The refusal applies because the signed policy file and the owner-key keyring entry resolve through the name the FILE carries. The approval store, audit log, and policy-window state key on the name that was ASKED for. Almost always a copied or renamed `<name>.toml`. Distinct from `validation.config_invalid`, which covers the profile CONFIGURATION being unusable: a name that is not a valid path component, a malformed TOML, an unsupported schema version, an out-of-range field. None of these conditions is covered by this code. Here the file parses and the name is valid; it simply belongs to another profile. | Not agent-recoverable by retry, and do NOT retry under a different profile name. Report the message to the operator: it names the offending field and the recovery, without either profile name or the stored value. Recovery is `stellar-agent profile init --profile <name>` for a genuinely new profile, or correcting `policy_owner_key_id.service` to `stellar-agent-owner-<name>`. `stellar-agent profile show <name>` still displays the file so the field can be read. |
 
 ## x402 codes
 
-`stellar_x402_create_payment` and `stellar_x402_authenticated_payment` return the first five codes while validating the payment requirement, before the spending window is touched. Nothing is signed or sent. The x402 flow is described in `protocols.md`.
+`stellar_x402_create_payment` and `stellar_x402_authenticated_payment` return the first five codes while validating the payment requirement, before the spending window is touched. Nothing is signed or sent. The x402 flow is described in [protocols.md](protocols.md).
 
 | Code | Meaning | Agent action |
 |---|---|---|
@@ -465,6 +991,7 @@ sub-code. A rotation-spanning outage can require `audit reanchor` after restart.
 | `x402.invalid_asset_address` | The requirement's `asset` is not a contract address (C-strkey). | Do not pay with this requirement. Pick another `accepts[]` element, or report the requirement to the operator. |
 | `x402.fees_not_sponsored` | The requirement's `extra.areFeesSponsored` is not the JSON boolean `true`. | Do not pay with this requirement. Pick another `accepts[]` element with sponsored fees, or report the requirement to the operator. |
 | `x402.amount_conversion` | The requirement's `amount` is not a positive integer, or does not fit in a signed 128-bit integer. | Do not pay with this requirement. Pick another `accepts[]` element, or report the requirement to the operator. |
+| `x402.muxed_contract_protocol_unsupported` | The W payee requires protocol 30 or later; the checked endpoint reports an older protocol. Before dispatch, a complete testnet approval pair answers `policy.approval_required`. A later protocol refusal keeps its x402 code. | Choose an eligible requirement or wait for the network upgrade. Preserve the full payee and id. |
 | `x402.keyring_load_failed` | The signer cannot be loaded, for a reason that has no `auth.*` code of its own. | Do not retry. Ask the operator to check the profile's signer entry. |
 | `x402.auth_entry_sign_failed` | `stellar_x402_create_payment` cannot sign the payer's authorization entry. `stellar_x402_authenticated_payment` reports this as `x402.payment_build_failed`. | Do not retry in a loop. Report it to the operator. |
 | `x402.transaction_build_failed` | `stellar_x402_create_payment` cannot assemble the payment, for example because the re-simulation data does not decode. `stellar_x402_authenticated_payment` reports this as `x402.payment_build_failed`. | Do not retry in a loop. Report it to the operator. |
@@ -502,7 +1029,9 @@ MPP codes are closed and redacted. Input/selection failures include
 `mpp.authorization_indeterminate`, `mpp.state_unavailable`,
 `mpp.simulation_failed`, `mpp.signing_failed`, and
 `mpp.credential_too_large`. Observation failures are `mpp.receipt_invalid`,
-`mpp.receipt_conflict`, and `mpp.reconciliation_unavailable`.
+`mpp.receipt_conflict`, and `mpp.reconciliation_unavailable`. A charge commit
+whose pending approval shows another transport, authority, or target than the
+prepared request refuses with `approval.entry_inconsistent` and commits nothing.
 
 `mpp.authorization_not_found` means no authorization matches the identifier
 you supplied, including on a profile that has never prepared a charge. It is a
@@ -518,7 +1047,8 @@ store state, so it never reveals whether a profile has MPP state.
 The MPP verbs that write an audit row before returning (charge commit, record
 receipt, reconcile, prune) answer an audit-log problem under its own `audit.*`
 code rather than `mpp.state_unavailable`. The remedy is a different one: the MPP state file is intact and the audit log is what needs attention. Treat
-`audit.chain_key_unavailable`, `audit.tip_anchor_mismatch`, and
+`audit.chain_key_unavailable`, `audit.tip_anchor_mismatch` (reason
+`unauthenticated_tail` included), `audit.tip_anchor_missing`, and
 `audit.log_binding_changed` from an MPP verb exactly as the rows above say.
 
 `mpp state prune` on a profile with no MPP history succeeds with `pruned: 0`
@@ -531,9 +1061,12 @@ authorization. For replayed, indeterminate, withheld, signing, state, receipt,
 or reconciliation ambiguity, do not retry commit or create another payment;
 query authorization status and reconcile any known server transaction.
 
-- Approval needed (`policy.approval_required`, `toolset.first_invoke_approval_required`):
+- Approval needed (`policy.approval_required`):
   ask the operator to run `stellar-agent approve --id <nonce> --profile <name>`, then re-submit
   the commit with `approval_nonce` and `approval_attestation`.
+- First-invoke gate (`toolset.first_invoke_approval_required`): the operator
+  approves the nonce, then the agent repeats the same invocation. That approval
+  returns no attestation.
 - Approval not honorable on this tool (`policy.approval_required_unsupported`):
   operator must change policy or use a two-phase tool.
 - Stale or used nonce (`nonce.expired`, `nonce.replayed`),
@@ -551,6 +1084,69 @@ query authorization status and reconcile any known server transaction.
   `network.envelope_signature_unverifiable`, `network.envelope_unsigned`,
   `network.account_not_found`): nothing was sent. Do not resubmit the same
   envelope against the same endpoint; report the mismatch to the operator.
+- Endpoint not ready (`network.endpoint_not_ready`): nothing was signed or
+  sent. Re-run the simulate step once the endpoint is current; if the refusal
+  persists, report the reason to the operator.
 - Environment or key problems (`keyring.*`, `mcp.disabled_per_profile`,
-  `audit.chain_key_unavailable`, other non-zero startup exits): operator-side;
+  `audit.chain_key_unavailable`, other startup exits with code 1 or 2): operator-side;
   not agent-recoverable at runtime.
+
+## Retained smart-account charges
+
+Reset refuses while an intent remains open or retained. A closed and pruned intent does not block reset.
+
+An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
+
+When an intent is open and the profile stores no `secondary_rpc_url`, the intent view reports that retained intents cannot close and asks for one.
+
+When an intent is open and the stored endpoint configuration cannot load, the intent view reports that only stored endpoints that load close retained intents.
+
+Snapshots containing signed intents or intent links require version 9 or later. Total-budget intent legs require version 16 or later. Committed snapshots are written at version 18. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.
+
+An unavailable observation leaves retained charges unchanged while the policy check continues. Read only tools and preparation requests acquire no charge closure witnesses.
+
+Signing through a supplied secondary endpoint does not give that endpoint authority to close retained intents.
+
+### x402 owner approval
+
+Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network.
+On testnet, a clock reading before approval creation refuses the approval without consuming it.
+
+When the policy requires approval, the tool queues the payment and returns
+`data.approval` with the approval nonce. Nothing is signed.
+The owner approves with `stellar-agent approve`. The repeated call with
+`approval_nonce` and `approval_attestation` pays.
+Queueing reads no key and runs no SEP-10 exchange.
+
+The approval binds the network, asset, payer, payee including its mux id, and amount.
+The authenticated tool also binds the home domain.
+A call with changed terms or an expired approval answers `policy.approval_required`
+and signs nothing. Final verification follows attestation and payer-key reads,
+immediately before the signing primitive, with no intervening I/O or await.
+
+An approval releases at most one signed authorization.
+A failed or interrupted call can spend it without returning a payment payload.
+On testnet a repeated proof with a live spent tombstone answers `policy.approval_consumed`.
+An expired or pruned tombstone can answer `policy.approval_required`.
+On mainnet a repeated proof of a completed payment answers `policy.approval_required`; only a submission receipt or a proof of another operation answers `policy.approval_consumed`.
+The authorization expires within 60 ledgers of the paying call's simulation ledger.
+The protocol estimates five seconds per ledger.
+
+On mainnet, Allow without approval arguments pays in one call under policy authority.
+A supplied proof must verify, even under Allow.
+On testnet, Allow pays without owner approval and ignores supplied approval arguments for valid terms.
+Owner approval is required only when the policy requires it.
+
+Before testnet dispatch, a complete approval pair answers `policy.approval_required` for invalid network,
+asset, amount, or payee terms, including a W payee on an unsupported protocol.
+A later protocol refusal keeps `x402.muxed_contract_protocol_unsupported`.
+On testnet, without approval arguments, an address mismatch under RequireApproval
+answers `policy.approval_required_unsupported`. Nothing is queued or signed.
+On mainnet, an address mismatch refuses with `x402.invalid_payment_required`
+before the policy decision.
+
+The CLI labels spent x402 approvals with `payment digest`.
+On mainnet, this hashes the final envelope's base64 text.
+On testnet, this hashes the XDR vector of signed authorization entries.
+Testnet spends approval inside the transmit gate before its authorized audit row and signed RPC request.
+Mainnet retains its consumption after payload release authorization.

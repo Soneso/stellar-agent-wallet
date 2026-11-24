@@ -13,6 +13,7 @@
 //! - [`enroll_rpc_credential`]: store an RPC provider key in the keyring and
 //!   name it in the role's provider record.
 //! - [`sign_policy`] — sign a V1 policy file with the owner key.
+//! - [`add_counterparty`]: add one payment recipient to a profile's policy.
 //! - [`rotate_nonce_key`] — rotate the HMAC nonce key for a profile.
 //! - [`rotate_attestation_key`] — rotate the approval-spine attestation HMAC
 //!   key.
@@ -28,7 +29,11 @@
 //! enum.  The top-level [`crate::main`] function routes `Commands::Profile(args)`
 //! to [`run`], which delegates to the appropriate subcommand handler.
 
+pub mod add_counterparty;
+pub mod apply_fragment;
 pub mod audit_emit;
+pub mod bind_signer;
+pub mod enable_mainnet;
 pub mod enroll_owner_key;
 pub mod enroll_rpc_credential;
 pub mod enroll_signer;
@@ -37,6 +42,9 @@ pub mod init;
 pub mod key_ops;
 pub mod list;
 pub mod migrate;
+pub(super) mod owner_seed;
+mod policy_authoring;
+pub mod policy_check;
 pub mod reset_mpp_state;
 pub mod reset_window_state;
 pub mod rotate_attestation_key;
@@ -62,6 +70,16 @@ pub struct ProfileArgs {
 #[derive(Debug, Subcommand)]
 #[non_exhaustive]
 pub enum ProfileSubcommand {
+    /// Validate a policy body from standard input without checking its signature.
+    PolicyCheck(policy_check::PolicyCheckArgs),
+    /// Author the policy of a profile.
+    Policy(PolicyArgs),
+    /// Replace allowed profile fields with a validated standard-input fragment.
+    ApplyFragment(apply_fragment::ApplyFragmentArgs),
+    /// Bind the enrolled mainnet signer to the profile and established owner.
+    BindSigner(bind_signer::BindSignerArgs),
+    /// Bind a named mainnet profile to this installation and signed policy.
+    EnableMainnet(enable_mainnet::EnableMainnetArgs),
     /// Create and persist a new profile TOML.
     ///
     /// Mints a version-2 profile with per-profile-derived keyring entry
@@ -70,7 +88,9 @@ pub enum ProfileSubcommand {
     /// (`enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, the
     /// `rotate-*` subcommands) do that. Refuses if the named profile already
     /// exists, or if `--network mainnet` is selected without an explicit
-    /// `--rpc-url`.
+    /// `--rpc-url`. On `--network mainnet --engine v1` it also writes the
+    /// policy body of a spending preset and previews its bounds on stderr
+    /// first.
     Init(init::InitArgs),
     /// List known profile names.
     ///
@@ -156,14 +176,19 @@ pub enum ProfileSubcommand {
     /// the new key so its history is preserved (not invalidated) by
     /// rotation.
     RotatePolicyStateKey(rotate_policy_state_key::RotatePolicyStateKeyArgs),
-    /// Re-initialise the persisted policy-window-state store to empty.
+    /// Clear verified policy-window history.
     ///
-    /// Recovery path for an unreadable, tampered, or unparseable window-state
-    /// store: the stateful criteria (`per_period_cap`, `rate_limit`,
-    /// `bundle_per_period_cap`, `bundle_rate_limit`) fail closed until reset.
-    /// Discards accumulated history for the profile; the reset is audited.
+    /// An absent file with no protected generation establishes an empty store.
+    /// A profile with a policy pin or an enrolled owner requires
+    /// `--owner-secret-env <VAR>` holding that owner's seed.
+    /// Unverifiable state refuses. No verb recovers unverifiable window state;
+    /// create a profile under a new name instead. The reset is audited.
     ResetWindowState(reset_window_state::ResetWindowStateArgs),
-    /// Discard MPP replay history with an explicit acknowledgement and an audit row.
+    /// Recover MPP state with an explicit acknowledgement and an audit row.
+    ///
+    /// Carries the records of the snapshot that authenticates and closes
+    /// charges not yet committed; discards the replay history only when no
+    /// snapshot authenticates.
     ResetMppState(reset_mpp_state::ResetMppStateArgs),
     /// Halt every agent action on a profile until `profile resume` lifts it.
     ///
@@ -184,6 +209,23 @@ pub enum ProfileSubcommand {
     Resume(halt::ResumeArgs),
 }
 
+/// Arguments for the `profile policy` subcommand group.
+#[derive(Debug, Args)]
+#[non_exhaustive]
+pub struct PolicyArgs {
+    /// The policy subcommand to run.
+    #[command(subcommand)]
+    pub subcommand: PolicySubcommand,
+}
+
+/// Subcommands of `stellar-agent profile policy`.
+#[derive(Debug, Subcommand)]
+#[non_exhaustive]
+pub enum PolicySubcommand {
+    /// Add one payment recipient to the profile's policy.
+    AddCounterparty(add_counterparty::AddCounterpartyArgs),
+}
+
 /// Runs the `profile` subcommand group.
 ///
 /// Dispatches to the appropriate subcommand handler.
@@ -199,6 +241,13 @@ pub enum ProfileSubcommand {
 /// Never panics.
 pub async fn run(args: &ProfileArgs) -> i32 {
     match &args.subcommand {
+        ProfileSubcommand::PolicyCheck(a) => policy_check::run(a),
+        ProfileSubcommand::Policy(policy) => match &policy.subcommand {
+            PolicySubcommand::AddCounterparty(a) => add_counterparty::run(a).await,
+        },
+        ProfileSubcommand::ApplyFragment(a) => apply_fragment::run(a),
+        ProfileSubcommand::BindSigner(a) => bind_signer::run(a).await,
+        ProfileSubcommand::EnableMainnet(a) => enable_mainnet::run(a),
         ProfileSubcommand::Init(a) => init::run(a).await,
         ProfileSubcommand::List(a) => list::run(a).await,
         ProfileSubcommand::Show(a) => show::run(a).await,
@@ -234,6 +283,13 @@ impl ProfileArgs {
     /// `required`, so their accessor is returned directly.
     pub(crate) fn profile_flag(&self) -> Option<&str> {
         match &self.subcommand {
+            ProfileSubcommand::PolicyCheck(a) => Some(&a.profile),
+            ProfileSubcommand::Policy(policy) => match &policy.subcommand {
+                PolicySubcommand::AddCounterparty(a) => Some(&a.profile),
+            },
+            ProfileSubcommand::ApplyFragment(a) => Some(&a.profile),
+            ProfileSubcommand::BindSigner(a) => Some(&a.profile),
+            ProfileSubcommand::EnableMainnet(a) => a.profile.as_deref(),
             ProfileSubcommand::Init(a) => a.profile.as_deref(),
             ProfileSubcommand::EnrollSigner(a) => a.profile.as_deref(),
             ProfileSubcommand::EnrollOwnerKey(a) => a.profile.as_deref(),

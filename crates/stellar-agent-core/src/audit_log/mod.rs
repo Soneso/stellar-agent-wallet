@@ -32,9 +32,18 @@
 //! # Hash chain mechanism
 //!
 //! ```text
-//! current_entry_hash = SHA-256(canonical_json(entry \ previous_entry_hash)
+//! current_entry_hash = SHA-256(canonical_json(entry \ previous_entry_hash
+//!                                                   \ entry_tag)
 //!                              || previous_entry_hash)
 //! ```
+//!
+//! A keyed writer also stores `entry_tag`, an HMAC-SHA256 over the entry's
+//! chain hash under a key derived from the profile's audit key (see
+//! [`chain::derive_entry_tag_key`](crate::audit_log::chain::derive_entry_tag_key)).
+//! The tag sits outside the hashed body, so entry hashes are the same with
+//! and without it. Once a log holds its `audit_entry_tags_started` row, keyed
+//! writers and `audit verify --profile` require a valid tag on every later
+//! entry.
 //!
 //! # Canonical-form contract
 //!
@@ -69,7 +78,11 @@
 //!
 //! Each log file gets its own `<file>.root_hmac` sidecar, written on the first
 //! entry of that file.  On rotation the sidecar is renamed alongside the log
-//! file: `audit.jsonl.root_hmac` → `audit.jsonl.<ts>.root_hmac`.
+//! file: `audit.jsonl.root_hmac` to `audit.jsonl.<ts>.root_hmac`. The sidecar
+//! covers that first entry only; the entry tags cover every later entry.
+//! Retention writes `<log>.pruned` before deleting an archive. It holds the
+//! oldest retained file's seed, the outgoing file's seed, a file count, and an
+//! HMAC tag when the writer has a key.
 //!
 //! # Single-writer invariant
 //!
@@ -88,11 +101,14 @@
 //! A consent row that cannot take the writer because a draining writer in
 //! another process holds it is queued in `<audit_log_path>.outbox` instead
 //! ([`outbox`](crate::audit_log::outbox)). A draining writer is one opened with
-//! a tip-anchor store in `Check` mode. It holds `<audit_log_path>.drain.lock`
-//! for its life and drains the outbox at open, on every registry cache hit,
-//! and before each of its own rows. The repair writer has a tip-anchor store
-//! and does not drain at open. Delivery is at least once, and queued rows sit
-//! outside the tip anchor until drained.
+//! a tip-anchor store in `Check` mode, or for an outbox-loss acknowledgement.
+//! It holds `<audit_log_path>.drain.lock` for its life and drains the outbox
+//! at open, on every registry cache hit, and before each of its own rows; the
+//! acknowledgement writer defers the drain at open until it has recorded the
+//! loss. The repair writer has a tip-anchor store and does not drain at open.
+//! Delivery is at least once. Until they are drained, queued rows are
+//! committed in the same store as the tip anchor: their count and a chain
+//! head over them, which every append and every drain checks.
 //!
 //! # Redaction discipline
 //!
@@ -118,8 +134,18 @@
 //! (`stellar-agent-cli::common::signer_ceremony`) when `Wallet::unlock`
 //! degrades under `MlockRequired::Warn`.
 
+//! Consent evidence uses a locked successor transaction with checked generation
+//! advancement. Key rotation fences the queue until the owner and both evidence
+//! copies are durable under the stored key. Records and the time floor survive.
+//! Admission reserves one of 4,096 slots for each authenticated approval lifetime.
+//! Appenders bind Queued references; anchored writers alone transition Queued records to Delivered.
+//! Pin adoption replaces one migration pin with Delivered evidence of a caller-verified reference.
+//! Bindings carry the authenticated source image; verification authenticates it and repairs nothing.
+
 pub mod binding;
+mod carriers;
 pub mod chain;
+mod consent_evidence;
 pub mod entry;
 pub mod health;
 mod lock;
@@ -129,21 +155,41 @@ pub(crate) mod redact;
 pub mod rotation;
 pub mod schema;
 pub mod signer_set;
+#[cfg(all(test, unix))]
+mod test_fifo;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;
 pub mod tip_anchor;
 pub mod verify;
 pub mod writer;
 
-pub use binding::{AuditBinding, AuditBindingParseError, BindingCheck, RecordedBinding};
+pub use binding::{
+    AuditBinding, AuditBindingParseError, BindingCheck, BindingHistory, RecordedBinding,
+};
+pub use carriers::CarrierBindingReport;
+pub use chain::{
+    EntryTagCheck, EntryTagKey, check_entry_tag, compute_entry_tag, derive_entry_tag_key,
+};
+pub use consent_evidence::{
+    EvidenceReservation, MAX_EVIDENCE_ENTRIES, OutboxEvidence, evidence_scope,
+};
 pub use entry::{AuditEntry, NewToolInvocation};
 pub use health::{AuditWriterHealth, AuditWriterHealthHandle};
-pub use outbox::{AuditOutbox, OutboxInspection, drain_lock_is_held, inspect_outbox};
-pub use reader::{AuditLogIntegrityError, AuditReader, PinnedHashesRecord};
+pub use lock::Carrier;
+pub use outbox::require_consent_delivered;
+pub use outbox::{
+    AuditOutbox, OutboxInspection, OutboxLoss, OutboxRowRef, OutboxState, check_outbox_commitment,
+    drain_lock_is_held, inspect_outbox, outbox_path,
+};
+pub use reader::{
+    AuditLogIntegrityError, AuditReader, ContextRulePinRecord, IncompletePinRecord,
+    PinnedHashesRecord,
+};
 pub use rotation::{SidecarResignError, resign_chain_root_sidecars};
 pub use schema::{
-    CrossCheckRecord, EVENT_KIND_VARIANT_COUNT, EventKind, ExecutableRefPin, KeyPurpose,
-    PinsUpdateReason, PolicyDecision, TipAnchorReason, ValueActionKind, ValueLegRecord,
+    CrossCheckRecord, EVENT_KIND_VARIANT_COUNT, EntryTagsRekeyCause, EventKind, ExecutableRefPin,
+    ExecutableRefPinFirst8, KeyPurpose, MainnetPresenceAudit, PinsUpdateReason, PolicyDecision,
+    TipAnchorReason, ValueActionKind, ValueLegRecord, WasmHashPin, WasmHashPinParseError,
     executable_refs_or_empty,
 };
 pub use signer_set::{
@@ -154,15 +200,18 @@ pub use signer_set::{
     format_digest_first8_last8, signer_pubkey_canonical_body,
 };
 pub use tip_anchor::{
-    KeyedAuditAccess, TipAnchor, TipAnchorParseError, TipAnchorStore, TipAnchorStoreError,
-    log_path_sha256, reanchor_count_account, reanchor_count_account_for_digest, tip_anchor_account,
+    KeyedAuditAccess, PriorAnchoring, TipAnchor, TipAnchorParseError, TipAnchorStore,
+    TipAnchorStoreError, log_path_sha256, outbox_state_account, outbox_state_account_for_digest,
+    reanchor_count_account, reanchor_count_account_for_digest, tip_anchor_account,
     tip_anchor_account_for_digest,
 };
 pub use verify::{
-    FileVerifyResult, PartialRotationState, VerifiedTip, VerifyError, VerifyOk, VerifyWarning,
-    check_anchor_against_walk, stored_anchor_disagrees_with_walk, verify_log,
+    EntryTagsBoundary, FileVerifyResult, PartialRotationState, VerifiedTip, VerifyError, VerifyOk,
+    VerifyWarning, check_anchor_against_walk, check_missing_anchor,
+    stored_anchor_disagrees_with_walk, verify_entry_tags, verify_log,
 };
 pub use writer::{
-    AuditWriter, AuditWriterRegistry, ReanchorAcknowledgement, ReanchorReport, StoredTipAnchor,
-    WriterError, audit_log_unusable_detail, audit_writer_refusal,
+    AuditWriter, AuditWriterRegistry, OutboxLossReport, ReanchorAcknowledgement, ReanchorReport,
+    RevokedCounts, StoredTipAnchor, VerifiedTipFacts, WriterError, audit_log_unusable_detail,
+    audit_writer_refusal,
 };

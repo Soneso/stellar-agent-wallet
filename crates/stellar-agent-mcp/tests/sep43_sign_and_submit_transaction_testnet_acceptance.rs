@@ -89,17 +89,12 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
 
 /// Funds a testnet account via Friendbot.
 ///
-/// Panics if the HTTP request fails or returns a non-2xx status.
+/// Panics when Friendbot does not fund the account.
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 200 for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Builds a `WalletServer` backed by an in-memory keyring mock for the given
@@ -128,6 +123,20 @@ fn build_test_server(g_strkey: &str, seed: &Zeroizing<[u8; 32]>) -> WalletServer
     entry
         .set_password(&s_strkey)
         .expect("keyring mock set_password must succeed");
+    // The identity record an enrollment stores beside the seed.
+    stellar_agent_network::keyring::write_keyring_string(
+        &stellar_agent_core::profile::schema::signer_identity_entry_ref(signer_ref),
+        &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .to_bytes(),
+            stellar_agent_core::profile::name::profile_name_for_approval(&profile),
+            profile.chain_id,
+        )
+        .render()
+        .expect("an agent record renders"),
+    )
+    .expect("set identity record");
 
     // Audit chain-root key. Signing verbs prove the keyed audit writer
     // acquirable before any signing (audit.chain_key_unavailable otherwise),
@@ -206,6 +215,10 @@ fn extract_text(result: rmcp::model::CallToolResult) -> String {
 #[tokio::test]
 #[serial]
 async fn sign_and_submit_self_payment_succeeds() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     // ── Fresh keypair + Friendbot funding ────────────────────────────────────
     let (g_strkey, seed) = fresh_keypair();
     fund_via_friendbot(&g_strkey).await;
@@ -225,6 +238,8 @@ async fn sign_and_submit_self_payment_succeeds() {
         transaction_xdr: unsigned_xdr,
         network_passphrase: None,
         address: None,
+        approval_nonce: None,
+        approval_attestation: None,
     };
 
     let result = server
@@ -303,6 +318,10 @@ async fn sign_and_submit_self_payment_succeeds() {
 #[tokio::test]
 #[serial]
 async fn sign_and_submit_invalid_xdr_returns_sep43_error() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
 
     let server = build_test_server(&g_strkey, &seed);
@@ -312,6 +331,8 @@ async fn sign_and_submit_invalid_xdr_returns_sep43_error() {
         transaction_xdr: "not-valid-base64-xdr".to_owned(),
         network_passphrase: None,
         address: None,
+        approval_nonce: None,
+        approval_attestation: None,
     };
 
     let result = server
@@ -347,18 +368,27 @@ async fn sign_and_submit_invalid_xdr_returns_sep43_error() {
 #[tokio::test]
 #[serial]
 async fn sign_and_submit_passphrase_mismatch_returns_sep43_error() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (g_strkey, seed) = fresh_keypair();
+    // The effects gate reads the wallet account before signing, so the
+    // source exists and the mismatch is reached at the signing step.
+    fund_via_friendbot(&g_strkey).await;
 
     let server = build_test_server(&g_strkey, &seed);
 
-    // Build a syntactically valid unsigned envelope; error fires during signing.
-    let unsigned_xdr = build_self_payment_xdr(&g_strkey, 0);
+    // Build a valid unsigned envelope; the error fires during signing.
+    let unsigned_xdr = build_self_payment_xdr(&g_strkey, fetch_sequence(&g_strkey).await);
 
     let args = Sep43SignAndSubmitTransactionArgs {
         chain_id: TESTNET_CHAIN_ID.to_owned(),
         transaction_xdr: unsigned_xdr,
         network_passphrase: Some("Public Global Stellar Network ; September 2015".to_owned()),
         address: None,
+        approval_nonce: None,
+        approval_attestation: None,
     };
 
     let result = server

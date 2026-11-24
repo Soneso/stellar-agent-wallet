@@ -28,4 +28,5 @@
 //! call site.
 
 pub mod auth_digest;
+pub mod auth_payload;
 pub mod rule_id;

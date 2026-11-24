@@ -75,7 +75,8 @@ fn serialize_bytes32<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::
 /// Deserialises a lowercase hex string into a 32-byte array.
 fn deserialize_bytes32<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
     let hex_str = String::deserialize(d)?;
-    let bytes = hex::decode(&hex_str).map_err(|e| D::Error::custom(format!("invalid hex: {e}")))?;
+    let bytes = hex::decode(&hex_str)
+        .map_err(|_| D::Error::custom("auditor_pubkey must be a 32-byte hex string"))?;
     bytes
         .try_into()
         .map_err(|_| D::Error::custom("expected 32-byte hex string for auditor_pubkey"))
@@ -89,7 +90,8 @@ fn serialize_bytes64<S: Serializer>(bytes: &[u8; 64], s: S) -> Result<S::Ok, S::
 /// Deserialises a lowercase hex string into a 64-byte array.
 fn deserialize_bytes64<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
     let hex_str = String::deserialize(d)?;
-    let bytes = hex::decode(&hex_str).map_err(|e| D::Error::custom(format!("invalid hex: {e}")))?;
+    let bytes = hex::decode(&hex_str)
+        .map_err(|_| D::Error::custom("signature must be a 64-byte hex string"))?;
     bytes
         .try_into()
         .map_err(|_| D::Error::custom("expected 64-byte hex string for signature"))
@@ -356,17 +358,7 @@ pub fn check_auditor_trusted(
         return Ok(());
     }
 
-    // `redact_strkey_first5_last5` already returns "G...?" for invalid inputs,
-    // so no second fallback is needed here.
-    let key_str = stellar_agent_core::observability::redact::redact_strkey_first5_last5(
-        &StrPublicKey::from_payload(auditor_pubkey_bytes)
-            .map(|pk| pk.to_string())
-            .unwrap_or_default(),
-    );
-
-    Err(ToolsetInstallError::AuditorUntrusted {
-        auditor_key_redacted: key_str,
-    })
+    Err(ToolsetInstallError::AuditorUntrusted)
 }
 
 /// Loads the auditor trust set from `path`.
@@ -674,7 +666,7 @@ mod tests {
         set.insert(pk);
         let err = check_auditor_trusted(&pk2, &set).unwrap_err();
         assert!(
-            matches!(err, ToolsetInstallError::AuditorUntrusted { .. }),
+            matches!(err, ToolsetInstallError::AuditorUntrusted),
             "expected AuditorUntrusted, got: {err:?}"
         );
     }

@@ -37,7 +37,11 @@ use super::rpc_mock_helpers::{
 /// sequence of the signer-set observation: get_context_rule, the policy's
 /// instance read, then get_threshold.
 #[tokio::test]
+#[serial_test::serial]
 async fn out_of_band_rotation_returns_signer_set_diverged() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
 
     // Write a 1-of-1 baseline (stale — an out-of-band add happened since).

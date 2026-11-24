@@ -6,6 +6,11 @@
 //!   integrity from the oldest rotated file to the current active file.
 //! - [`reanchor`] — move the log's keyring-held tip anchor to its current tip
 //!   after an operator-acknowledged rollback or audit binding change.
+//! - `acknowledge-outbox-loss`: remove the profile's decided approvals from
+//!   its approval inbox and revoke its toolset grants, then record the loss
+//!   of queued operator rows.
+//! - `bind-carriers`: record the identities of the audit lock files and start
+//!   a new outbox generation, with every wallet process stopped.
 //!
 //! # Dispatch
 //!
@@ -13,18 +18,34 @@
 //! enum.  The top-level [`crate::main`] function routes `Commands::Audit(args)`
 //! to [`run`], which delegates to the appropriate subcommand handler.
 
+pub mod acknowledge_outbox_loss;
+mod bind_carriers;
 pub mod reanchor;
 pub mod verify;
 
 use clap::{Args, Subcommand};
-use stellar_agent_core::audit_log::WriterError;
+use stellar_agent_core::audit_log::{TipAnchorStoreError, WriterError};
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
+
+/// Returns `true` when `text` already starts with an `audit.<subcode>:` wire
+/// code.
+fn starts_with_audit_wire_code(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix("audit.") else {
+        return false;
+    };
+    let Some((subcode, _)) = rest.split_once(':') else {
+        return false;
+    };
+    !subcode.is_empty()
+        && subcode
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
 
 /// Maps an audit-writer failure onto the CLI envelope model.
 ///
-/// Two conditions are operator-actionable and get the codes the documentation
-/// names for them, rather than being flattened into the caller's generic
-/// failure code:
+/// Operator-actionable conditions carry their documented `audit.*` codes rather
+/// than being flattened into the caller's generic failure code:
 ///
 /// - A held writer lock is `audit.writer_locked`. The audit writer is
 ///   process-exclusive. While an MCP server holds that profile's writer,
@@ -33,12 +54,24 @@ use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 ///   `approve --id` holds it only to write one consent row, and beside a
 ///   draining server it queues that row in the audit outbox instead. The
 ///   skill's troubleshooting table keys on codes, so an agent can only
-///   recognise this if the code reaches the envelope.
-/// - A tip-anchor mismatch is `audit.tip_anchor_mismatch`, the same code the
-///   value-verb pre-flight emits, so one refusal reads the same wherever it
-///   comes from.
+///   recognize this if the code reaches the envelope.
+/// - A tip-anchor mismatch is `audit.tip_anchor_mismatch`, and an absent anchor
+///   with prior anchoring evidence is `audit.tip_anchor_missing`. Both name
+///   `audit reanchor` as the remedy.
+/// - Outbox loss and carrier refusals emit their own `audit.*` envelope codes:
+///   `audit.outbox_rows_missing`, `audit.outbox_loss_not_found`,
+///   `audit.carrier_replaced`, `audit.carriers_unbound`,
+///   `audit.carrier_identity_unavailable`, `audit.carriers_busy`, and
+///   `audit.carrier_binding_incomplete`.
+/// - A keyed log opened without its audit key is `audit.chain_key_unavailable`,
+///   and unusable consent evidence is `audit.outbox_evidence_unusable`, via
+///   [`stellar_agent_core::audit_log::audit_writer_refusal`].
+/// - A tip-anchor store error that carries a classified keyring
+///   [`AuthError`](stellar_agent_core::error::AuthError) reports that `auth.*`
+///   code, through [`tip_anchor_keyring_refusal`].
 ///
-/// Everything else carries `fallback_code`, the caller's own label for "this
+/// Everything else carries `fallback_code`, unless its own text already starts
+/// with an `audit.*` code. `fallback_code` is the caller's own label for "this
 /// verb could not use the audit writer".
 ///
 /// Detail strings follow the CLI's sub-code convention: the detail begins with
@@ -61,21 +94,94 @@ pub(crate) fn audit_writer_error(
                 reason: (*reason).to_owned(),
             })
         }
-        // Variants whose own Display already leads with an `audit.*` code carry
-        // it through unchanged; prefixing the caller's fallback would put two
-        // codes in one detail and an agent matching on the first would read the
-        // wrong one.
-        WriterError::RotationBridgeUnusable { .. }
-        | WriterError::OutboxBusy
-        | WriterError::OutboxUnusable { .. } => {
-            WalletError::Internal(InternalError::UnexpectedState {
+        WriterError::TipAnchorMissing { evidence, .. } => {
+            WalletError::Validation(ValidationError::AuditTipAnchorMissing {
+                profile: profile_name.to_owned(),
+                evidence: evidence.describe().to_owned(),
+            })
+        }
+        WriterError::OutboxRowsMissing { .. } | WriterError::RetiredOutboxChanged { .. } => {
+            WalletError::Validation(ValidationError::AuditOutboxRowsMissing {
                 detail: e.to_string(),
             })
         }
-        _ => WalletError::Internal(InternalError::UnexpectedState {
-            detail: format!("{fallback_code}: {e}"),
+        WriterError::OutboxLossNotFound => {
+            WalletError::Validation(ValidationError::AuditOutboxLossNotFound {
+                detail: e.to_string(),
+            })
+        }
+        WriterError::CarrierReplaced { .. } | WriterError::CarrierGenerationChanged { .. } => {
+            WalletError::Validation(ValidationError::AuditCarrierReplaced {
+                detail: e.to_string(),
+            })
+        }
+        WriterError::CarriersUnbound => {
+            WalletError::Validation(ValidationError::AuditCarriersUnbound {
+                detail: e.to_string(),
+            })
+        }
+        WriterError::CarrierIdentityUnavailable => {
+            WalletError::Validation(ValidationError::AuditCarrierIdentityUnavailable {
+                detail: e.to_string(),
+            })
+        }
+        WriterError::CarriersBusy => WalletError::Validation(ValidationError::AuditCarriersBusy {
+            detail: e.to_string(),
         }),
+        WriterError::CarrierBindingIncomplete => {
+            WalletError::Validation(ValidationError::AuditCarrierBindingIncomplete {
+                detail: e.to_string(),
+            })
+        }
+        // A keyed log opened without its key is the condition every other
+        // audited verb reports as an unusable log; one condition, one code.
+        // An evidence refusal keeps its own code the same way.
+        WriterError::KeyedLogNeedsKey { .. } | WriterError::OutboxEvidenceUnusable { .. } => {
+            stellar_agent_core::audit_log::audit_writer_refusal(profile_name, e)
+        }
+        // A keyring refusal in the tip-anchor store reports its `auth.*` code.
+        // Any other store error, such as a corrupt stored value, keeps its
+        // `audit.tip_anchor_unavailable` detail.
+        WriterError::TipAnchorStore(store_error) => tip_anchor_keyring_refusal(store_error)
+            .unwrap_or_else(|| fallback_writer_error(e, fallback_code)),
+        // Variants whose own Display already leads with an `audit.*` wire code
+        // carry it through unchanged; prefixing the caller's fallback would put
+        // two codes in one detail and an agent matching on the first would read
+        // the wrong one.
+        _ => fallback_writer_error(e, fallback_code),
     }
+}
+
+/// Returns the keyring refusal a tip-anchor store error carries, as the
+/// wallet error that reports its `auth.*` code.
+///
+/// Every audit verb maps a tip-anchor store error through this classifier
+/// first. `None` means the error carries no classified keyring
+/// [`AuthError`](stellar_agent_core::error::AuthError), and the caller keeps
+/// its own code and message.
+pub(crate) fn tip_anchor_keyring_refusal(e: &TipAnchorStoreError) -> Option<WalletError> {
+    e.auth_error().cloned().map(WalletError::Auth)
+}
+
+/// Maps a tip-anchor store error read outside the writer: a keyring refusal
+/// reports its `auth.*` code, and any other store error is
+/// `internal.unexpected_state` with the `audit.tip_anchor_unavailable` detail.
+pub(crate) fn tip_anchor_unavailable(e: &TipAnchorStoreError) -> WalletError {
+    tip_anchor_keyring_refusal(e).unwrap_or_else(|| {
+        WalletError::Internal(InternalError::UnexpectedState {
+            detail: format!("audit.tip_anchor_unavailable: {e}"),
+        })
+    })
+}
+
+fn fallback_writer_error(e: &WriterError, fallback_code: &str) -> WalletError {
+    let text = e.to_string();
+    let detail = if starts_with_audit_wire_code(&text) {
+        text
+    } else {
+        format!("{fallback_code}: {text}")
+    };
+    WalletError::Internal(InternalError::UnexpectedState { detail })
 }
 
 /// Arguments for the `audit` subcommand group.
@@ -115,6 +221,10 @@ pub enum AuditSubcommand {
     /// Exits 0 on success; exits 1 without a required acknowledgement and on
     /// any failure.
     Reanchor(reanchor::ReanchorArgs),
+    /// Acknowledge lost queued rows after removing decided inbox approvals and toolset grants.
+    AcknowledgeOutboxLoss(acknowledge_outbox_loss::AcknowledgeOutboxLossArgs),
+    /// Record the carrier identities with every wallet process stopped.
+    BindCarriers(bind_carriers::BindCarriersArgs),
 }
 
 /// Runs the `audit` subcommand group.
@@ -133,7 +243,9 @@ pub enum AuditSubcommand {
 pub async fn run(args: &AuditArgs) -> i32 {
     match &args.subcommand {
         AuditSubcommand::Verify(a) => verify::run(a).await,
+        AuditSubcommand::BindCarriers(a) => bind_carriers::run(a).await,
         AuditSubcommand::Reanchor(a) => reanchor::run(a).await,
+        AuditSubcommand::AcknowledgeOutboxLoss(a) => acknowledge_outbox_loss::run(a).await,
     }
 }
 
@@ -150,6 +262,8 @@ impl AuditArgs {
         match &self.subcommand {
             AuditSubcommand::Verify(a) => a.profile.as_deref(),
             AuditSubcommand::Reanchor(a) => Some(a.profile.as_str()),
+            AuditSubcommand::BindCarriers(a) => Some(a.profile.as_str()),
+            AuditSubcommand::AcknowledgeOutboxLoss(a) => Some(a.profile.as_str()),
         }
     }
 }
@@ -192,25 +306,95 @@ mod tests {
     }
 
     #[test]
-    fn a_variant_with_its_own_code_does_not_get_a_second_one() {
+    fn a_missing_tip_anchor_keeps_its_wire_code_and_names_the_evidence() {
         let err = audit_writer_error(
-            &WriterError::RotationBridgeUnusable {
-                archive_name: "audit.jsonl.20260913T120000000".to_owned(),
-                reason: "test",
+            &WriterError::TipAnchorMissing {
+                evidence: stellar_agent_core::audit_log::PriorAnchoring::ChainRootSidecar,
+                entry_count: 9,
+                actual_len: 2600,
             },
-            "audit.reanchor_failed",
-            "default",
+            "audit.writer_unavailable",
+            "acme",
         );
+        assert_eq!(err.code(), "audit.tip_anchor_missing");
+        let message = err.to_string();
+        assert!(message.contains("chain-root sidecar"), "{message}");
         assert!(
-            err.message().contains("audit.rotation_bridge_unusable"),
-            "message: {}",
-            err.message()
+            message.contains("audit reanchor --profile acme --acknowledge-rollback"),
+            "{message}"
         );
-        assert!(
-            !err.message().contains("audit.reanchor_failed"),
-            "two codes in one detail: {}",
-            err.message()
-        );
+    }
+
+    #[test]
+    fn a_variant_with_its_own_code_does_not_get_a_second_one() {
+        let cases = [
+            (
+                WriterError::OutboxRowsMissing {
+                    recorded: 2,
+                    found: 1,
+                },
+                "audit.outbox_rows_missing",
+            ),
+            (
+                WriterError::RetainedHistoryUnverified(
+                    stellar_agent_core::audit_log::VerifyError::HmacMismatch {
+                        file: "audit.jsonl.pruned".to_owned(),
+                    },
+                ),
+                "audit.history_unverified",
+            ),
+            (
+                WriterError::RetiredOutboxChanged { generation: 1 },
+                "audit.outbox_rows_missing",
+            ),
+            (
+                WriterError::CarrierGenerationChanged {
+                    held: 1,
+                    current: 2,
+                },
+                "audit.carrier_replaced",
+            ),
+            (
+                WriterError::OutboxLossNotFound,
+                "audit.outbox_loss_not_found",
+            ),
+            (
+                WriterError::RotationBridgeUnusable {
+                    archive_name: "audit.jsonl.20260913T120000000".to_owned(),
+                    reason: "test",
+                },
+                "audit.rotation_bridge_unusable",
+            ),
+            (
+                WriterError::RowTooLarge {
+                    bytes: 2_000_000,
+                    cap: 1_048_576,
+                },
+                "audit.row_too_large",
+            ),
+        ];
+        for (writer_error, own_code) in &cases {
+            let err = audit_writer_error(writer_error, "audit.reanchor_failed", "default");
+            if matches!(
+                writer_error,
+                WriterError::OutboxRowsMissing { .. }
+                    | WriterError::RetiredOutboxChanged { .. }
+                    | WriterError::OutboxLossNotFound
+                    | WriterError::CarrierGenerationChanged { .. }
+            ) {
+                assert_eq!(err.code(), *own_code);
+            }
+            assert!(
+                err.message().contains(own_code),
+                "message: {}",
+                err.message()
+            );
+            assert!(
+                !err.message().contains("audit.reanchor_failed"),
+                "two codes in one detail: {}",
+                err.message()
+            );
+        }
     }
 
     #[test]
@@ -225,5 +409,209 @@ mod tests {
             "message: {}",
             err.message()
         );
+    }
+
+    #[test]
+    fn carrier_refusals_report_their_own_audit_codes() {
+        use stellar_agent_core::audit_log::{Carrier, audit_writer_refusal};
+
+        let cases = [
+            (
+                WriterError::CarrierReplaced {
+                    carrier: Carrier::Writer,
+                },
+                "audit.carrier_replaced",
+            ),
+            (
+                WriterError::CarrierGenerationChanged {
+                    held: 1,
+                    current: 2,
+                },
+                "audit.carrier_replaced",
+            ),
+            (WriterError::CarriersUnbound, "audit.carriers_unbound"),
+            (
+                WriterError::CarrierIdentityUnavailable,
+                "audit.carrier_identity_unavailable",
+            ),
+            (WriterError::CarriersBusy, "audit.carriers_busy"),
+            (
+                WriterError::CarrierBindingIncomplete,
+                "audit.carrier_binding_incomplete",
+            ),
+        ];
+        for (writer_error, expected_code) in &cases {
+            let err = audit_writer_error(writer_error, "audit.carrier_binding_failed", "default");
+            assert_eq!(
+                err.code(),
+                *expected_code,
+                "audit verb envelope code must be {expected_code}, got {} ({})",
+                err.code(),
+                err.message()
+            );
+            assert!(
+                !err.code().starts_with("internal."),
+                "carrier refusal must never use internal.*: {}",
+                err.code()
+            );
+            assert!(
+                err.message().starts_with(expected_code),
+                "message must start with {expected_code}: {}",
+                err.message()
+            );
+            assert!(
+                !err.message().contains("audit.carrier_binding_failed"),
+                "fallback code must not appear: {}",
+                err.message()
+            );
+
+            // Value verbs keep `audit.chain_key_unavailable` with the carrier
+            // code at the head of the detail.
+            let value_err = audit_writer_refusal("default", writer_error);
+            assert_eq!(value_err.code(), "audit.chain_key_unavailable");
+            assert!(
+                value_err
+                    .message()
+                    .contains(&format!("cannot be audited: {expected_code}:")),
+                "value verb detail must lead with {expected_code}: {}",
+                value_err.message()
+            );
+        }
+    }
+
+    #[test]
+    fn tip_anchor_store_and_outbox_cap_errors_keep_single_code() {
+        use stellar_agent_core::audit_log::TipAnchorStoreError;
+
+        let cases = [
+            (
+                WriterError::TipAnchorStore(TipAnchorStoreError::new("anchor value is unusable")),
+                "audit.tip_anchor_unavailable",
+            ),
+            (
+                WriterError::OutboxFull {
+                    queued: 64,
+                    cap: 64,
+                },
+                "audit.outbox_full",
+            ),
+            (
+                WriterError::OutboxRowTooLarge {
+                    bytes: 2_000_000,
+                    cap: 1_048_576,
+                },
+                "audit.outbox_row_too_large",
+            ),
+        ];
+        for (writer_error, own_code) in &cases {
+            let err = audit_writer_error(writer_error, "audit.reanchor_failed", "default");
+            let message = err.message();
+            assert!(
+                message.contains(&format!("{own_code}: ")),
+                "expected {own_code}: {message}"
+            );
+            assert_eq!(
+                message.matches(own_code).count(),
+                1,
+                "wire code must appear once: {message}"
+            );
+            assert!(
+                !message.contains("audit.reanchor_failed"),
+                "fallback code must not prefix self-coded error: {message}"
+            );
+        }
+    }
+
+    /// Each audit verb's fallback code: a tip-anchor store error that carries
+    /// a classified keyring refusal reports its `auth.*` code on every verb,
+    /// and one without keeps `internal.unexpected_state` with the
+    /// `audit.tip_anchor_unavailable` detail. The mapper for a store error
+    /// read outside the writer follows the same rule.
+    #[test]
+    fn tip_anchor_store_auth_error_keeps_its_auth_code() {
+        use stellar_agent_core::audit_log::TipAnchorStoreError;
+        use stellar_agent_core::error::AuthError;
+
+        let refusals = [
+            (
+                AuthError::KeyringPlatformError {
+                    detail: "write Linux Secret Service: credential store operation failed"
+                        .to_owned(),
+                },
+                "auth.keyring_platform_error",
+                "credential store operation failed",
+            ),
+            (
+                AuthError::KeyringInteractiveSessionRequired,
+                "auth.keyring_interactive_session_required",
+                "",
+            ),
+        ];
+        let untyped = TipAnchorStoreError::new(
+            "anchor value is unusable: expected three colon-separated fields",
+        );
+        // `profile rotate-audit-key`, `audit reanchor`, `audit bind-carriers`,
+        // `audit acknowledge-outbox-loss`, and `audit verify`.
+        for fallback_code in [
+            "audit.writer_unavailable",
+            "audit.reanchor_failed",
+            "audit.carrier_binding_failed",
+            "audit.outbox_acknowledgement_failed",
+            "audit.tip_anchor_unavailable",
+        ] {
+            for (auth, code, text) in &refusals {
+                let typed = WriterError::TipAnchorStore(TipAnchorStoreError::from_auth(
+                    "carrier record write failed",
+                    auth.clone(),
+                ));
+                let err = audit_writer_error(&typed, fallback_code, "default");
+                assert_eq!(err.code(), *code, "{fallback_code}: {}", err.message());
+                assert!(err.message().contains(text), "{}", err.message());
+                assert!(!err.message().contains(fallback_code), "{}", err.message());
+            }
+
+            let err = audit_writer_error(
+                &WriterError::TipAnchorStore(untyped.clone()),
+                fallback_code,
+                "default",
+            );
+            assert_eq!(err.code(), "internal.unexpected_state", "{fallback_code}");
+            assert_eq!(
+                err.message(),
+                "unexpected internal state: audit.tip_anchor_unavailable: audit log tip anchor \
+                 unavailable: audit tip anchor store: anchor value is unusable: expected three \
+                 colon-separated fields",
+                "{fallback_code}"
+            );
+        }
+
+        for (auth, code, _) in &refusals {
+            let typed = TipAnchorStoreError::from_auth("anchor read failed", auth.clone());
+            assert_eq!(tip_anchor_unavailable(&typed).code(), *code);
+            assert_eq!(
+                tip_anchor_keyring_refusal(&typed).map(|e| e.code()),
+                Some(*code)
+            );
+        }
+        assert!(tip_anchor_keyring_refusal(&untyped).is_none());
+        let err = tip_anchor_unavailable(&untyped);
+        assert_eq!(err.code(), "internal.unexpected_state");
+        assert_eq!(
+            err.message(),
+            "unexpected internal state: audit.tip_anchor_unavailable: audit tip anchor store: \
+             anchor value is unusable: expected three colon-separated fields"
+        );
+    }
+
+    #[test]
+    fn starts_with_audit_wire_code_checks_code_grammar() {
+        assert!(starts_with_audit_wire_code("audit.outbox_full: cap"));
+        assert!(starts_with_audit_wire_code("audit.code_2: detail"));
+        assert!(!starts_with_audit_wire_code("other: detail"));
+        assert!(!starts_with_audit_wire_code("policy.pin_absent: detail"));
+        assert!(!starts_with_audit_wire_code("audit.outbox_full"));
+        assert!(!starts_with_audit_wire_code("audit.: detail"));
+        assert!(!starts_with_audit_wire_code("audit.BadCode: detail"));
+        assert!(!starts_with_audit_wire_code("audit.has space: detail"));
     }
 }

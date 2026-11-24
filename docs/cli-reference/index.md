@@ -1,8 +1,11 @@
 # CLI reference
 
-`stellar-agent` is a self-custodial Stellar wallet for AI agents. It builds, signs, and submits transactions on testnet under a policy engine, an operator-approval spine, and a tamper-evident hash-chained audit log.
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
 
-This page covers the conventions shared by every command: how the profile and network are resolved, the signer-source flags, the JSON output envelope and exit codes, and the mainnet-write refusal. Each command group is documented on its own page, linked from the [command index](#command-index) below.
+`stellar-agent` is a self-custodial Stellar wallet for AI agents. It builds, signs, and submits transactions on testnet under a policy engine, an operator-approval spine, and a tamper-evident hash-chained audit log. On mainnet it admits `pay`, `claim`, sponsored `accounts create`, and `trustline` after setup.
+
+This page covers the conventions shared by every command: how the profile and network are resolved, the signer-source flags, the JSON output envelope and exit codes, and [mainnet write behavior](#mainnet-write-behavior). Each command group is documented on its own page, linked from the [command index](#command-index) below.
 
 For the concepts referenced here (profiles, the policy engine, the approval spine, the audit log, context rules), see [concepts](../concepts.md). For which commands need only a classic keyring key versus a deployed smart-account contract, see [the two account models](../concepts.md#two-account-models).
 
@@ -22,13 +25,15 @@ Run `stellar-agent --help` for the live subcommand list, or `stellar-agent <comm
 
 The wallet is a public alpha; prebuilt binaries are published on the GitHub releases page for each tagged release, and 36 of its 37 workspace crates are published on crates.io. The unpublished one, `stellar-agent-smart-account-acceptance`, holds live acceptance tests only. While only prerelease versions are published, the version must be spelled out: a bare crate name matches stable versions only. The ways to install are:
 
-- `cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13`: downloads the prebuilt GitHub release archive, resolved through crates.io. The archive is `stellar-agent-<version>-<target>.tar.xz`, or `.zip` on Windows. The `stellar-agent` CLI and the `stellar-agent-mcp` server ship in one archive. With the strategy flag, binstall fails on a host for which no release archive exists; see [Prebuilt binaries](../getting-started.md#prebuilt-binaries-cargo-binstall) for the release targets.
+- `cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13`: downloads the prebuilt GitHub release archive, resolved through crates.io. The archive is `stellar-agent-<version>-<target>.tar.xz`, or `.zip` on Windows. It holds one executable under two names, `stellar-agent` and `stellar-agent-mcp`; binstall installs `stellar-agent`. With the strategy flag, binstall fails on a host for which no release archive exists; see [Prebuilt binaries](../getting-started.md#prebuilt-binaries-cargo-binstall) for the release targets.
 - `cargo install --locked stellar-agent-cli@0.1.0-alpha.13`: builds from the published sources with the `Cargo.lock` published in the crate and installs the binary `stellar-agent`.
-- Building from a clone of the release tag with `cargo build --release --locked`.
+- Building from a clone of the release tag with `cargo build --release --locked`, which writes `target/release/stellar-agent`.
+
+The same executable runs the MCP server as `stellar-agent mcp serve`, and under the file name `stellar-agent-mcp`. MCP client stanzas that start `stellar-agent-mcp` need a copy of the executable under that name; [Prebuilt binaries](../getting-started.md#prebuilt-binaries-cargo-binstall) shows the copy command.
 
 ## Global conventions
 
-The top-level command accepts `-h`/`--help` and `-V`/`--version`. Network selection, the profile, RPC URLs, and the signer source are declared per subcommand. The recurring flags below have the same meaning everywhere they appear; the per-group pages reference this section rather than restating them.
+The top-level command accepts `-h`/`--help` and `-V`/`--version`. A build with the `mainnet-write` feature, the default, admits the mainnet operations below. The second line of `--version` and `-V` output, `STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on`, reports the compiled feature state. Network selection, the profile, RPC URLs, and the signer source are declared per subcommand. The recurring flags below have the same meaning everywhere they appear; the per-group pages reference this section rather than restating them.
 
 ### Profile
 
@@ -44,7 +49,7 @@ A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE`
 
 Some commands take the profile as a positional argument instead of a flag (the `profile` group itself); those cases are noted on their page.
 
-The selected name must also be the name the profile file carries. Every command that loads a profile compares the selected name against the one derived from the file's `policy_owner_key_id.service`, and refuses with `profile.name_mismatch` when the two disagree — the case a `<name>.toml` copied or renamed from another profile produces. The refusal names both profiles and quotes the offending field; recover with `stellar-agent profile init --profile <name>`, or by correcting that field to `stellar-agent-owner-<name>`. `stellar-agent profile show <name>` is the one command that still displays a mismatched profile, so the field can be read.
+The selected name must also be the name the profile file carries. Every command that loads a profile compares the selected name against the one derived from the file's `policy_owner_key_id.service`, and refuses with `profile.name_mismatch` when the two disagree, as they do for a `<name>.toml` copied or renamed from another profile. The refusal names the offending field without its value or either profile name; recover with `stellar-agent profile init --profile <name>`, or by correcting that field to `stellar-agent-owner-<name>`. `stellar-agent profile show <name>` is the one command that still displays a mismatched profile, so the field can be read.
 
 ### Network
 
@@ -62,15 +67,15 @@ RPC URL flags refuse credentials. Configure credentialed endpoints in the profil
 An overriding URL gets the keyring credential only when it equals the profile's `rpc_url`.
 Store a provider key with `profile enroll-rpc-credential` (see [Provider credentials](../profiles.md#provider-credentials)).
 
-Smart-account rule commands use the effective secondary for cross-RPC checks. `smart-account multicall` requires a secondary endpoint.
-The signers manager and timelock commands use the primary when no secondary is configured.
+Smart-account writes require a secondary endpoint on the same network and on a host other than the primary's; see [Pre-submission checks](smart-account.md#pre-submission-checks).
+Read-only smart-account commands use the primary when no secondary is configured.
 A configured mainnet secondary requires `providers.secondary`, a host distinct from the primary, and a `[providers.primary]` record; the fallback provides no independent provider.
 `balances` keeps its testnet endpoint default. Standalone `friendbot` derives its endpoint from its network selector.
-`fees stats --profile` applies the endpoint rules above and keeps its flag allowlist. Without `--profile`, it uses `--rpc-url`, else the testnet endpoint.
+`fees stats --profile` applies the endpoint rules above. Without `--profile`, it reads `--rpc-url`, else the testnet endpoint, and sends no credential. That `--rpc-url` must be an HTTPS URL; another scheme refuses with `validation.config_invalid`.
 
 ### Timeout
 
-`--timeout-seconds <SECONDS>` bounds submission and simulation. On `pay`, `claim`, sponsored `accounts create`, and `pool init`, it also bounds the [endpoint identity check](#endpoint-identity-before-the-first-read), which gets a budget of its own. The default is `60`, and `120` on `pool init`.
+`--timeout-seconds <SECONDS>` bounds submission and simulation. On `pay`, `claim`, sponsored `accounts create`, and `trustline`, it bounds the send and the confirmation poll; without the flag the profile's `submit_timeout_seconds` applies, then `60`. The [endpoint checks](#endpoint-identity-before-the-first-read) and the reads before the send run under a fixed 30-second pre-send budget instead. On `pool init` the flag also bounds the endpoint identity check, which gets a budget of its own, and the default is `120`.
 
 ### Output format
 
@@ -80,7 +85,7 @@ A configured mainnet secondary requires `providers.secondary`, a host distinct f
 
 Signing commands take a mutually exclusive signer-source group. Exactly one source is selected:
 
-- The secret-env flag: the name of an environment variable holding the source account S-strkey. Set the variable as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows; pass the variable name, never the secret itself. Its spelling is `--secret-env` on `pay` and `accounts create`, `--deployer-secret-env` on `accounts deploy-c`, and `--signer-secret-env` on the `smart-account` commands; the per-group pages give the exact spelling.
+- The secret-env flag: the name of an environment variable holding the source account S-strkey. Set the variable as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows; pass the variable name, never the secret itself. Its spelling is `--secret-env` on `pay`, `claim` and `accounts create`, `--deployer-secret-env` on `accounts deploy-c`, and `--signer-secret-env` on the `smart-account` commands; the per-group pages give the exact spelling. On a mainnet profile `pay`, `claim` and `accounts create` refuse `--secret-env` with `validation.mainnet_secret_env_refused` and, without a signer flag, sign with the enrolled seed in the keyring.
 - `--sign-with-ledger`: sign with a connected Ledger hardware device.
 - `--account-index <INDEX>`: the BIP-44 account index for the Ledger derivation path. Default `0`.
 
@@ -103,16 +108,19 @@ A signing command refuses before any signature or send when its signer source fa
 - the key's public key is not the account or key the command expects: `auth.signer_key_mismatch`, which reports the derived public key beside the expected value.
 
 `profile.key_scope_conflict` reports shared, self-colliding or out-of-scope
-keyring entries, a non-default owner account, or an unreadable comparison input.
+keyring entries, a non-default owner account, a mainnet window-state entry other
+than the profile's default, or an unreadable comparison input.
 It refuses mainnet reconciliation and warns on testnet. An unreadable sibling
 only warns. See [profile key scoping](../profiles.md#file-location-and-selection)
 for the two recovery paths. `profile show` remains available for diagnosis.
 
 ## Output envelope and exit codes
 
-By default every command prints one JSON envelope on stdout. Exit code `0` means success; exit code `1` means any error. Scripts can branch on the exit code and parse the JSON for details.
+By default every command prints one JSON envelope on stdout. Exit code `0` means success, and exit code `1` means an error. `profile policy-check`, `profile apply-fragment`, and `profile enable-mainnet --state` use more exit codes; see [profile-and-governance](profile-and-governance.md). `mcp serve` exits `2` on a usage refusal and `3` on a second shutdown event; see [MCP server](../mcp.md). Scripts can branch on the exit code and parse the JSON for details.
 
-An argument the parser refuses, such as an unknown flag or a missing required one, also prints one envelope: `validation.usage_error` with the parser's message, exit code `1`, and nothing on stderr. `--help` and `--version` print their text and exit `0`.
+An argument the parser refuses, such as an unknown flag or a missing required one, also prints one envelope: `validation.usage_error`, exit code `1`, and nothing on stderr. The message names the error class and the schema-defined argument, never the rejected text. `--help` and `--version` print their text and exit `0`.
+
+Before it parses the arguments, the CLI on Linux marks its process non-dumpable. When it cannot, it prints one `wallet.process_hardening_failed` envelope, exits `1` and runs no command. A CLI that cannot start its async runtime prints `wallet.runtime_unavailable` the same way.
 
 ```bash
 if stellar-agent balances --account GABC...WXYZ > out.json; then
@@ -122,19 +130,97 @@ else
 fi
 ```
 
-## Mainnet-write refusal
+## Mainnet write behavior
 
-The zero-config profile uses testnet. Friendbot funding is limited to testnet-class networks.
+Default builds enable the `mainnet-write` feature. These builds admit full-mode `pay`, `claim`, sponsored
+`accounts create`, and `trustline` after installation setup. CLI `Allow` signs
+without a passkey ceremony; `RequireApproval` runs one. Build-only, sign-only, submit-only,
+Friendbot creation, generated-account creation, and relayer paths remain excluded.
 
-On a mainnet profile, `pay`, `claim`, account creation, account deployment, and smart-account deployment refuse before signer access.
-The same structural refusal covers the signer verbs that sign, rule writes, policy writes, `execute`, migration submit, timelock writes, and `multicall`.
-It also covers `vault deposit`, `vault withdraw`, `trade`, `trustline`, and `pool init`, before signer access and any RPC call.
-It reports `network.mainnet_write_forbidden`; Friendbot funding reports `network.friendbot_mainnet_forbidden`, and `mpp` reports `mpp.network_forbidden`.
-Read-only inspection remains available. `tx` signs nothing, and `pool init` is the only `pool` command that signs.
-`smart-account rules verify-pins`, `signers list`, and `signers refresh` load no signer and accept a mainnet profile. They keep their local audit writes, so a persisted profile needs `profile rotate-audit-key` first.
-`--network` is checked against the profile before a structural refusal, so `--network mainnet` on the zero-config testnet profile reports `profile.network_flag_mismatch`.
+Select an explicit nondefault mainnet profile with matching stored configuration.
+Enroll signer and owner identities, enable the installation, and sign a v2 policy.
+Valid pin and audit state, required witnesses, and per-action authorization remain
+necessary. [The policy guide](../profiles.md#mainnet-policy-body) lists the fields.
 
-The submit layer applies the same refusal in a fixed order. A declared mainnet network passphrase is refused first, then an `--rpc-url` matching a known mainnet host; both cost zero RPC calls. The envelope is then decoded locally, so a malformed or legacy V0 envelope is refused without a round trip.
+Mainnet consent requires a fresh WebAuthn assertion, with user presence and
+user verification, from an approval credential listed in the owner-signed
+policy ([approval credentials](../profiles.md#approval-credentials)). Terminal input, a
+pseudo-terminal, `--yes`, and the local process identity supply no mainnet
+consent.
+
+Without a signed approval origin, mainnet consent uses the localhost passkey page.
+Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+Without a display, mainnet consent needs `--open-by-operator`, which prints the localhost URL for the operator to open.
+With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
+The CLI prints the signed approval link without opening a browser or requiring a display.
+Ledger signing also requires this passkey ceremony when the CLI policy requires approval.
+After the ceremony the CLI verifies the consent against its durable record and exits 1 before signing on any refusal.
+An unreadable receipt store refuses with `submission.record_unavailable`, and a submission receipt that names the nonce or a record of another operation with `approval.consumed`.
+A receipt whose attempt is a checked non-inclusion of the admitted canonical operation does not refuse.
+The record check refuses with `approval.not_found`, `approval.revoked`, `approval.expired`, `approval.presence_required`, `approval.presence_invalid`, `approval.presence_policy_unavailable`, `approval.attestation_invalid`, `approval.wrong_kind`, or `approval.binding_mismatch`.
+An unreadable wall clock refuses with `approval.clock_error`; window store, keyring, and audit evidence failures keep their own codes.
+
+A localhost ceremony binds `127.0.0.1` and `[::1]` on one port before it
+creates any token, serves the same session on both, and closes both together.
+When either family cannot be held, the ceremony does not start.
+
+An MCP mainnet commit under `allow` signs without an approval.
+A supplied approval, and every approval under `require_approval`, must be a
+version 5 approval of an exact envelope, or version 6 of an intent stored under
+the business id, with its verified presence receipt. An invalid proof refuses
+with `policy.approval_required`.
+Each challenge lasts at most 120 seconds. The command waits until pending
+expiry. A canceled authenticator prompt ends the ceremony; retry the command
+for a fresh challenge.
+Testnet approvals retain version 4 and their terminal and remote paths.
+
+`approval.presence_required`: `Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page.`
+
+`approve.yes_refused_on_mainnet`: `approve --yes is refused on a mainnet profile; approve with a pinned passkey in the local browser.`
+
+`network.mainnet_write_forbidden` means the build, operation, or selected context
+has no admitted path. Missing CLI engine, verified policy, or enablement is an
+entry refusal with the prerequisite named. Resolver refusal uses
+`network.mainnet_authorization_refused`. Its core message is
+`the mainnet write was refused before submission; nothing was sent`.
+
+`network.mainnet_keyring_backend_unsupported` means
+`STELLAR_AGENT_KEYRING_BACKEND` is set to any value. Mainnet readiness and
+`profile enable-mainnet` refuse such a process before the
+keyring initializes; mainnet needs the platform keyring. Testnet is
+unaffected.
+
+CLI messages distinguish the withheld result:
+
+- Signature: `the mainnet write was refused; the signature was withheld and nothing was sent`.
+- Submission: `the mainnet write was refused; the submission was refused after signing and nothing was sent`.
+
+Other signature-stage errors append `The signature was withheld and nothing was sent.`
+Other post-signing errors retain their own outcome semantics. A signer can run
+before signature verification rejects its result. Submission refusal can follow
+signing. Classic MCP renders the core message without these stage replacements.
+[Mainnet refusal order](../getting-started.md#mainnet-refusal-order) lists what
+has been signed or sent when a mainnet check refuses.
+
+Read-only inspection remains available. `tx` signs nothing. Smart-account writes,
+DeFi, and pool submission remain excluded. `smart-account rules verify-pins`,
+`signers list`, and `signers refresh` retain local audit writes without signing.
+A persisted profile therefore needs its audit key initialized.
+Friendbot reports `network.friendbot_mainnet_forbidden`; MPP reports
+`mpp.network_forbidden`. `--network mainnet` on a testnet profile reports
+`profile.network_flag_mismatch` before write admission.
+
+The wallet's own signing paths sign mainnet payloads only under mainnet
+authorization. The library signers enforce it too: every `Signer`, the public
+keyring handle included, signs a mainnet transaction or Soroban authorization
+payload only under a mainnet authorization. Code running as the same OS user
+with access to a keyring entry can read its seed directly. The keyring entry
+is the custody boundary.
+
+Ordinary submission refuses the declared mainnet passphrase or known mainnet host before RPC.
+Both submission paths then decode the envelope locally, so a malformed or
+legacy V0 envelope refuses with `protocol.xdr_codec_failed` without a round trip.
+Authorized signing and submission independently check sealed authorization.
 
 ## Halted-profile refusal
 
@@ -148,31 +234,34 @@ Read-only commands, `pay --build-only`, `claim --build-only`, `smart-account mig
 
 - The full pipeline and `--submit-only` check before the reservation reconcile. The full payment pipeline validates the asset and amount before endpoint identity and reservation reconciliation. Fee validation follows reconciliation.
 - `--build-only` checks before the fee and sequence reads.
-- `--sign-only` checks before the account reads of an envelope it decodes. It signs an envelope it cannot decode without any request.
+- `--sign-only` checks before the account reads of an envelope it decodes. It signs an envelope it cannot decode without any request. A contract transfer envelope refuses before any request instead.
 - `pool init --resume` makes no request when the profile already holds the pool or the checkpoint records its completion. Every other resume checks before its first read, whether or not it sends.
 
 Checks that need no request come first: argument, keyring, and profile validation, the structural mainnet refusal, and the relayer refusal. `pool init` also runs its audit pre-flight before the check. An endpoint refusal precedes every refusal that follows a read. These include a missing account or claim entry, a policy denial, the audit pre-flight of the other commands, and the amount, asset, and fee checks. It also precedes the reservation reconcile and its settlement. A `claim` or `trustline` refused at this early check carries no preview.
 
-Each check gets a budget of its own: `--timeout-seconds` on `pay`, `claim`, `accounts create`, and `pool init`, and the profile's `submit_timeout_seconds` on `trustline`. The submit layer's check starts a fresh budget.
+Each check gets a budget of its own: the 30-second pre-send budget on `pay`, `claim`, `accounts create`, and `trustline`, and `--timeout-seconds` on `pool init`. A readiness check that outlasts its budget refuses with `network.endpoint_not_ready`. The submit layer's check starts a fresh budget.
 
 ## Submit-layer network binding
 
 The submit layer does not take the declared network on trust. Before sending, it asks the endpoint which network it serves and which protocol it runs (`getNetwork`), on the same client instance that will send. It treats that answer, not the declaration, as authoritative:
 
-- the endpoint reports mainnet: `network.mainnet_write_forbidden`;
+- the ordinary submit path sees mainnet: `network.mainnet_write_forbidden`;
 - the endpoint reports a different network than the one declared: `network.endpoint_network_mismatch`;
-- the endpoint's identity cannot be established within the submission timeout: `network.endpoint_identity_unavailable`;
+- the endpoint's identity cannot be established: `network.endpoint_identity_unavailable`;
+- the identity probe or the signer-set read does not answer within the 30-second pre-send budget: `network.pre_send_timeout`, whose message names the read; nothing is sent;
 - the endpoint answers the identity request with HTTP 401 or 403: `network.rpc_credential_refused`, which is not retried;
 - a mainnet endpoint runs a protocol version outside the supported range: `network.unsupported_protocol_version`.
 
-The probe is retried with bounded exponential backoff inside the caller's own timeout and is fail-closed: it never falls back to the declared network. An answer that does not parse, for example one without `protocolVersion`, is not retried and reports `network.endpoint_identity_unavailable`. The endpoint check is the one mainnet refusal that costs a round trip. [Retries, deadlines, and failover](../maintainers/security-internals.md#retries-deadlines-and-failover) gives the retry numbers and the deadlines.
+The probe is retried with bounded exponential backoff inside the pre-send budget and is fail-closed: it never falls back to the declared network. An answer that does not parse, for example one without `protocolVersion`, is not retried and reports `network.endpoint_identity_unavailable`. The endpoint check uses an RPC round trip. Authorized paths verify mainnet identity against their bound context. [Retries, deadlines, and failover](../maintainers/security-internals.md#retries-deadlines-and-failover) gives the retry numbers and the deadlines.
 
-This release supports protocol versions 29 and 30. A release adds a version only after its testnet acceptance tests ran against it. On testnet and on any other network that matches the declaration, a version outside the range is logged as a warning and the submission continues. On mainnet the same version is refused with `network.unsupported_protocol_version`. While mainnet writes are refused, an endpoint reporting mainnet is refused with `network.mainnet_write_forbidden` before this rule applies.
+After the identity check, `pay`, `claim`, sponsored `accounts create`, and `trustline` check that the endpoint reports a healthy status and that its latest ledger closed within 60 seconds of the host clock. An endpoint that fails the check is refused with `network.endpoint_not_ready`, and the message names the reason. The check runs before the first account read, and the summary of a mainnet write names the ledger the check observed.
+
+This release supports protocol versions 29 and 30. A release adds a version only after its testnet acceptance tests ran against it. On testnet and on any other network that matches the declaration, a version outside the range is logged as a warning and the submission continues. On mainnet the same version is refused with `network.unsupported_protocol_version`. Ordinary submission refuses a mainnet endpoint before this rule. Authorized submission enforces the mainnet protocol range.
 
 The layer then verifies the envelope's signatures against that network. It fetches the ed25519 signer sets of the transaction source account and of every distinct operation-level source account in one `getLedgerEntries` call (for a fee-bump, the fee source answers for the outer signatures and the inner transaction's sources for the inner ones); an account absent from the ledger is refused with `network.account_not_found` before anything is sent, unless the transaction itself creates it, in which case its own master key is the signer it will have at apply time and no ledger entry is needed. Every decorated signature must then verify: the SEP-23 signing payload is rebuilt under the network id the endpoint reported and checked against the gathered signers whose key hint matches.
 
 - verifies under the endpoint's network id: accepted;
-- verifies under the mainnet network id: `network.envelope_signed_for_mainnet`;
+- fails under the endpoint network but verifies under mainnet: `network.envelope_signed_for_mainnet`;
 - verifies under neither: `network.envelope_signature_unverifiable`;
 - the envelope carries no signature, or on a fee-bump the outer or the inner transaction carries none: `network.envelope_unsigned`.
 
@@ -180,8 +269,8 @@ Every signature must pass, and each signature set must have at least one: on a f
 
 ## Audit-key pre-flight refusal
 
-`pay`, `claim`, sponsored `accounts create`, `trustline`, `trade`, and `vault`
-require the active profile's audit chain-root key before accessing signing keys
+`pay`, `claim`, sponsored `accounts create`, `trustline`, `trade`, `vault`, and
+`pool init` require the active profile's audit chain-root key before accessing signing keys
 or submitting transactions. A profile from `profile init` has the audit-log
 keyring coordinate but no key material. `profile rotate-audit-key <name>` mints
 the key. Until it runs, these verbs refuse with `audit.chain_key_unavailable`.
@@ -195,8 +284,7 @@ An `--rpc-url` pointing at a different network than `--network` is refused befor
 either check runs. The check also reads the endpoint's protocol version and
 applies the protocol rule of
 [Submit-layer network binding](#submit-layer-network-binding). It runs under
-its own `--timeout-seconds` deadline, and the submission that follows starts a
-fresh one.
+its own pre-send budget, and the submission that follows starts a fresh one.
 
 This pre-flight fails closed for persisted `<name>.toml` profiles. `pay`,
 `claim`, and `accounts create` synthesize an in-memory testnet profile when no
@@ -206,11 +294,32 @@ binding still refuses with `audit.log_binding_changed` before signing or submiss
 See [Key-rotation subcommands](profile-and-governance.md#key-rotation-subcommands)
 and [Concepts: fail-closed on an unminted audit key](../concepts.md#fail-closed-on-an-unminted-audit-key).
 
-The same pre-flight proves the audit log still contains the chain tip its keyring-held anchor names, refusing with `audit.tip_anchor_mismatch` when the log was restored from an older copy, truncated, or substituted. A log that moved forward past its anchor is absorbed, not refused, and a log with no anchor is adopted on first use with no operator action. A profile whose `audit_log_path` or audit key differs from the binding recorded in the keyring refuses with `audit.log_binding_changed`. Recovery from either is [`audit reanchor`](profile-and-governance.md#audit-reanchor---profile-name---acknowledge-rollback).
+The same pre-flight proves the audit log still contains the chain tip its keyring-held anchor names, refusing with `audit.tip_anchor_mismatch` when the log was restored from an older copy, truncated, or substituted. A log that moved forward past its anchor is absorbed, not refused. A log with no anchor is adopted on first use with no operator action when nothing shows it was anchored before; a recorded audit binding, a chain-root sidecar, or an `audit_tip_anchored` row in the file shows it was, and the pre-flight refuses with `audit.tip_anchor_missing`. A log with keyed history first needs `stellar-agent audit bind-carriers --profile <NAME>` with every wallet process stopped. A profile whose `audit_log_path` or audit key differs from the binding recorded in the keyring refuses with `audit.log_binding_changed`. Recovery from any of them is [`audit reanchor`](profile-and-governance.md#audit-reanchor---profile-name---acknowledge-rollback).
 
 ## Startup advisory
 
-Before dispatching any command, the CLI runs a local-only startup advisory: it scans the profile's audit log for context rules that reference revoked or retired verifier WASM hashes. The scan issues no network calls and is non-fatal. If it cannot run, the error is logged at warn level and the command proceeds. The advisory reads the audit log of the profile the command it precedes operates on: it takes the profile the parsed subcommand resolved and applies the same resolution order as that subcommand. The advisory therefore never opens — or appends to — a different profile's log than the command itself uses.
+Before dispatching any command except `profile init`, `profile enable-mainnet`,
+and the `profile policy` verbs, the CLI scans the profile's audit log for
+context rules that reference revoked or retired verifier WASM hashes. The scan
+reads without a writer and issues no network calls. These profile commands skip
+it. No startup advisory precedes the spending preview.
+
+A finding prints a stderr advisory and opens a writer to append a
+`sa_verifier_allowlist_advisory` row with the profile's audit key. The writer
+opens unkeyed only for a persisted profile whose audit key does not load and
+whose log shows no keying. A keyed finding append checks the profile binding
+and handles the tip anchor like every keyed append. Later findings reuse the
+writer, which closes before command dispatch. An incomplete pin record prints its recovery without an
+allowlist lookup or audit row.
+
+A start without findings writes nothing and logs nothing. A scan failure logs a
+warning and the command proceeds. A writer acquisition or append failure logs
+a warning and leaves the stderr advisory intact.
+
+The advisory uses the parsed subcommand's profile selection and resolution
+order. It reads and appends to the same profile's configured log as the command.
+
+Signing under a rule pinned to a revoked or retired verifier refuses with `sa.verifier_wasm_revoked` or `sa.verifier_wasm_retired`. No flag overrides this status.
 
 ## Command index
 
@@ -228,12 +337,13 @@ Before dispatching any command, the CLI runs a local-only startup advisory: it s
 | `counterparty` | Manage the cached `stellar.toml` bindings that back the counterparty allowlist policy. | [stellar-ops](stellar-ops.md) |
 | `vault` | Deposit into or withdraw from a DeFindex vault via the smart-account (signing). | [defi-and-pool](defi-and-pool.md) |
 | `trade` | Swap tokens via the Soroswap router-direct path via the smart-account (signing). | [defi-and-pool](defi-and-pool.md) |
-| `pool` | Initialise and inspect a channel-account pool for parallel transaction submission. | [defi-and-pool](defi-and-pool.md) |
-| `profile` | Create, list, show, migrate, and rotate the keyring-backed keys of a profile; halt and resume its agent actions. | [profile-and-governance](profile-and-governance.md) |
+| `pool` | Initialize and inspect a channel-account pool for parallel transaction submission. | [defi-and-pool](defi-and-pool.md) |
+| `profile` | Create, list, show, and migrate profiles; enroll and rotate their keys; sign and check policies; enable mainnet; reset window and MPP state; halt and resume agent actions. | [profile-and-governance](profile-and-governance.md) |
 | `credentials` | Register, list, show, and delete WebAuthn passkeys in the per-profile registry. | [profile-and-governance](profile-and-governance.md) |
-| `approve` | Read a pending approval, prompt y/n, and record the HMAC attestation; garbage-collect expired approvals. | [profile-and-governance](profile-and-governance.md) |
-| `audit` | Walk and verify the integrity of a hash-chained audit log, and repair its tip anchor. | [profile-and-governance](profile-and-governance.md) |
+| `approve` | Approve a pending request by terminal prompt on testnet or by passkey ceremony on mainnet. Subcommands list, inspect, revoke, serve, and collect approvals and manage approval credentials. | [profile-and-governance](profile-and-governance.md) |
+| `audit` | Verify a hash-chained audit log, repair its tip anchor, acknowledge outbox loss, and bind the audit carriers. | [profile-and-governance](profile-and-governance.md) |
 | `toolsets` | Install, list, run, and uninstall agent toolsets with cryptographic provenance verification. | [toolsets](../toolsets.md) |
+| `mcp` | Run the MCP stdio server with `stellar-agent mcp serve`. | [MCP server](../mcp.md) |
 | `mpp` | Authorize a sponsored testnet MPP charge, inspect durable state, record a host receipt, reconcile settlement, and prune old terminal replay markers. | [agent payments](../agent-payments.md) |
 
 ## Related pages

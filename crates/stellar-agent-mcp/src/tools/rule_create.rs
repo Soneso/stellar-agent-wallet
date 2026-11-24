@@ -71,8 +71,8 @@ use stellar_agent_core::approval::user_id::process_uid_for_attestation;
 use stellar_agent_core::approval::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, RuleProposalGateError, open_with_retry,
 };
-use stellar_agent_core::audit_log::ExecutableRefPin;
 use stellar_agent_core::audit_log::writer::AuditWriter;
+use stellar_agent_core::audit_log::{ExecutableRefPin, WasmHashPin};
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::keyring::enrolled_keyring_signer;
 use stellar_agent_smart_account::error::SaError;
@@ -80,9 +80,8 @@ use stellar_agent_smart_account::managers::credentials::CredentialsManager;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
     DELEGATED_SIGNER_ADDRESS_REASON, OZ_MAX_EXTERNAL_KEY_SIZE, OZ_MAX_NAME_SIZE, OZ_MAX_POLICIES,
-    OZ_MAX_SIGNERS, RuleContext, compute_context_rule_proposal_sha256,
-    context_rule_definition_from_snapshot, parse_c_strkey_to_smart_account,
-    parse_delegated_signer_address,
+    OZ_MAX_SIGNERS, RuleContext, context_rule_definition_from_snapshot,
+    parse_c_strkey_to_smart_account, parse_delegated_signer_address,
 };
 use stellar_agent_smart_account::managers::signers::SignersManager;
 use stellar_agent_smart_account::spending_limit_policy::{
@@ -268,8 +267,8 @@ pub struct StellarRuleCreateCommitArgs {
     pub approval_nonce: String,
 
     /// HMAC-SHA256 attestation blob, URL-safe base64 no-pad encoded (32
-    /// bytes). Required when the policy engine (or the toolset-gated forced
-    /// path) requires approval.
+    /// bytes). Required on every call. The commit verifies the operator
+    /// attestation whatever the policy verdict.
     #[serde(default)]
     pub approval_attestation: Option<String>,
 }
@@ -307,7 +306,7 @@ fn parse_rule_context_arg(s: &str) -> Result<RuleContext, String> {
         })?;
         return Ok(RuleContext::CreateContract { wasm_hash });
     }
-    Err(format!("unknown context '{s}'; {CONTEXT_GRAMMAR}"))
+    Err(format!("unknown context; {CONTEXT_GRAMMAR}"))
 }
 
 /// Renders a [`RuleContext`] back into its core-side
@@ -451,9 +450,14 @@ fn resolve_signers(
                         None,
                     )
                 })?;
-                let pubkey_data = hex::decode(pubkey_data_hex).map_err(|e| {
+                // The hex decoder's error quotes the offending character, so
+                // the refusal names the field and the expected form only.
+                let pubkey_data = hex::decode(pubkey_data_hex).map_err(|_| {
                     rmcp::ErrorData::invalid_params(
-                        format!("signers[{idx}].pubkey_data_hex: invalid hex: {e}"),
+                        format!(
+                            "signers[{idx}].pubkey_data_hex: must be an even-length string of \
+                             hex digits"
+                        ),
                         None,
                     )
                 })?;
@@ -514,11 +518,10 @@ fn resolve_webauthn_signer(
     server: &WalletServer,
     idx: usize,
 ) -> Result<(String, stellar_xdr::ScAddress, Vec<u8>), rmcp::ErrorData> {
+    // The refusal names the field by its position; the credential name stays
+    // out, because a name the passkey store does not hold is refused input.
     let bad = |detail: String| {
-        rmcp::ErrorData::invalid_params(
-            format!("signers[{idx}].credential_name '{credential_name}': {detail}"),
-            None,
-        )
+        rmcp::ErrorData::invalid_params(format!("signers[{idx}].credential_name: {detail}"), None)
     };
 
     let registry = VerifierRegistry::open()
@@ -615,10 +618,11 @@ fn resolve_policies(
                 // the CLI `rules add-policy --kind raw --install-param` path.
                 let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
                     .decode(install_param_xdr_b64)
-                    .map_err(|e| {
+                    .map_err(|_| {
                         rmcp::ErrorData::invalid_params(
                             format!(
-                                "policies[{idx}].install_param_xdr_b64: not valid base64url: {e}"
+                                "policies[{idx}].install_param_xdr_b64: must be unpadded \
+                                 base64url"
                             ),
                             None,
                         )
@@ -645,10 +649,7 @@ fn resolve_policies(
             } => {
                 let limit_stroops: i128 = limit_stroops.parse().map_err(|_| {
                     rmcp::ErrorData::invalid_params(
-                        format!(
-                            "policies[{idx}].limit_stroops: not a valid decimal i128: \
-                             {limit_stroops:?}"
-                        ),
+                        format!("policies[{idx}].limit_stroops: not a valid decimal i128"),
                         None,
                     )
                 })?;
@@ -757,17 +758,31 @@ fn open_rule_create_audit_writer(
               propagates it"
 )]
 fn build_write_context_rule_manager(server: &WalletServer) -> Result<ContextRuleManager, SaError> {
+    let now_ms = stellar_agent_core::timefmt::now_unix_ms().map_err(|_| {
+        SaError::IntentRecordUnavailable {
+            class: "policy_unavailable",
+        }
+    })?;
+    let admission =
+        super::submission_record::no_value_admission(server, "stellar_rule_create_commit", now_ms)
+            .map_err(|_| SaError::IntentRecordUnavailable {
+                class: "policy_unavailable",
+            })?;
     let audit_writer = open_rule_create_audit_writer(server)?;
     let timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECONDS);
-    let signers_manager = SignersManager::new(signers_manager_config(
-        &server.context,
-        Arc::clone(&audit_writer),
-        server.profile.audit_log_path.clone(),
-        server.profile_name_for_approval(),
-        timeout,
-    ))?;
+    let signers_manager = SignersManager::new(
+        signers_manager_config(
+            &server.context,
+            Arc::clone(&audit_writer),
+            server.profile.audit_log_path.clone(),
+            server.profile_name_for_approval(),
+            timeout,
+        )
+        .with_intent_admission(Arc::clone(&admission)),
+    )?;
 
     let config = context_rule_manager_config(&server.context, timeout)
+        .with_intent_admission(admission)
         .with_signers_manager(Arc::new(signers_manager))
         .with_audit_writer(audit_writer);
 
@@ -792,7 +807,6 @@ impl WalletServer {
         network_passphrase: &str,
         chain_id: &str,
         definition: ContextRuleProposalSnapshot,
-        proposal_sha256: [u8; 32],
         summary_line: String,
         profile_name: &str,
     ) -> Result<PendingApproval, String> {
@@ -812,7 +826,6 @@ impl WalletServer {
             network_passphrase.to_owned(),
             chain_id.to_owned(),
             definition,
-            proposal_sha256,
             summary_line,
             uid,
             crate::tools::common::APPROVAL_TTL_MS,
@@ -869,7 +882,10 @@ impl WalletServer {
                        address or two simple-threshold policies refuse with sa.deployment_failed at phase \
                        build. An external entry whose pubkey_data_hex decodes to empty key data refuses with \
                        sa.auth_entry_construction_failed. Returns {approval_nonce, expires_at_unix_ms, \
-                       summary}. Simulate responses include profile and chain_id at the top level. Pass \
+                       summary}. The result also carries requires_operator_approval, \
+                       proposal_sha256_hex, latest_ledger, and the pin fields mutable_override and \
+                       unknown_override. The commit requires the attestation even when \
+                       requires_operator_approval is false. Simulate responses include profile and chain_id at the top level. Pass \
                        approval_nonce to stellar_rule_create_commit once the operator approves via \
                        `stellar-agent approve --id <nonce> --profile <profile>`. \
                        destructive_hint=false; read_only_hint=false.",
@@ -927,11 +943,6 @@ impl WalletServer {
                 None,
             ));
         }
-        let auth_rule_ids: Vec<stellar_agent_core::smart_account::rule_id::ContextRuleId> = args
-            .auth_rule_ids
-            .iter()
-            .map(|id| stellar_agent_core::smart_account::rule_id::ContextRuleId::new(*id))
-            .collect();
 
         let rule_definition = ContextRuleDefinition::new(
             context,
@@ -996,23 +1007,6 @@ impl WalletServer {
             Err(err) => return Ok(sa_error_result(&err)),
         };
 
-        // ── Compute the domain-separated proposal digest ──────────────────────
-        let proposal_sha256 = match compute_context_rule_proposal_sha256(
-            &smart_account,
-            &rule_definition,
-            &auth_rule_ids,
-            args.accept_mutable_verifier,
-            args.accept_unknown_verifier,
-        ) {
-            Ok(d) => d,
-            Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    format!("rule_proposal_digest_error: {err}"),
-                    None,
-                ));
-            }
-        };
-
         // ── Build the snapshot ─────────────────────────────────────────────────
         let context_label = rule_definition.context_type_label();
         let summary_line = format!(
@@ -1054,38 +1048,55 @@ impl WalletServer {
                 self.context.network_passphrase(),
                 &args.chain_id,
                 snapshot,
-                proposal_sha256,
-                summary_line.clone(),
+                summary_line,
                 &profile_name,
             )
             .map_err(|e| {
                 rmcp::ErrorData::internal_error(format!("approval.store_error: {e}"), None)
             })?;
 
+        let stellar_agent_core::approval::ApprovalKind::RuleProposalSimulated {
+            proposal_sha256,
+            smart_account,
+            chain_id,
+            definition,
+            summary_line,
+            ..
+        } = &entry.kind
+        else {
+            return Err(rmcp::ErrorData::internal_error(
+                "approval.store_error: wrong proposal kind",
+                None,
+            ));
+        };
+
         // ── Build response ─────────────────────────────────────────────────────
         let mut view = json!({
             "approval_nonce": entry.approval_nonce,
             "profile": &profile_name,
-            "chain_id": self.context.chain_id.caip2_str(),
+            "chain_id": chain_id,
             "expires_at_unix_ms": entry.expires_at_unix_ms,
             "requires_operator_approval": requires_operator_approval,
             "proposal_sha256_hex": proposal_sha256.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             "latest_ledger": simulate_output.latest_ledger,
-            "pinned_verifier_wasm_hashes_first8": simulate_output.pin_result.pinned_verifier_hashes_first8(),
-            "pinned_policy_wasm_hashes_first8": simulate_output.pin_result.pinned_policy_hashes_first8(),
             "mutable_override": simulate_output.pin_result.mutable_override,
             "unknown_override": simulate_output.pin_result.unknown_override,
             "summary": {
-                "smart_account": &args.smart_account,
-                "context_type_label": context_label,
-                "name": &args.name,
-                "valid_until": args.valid_until,
-                "signer_count": args.signers.len(),
-                "policy_count": args.policies.len(),
-                "auth_rule_ids": &args.auth_rule_ids,
-                "summary_line": &summary_line,
+                "smart_account": smart_account,
+                "context_type_label": json!(definition.context_type)["type"],
+                "name": &definition.name,
+                "valid_until": definition.valid_until,
+                "signer_count": definition.signers.len(),
+                "policy_count": definition.policies.len(),
+                "auth_rule_ids": &definition.auth_rule_ids,
+                "summary_line": summary_line,
             },
         });
+        insert_pin_fields(
+            &mut view,
+            &simulate_output.pin_result.pinned_verifier_hashes(),
+            &simulate_output.pin_result.pinned_policy_hashes(),
+        );
         insert_executable_refs(
             &mut view,
             simulate_output.pin_result.verifier_executable_refs(),
@@ -1110,7 +1121,7 @@ impl WalletServer {
     ///    verifies the HMAC attestation over `proposal_sha256` — the shared
     ///    pay/claim `verify_attestation_gate` is NOT used.
     /// 3. The digest is recomputed from the stored snapshot through the SAME
-    ///    builder (`compute_context_rule_proposal_sha256`) used at propose
+    ///    core snapshot digest (`rule_proposal_digest`) used at propose
     ///    time, UNCONDITIONALLY (even on a policy-engine `Allow` outcome) —
     ///    a mismatch against the entry's own recorded digest is
     ///    `simulation.divergence` (store self-consistency, independent of
@@ -1133,8 +1144,12 @@ impl WalletServer {
         description = "Verify the operator's attestation and install the proposed context rule (commit \
                        step). Testnet-only; refuses chain_id=stellar:mainnet. Always requires operator \
                        attestation, regardless of the policy verdict. Requires approval_nonce from \
-                       stellar_rule_create and approval_attestation. Install and simulation refuse an \
-                       invalid simple-threshold parameter with sa.simple_threshold_install_refused. A \
+                       stellar_rule_create and approval_attestation. The commit spends the approval \
+                       before the install starts, so a retry with the same approval returns \
+                       policy.approval_consumed for every install outcome. An unusable spent record \
+                       refuses with approval.spent_record_unavailable and installs nothing. Install \
+                       and simulation refuse an invalid simple-threshold parameter with \
+                       sa.simple_threshold_install_refused. A \
                        duplicate policy address or two simple-threshold policies refuse with \
                        sa.deployment_failed at phase build. An external entry whose pubkey_data_hex \
                        decodes to empty key data refuses with sa.auth_entry_construction_failed. Every \
@@ -1145,7 +1160,8 @@ impl WalletServer {
                        rule_lock. A deadline that elapses during the baseline read or the comparison uses \
                        that code at baseline_read or signer_set_compare. Pin refusals are \
                        sa.verifier_hash_drift, sa.policy_hash_drift, sa.pinned_policy_absent, \
-                       sa.pinned_verifier_absent, and sa.pin_check_unavailable. A version 1 authorizing \
+                       sa.pinned_verifier_absent, sa.wasm_pin_incomplete, and sa.pin_check_unavailable. \
+                       A version 1 authorizing \
                        rule compares through its projection. Its own refusals are \
                        sa.threshold_policy_not_installed, sa.threshold_policy_identification_failed, and \
                        sa.deployment_failed. After the install confirms, the observed rule's signer \
@@ -1182,16 +1198,9 @@ impl WalletServer {
 
     /// Inner implementation of `stellar_rule_create_commit`.
     ///
-    /// Separated so BOTH call sites — the public tool handler
-    /// (`stellar_rule_create_commit`) and the toolset-gated path
-    /// (`invoke_stellar_rule_create_commit_toolset_gated`) — supply a
-    /// forced `DispatchOutcome::RequireApproval` override, mirroring
-    /// `stellar_pay_commit_impl` (pay.rs:1135)'s override PLUMBING, but with
-    /// a DELIBERATE divergence from the pay precedent: `forced_dispatch_outcome`
-    /// is `Some(..)` at EVERY call site here, never `None`. A payment `Allow`
-    /// spends within an operator-configured budget; a rule-create `Allow`
-    /// would let the agent grant itself permanent (potentially
-    /// account-wide) authority, which this feature's contract forbids.
+    /// Both the public and toolset handlers supply a forced
+    /// `DispatchOutcome::RequireApproval`. Installing a rule grants persistent
+    /// account authority, so every installation requires operator consent.
     ///
     /// # Security
     ///
@@ -1207,6 +1216,11 @@ impl WalletServer {
         forced_dispatch_outcome: Option<DispatchOutcome>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use crate::tools::common::approval_required_indistinguishable;
+        use stellar_agent_core::approval::{
+            RuleApprovalSpentStore, SpentSet, SpentSetError, rule_approval_spent_marker,
+        };
+        use stellar_agent_core::policy::state_lock::{StateLockError, WindowStoreLock};
+        use stellar_agent_core::profile::schema::rule_approval_spent_entry_ref;
 
         // Structural mainnet refusal, keyed on the server's profile context:
         // before the argument check below, the policy gate, any key access,
@@ -1325,35 +1339,44 @@ impl WalletServer {
             ));
         }
 
-        let (smart_account_str, entry_chain_id, definition_snapshot, stored_proposal_sha256) =
-            match &entry.kind {
-                stellar_agent_core::approval::ApprovalKind::Rejected { .. } => {
-                    return Ok(approval_rejected_error());
-                }
-                // A spent approval is named as spent rather than as absent:
-                // the agent needs to know its approval was already used, and
-                // on which transaction, instead of being told to ask again.
-                stellar_agent_core::approval::ApprovalKind::Consumed { .. } => {
-                    return Ok(crate::tools::common::approval_consumed_error());
-                }
-                stellar_agent_core::approval::ApprovalKind::RuleProposalSimulated {
-                    smart_account,
-                    chain_id,
-                    definition,
-                    proposal_sha256,
-                    ..
-                } => (
-                    smart_account.clone(),
-                    chain_id.clone(),
-                    definition.clone(),
-                    *proposal_sha256,
-                ),
-                _ => {
-                    return Ok(approval_required_indistinguishable(
-                        &self.profile_name_for_approval(),
-                    ));
-                }
-            };
+        let (
+            smart_account_str,
+            entry_chain_id,
+            definition_snapshot,
+            stored_proposal_sha256,
+            entry_passphrase,
+            entry_summary,
+        ) = match &entry.kind {
+            stellar_agent_core::approval::ApprovalKind::Rejected { .. } => {
+                return Ok(approval_rejected_error());
+            }
+            // A consumed approval carries its spent state so the caller
+            // knows the install may have reached the network.
+            stellar_agent_core::approval::ApprovalKind::Consumed { .. } => {
+                return Ok(crate::tools::common::rule_proposal_consumed_error());
+            }
+            stellar_agent_core::approval::ApprovalKind::RuleProposalSimulated {
+                smart_account,
+                chain_id,
+                definition,
+                proposal_sha256,
+                network_passphrase,
+                summary_line,
+                ..
+            } => (
+                smart_account.clone(),
+                chain_id.clone(),
+                definition.clone(),
+                *proposal_sha256,
+                network_passphrase.clone(),
+                summary_line.clone(),
+            ),
+            _ => {
+                return Ok(approval_required_indistinguishable(
+                    &self.profile_name_for_approval(),
+                ));
+            }
+        };
 
         if entry_chain_id != args.chain_id {
             return Err(rmcp::ErrorData::internal_error(
@@ -1385,16 +1408,13 @@ impl WalletServer {
                 .map(|id| stellar_agent_core::smart_account::rule_id::ContextRuleId::new(*id))
                 .collect();
 
-        let recomputed_digest = compute_context_rule_proposal_sha256(
-            &smart_account,
-            &rule_definition,
-            &auth_rule_ids,
-            definition_snapshot.accept_mutable_verifier,
-            definition_snapshot.accept_unknown_verifier,
-        )
-        .map_err(|e| {
-            rmcp::ErrorData::internal_error(format!("rule_proposal_digest_error: {e}"), None)
-        })?;
+        let recomputed_digest = stellar_agent_core::approval::rule_proposal_digest(
+            &smart_account_str,
+            &entry_passphrase,
+            &entry_chain_id,
+            &definition_snapshot,
+            &entry_summary,
+        );
 
         if recomputed_digest != stored_proposal_sha256 {
             return Err(rmcp::ErrorData::internal_error(
@@ -1436,11 +1456,10 @@ impl WalletServer {
                 }
             };
 
-            let attestation_key_bytes = match load_attestation_key(&self.profile) {
+            let attestation_key = match load_attestation_key(&self.profile) {
                 Ok(k) => k,
                 Err(result) => return Ok(result),
             };
-            let attestation_key = zeroize::Zeroizing::new(attestation_key_bytes);
 
             if let Err(e) = store.verify_rule_proposal_gate(
                 nonce_str,
@@ -1492,6 +1511,7 @@ impl WalletServer {
             &self.profile_name_for_approval(),
             &self.profile,
             &source_g,
+            self.established_owner().as_ref(),
         )
         .await
         {
@@ -1517,6 +1537,121 @@ impl WalletServer {
             }
         };
 
+        // ── Spend the approval before the install can send ───────────────────
+        // The store lock serializes this read, modify and write across commits
+        // of this profile, and the spent-record lock, named by the keyring
+        // entry, extends that to every profile sharing the coordinate, so no
+        // concurrent commit passes the check before the marker is stored. The
+        // locks are always taken in this order.
+        // A marker-write error leaves the pending entry unconsumed but can
+        // leave the marker stored. A stored marker keeps the approval spent.
+        // It outlives a failed tombstone write and a restored pending file,
+        // and every install outcome leaves the approval spent, so a new
+        // install needs a new proposal.
+        let keyring_spent = stellar_agent_network::keyring::KeyringRuleApprovalSpentStore::new(
+            &self.profile.attestation_key_id,
+        );
+        let spent_store: &dyn RuleApprovalSpentStore = &keyring_spent;
+        #[cfg(any(test, feature = "test-helpers"))]
+        let spent_store = self
+            .rule_approval_spent_store_override
+            .as_deref()
+            .unwrap_or(spent_store);
+        let unavailable = |reason| {
+            let err = stellar_agent_core::error::ApprovalFailure::SpentRecordUnavailable { reason };
+            crate::tools::common::business_error_result(err.code(), err.to_string())
+        };
+        let backend_refused = |reason, error: SpentSetError| {
+            if let SpentSetError::Unavailable { code } = error {
+                tracing::debug!(
+                    tool = "stellar_rule_create_commit",
+                    code,
+                    "spent record backend refused"
+                );
+            }
+            unavailable(reason)
+        };
+        let window_path = self.resolve_policy_window_state_path();
+        let spent_lock = window_path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .map_err(|e| StateLockError::Io { kind: e.kind() })
+            .and_then(|()| {
+                WindowStoreLock::acquire_for_with_retry(
+                    &window_path,
+                    &rule_approval_spent_entry_ref(&self.profile.attestation_key_id),
+                )
+            });
+        let spent_lock = match spent_lock {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::debug!(
+                    tool = "stellar_rule_create_commit",
+                    %error,
+                    "spent record lock refused"
+                );
+                return Ok(unavailable("it is busy"));
+            }
+        };
+        let marker = rule_approval_spent_marker(
+            &self.profile_name_for_approval(),
+            &entry_chain_id,
+            &args.approval_nonce,
+            &recomputed_digest,
+        );
+        let value = match spent_store.load() {
+            Ok(value) => value,
+            Err(error) => return Ok(backend_refused("it cannot be read", error)),
+        };
+        let mut spent = match SpentSet::parse(value.as_deref()) {
+            Ok(spent) => spent,
+            Err(_) => return Ok(unavailable("it does not parse")),
+        };
+        if spent.contains(&marker) {
+            return Ok(crate::tools::common::rule_proposal_consumed_error());
+        }
+        // The record of a lapsed approval may be pruned, so the floor refuses
+        // it whatever the clock reads now.
+        if spent.lapsed(entry.expires_at_unix_ms) {
+            return Ok(unavailable("it is past this approval's expiry"));
+        }
+        if spent
+            .insert(marker, entry.expires_at_unix_ms, now_ms)
+            .is_err()
+        {
+            return Ok(unavailable("it is full until an approval expires"));
+        }
+        if let Err(error) = spent_store.store(&spent.encode()) {
+            return Ok(backend_refused("it cannot be written", error));
+        }
+        drop(spent_lock);
+
+        let proposal_digest_hex = stellar_agent_core::hex::encode(&recomputed_digest);
+        let mut consume = || {
+            store.consume(
+                &args.approval_nonce,
+                &proposal_digest_hex,
+                stellar_agent_core::approval::ConsumedOutcome::Unknown,
+            )
+        };
+        #[cfg(any(test, feature = "test-helpers"))]
+        let consumed = CONSUME_REFUSAL
+            .with(|fault| fault.borrow_mut().take())
+            .map_or_else(&mut consume, Err);
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        let consumed = consume();
+        match consumed {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(approval_required_indistinguishable(
+                    &self.profile_name_for_approval(),
+                ));
+            }
+            Err(e) => return Ok(consume_refusal(&e)),
+        }
+        // Release the store lock before the install's network round trips.
+        drop(store);
+
         let request_id = uuid::Uuid::new_v4().to_string();
         let install_result = manager
             .install_rule(
@@ -1541,16 +1676,6 @@ impl WalletServer {
                     "stellar_rule_create_commit: rule installed"
                 );
 
-                // Best-effort removal of the consumed approval entry.
-                if let Err(e) = store.remove(&args.approval_nonce) {
-                    tracing::warn!(
-                        nonce = %args.approval_nonce,
-                        error = %e,
-                        "stellar_rule_create_commit: approval entry remove failed after \
-                         successful install; entry will expire via gc"
-                    );
-                }
-
                 let view = json!({
                     "rule_id": output.rule_id,
                     "tx_hash": output.tx_hash,
@@ -1566,8 +1691,19 @@ impl WalletServer {
     }
 }
 
+/// Adds the pinned verifier and policy hashes to a rule-create view, each in
+/// full as 64 lowercase hex characters.
+fn insert_pin_fields(
+    view: &mut serde_json::Value,
+    verifier_hashes: &[WasmHashPin],
+    policy_hashes: &[WasmHashPin],
+) {
+    view["pinned_verifier_wasm_hashes"] = json!(verifier_hashes);
+    view["pinned_policy_wasm_hashes"] = json!(policy_hashes);
+}
+
 /// Adds the executable-reference pins to a rule-create view: each list is
-/// aligned with its first-8 list and present only when at least one pinned
+/// aligned with its hash list and present only when at least one pinned
 /// contract is an external reference.
 fn insert_executable_refs(
     view: &mut serde_json::Value,
@@ -1605,8 +1741,7 @@ impl WalletServer {
     }
 
     /// Routes to `stellar_rule_create_commit` with the per-action
-    /// `RuleProposalSimulated` approval FORCED ON UNCONDITIONALLY — mirrors
-    /// `invoke_stellar_pay_commit_toolset_gated` (pay.rs:1654).
+    /// `RuleProposalSimulated` approval required unconditionally.
     ///
     /// Unlike the pay/claim toolset-gated wrappers, no "synthesise a fresh
     /// pending approval if the agent doesn't already have one" branch is
@@ -1663,6 +1798,16 @@ impl WalletServer {
 // Tests: arg schema round-trips + grammar parsing
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn consume_refusal(error: &stellar_agent_core::approval::ApprovalError) -> CallToolResult {
+    let error = stellar_agent_core::approval::attest::record_error(error);
+    crate::tools::common::business_error_result(error.code(), error.to_string())
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+thread_local! {
+    static CONSUME_REFUSAL: std::cell::RefCell<Option<stellar_agent_core::approval::ApprovalError>> = const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1673,8 +1818,68 @@ mod tests {
     )]
     use super::*;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn intent_total_recorder_codes_reach_mcp_adapter() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for (case, code) in [
+            ("unavailable", "policy.total_epoch_unavailable"),
+            ("stale", "policy.total_epoch_stale"),
+            ("retired", "policy.total_epoch_retired"),
+            ("exhausted", "policy.deny.total_budget_exhausted"),
+            ("binding", "submission.intent_binding_mismatch"),
+            ("invalid", "submission.intent_record_unavailable"),
+        ] {
+            let error = stellar_agent_network::policy_state::store::total_intent_test_helpers::recorder_refusal(case).await;
+            for mapped in
+                stellar_agent_smart_account::signing::intent_test_helpers::total_intent_error_routes(
+                    &error,
+                )
+            {
+                let result = sa_error_result(&mapped);
+                let (actual, _, _) = crate::tools::common::assert_business_envelope(&result);
+                assert_eq!(actual, code, "{case}");
+            }
+        }
+    }
+
+    /// The rule-create view carries both hash lists in full: two hashes that
+    /// share their first eight bytes stay distinct, and no `_first8` field
+    /// appears.
+    #[test]
+    fn insert_pin_fields_adds_full_hash_lists() {
+        let pinned = [0x42u8; 32];
+        let mut twin = pinned;
+        twin[8..].fill(0x43);
+        let mut view = serde_json::json!({ "mutable_override": false });
+        insert_pin_fields(
+            &mut view,
+            &[WasmHashPin::new(pinned)],
+            &[WasmHashPin::new(twin)],
+        );
+        assert_eq!(
+            view["pinned_verifier_wasm_hashes"],
+            serde_json::json!([hex::encode(pinned)])
+        );
+        assert_eq!(
+            view["pinned_policy_wasm_hashes"],
+            serde_json::json!([hex::encode(twin)])
+        );
+        assert_eq!(
+            view["pinned_verifier_wasm_hashes"][0]
+                .as_str()
+                .map(str::len),
+            Some(64)
+        );
+        assert!(view.get("pinned_verifier_wasm_hashes_first8").is_none());
+        assert!(view.get("pinned_policy_wasm_hashes_first8").is_none());
+    }
+
     /// The rule-create view carries each executable-reference list only when
-    /// it is non-empty, aligned with its first-8 list.
+    /// it is non-empty, aligned with its hash list, with the full resolved
+    /// hash.
     #[test]
     fn insert_executable_refs_adds_only_non_empty_lists() {
         use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
@@ -1699,6 +1904,10 @@ mod tests {
         assert_eq!(
             view["pinned_policy_executable_refs"][1]["owner_redacted"],
             "CAAAA...ABSC4"
+        );
+        assert_eq!(
+            view["pinned_policy_executable_refs"][1]["resolved_hash"],
+            "42".repeat(32)
         );
     }
 
@@ -1808,8 +2017,17 @@ mod tests {
     // wiremock server.
     // ─────────────────────────────────────────────────────────────────────────
 
-    use stellar_agent_core::approval::{DEFAULT_TTL_MS, PendingApprovalStore};
-    use stellar_agent_core::profile::schema::Profile;
+    use stellar_agent_core::approval::{
+        DEFAULT_TTL_MS, InMemoryRuleApprovalSpentStore, MAX_SPENT_RULE_APPROVALS,
+        PendingApprovalStore, RuleApprovalSpentStore, SpentSet, SpentSetError,
+        rule_approval_spent_marker,
+    };
+    use stellar_agent_core::policy::state_lock::WindowStoreLock;
+    use stellar_agent_core::profile::schema::{
+        KeyringEntryRef, Profile, rule_approval_spent_entry_ref,
+    };
+    use stellar_agent_network::keyring::KeyringRuleApprovalSpentStore;
+    use stellar_agent_test_support::keyring_mock;
 
     const TEST_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
     const TEST_G_2: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
@@ -1903,7 +2121,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_rejects_empty() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let err = resolve_signers(&[], &server).unwrap_err();
         assert!(err.message.contains("non-empty"));
@@ -1911,7 +2133,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_rejects_over_oz_max_signers() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers: Vec<RuleCreateSignerArg> = (0..=OZ_MAX_SIGNERS)
             .map(|_| RuleCreateSignerArg::Delegated {
@@ -1924,7 +2150,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_delegated_tags_proposer_when_address_matches_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![RuleCreateSignerArg::Delegated {
             address: TEST_G.to_owned(),
@@ -1940,7 +2170,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_delegated_does_not_tag_proposer_for_a_different_address() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![RuleCreateSignerArg::Delegated {
             address: TEST_G_2.to_owned(),
@@ -1953,7 +2187,11 @@ mod tests {
     /// signer, in both the typed definition and the snapshot.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_delegated_accepts_a_c_strkey() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![
             RuleCreateSignerArg::Delegated {
@@ -1980,7 +2218,11 @@ mod tests {
     /// A muxed M-strkey delegate is refused with the signer's index.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_delegated_refuses_an_m_strkey() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let muxed = format!(
             "{}",
@@ -2008,7 +2250,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_delegated_rejects_invalid_strkey() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![RuleCreateSignerArg::Delegated {
             address: "not-a-strkey".to_owned(),
@@ -2027,7 +2273,11 @@ mod tests {
     /// proceeds without it.
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn only_an_account_delegate_is_the_fallback_signer() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let external = RuleCreateSignerArg::External {
             verifier: TEST_C.to_owned(),
@@ -2060,7 +2310,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_external_valid() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![RuleCreateSignerArg::External {
             verifier: TEST_C.to_owned(),
@@ -2077,7 +2331,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_external_rejects_invalid_verifier_strkey() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![RuleCreateSignerArg::External {
             verifier: "not-a-strkey".to_owned(),
@@ -2089,19 +2347,30 @@ mod tests {
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_external_rejects_invalid_hex() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![RuleCreateSignerArg::External {
             verifier: TEST_C.to_owned(),
             pubkey_data_hex: "not-hex!!".to_owned(),
         }];
         let err = resolve_signers(&signers, &server).unwrap_err();
-        assert!(err.message.contains("invalid hex"));
+        assert!(
+            err.message
+                .contains("must be an even-length string of hex digits")
+        );
     }
 
     #[test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     fn resolve_signers_external_rejects_oversized_pubkey() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let signers = vec![RuleCreateSignerArg::External {
             verifier: TEST_C.to_owned(),
@@ -2145,7 +2414,7 @@ mod tests {
         }];
         let err =
             resolve_policies(&policies, &RuleContext::Default, NETWORK_PASSPHRASE).unwrap_err();
-        assert!(err.message.contains("not valid base64url"));
+        assert!(err.message.contains("must be unpadded base64url"));
     }
 
     #[test]
@@ -2244,6 +2513,107 @@ mod tests {
         assert_eq!(snapshot[0].policy_address, TEST_C);
     }
 
+    #[test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    fn propose_time_and_snapshot_definitions_encode_the_same_install_arguments() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_smart_account::managers::rules::build_add_context_rule_args_for_test;
+
+        let (server, _dir) = test_server();
+        let signer_sets = [
+            vec![RuleCreateSignerArg::Delegated {
+                address: TEST_G.to_owned(),
+            }],
+            vec![
+                RuleCreateSignerArg::Delegated {
+                    address: TEST_G_2.to_owned(),
+                },
+                RuleCreateSignerArg::Delegated {
+                    address: TEST_SMART_ACCOUNT.to_owned(),
+                },
+            ],
+            vec![RuleCreateSignerArg::External {
+                verifier: TEST_C.to_owned(),
+                pubkey_data_hex: "ab".repeat(65),
+            }],
+            vec![
+                RuleCreateSignerArg::Delegated {
+                    address: TEST_G.to_owned(),
+                },
+                RuleCreateSignerArg::External {
+                    verifier: TEST_C.to_owned(),
+                    pubkey_data_hex: "ab".repeat(65),
+                },
+            ],
+        ];
+        let raw_policy = |address: String, value| RuleCreatePolicyArg::Raw {
+            policy_address: address,
+            install_param_xdr_b64: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(ScVal::U32(value).to_xdr(Limits::none()).unwrap()),
+        };
+        let mut cases = 0;
+        for context_arg in [
+            "default".to_owned(),
+            format!("call-contract:{TEST_SMART_ACCOUNT}"),
+            format!("create-contract:{}", "ab".repeat(32)),
+        ] {
+            let context = parse_rule_context_arg(&context_arg).unwrap();
+            let mut policy_sets = vec![
+                vec![],
+                vec![raw_policy(TEST_C.to_owned(), 7)],
+                vec![
+                    raw_policy(TEST_C.to_owned(), 7),
+                    raw_policy(stellar_strkey::Contract([2; 32]).to_string().to_string(), 8),
+                ],
+            ];
+            if matches!(context, RuleContext::CallContract { .. }) {
+                policy_sets.push(vec![RuleCreatePolicyArg::SpendingLimit {
+                    limit_stroops: "10000000".to_owned(),
+                    period_ledgers: 17_280,
+                    policy_address: Some(TEST_C.to_owned()),
+                }]);
+            }
+            for signers in &signer_sets {
+                for policies in &policy_sets {
+                    for valid_until in [None, Some(100)] {
+                        let resolved = resolve_signers(signers, &server).unwrap();
+                        let (typed_policies, snapshot_policies) =
+                            resolve_policies(policies, &context, NETWORK_PASSPHRASE).unwrap();
+                        let proposed = ContextRuleDefinition::new(
+                            context.clone(),
+                            "fixture-rule".to_owned(),
+                            valid_until,
+                            resolved.typed,
+                            typed_policies,
+                        );
+                        let snapshot = ContextRuleProposalSnapshot::new(
+                            context_type_to_snapshot(&context).unwrap(),
+                            "fixture-rule".to_owned(),
+                            valid_until,
+                            resolved.snapshot,
+                            snapshot_policies,
+                            vec![1, 2],
+                            false,
+                            false,
+                        );
+                        let reconstructed =
+                            context_rule_definition_from_snapshot(&snapshot).unwrap();
+                        assert_eq!(
+                            build_add_context_rule_args_for_test(&proposed).unwrap(),
+                            build_add_context_rule_args_for_test(&reconstructed).unwrap(),
+                            "{context_arg}: {snapshot:?}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 80);
+    }
+
     // ── stellar_rule_create_commit_impl: gate-refusal paths ───────────────────
     //
     // Every scenario below fires before `signer_from_keyring` / `install_rule`
@@ -2267,18 +2637,13 @@ mod tests {
     /// tests that must pass the digest-consistency check can use a value that
     /// genuinely matches (rather than an arbitrary placeholder).
     fn matching_digest_for(smart_account: &stellar_xdr::ScAddress) -> [u8; 32] {
-        let rule_definition =
-            context_rule_definition_from_snapshot(&valid_rule_definition_snapshot())
-                .expect("reconstruct");
-        let auth_rule_ids = vec![stellar_agent_core::smart_account::rule_id::ContextRuleId::new(0)];
-        compute_context_rule_proposal_sha256(
-            smart_account,
-            &rule_definition,
-            &auth_rule_ids,
-            false,
-            false,
+        stellar_agent_core::approval::rule_proposal_digest(
+            &smart_account.to_string(),
+            NETWORK_PASSPHRASE,
+            "stellar:testnet",
+            &valid_rule_definition_snapshot(),
+            "Default rule \"spend-daily\"",
         )
-        .expect("digest compute")
     }
 
     /// Inserts a `RuleProposalSimulated` entry (with a genuinely-matching
@@ -2290,22 +2655,27 @@ mod tests {
         digest_override: Option<[u8; 32]>,
         ttl_ms: u64,
     ) -> String {
-        let smart_account = parse_c_strkey_to_smart_account(TEST_SMART_ACCOUNT).unwrap();
-        let digest = digest_override.unwrap_or_else(|| matching_digest_for(&smart_account));
         let approvals_dir = server.resolve_approval_dir().unwrap();
         let store_path = approvals_dir.join(format!("{}.toml", server.profile_name_for_approval()));
         let mut store = PendingApprovalStore::open(store_path).unwrap();
-        let entry = PendingApproval::new_rule_proposal_pending(
+        let mut entry = PendingApproval::new_rule_proposal_pending(
             TEST_SMART_ACCOUNT.to_owned(),
             NETWORK_PASSPHRASE.to_owned(),
             chain_id.to_owned(),
             valid_rule_definition_snapshot(),
-            digest,
             "Default rule \"spend-daily\"".to_owned(),
             process_uid_for_attestation().unwrap(),
             ttl_ms,
         )
         .unwrap();
+        if let Some(digest) = digest_override
+            && let stellar_agent_core::approval::ApprovalKind::RuleProposalSimulated {
+                proposal_sha256,
+                ..
+            } = &mut entry.kind
+        {
+            *proposal_sha256 = digest;
+        }
         let nonce = entry.approval_nonce.clone();
         let now_ms = now_unix_ms().unwrap();
         store.insert(entry, now_ms).unwrap();
@@ -2322,7 +2692,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_unknown_nonce_is_indistinguishable_approval_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         let result = server
@@ -2338,7 +2712,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_expired_entry_is_indistinguishable_approval_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, 0);
@@ -2352,7 +2730,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_rejected_tombstone_returns_distinguishable_rejected() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, DEFAULT_TTL_MS);
@@ -2386,7 +2768,11 @@ mod tests {
     /// the agent grant itself permanent authority.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_via_public_handler_with_allow_engine_still_requires_attestation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, DEFAULT_TTL_MS);
@@ -2405,7 +2791,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_wrong_kind_entry_is_indistinguishable_approval_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         // Insert a PaymentSimulated entry under the nonce the commit call
@@ -2441,7 +2831,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_chain_id_mismatch_is_simulation_divergence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         // The presented chain_id ("stellar:testnet") must itself match the
@@ -2459,7 +2853,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_digest_mismatch_is_simulation_divergence() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         // Store an entry whose recorded digest does NOT match what
@@ -2484,7 +2882,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_missing_attestation_when_required_is_indistinguishable_approval_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, DEFAULT_TTL_MS);
@@ -2501,7 +2903,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_malformed_attestation_base64_is_indistinguishable_approval_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
 
         let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, DEFAULT_TTL_MS);
@@ -2520,7 +2926,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_wrong_attestation_is_indistinguishable_approval_required() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         stellar_agent_test_support::keyring_mock::install().ok();
 
         let (server, _dir) = test_server();
@@ -2548,7 +2958,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn propose_refuses_mainnet_chain_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         let json = serde_json::json!({
             "chain_id": "stellar:mainnet",
@@ -2570,7 +2984,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_refuses_mainnet_chain_id() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let (server, _dir) = test_server();
         // The mainnet refusal fires before any nonce lookup, so an
         // arbitrary/never-inserted nonce is sufficient for this test.
@@ -2597,11 +3015,15 @@ mod tests {
     /// the commit refuses there.
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn commit_logs_a_consent_row_queued_after_its_pre_flight_before_the_signer_loads() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
 
-        use stellar_agent_core::approval::attestation::compute_attestation;
+        use stellar_agent_core::approval::attestation::compute_attestation_v4;
         use stellar_agent_core::audit_log::{AuditEntry, AuditOutbox, AuditWriterRegistry};
         use stellar_agent_test_support::keyring_mock::{ReadHook, install_with_read_hooks};
 
@@ -2614,11 +3036,15 @@ mod tests {
         let queue_hook = {
             let queued = Arc::clone(&queued);
             let log_path = log_path.clone();
+            let outbox_store = stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &log_path,
+            );
             Arc::new(move || {
                 if queued.swap(true, Ordering::SeqCst) {
                     return;
                 }
-                AuditOutbox::for_log(&log_path)
+                AuditOutbox::for_log(&log_path, outbox_store.clone())
                     .append(&AuditEntry::new_approval_attested(
                         "RuleProposalSimulated",
                         "stellar_rule_create_commit",
@@ -2654,6 +3080,7 @@ mod tests {
             ),
         ])
         .unwrap();
+        crate::tools::identity_fixture::store_signer_identity_of_account(&profile);
         {
             use base64::Engine as _;
             let coord = &profile.audit_log_hash_chain_key_id;
@@ -2680,7 +3107,17 @@ mod tests {
         server.set_approval_dir_for_test(dir.path().to_path_buf());
         let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, DEFAULT_TTL_MS);
         let smart_account = parse_c_strkey_to_smart_account(TEST_SMART_ACCOUNT).unwrap();
-        let blob = compute_attestation(
+        let stored = {
+            let approvals_dir = server.resolve_approval_dir().unwrap();
+            let store_path =
+                approvals_dir.join(format!("{}.toml", server.profile_name_for_approval()));
+            PendingApprovalStore::open(store_path)
+                .unwrap()
+                .get(&nonce)
+                .unwrap()
+                .clone()
+        };
+        let blob = compute_attestation_v4(
             &attestation_key,
             &stellar_agent_core::approval::AttestationBinding::new(
                 &server.profile_name_for_approval(),
@@ -2689,6 +3126,8 @@ mod tests {
             &nonce,
             &matching_digest_for(&smart_account),
             &process_uid_for_attestation().unwrap(),
+            &stored.attested_lifetime(),
+            &stellar_agent_core::approval::AttestedApprover::Local,
         );
         {
             let approvals_dir = server.resolve_approval_dir().unwrap();
@@ -2696,7 +3135,11 @@ mod tests {
                 approvals_dir.join(format!("{}.toml", server.profile_name_for_approval()));
             let mut store = PendingApprovalStore::open(store_path).unwrap();
             store
-                .record_rule_proposal_attestation(&nonce, blob)
+                .record_rule_proposal_attestation(
+                    &nonce,
+                    blob,
+                    stellar_agent_core::approval::AttestedApprover::Local,
+                )
                 .unwrap();
         }
 
@@ -2730,5 +3173,1087 @@ mod tests {
             seen.iter().all(|in_log| *in_log),
             "the consent row must be in the log when the signing key loads: {seen:?}"
         );
+    }
+
+    // ── The commit spends its approval before the install ────────────────────
+
+    /// The message of the rule-proposal consumed refusal.
+    const RULE_PROPOSAL_CONSUMED_MESSAGE: &str = "this rule-proposal approval is already spent; \
+                                                  list the account's rules before proposing the \
+                                                  rule again";
+
+    /// A loopback RPC endpoint that accepts, counts, and closes every
+    /// connection.
+    ///
+    /// On the first connection, before closing it, the endpoint records the
+    /// kind of the approval entry it watches. The install waits on that
+    /// connection while the record is taken, so the record shows the store as
+    /// the install found it when it first reached the network. Every
+    /// connection a commit opens is accepted before the commit returns, since
+    /// the client waits for the close.
+    struct FirstContactRpc {
+        address: std::net::SocketAddr,
+        state: std::sync::Arc<FirstContactState>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    /// State shared by [`FirstContactRpc`] and its accept worker.
+    struct FirstContactState {
+        accepted: std::sync::atomic::AtomicUsize,
+        watched: std::sync::OnceLock<(std::path::PathBuf, String)>,
+        first_kind: std::sync::Mutex<Option<String>>,
+        shutdown: std::sync::atomic::AtomicBool,
+    }
+
+    impl FirstContactState {
+        /// The kind of the watched entry, or why it could not be read.
+        fn watched_kind(&self) -> String {
+            let Some((store_path, nonce)) = self.watched.get() else {
+                return "no watched entry".to_owned();
+            };
+            match PendingApprovalStore::open(store_path.clone()) {
+                Ok(store) => store.get(nonce).map_or_else(
+                    || "absent".to_owned(),
+                    |entry| entry.kind.kind_name().to_owned(),
+                ),
+                Err(e) => format!("store unavailable: {e}"),
+            }
+        }
+    }
+
+    impl FirstContactRpc {
+        fn start() -> Self {
+            use std::sync::atomic::Ordering;
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let state = std::sync::Arc::new(FirstContactState {
+                accepted: std::sync::atomic::AtomicUsize::new(0),
+                watched: std::sync::OnceLock::new(),
+                first_kind: std::sync::Mutex::new(None),
+                shutdown: std::sync::atomic::AtomicBool::new(false),
+            });
+            let worker_state = std::sync::Arc::clone(&state);
+            let worker = std::thread::spawn(move || {
+                while !worker_state.shutdown.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _peer)) => {
+                            if worker_state.accepted.fetch_add(1, Ordering::SeqCst) == 0 {
+                                let kind = worker_state.watched_kind();
+                                *worker_state.first_kind.lock().unwrap() = Some(kind);
+                            }
+                            drop(stream);
+                        }
+                        Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    }
+                }
+            });
+            Self {
+                address,
+                state,
+                worker: Some(worker),
+            }
+        }
+
+        fn uri(&self) -> String {
+            format!("http://{}", self.address)
+        }
+
+        /// Watches the entry under `nonce` in the store at `store_path`.
+        fn watch(&self, store_path: std::path::PathBuf, nonce: String) {
+            self.state.watched.set((store_path, nonce)).unwrap();
+        }
+
+        fn accepted(&self) -> usize {
+            self.state
+                .accepted
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// The watched entry's kind at the first connection.
+        fn first_kind(&self) -> Option<String> {
+            self.state.first_kind.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for FirstContactRpc {
+        fn drop(&mut self) {
+            self.state
+                .shutdown
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    const RULE_ATTESTATION_KEY: [u8; 32] = [0x3b; 32];
+
+    /// Builds an enrolled signer, a pending proposal, and matching commit
+    /// arguments. Returns the server, arguments, store path, and HMAC blob.
+    async fn pending_commit_setup(
+        dir: &std::path::Path,
+        approvals_dir: std::path::PathBuf,
+        rpc_url: String,
+        configure_keyring: impl FnOnce(&mut Profile),
+    ) -> (
+        WalletServer,
+        StellarRuleCreateCommitArgs,
+        std::path::PathBuf,
+        [u8; 32],
+    ) {
+        use stellar_agent_core::approval::attestation::compute_attestation_v4;
+        use stellar_agent_network::Signer as _;
+
+        let seed = [0x5a_u8; 32];
+        let account = stellar_agent_network::signing::SoftwareSigningKey::new_from_bytes(seed)
+            .public_key()
+            .await
+            .unwrap()
+            .to_string()
+            .to_string();
+        let mut profile = test_profile(dir);
+        profile.secondary_rpc_url =
+            Some(stellar_agent_test_support::second_loopback_host(&rpc_url));
+        profile.rpc_url = rpc_url;
+        profile.mcp_signer_default.account.clone_from(&account);
+        configure_keyring(&mut profile);
+        keyring_core::Entry::new(&profile.mcp_signer_default.service, &account)
+            .unwrap()
+            .set_password(
+                &stellar_strkey::ed25519::PrivateKey(seed)
+                    .as_unredacted()
+                    .to_string(),
+            )
+            .unwrap();
+        crate::tools::identity_fixture::store_signer_identity(&profile, seed);
+        {
+            let coord = &profile.audit_log_hash_chain_key_id;
+            keyring_core::Entry::new(&coord.service, &coord.account)
+                .unwrap()
+                .set_password(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x3a_u8; 32]),
+                )
+                .unwrap();
+        }
+        let attestation_key = RULE_ATTESTATION_KEY;
+        keyring_core::Entry::new(
+            &profile.attestation_key_id.service,
+            &profile.attestation_key_id.account,
+        )
+        .unwrap()
+        .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(attestation_key))
+        .unwrap();
+
+        std::fs::create_dir_all(&approvals_dir).unwrap();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_approval_dir_for_test(approvals_dir.clone());
+        server.policy_window_state_path_override = Some(dir.join("policy").join("commit.window"));
+        let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, DEFAULT_TTL_MS);
+        let store_path = approvals_dir.join(format!("{}.toml", server.profile_name_for_approval()));
+        let smart_account = parse_c_strkey_to_smart_account(TEST_SMART_ACCOUNT).unwrap();
+        let store = PendingApprovalStore::open(store_path.clone()).unwrap();
+        let lifetime = store.get(&nonce).unwrap().attested_lifetime();
+        let blob = compute_attestation_v4(
+            &attestation_key,
+            &stellar_agent_core::approval::AttestationBinding::new(
+                &server.profile_name_for_approval(),
+                "stellar:testnet",
+            ),
+            &nonce,
+            &matching_digest_for(&smart_account),
+            &process_uid_for_attestation().unwrap(),
+            &lifetime,
+            &stellar_agent_core::approval::AttestedApprover::Local,
+        );
+        drop(store);
+
+        let mut args = commit_args("stellar:testnet", nonce);
+        args.approval_attestation =
+            Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob));
+        (server, args, store_path, blob)
+    }
+
+    /// Builds an enrolled signer with an attested proposal and matching
+    /// commit arguments. Returns the server, arguments, and store path.
+    async fn attested_commit_with_enrolled_signer(
+        dir: &std::path::Path,
+        approvals_dir: std::path::PathBuf,
+        rpc_url: String,
+    ) -> (
+        WalletServer,
+        StellarRuleCreateCommitArgs,
+        std::path::PathBuf,
+    ) {
+        attested_commit_with_keyring(dir, approvals_dir, rpc_url, |_| {
+            keyring_mock::install().unwrap();
+        })
+        .await
+    }
+
+    /// [`attested_commit_with_enrolled_signer`] over the keyring and profile
+    /// state `configure_keyring` prepares.
+    async fn attested_commit_with_keyring(
+        dir: &std::path::Path,
+        approvals_dir: std::path::PathBuf,
+        rpc_url: String,
+        configure_keyring: impl FnOnce(&mut Profile),
+    ) -> (
+        WalletServer,
+        StellarRuleCreateCommitArgs,
+        std::path::PathBuf,
+    ) {
+        let (server, args, store_path, blob) =
+            pending_commit_setup(dir, approvals_dir, rpc_url, configure_keyring).await;
+        let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+        store
+            .record_rule_proposal_attestation(
+                &args.approval_nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
+            .unwrap();
+        (server, args, store_path)
+    }
+
+    /// [`attested_commit_with_enrolled_signer`] over an in-memory spent record,
+    /// which the caller seeds and observes.
+    async fn attested_commit_with_memory_record(
+        dir: &std::path::Path,
+        rpc_url: String,
+    ) -> (
+        WalletServer,
+        StellarRuleCreateCommitArgs,
+        std::path::PathBuf,
+        Arc<InMemoryRuleApprovalSpentStore>,
+    ) {
+        let (mut server, args, store_path) =
+            attested_commit_with_enrolled_signer(dir, dir.join("approvals"), rpc_url).await;
+        let record = Arc::new(InMemoryRuleApprovalSpentStore::default());
+        server.rule_approval_spent_store_override = Some(record.clone());
+        (server, args, store_path, record)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn approve_reports_the_store_refusal_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let (server, args, _, _) = attested_commit_with_memory_record(dir.path(), rpc.uri()).await;
+        CONSUME_REFUSAL.with(|fault| {
+            *fault.borrow_mut() = Some(stellar_agent_core::approval::ApprovalError::WrongKind {
+                expected: "RuleProposalSimulated",
+                actual: "PaymentSimulated",
+            })
+        });
+        let result = server.call_stellar_rule_create_commit(args).await.unwrap();
+        assert!(
+            CONSUME_REFUSAL.with(|fault| fault.borrow().is_none()),
+            "the adapter reaches consume"
+        );
+        let (code, _, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "approval.wrong_kind");
+        assert_eq!(rpc.accepted(), 0);
+    }
+
+    /// An encoded spent record holding `count` live records of other approvals.
+    fn live_spent_record(count: usize) -> String {
+        let mut set = SpentSet::default();
+        for index in 0..count {
+            set.insert([index as u8; 32], u64::MAX, 1).unwrap();
+        }
+        set.encode()
+    }
+
+    /// The approval entry stored under `nonce` at `store_path`.
+    fn stored_kind(
+        store_path: &std::path::Path,
+        nonce: &str,
+    ) -> stellar_agent_core::approval::ApprovalKind {
+        let kind = PendingApprovalStore::open(store_path.to_path_buf())
+            .unwrap()
+            .get(nonce)
+            .unwrap()
+            .kind
+            .clone();
+        stellar_agent_core::approval::verify_rule_proposal_entry_terms(&kind).unwrap();
+        kind
+    }
+
+    /// The expiry of the approval entry stored under `nonce` at `store_path`.
+    fn stored_expiry(store_path: &std::path::Path, nonce: &str) -> u64 {
+        PendingApprovalStore::open(store_path.to_path_buf())
+            .unwrap()
+            .get(nonce)
+            .unwrap()
+            .expires_at_unix_ms
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_definition_swapped_after_approval_does_not_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_core::approval::{
+            ApprovalKind, AttestedApprover, ConsentAudit, ConsentAuthorization, Surface,
+            attest_and_persist,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let (server, args, store_path, _) =
+            pending_commit_setup(dir.path(), dir.path().join("approvals"), rpc.uri(), |_| {
+                stellar_agent_test_support::keyring_mock::install().unwrap()
+            })
+            .await;
+        let nonce = args.approval_nonce.clone();
+        let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+        let mut entry = store.get(&nonce).unwrap().clone();
+        let original = entry.kind.clone();
+        if let ApprovalKind::RuleProposalSimulated { definition, .. } = &mut entry.kind {
+            definition.name = "replacement-rule".to_owned();
+        }
+        store.remove(&nonce).unwrap();
+        store.insert(entry.clone(), now_unix_ms().unwrap()).unwrap();
+        let mut audit = stellar_agent_core::audit_log::writer::AuditWriter::open(
+            dir.path().join("consent.jsonl"),
+            None,
+        )
+        .unwrap();
+        let error = attest_and_persist(
+            &mut store,
+            &entry,
+            &RULE_ATTESTATION_KEY,
+            &stellar_agent_core::approval::AttestationBinding::new(
+                &server.profile_name_for_approval(),
+                "stellar:testnet",
+            ),
+            Surface::Cli,
+            ConsentAudit::Writer(&mut audit),
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
+            |_req, _key| Err("rule approval does not create a grant".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "approval.entry_inconsistent");
+        assert!(store.get(&nonce).unwrap().attestation_blob_b64.is_none());
+        entry.kind = original;
+        store.remove(&nonce).unwrap();
+        store.insert(entry, now_unix_ms().unwrap()).unwrap();
+        drop(store);
+        let result = server.call_stellar_rule_create_commit(args).await.unwrap();
+        let (code, _, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "policy.approval_required");
+        assert_eq!(rpc.accepted(), 0);
+        assert_eq!(
+            stored_kind(&store_path, &nonce).kind_name(),
+            "RuleProposalSimulated"
+        );
+    }
+
+    async fn restored_commit_is_spent(new_server: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let approvals = dir.path().join("approvals");
+        let (server, args, store_path) =
+            attested_commit_with_enrolled_signer(dir.path(), approvals.clone(), rpc.uri()).await;
+        let snapshot = std::fs::read(&store_path).unwrap();
+        let first = server
+            .call_stellar_rule_create_commit(args.clone())
+            .await
+            .unwrap();
+        let (code, _, _) = crate::tools::common::assert_business_envelope(&first);
+        assert!(code.starts_with("sa."));
+        assert!(rpc.accepted() > 0);
+        let contacts = rpc.accepted();
+        std::fs::write(&store_path, snapshot).unwrap();
+        let server = if new_server {
+            let profile = (*server.profile).clone();
+            let window_path = server.policy_window_state_path_override.clone();
+            drop(server);
+            let mut server = WalletServer::new(profile).unwrap();
+            server.set_approval_dir_for_test(approvals);
+            server.policy_window_state_path_override = window_path;
+            server
+        } else {
+            server
+        };
+        let second = server.call_stellar_rule_create_commit(args).await.unwrap();
+        let (code, _, _) = crate::tools::common::assert_business_envelope(&second);
+        assert_eq!(code, "policy.approval_consumed");
+        assert_eq!(rpc.accepted(), contacts);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_restored_pending_store_does_not_rearm_a_spent_rule_approval() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        restored_commit_is_spent(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_spent_record_survives_a_new_server() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        restored_commit_is_spent(true).await;
+    }
+
+    /// A later commit prunes the marker of an approval past its expiry. With
+    /// the clock back before that expiry and the pending entry restored, the
+    /// entry check and the gate pass and no marker refuses, so the time floor
+    /// alone keeps the approval from a second install.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_pruned_approval_stays_refused_when_the_clock_moves_back() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let (server, args, store_path, record) =
+            attested_commit_with_memory_record(dir.path(), rpc.uri()).await;
+        let snapshot = std::fs::read(&store_path).unwrap();
+        let expiry = stored_expiry(&store_path, &args.approval_nonce);
+        let first = server
+            .call_stellar_rule_create_commit(args.clone())
+            .await
+            .unwrap();
+        let (code, _, _) = crate::tools::common::assert_business_envelope(&first);
+        assert!(code.starts_with("sa."));
+        assert!(rpc.accepted() > 0);
+        let contacts = rpc.accepted();
+
+        let smart_account = parse_c_strkey_to_smart_account(TEST_SMART_ACCOUNT).unwrap();
+        let marker = rule_approval_spent_marker(
+            &server.profile_name_for_approval(),
+            "stellar:testnet",
+            &args.approval_nonce,
+            &matching_digest_for(&smart_account),
+        );
+        let mut spent = SpentSet::parse(record.load().unwrap().as_deref()).unwrap();
+        assert!(spent.contains(&marker));
+        spent
+            .insert([0x77; 32], expiry + 1_000, expiry + 1)
+            .unwrap();
+        assert!(!spent.contains(&marker));
+        let later_record = spent.encode();
+        record.store(&later_record).unwrap();
+
+        std::fs::write(&store_path, snapshot).unwrap();
+        let second = server.call_stellar_rule_create_commit(args).await.unwrap();
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&second);
+        assert_eq!(code, "approval.spent_record_unavailable");
+        assert!(message.contains("it is past this approval's expiry"));
+        assert_eq!(rpc.accepted(), contacts);
+        assert_eq!(record.load().unwrap(), Some(later_record));
+    }
+
+    async fn spent_record_failure_refuses(write: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let mut write_switch = None;
+        let (server, args, store_path, blob) = pending_commit_setup(
+            dir.path(),
+            dir.path().join("approvals"),
+            rpc.uri(),
+            |profile| {
+                let entry = rule_approval_spent_entry_ref(&profile.attestation_key_id);
+                if write {
+                    write_switch = Some(
+                        keyring_mock::install_with_write_failure_switch(
+                            &entry.service,
+                            &entry.account,
+                        )
+                        .unwrap(),
+                    );
+                } else {
+                    keyring_mock::install().unwrap();
+                }
+            },
+        )
+        .await;
+        let nonce = args.approval_nonce.clone();
+        PendingApprovalStore::open(store_path.clone())
+            .unwrap()
+            .record_rule_proposal_attestation(
+                &nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
+            .unwrap();
+        let record = KeyringRuleApprovalSpentStore::new(&server.profile.attestation_key_id);
+        let seeded = live_spent_record(2);
+        record.store(&seeded).unwrap();
+        if let Some(switch) = write_switch {
+            switch.store(true, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            let entry = rule_approval_spent_entry_ref(&server.profile.attestation_key_id);
+            keyring_mock::inject_error(
+                &entry.service,
+                &entry.account,
+                keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                    "rejected-value",
+                ))),
+            )
+            .unwrap();
+        }
+        let result = server.call_stellar_rule_create_commit(args).await.unwrap();
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "approval.spent_record_unavailable");
+        assert!(message.contains(if write {
+            "it cannot be written"
+        } else {
+            "it cannot be read"
+        }));
+        assert_eq!(rpc.accepted(), 0);
+        assert_eq!(
+            stored_kind(&store_path, &nonce).kind_name(),
+            "RuleProposalSimulated"
+        );
+        assert_eq!(record.load().unwrap(), Some(seeded));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_spent_record_write_failure_refuses_before_the_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        spent_record_failure_refuses(true).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_spent_record_read_failure_refuses_before_the_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        spent_record_failure_refuses(false).await;
+    }
+
+    /// A write that replaces the value and then reports an error refuses the
+    /// commit, and the stored marker keeps the approval spent.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_marker_stored_before_a_write_error_keeps_the_approval_spent() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let (server, args, store_path, record) =
+            attested_commit_with_memory_record(dir.path(), rpc.uri()).await;
+        record
+            .fail_after_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let refused = server
+            .call_stellar_rule_create_commit(args.clone())
+            .await
+            .unwrap();
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&refused);
+        assert_eq!(code, "approval.spent_record_unavailable");
+        assert!(message.contains("it cannot be written"));
+        assert_eq!(rpc.accepted(), 0);
+        let nonce = args.approval_nonce.clone();
+        assert_eq!(
+            stored_kind(&store_path, &nonce).kind_name(),
+            "RuleProposalSimulated"
+        );
+
+        record
+            .fail_after_write
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let retry = server.call_stellar_rule_create_commit(args).await.unwrap();
+        let (code, _, _) = crate::tools::common::assert_business_envelope(&retry);
+        assert_eq!(code, "policy.approval_consumed");
+        assert_eq!(rpc.accepted(), 0);
+    }
+
+    async fn stored_record_refuses(seeded: &str, reason: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let (server, args, store_path, record) =
+            attested_commit_with_memory_record(dir.path(), rpc.uri()).await;
+        record.store(seeded).unwrap();
+        let nonce = args.approval_nonce.clone();
+        let result = server.call_stellar_rule_create_commit(args).await.unwrap();
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "approval.spent_record_unavailable");
+        assert!(message.contains(reason), "{message}");
+        assert_eq!(rpc.accepted(), 0);
+        assert_eq!(
+            stored_kind(&store_path, &nonce).kind_name(),
+            "RuleProposalSimulated"
+        );
+        assert_eq!(record.load().unwrap().as_deref(), Some(seeded));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_malformed_spent_record_refuses_before_the_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stored_record_refuses("not-a-record", "it does not parse").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_full_spent_record_refuses_before_the_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stored_record_refuses(
+            &live_spent_record(MAX_SPENT_RULE_APPROVALS),
+            "it is full until an approval expires",
+        )
+        .await;
+    }
+
+    /// The window-state path a commit of `server` locks, with its directory.
+    fn spent_lock_coordinates(server: &WalletServer) -> (std::path::PathBuf, KeyringEntryRef) {
+        let window_path = server.resolve_policy_window_state_path();
+        std::fs::create_dir_all(window_path.parent().unwrap()).unwrap();
+        (
+            window_path,
+            rule_approval_spent_entry_ref(&server.profile.attestation_key_id),
+        )
+    }
+
+    /// A spent record that notes, per access, whether the coordinate's lock
+    /// was held.
+    struct LockObservingRecord {
+        inner: InMemoryRuleApprovalSpentStore,
+        window_path: std::path::PathBuf,
+        entry: KeyringEntryRef,
+        accesses: Mutex<Vec<(&'static str, bool)>>,
+    }
+
+    impl LockObservingRecord {
+        fn note(&self, access: &'static str) {
+            let held = WindowStoreLock::acquire_for(&self.window_path, &self.entry).is_err();
+            self.accesses.lock().unwrap().push((access, held));
+        }
+    }
+
+    impl RuleApprovalSpentStore for LockObservingRecord {
+        fn load(&self) -> Result<Option<String>, SpentSetError> {
+            self.note("load");
+            self.inner.load()
+        }
+
+        fn store(&self, value: &str) -> Result<(), SpentSetError> {
+            self.note("store");
+            self.inner.store(value)
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn the_spent_record_lock_spans_the_load_and_the_store() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let (mut server, args, _store_path) = attested_commit_with_enrolled_signer(
+            dir.path(),
+            dir.path().join("approvals"),
+            rpc.uri(),
+        )
+        .await;
+        let (window_path, entry) = spent_lock_coordinates(&server);
+        let record = Arc::new(LockObservingRecord {
+            inner: InMemoryRuleApprovalSpentStore::default(),
+            window_path,
+            entry,
+            accesses: Mutex::new(Vec::new()),
+        });
+        server.rule_approval_spent_store_override = Some(record.clone());
+        server.call_stellar_rule_create_commit(args).await.unwrap();
+        assert_eq!(
+            *record.accesses.lock().unwrap(),
+            [("load", true), ("store", true)]
+        );
+    }
+
+    /// The lock names the entry, not the profile, so the commits of every
+    /// profile sharing the coordinate contend for it. A commit that cannot
+    /// take it refuses and leaves the record as it stands.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_held_spent_record_lock_refuses_before_the_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let (server, args, store_path, record) =
+            attested_commit_with_memory_record(dir.path(), rpc.uri()).await;
+        let seeded = live_spent_record(2);
+        record.store(&seeded).unwrap();
+        let (window_path, entry) = spent_lock_coordinates(&server);
+        let guard = WindowStoreLock::acquire_for(&window_path, &entry).unwrap();
+        let nonce = args.approval_nonce.clone();
+        let result = server.call_stellar_rule_create_commit(args).await.unwrap();
+        drop(guard);
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "approval.spent_record_unavailable");
+        assert!(message.contains("it is busy"), "{message}");
+        assert_eq!(rpc.accepted(), 0);
+        assert_eq!(
+            stored_kind(&store_path, &nonce).kind_name(),
+            "RuleProposalSimulated"
+        );
+        assert_eq!(record.load().unwrap(), Some(seeded));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn profiles_sharing_a_coordinate_both_keep_their_markers() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let shared = KeyringEntryRef::new("stellar-agent-attestation-shared", "default");
+        let first_shared = shared.clone();
+        let first_dir = dir.path().join("first");
+        let second_dir = dir.path().join("second");
+        let window_path = dir.path().join("policy").join("shared.window");
+        let (mut first, first_args, first_path) = attested_commit_with_keyring(
+            &first_dir,
+            first_dir.join("approvals"),
+            rpc.uri(),
+            |profile| {
+                keyring_mock::install().unwrap();
+                profile.attestation_key_id = first_shared;
+            },
+        )
+        .await;
+        let (mut second, second_args, second_path) = attested_commit_with_keyring(
+            &second_dir,
+            second_dir.join("approvals"),
+            rpc.uri(),
+            |profile| {
+                profile.mcp_signer_default.service = "svc-second".to_owned();
+                profile.attestation_key_id = shared;
+            },
+        )
+        .await;
+        first.policy_window_state_path_override = Some(window_path.clone());
+        second.policy_window_state_path_override = Some(window_path);
+        assert_ne!(
+            first.profile_name_for_approval(),
+            second.profile_name_for_approval()
+        );
+
+        let first_snapshot = std::fs::read(&first_path).unwrap();
+        let second_snapshot = std::fs::read(&second_path).unwrap();
+        for (server, args) in [(&first, &first_args), (&second, &second_args)] {
+            let result = server
+                .call_stellar_rule_create_commit(args.clone())
+                .await
+                .unwrap();
+            let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+            assert!(code.starts_with("sa."), "{code}: {message}");
+        }
+        let contacts = rpc.accepted();
+        assert!(contacts > 0);
+        std::fs::write(&first_path, first_snapshot).unwrap();
+        std::fs::write(&second_path, second_snapshot).unwrap();
+        for (server, args) in [(&first, first_args), (&second, second_args)] {
+            let result = server.call_stellar_rule_create_commit(args).await.unwrap();
+            let (code, _, _) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(code, "policy.approval_consumed");
+        }
+        assert_eq!(rpc.accepted(), contacts);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_rule_approval_issued_before_the_upgrade_cannot_be_committed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_core::approval::{
+            ApprovalKind, AttestationBinding, AttestedApprover, compute_attestation_v4,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let (server, mut args, store_path, _) =
+            pending_commit_setup(dir.path(), dir.path().join("approvals"), rpc.uri(), |_| {
+                keyring_mock::install().unwrap();
+            })
+            .await;
+        let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+        let mut entry = store.get(&args.approval_nonce).unwrap().clone();
+        let legacy_digest = [0x91; 32];
+        if let ApprovalKind::RuleProposalSimulated {
+            proposal_sha256, ..
+        } = &mut entry.kind
+        {
+            *proposal_sha256 = legacy_digest;
+        }
+        let blob = compute_attestation_v4(
+            &RULE_ATTESTATION_KEY,
+            &AttestationBinding::new(&server.profile_name_for_approval(), "stellar:testnet"),
+            &args.approval_nonce,
+            &legacy_digest,
+            &entry.process_uid,
+            &entry.attested_lifetime(),
+            &AttestedApprover::Local,
+        );
+        store.remove(&args.approval_nonce).unwrap();
+        store.insert(entry, now_unix_ms().unwrap()).unwrap();
+        store
+            .record_rule_proposal_attestation(&args.approval_nonce, blob, AttestedApprover::Local)
+            .unwrap();
+        drop(store);
+        args.approval_attestation =
+            Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob));
+        let error = server
+            .call_stellar_rule_create_commit(args)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("simulation.divergence"));
+        assert_eq!(
+            KeyringRuleApprovalSpentStore::new(&server.profile.attestation_key_id)
+                .load()
+                .unwrap(),
+            None
+        );
+        assert_eq!(rpc.accepted(), 0);
+    }
+
+    /// The approval is spent before the install reaches the network, and an
+    /// install that then fails leaves it spent: the entry is a tombstone
+    /// holding the proposal digest, and a second commit with the same
+    /// approval and attestation is refused as consumed without contacting the
+    /// network. The install fails because the RPC endpoint closes every
+    /// connection.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_failed_install_spends_the_rule_approval() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let (server, args, store_path) = attested_commit_with_enrolled_signer(
+            dir.path(),
+            dir.path().join("approvals"),
+            rpc.uri(),
+        )
+        .await;
+        let nonce = args.approval_nonce.clone();
+        rpc.watch(store_path.clone(), nonce.clone());
+
+        let result = server
+            .call_stellar_rule_create_commit(args.clone())
+            .await
+            .unwrap();
+        let (code, message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert!(
+            code.starts_with("sa.") && message.contains(&rpc.uri()),
+            "the commit must pass the gate and fail in the install: {code}: {message}"
+        );
+        assert!(rpc.accepted() > 0, "the install reached the network");
+        assert_eq!(
+            rpc.first_kind().as_deref(),
+            Some("Consumed"),
+            "the approval must be spent when the install first reaches the network"
+        );
+
+        let smart_account = parse_c_strkey_to_smart_account(TEST_SMART_ACCOUNT).unwrap();
+        let expected_digest = stellar_agent_core::hex::encode(&matching_digest_for(&smart_account));
+        match stored_kind(&store_path, &nonce) {
+            stellar_agent_core::approval::ApprovalKind::Consumed {
+                original_kind_name,
+                tx_hash,
+                outcome,
+            } => {
+                assert_eq!(original_kind_name, "RuleProposalSimulated");
+                assert_eq!(tx_hash, expected_digest);
+                assert_eq!(
+                    outcome,
+                    stellar_agent_core::approval::ConsumedOutcome::Unknown
+                );
+            }
+            other => panic!("the approval must be spent, got {}", other.kind_name()),
+        }
+
+        let contacts = rpc.accepted();
+        let retry = server.call_stellar_rule_create_commit(args).await.unwrap();
+        let (code, message, _text) = crate::tools::common::assert_business_envelope(&retry);
+        assert_eq!(code, "policy.approval_consumed");
+        assert_eq!(message, RULE_PROPOSAL_CONSUMED_MESSAGE);
+        assert_eq!(
+            rpc.accepted(),
+            contacts,
+            "the refused retry must not reach the network"
+        );
+    }
+
+    /// A tombstone write that fails before it replaces the store file refuses
+    /// the commit before the install reaches the network. The entry stays
+    /// pending and the stored marker keeps the approval spent, so a retry is
+    /// refused as consumed. The write fails at the temporary file, which the
+    /// read-only approval directory refuses.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_consume_write_failure_refuses_before_the_install() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let approvals_dir = dir.path().join("approvals");
+        let (server, args, store_path) =
+            attested_commit_with_enrolled_signer(dir.path(), approvals_dir.clone(), rpc.uri())
+                .await;
+        let nonce = args.approval_nonce.clone();
+        rpc.watch(store_path.clone(), nonce.clone());
+
+        std::fs::set_permissions(&approvals_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = server.call_stellar_rule_create_commit(args.clone()).await;
+        std::fs::set_permissions(&approvals_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = result.unwrap();
+        let (code, message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "approval.record_failed", "{message}");
+        assert_eq!(rpc.accepted(), 0, "the install must not reach the network");
+        assert_eq!(
+            stored_kind(&store_path, &nonce).kind_name(),
+            "RuleProposalSimulated"
+        );
+
+        let retry = server.call_stellar_rule_create_commit(args).await.unwrap();
+        let (code, _, _) = crate::tools::common::assert_business_envelope(&retry);
+        assert_eq!(code, "policy.approval_consumed");
+        assert_eq!(rpc.accepted(), 0);
+    }
+
+    /// The propose tool refuses a malformed context, external signer key,
+    /// credential name, install parameter and spending limit by the field and
+    /// the expected form or constraint, and no refusal repeats the argument.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn rule_create_marker_is_not_echoed() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let (server, _dir) = test_server();
+        let delegated = serde_json::json!([{ "kind": "delegated", "address": TEST_G }]);
+        let call_contract = format!("call-contract:{TEST_SMART_ACCOUNT}");
+        let cases: Vec<(serde_json::Value, &str, Option<String>)> = vec![
+            (
+                serde_json::json!({ "context": CREDENTIAL_MARKER, "signers": delegated }),
+                CREDENTIAL_MARKER,
+                Some(format!("unknown context; {CONTEXT_GRAMMAR}")),
+            ),
+            (
+                serde_json::json!({ "signers": [{
+                    "kind": "external", "verifier": TEST_C, "pubkey_data_hex": CREDENTIAL_MARKER
+                }] }),
+                CREDENTIAL_MARKER,
+                Some(
+                    "signers[0].pubkey_data_hex: must be an even-length string of hex digits"
+                        .to_owned(),
+                ),
+            ),
+            (
+                serde_json::json!({ "signers": [{
+                    "kind": "webauthn", "credential_name": CREDENTIAL_MARKER
+                }] }),
+                CREDENTIAL_MARKER,
+                None,
+            ),
+            (
+                serde_json::json!({ "signers": delegated, "policies": [{
+                    "kind": "raw", "policy_address": TEST_C,
+                    "install_param_xdr_b64": format!("{CREDENTIAL_MARKER}*")
+                }] }),
+                CREDENTIAL_MARKER,
+                Some("policies[0].install_param_xdr_b64: must be unpadded base64url".to_owned()),
+            ),
+            (
+                serde_json::json!({ "context": call_contract, "signers": delegated, "policies": [{
+                    "kind": "spending_limit", "limit_stroops": CREDENTIAL_MARKER,
+                    "period_ledgers": 17_280, "policy_address": TEST_C
+                }] }),
+                CREDENTIAL_MARKER,
+                Some("policies[0].limit_stroops: not a valid decimal i128".to_owned()),
+            ),
+            (
+                serde_json::json!({ "context": call_contract, "signers": delegated, "policies": [{
+                    "kind": "spending_limit", "limit_stroops": "-7777777",
+                    "period_ledgers": 17_280, "policy_address": TEST_C
+                }] }),
+                "7777777",
+                Some(
+                    "policies[0]: spending-limit policy install refused: --limit must be \
+                     positive (OZ install rejects a non-positive spending_limit with \
+                     InvalidLimitOrPeriod)"
+                        .to_owned(),
+                ),
+            ),
+        ];
+        for (overrides, marker, expected) in cases {
+            let mut args = serde_json::json!({
+                "chain_id": "stellar:testnet",
+                "smart_account": TEST_SMART_ACCOUNT,
+                "name": "spend-daily",
+            });
+            for (key, value) in overrides.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            let args: StellarRuleCreateArgs = serde_json::from_value(args).unwrap();
+            let err = server
+                .call_stellar_rule_create(args)
+                .await
+                .expect_err("the argument is refused");
+            match expected {
+                Some(expected) => assert_eq!(err.message, expected),
+                None => assert!(
+                    err.message.starts_with("signers[0].credential_name: "),
+                    "{}",
+                    err.message
+                ),
+            }
+            assert_no_marker_in_text(&format!("{err:?}"), marker);
+        }
     }
 }

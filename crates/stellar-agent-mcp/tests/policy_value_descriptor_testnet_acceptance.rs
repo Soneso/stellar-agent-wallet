@@ -126,14 +126,9 @@ fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {
 
 async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
+    stellar_agent_test_support::testnet_helpers::friendbot_fund(&url)
         .await
-        .expect("Friendbot HTTP request must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 2xx for {g_strkey}; got {}",
-        resp.status()
-    );
+        .expect("Friendbot funds the account");
 }
 
 /// Polls RPC until the freshly-funded account is queryable, tolerating
@@ -170,6 +165,20 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
         .expect("signer keyring entry")
         .set_password(&s_strkey)
         .expect("set signing key");
+    // The identity record an enrollment stores beside the seed.
+    stellar_agent_network::keyring::write_keyring_string(
+        &stellar_agent_core::profile::schema::signer_identity_entry_ref(signer_ref),
+        &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .to_bytes(),
+            stellar_agent_core::profile::name::profile_name_for_approval(profile),
+            profile.chain_id,
+        )
+        .render()
+        .expect("an agent record renders"),
+    )
+    .expect("set identity record");
 
     // Nonce key.
     let nonce_ref = &profile.mcp_nonce_key_alias;
@@ -261,6 +270,7 @@ async fn simulate_self_payment_envelope(server: &WalletServer, g_strkey: &str) -
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("Noop-engine simulate must succeed against a funded account");
@@ -284,6 +294,10 @@ async fn simulate_self_payment_envelope(server: &WalletServer, g_strkey: &str) -
 #[tokio::test]
 #[serial]
 async fn value_gate_allow_per_tx_cap_commits_on_testnet() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (g_strkey, seed) = fresh_keypair();
@@ -323,6 +337,7 @@ async fn value_gate_allow_per_tx_cap_commits_on_testnet() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("simulate under an allowing per_tx_cap value rule must succeed");
@@ -355,11 +370,12 @@ async fn value_gate_allow_per_tx_cap_commits_on_testnet() {
             memo_id: None,
             memo_hash_hex: None,
             memo_return_hex: None,
-            nonce,
-            expires_at_unix_ms,
-            envelope_xdr,
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: None,
             approval_attestation: None,
+            business_id: None,
         })
         .await
         .expect(
@@ -390,6 +406,10 @@ async fn value_gate_allow_per_tx_cap_commits_on_testnet() {
 #[tokio::test]
 #[serial]
 async fn value_gate_deny_per_tx_cap_exceeded_blocks_before_submit() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (g_strkey, seed) = fresh_keypair();
@@ -421,6 +441,7 @@ async fn value_gate_deny_per_tx_cap_exceeded_blocks_before_submit() {
             memo_hash_hex: None,
             memo_return_hex: None,
             classic_base: Some(FEE_STROOPS.to_string()),
+            business_id: None,
         })
         .await
         .expect("a policy deny must return the business-error envelope, not a protocol error");
@@ -448,6 +469,10 @@ async fn value_gate_deny_per_tx_cap_exceeded_blocks_before_submit() {
 #[tokio::test]
 #[serial]
 async fn value_gate_deny_opaque_unsizable_blocks_raw_signing() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (g_strkey, seed) = fresh_keypair();
@@ -477,6 +502,8 @@ async fn value_gate_deny_opaque_unsizable_blocks_raw_signing() {
             transaction_xdr: envelope_xdr,
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .expect(
@@ -500,13 +527,18 @@ async fn value_gate_deny_opaque_unsizable_blocks_raw_signing() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The same broad `tool = "*"` value rule as scenario 3, but with the explicit
-/// operator opt-in `allow_opaque_signing = true`: the engine downgrades the
-/// opaque value class to read-only for this rule, the `per_tx_cap` criterion
-/// treats the call as not-applicable, and the rule's own `Allow` decision
-/// governs — the call proceeds to sign and submit on the live testnet ledger.
+/// operator opt-in `allow_opaque_signing = true`. The opt-in covers only the
+/// tool's own opaque value class. The self-payment inside the envelope is a
+/// wallet payment, so the same rule decides it through `stellar_pay_commit`
+/// with its `per_tx_cap`. Under a cap below 1 XLM the call refuses; under the
+/// 10 000 XLM cap it signs and submits on the live testnet ledger.
 #[tokio::test]
 #[serial]
 async fn value_gate_allow_opaque_signing_exemption_permits_raw_signing() {
+    let storage_sandbox =
+        stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     keyring_mock::install().expect("mock keyring store init");
 
     let (g_strkey, seed) = fresh_keypair();
@@ -524,6 +556,26 @@ async fn value_gate_allow_opaque_signing_exemption_permits_raw_signing() {
     let mut server = WalletServer::new(profile).expect("WalletServer::new");
     let envelope_xdr = simulate_self_payment_envelope(&server, &g_strkey).await;
 
+    let over = per_tx_cap_document(vec![("*", PER_TX_CAP_LOW_STROOPS, true)]);
+    server.set_policy_engine_for_test(Arc::new(PolicyEngineV1::new(over, g_strkey.clone())));
+    let refused = server
+        .call_stellar_sep43_sign_and_submit_transaction(Sep43SignAndSubmitTransactionArgs {
+            chain_id: TESTNET_CHAIN_ID.to_owned(),
+            transaction_xdr: envelope_xdr.clone(),
+            network_passphrase: None,
+            address: None,
+            approval_nonce: None,
+            approval_attestation: None,
+        })
+        .await
+        .expect("an over-cap payment leg must return the business-error envelope");
+    let (code, _message, text) = common::assert_business_envelope(&refused);
+    assert_eq!(
+        code, "policy.deny.per_tx_cap_exceeded",
+        "the opt-in does not exempt the payment leg from its cap; got: {text}"
+    );
+    assert!(!text.contains("signedTxXdr"), "{text}");
+
     let doc = per_tx_cap_document(vec![("*", PER_TX_CAP_MAX_STROOPS, true)]);
     server.set_policy_engine_for_test(Arc::new(PolicyEngineV1::new(doc, g_strkey.clone())));
 
@@ -533,6 +585,8 @@ async fn value_gate_allow_opaque_signing_exemption_permits_raw_signing() {
             transaction_xdr: envelope_xdr,
             network_passphrase: None,
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .expect("the allow_opaque_signing exemption must pass the value gate and reach signing");

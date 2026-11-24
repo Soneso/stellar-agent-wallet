@@ -9,8 +9,11 @@
 //!   `sa.policy_mutable`, reason `owner-managed external reference`, and a
 //!   detail naming the owner and the tag;
 //! - admit it with `accept_mutable_verifier`, return a pending mutable
-//!   override naming the owner and the tag, and pin the resolved hash
-//!   together with an `ExecutableRefPin` at the same position;
+//!   override naming the owner and the tag, and pin the full resolved hash
+//!   together with an `ExecutableRefPin` at the same position; the pin
+//!   persists in full through the audit row, and signing refuses the same
+//!   reference once it resolves to a hash differing only after the first
+//!   eight bytes;
 //! - require `accept_unknown_verifier` as well when the resolved hash is
 //!   outside the allowlist, returning both pending overrides;
 //! - refuse with `sa.contract_instance_unsupported`, reason
@@ -23,9 +26,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use stellar_agent_core::audit_log::schema::{ContractKind, EventKind, ExecutableRefPin};
+use stellar_agent_core::audit_log::schema::{
+    ContractKind, EventKind, ExecutableRefPin, WasmHashPin,
+};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_lines;
-use stellar_agent_core::audit_log::{AuditReader, AuditWriter};
+use stellar_agent_core::audit_log::{AuditReader, AuditWriter, ContextRulePinRecord};
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::error::{AdminOrOwnerKey, SaError};
 use stellar_agent_smart_account::managers::rules::RuleContext;
@@ -41,8 +46,9 @@ use uuid::Uuid;
 use wiremock::{Request, Respond, ResponseTemplate};
 
 use super::rpc_mock_helpers::{
-    KNOWN_WASM_HASH, SOURCE_G, ZERO_CONTRACT_REDACTED, contract_instance_key_xdr, manager_one_url,
-    tmp_audit_writer,
+    KNOWN_WASM_HASH, SOURCE_G, ZERO_CONTRACT_REDACTED, assert_refusal_holds_no_marker,
+    contract_instance_key_xdr, manager_one_url, mcp_error_envelope, tmp_audit_writer,
+    wallet_traced,
 };
 
 // ── Fixture values ────────────────────────────────────────────────────────────
@@ -70,10 +76,6 @@ fn owner_scaddress() -> ScAddress {
 
 fn contract_strkey() -> String {
     stellar_agent_core::sc_address::scaddress_to_strkey(&contract_addr()).expect("contract strkey")
-}
-
-fn first8(hash: &[u8; 32]) -> String {
-    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The hash the allowlist of `kind` accepts.
@@ -232,6 +234,15 @@ async fn pin_with<R: Respond + 'static>(
     result
 }
 
+/// The bounded executable summary of an external reference naming `OWNER` /
+/// `TAG` that resolves to `resolved`.
+fn resolved_summary(resolved: [u8; 32]) -> String {
+    format!(
+        "external reference owner {OWNER_REDACTED} tag \"verifier-v1\" resolved {}",
+        hex::encode(resolved)
+    )
+}
+
 fn expected_pin(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPin {
     ExecutableRefPin::new(
         &owner_scaddress(),
@@ -246,18 +257,34 @@ fn expected_pin(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPin {
 /// Without `accept_mutable_verifier`, an external reference whose resolved
 /// hash is allowlisted is refused as mutable with a detail naming the owner
 /// and the tag.
-#[tokio::test]
-async fn external_ref_refused_without_accept_mutable_verifier() {
+///
+/// The allowlist admits the resolved hash before the mutability check
+/// refuses the reference, so the observation event at DEBUG names neither
+/// the resolved hash, whole or as its first eight bytes, nor the executable
+/// summary, and no other channel of the refusal holds them.
+#[test]
+fn external_ref_refused_without_accept_mutable_verifier() {
     for kind in [ContractKind::Verifier, ContractKind::Policy] {
-        let result = pin_with(
-            external_ref_responder(TAG, allowlisted_hash(kind)),
+        let resolved = allowlisted_hash(kind);
+        let (result, logs) = wallet_traced(pin_with(
+            external_ref_responder(TAG, resolved),
             kind,
             false,
             false,
-        )
-        .await;
+        ));
 
         let error = result.expect_err(&format!("{kind}: must refuse"));
+        assert!(
+            logs.contains("observe_contract: observed contract executable")
+                && logs.contains("\"allowlisted\":true"),
+            "{kind}: the observation event is captured: {logs}"
+        );
+        assert_refusal_holds_no_marker(
+            &error,
+            &logs,
+            &[&hex::encode(resolved), &hex::encode(&resolved[..8])],
+            &[&resolved_summary(resolved)],
+        );
         let expected_detail = format!("owner {OWNER_REDACTED}, tag \"verifier-v1\"");
         let (key, detail, rule_id) = match (&error, kind) {
             (
@@ -283,12 +310,22 @@ async fn external_ref_refused_without_accept_mutable_verifier() {
         assert_eq!(rule_id, None, "{kind}: a pre-install refusal names no rule");
         assert_eq!(key, AdminOrOwnerKey::ExternalRefExecutable, "{kind}");
         assert_eq!(detail.as_deref(), Some(expected_detail.as_str()), "{kind}");
-        let message = error.to_string();
-        assert!(
-            message.contains("owner-managed external reference")
-                && message.contains(&expected_detail),
-            "{kind}: {message}"
-        );
+        let expected = match kind {
+            ContractKind::Policy => {
+                "policy address must identify an immutable contract; use \
+                 --accept-mutable-verifier only when you accept that its code can change."
+            }
+            _ => {
+                "verifier address must identify an immutable contract; use \
+                 --accept-mutable-verifier only when you accept that its code can change."
+            }
+        };
+        assert_eq!(error.to_string(), expected, "{kind}");
+        let forms = format!("{error:?}\n{}", serde_json::to_string(&error).unwrap());
+        let refused = contract_strkey();
+        let redacted = stellar_agent_core::observability::redact_strkey_first5_last5(&refused);
+        assert!(!forms.contains(&refused), "{forms}");
+        assert!(!forms.contains(&redacted), "{forms}");
     }
 }
 
@@ -351,7 +388,7 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
         );
         assert_no_audit_row(&audit_writer, &format!("{kind}"));
 
-        // The created row records the resolved first-8 and the pin at the
+        // The created row records the full resolved hash and the pin at the
         // same position, and the reader returns them.
         let created = pin_result.context_rule_created_entry(
             ZERO_CONTRACT_REDACTED,
@@ -360,32 +397,32 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
             "stellar:testnet",
             &request_id,
         );
-        let EventKind::SaContextRuleCreated {
-            pinned_verifier_wasm_hashes_first8,
-            pinned_policy_wasm_hashes_first8,
+        let EventKind::SaContextRuleCreatedV2 {
+            pinned_verifier_wasm_hashes,
+            pinned_policy_wasm_hashes,
             pinned_verifier_executable_refs,
             pinned_policy_executable_refs,
             mutable_override,
             ..
         } = &created.event_kind
         else {
-            panic!("{kind}: expected SaContextRuleCreated");
+            panic!("{kind}: expected SaContextRuleCreatedV2");
         };
         assert!(*mutable_override, "{kind}");
-        let (created_first8, created_refs, other_refs) = if kind == ContractKind::Policy {
+        let (created_hashes, created_refs, other_refs) = if kind == ContractKind::Policy {
             (
-                pinned_policy_wasm_hashes_first8,
+                pinned_policy_wasm_hashes,
                 pinned_policy_executable_refs,
                 pinned_verifier_executable_refs,
             )
         } else {
             (
-                pinned_verifier_wasm_hashes_first8,
+                pinned_verifier_wasm_hashes,
                 pinned_verifier_executable_refs,
                 pinned_policy_executable_refs,
             )
         };
-        assert_eq!(created_first8, &vec![first8(&resolved)], "{kind}");
+        assert_eq!(created_hashes, &vec![WasmHashPin::new(resolved)], "{kind}");
         assert_eq!(created_refs, &vec![Some(pin.clone())], "{kind}");
         assert!(other_refs.is_empty(), "{kind}");
 
@@ -394,10 +431,13 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
             .expect("audit writer")
             .write_entry(created)
             .expect("created row writes");
-        let record = AuditReader::new(Arc::clone(&audit_writer), None)
-            .find_latest_context_rule_pinned_hashes(4, ZERO_CONTRACT_REDACTED)
-            .expect("reader succeeds")
-            .expect("created row found");
+        let Some(ContextRulePinRecord::Complete(record)) =
+            AuditReader::new(Arc::clone(&audit_writer), None)
+                .find_latest_context_rule_pinned_hashes(4, ZERO_CONTRACT_REDACTED)
+                .expect("reader succeeds")
+        else {
+            panic!("{kind}: the created row reads as a complete record");
+        };
         let read_back = if kind == ContractKind::Policy {
             record.policy_executable_ref(0)
         } else {
@@ -407,29 +447,186 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
     }
 }
 
+/// An external-reference pin persists in full through the audit row, and
+/// signing under it passes while the reference resolves to the pinned hash
+/// and refuses as drift once the same owner and tag resolve to a hash that
+/// shares the first eight bytes, for a verifier and for a policy.
+#[cfg(feature = "test-helpers")]
+#[tokio::test]
+async fn external_ref_pin_refuses_the_same_reference_resolving_to_a_suffix_twin() {
+    use stellar_agent_smart_account::managers::verifiers::test_helpers;
+
+    for kind in [ContractKind::Verifier, ContractKind::Policy] {
+        let resolved = allowlisted_hash(kind);
+        let mut twin = resolved;
+        twin[8..].iter_mut().for_each(|byte| *byte ^= 0xff);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(external_ref_responder(TAG, resolved))
+            .mount(&server)
+            .await;
+        let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
+        let manager = manager_one_url(
+            &server.uri(),
+            Arc::clone(&audit_writer),
+            audit_log_path.clone(),
+        );
+        let definition = definition_for(kind);
+        let request_id = Uuid::new_v4().to_string();
+        let pin_result = pin_referenced_contracts(
+            &manager,
+            smart_account_addr(),
+            ZERO_CONTRACT_REDACTED,
+            &definition,
+            None,
+            SOURCE_G,
+            true,
+            false,
+            request_id.clone(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{kind}: install must succeed with the flag: {e}"));
+        audit_writer
+            .lock()
+            .expect("audit writer")
+            .write_entry(pin_result.context_rule_created_entry(
+                ZERO_CONTRACT_REDACTED,
+                4,
+                &definition,
+                "stellar:testnet",
+                &request_id,
+            ))
+            .expect("created row writes");
+
+        let sign_check = |manager| {
+            let request_id = request_id.clone();
+            async move {
+                let mut cache = std::collections::HashMap::new();
+                if kind == ContractKind::Policy {
+                    test_helpers::verify_pinned_policy_against_chain(
+                        &manager,
+                        contract_addr(),
+                        4,
+                        ZERO_CONTRACT_REDACTED,
+                        &request_id,
+                        &mut cache,
+                    )
+                    .await
+                } else {
+                    test_helpers::verify_pinned_verifier_against_chain(
+                        &manager,
+                        contract_addr(),
+                        4,
+                        ZERO_CONTRACT_REDACTED,
+                        &request_id,
+                        &mut cache,
+                    )
+                    .await
+                }
+            }
+        };
+        sign_check(manager)
+            .await
+            .unwrap_or_else(|e| panic!("{kind}: the pinned resolution signs: {e}"));
+
+        let twin_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(external_ref_responder(TAG, twin))
+            .mount(&twin_server)
+            .await;
+        let twin_manager = manager_one_url(
+            &twin_server.uri(),
+            Arc::clone(&audit_writer),
+            audit_log_path,
+        );
+        let error = sign_check(twin_manager)
+            .await
+            .expect_err("a suffix twin resolution must refuse");
+        let pinned = match (&error, kind) {
+            (SaError::VerifierHashDrift { pinned_hash, .. }, ContractKind::Verifier)
+            | (SaError::PolicyHashDrift { pinned_hash, .. }, ContractKind::Policy) => *pinned_hash,
+            _ => panic!("{kind}: expected the kind's drift refusal; got {error:?}"),
+        };
+        assert_eq!(pinned, WasmHashPin::new(resolved), "{kind}");
+        let rendered = format!("{error}\n{error:?}");
+        assert!(
+            !rendered.contains(&hex::encode(twin)),
+            "{kind}: the refusal holds no observed hash: {rendered}"
+        );
+    }
+}
+
 /// A resolved hash outside the allowlist needs both flags: each flag alone
 /// refuses, and both together install and write both override rows.
-#[tokio::test]
-async fn external_ref_outside_allowlist_needs_both_flags() {
+///
+/// Each refusal holds no form of the resolved hash, whole or as its first
+/// eight bytes, nor the executable summary, in its Display, Debug and source
+/// chain, its serialized form, the MCP error envelope or the wallet's logs,
+/// which hold the refusing path's events.
+#[test]
+fn external_ref_outside_allowlist_needs_both_flags() {
     let unknown = [0xd1u8; 32];
+    let markers = [hex::encode(unknown), hex::encode(&unknown[..8])];
+    let markers = [markers[0].as_str(), markers[1].as_str()];
     for kind in [ContractKind::Verifier, ContractKind::Policy] {
         // Only the mutable flag: the allowlist miss refuses first.
-        let result = pin_with(external_ref_responder(TAG, unknown), kind, true, false).await;
+        let (result, logs) = wallet_traced(pin_with(
+            external_ref_responder(TAG, unknown),
+            kind,
+            true,
+            false,
+        ));
         let error = result.expect_err(&format!("{kind}: allowlist miss must refuse"));
+        assert!(
+            logs.contains("observe_contract: observed contract executable")
+                && logs.contains("\"allowlisted\":false"),
+            "{kind}: the observation event is captured: {logs}"
+        );
+        assert!(
+            mcp_error_envelope(&error).contains("_wasm_not_in_allowlist\""),
+            "{kind}: the MCP envelope carries the wire code"
+        );
+        assert_refusal_holds_no_marker(&error, &logs, &markers, &[&resolved_summary(unknown)]);
         assert!(
             matches!(
                 (&error, kind),
-                (SaError::VerifierWasmNotInAllowlist { observed_hash_first8, .. }, ContractKind::Verifier)
-                | (SaError::PolicyWasmNotInAllowlist { observed_hash_first8, .. }, ContractKind::Policy)
-                    if observed_hash_first8 == "d1d1d1d1d1d1d1d1"
+                (
+                    SaError::VerifierWasmNotInAllowlist { .. },
+                    ContractKind::Verifier
+                ) | (
+                    SaError::PolicyWasmNotInAllowlist { .. },
+                    ContractKind::Policy
+                )
             ),
             "{kind}: {error:?}"
+        );
+        let rendered = format!(
+            "{error}\n{error:?}\n{}",
+            serde_json::to_string(&error).unwrap()
+        );
+        assert!(
+            !rendered.contains("d1d1d1d1d1d1d1d1"),
+            "{kind}: the refusal holds no part of the observed hash: {rendered}"
         );
 
         // Only the unknown flag: the reference is refused as mutable, and the
         // unknown-hash override applied before the refusal is written nowhere.
-        let result = pin_with(external_ref_responder(TAG, unknown), kind, false, true).await;
+        let (result, logs) = wallet_traced(pin_with(
+            external_ref_responder(TAG, unknown),
+            kind,
+            false,
+            true,
+        ));
         let error = result.expect_err(&format!("{kind}: mutable must refuse"));
+        assert!(
+            logs.contains("proceeding with --accept-unknown-verifier override"),
+            "{kind}: the override warning is captured: {logs}"
+        );
+        assert!(
+            mcp_error_envelope(&error).contains("_mutable\""),
+            "{kind}: the MCP envelope carries the wire code"
+        );
+        assert_refusal_holds_no_marker(&error, &logs, &markers, &[&resolved_summary(unknown)]);
         assert!(
             matches!(
                 (&error, kind),
@@ -451,7 +648,12 @@ async fn external_ref_outside_allowlist_needs_both_flags() {
         );
 
         // Both flags: installs, with both pending overrides and the pin.
-        let result = pin_with(external_ref_responder(TAG, unknown), kind, true, true).await;
+        let (result, _logs) = wallet_traced(pin_with(
+            external_ref_responder(TAG, unknown),
+            kind,
+            true,
+            true,
+        ));
         let pin_result = result.unwrap_or_else(|e| panic!("{kind}: both flags install: {e}"));
         assert!(
             pin_result.mutable_override && pin_result.unknown_override,
@@ -492,10 +694,22 @@ async fn external_ref_outside_allowlist_needs_both_flags() {
 /// identification is refused with `ExecutableChanged` whatever the flags: a
 /// different external reference, a reference replacing a Wasm executable,
 /// and a Wasm executable replacing a reference.
-#[tokio::test]
-async fn probe_observing_a_different_executable_is_refused_as_executable_changed() {
+///
+/// Each case is captured on its own and holds its probe-refusal event. No
+/// channel of the refusal names the contract, the resolved hash, whole or as
+/// its first eight bytes, or the summary of either executable.
+#[test]
+fn probe_observing_a_different_executable_is_refused_as_executable_changed() {
     for kind in [ContractKind::Verifier, ContractKind::Policy] {
         let allowlisted = allowlisted_hash(kind);
+        let allowlisted_full = hex::encode(allowlisted);
+        let allowlisted_first8 = hex::encode(&allowlisted[..8]);
+        let refused = contract_strkey();
+        let redacted = stellar_agent_core::observability::redact_strkey_first5_last5(&refused);
+        let reference_summary = resolved_summary(allowlisted);
+        let other_tag_summary = format!(
+            "external reference owner {OWNER_REDACTED} tag \"verifier-v2\" resolved {allowlisted_full}"
+        );
         let wasm_responder = || {
             KeyedLedgerEntriesResponder::new().with_entry(
                 xdr_fixtures::ledger_entry_from_response_json(
@@ -506,21 +720,24 @@ async fn probe_observing_a_different_executable_is_refused_as_executable_changed
                 ),
             )
         };
-        for (case, before, after) in [
+        for (case, before, after, summaries) in [
             (
                 "different tag",
                 external_ref_responder(TAG, allowlisted),
                 external_ref_responder(b"verifier-v2", allowlisted),
+                [reference_summary.as_str(), other_tag_summary.as_str()],
             ),
             (
                 "wasm became a reference",
                 wasm_responder(),
                 external_ref_responder(TAG, allowlisted),
+                ["wasm", reference_summary.as_str()],
             ),
             (
                 "reference became wasm",
                 external_ref_responder(TAG, allowlisted),
                 wasm_responder(),
+                [reference_summary.as_str(), "wasm"],
             ),
         ] {
             let responder = SwitchingResponder {
@@ -530,7 +747,7 @@ async fn probe_observing_a_different_executable_is_refused_as_executable_changed
                 switch_after: 2,
                 instance_requests: AtomicUsize::new(0),
             };
-            let result = pin_with(responder, kind, true, true).await;
+            let (result, logs) = wallet_traced(pin_with(responder, kind, true, true));
             let error = result.expect_err(&format!("{kind}, {case}: must refuse"));
             assert!(
                 matches!(
@@ -544,11 +761,30 @@ async fn probe_observing_a_different_executable_is_refused_as_executable_changed
                 ),
                 "{kind}, {case}: {error:?}"
             );
+            assert_eq!(
+                error.to_string(),
+                "verifier or policy address must identify a deployed contract with a supported, \
+                 resolvable Wasm executable; repair the deployment or select another contract.",
+                "{kind}, {case}"
+            );
             assert!(
-                error
-                    .to_string()
-                    .contains("executable changed during install"),
-                "{kind}, {case}: {error}"
+                logs.contains(
+                    "\"message\":\"pin_referenced_contracts: the mutability probe observed a \
+                     different executable than identification; refusing\""
+                ),
+                "{kind}, {case}: the probe-refusal event is captured: {logs}"
+            );
+            assert_refusal_holds_no_marker(
+                &error,
+                &logs,
+                &[
+                    &refused,
+                    &redacted,
+                    &allowlisted_full,
+                    &allowlisted_first8,
+                    "external reference owner",
+                ],
+                &summaries,
             );
         }
     }

@@ -74,8 +74,7 @@ impl std::fmt::Debug for RpcCredentialBinding {
 /// # Errors
 ///
 /// - The keyring errors of [`read_rpc_credential`]: `auth.keyring_not_found`
-///   naming `service/account`, the other keyring codes, and
-///   [`NetworkError::RpcCredentialInvalid`].
+///   the other keyring codes, and [`NetworkError::RpcCredentialInvalid`].
 /// - [`NetworkError::RpcCredentialUnusable`] when the credential cannot be
 ///   sent to the endpoint.
 /// - [`NetworkError::RpcUnreachable`] when the transport refuses the URL.
@@ -107,8 +106,7 @@ pub(crate) fn rpc_client(
 /// # Errors
 ///
 /// - The keyring errors of [`read_rpc_credential`]: `auth.keyring_not_found`
-///   naming `service/account`, the other keyring codes, and
-///   [`NetworkError::RpcCredentialInvalid`].
+///   the other keyring codes, and [`NetworkError::RpcCredentialInvalid`].
 /// - [`NetworkError::RpcCredentialUnusable`] when the credential cannot be
 ///   sent to the endpoint.
 /// - [`NetworkError::RpcUnreachable`] when the transport refuses the URL.
@@ -236,7 +234,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn binding_follows_its_role() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let profile = profile();
         for (role, url, account, placement) in [
             (ProviderRole::Primary, PRIMARY, "primary", header()),
@@ -292,6 +294,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn no_binding_makes_no_keyring_call() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _restore = RestoreStore::new();
         let reads = counted_store(Some("value"));
         let client = rpc_client(PRIMARY, None).unwrap();
@@ -307,6 +312,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn overridden_url_gets_no_credential() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _restore = RestoreStore::new();
         let reads = counted_store(None);
         let binding = RpcCredentialBinding::for_role(&profile(), ProviderRole::Primary).unwrap();
@@ -327,6 +335,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn equal_override_keeps_the_credential() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let _restore = RestoreStore::new();
         let reads = counted_store(Some("Bearer abc"));
         let profile = profile();
@@ -338,9 +349,9 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.code(), "auth.keyring_not_found");
-        assert!(
-            error.to_string().contains("stellar-agent-rpc-unit/oracle"),
-            "{error}"
+        assert_eq!(
+            error.to_string(),
+            "the configured keyring entry must exist; provision or select the required entry."
         );
         assert!(is_credential_error(&error));
     }
@@ -351,7 +362,7 @@ mod tests {
         use stellar_agent_core::profile::schema::RpcCredentialDefect;
         let credential = [
             WalletError::Auth(AuthError::KeyringNotFound {
-                name: "s/a".to_owned(),
+                cause: stellar_agent_core::error::KeyringMissingCause::MissingEntry,
             }),
             WalletError::Network(NetworkError::RpcCredentialInvalid {
                 entry: "s/a".to_owned(),
@@ -381,7 +392,11 @@ mod tests {
     /// `Debug` prints the authority of the URL, the entry, and the placement,
     /// and no path or query of the URL.
     #[test]
+    #[serial_test::serial]
     fn binding_debug_redacts_the_url() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut profile = profile();
         profile.rpc_url = "https://primary.example/PATH-SENTINEL?key=QUERY-SENTINEL".to_owned();
         let binding = RpcCredentialBinding::for_role(&profile, ProviderRole::Primary).unwrap();

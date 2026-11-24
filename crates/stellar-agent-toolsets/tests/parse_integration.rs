@@ -101,7 +101,7 @@ fn ac2_name_dir_mismatch_refused() {
     let dir = fixture("invalid-name-dir-mismatch/my-toolset");
     let err = parse_toolset(&dir).unwrap_err();
     assert!(
-        matches!(err, ToolsetFormatError::NameDirMismatch { .. }),
+        matches!(err, ToolsetFormatError::NameDirMismatch),
         "expected NameDirMismatch, got {err:?}"
     );
 }
@@ -144,7 +144,7 @@ fn ac4_unknown_token_refused() {
     let dir = fixture("invalid-capability-unknown/unknown-cap");
     let err = parse_toolset(&dir).unwrap_err();
     assert!(
-        matches!(err, ToolsetFormatError::UnknownCapability { .. }),
+        matches!(err, ToolsetFormatError::UnknownCapability),
         "expected UnknownCapability, got {err:?}"
     );
 }
@@ -200,7 +200,7 @@ fn ac6_sign_transaction_uppercase_refused_at_charset_gate() {
 
     let err = parse_toolset(&toolset_dir).unwrap_err();
     assert!(
-        matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar { .. }),
+        matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar),
         "expected CapabilityTokenInvalidChar for 'Sign-Transaction', got {err:?}"
     );
 }
@@ -220,7 +220,7 @@ fn ac6_sign_transaction_all_caps_refused_at_charset_gate() {
 
     let err = parse_toolset(&toolset_dir).unwrap_err();
     assert!(
-        matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar { .. }),
+        matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar),
         "expected CapabilityTokenInvalidChar for 'SIGN-TRANSACTION', got {err:?}"
     );
 }
@@ -240,7 +240,7 @@ fn ac6_sign_transaction_underscore_refused_at_charset_gate() {
 
     let err = parse_toolset(&toolset_dir).unwrap_err();
     assert!(
-        matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar { .. }),
+        matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar),
         "expected CapabilityTokenInvalidChar for 'sign_transaction', got {err:?}"
     );
 }
@@ -284,7 +284,7 @@ fn ac6_sign_transaction_unicode_homoglyph_refused_at_charset_gate() {
 
     let err = parse_toolset(&toolset_dir).unwrap_err();
     assert!(
-        matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar { .. }),
+        matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar),
         "expected CapabilityTokenInvalidChar for homoglyph token, got {err:?}"
     );
 }
@@ -307,7 +307,7 @@ fn ac7_duplicate_capability_key_refused() {
 
     let err = parse_toolset(&toolset_dir).unwrap_err();
     assert!(
-        matches!(err, ToolsetFormatError::DuplicateKey { .. }),
+        matches!(err, ToolsetFormatError::DuplicateKey),
         "expected DuplicateKey, got {err:?}"
     );
 }
@@ -317,7 +317,7 @@ fn ac7_duplicate_top_level_key_refused() {
     let dir = fixture("invalid-duplicate-key/dup-key");
     let err = parse_toolset(&dir).unwrap_err();
     assert!(
-        matches!(err, ToolsetFormatError::DuplicateKey { .. }),
+        matches!(err, ToolsetFormatError::DuplicateKey),
         "expected DuplicateKey, got {err:?}"
     );
 }
@@ -327,7 +327,7 @@ fn ac7_reserved_metadata_key_refused() {
     let dir = fixture("invalid-reserved-metadata-key/reserved-key");
     let err = parse_toolset(&dir).unwrap_err();
     assert!(
-        matches!(err, ToolsetFormatError::ReservedMetadataKey { .. }),
+        matches!(err, ToolsetFormatError::ReservedMetadataKey),
         "expected ReservedMetadataKey, got {err:?}"
     );
 }
@@ -337,7 +337,7 @@ fn ac7_capability_invalid_char_refused() {
     let dir = fixture("invalid-capability-invalid-char/bad-char-cap");
     let err = parse_toolset(&dir).unwrap_err();
     assert!(
-        matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar { .. }),
+        matches!(err, ToolsetFormatError::CapabilityTokenInvalidChar),
         "expected CapabilityTokenInvalidChar, got {err:?}"
     );
 }
@@ -517,7 +517,7 @@ fn ac9_newline_in_error_token_sanitised() {
 }
 
 #[test]
-fn ac9_10kb_token_truncated_in_error_display() {
+fn ac9_10kb_token_stays_out_of_the_error_display() {
     use std::io::Write;
     let tmp = tempfile::TempDir::new().unwrap();
     let toolset_dir = tmp.path().join("test-toolset");
@@ -531,19 +531,68 @@ fn ac9_10kb_token_truncated_in_error_display() {
     )
     .unwrap();
 
-    if let Err(e) = parse_toolset(&toolset_dir) {
-        let rendered = e.to_string();
-        // The rendered error must not be more than ~300 chars (256 + overhead).
-        assert!(
-            rendered.len() <= 512,
-            "large token not truncated in error: len={}",
-            rendered.len()
-        );
-        // Must end with the ellipsis marker if truncated.
-        assert!(
-            rendered.contains('\u{2026}'),
-            "truncated error should contain ellipsis: {rendered}"
-        );
+    assert_eq!(
+        parse_toolset(&toolset_dir).unwrap_err().to_string(),
+        "capability token must name a capability in the recognized taxonomy"
+    );
+}
+
+/// Writes `frontmatter` as the `TOOLSET.md` of a directory named `dir`.
+fn toolset_with(dir: &str, frontmatter: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let toolset_dir = tmp.path().join(dir);
+    std::fs::create_dir_all(&toolset_dir).unwrap();
+    std::fs::write(
+        toolset_dir.join("TOOLSET.md"),
+        format!("---\n{frontmatter}---\n"),
+    )
+    .unwrap();
+    (tmp, toolset_dir)
+}
+
+/// Each refusal of frontmatter content states the rule, with no form of the
+/// refused key, name or token.
+#[test]
+fn refused_frontmatter_values_stay_out_of_the_error() {
+    const HEAD: &str = "name: test-toolset\ndescription: test\n";
+    let cases = [
+        (
+            format!("{HEAD}metadata:\n  credmarker7:\n    inner: value\n"),
+            "TOOLSET.md frontmatter is malformed YAML: a metadata value must be a string, not a \
+             mapping or sequence",
+        ),
+        (
+            format!("{HEAD}metadata:\n  credmarker7:\n    - value\n"),
+            "TOOLSET.md frontmatter is malformed YAML: a metadata value must be a string, not a \
+             mapping or sequence",
+        ),
+        (
+            format!("{HEAD}metadata:\n  credmarker7: a\n  credmarker7: b\n"),
+            "TOOLSET.md frontmatter must contain each mapping key only once",
+        ),
+        (
+            format!("{HEAD}metadata:\n  stellar-agent-credmarker7: a\n"),
+            "TOOLSET.md metadata keys using the 'stellar-agent-' prefix must be recognized wallet \
+             keys",
+        ),
+        (
+            format!("{HEAD}metadata:\n  stellar-agent-capabilities: \"credmarker7!\"\n"),
+            "capability token must contain only characters from [a-z0-9-]",
+        ),
+        (
+            format!("{HEAD}metadata:\n  stellar-agent-capabilities: \"credmarker7\"\n"),
+            "capability token must name a capability in the recognized taxonomy",
+        ),
+        (
+            "name: credmarker7\ndescription: test\n".to_owned(),
+            "TOOLSET.md 'name' must match the toolset directory name",
+        ),
+    ];
+    for (frontmatter, expected) in cases {
+        let (_tmp, toolset_dir) = toolset_with("test-toolset", &frontmatter);
+        let err = parse_toolset(&toolset_dir).unwrap_err();
+        assert_eq!(err.to_string(), expected);
+        assert!(!format!("{err:?}").contains("credmarker7"), "{err:?}");
     }
 }
 
@@ -664,7 +713,7 @@ fn unknown_map_then_reserved_metadata_key_refused() {
 
     let err = parse_toolset(&toolset_dir).unwrap_err();
     assert!(
-        matches!(err, ToolsetFormatError::ReservedMetadataKey { .. }),
+        matches!(err, ToolsetFormatError::ReservedMetadataKey),
         "expected ReservedMetadataKey; got {err:?}"
     );
 }
@@ -805,20 +854,17 @@ fn error_display_io_is_sanitised() {
 }
 
 #[test]
-fn error_display_duplicate_key_sanitised() {
-    let err = ToolsetFormatError::DuplicateKey {
-        key: "key\x1b[31mred\x1b[0m".to_owned(),
-    };
-    let s = err.to_string();
-    assert!(!s.contains('\x1b'), "ANSI escape leaked: {s:?}");
+fn error_display_duplicate_key_states_the_rule() {
+    assert_eq!(
+        ToolsetFormatError::DuplicateKey.to_string(),
+        "TOOLSET.md frontmatter must contain each mapping key only once"
+    );
 }
 
 #[test]
-fn error_display_unknown_capability_sanitised() {
-    let err = ToolsetFormatError::UnknownCapability {
-        token: "tok\ninjection".to_owned(),
-    };
-    let s = err.to_string();
-    // The rendered error must be a single line (no newline injection).
-    assert!(s.lines().count() == 1, "newline injected into error: {s:?}");
+fn error_display_unknown_capability_states_the_rule() {
+    assert_eq!(
+        ToolsetFormatError::UnknownCapability.to_string(),
+        "capability token must name a capability in the recognized taxonomy"
+    );
 }

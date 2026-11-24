@@ -24,7 +24,7 @@
 )]
 
 use stellar_agent_core::error::{NetworkError, WalletError};
-use stellar_agent_network::{Asset, StellarRpcClient, fetch_account};
+use stellar_agent_network::{Asset, AssetType, StellarRpcClient, fetch_account};
 
 const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
@@ -56,7 +56,8 @@ async fn live_fetch_funded_account_returns_native_balance() {
         "funded account must have at least one balance"
     );
     assert_eq!(
-        account.balances[0].asset.asset_type, "native",
+        account.balances[0].asset.asset_type,
+        AssetType::Native,
         "first balance must be native XLM"
     );
     // Balance must be a positive decimal.
@@ -123,7 +124,8 @@ async fn live_fetch_trustline_not_held_is_omitted() {
         "funded account must have at least one balance"
     );
     assert_eq!(
-        account.balances[0].asset.asset_type, "native",
+        account.balances[0].asset.asset_type,
+        AssetType::Native,
         "first balance must be native XLM"
     );
 
@@ -131,7 +133,7 @@ async fn live_fetch_trustline_not_held_is_omitted() {
     let usdc_present = account
         .balances
         .iter()
-        .any(|b| b.asset.asset_type == "USDC");
+        .any(|b| b.asset.code.as_deref() == Some("USDC"));
     assert!(
         !usdc_present,
         "USDC trustline should be absent for an account that does not hold it"

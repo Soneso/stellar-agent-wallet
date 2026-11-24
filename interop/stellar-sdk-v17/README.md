@@ -10,8 +10,7 @@ Pins:
 - Node `24.5.0`
 - pnpm `10.33.0`
 
-The SDK is Apache-2.0 licensed as recorded in the frozen lockfile package
-metadata. The fixtures and the live driver use only public SDK exports.
+The SDK is Apache-2.0 licensed as declared in its package manifest. The fixtures and the live driver use only public SDK exports.
 
 Contents:
 

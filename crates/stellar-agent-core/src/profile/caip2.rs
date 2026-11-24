@@ -181,7 +181,7 @@ impl FromStr for Caip2 {
         match s {
             "stellar:testnet" => Ok(Self::Testnet),
             "stellar:mainnet" => Ok(Self::Mainnet),
-            other => Err(Caip2ParseError::Unknown(other.to_owned())),
+            _ => Err(Caip2ParseError::Unknown),
         }
     }
 }
@@ -192,12 +192,11 @@ impl FromStr for Caip2 {
 pub enum Caip2ParseError {
     /// The CAIP-2 string was not recognised.
     ///
-    /// Supported values: `stellar:testnet` and `stellar:mainnet`.
-    #[error(
-        "unknown CAIP-2 chain ID '{0}'; supported values: \
-         stellar:testnet, stellar:mainnet"
-    )]
-    Unknown(String),
+    /// Supported values: `stellar:testnet` and `stellar:mainnet`. The
+    /// refused string is not stored: it can come from a file or a tool
+    /// argument that holds other text.
+    #[error("unknown CAIP-2 chain ID; supported values: stellar:testnet, stellar:mainnet")]
+    Unknown,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -224,6 +223,10 @@ pub enum Caip2ParseError {
 /// # Examples
 ///
 /// ```
+/// # #[serial_test::serial]
+/// # fn main() {
+/// # let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+/// # let _storage_home = stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
 /// use stellar_agent_core::profile::caip2::validate_chain_id_matches_profile;
 /// use stellar_agent_core::profile::schema::Profile;
 ///
@@ -231,6 +234,7 @@ pub enum Caip2ParseError {
 /// assert!(validate_chain_id_matches_profile("stellar:testnet", &profile).is_ok());
 /// assert!(validate_chain_id_matches_profile("stellar:mainnet", &profile).is_err());
 /// assert!(validate_chain_id_matches_profile("invalid", &profile).is_err());
+/// # }
 /// ```
 pub fn validate_chain_id_matches_profile(
     chain_id_arg: &str,
@@ -325,8 +329,15 @@ mod tests {
     #[test]
     fn from_str_unknown_is_error() {
         let err = Caip2::from_str("stellar:futurenet").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("stellar:futurenet"), "error: {msg}");
+        assert_eq!(
+            err.to_string(),
+            "unknown CAIP-2 chain ID; supported values: stellar:testnet, stellar:mainnet"
+        );
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains("futurenet"), "{rendered}");
+        let wrapped = ChainIdValidationError::from(err);
+        let rendered = format!("{wrapped} {wrapped:?}");
+        assert!(!rendered.contains("futurenet"), "{rendered}");
     }
 
     #[test]
@@ -390,7 +401,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn validate_chain_id_testnet_matches_testnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(
             validate_chain_id_matches_profile("stellar:testnet", &testnet_profile()).is_ok(),
             "testnet chain_id must match testnet profile"
@@ -398,7 +413,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn validate_chain_id_mainnet_matches_mainnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(
             validate_chain_id_matches_profile("stellar:mainnet", &mainnet_profile()).is_ok(),
             "mainnet chain_id must match mainnet profile"
@@ -406,7 +425,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn validate_chain_id_mismatch_testnet_arg_mainnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let result = validate_chain_id_matches_profile("stellar:testnet", &mainnet_profile());
         assert!(
             matches!(result, Err(ChainIdValidationError::Mismatch { .. })),
@@ -415,7 +438,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn validate_chain_id_mismatch_mainnet_arg_testnet_profile() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let result = validate_chain_id_matches_profile("stellar:mainnet", &testnet_profile());
         assert!(
             matches!(result, Err(ChainIdValidationError::Mismatch { .. })),
@@ -424,7 +451,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn validate_chain_id_invalid_caip2_string() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let result = validate_chain_id_matches_profile("invalid-caip2", &testnet_profile());
         assert!(
             matches!(result, Err(ChainIdValidationError::ParseError(_))),
@@ -433,7 +464,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn validate_chain_id_mismatch_error_message_contains_both_values() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let result = validate_chain_id_matches_profile("stellar:testnet", &mainnet_profile());
         let msg = result.unwrap_err().to_string();
         assert!(

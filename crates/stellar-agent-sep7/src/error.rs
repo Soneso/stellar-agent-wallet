@@ -32,11 +32,11 @@ pub enum Sep7Error {
     },
 
     /// The operation after `web+stellar:` is not `tx` or `pay`.
-    #[error("unknown SEP-7 operation: {operation:?}; expected 'tx' or 'pay'")]
-    UnknownOperation {
-        /// The unrecognised operation token.
-        operation: String,
-    },
+    ///
+    /// The token is part of the refused URI, so the error names only the
+    /// accepted operations.
+    #[error("unknown SEP-7 operation; expected 'tx' or 'pay'")]
+    UnknownOperation,
 
     /// A required parameter was absent.
     ///

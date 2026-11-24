@@ -20,8 +20,6 @@
     reason = "test-only; equivalence is asserted via panic-on-violation"
 )]
 
-use std::process::Command;
-
 use serde_json::Value;
 
 /// A profile name that cannot exist on any host, so both invocations resolve to
@@ -32,7 +30,10 @@ const MISSING_PROFILE: &str = "__issue66_show_equivalence_missing_profile__";
 /// returns `(exit_code, parsed_stdout_json)`.
 fn run_show(extra_args: &[&str]) -> (i32, Value) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
-    let output = Command::new(bin_path)
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().expect("fixture directory");
+    let output = stellar_agent_test_support::cli_child::cli_command(bin_path, home.path())
+        .expect("isolated CLI child")
+        .env("STELLAR_AGENT_HOME", home.path())
         .args(["profile", "show"])
         .args(extra_args)
         // Never touch the login keychain: force the headless backend. `show`

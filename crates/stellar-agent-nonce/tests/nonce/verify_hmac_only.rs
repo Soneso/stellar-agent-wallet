@@ -25,7 +25,7 @@
 
 use keyring_core::mock;
 use serial_test::serial;
-use stellar_agent_nonce::{NonceError, NonceMint, NonceVerifyHmacOnlyRequest, ReplayWindow};
+use stellar_agent_nonce::{Nonce, NonceError, NonceMint, NonceVerifyHmacOnlyRequest, ReplayWindow};
 
 use crate::helpers::{
     StaticCatalogue, far_future_expiry, init_mock, make_profile, now_before_expiry, seed_key,
@@ -40,6 +40,9 @@ use crate::helpers::{
 #[test]
 #[serial]
 fn verify_hmac_only_happy_path_then_record() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA1u8; 32];
     let profile = make_profile("vho-happy");
@@ -92,6 +95,9 @@ fn verify_hmac_only_happy_path_then_record() {
 #[test]
 #[serial]
 fn record_verified_nonce_returns_replayed_on_duplicate() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA2u8; 32];
     let profile = make_profile("vho-replay");
@@ -139,6 +145,9 @@ fn record_verified_nonce_returns_replayed_on_duplicate() {
 #[test]
 #[serial]
 fn verify_hmac_only_returns_expired_when_now_at_expiry() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA3u8; 32];
     let profile = make_profile("vho-expired");
@@ -185,6 +194,9 @@ fn verify_hmac_only_returns_expired_when_now_at_expiry() {
 #[test]
 #[serial]
 fn verify_hmac_only_returns_expired_when_now_past_expiry() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA4u8; 32];
     let profile = make_profile("vho-expired-past");
@@ -233,6 +245,9 @@ fn verify_hmac_only_returns_expired_when_now_past_expiry() {
 #[test]
 #[serial]
 fn verify_hmac_only_returns_chain_mismatch() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA5u8; 32];
     let profile = make_profile("vho-chain");
@@ -265,16 +280,18 @@ fn verify_hmac_only_returns_chain_mismatch() {
             now_unix_ms: now,
         })
         .expect_err("wrong chain_id must return ChainMismatch");
+    assert_eq!(
+        err.to_string(),
+        "chain_id must match the configured profile chain; expected stellar:testnet"
+    );
+    assert_eq!(err.wire_code(), "nonce.chain_mismatch");
 
     assert!(
         matches!(
             err,
-            NonceError::ChainMismatch {
-                ref expected,
-                ref got,
-            } if expected == "stellar:testnet" && got == "stellar:mainnet"
+            NonceError::ChainMismatch { ref expected } if expected == "stellar:testnet"
         ),
-        "expected ChainMismatch(testnet, mainnet), got: {err:?}"
+        "expected ChainMismatch(testnet), got: {err:?}"
     );
 }
 
@@ -285,6 +302,9 @@ fn verify_hmac_only_returns_chain_mismatch() {
 #[test]
 #[serial]
 fn verify_hmac_only_returns_hmac_mismatch_on_tampered_envelope() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA6u8; 32];
     let profile = make_profile("vho-hmac-env");
@@ -330,6 +350,9 @@ fn verify_hmac_only_returns_hmac_mismatch_on_tampered_envelope() {
 #[test]
 #[serial]
 fn verify_hmac_only_returns_hmac_mismatch_on_tool_substitution() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA7u8; 32];
     let profile = make_profile("vho-hmac-tool");
@@ -376,6 +399,9 @@ fn verify_hmac_only_returns_hmac_mismatch_on_tool_substitution() {
 #[test]
 #[serial]
 fn verify_hmac_only_returns_hmac_mismatch_on_corrupted_tag() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA8u8; 32];
     let profile = make_profile("vho-hmac-corrupt");
@@ -431,6 +457,9 @@ fn verify_hmac_only_returns_hmac_mismatch_on_corrupted_tag() {
 #[test]
 #[serial]
 fn verify_hmac_only_propagates_keyring_error_on_get_password_failure() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     init_mock();
     let key = [0xA9u8; 32];
     let profile = make_profile("vho-keyring-err");
@@ -482,4 +511,37 @@ fn verify_hmac_only_propagates_keyring_error_on_get_password_failure() {
         matches!(err, NonceError::KeyringError(_)),
         "expected KeyringError, got: {err:?}"
     );
+}
+
+/// A supplied nonce the HMAC check refuses shows only the redaction in its
+/// `Debug` form; the leading bytes spell a marker in hex.
+#[test]
+#[serial]
+fn refused_nonce_debug_holds_no_byte() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    init_mock();
+    let profile = make_profile("vho-refused-debug");
+    seed_key(&profile, &[0xA7; 32]);
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
+    let mut bytes = [0u8; 48];
+    bytes[..4].copy_from_slice(&[0x63, 0x72, 0x65, 0x64]);
+    let nonce = Nonce::from_raw(bytes);
+
+    let err = mint
+        .verify_hmac_only(NonceVerifyHmacOnlyRequest {
+            nonce: &nonce,
+            envelope_xdr: b"xdr",
+            expiry_unix_ms: far_future_expiry(),
+            tool_name: "stellar_pay",
+            chain_id: "stellar:testnet",
+            now_unix_ms: now_before_expiry(),
+        })
+        .expect_err("a forged tag is refused");
+
+    assert!(matches!(err, NonceError::HmacMismatch), "{err:?}");
+    let debug = format!("{nonce:?}");
+    assert_eq!(debug, "Nonce([REDACTED])");
+    assert!(!debug.contains("63726564"), "{debug}");
 }

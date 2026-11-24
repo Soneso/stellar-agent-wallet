@@ -5,41 +5,21 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "MCP stdio server for the Stellar agent wallet. Tools are registered at link time via the #[mcp_tool_router]/#[mcp_tool_item] macro pair (stellar-agent-mcp-macros) with inventory-based discovery."
+description = "MCP stdio server library for the Stellar agent wallet, run by the stellar-agent executable of stellar-agent-cli. Tools are registered at link time via the #[mcp_tool_router]/#[mcp_tool_item] macro pair (stellar-agent-mcp-macros) with inventory-based discovery."
 readme = "README.md"
 keywords = ["stellar", "mcp", "ai-agent", "wallet", "soroban"]
 categories = ["cryptography::cryptocurrencies", "command-line-utilities"]
+# The package is a library; the stellar-agent executable of stellar-agent-cli
+# runs the server. No file in src/ becomes an executable target.
+autobins = false
 
 [lib]
 name = "stellar_agent_mcp"
 path = "src/lib.rs"
 
-[[bin]]
-name = "stellar-agent-mcp"
-path = "src/main.rs"
-
-# `cargo binstall stellar-agent-mcp` support. The CLI and MCP binaries share a
-# single release archive; `{ bin }` resolves to `stellar-agent-mcp` here via the
-# `[[bin]]` declaration above. binstall installs this repository's release
-# archive for the host's target, or for a compatible target the host runs, such
-# as the x86_64 Windows archive under emulation. `disabled-strategies`, read by
-# cargo-binstall 1.8.0 and later, turns off the third-party binary host and the
-# source build, so binstall fails when no such archive exists; `cargo install
-# --locked` or a source build applies there. binstall checks the download over
-# TLS only, with no signature; the README "Verifying a release" section covers
-# signature and provenance checks.
-[package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/stellar-agent-{ version }-{ target }.tar.xz"
-pkg-fmt = "txz"
-bin-dir = "stellar-agent-{ version }-{ target }/{ bin }{ binary-ext }"
-disabled-strategies = ["quick-install", "compile"]
-
-[package.metadata.binstall.overrides.'cfg(target_os = "windows")']
-pkg-url = "{ repo }/releases/download/v{ version }/stellar-agent-{ version }-{ target }.zip"
-pkg-fmt = "zip"
-
 [dependencies]
 stellar-agent-core       = { workspace = true }
+stellar-agent-xdr-limits = { workspace = true }
 stellar-agent-network    = { workspace = true }
 stellar-agent-mpp        = { workspace = true }
 # Smart-account rules observability — SignersManager / ContextRuleManager for
@@ -106,8 +86,9 @@ inventory = { workspace = true }
 stellar-strkey = { workspace = true }
 
 # MCP server framework. The default IntoTransport adapter is not used; the
-# transport is an AsyncRwTransport constructed with an explicit
-# JsonRpcMessageCodec::new_with_max_length (1 MiB) at the transport site in main.rs.
+# transport is the wallet's own BoundedTransport in transport.rs, built with
+# JsonRpcMessageCodec::new_with_max_length (1 MiB), which entry.rs serves
+# through.
 rmcp      = { workspace = true }
 schemars  = { workspace = true }
 
@@ -129,14 +110,18 @@ uuid = { workspace = true }
 # URL parsing for secondary override validation in server.rs.
 url = { workspace = true }
 
-# Codec framing for the bounded max-line transport (FramedRead / FramedWrite).
+# Codec and framed writer of the bounded max-line transport (Decoder /
+# FramedWrite, BytesMut), and the session's CancellationToken.
 tokio-util = { workspace = true }
 
-# SinkExt + StreamExt traits for the bounded stdio transport.
+# SinkExt and poll_fn for the bounded stdio transport.
 futures = { workspace = true }
 
-# Tokio async runtime — `rt-multi-thread` for the MCP stdio server.
-tokio = { workspace = true, features = ["rt-multi-thread", "io-std"] }
+# Tokio async runtime: `rt-multi-thread` for the MCP stdio server, `signal` and
+# `time` for the shutdown that drains the audit outbox before exit. The shutdown
+# runs on SIGINT and SIGTERM on Unix, and on Ctrl-C, Ctrl-Break, and console
+# close on Windows; a second event exits with code 3.
+tokio = { workspace = true, features = ["rt-multi-thread", "io-std", "signal", "time"] }
 
 # Raw prctl(2) on Linux for process isolation; #[cfg(target_os = "linux")] only,
 # a zero-dep no-op on macOS/Windows.
@@ -161,22 +146,39 @@ zeroize = { workspace = true }
 # process-local tracker into DefiAdapterCtx for the DeFi adapter submit paths.
 async-trait = { workspace = true }
 
+# The native console close handler on Windows: `SetConsoleCtrlHandler` and
+# `CTRL_CLOSE_EVENT`. It forwards the close event to the shutdown supervisor and
+# blocks, because Windows ends the process when that handler returns.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }
+
 [dev-dependencies]
+# test-helpers exposes the install encoder for snapshot reconstruction checks.
+stellar-agent-smart-account = { path = "../stellar-agent-smart-account", features = ["test-helpers"] }
+toml_edit = { workspace = true }
 stellar-agent-toolsets-runtime = { path = "../stellar-agent-toolsets-runtime", features = ["test-helpers"] }
+# write_toolset_for_test writes the tagged install records the toolset suites
+# read through the server.
+stellar-agent-toolsets-install = { path = "../stellar-agent-toolsets-install", features = ["test-helpers"] }
 # Path-only self-reference: enables this crate's own test features for its tests
 # and is stripped from the published manifest like every internal dev-dependency.
-stellar-agent-mcp = { path = ".", features = ["test-helpers"] }
+# Its default stays off here, so a --no-default-features run stays off.
+stellar-agent-mcp = { path = ".", default-features = false, features = ["test-helpers"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 # test-hooks counts StellarRpcClient constructions, so the tool tests can show
-# which clients a prepare or commit call builds.
-stellar-agent-network = { path = "../stellar-agent-network", features = ["test-loopback", "test-hooks"] }
+# which clients a prepare or commit call builds. test-helpers places window
+# stores at explicit paths in the accounting delivery tests.
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-loopback", "test-hooks", "test-helpers"] }
 stellar-agent-nonce = { path = "../stellar-agent-nonce", features = ["test-helpers"] }
+# The SEP-10 prepare step, the authorized completion and its signing hooks for
+# the authenticated x402 mainnet tests.
+stellar-agent-sep10 = { path = "../stellar-agent-sep10", features = ["test-helpers"] }
 tempfile                   = { workspace = true }
 tokio                      = { workspace = true, features = ["rt-multi-thread", "process", "io-util", "time", "sync", "test-util"] }
 regex-lite                 = { workspace = true }
 # The loopback approval-inbox server, driven over real HTTP in the
 # approve-serve testnet acceptance test (gated behind testnet-acceptance).
-stellar-agent-approval-ui = { path = "../stellar-agent-approval-ui" }
+stellar-agent-approval-ui = { path = "../stellar-agent-approval-ui", features = ["test-helpers"] }
 serde_json                 = { workspace = true }
 # registry_walk.rs iterates McpToolRegistration records and cross-checks the
 # rmcp ToolRouter.
@@ -187,6 +189,10 @@ inventory                  = { workspace = true }
 # through dispatch_gate_inner's window-state refresh/record and need the
 # persisted store isolated to a temp dir instead of the real OS state dir.
 stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
+# The headless keyring store the binary-spawn halt tests install in-process and
+# point the child at with STELLAR_AGENT_KEYRING_BACKEND=headless-env.
+# test-helpers makes the child resolve headless-keyring/store.keyring under STELLAR_AGENT_HOME.
+stellar-agent-headless-keyring = { path = "../stellar-agent-headless-keyring", features = ["test-helpers"] }
 stellar-agent-mcp-macros = { path = "../stellar-agent-mcp-macros" }
 # Wiremock for the friendbot + balances handler tests.
 wiremock                   = { workspace = true }
@@ -207,6 +213,9 @@ ed25519-dalek              = { workspace = true }
 zeroize                    = { workspace = true }
 # x402 wire types + XDR decode in the testnet acceptance tests.
 stellar-agent-x402 = { path = "../stellar-agent-x402" }
+# Builds the authorization-entry preimages the mainnet signing-boundary tests
+# sign.
+stellar-agent-soroban-auth = { workspace = true }
 stellar-strkey             = { workspace = true }
 stellar-xdr                = { workspace = true }
 # SHA-256 for HashIdPreimage construction in the x402 / claim testnet
@@ -217,21 +226,52 @@ stellar-xdr                = { workspace = true }
 # fixture with stellar-baselib.
 stellar-baselib            = { workspace = true }
 
+# The pseudoconsole host of the Windows console-event tests: pipes,
+# `CreatePseudoConsole` and `ClosePseudoConsole`, process creation, and
+# process waits. It also reads the inherited environment and compares its
+# names ordinally.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Environment",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 [features]
-# Exposes call_stellar_* test helpers used by the integration tests and the
-# binary smoke-test harness. Must NOT be enabled in production builds.
-test-helpers = [
+# On by default, so release, cargo install and source builds carry it, and
+# --version reports its state. --no-default-features builds without it.
+# A dependent of the library sets default-features = false to leave it off.
+default = ["mainnet-write"]
+# Enables mainnet-write in core, network, sep43, x402 and x402-identity.
+mainnet-write = [
+    "stellar-agent-core/mainnet-write",
+    "stellar-agent-network/mainnet-write",
+    "stellar-agent-sep43/mainnet-write",
+    "stellar-agent-x402/mainnet-write",
+    "stellar-agent-x402-identity/mainnet-write",
+]
+
+# Exposes call_stellar_* test helpers used by the integration tests and by the
+# server-child tests, which run the stellar-agent executable built with them.
+# Must NOT be enabled in production builds.
+test-helpers = ["stellar-agent-network/test-hooks",
     # Enable GatedInvokeParams override fields (approval_dir_override,
     # grant_store_path_override) used by the toolsets.rs test-helpers block.
     "stellar-agent-toolsets-runtime/test-helpers",
+    # The SEP-10 transport seam of the authorized counterparty gate.
+    "stellar-agent-x402-identity/test-helpers",
 ]
 # Gate end-to-end testnet acceptance tests that require a live Friendbot + RPC.
 # These tests are NOT run under default `cargo test`; invoke with:
-#   cargo test -p stellar-agent-mcp --features testnet-acceptance \
+#   cargo test -p stellar-agent-mcp --no-default-features --features testnet-acceptance \
 #     --test sep43_sign_and_submit_transaction_testnet_acceptance
 # This feature is CI/dev-only and MUST NOT be enabled in any release-artefact
 # feature set.
-testnet-acceptance = ["stellar-agent-test-support/testnet-helpers"]
+testnet-acceptance = ["stellar-agent-test-support/testnet-helpers", "stellar-agent-network/test-hooks"]
 
 # The live testnet suites build only with `testnet-acceptance`, so an offline
 # test run never links them.

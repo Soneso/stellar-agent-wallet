@@ -1,5 +1,13 @@
 //! Offline integration tests for the Stellar agent CLI.
 
+#[path = "../src/common/approval_fixture.rs"]
+mod approval_fixture;
+
+#[path = "cli/unified_dispatch.rs"]
+mod unified_dispatch;
+#[path = "cli/unified_protocol.rs"]
+mod unified_protocol;
+
 #[path = "cli/advisory_no_network_deps.rs"]
 mod advisory_no_network_deps;
 #[path = "cli/approval_attestation_binding.rs"]
@@ -12,18 +20,31 @@ mod audit_binding_cli;
 mod audit_path_discipline;
 #[path = "cli/audit_verify_codes.rs"]
 mod audit_verify_codes;
+#[path = "cli/classic_ledger.rs"]
+mod classic_ledger;
 #[path = "cli/consent_drain_source_order.rs"]
 mod consent_drain_source_order;
 #[path = "cli/cross_check_witness.rs"]
 mod cross_check_witness;
+#[cfg(all(unix, feature = "test-helpers"))]
+#[path = "cli/dedicated_user.rs"]
+mod dedicated_user;
 #[path = "cli/endpoint_identity_ordering.rs"]
 mod endpoint_identity_ordering;
+#[path = "cli/fee_reserve_boundary.rs"]
+mod fee_reserve_boundary;
+#[path = "cli/fees_stats_endpoint_rules.rs"]
+mod fees_stats_endpoint_rules;
 #[path = "cli/fresh_v1_ceremony.rs"]
 mod fresh_v1_ceremony;
 #[path = "cli/halt_check_discipline.rs"]
 mod halt_check_discipline;
 #[path = "cli/keyring_classification_discipline.rs"]
 mod keyring_classification_discipline;
+#[path = "cli/mainnet_oracle_required.rs"]
+mod mainnet_oracle_required;
+#[path = "cli/mainnet_presence.rs"]
+mod mainnet_presence;
 #[path = "cli/mpp_authorize_preview_parity.rs"]
 mod mpp_authorize_preview_parity;
 #[path = "cli/mpp_first_run_vs_unavailable_state.rs"]
@@ -32,10 +53,13 @@ mod mpp_first_run_vs_unavailable_state;
 mod multicall_policy;
 #[path = "cli/output_failure_exit_code.rs"]
 mod output_failure_exit_code;
-#[path = "cli/owner_key_sweep_cli.rs"]
-mod owner_key_sweep_cli;
+#[path = "cli/owner_key_older_form_cli.rs"]
+mod owner_key_older_form_cli;
 #[path = "cli/pool_init_lifecycle.rs"]
 mod pool_init_lifecycle;
+#[cfg(target_os = "linux")]
+#[path = "cli/process_hardening.rs"]
+mod process_hardening;
 #[path = "cli/profile_env_var_resolution.rs"]
 mod profile_env_var_resolution;
 #[path = "cli/profile_flag_discipline.rs"]
@@ -60,6 +84,10 @@ mod profile_show_load_failure_codes;
 mod profile_show_profile_flag_equivalence;
 #[path = "cli/reconcile_pass_discipline.rs"]
 mod reconcile_pass_discipline;
+#[path = "cli/rejected_input.rs"]
+mod rejected_input;
+#[path = "cli/rejected_input_events.rs"]
+mod rejected_input_events;
 #[path = "cli/rpc_credential_cli.rs"]
 mod rpc_credential_cli;
 #[path = "cli/rpc_error_text_redaction.rs"]
@@ -68,12 +96,16 @@ mod rpc_error_text_redaction;
 mod smart_account_signer_free;
 #[path = "cli/staged_submit_probe_ordering.rs"]
 mod staged_submit_probe_ordering;
+#[path = "cli/trustline_held_reserve.rs"]
+mod trustline_held_reserve;
 #[path = "cli/tx_receipt_clear_integration.rs"]
 mod tx_receipt_clear_integration;
 #[path = "cli/usage_error_envelope.rs"]
 mod usage_error_envelope;
 #[path = "cli/v1_ceremony.rs"]
 mod v1_ceremony;
+#[path = "cli/version_marker.rs"]
+mod version_marker;
 
 #[path = "cli/profile_counterparty_key.rs"]
 mod profile_counterparty_key;
@@ -81,3 +113,13 @@ mod profile_counterparty_key;
 mod profile_key_scope;
 #[path = "cli/profile_window_reset.rs"]
 mod profile_window_reset;
+
+#[path = "cli/tx_status_wire_guard.rs"]
+mod tx_status_wire_guard;
+#[path = "cli/value_verb_wire_guard.rs"]
+mod value_verb_wire_guard;
+
+#[path = "cli/proof_row_claims.rs"]
+mod proof_row_claims;
+#[path = "cli/proof_rows.rs"]
+mod proof_rows;

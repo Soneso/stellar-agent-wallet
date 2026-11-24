@@ -46,6 +46,19 @@
 
 use stellar_agent_loopback_http::brand::{BRAND_STYLE, PageIdentity, TRUST_LINE_LOOPBACK};
 
+/// The registration page's style for the confirmation code it shows once the
+/// bridge accepted the browser's response.
+const REGISTER_STYLE: &str = r#"
+.confirmation-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: var(--ink-navy);
+  margin: 14px 0 0;
+}
+"#;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Data island
 // ─────────────────────────────────────────────────────────────────────────────
@@ -85,6 +98,14 @@ fn json_data_island(value: &serde_json::Value) -> String {
 /// - `rp_id`: the WebAuthn RP-ID (e.g. `"localhost"` or `"127.0.0.1"`).
 /// - `user_handle_b64`: the 32-byte user handle, base64url-encoded, for the
 ///   WebAuthn registration ceremony `user.id` field.
+/// - `challenge_b64url`: the entry's 32-byte registration challenge, unpadded
+///   base64url-encoded, which the page passes to
+///   `navigator.credentials.create()` and the bridge verifies the response
+///   against.
+///
+/// The page shows the confirmation code of the credential its ceremony
+/// created once the bridge accepted the response, and asks the operator to
+/// type it at the terminal that started the registration.
 ///
 /// # Security
 ///
@@ -97,6 +118,7 @@ pub(crate) fn render_register_page(
     csrf_hex: &str,
     rp_id: &str,
     user_handle_b64: &str,
+    challenge_b64url: &str,
     identity: &PageIdentity,
 ) -> String {
     let title = identity.page_title("Register a passkey");
@@ -107,6 +129,7 @@ pub(crate) fn render_register_page(
         "csrfToken": csrf_hex,
         "rpId": rp_id,
         "userHandle": user_handle_b64,
+        "challenge": challenge_b64url,
     }));
 
     format!(
@@ -116,7 +139,7 @@ pub(crate) fn render_register_page(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{title}</title>
-  <style>{BRAND_STYLE}</style>
+  <style>{BRAND_STYLE}{REGISTER_STYLE}</style>
 </head>
 <body>
   <main class="page">
@@ -124,10 +147,14 @@ pub(crate) fn render_register_page(
 {card_header}
       <h1>Register a passkey</h1>
       <p class="lead">Your wallet asked to add a new passkey for approving
-         transactions. Your browser will prompt you next &mdash; confirm with
-         Touch&nbsp;ID, Windows&nbsp;Hello, or your security key.</p>
+         transactions. Your browser will prompt you next. Confirm with
+         Touch&nbsp;ID, Windows&nbsp;Hello, or your security key, then type
+         the code this page shows at the terminal that started the
+         registration.</p>
       <div class="status" id="status" data-state="busy">Initialising&hellip;</div>
-      <p class="help">Nothing happening? The prompt may be behind this window.
+      <p class="confirmation-code" id="confirmation-code" hidden></p>
+      <p class="help">Nothing is registered until the terminal accepts the code.
+         Nothing happening? The prompt may be behind this window.
          If this page reports an error, the link has expired &mdash; close this
          tab and run <code>stellar-agent credentials add-passkey</code> again.</p>
 {TRUST_LINE_LOOPBACK}
@@ -297,6 +324,7 @@ mod tests {
             &"d".repeat(64),
             "localhost",
             "dXNlcmhhbmRsZQ",
+            "Y2hhbGxlbmdl",
             &neutral(),
         );
         let parsed = parse_island(&html);
@@ -304,6 +332,7 @@ mod tests {
         assert_eq!(parsed["nonce"], "abc123nonce");
         assert_eq!(parsed["rpId"], "localhost");
         assert_eq!(parsed["userHandle"], "dXNlcmhhbmRsZQ");
+        assert_eq!(parsed["challenge"], "Y2hhbGxlbmdl");
     }
 
     #[test]
@@ -329,8 +358,14 @@ mod tests {
         // A value containing `<`/`>` must not appear literally (which could form
         // `</script>`); it is JSON-unicode-escaped, and the island still parses
         // back to the original value.
-        let html =
-            render_register_page("n", &"c".repeat(64), "a<b>c", "dXNlcmhhbmRsZQ", &neutral());
+        let html = render_register_page(
+            "n",
+            &"c".repeat(64),
+            "a<b>c",
+            "dXNlcmhhbmRsZQ",
+            "Y2hhbGxlbmdl",
+            &neutral(),
+        );
         assert!(
             !html.contains("a<b>c"),
             "raw angle brackets must not appear in the page"
@@ -346,6 +381,7 @@ mod tests {
             &"c".repeat(64),
             "localhost",
             "dXNlcmhhbmRsZQ",
+            "Y2hhbGxlbmdl",
             &neutral(),
         );
         assert!(
@@ -385,6 +421,7 @@ mod tests {
             &"c".repeat(64),
             "localhost",
             "dXNlcmhhbmRsZQ",
+            "Y2hhbGxlbmdl",
             &neutral(),
         );
         assert!(
@@ -402,6 +439,7 @@ mod tests {
                 &"c".repeat(64),
                 "localhost",
                 "dXNlcmhhbmRsZQ",
+                "Y2hhbGxlbmdl",
                 identity,
             ),
             render_approve_page(
@@ -497,9 +535,33 @@ mod tests {
             &"c".repeat(64),
             "localhost",
             "dXNlcmhhbmRsZQ",
+            "Y2hhbGxlbmdl",
             &neutral(),
         );
         assert!(html.contains("<code>stellar-agent credentials add-passkey</code>"));
+    }
+
+    /// The registration page holds a hidden element for the confirmation code
+    /// and says that nothing is registered before the terminal accepts it.
+    #[test]
+    fn register_page_asks_for_the_code_at_the_terminal() {
+        let html = render_register_page(
+            "n",
+            &"c".repeat(64),
+            "localhost",
+            "dXNlcmhhbmRsZQ",
+            "Y2hhbGxlbmdl",
+            &neutral(),
+        );
+        assert!(
+            html.contains(r#"<p class="confirmation-code" id="confirmation-code" hidden></p>"#)
+        );
+        assert!(html.contains("Nothing is registered until the terminal accepts the code."));
+        let lead: String = html.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(lead.contains(
+            "then type the code this page shows at the terminal that started the registration."
+        ));
+        assert!(html.contains(REGISTER_STYLE));
     }
 
     #[test]

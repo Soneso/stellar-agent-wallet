@@ -6,14 +6,17 @@
 //! # Two-layer mainnet defence
 //!
 //! Structural refusals inspect the context's chain before signer access and
-//! any RPC request. They cover pay, claim, account creation and deployment,
-//! smart-account deployment, the signer writes, rules writes, execute,
-//! migration submit, timelock writes, and multicall. They also cover
-//! `vault deposit`, `vault withdraw`, `trade`, `trustline`, and `pool init`.
-//! Each answers `network.mainnet_write_forbidden` with exit code 1. The submit
-//! layer also checks the endpoint and passphrase. `rules verify-pins`,
-//! `signers list`, and `signers refresh` have no structural refusal: they load
-//! no signing key, sign nothing, and write nothing on chain.
+//! any RPC request. They cover account deployment, smart-account deployment,
+//! the signer writes, rules writes, execute, migration submit, timelock
+//! writes, and multicall. They also cover `vault deposit`, `vault withdraw`,
+//! `trade`, and `pool init`. Each answers `network.mainnet_write_forbidden`
+//! with exit code 1. `pay` and `claim` refuse their staged modes the same
+//! way. Their full mode, sponsored `accounts create` and `trustline` build
+//! the mainnet write context, which refuses with that code in a build without
+//! mainnet writes. The submit layer also checks the endpoint and passphrase.
+//! `rules verify-pins`, `signers list`, and `signers refresh` have no
+//! structural refusal: they load no signing key, sign nothing, and write
+//! nothing on chain.
 
 use std::fmt;
 use std::str::FromStr;
@@ -21,6 +24,27 @@ use std::str::FromStr;
 use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_core::profile::caip2::Caip2;
 pub(crate) use stellar_agent_core::profile::caip2::TESTNET_RPC_URL;
+use stellar_agent_network::operational::{OperationalReport, operational_check};
+use stellar_agent_network::{NetworkContext, StellarRpcClient};
+
+/// The network context of `profile` for a verb that reads its endpoints
+/// without a mainnet write context, such as `tx receipt clear`. In a test
+/// that routed hosts on this thread, the context's clients follow those
+/// routes.
+pub(crate) fn profile_network_context(
+    profile: &stellar_agent_core::profile::Profile,
+) -> NetworkContext {
+    let context = NetworkContext::from_profile(profile);
+    #[cfg(test)]
+    if let Some(routes) = crate::common::mainnet_write::test_routes_on_this_thread() {
+        let routes: Vec<(&str, &str)> = routes
+            .iter()
+            .map(|(host, url)| (host.as_str(), url.as_str()))
+            .collect();
+        return context.with_test_transport_routes(&routes);
+    }
+    context
+}
 
 /// An optional assertion that the loaded profile uses the named network.
 /// Profile creation uses the value to select the new file's chain.
@@ -58,13 +82,12 @@ impl FromStr for TargetNetwork {
     /// # Errors
     ///
     /// Returns a `String` error if the input is not `"testnet"` or `"mainnet"`.
+    /// The error names the accepted values and never the refused text.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "testnet" => Ok(Self::Testnet),
             "mainnet" => Ok(Self::Mainnet),
-            other => Err(format!(
-                "unknown network '{other}'; only 'testnet' and 'mainnet' are recognized"
-            )),
+            _ => Err("unknown network; only 'testnet' and 'mainnet' are recognized".to_owned()),
         }
     }
 }
@@ -87,6 +110,7 @@ pub(crate) struct EndpointFlags<'a> {
 }
 
 /// The network context of a command, from the loaded profile and the flags.
+/// Supplied endpoints authorize signing; only both endpoints stored in the profile authorize charge closure.
 pub(crate) fn network_context_for_command(
     profile: &stellar_agent_core::profile::Profile,
     profile_name: &str,
@@ -128,12 +152,27 @@ pub(crate) fn network_context_for_command(
 /// The structural mainnet-write refusal for `chain`: `Some` on mainnet, `None`
 /// otherwise.
 ///
-/// The timelock writes, `vault`, `trade`, `trustline`, and `pool init` call
+/// The timelock writes, `vault`, `trade`, and `pool init` call
 /// this once their network context is built. The call precedes their keyring
 /// initialiser or signer resolution, so a mainnet profile is refused before
 /// signer access and any RPC request.
 pub(crate) fn mainnet_write_refusal(chain: Caip2) -> Option<WalletError> {
     if chain.is_mainnet() {
+        Some(WalletError::Network(NetworkError::MainnetWriteForbidden))
+    } else {
+        None
+    }
+}
+
+/// The refusal of a staged mode on `chain`: `Some` on mainnet unless
+/// `full_mode`, `None` otherwise.
+///
+/// A mainnet write runs build, confirmation, signing and submission in one
+/// invocation, so `--build-only`, `--sign-only` and `--submit-only` are
+/// refused before the write context is built. The check reads no file, no
+/// keyring entry and no environment variable.
+pub(crate) fn mainnet_mode_refusal(chain: Caip2, full_mode: bool) -> Option<WalletError> {
+    if chain.is_mainnet() && !full_mode {
         Some(WalletError::Network(NetworkError::MainnetWriteForbidden))
     } else {
         None
@@ -148,26 +187,80 @@ pub(crate) fn mainnet_write_refusal(chain: Caip2) -> Option<WalletError> {
 /// this check on that client before the first such read, so an endpoint
 /// serving another network never supplies a value the verb signs. The submit
 /// layer checks the sending client again before the send. Each check gets its
-/// own budget, `timeout` from the moment it starts.
+/// own budget, `timeout` from the moment it starts. The value verbs `pay`,
+/// `claim`, `accounts create` and `trustline` pass
+/// [`PRE_SEND_BUDGET`](stellar_agent_network::PRE_SEND_BUDGET), so their
+/// `--timeout-seconds` bounds only the send and the confirmation poll; `pool
+/// init` passes its own flag.
+///
+/// On mainnet the check is the mainnet probe, which requires the mainnet
+/// passphrase and a supported protocol; on every other chain it is the
+/// endpoint identity of the context's passphrase.
 ///
 /// # Errors
 ///
-/// Returns the refusal of
-/// [`StellarRpcClient::endpoint_identity`](stellar_agent_network::StellarRpcClient::endpoint_identity):
+/// Returns the refusal of [`StellarRpcClient::endpoint_identity`] or, on
+/// mainnet, of [`StellarRpcClient::check_mainnet_endpoint`]:
 /// `network.endpoint_network_mismatch`, `network.mainnet_write_forbidden`,
 /// `network.endpoint_identity_unavailable`,
 /// `network.unsupported_protocol_version`, or
 /// `network.rpc_credential_refused` when the endpoint answers HTTP 401 or 403.
 pub(crate) async fn check_endpoint_identity(
-    client: &stellar_agent_network::StellarRpcClient,
+    client: &StellarRpcClient,
     context: &stellar_agent_network::NetworkContext,
     timeout: std::time::Duration,
 ) -> Result<(), WalletError> {
     let deadline = tokio::time::Instant::now() + timeout;
+    if context.chain_id.is_mainnet() {
+        return client.check_mainnet_endpoint(deadline).await;
+    }
     client
         .endpoint_identity(context.network_passphrase(), deadline)
         .await?;
     Ok(())
+}
+
+/// Checks that the endpoint of `client` is healthy and current, under
+/// `deadline`.
+///
+/// A value verb runs this check after [`check_endpoint_identity`] on the same
+/// client and before the first account read, on every network, so the
+/// sequence, the fee, and the policy views it signs against come from an
+/// endpoint whose latest ledger closed within
+/// [`stellar_agent_network::operational::MAX_LEDGER_CLOSE_LAG`] of the host
+/// clock. A mainnet build reads the account it signs against under the same
+/// `deadline` through
+/// [`stellar_agent_network::operational::read_within_readiness_deadline`],
+/// and a mainnet write hands the report to its summary. The value verbs set
+/// `deadline` a fresh
+/// [`PRE_SEND_BUDGET`](stellar_agent_network::PRE_SEND_BUDGET) ahead; a check
+/// that outlasts it refuses with `network.endpoint_not_ready`.
+///
+/// # Errors
+///
+/// Returns the refusal of
+/// [`stellar_agent_network::operational::operational_check`]:
+/// `network.endpoint_not_ready`, or `wallet.clock_error` when the host clock
+/// cannot be read.
+pub(crate) async fn check_endpoint_ready(
+    client: &StellarRpcClient,
+    deadline: tokio::time::Instant,
+) -> Result<OperationalReport, WalletError> {
+    operational_check(client, deadline).await
+}
+
+/// The submission timeout of a value verb: `flag`, the verb's
+/// `--timeout-seconds`, when given, else the profile's
+/// `submit_timeout_seconds`, else 60 seconds.
+///
+/// It bounds the send and the confirmation poll. The endpoint checks and the
+/// reads before the send run under
+/// [`PRE_SEND_BUDGET`](stellar_agent_network::PRE_SEND_BUDGET) instead.
+pub(crate) fn submit_timeout(
+    flag: Option<u64>,
+    profile: &stellar_agent_core::profile::Profile,
+) -> std::time::Duration {
+    flag.map_or_else(|| profile.submit_timeout(), std::time::Duration::from_secs)
 }
 
 /// Parses an RPC URL flag without echoing credentials in errors.
@@ -182,25 +275,28 @@ impl clap::builder::TypedValueParser for EndpointUrlFlag {
         arg: Option<&clap::Arg>,
         value: &std::ffi::OsStr,
     ) -> Result<String, clap::Error> {
-        use clap::error::ErrorKind;
+        use clap::error::{ContextKind, ContextValue, ErrorKind};
         let flag = arg.and_then(clap::Arg::get_long).unwrap_or("endpoint");
-        let value = value.to_str().ok_or_else(|| {
-            clap::Error::raw(
-                ErrorKind::ValueValidation,
-                format!("`--{flag}`: invalid UTF-8"),
-            )
-        })?;
-        let parsed = url::Url::parse(value).map_err(|error| {
-            clap::Error::raw(ErrorKind::ValueValidation, format!("`--{flag}`: {error}"))
-        })?;
+        let refusal = |reason: String| {
+            let mut error = clap::Error::raw(ErrorKind::ValueValidation, reason);
+            if let Some(long) = arg.and_then(clap::Arg::get_long) {
+                error.insert(
+                    ContextKind::InvalidArg,
+                    ContextValue::String(format!("--{long}")),
+                );
+            }
+            error
+        };
+        let value = value
+            .to_str()
+            .ok_or_else(|| refusal(format!("`--{flag}`: invalid UTF-8")))?;
+        let parsed =
+            url::Url::parse(value).map_err(|error| refusal(format!("`--{flag}`: {error}")))?;
         if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(clap::Error::raw(
-                ErrorKind::ValueValidation,
-                format!(
-                    "`--{flag}` {}",
-                    stellar_agent_core::redact::CREDENTIALED_URL_INPUT_REFUSAL
-                ),
-            ));
+            return Err(refusal(format!(
+                "`--{flag}` {}",
+                stellar_agent_core::redact::CREDENTIALED_URL_INPUT_REFUSAL
+            )));
         }
         Ok(value.to_owned())
     }
@@ -219,6 +315,36 @@ mod tests {
     )]
 
     use super::*;
+
+    /// The flag wins; without it the profile's `submit_timeout_seconds`
+    /// applies, then 60 seconds.
+    #[test]
+    #[serial_test::serial]
+    fn submit_timeout_prefers_the_flag_then_the_profile_then_sixty() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut profile =
+            stellar_agent_core::profile::Profile::builder_testnet("timeout", "s", "n", "a").build();
+        profile.submit_timeout_seconds = Some(17);
+        assert_eq!(
+            submit_timeout(Some(5), &profile),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            submit_timeout(None, &profile),
+            std::time::Duration::from_secs(17)
+        );
+        profile.submit_timeout_seconds = None;
+        assert_eq!(
+            submit_timeout(Some(5), &profile),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            submit_timeout(None, &profile),
+            std::time::Duration::from_secs(60)
+        );
+    }
 
     #[test]
     fn target_network_from_str_round_trips() {
@@ -244,14 +370,24 @@ mod tests {
         );
     }
 
+    /// An unknown network name is refused by the accepted values, and the
+    /// error carries none of the supplied text.
     #[test]
-    fn target_network_from_str_unknown_is_error() {
-        let err = TargetNetwork::from_str("futurenet").unwrap_err();
-        assert!(
-            err.contains("futurenet"),
-            "error must include the unknown token"
-        );
-        assert!(TargetNetwork::from_str("").is_err());
+    fn target_network_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        for input in [CREDENTIAL_MARKER, "futurenet", ""] {
+            let err = TargetNetwork::from_str(input).unwrap_err();
+            assert_eq!(
+                err,
+                "unknown network; only 'testnet' and 'mainnet' are recognized"
+            );
+        }
+        let err = TargetNetwork::from_str(CREDENTIAL_MARKER).unwrap_err();
+        assert_no_marker_in_text(&err, CREDENTIAL_MARKER);
+        assert_no_marker_in_text(&err, &CREDENTIAL_MARKER.to_lowercase());
     }
 
     #[test]
@@ -319,7 +455,11 @@ mod flag_rules_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn absent_flags_copy_all_profile_fields() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = profile(false);
         let c = network_context_for_command(&p, "flags", flags()).unwrap();
         assert_eq!(c.chain_id, p.chain_id);
@@ -328,7 +468,11 @@ mod flag_rules_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn matching_testnet_flag_passes() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(
             network_context_for_command(
                 &profile(false),
@@ -343,7 +487,11 @@ mod flag_rules_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_profile_mainnet_flag_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let error = network_context_for_command(
             &profile(false),
             "flags",
@@ -357,7 +505,11 @@ mod flag_rules_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_profile_testnet_flag_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let error = network_context_for_command(
             &profile(true),
             "flags",
@@ -371,7 +523,11 @@ mod flag_rules_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn testnet_endpoint_flags_override_only_endpoints() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let p = profile(false);
         let c = network_context_for_command(
             &p,
@@ -402,7 +558,11 @@ mod flag_rules_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_equal_primary_flag_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(matches!(
             network_context_for_command(
                 &profile(true),
@@ -419,7 +579,11 @@ mod flag_rules_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn mainnet_equal_secondary_flag_refuses() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         assert!(matches!(
             network_context_for_command(
                 &profile(true),

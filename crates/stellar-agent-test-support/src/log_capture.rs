@@ -24,6 +24,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// The wallet's subscriber keeps every target with this prefix off at every level.
+/// The strict harness applies the same rule.
+pub const RAW_TRANSPORT_LOG_TARGET: &str = "jsonrpsee";
+
 /// Returns a dispatcher with no subscriber that keeps a log capture complete.
 ///
 /// `tracing` caches each callsite's interest for the whole process. With one
@@ -170,8 +174,19 @@ pub struct CaptureWriter {
 /// whenever a test asserts on captured log content. The hand-rolled form is
 /// for a test that must also drive the subscriber or the writer directly.
 pub fn with_captured_logs<F: FnOnce()>(f: F) -> String {
+    capture_at(tracing::Level::INFO, f)
+}
+
+/// [`with_captured_logs`] at the `TRACE` level, for an assertion on a
+/// `debug!` event.
+pub fn with_captured_trace_logs<F: FnOnce()>(f: F) -> String {
+    capture_at(tracing::Level::TRACE, f)
+}
+
+fn capture_at<F: FnOnce()>(level: tracing::Level, f: F) -> String {
     let capture = CaptureWriter::new();
     let subscriber = tracing_subscriber::fmt()
+        .with_max_level(level)
         .with_writer(capture.clone())
         .with_ansi(false)
         .finish();
@@ -287,6 +302,8 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
 /// subscriber. Tests execute the code under test through [`Self::run`] so the
 /// subscriber is mounted only for the closure body, then call
 /// [`Self::assert_clean`] after capture has stopped.
+/// The harness excludes raw transport events and spans at every level, as the
+/// wallet's subscriber does.
 pub struct RedactionStrictSubscriber {
     capture: CaptureWriter,
     forbidden: Vec<Vec<u8>>,
@@ -311,11 +328,16 @@ impl RedactionStrictSubscriber {
     }
 
     fn subscriber_guard(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
         tracing_subscriber::fmt()
             .with_writer(self.capture.clone())
             .with_ansi(false)
             .with_max_level(tracing::Level::TRACE)
             .finish()
+            .with(tracing_subscriber::filter::filter_fn(|metadata| {
+                !metadata.target().starts_with(RAW_TRANSPORT_LOG_TARGET)
+            }))
     }
 
     /// Executes `f` with the strict subscriber mounted as the default.
@@ -448,6 +470,31 @@ mod tests {
         let strict = RedactionStrictSubscriber::new(["memo-secret"]);
         strict.run(|| {
             tracing::info!("memo-secret");
+        });
+
+        let result = std::panic::catch_unwind(|| strict.assert_clean());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strict_subscriber_excludes_raw_transport_events() {
+        let needle = "transport-secret";
+        let strict = RedactionStrictSubscriber::new([needle]);
+        strict.run(|| {
+            tracing::trace!(target: "jsonrpsee", "response = {needle}");
+            tracing::trace!(target: "jsonrpsee::client", "response = {needle}");
+        });
+
+        assert!(!strict.captured_str().contains(needle));
+        strict.assert_clean();
+    }
+
+    #[test]
+    fn strict_subscriber_detects_forbidden_wallet_trace() {
+        let needle = "transport-secret";
+        let strict = RedactionStrictSubscriber::new([needle]);
+        strict.run(|| {
+            tracing::trace!(target: "stellar_agent_network::client", "response = {needle}");
         });
 
         let result = std::panic::catch_unwind(|| strict.assert_clean());
