@@ -95,8 +95,8 @@ pub use redact::{
 };
 
 pub use account::{
-    AccountView, AssetView, BASE_RESERVE_STROOPS, BalanceView, SignerView, ThresholdsView,
-    fetch_account, fetch_account_observed, fetch_data_entry, fetch_trustline_entry,
+    AccountView, AssetType, AssetView, BASE_RESERVE_STROOPS, BalanceView, SignerView,
+    ThresholdsView, fetch_account, fetch_account_observed, fetch_data_entry, fetch_trustline_entry,
 };
 pub use builder::{Asset, ClassicOpBuilder};
 pub use client::{

@@ -110,17 +110,17 @@ pub fn render_selected_fee_line(per_op_stroops: Option<u32>, percentile: Option<
 ///
 /// Native: `"native"`. Non-native: `"{code}:{issuer_first4...last4}"`.
 fn format_asset(asset: &AssetView) -> String {
-    match &asset.issuer {
-        None => "native".to_owned(),
-        Some(issuer) => {
+    match (asset.code.as_deref(), asset.issuer.as_deref()) {
+        (Some(code), Some(issuer)) => {
             // Show code + abbreviated issuer: first 4 chars + last 4 chars.
             let abbrev = if issuer.len() > 8 {
                 format!("{}...{}", &issuer[..4], &issuer[issuer.len() - 4..])
             } else {
-                issuer.clone()
+                issuer.to_owned()
             };
-            format!("{}:{}", asset.asset_type, abbrev)
+            format!("{code}:{abbrev}")
         }
+        _ => "native".to_owned(),
     }
 }
 

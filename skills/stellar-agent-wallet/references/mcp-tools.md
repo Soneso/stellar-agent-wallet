@@ -633,8 +633,10 @@ omits the binding triple.
 | `account_id` | string | yes | G-strkey, or M-strkey whose G base account is read; the response echoes the address as given. |
 | `assets` | array | no | Each entry `{ "code": "USDC", "issuer": "GA5Z..." }`. Empty/absent returns native XLM only. |
 
-In each returned `balances` entry, `asset.asset_type` is `native` for XLM or
-the asset code, such as `USDC`, and a trustline adds `asset.issuer`.
+In each returned `balances` entry, `asset.asset_type` is `native`,
+`credit_alphanum4`, or `credit_alphanum12`. Credit assets carry `asset.code`
+and `asset.issuer`; native XLM omits both. Codes of 1 to 4 characters use
+`credit_alphanum4`; codes of 5 to 12 characters use `credit_alphanum12`.
 
 ### stellar_friendbot arguments
 

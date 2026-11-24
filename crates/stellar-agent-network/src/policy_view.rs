@@ -153,7 +153,7 @@ impl AccountReservesView for AccountViewAdapter<'_> {
         self.0
             .balances
             .first()
-            .filter(|b| b.asset.asset_type == "native")
+            .filter(|b| b.asset.asset_type == crate::account::AssetType::Native)
             .ok_or_else(|| AccountReserveLookupError {
                 detail: "no native balance entry".to_owned(),
             })
@@ -172,19 +172,18 @@ impl AccountReservesView for AccountViewAdapter<'_> {
     /// the read did not request is unknown.
     fn holds_trustline(&self, asset: &str, network_passphrase: &str) -> Option<bool> {
         let is_asset = |view: &AssetView| {
-            view.issuer.as_deref().is_some_and(|issuer| {
-                assets_equivalent(
-                    &format!("{}:{issuer}", view.asset_type),
-                    asset,
-                    network_passphrase,
-                )
-            })
+            view.code
+                .as_deref()
+                .zip(view.issuer.as_deref())
+                .is_some_and(|(code, issuer)| {
+                    assets_equivalent(&format!("{code}:{issuer}"), asset, network_passphrase)
+                })
         };
         if self
             .0
             .balances
             .iter()
-            .any(|b| b.asset.asset_type != "native" && is_asset(&b.asset))
+            .any(|b| b.asset.asset_type != crate::account::AssetType::Native && is_asset(&b.asset))
         {
             Some(true)
         } else if self.0.requested_trustlines.iter().any(is_asset) {
@@ -327,6 +326,17 @@ mod tests {
         const ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
         let passphrase = stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
         let mut view = make_view("100.0000000", 1);
+        view.balances.push(BalanceView::new(
+            AssetView {
+                asset_type: crate::account::AssetType::Native,
+                code: Some("USDC".to_owned()),
+                issuer: Some(ISSUER.to_owned()),
+            },
+            "0.0000000".to_owned(),
+            None,
+            "0.0000000".to_owned(),
+            "0.0000000".to_owned(),
+        ));
         let adapter = AccountViewAdapter::new(&view);
         assert_eq!(
             adapter.holds_trustline(&format!("USDC:{ISSUER}"), passphrase),

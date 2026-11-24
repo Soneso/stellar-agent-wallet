@@ -73,7 +73,7 @@ use smart_account_fixtures::{
     wait_until_account_queryable,
 };
 use stellar_agent_core::StellarAmount;
-use stellar_agent_network::{StellarRpcClient, fetch_account};
+use stellar_agent_network::{AssetType, StellarRpcClient, fetch_account};
 use stellar_agent_smart_account::deployment::{
     Ed25519VerifierDeployArgs, ResolvedFeePerOp, SpendingLimitPolicyDeployArgs,
     deploy_ed25519_verifier, deploy_spending_limit_policy,
@@ -135,7 +135,7 @@ async fn xlm_stroops_balance(g_strkey: &str) -> i64 {
     let native = account
         .balances
         .iter()
-        .find(|b| b.asset.asset_type == "native")
+        .find(|b| b.asset.asset_type == AssetType::Native)
         .expect("account must have a native balance entry");
     StellarAmount::parse_with_unit(&format!("{} XLM", native.balance))
         .expect("native balance decimal string must parse as a StellarAmount")

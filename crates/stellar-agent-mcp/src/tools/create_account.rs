@@ -651,7 +651,7 @@ impl WalletServer {
         let native_balance_stroops = account_view
             .balances
             .first()
-            .filter(|b| b.asset.asset_type == "native")
+            .filter(|b| b.asset.asset_type == stellar_agent_network::AssetType::Native)
             .map(|b| b.balance_stroops())
             .transpose()
             .map_err(|e| {

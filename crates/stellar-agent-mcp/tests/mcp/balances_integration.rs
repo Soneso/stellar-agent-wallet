@@ -495,11 +495,24 @@ async fn stellar_balances_dispatch_returns_native_and_trustline_from_wiremock() 
         payload["data"]["balances"][0]["asset"]["asset_type"],
         "native"
     );
+    assert!(
+        payload["data"]["balances"][0]["asset"]
+            .get("code")
+            .is_none(),
+        "native asset must omit code"
+    );
+    assert!(
+        payload["data"]["balances"][0]["asset"]
+            .get("issuer")
+            .is_none(),
+        "native asset must omit issuer"
+    );
     assert_eq!(payload["data"]["balances"][0]["balance"], "2.5000000");
     assert_eq!(
         payload["data"]["balances"][1]["asset"]["asset_type"],
-        "USDC"
+        "credit_alphanum4"
     );
+    assert_eq!(payload["data"]["balances"][1]["asset"]["code"], "USDC");
     assert_eq!(
         payload["data"]["balances"][1]["asset"]["issuer"],
         TEST_USDC_ISSUER

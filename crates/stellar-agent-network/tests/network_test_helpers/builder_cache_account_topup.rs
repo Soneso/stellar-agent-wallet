@@ -223,8 +223,8 @@ async fn fetch_account_null_entries_returns_account_not_found() {
 /// This test uses two mock entries: one `LedgerKey::Account` with the funded-
 /// account XDR, and one `LedgerKey::Trustline` with a `LedgerEntryData::Trustline`.
 /// The test verifies:
-/// 1. `view.balances[0]` is the native XLM entry (asset_type = "native").
-/// 2. `view.balances[1]` is the USDC trustline entry (asset_type = "USDC").
+/// 1. `view.balances[0]` is the native XLM entry (`asset_type` `AssetType::Native`).
+/// 2. `view.balances[1]` is the USDC trustline entry (`asset_type` `AssetType::CreditAlphanum4`, `code` `Some("USDC")`).
 /// 3. The trustline balance and limit strings have the correct 7-decimal format.
 #[tokio::test]
 async fn fetch_account_with_trustline_appends_balance() {
@@ -313,7 +313,8 @@ async fn fetch_account_with_trustline_appends_balance() {
 
     // Native XLM is always first.
     assert_eq!(
-        view.balances[0].asset.asset_type, "native",
+        view.balances[0].asset.asset_type,
+        stellar_agent_network::AssetType::Native,
         "first balance must be native XLM"
     );
 
@@ -326,7 +327,13 @@ async fn fetch_account_with_trustline_appends_balance() {
     );
     let tl_balance = &view.balances[1];
     assert_eq!(
-        tl_balance.asset.asset_type, "USDC",
+        tl_balance.asset.asset_type,
+        stellar_agent_network::AssetType::CreditAlphanum4,
+        "second balance must be credit_alphanum4"
+    );
+    assert_eq!(
+        tl_balance.asset.code.as_deref(),
+        Some("USDC"),
         "second balance must be USDC"
     );
     assert_eq!(
@@ -405,7 +412,8 @@ async fn fetch_account_absent_trustline_is_silently_omitted() {
         view.balances.len()
     );
     assert_eq!(
-        view.balances[0].asset.asset_type, "native",
+        view.balances[0].asset.asset_type,
+        stellar_agent_network::AssetType::Native,
         "only native XLM must appear when the trustline is absent"
     );
 }

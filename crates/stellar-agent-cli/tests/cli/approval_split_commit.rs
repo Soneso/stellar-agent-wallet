@@ -341,8 +341,12 @@ async fn gc_include_consumed_keeps_receipt_replay_protection() {
         );
         serde_json::from_slice(&output.stdout).unwrap()
     };
-    let consumed_rows = |listed: &Value| {
-        listed["data"]["pending"]
+    let resolved_rows = |listed: &Value| {
+        assert!(
+            listed["data"]["pending"].as_array().unwrap().is_empty(),
+            "tombstones must not appear under pending: {listed}"
+        );
+        listed["data"]["resolved"]
             .as_array()
             .unwrap()
             .iter()
@@ -352,7 +356,7 @@ async fn gc_include_consumed_keeps_receipt_replay_protection() {
     };
     let list = ["approve", "list", "--profile", NAME];
     assert_eq!(
-        consumed_rows(&json_of(payment.cli(&list))),
+        resolved_rows(&json_of(payment.cli(&list))),
         [json!("Consumed")],
         "the completed payment leaves a consumed row"
     );
@@ -363,7 +367,7 @@ async fn gc_include_consumed_keeps_receipt_replay_protection() {
         "{default}"
     );
     assert_eq!(
-        consumed_rows(&json_of(payment.cli(&list))),
+        resolved_rows(&json_of(payment.cli(&list))),
         [json!("Consumed")],
         "default gc keeps the consumed row"
     );
@@ -374,7 +378,7 @@ async fn gc_include_consumed_keeps_receipt_replay_protection() {
         "{flagged}"
     );
     assert!(
-        consumed_rows(&json_of(payment.cli(&list))).is_empty(),
+        resolved_rows(&json_of(payment.cli(&list))).is_empty(),
         "flagged gc removes the consumed row"
     );
 
@@ -499,4 +503,113 @@ fn approve_gc_default_keeps_consumed_rows_and_its_json() {
         "the consumed row stays"
     );
     assert!(store.get(&nonces[2]).is_none(), "the expired row goes");
+}
+
+/// `approve list --output table` writes pending entries before the `Resolved`
+/// heading and both `Consumed` and `Rejected` tombstones after it on stdout.
+#[test]
+#[serial]
+fn approve_list_table_separates_pending_and_resolved_on_stdout() {
+    const NAME: &str = "approve-list-table";
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    assert!(
+        home.path()
+            .join(stellar_agent_test_support::sandbox::MARKER)
+            .is_file(),
+        "owned wallet root is marked before the home guard"
+    );
+    let _home_guard = StellarAgentHomeGuard::new(home.path());
+    let account = stellar_strkey::ed25519::PublicKey([0x32; 32])
+        .to_string()
+        .to_string();
+    let profile = Profile::builder_testnet_named(NAME, "list-signer", &account, "list-nonce", NAME)
+        .audit_log_path(home.path().join("audit/approval.jsonl"))
+        .build();
+    save_new_to_dir(NAME, &profile, &home.path().join("profiles")).unwrap();
+
+    let uid = stellar_agent_core::approval::process_uid_for_attestation()
+        .expect("UID available on test host");
+    let make_entry = || {
+        stellar_agent_core::approval::fixtures::payment_pending(
+            &account,
+            DEST,
+            "XLM",
+            1_000_000,
+            Some("hi"),
+            100,
+            1,
+            uid.clone(),
+            stellar_agent_core::approval::DEFAULT_TTL_MS,
+        )
+    };
+    let pending_entry = make_entry();
+    let consumed_entry = make_entry();
+    let rejected_entry = make_entry();
+    let pending_nonce = pending_entry.approval_nonce.clone();
+    let consumed_nonce = consumed_entry.approval_nonce.clone();
+    let rejected_nonce = rejected_entry.approval_nonce.clone();
+
+    let path = home.path().join(format!("approvals/{NAME}.toml"));
+    {
+        let mut store = PendingApprovalStore::open(path).unwrap();
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        for row in [pending_entry, consumed_entry, rejected_entry] {
+            store.insert(row, now).unwrap();
+        }
+        assert!(
+            store
+                .consume(
+                    &consumed_nonce,
+                    &"ab".repeat(32),
+                    stellar_agent_core::approval::store::ConsumedOutcome::Confirmed,
+                )
+                .unwrap()
+        );
+        store
+            .reject(
+                &rejected_nonce,
+                now,
+                stellar_agent_core::approval::DEFAULT_TTL_MS,
+            )
+            .unwrap();
+    }
+
+    let output = stellar_agent_test_support::cli_child::cli_command(
+        env!("CARGO_BIN_EXE_stellar-agent"),
+        home.path(),
+    )
+    .expect("isolated CLI child")
+    .args(["approve", "list", "--profile", NAME, "--output", "table"])
+    .env("STELLAR_AGENT_HOME", home.path())
+    .env_remove("STELLAR_AGENT_PROFILE")
+    .stdin(std::process::Stdio::null())
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let (before, after) = stdout
+        .split_once("\n\nResolved\n")
+        .unwrap_or_else(|| panic!("expected Resolved heading in table stdout: {stdout:?}"));
+    assert!(
+        before.contains(&pending_nonce) && before.contains("PaymentSimulated"),
+        "pending row must precede Resolved heading: {stdout:?}"
+    );
+    assert!(
+        !before.contains(&consumed_nonce) && !before.contains(&rejected_nonce),
+        "tombstones must not precede Resolved heading: {stdout:?}"
+    );
+    assert!(
+        after.contains(&consumed_nonce) && after.contains("spent (PaymentSimulated)"),
+        "Consumed tombstone row must follow Resolved heading: {stdout:?}"
+    );
+    assert!(
+        after.contains(&rejected_nonce) && after.contains("rejected (PaymentSimulated)"),
+        "Rejected tombstone row must follow Resolved heading: {stdout:?}"
+    );
 }

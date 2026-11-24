@@ -7,12 +7,18 @@
 //!
 //! # Output (JSON envelope, default)
 //!
+//! `data` carries `pending` (non-tombstone entries), `resolved` (`Consumed`
+//! and `Rejected` tombstones, each keeping its `kind_name`), and
+//! `expired_count` (expired entries in the snapshot), alongside `profile`
+//! when a saved profile matches:
+//!
 //! ```json
 //! {
 //!   "ok": true,
 //!   "data": {
 //!     "profile": "default",
-//!     "pending": [ /* PendingApprovalView, one per entry */ ],
+//!     "pending": [ /* PendingApprovalView, non-tombstone entries */ ],
+//!     "resolved": [ /* PendingApprovalView, Consumed and Rejected tombstones */ ],
 //!     "expired_count": 1
 //!   },
 //!   "request_id": "..."
@@ -22,17 +28,18 @@
 //! # Output (`--output table`)
 //!
 //! One row per entry: nonce, kind, a one-line wallet-controlled summary, and
-//! the time remaining until expiry. Every rendered field is passed through
+//! the time remaining until expiry. Tombstone entries appear in a separate
+//! section headed `Resolved`. Every rendered field is passed through
 //! [`escape_for_terminal`]: summary values are decoded from an agent-built
 //! envelope and must not be trusted with raw terminal output.
 //!
 //! # `--include-expired`
 //!
-//! By default, expired entries are omitted from `pending` (they no longer
-//! grant approval and only remain on disk until the next `approve gc`).
-//! `expired_count` always reports the number of expired entries in the
-//! snapshot, regardless of this flag, so the operator can tell whether a
-//! `gc` is due even when expired entries are hidden.
+//! By default, expired entries are omitted from `pending` and `resolved`
+//! (they no longer grant approval and only remain on disk until the next
+//! `approve gc`). `expired_count` always reports the number of expired entries
+//! in the snapshot, regardless of this flag, so the operator can tell whether
+//! a `gc` is due even when expired entries are hidden.
 //!
 //! # Exit codes
 //!
@@ -74,22 +81,38 @@ pub struct ListArgs {
     #[arg(long, default_value_t = OutputFormat::DEFAULT, value_name = "FORMAT")]
     pub output: OutputFormat,
 
-    /// Include already-expired entries in `pending` instead of omitting them.
+    /// Include already-expired entries in `pending` and `resolved` instead of omitting them.
     #[arg(long = "include-expired")]
     pub include_expired: bool,
 }
 
 /// Success payload for the `approve list` JSON envelope.
+///
+/// Carries `pending` (non-tombstone entries), `resolved` (`Consumed` and
+/// `Rejected` tombstones, each keeping its `kind_name`), and `expired_count`
+/// (expired entries in the snapshot), plus `profile` when a saved profile
+/// matches.
 #[derive(Debug, Serialize)]
 struct ListData {
     /// Saved profile the snapshot was taken from; absent when the name
     /// resolves to no saved profile.
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<String>,
-    /// Pending entries, filtered per `--include-expired`.
+    /// Non-tombstone pending entries, filtered per `--include-expired`.
     pending: Vec<PendingApprovalView>,
+    /// Tombstone entries (`Consumed` and `Rejected`), filtered per `--include-expired`.
+    resolved: Vec<PendingApprovalView>,
     /// Count of expired entries in the snapshot, independent of the filter.
     expired_count: usize,
+}
+
+/// Returns `true` when `view` is a terminal tombstone rather than an entry
+/// awaiting a decision.
+fn is_tombstone(view: &PendingApprovalView) -> bool {
+    matches!(
+        view.summary,
+        ApprovalSummaryView::Consumed { .. } | ApprovalSummaryView::Rejected { .. }
+    )
 }
 
 /// Runs `stellar-agent approve list`.
@@ -149,14 +172,14 @@ pub async fn run(args: ListArgs) -> i32 {
 
     let snapshot = store.snapshot(now_ms);
     let expired_count = snapshot.iter().filter(|v| v.expired).count();
-    let pending: Vec<PendingApprovalView> = if args.include_expired {
-        snapshot
-    } else {
-        snapshot.into_iter().filter(|v| !v.expired).collect()
-    };
+    let (resolved, pending): (Vec<PendingApprovalView>, Vec<PendingApprovalView>) = snapshot
+        .into_iter()
+        .filter(|v| args.include_expired || !v.expired)
+        .partition(is_tombstone);
 
     tracing::debug!(
         pending_count = pending.len(),
+        resolved_count = resolved.len(),
         expired_count,
         "approval list completed"
     );
@@ -164,6 +187,7 @@ pub async fn run(args: ListArgs) -> i32 {
     let envelope = Envelope::ok(ListData {
         profile: super::common::saved_profile_name(profile_name),
         pending,
+        resolved,
         expired_count,
     });
     print_success(&envelope, args.output, now_ms);
@@ -174,29 +198,42 @@ pub async fn run(args: ListArgs) -> i32 {
 // Rendering
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn render_table(data: &ListData, now_ms: u64) -> String {
+    let mut lines = Vec::new();
+    if data.pending.is_empty() {
+        match &data.profile {
+            Some(profile) => lines.push(format!("No pending approvals for profile '{profile}'.")),
+            None => lines.push("No pending approvals.".to_owned()),
+        }
+    } else {
+        for view in &data.pending {
+            lines.push(render_pending_row(view, now_ms));
+        }
+    }
+    if !data.resolved.is_empty() {
+        lines.push(String::new());
+        lines.push("Resolved".to_owned());
+        for view in &data.resolved {
+            lines.push(render_pending_row(view, now_ms));
+        }
+    }
+    if data.expired_count > 0 {
+        lines.push(format!(
+            "({} expired entr{} not shown; run `approve gc` to clear)",
+            data.expired_count,
+            if data.expired_count == 1 { "y" } else { "ies" }
+        ));
+    }
+    lines.join("\n")
+}
+
 fn print_success(envelope: &Envelope<ListData>, format: OutputFormat, now_ms: u64) {
     match format {
         OutputFormat::Table =>
         {
             #[allow(clippy::print_stdout, reason = "CLI binary intentional user output")]
             if let Some(data) = &envelope.data {
-                if data.pending.is_empty() {
-                    match &data.profile {
-                        Some(profile) => println!("No pending approvals for profile '{profile}'."),
-                        None => println!("No pending approvals."),
-                    }
-                } else {
-                    for view in &data.pending {
-                        println!("{}", render_pending_row(view, now_ms));
-                    }
-                }
-                if data.expired_count > 0 {
-                    println!(
-                        "({} expired entr{} not shown; run `approve gc` to clear)",
-                        data.expired_count,
-                        if data.expired_count == 1 { "y" } else { "ies" }
-                    );
-                }
+                println!("{}", render_table(data, now_ms));
             }
         }
         // `OutputFormat` is `#[non_exhaustive]`; unrecognised future variants
@@ -487,13 +524,19 @@ mod tests {
             output: OutputFormat::Json,
             include_expired: false,
         };
+        crate::common::render::take_rendered_for_test();
         let code = run(args).await;
         assert_eq!(code, 0, "list on a not-yet-existing store must succeed");
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0]["data"]["pending"], serde_json::json!([]));
+        assert_eq!(rendered[0]["data"]["resolved"], serde_json::json!([]));
+        assert_eq!(rendered[0]["data"]["expired_count"], 0);
     }
 
     #[tokio::test]
     #[serial]
-    async fn list_run_populated_store_reports_payment_and_rejected_entries() {
+    async fn list_run_populated_store_separates_pending_from_tombstones() {
         let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         assert!(
             home.path()
@@ -508,17 +551,31 @@ mod tests {
         let path = dir.join(format!("{profile}.toml"));
 
         let now_ms = timefmt::now_unix_ms().unwrap();
+        let pending_nonce;
+        let rejected_nonce;
+        let consumed_nonce;
         {
             let mut store = PendingApprovalStore::open(path.clone()).unwrap();
-            store
-                .insert(make_payment_entry(DEFAULT_TTL_MS), now_ms)
-                .unwrap();
+            let pending_entry = make_payment_entry(DEFAULT_TTL_MS);
+            pending_nonce = pending_entry.approval_nonce.clone();
+            store.insert(pending_entry, now_ms).unwrap();
 
             let rejected_source = make_payment_entry(DEFAULT_TTL_MS);
-            let rejected_nonce = rejected_source.approval_nonce.clone();
+            rejected_nonce = rejected_source.approval_nonce.clone();
             store.insert(rejected_source, now_ms).unwrap();
             store
                 .reject(&rejected_nonce, now_ms, DEFAULT_TTL_MS)
+                .unwrap();
+
+            let consumed_source = make_payment_entry(DEFAULT_TTL_MS);
+            consumed_nonce = consumed_source.approval_nonce.clone();
+            store.insert(consumed_source, now_ms).unwrap();
+            store
+                .consume(
+                    &consumed_nonce,
+                    &"ab".repeat(32),
+                    stellar_agent_core::approval::ConsumedOutcome::Confirmed,
+                )
                 .unwrap();
         } // lock released
 
@@ -527,15 +584,34 @@ mod tests {
             output: OutputFormat::Json,
             include_expired: false,
         };
+        crate::common::render::take_rendered_for_test();
         let code = run(args).await;
         assert_eq!(code, 0);
 
-        // Re-open to inspect the shape via the same snapshot API the command uses.
-        let store = PendingApprovalStore::open(path).unwrap();
-        let views = store.snapshot(now_ms);
-        assert_eq!(views.len(), 2, "both entries must be present");
-        assert!(views.iter().any(|v| v.kind_name == "PaymentSimulated"));
-        assert!(views.iter().any(|v| v.kind_name == "Rejected"));
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1);
+        let data = &rendered[0]["data"];
+        let pending = data["pending"].as_array().unwrap();
+        assert!(
+            data["resolved"].is_array(),
+            "expected resolved array: {data}"
+        );
+        let resolved = data["resolved"].as_array().unwrap();
+        assert_eq!(pending.len(), 1, "only non-tombstone in pending: {data}");
+        assert_eq!(pending[0]["approval_nonce"], pending_nonce);
+        assert_eq!(pending[0]["kind_name"], "PaymentSimulated");
+        assert_eq!(resolved.len(), 2, "tombstones live in resolved: {data}");
+        assert!(
+            resolved
+                .iter()
+                .any(|v| v["approval_nonce"] == rejected_nonce && v["kind_name"] == "Rejected")
+        );
+        assert!(
+            resolved
+                .iter()
+                .any(|v| v["approval_nonce"] == consumed_nonce && v["kind_name"] == "Consumed")
+        );
+        assert_eq!(data["expired_count"], 0);
     }
 
     #[tokio::test]
@@ -558,15 +634,36 @@ mod tests {
         {
             let mut store = PendingApprovalStore::open(path.clone()).unwrap();
             store.insert(make_payment_entry(1), now_ms).unwrap(); // TTL=1ms
+            let consumed_entry = make_payment_entry(1);
+            let consumed_nonce = consumed_entry.approval_nonce.clone();
+            store.insert(consumed_entry, now_ms).unwrap();
+            store
+                .consume(
+                    &consumed_nonce,
+                    &"cd".repeat(32),
+                    stellar_agent_core::approval::ConsumedOutcome::Confirmed,
+                )
+                .unwrap();
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
 
+        crate::common::render::take_rendered_for_test();
         let args_default = ListArgs {
             profile: Some(profile.to_owned()),
             output: OutputFormat::Json,
             include_expired: false,
         };
         assert_eq!(run(args_default).await, 0);
+        let default_rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(
+            default_rendered[0]["data"]["pending"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            default_rendered[0]["data"]["resolved"],
+            serde_json::json!([])
+        );
+        assert_eq!(default_rendered[0]["data"]["expired_count"], 2);
 
         let args_include = ListArgs {
             profile: Some(profile.to_owned()),
@@ -574,14 +671,111 @@ mod tests {
             include_expired: true,
         };
         assert_eq!(run(args_include).await, 0);
+        let included_rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(
+            included_rendered[0]["data"]["pending"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            included_rendered[0]["data"]["resolved"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(included_rendered[0]["data"]["expired_count"], 2);
+    }
 
-        // Both invocations must succeed; the filtering behavior itself is
-        // covered directly against the snapshot filter logic below.
-        let store = PendingApprovalStore::open(path).unwrap();
-        let later_now = timefmt::now_unix_ms().unwrap();
-        let views = store.snapshot(later_now);
-        assert_eq!(views.len(), 1);
-        assert!(views[0].expired, "the sole entry must have expired by now");
+    #[test]
+    fn render_table_places_tombstones_under_resolved_heading() {
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        let pending_entry = make_payment_entry(DEFAULT_TTL_MS);
+        let now_ms = pending_entry.created_at_unix_ms;
+        store.insert(pending_entry, now_ms).unwrap();
+        let pending_view = store.snapshot(now_ms).remove(0);
+        let (consumed_view, _) = consumed_view(make_payment_entry(DEFAULT_TTL_MS));
+        let rejected_dir = TempDir::new().unwrap();
+        let mut rejected_store =
+            PendingApprovalStore::open(rejected_dir.path().join("default.toml")).unwrap();
+        let rejected_entry = make_payment_entry(DEFAULT_TTL_MS);
+        let rejected_nonce = rejected_entry.approval_nonce.clone();
+        rejected_store.insert(rejected_entry, now_ms).unwrap();
+        rejected_store
+            .reject(&rejected_nonce, now_ms, DEFAULT_TTL_MS)
+            .unwrap();
+        let rejected_view = rejected_store.snapshot(now_ms).remove(0);
+
+        let pending_only = render_table(
+            &ListData {
+                profile: Some("default".to_owned()),
+                pending: vec![pending_view.clone()],
+                resolved: vec![],
+                expired_count: 0,
+            },
+            now_ms,
+        );
+        assert!(!pending_only.contains("Resolved"), "{pending_only}");
+
+        let both = render_table(
+            &ListData {
+                profile: Some("default".to_owned()),
+                pending: vec![pending_view],
+                resolved: vec![consumed_view.clone(), rejected_view],
+                expired_count: 0,
+            },
+            now_ms,
+        );
+        assert!(
+            both.contains("\n\nResolved\n"),
+            "expected Resolved section heading: {both}"
+        );
+        let (before, after) = both.split_once("\n\nResolved\n").unwrap();
+        assert!(before.contains("PaymentSimulated"), "{before}");
+        assert!(!before.contains("spent (PaymentSimulated)"), "{before}");
+        assert!(!before.contains("rejected (PaymentSimulated)"), "{before}");
+        assert!(after.contains("spent (PaymentSimulated)"), "{after}");
+        assert!(after.contains("rejected (PaymentSimulated)"), "{after}");
+
+        let resolved_only = render_table(
+            &ListData {
+                profile: Some("default".to_owned()),
+                pending: vec![],
+                resolved: vec![consumed_view],
+                expired_count: 1,
+            },
+            now_ms,
+        );
+        assert!(
+            resolved_only.starts_with("No pending approvals for profile 'default'."),
+            "{resolved_only}"
+        );
+        assert!(resolved_only.contains("\n\nResolved\n"), "{resolved_only}");
+        assert!(
+            resolved_only.contains("(1 expired entry not shown; run `approve gc` to clear)"),
+            "{resolved_only}"
+        );
+
+        let unsaved_plural = render_table(
+            &ListData {
+                profile: None,
+                pending: vec![],
+                resolved: vec![],
+                expired_count: 2,
+            },
+            now_ms,
+        );
+        assert!(
+            unsaved_plural.starts_with("No pending approvals.\n"),
+            "{unsaved_plural}"
+        );
+        assert!(
+            unsaved_plural.contains("(2 expired entries not shown; run `approve gc` to clear)"),
+            "{unsaved_plural}"
+        );
     }
 
     // ── render_pending_row / render_summary_line ─────────────────────────────

@@ -623,8 +623,7 @@ struct TrustlineSubmitted {
     ledger: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cross_check: Option<CrossCheckView>,
-    /// The business id the run named, echoed off mainnet, where no record
-    /// exists. Absent when the run named none.
+    /// The business id the run named. Absent when the run named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     business_id: Option<String>,
 }
@@ -1598,7 +1597,7 @@ where
             tx_hash,
             ledger,
             cross_check: Some(cross_check),
-            business_id: None,
+            business_id: args.business_id.clone(),
         })
     }
     .await;
@@ -3981,6 +3980,24 @@ pub(crate) mod tests {
                 run.envelope
             );
             assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// Mainnet `trustline` echoes the run's `business_id` on success.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn mainnet_trustline_success_echoes_business_id() {
+            let fixture = spec("mainnet-trustline-business-id").build().await;
+            let mut args = mainnet_args(&fixture);
+            args.business_id = Some("trustline-mainnet-bid-1".to_owned());
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(
+                run.envelope["data"]["business_id"], "trustline-mainnet-bid-1",
+                "{}",
+                run.envelope
+            );
         }
     }
     #[tokio::test(flavor = "current_thread")]

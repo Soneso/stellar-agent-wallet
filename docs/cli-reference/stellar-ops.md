@@ -49,9 +49,10 @@ alone leaves it unknown. A `not_included` operation admits a further attempt
 only once the checked decision of its last attempt is projected onto that
 attempt's receipt. Before that projection, the run refuses with
 `recovery.retry_refused` and sends nothing. The run exits `0` for a
-succeeded operation and `1` otherwise. On another network a supplied id is
-validated and echoed in `data.business_id`, and no record exists; without an
-id the output is unchanged.
+succeeded operation and `1` otherwise. Success output from `pay`, `claim`,
+sponsored `accounts create`, and `trustline` echoes a supplied id in
+`data.business_id` on mainnet and testnet. The field is omitted when no id is
+supplied. Off mainnet a supplied id is validated, and no record exists.
 
 The four full-mode verbs include numeric `total_fee_stroops`, equal to unsigned
 `tx.fee`, in policy arguments on both networks. `pay --build-only` and
@@ -161,7 +162,7 @@ Argument groups (enforced by the parser):
 | `--friendbot-url <URL>` | Friendbot endpoint URL (Friendbot mode) | optional | `https://friendbot.stellar.org` |
 | `--network <NETWORK>` | Must match the profile chain | optional | profile chain |
 | `--fee <STROOPS\|auto[:pNN]>` | Sponsored per-op fee | optional | command default (100) |
-| `--business-id <ID>` | Business id naming the operation; validated and echoed off mainnet, also in Friendbot mode | mainnet | none |
+| `--business-id <ID>` | Business id naming the operation; echoed on success on mainnet and testnet, including Friendbot mode on testnet | mainnet | none |
 | `--timeout-seconds <SECONDS>` | Send and confirmation poll timeout (sponsored mode) | optional | profile `submit_timeout_seconds`, else `60` |
 | `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
@@ -332,7 +333,9 @@ A version 2 policy's `memo_binding` criterion can also require an exact memo kin
   only a G account. No wallet command builds an M or W address: encode one
   outside the wallet as a SEP-23 strkey of the G account or C contract and a
   64-bit id.
-- Output: The signing and submitting stages report the witness outcome as
+- Output: Success echoes a supplied id in `data.business_id`, including on
+  mainnet. The field is omitted when no id is supplied.
+  The signing and submitting stages report the witness outcome as
   `data.cross_check`: `status` is `passed`, `skipped`, or `not_required`, with
   `reason`, `provider`, and `ledger` where they apply. `--output table` prints a
   `Cross-check:` line after the result line. `--build-only` reports no
@@ -442,7 +445,9 @@ included: the balance was already claimed, or the id is wrong.
   source's trustline. The staged stages compare the source account they
   re-read; a muxed source is witnessed on its G account. The refusal codes
   are those of `pay`. `--build-only` obtains no witness.
-- Output: The command prints one JSON envelope. The build stage's typed
+- Output: The command prints one JSON envelope. Success echoes a supplied id
+  in `data.business_id`, including on mainnet, and omits it when absent.
+  The build stage's typed
   preview is a nested `preview` object: in `data.preview` on success, and in
   `error.details.preview` when a later step fails. Those steps include claim
   guards, fee resolution, the policy gate, the fee cap, the witness, the audit
@@ -491,7 +496,7 @@ Reads the native XLM balance and trustlines for an account via the Stellar RPC `
 - Network: No mainnet gate; the command queries whatever `--rpc-url` points at.
 - Account: `--account` is required. When omitted, the command exits `1` with `validation.usage_error`.
 - Trustlines: Pass `--asset CODE:ISSUER` to query specific trustlines; repeat the flag for multiple assets. Assets the account does not trust are silently omitted from the output.
-- Output: `balances` lists native XLM first, then each trusted asset in the order of the `--asset` flags. Each entry's `asset.asset_type` is `native` for XLM or the asset code, such as `USDC`, and a trustline adds `asset.issuer`. `balance`, `buying_liabilities` and `selling_liabilities` are 7-decimal strings, and `limit` is the trustline limit, or `null` for XLM. The table output shows `native` or `CODE:GABC...WXYZ`.
+- Output: `balances` lists native XLM first, then each trusted asset in the order of the `--asset` flags. Each entry's `asset.asset_type` is `native`, `credit_alphanum4`, or `credit_alphanum12`. Credit assets carry `asset.code` and `asset.issuer`; native XLM omits both. Codes of 1 to 4 characters use `credit_alphanum4`; codes of 5 to 12 characters use `credit_alphanum12`. `balance`, `buying_liabilities` and `selling_liabilities` are 7-decimal strings, and `limit` is the trustline limit, or `null` for XLM. The table output shows `native` or `CODE:GABC...WXYZ`.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
@@ -518,7 +523,9 @@ Creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust g
 - USDT is hard-refused: The denomination resolver rejects USDT outright; the command cannot create a USDT trustline.
 - Limit: `--limit-stroops 0` removes the trustline. When absent the Stellar default (`i64::MAX`, unlimited) applies.
 - Asset grammar: A bare code such as `USDC` resolves through the pin table; `CODE:ISSUER` names an explicit issuer; a 56-char `C...` SAC address is deferred and returns a typed error.
-- Output: The command prints one JSON envelope. The typed preview contains
+- Output: The command prints one JSON envelope. Success echoes a supplied id
+  in `data.business_id`, including on mainnet, and omits it when absent.
+  The typed preview contains
   the code, issuer, limit, pin status, issuer flags, and gate decision.
   After the gate proceeds, success carries it in `data.preview` beside the result.
   Witness, signing, and submission refusals carry it in `error.details.preview`.

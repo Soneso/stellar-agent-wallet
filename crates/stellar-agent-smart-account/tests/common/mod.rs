@@ -24,7 +24,7 @@ use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::submit::{
     SubmissionResult, SubmissionSignerKind, submit_transaction_and_wait,
 };
-use stellar_agent_network::{SoftwareSigningKey, StellarRpcClient, fetch_account};
+use stellar_agent_network::{AssetType, SoftwareSigningKey, StellarRpcClient, fetch_account};
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::rules::{
     parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
@@ -115,7 +115,7 @@ pub async fn xlm_stroops_balance(g_strkey: &str) -> i64 {
     let native = account
         .balances
         .iter()
-        .find(|b| b.asset.asset_type == "native")
+        .find(|b| b.asset.asset_type == AssetType::Native)
         .expect("account must have a native balance entry");
     StellarAmount::parse_with_unit(&format!("{} XLM", native.balance))
         .expect("native balance decimal string must parse as a StellarAmount")

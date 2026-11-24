@@ -44,8 +44,15 @@ use crate::client::StellarRpcClient;
 /// release and changes in this one place.
 pub const MAX_LEDGER_CLOSE_LAG: Duration = Duration::from_secs(60);
 
-/// Bounds the `getLedgers` read independently of the caller's deadline.
+/// Bounds each `getLedgers` read attempt independently of the caller's deadline.
 pub const LEDGER_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Pauses between retryable `getLedgers` attempts in [`operational_check`].
+const LEDGER_READ_RETRY_PAUSES: [Duration; 2] =
+    [Duration::from_millis(250), Duration::from_millis(500)];
+
+/// Total `getLedgers` attempts in [`operational_check`] before refusing.
+const LEDGER_READ_MAX_ATTEMPTS: usize = LEDGER_READ_RETRY_PAUSES.len() + 1;
 
 /// The `getHealth` status of an endpoint that serves current ledgers.
 const HEALTHY_STATUS: &str = "healthy";
@@ -139,10 +146,13 @@ impl OperationalReport {
 /// Checks that `client`'s endpoint is healthy and current before a value
 /// ceremony reads the account it signs against.
 ///
-/// The check reads `getHealth` under `deadline`, then the endpoint's latest
-/// ledger through `getLedgers` under the earlier of `deadline` and
-/// [`LEDGER_READ_TIMEOUT`] from now, then the host clock. The caller reads
-/// the account afterwards through the same client.
+/// The check reads `getHealth` under `deadline`, then reads the endpoint's
+/// latest ledger through `getLedgers` with up to three attempts on timeout or
+/// transport error (250 ms and 500 ms pauses, never past `deadline`), each
+/// attempt bounded by the earlier of `deadline` and [`LEDGER_READ_TIMEOUT`],
+/// then reads the host clock. JSON-RPC error answers and close-time validation
+/// failures are answers and are not retried. The caller reads the account
+/// afterwards through the same client.
 ///
 /// # Errors
 ///
@@ -204,7 +214,7 @@ pub(crate) async fn single_readiness(
                 .map_err(|error| not_ready(network_failure_reason(error)))?
         }
     };
-    readiness_after_health(client, deadline, health, now_unix, charge).await
+    readiness_after_health(client, deadline, health, now_unix, charge, 1).await
 }
 
 /// The host clock in Unix seconds, mapped to the wallet's clock error.
@@ -229,18 +239,47 @@ async fn operational_check_at(
         .get_health_within(deadline)
         .await
         .map_err(|error| not_ready(network_failure_reason(error)))?;
-    readiness_after_health(client, deadline, health, now_unix, &mut || true)
-        .await
-        .map(|read| read.report)
+    readiness_after_health(
+        client,
+        deadline,
+        health,
+        now_unix,
+        &mut || true,
+        LEDGER_READ_MAX_ATTEMPTS,
+    )
+    .await
+    .map(|read| read.report)
 }
 
-/// Checks `health`, then reads and validates one ledger.
+/// Whether a `getLedgers` error is a transport error or request timeout that
+/// may be retried. JSON-RPC error answers and decode errors are not retried.
+fn is_retryable_ledger_read_error(error: &stellar_rpc_client::Error) -> bool {
+    matches!(
+        error,
+        stellar_rpc_client::Error::JsonRpc(
+            jsonrpsee_core::ClientError::Transport(_) | jsonrpsee_core::ClientError::RequestTimeout
+        )
+    )
+}
+
+/// Formats an attempt count for readiness refusal messages.
+fn attempts_label(attempts: usize) -> String {
+    if attempts == 1 {
+        "1 attempt".to_owned()
+    } else {
+        format!("{attempts} attempts")
+    }
+}
+
+/// Checks `health`, then reads and validates the latest ledger up to
+/// `max_attempts` times on timeout or transport error.
 async fn readiness_after_health(
     client: &StellarRpcClient,
     deadline: Instant,
     health: stellar_rpc_client::GetHealthResponse,
     now_unix: impl FnOnce() -> Result<u64, WalletError>,
     charge: &mut (dyn FnMut() -> bool + Send),
+    max_attempts: usize,
 ) -> Result<ReadinessRead, WalletError> {
     if health.status != HEALTHY_STATUS {
         return Err(not_ready(format!(
@@ -249,37 +288,58 @@ async fn readiness_after_health(
         )));
     }
 
-    if !charge() {
-        return Err(not_ready(REQUEST_ALLOWANCE_SPENT.to_owned()));
-    }
-    let own = Instant::now() + LEDGER_READ_TIMEOUT;
-    let answer = tokio::time::timeout_at(
-        deadline.min(own),
-        client.inner.get_ledgers(
-            stellar_rpc_client::LedgerStart::Ledger(health.latest_ledger),
-            Some(1),
-            None,
-        ),
-    )
-    .await;
-    let ledger = match answer {
-        Ok(Ok(answer)) => answer,
-        Ok(Err(error)) => {
-            return Err(not_ready(format!(
-                "getLedgers failed: {}",
-                client.url.scrub_display(&error)
-            )));
+    let mut attempt = 0_usize;
+    let ledger = loop {
+        attempt += 1;
+        if !charge() {
+            return Err(not_ready(REQUEST_ALLOWANCE_SPENT.to_owned()));
         }
-        Err(_) if deadline < own => {
-            return Err(not_ready(
-                "getLedgers did not answer before the caller's deadline".to_owned(),
-            ));
+        let own = Instant::now() + LEDGER_READ_TIMEOUT;
+        let answer = tokio::time::timeout_at(
+            deadline.min(own),
+            client.inner.get_ledgers(
+                stellar_rpc_client::LedgerStart::Ledger(health.latest_ledger),
+                Some(1),
+                None,
+            ),
+        )
+        .await;
+        let (retryable, refusal) = match answer {
+            Ok(Ok(answer)) => break answer,
+            Ok(Err(error)) => (
+                is_retryable_ledger_read_error(&error),
+                format!(
+                    "getLedgers failed ({}): {}",
+                    attempts_label(attempt),
+                    client.url.scrub_display(&error)
+                ),
+            ),
+            Err(_) if deadline < own => (
+                false,
+                format!(
+                    "getLedgers did not answer before the caller's deadline ({})",
+                    attempts_label(attempt)
+                ),
+            ),
+            Err(_) => (
+                true,
+                format!(
+                    "getLedgers did not answer within {}s ({})",
+                    LEDGER_READ_TIMEOUT.as_secs(),
+                    attempts_label(attempt)
+                ),
+            ),
+        };
+        if !retryable || attempt >= max_attempts {
+            return Err(not_ready(refusal));
         }
-        Err(_) => {
-            return Err(not_ready(format!(
-                "getLedgers did not answer within {}s",
-                LEDGER_READ_TIMEOUT.as_secs()
-            )));
+        let pause = LEDGER_READ_RETRY_PAUSES[attempt - 1];
+        if Instant::now() + pause >= deadline {
+            return Err(not_ready(refusal));
+        }
+        tokio::time::sleep(pause).await;
+        if Instant::now() >= deadline {
+            return Err(not_ready(refusal));
         }
     };
 
@@ -636,29 +696,273 @@ mod tests {
         let reason = reason(check(&server, Duration::from_millis(800)).await);
         assert_eq!(
             reason,
-            "getLedgers did not answer before the caller's deadline"
+            "getLedgers did not answer before the caller's deadline (1 attempt)"
         );
         assert!(
             started.elapsed() < LEDGER_READ_TIMEOUT,
             "the caller's deadline ends the read before the own bound"
         );
+        assert_eq!(rpc_request_count(&server, "getLedgers").await, 1);
     }
 
-    /// The ledger read has its own bound: with the caller's deadline far
-    /// away, a `getLedgers` answer slower than [`LEDGER_READ_TIMEOUT`]
-    /// refuses at that bound.
+    /// The ledger read retries up to three attempts on timeout, each bounded
+    /// by [`LEDGER_READ_TIMEOUT`], and refuses with the attempt count after
+    /// the third timeout.
     #[tokio::test]
     async fn a_slow_ledger_read_refuses_at_its_own_bound() {
         let delay = LEDGER_READ_TIMEOUT * 2;
         let server = server(health("healthy", 100), Some((ledgers(100, NOW - 4), delay))).await;
         let started = std::time::Instant::now();
         let reason = reason(check(&server, Duration::from_secs(30)).await);
-        assert_eq!(reason, "getLedgers did not answer within 2s");
+        assert_eq!(reason, "getLedgers did not answer within 2s (3 attempts)");
+        let elapsed = started.elapsed();
+        let min_expected = LEDGER_READ_TIMEOUT * 3 + Duration::from_millis(750);
+        assert!(
+            elapsed >= min_expected && elapsed < delay * 3,
+            "three bounded attempts and pauses end the read: {elapsed:?}"
+        );
+        assert_eq!(rpc_request_count(&server, "getLedgers").await, 3);
+    }
+
+    /// A first `getLedgers` attempt that times out followed by a prompt answer
+    /// succeeds and returns the readiness report.
+    #[tokio::test]
+    async fn a_timeout_followed_by_a_prompt_answer_is_ready() {
+        let server = server(health("healthy", 100), None).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "getLedgers"})))
+            .respond_with(DelayedResponder {
+                inner: EchoIdResponder::new(ledgers(100, NOW - 4)),
+                delay: LEDGER_READ_TIMEOUT * 2,
+            })
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "getLedgers"})))
+            .respond_with(EchoIdResponder::new(ledgers(100, NOW - 4)))
+            .mount(&server)
+            .await;
+
+        let report = check(&server, Duration::from_secs(10)).await.unwrap();
+        assert_eq!(
+            report,
+            OperationalReport {
+                latest_ledger: 100,
+                close_time_unix: NOW - 4,
+                close_lag_seconds: 4,
+            }
+        );
+        assert_eq!(rpc_request_count(&server, "getLedgers").await, 2);
+    }
+
+    /// A transport error on `getLedgers` retries with pauses and succeeds when
+    /// a later attempt answers, or refuses with the attempt count after three
+    /// failures.
+    #[tokio::test]
+    async fn transport_error_retries_and_refuses_after_three_attempts() {
+        let recovering = server(health("healthy", 100), None).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "getLedgers"})))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .mount(&recovering)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "getLedgers"})))
+            .respond_with(EchoIdResponder::new(ledgers(100, NOW - 4)))
+            .mount(&recovering)
+            .await;
+
+        let started = std::time::Instant::now();
+        let report = check(&recovering, Duration::from_secs(10)).await.unwrap();
+        assert_eq!(report.latest_ledger, 100);
+        assert_eq!(rpc_request_count(&recovering, "getLedgers").await, 3);
+        assert!(
+            started.elapsed() >= Duration::from_millis(750),
+            "both pauses (250ms + 500ms) run before the third attempt: {:?}",
+            started.elapsed()
+        );
+
+        let failing = server(health("healthy", 100), None).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "getLedgers"})))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&failing)
+            .await;
+        let reason = reason(check(&failing, Duration::from_secs(10)).await);
+        assert!(
+            reason.starts_with("getLedgers failed (3 attempts): "),
+            "{reason}"
+        );
+        assert_eq!(rpc_request_count(&failing, "getLedgers").await, 3);
+    }
+
+    /// A caller deadline shorter than the retry pause stops without sleeping
+    /// past the deadline and without sending a second request.
+    #[tokio::test]
+    async fn caller_deadline_shorter_than_retry_pause_stops_at_deadline() {
+        let server = server(health("healthy", 100), None).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "getLedgers"})))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let deadline = Duration::from_millis(150);
+        let started = std::time::Instant::now();
+        let reason = reason(check(&server, deadline).await);
         let elapsed = started.elapsed();
         assert!(
-            elapsed >= LEDGER_READ_TIMEOUT && elapsed < delay,
-            "the own bound ends the read: {elapsed:?}"
+            reason.starts_with("getLedgers failed (1 attempt): "),
+            "{reason}"
         );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "retry pause must not sleep past caller deadline: {elapsed:?}"
+        );
+        assert_eq!(rpc_request_count(&server, "getLedgers").await, 1);
+    }
+
+    /// `operational_check_single` sends at most one `getLedgers` request even on
+    /// a retryable transport failure.
+    #[tokio::test]
+    async fn single_readiness_does_not_retry_ledger_read() {
+        let srv = server(health("healthy", 100), None).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "getLedgers"})))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&srv)
+            .await;
+        let client = StellarRpcClient::new(&srv.uri()).unwrap();
+        let err = reason(
+            operational_check_single(&client, Instant::now() + Duration::from_secs(10)).await,
+        );
+        assert!(err.starts_with("getLedgers failed (1 attempt): "), "{err}");
+        assert_eq!(rpc_request_count(&srv, "getLedgers").await, 1);
+    }
+
+    /// A JSON-RPC error answer and a close-time validation failure are answers
+    /// and are never retried.
+    #[tokio::test]
+    async fn error_answer_and_close_time_failure_are_read_once() {
+        let error_server = server(health("healthy", 100), None).await;
+        mount_ledgers_error(&error_server, "internal server error").await;
+        let error_reason = reason(check(&error_server, Duration::from_secs(10)).await);
+        assert!(
+            error_reason.starts_with("getLedgers failed (1 attempt): "),
+            "{error_reason}"
+        );
+        assert_eq!(rpc_request_count(&error_server, "getLedgers").await, 1);
+
+        let stale_server = server(
+            health("healthy", 100),
+            Some((ledgers(100, NOW - 61), Duration::ZERO)),
+        )
+        .await;
+        let _ = reason(check(&stale_server, Duration::from_secs(10)).await);
+        assert_eq!(rpc_request_count(&stale_server, "getLedgers").await, 1);
+    }
+
+    /// A timeout on the first `getLedgers` attempt followed by a JSON-RPC
+    /// error answer on the second refuses without a third attempt, naming both
+    /// attempts and keeping `network.endpoint_not_ready`.
+    #[tokio::test]
+    async fn a_timeout_followed_by_an_error_answer_refuses_with_attempt_count() {
+        let server = server(health("healthy", 100), None).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "getLedgers"})))
+            .respond_with(DelayedResponder {
+                inner: EchoIdResponder::new(ledgers(100, NOW - 4)),
+                delay: LEDGER_READ_TIMEOUT * 2,
+            })
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_ledgers_error(&server, "internal server error").await;
+
+        let err = check(&server, Duration::from_secs(10)).await.unwrap_err();
+        assert_eq!(err.code(), "network.endpoint_not_ready", "{err:?}");
+        let msg = reason(Err::<OperationalReport, _>(err));
+        assert!(msg.starts_with("getLedgers failed (2 attempts): "), "{msg}");
+        assert_eq!(rpc_request_count(&server, "getLedgers").await, 2);
+    }
+
+    /// A retry pause that ends after the caller's deadline refuses with the
+    /// pre-pause refusal naming the attempts made, without starting another
+    /// attempt.
+    #[tokio::test(start_paused = true)]
+    async fn retry_pause_ending_after_deadline_stops_without_starting_next_attempt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let server = server(
+            health("healthy", 100),
+            Some((ledgers(100, NOW - 4), Duration::from_secs(60))),
+        )
+        .await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let health_resp: stellar_rpc_client::GetHealthResponse =
+            serde_json::from_value(health("healthy", 100)).unwrap();
+        let attempts = AtomicUsize::new(0);
+        let mut charge = || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            true
+        };
+        let deadline = Instant::now()
+            + LEDGER_READ_TIMEOUT
+            + LEDGER_READ_RETRY_PAUSES[0]
+            + Duration::from_millis(50);
+
+        let mut read = std::pin::pin!(readiness_after_health(
+            &client,
+            deadline,
+            health_resp,
+            || Ok(NOW),
+            &mut charge,
+            LEDGER_READ_MAX_ATTEMPTS,
+        ));
+
+        tokio::select! {
+            biased;
+            result = &mut read => panic!(
+                "expected retry pause before refusal, got {:?}",
+                result.map(|read| read.report)
+            ),
+            () = tokio::time::sleep(LEDGER_READ_TIMEOUT + Duration::from_millis(100)) => {}
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_millis(250)).await;
+        assert!(Instant::now() >= deadline);
+
+        let err = reason(read.await.map(|read| read.report));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(err, "getLedgers did not answer within 2s (1 attempt)");
+    }
+
+    /// Error classification retries transport errors and timeouts, and never
+    /// retries JSON-RPC call errors or parse errors.
+    #[test]
+    fn ledger_read_retry_classifier_separates_transport_from_answers() {
+        use jsonrpsee_core::ClientError;
+        use stellar_rpc_client::Error as RpcError;
+
+        assert!(is_retryable_ledger_read_error(&RpcError::JsonRpc(
+            ClientError::RequestTimeout
+        )));
+        assert!(is_retryable_ledger_read_error(&RpcError::JsonRpc(
+            ClientError::Transport(std::io::Error::other("reset").into())
+        )));
+        assert!(!is_retryable_ledger_read_error(&RpcError::JsonRpc(
+            ClientError::Call(
+                serde_json::from_value(json!({
+                    "code": -32603,
+                    "message": "internal"
+                }))
+                .unwrap()
+            )
+        )));
+        assert!(!is_retryable_ledger_read_error(&RpcError::InvalidResponse));
     }
 
     /// A failed ledger read names the failure without the credential of an
@@ -677,7 +981,10 @@ mod tests {
                 .await,
         );
 
-        assert!(reason.starts_with("getLedgers failed: "), "{reason}");
+        assert!(
+            reason.starts_with("getLedgers failed (1 attempt): "),
+            "{reason}"
+        );
         assert!(
             reason.contains(&format!("upstream {authority} refused the read")),
             "{reason}"

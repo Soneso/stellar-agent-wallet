@@ -667,10 +667,12 @@ A full binding writes `classic_max_fee_per_op_stroops = 10000` into
 Every enablement or rotation also inserts root
 `contract_transfer_max_fee_stroops = 1000000` when absent and preserves explicit
 values, including zero. Review both fee bounds before signing.
-The operator supplies the optional authorization
-TTL and thresholds. The operator also adds at least one approval credential
-from `approve credential enroll`, then signs the policy as the output's
-`next` list directs.
+The `next` list checks the profile and policy read before the rewrite fills
+defaults. It lists fee-cap, optional authorization TTL, optional cross-check
+threshold, and approval-credential hints only while their settings are missing
+or invalid. An empty threshold table also gets its hint.
+The `profile sign-policy` hint appears whenever `policy_needs_signature` is
+`true`.
 
 Before its first write, the ceremony writes the spending preview to stderr
 as one JSON line. It holds `phase = "before_write"` and the
@@ -1503,10 +1505,12 @@ The report names `profile` only when the name resolves to a saved profile.
 stellar-agent approve list --profile default
 ```
 
-Read-only. Lists every unexpired entry of the profile's pending-approval store
-under `pending`, with its wallet-controlled summary and expiry, so the operator
-does not depend on the agent relaying a nonce. Consumed and rejected tombstones
-are included (`kind_name` `Consumed` or `Rejected`) until their TTL ends;
+Read-only. Lists unexpired entries of the profile's pending-approval store,
+with wallet-controlled summaries and expiry, so the operator does not depend
+on the agent relaying a nonce. `pending` contains only non-tombstone entries.
+`resolved` contains consumed and rejected tombstones, distinguished by
+`kind_name` values `Consumed` and `Rejected`, with the same entry shape.
+Tombstones remain listed until their TTL ends;
 `approve gc --include-consumed` removes consumed ones earlier. Only an entry
 with a request `kind_name`, such as `PaymentSimulated` or
 `TrustlineSimulated`, awaits a decision.
@@ -1515,10 +1519,12 @@ with a request `kind_name`, such as `PaymentSimulated` or
 `approve status`, whose `state` is `attested` while the consent is unspent, or
 the `approval_attested` audit row.
 
-- `--include-expired`: also show entries whose TTL has elapsed (they are
-  counted in `expired_count` either way).
+- `--include-expired`: also show entries whose TTL has elapsed in `pending`
+  and `resolved`. `expired_count` counts all expired entries in the snapshot,
+  regardless of this flag.
 - `--output json|table`: envelope JSON (default) or one sanitized row per
-  entry with an expires-in countdown.
+  entry with an expires-in countdown. Table output groups tombstones under
+  `Resolved` when any are listed.
 
 For a muxed destination the payment summary carries `to` (the M address) and
 `to_base` (its G account); the table row reads `to <M> (base account <G>)`,
@@ -1528,7 +1534,7 @@ carries `to` only.
 The report names `profile` only when the name resolves to a saved profile.
 
 ```json
-{"ok":true,"data":{"profile":"default","pending":[{"approval_nonce":"ABCxyzNonce","kind_name":"PaymentSimulated","created_at_unix_ms":1717000000000,"expires_at_unix_ms":1717086400000,"expired":false,"attested":false,"summary":{"kind":"payment","source":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","to":"GDEST...","amount_stroops":"100000000","asset":"XLM","memo":null,"fee_stroops":"100","seq_num":12345}}],"expired_count":0},"request_id":"..."}
+{"ok":true,"data":{"profile":"default","pending":[{"approval_nonce":"ABCxyzNonce","kind_name":"PaymentSimulated","created_at_unix_ms":1717000000000,"expires_at_unix_ms":1717086400000,"expired":false,"attested":false,"summary":{"kind":"payment","source":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","to":"GDEST...","amount_stroops":"100000000","asset":"XLM","memo":null,"fee_stroops":"100","seq_num":12345}}],"resolved":[],"expired_count":0},"request_id":"..."}
 ```
 
 Trustline table rows read

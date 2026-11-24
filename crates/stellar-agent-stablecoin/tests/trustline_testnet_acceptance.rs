@@ -292,7 +292,7 @@ async fn happy_path_usdc_trustline() {
         .await
         .expect("holder account re-fetch must succeed after ChangeTrust");
     let trustline_exists = holder_after.balances.iter().any(|b| {
-        b.asset.asset_type == resolved.code
+        b.asset.code.as_deref() == Some(resolved.code.as_str())
             && b.asset.issuer.as_deref() == Some(resolved.issuer.as_str())
     });
     assert!(
@@ -665,10 +665,10 @@ async fn clawback_gate_opt_in_round_trip() {
         .await
         .expect("holder account re-fetch must succeed after ChangeTrust");
 
-    // BalanceView.asset is AssetView { asset_type: code, issuer: Some(g_strkey) }
-    // for non-native trustlines.
+    // BalanceView.asset carries `asset_type` (`CreditAlphanum4`/`CreditAlphanum12`),
+    // `code: Some(code)`, and `issuer: Some(g_strkey)` for non-native trustlines.
     let trustline_exists = holder_after.balances.iter().any(|b| {
-        b.asset.asset_type == resolved.code
+        b.asset.code.as_deref() == Some(resolved.code.as_str())
             && b.asset.issuer.as_deref() == Some(resolved.issuer.as_str())
     });
 
@@ -684,7 +684,7 @@ async fn clawback_gate_opt_in_round_trip() {
             .iter()
             .map(|b| format!(
                 "{}:{}",
-                b.asset.asset_type,
+                b.asset.code.as_deref().unwrap_or("native"),
                 b.asset.issuer.as_deref().unwrap_or("native")
             ))
             .collect::<Vec<_>>()
