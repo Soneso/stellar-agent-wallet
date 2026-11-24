@@ -81,7 +81,7 @@ jobs:
           # cache quota. They save on push runs and restore on pull requests.
           prefix-key: coverage
           save-if: ${{ github.event_name == 'push' }}
-      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-llvm-cov@0.8.7
       # Offline tier only, matching the test jobs. Coverage of
@@ -139,7 +139,7 @@ jobs:
           # cache quota. They save on push runs and restore on pull requests.
           prefix-key: coverage
           save-if: ${{ github.event_name == 'push' }}
-      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-llvm-cov@0.8.7
       # Offline tier only, matching the test jobs. The explicit feature list
