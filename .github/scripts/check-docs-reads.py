@@ -67,7 +67,7 @@ These forms stay invisible to the check:
 
 The full suite still covers them, as the workflow triggers set it: every
 pull request into ``main`` runs the full ``ci.yml`` suite (``ci.yml:26-27``);
-every push to ``mainnet-write`` or ``main`` runs the workspace tests of the
+every push to ``next`` or ``main`` runs the workspace tests of the
 Coverage workflow, whose push trigger has no paths filter and whose
 measuring jobs run on every push (``coverage.yml:21-22``, ``:48``); a push that
 changes a path other than Markdown, ``LICENSE``, or ``.claude-plugin/**``

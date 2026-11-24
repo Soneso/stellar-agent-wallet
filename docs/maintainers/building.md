@@ -249,9 +249,9 @@ issue-specific acceptance commands. `bash .github/scripts/preflight.sh --full`
 runs the complete local registry, including coverage.
 
 CI runs the offline gates on every pull request to `main` or
-`mainnet-write`. Pull-request
+`next`. Pull-request
 coverage requires the `coverage` label; live acceptance uses its separate
-workflow. A pull request into `mainnet-write` that changes only documentation,
+workflow. A pull request into `next` that changes only documentation,
 as `.github/scripts/classify-docs-only.py` decides, skips the `ci.yml` build
 and test jobs and runs `docs-tests`: the tests that `.github/docs-tests.tsv`
 lists, which `.github/scripts/check-docs-reads.py` keeps complete.
@@ -270,7 +270,7 @@ another package that holds the documentation path, an include whose file name
 arrives as a macro argument, a proc macro that reads a documentation file, or
 an embedding crate that takes a directory; review such code by hand.
 The full suite still covers them: every pull request into `main` runs the full
-`ci.yml` suite, every push to `mainnet-write` or `main` runs the workspace
+`ci.yml` suite, every push to `next` or `main` runs the workspace
 tests of `coverage.yml`, and a push that changes a path other than Markdown,
 `LICENSE`, or `.claude-plugin/**` runs `ci.yml`. A path under `skills/` counts,
 Markdown included.
@@ -281,7 +281,7 @@ reproductions. See the build-gate dimension of the
 [review checklist](review-checklist.md#8-build-gates).
 
 CI also checks the skill archive.
-CI skips this check for pull requests into and pushes to the `mainnet-write` integration branch.
+CI skips this check for pull requests into and pushes to the `next` integration branch.
 The pull request that merges that branch into `main` runs the check.
 
 ### Preflight
@@ -584,7 +584,7 @@ run. Each run resets its instrumentation data, writes a separate report and
 uses the selected configuration's floors. Live tiers that attempt RPC and
 Friendbot access remain disabled.
 
-CI runs this gate in the Coverage workflow. A push to `mainnet-write` or
+CI runs this gate in the Coverage workflow. A push to `next` or
 `main` runs it and seeds the coverage caches. It also runs weekly on main, on a
 pull request that carries the `coverage` label, and on demand through
 `workflow_dispatch`. A failed, canceled, or skipped measurement fails

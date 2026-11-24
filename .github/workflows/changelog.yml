@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
       - name: Protect integration changelog
-        if: github.event_name == 'pull_request' && github.base_ref == 'mainnet-write'
+        if: github.event_name == 'pull_request' && github.base_ref == 'next'
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}

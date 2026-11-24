@@ -273,7 +273,7 @@ except ImportError:
 WORKFLOWS = ("release.yml", "publish.yml", "notarize-smoke.yml", "labels.yml", "stale.yml", "triage.yml",
              "triage-review.yml", "triage-sweep.yml", "welcome.yml", "coverage.yml", "release-rehearsal.yml",
              "ci.yml", "vendored-wasm.yml", "changelog.yml")
-CHANGELOG_CONDITION = "github.event_name == 'pull_request' && github.base_ref == 'mainnet-write'"
+CHANGELOG_CONDITION = "github.event_name == 'pull_request' && github.base_ref == 'next'"
 CHANGELOG_ARGS = 'guard --base "$BASE_SHA" --head "$HEAD_SHA" --main-ref refs/remotes/origin/main'
 CHANGELOG_GUARD = ('set -euo pipefail\n'
                    'GUARD_ENTRY=$(git ls-tree "$BASE_SHA" -- .github/scripts/changelog.py)\n'
@@ -347,7 +347,7 @@ COVERAGE_PARTS = ("coverage-off", "coverage-on")
 COVERAGE_GATE = "coverage"
 # Pushes to these branches seed the coverage caches. Later runs do not cancel
 # a running push. A newer pending run replaces the older pending run.
-COVERAGE_SEED_BRANCHES = ("mainnet-write", "main")
+COVERAGE_SEED_BRANCHES = ("next", "main")
 COVERAGE_SEED_CANCEL = "github.event_name == 'pull_request'"
 COVERAGE_OFF_COMMAND = ("cargo llvm-cov --workspace --no-default-features --features "
                         "test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json")
@@ -549,7 +549,7 @@ VERIFY_JOBS = (("release.yml", "verify-packaged"), ("release.yml", "verify-prove
                ("publish.yml", "verify"), ("publish.yml", "verify-install"),
                ("release-rehearsal.yml", "verify-packaged"), ("release-rehearsal.yml", "verify-crates"))
 TOKEN_ENV = {"GH_TOKEN", "GITHUB_TOKEN"}
-SKILL_ARCHIVE_CONDITION = "github.base_ref != 'mainnet-write' && github.ref != 'refs/heads/mainnet-write'"
+SKILL_ARCHIVE_CONDITION = "github.base_ref != 'next' && github.ref != 'refs/heads/next'"
 # The feature jobs of ci.yml and the commands that define each of them. The
 # off jobs pass --no-default-features, which keeps mainnet-write off; the
 # binary packages enable it by default.
@@ -576,7 +576,7 @@ CI_FEATURE_JOBS = {
         '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-provenance.py --mutations'),
     "release-shape": ("bash .github/scripts/release/check-host.sh",),
 }
-# The feature jobs of ci.yml that skip a pull request into mainnet-write that
+# The feature jobs of ci.yml that skip a pull request into next that
 # changes only documentation. Each needs only the changes job and runs under
 # DOCS_ONLY_CONDITION. On such a pull request the docs-tests job runs under
 # DOCS_TESTS_CONDITION instead and runs DOCS_TESTS_COMMANDS: the documentation

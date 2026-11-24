@@ -60,7 +60,7 @@ The tag push starts `.github/workflows/release.yml`. Tag only a commit on
 same script with `--warn`, annotates the run with one warning per missing
 member, and the release proceeds.
 
-The changelog guard checks pull requests into `mainnet-write`.
+The changelog guard checks pull requests into `next`.
 An eligible sync merge there has exactly two parents and brings new ancestry
 from `main` through its second parent.
 Its `CHANGELOG.md` equals the clean three-way merge over the parents' merge
@@ -167,7 +167,7 @@ verification jobs hold no publishing or signing credential, their token has
 dependencies. The archive checks run on a runner of each release target, and
 the rehearsal packages with the toolchain that `publish.yml` packages with.
 In `ci.yml`, `feature-discipline` runs unconditionally. The other feature jobs
-skip only a documentation-only pull request into `mainnet-write`, where
+skip only a documentation-only pull request into `next`, where
 `docs-tests` runs instead. Each job runs its defining commands unconditionally.
 
 The `release-cache` rule refuses cache actions in the release and rehearsal.
@@ -223,7 +223,7 @@ them before the next release.
 
 - A tag ruleset on `refs/tags/v*` that restricts creations, updates, and
   deletions, with a bypass list of release maintainers only.
-- The rulesets for `main` and `mainnet-write` require the `changelog` check.
+- The rulesets for `main` and `next` require the `changelog` check.
 - The `release-signing` environment:
   - The five secrets `APPLE_DEVELOPER_ID_P12`,
     `APPLE_DEVELOPER_ID_P12_PASSWORD`, `APPLE_ASC_API_KEY_P8`,

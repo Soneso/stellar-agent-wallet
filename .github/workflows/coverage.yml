@@ -2,7 +2,7 @@ name: Coverage
 
 # The coverage gate measures offline line coverage and enforces the per-crate
 # floors of .github/scripts/check-coverage.py. It runs on pushes to
-# mainnet-write and main, weekly on main, on a pull request that carries the
+# next and main, weekly on main, on a pull request that carries the
 # `coverage` label, and on demand.
 #
 # Push runs seed the coverage caches that pull requests into those branches
@@ -16,10 +16,10 @@ name: Coverage
 
 on:
   pull_request:
-    branches: [main, mainnet-write]
+    branches: [main, next]
     types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
-    branches: [mainnet-write, main]
+    branches: [next, main]
   schedule:
     # Weekly, Monday 04:41 UTC.
     - cron: '41 4 * * 1'
