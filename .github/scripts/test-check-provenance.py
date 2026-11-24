@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Content assertions using the public alpha.12 predicate and checksums.
+"""Content assertions using the synthetic alpha.12 predicate fixture and checksums.
 
 --checker names the checker the assertions load. --mutations then changes
 one build-configuration check at a time in a scratch copy of
@@ -24,13 +24,15 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 FIXTURE = HERE / 'fixtures/stellar-agent-0.1.0-alpha.12.intoto.jsonl'
 SUMMARY = ('provenance: builder, source, subjects and build type match, '
-           'the parameters hold only string vars, and the environment is empty\n')
+           'the parameters hold only string vars, and the environment has exactly '
+           'the 15 generator keys with matching commit, ref and repository owner '
+           'and a tag push event\n')
 # The values each build-configuration field refuses; 'missing' removes the
 # field. The parameters accept a vars mapping of strings of any size.
 REFUSED = (
     ('buildType', ('unknown', None, {}, [])),
     ('parameters', ({}, {'vars': {}, 'inputs': {}}, {'vars': []}, {'vars': {'TESTNET_SCHEDULE': 1}}, None, [])),
-    ('environment', ({'RUSTFLAGS': '--cfg feature="mainnet-write"'}, {'extra': ''}, None, [])),
+    ('environment', ({'RUSTFLAGS': '--cfg feature="mainnet-write"'}, {'extra': ''}, None, [], {}, 'invalid', 1, False)),
 )
 ACCEPTED_PARAMETERS = ({'vars': {}}, {'vars': {'TESTNET_SCHEDULE': 'off'}})
 CONFIGURATION = 'provenance-build-configuration'
@@ -44,11 +46,43 @@ MUTATIONS = {
         "check_parameters(predicate['invocation'].get('parameters'))", 'pass',
         f'{CONFIGURATION}: parameters={{}}: accepted'),
     'provenance-environment': (
-        "if predicate['invocation'].get('environment') != {}:", 'if False:',
+        "check_environment(predicate['invocation'].get('environment'), sha, repository, ref)", 'pass',
         f"{CONFIGURATION}: environment={{'RUSTFLAGS': '--cfg feature=\"mainnet-write\"'}}: accepted"),
+    'provenance-environment-mapping': (
+        'if not isinstance(environment, dict):', 'if False:',
+        f'{CONFIGURATION}: environment=None: raised TypeError'),
+    'provenance-environment-missing-key': (
+        'if set(environment) != ENVIRONMENT_KEYS:',
+        "if set(environment) not in (ENVIRONMENT_KEYS, ENVIRONMENT_KEYS - {'github_actor'}):",
+        f'{CONFIGURATION}: environment-missing-key: accepted'),
+    'provenance-environment-extra-key': (
+        'if set(environment) != ENVIRONMENT_KEYS:',
+        "if set(environment) not in (ENVIRONMENT_KEYS, ENVIRONMENT_KEYS | {'extra'}):",
+        f'{CONFIGURATION}: environment-extra-key: accepted'),
+    'provenance-environment-sha1': (
+        "        'github_sha1': sha,\n", '',
+        f'{CONFIGURATION}: environment-github_sha1: accepted'),
+    'provenance-environment-ref': (
+        "        'github_ref': ref,\n", '',
+        f'{CONFIGURATION}: environment-github_ref: accepted'),
+    'provenance-environment-ref-type': (
+        "        'github_ref_type': 'tag',\n", '',
+        f'{CONFIGURATION}: environment-github_ref_type: accepted'),
+    'provenance-environment-event-name': (
+        "        'github_event_name': 'push',\n", '',
+        f'{CONFIGURATION}: environment-github_event_name: accepted'),
+    'provenance-environment-owner': (
+        "        'github_repository_owner': repository.split('/', 1)[0],\n", '',
+        f'{CONFIGURATION}: environment-github_repository_owner: accepted'),
+    'provenance-environment-variable-values': (
+        "        'github_sha1': sha,\n",
+        "        'github_sha1': sha,\n        'github_actor': 'example-actor',\n",
+        f'{CONFIGURATION}: environment-variable-values: refused'),
     'provenance-summary': (
         "print('provenance: builder, source, subjects and build type match, '\n"
-        "          'the parameters hold only string vars, and the environment is empty')",
+        "          'the parameters hold only string vars, and the environment has exactly '\n"
+        "          'the 15 generator keys with matching commit, ref and repository owner '\n"
+        "          'and a tag push event')",
         "print('provenance: builder, source and subjects match')",
         f'{CONFIGURATION}: success summary differs'),
     'provenance-parameters-exact': (
@@ -92,6 +126,39 @@ def with_field(document, field, value):
     return wrapped
 
 
+def environment_configuration(module, document, sums, sha, repository, ref):
+    statement = json.loads(base64.b64decode(document['dsseEnvelope']['payload']))
+    environment = statement['predicate']['invocation']['environment']
+    mismatches = {
+        'github_sha1': '0' * 40,
+        'github_ref': 'refs/tags/v0.0.0',
+        'github_ref_type': 'branch',
+        'github_event_name': 'workflow_dispatch',
+        'github_repository_owner': 'other-owner',
+    }
+    cases = {key: ({**environment, key: value}, f'{key} differs')
+             for key, value in mismatches.items()}
+    cases['missing-key'] = ({key: value for key, value in environment.items()
+                             if key != 'github_actor'}, 'keys differ')
+    cases['extra-key'] = ({**environment, 'extra': ''}, 'keys differ')
+    for name, (value, reason) in cases.items():
+        label = f'{CONFIGURATION}: environment-{name}'
+        try:
+            module.check(with_field(document, 'environment', value), sums, sha, repository, ref)
+        except ValueError as error:
+            assert str(error) == f'invocation.environment {reason}', f'{label}: diagnostic differs: {error}'
+        else:
+            raise AssertionError(f'{label}: accepted')
+        print(f'ok environment-{name}')
+    variable_environment = {key: value if key in mismatches else 'synthetic-variable'
+                            for key, value in environment.items()}
+    try:
+        module.check(with_field(document, 'environment', variable_environment), sums, sha, repository, ref)
+    except ValueError as error:
+        raise AssertionError(f'{CONFIGURATION}: environment-variable-values: refused: {error}') from None
+    print('ok environment-variable-values')
+
+
 def configuration(module, checker, document, sums, sha, repository, ref):
     module.check(document, sums, sha, repository, ref)
     for field, values in REFUSED:
@@ -105,6 +172,7 @@ def configuration(module, checker, document, sums, sha, repository, ref):
                 raise AssertionError(f'{label}: raised {type(error).__name__}') from None
             else:
                 raise AssertionError(f'{label}: accepted')
+    environment_configuration(module, document, sums, sha, repository, ref)
     for value in ACCEPTED_PARAMETERS:
         try:
             module.check(with_field(document, 'parameters', value), sums, sha, repository, ref)
@@ -189,14 +257,18 @@ def assertions(module, checker):
     # predicate names the same value.
     short = copy.deepcopy(statement)
     short['predicate']['invocation']['configSource']['digest']['sha1'] = sha[:12]
+    short['predicate']['invocation']['environment']['github_sha1'] = sha[:12]
     short['predicate']['materials'][0]['digest']['sha1'] = sha[:12]
     wrapped = copy.deepcopy(document)
     wrapped['dsseEnvelope']['payload'] = base64.b64encode(json.dumps(short).encode()).decode()
+    other_tag_environment = {**statement['predicate']['invocation']['environment'],
+                             'github_ref': 'refs/tags/v0.0.0'}
+    other_tag = with_field(document, 'environment', other_tag_environment)
     for name, altered, checksum, commit, tag in [
         ('payload-type', {'dsseEnvelope': {**envelope, 'payloadType': 'unknown'}}, sums, sha, ref),
         ('envelope-key', envelope, sums, sha, ref),
         ('commit-shape', wrapped, sums, sha[:12], ref),
-        ('tag-ref', document, sums, sha, 'refs/tags/v0.0.0'),
+        ('tag-ref', other_tag, sums, sha, 'refs/tags/v0.0.0'),
         ('checksum-duplicate', document, sums + sums.splitlines()[0] + '\n', sha, ref),
         ('checksum-invalid', document, 'invalid\n', sha, ref),
         ('checksum-empty', document, '', sha, ref),

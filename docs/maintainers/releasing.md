@@ -429,15 +429,21 @@ credential is requested.
 
 The generic SLSA generator records source identity and checksum subjects.
 It records the `vars` context, which holds the repository, organization, and
-environment variables, as its only parameter. Its environment is `{}`, and it
-records no Cargo command. The content checker requires a parameters mapping
-whose only key is `vars`, a mapping of string names to string values, and an
-empty environment, and pins the generic build type, the builder, the source,
+environment variables, as its only parameter. It records no Cargo command.
+The content checker requires a parameters mapping whose only key is `vars`,
+a mapping of string names to string values. The environment must be an object
+with exactly the 15 keys in `ENVIRONMENT_KEYS` in
+[check-provenance.py](../../.github/scripts/check-provenance.py).
+Its `github_sha1`, `github_ref` and `github_repository_owner` values must match
+the commit, ref and repository owner arguments. Its `github_ref_type` must be
+`tag`, and its `github_event_name` must be `push`.
+The other environment values vary per run and are not compared.
+The checker also pins the generic build type, the builder, the source,
 and the exact subjects. The release workflow, the reusable workflows it calls,
 and its local actions never read the `vars` context, and the `release-vars`
 rule of the workflow invariants check refuses a reference to it, so a
 repository or organization variable cannot reach the build.
-Empty provenance fields do not prove that the compiler receives no extra flags.
+The workflow guards and feature graph checks constrain compiler flags.
 
 The provenance boundary combines three checks: statement content, workflow
 guards and resolved feature graphs, and markers from packaged executables.
