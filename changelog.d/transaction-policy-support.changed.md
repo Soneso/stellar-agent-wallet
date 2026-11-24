@@ -1,2 +1,0 @@
-- Refuse overflowing period, total, and unlisted budget sums with the governing limit's denial code. Exact-cap use remains allowed.
-- Add ordered authorized accounting batches, a first-rule opaque-signing consent query, and optional value legs on signing audit rows. Existing signing callers retain empty legs.

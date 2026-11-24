@@ -122,7 +122,7 @@ need a copy of the executable under that name.
 installs `stellar-agent`:
 
 ```bash
-cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.2.0-alpha.1
 ```
 
 ### cargo install (from crates.io)
@@ -130,7 +130,7 @@ cargo binstall --locked --disable-strategies quick-install,compile stellar-agent
 `cargo install` builds `stellar-agent` from the sources on crates.io:
 
 ```bash
-cargo install --locked stellar-agent-cli@0.1.0-alpha.13
+cargo install --locked stellar-agent-cli@0.2.0-alpha.1
 ```
 
 After either install, copy the executable for clients that start
@@ -145,7 +145,7 @@ cp ~/.cargo/bin/stellar-agent ~/.cargo/bin/stellar-agent-mcp
 Clone the release tag and build with its committed `Cargo.lock`:
 
 ```bash
-git clone --branch v0.1.0-alpha.13 https://github.com/Soneso/stellar-agent-wallet.git
+git clone --branch v0.2.0-alpha.1 https://github.com/Soneso/stellar-agent-wallet.git
 cd stellar-agent-wallet
 cargo build --release --locked
 cp target/release/stellar-agent target/release/stellar-agent-mcp

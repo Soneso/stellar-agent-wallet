@@ -1,1 +1,0 @@
-- CLI pay results, MCP payment commits, and retries of a retained payment show the complete destination, including the full muxed ID, and list each payment operation's destination when they differ. Toolset consent shows the complete destination for G and M accounts. A payment preparation refuses with the read error when the destination account cannot be read.

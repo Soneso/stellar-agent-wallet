@@ -73,7 +73,7 @@ archive carries it under two names:
   copies of one executable (`.exe` on Windows), plus `README.md` and `LICENSE`.
 
 ```bash
-cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.2.0-alpha.1
 ```
 
 `cargo binstall` installs the canonical name `stellar-agent` only. The
@@ -123,8 +123,8 @@ your target in the commands.
 Linux or macOS (this example selects Apple Silicon):
 
 ```bash
-curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.13/stellar-agent-0.1.0-alpha.13-aarch64-apple-darwin.tar.xz
-curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.13/SHA256SUMS
+curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.2.0-alpha.1/stellar-agent-0.2.0-alpha.1-aarch64-apple-darwin.tar.xz
+curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.2.0-alpha.1/SHA256SUMS
 ```
 
 On Linux, check the checksum with `sha256sum --ignore-missing --check SHA256SUMS`.
@@ -133,15 +133,15 @@ When the checksum matches, extract the archive. Then add its folder to this
 shell's `PATH`:
 
 ```bash
-tar -xJf stellar-agent-0.1.0-alpha.13-aarch64-apple-darwin.tar.xz
-export PATH="$PWD/stellar-agent-0.1.0-alpha.13-aarch64-apple-darwin:$PATH"
+tar -xJf stellar-agent-0.2.0-alpha.1-aarch64-apple-darwin.tar.xz
+export PATH="$PWD/stellar-agent-0.2.0-alpha.1-aarch64-apple-darwin:$PATH"
 ```
 
 Windows PowerShell:
 
 ```powershell
-$release = 'https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.13'
-$folder = 'stellar-agent-0.1.0-alpha.13-x86_64-pc-windows-msvc'
+$release = 'https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.2.0-alpha.1'
+$folder = 'stellar-agent-0.2.0-alpha.1-x86_64-pc-windows-msvc'
 $archive = "$folder.zip"
 curl.exe -fsSLO "$release/$archive"
 curl.exe -fsSLO "$release/SHA256SUMS"
@@ -189,7 +189,7 @@ your `PATH`; the `stellar-agent-cli` crate installs the executable named
 `stellar-agent`:
 
 ```bash
-cargo install --locked stellar-agent-cli@0.1.0-alpha.13
+cargo install --locked stellar-agent-cli@0.2.0-alpha.1
 ```
 
 `--locked` makes cargo build with the `Cargo.lock` published in the crate.
@@ -203,7 +203,7 @@ starts that name.
 Clone the release tag and build with its committed `Cargo.lock`:
 
 ```bash
-git clone --branch v0.1.0-alpha.13 https://github.com/Soneso/stellar-agent-wallet
+git clone --branch v0.2.0-alpha.1 https://github.com/Soneso/stellar-agent-wallet
 cd stellar-agent-wallet
 cargo build --release --locked
 cp target/release/stellar-agent target/release/stellar-agent-mcp

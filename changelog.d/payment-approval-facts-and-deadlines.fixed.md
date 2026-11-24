@@ -1,1 +1,0 @@
-- Payment approvals now display retained envelope facts with structured memo details, preserve exact policy expiry through queueing delay, and bound mainnet signing authority by the captured decision end.

@@ -60,7 +60,7 @@ approval attestations) see `./approvals-and-audit.md` and `./security.md`.
   HTTP or SSE transport.
 - Protocol version `2024-11-05`. Declared capabilities: `tools` and `resources`.
 - Server identity at `initialize`: name `stellar-agent-mcp`, version matching
-  the workspace package version, `0.1.0-alpha.13`.
+  the workspace package version, `0.2.0-alpha.1`.
 - The server refuses to start if the active profile sets `mcp_disabled = true`,
   exiting 1 with `mcp.disabled_per_profile`.
 - The operator can halt a running server's profile with

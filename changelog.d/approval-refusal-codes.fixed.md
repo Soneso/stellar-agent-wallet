@@ -1,1 +1,0 @@
-- Approval refusals keep their own codes. A request changed after review refuses with approval.presence_changed, and a record of another kind refuses with approval.wrong_kind. Both inboxes answer a wrong-kind or inconsistent entry with HTTP 409.

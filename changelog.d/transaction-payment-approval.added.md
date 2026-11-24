@@ -1,3 +1,0 @@
-- `stellar_sep43_sign_transaction` and `stellar_sep43_sign_and_submit_transaction` accept `approval_nonce` and `approval_attestation`. A single payment, path payment, account creation or trustline change that needs approval returns a pending approval and signs on the attested repeat.
-- A sign-only signature under approval consumes the approval before the signature is returned. Its `opaque_payload_signed` row records `require_approval`.
-- A transaction of another shape that needs approval keeps `policy.approval_required_unsupported`.

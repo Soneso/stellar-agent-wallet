@@ -1,4 +1,0 @@
-- `stellar_sep43_sign_transaction` and `stellar_sep43_sign_and_submit_transaction` count an operation of another source account only when that account's signer set lists the wallet key, at any weight. Each call reads those signer sets once over the profile's RPC endpoint, and a read failure refuses with its own `network.*` or `protocol.*` code.
-- Operations of an account that does not list the wallet key add no payment, opt-in requirement, refusal, window charge or audit leg. Negative amount fields refuse for every source, and fee ownership is unchanged.
-- An approval still covers the complete envelope: a transaction of two operations with one counted payment keeps `policy.approval_required_unsupported`.
-- `stellar_agent_network::account::fetch_account_signers` is public, and `stellar_agent_core::policy::transaction_effects` adds `transaction_source_candidates` and `transaction_effects_for_sources`.

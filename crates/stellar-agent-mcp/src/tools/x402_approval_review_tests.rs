@@ -269,34 +269,10 @@ fn approval_public_text_names_the_contract() {
             "An error returns at once, unchanged, and nothing is signed.",
         ),
         (
-            include_str!("../../../../changelog.d/x402-owner-approval.added.md"),
+            include_str!("../../../../CHANGELOG.md"),
             "`KeyringSignHandle::sign_soroban_address_auth_payload_checked` runs a caller check after the payer-key read, immediately before signing.",
         ),
     ] {
         assert!(source.contains(sentence), "public text states: {sentence}");
-    }
-    for (fragment, items) in [
-        (
-            include_str!("../../../../changelog.d/x402-owner-approval.added.md"),
-            3,
-        ),
-        (
-            include_str!("../../../../changelog.d/x402-owner-approval.changed.md"),
-            4,
-        ),
-    ] {
-        assert_eq!(
-            fragment
-                .lines()
-                .filter(|line| line.starts_with("- "))
-                .count(),
-            items,
-            "each release category retains its top-level items"
-        );
-        assert!(
-            fragment
-                .lines()
-                .all(|line| line.starts_with("- ") || line.starts_with("  "))
-        );
     }
 }
