@@ -1,7 +1,7 @@
 name: CI
 
 # Every pull request to main runs the offline gate suite, including docs
-# changes. A pull request to mainnet-write that changes only documentation
+# changes. A pull request to next that changes only documentation
 # skips the jobs that read no documentation path and the workspace build and
 # test jobs; the docs-tests job runs the tests that read documentation in
 # their place. The changes job decides.
@@ -13,7 +13,7 @@ name: CI
 
 on:
   push:
-    branches: [main, mainnet-write]
+    branches: [main, next]
     # Documentation, the license, and the plugin manifest cannot change a gate
     # result, so pushes skip them.
     # Skill changes run CI because release-contracts verifies the archive on main.
@@ -24,7 +24,7 @@ on:
       - '!.claude-plugin/**'
       - 'skills/**'
   pull_request:
-    branches: [main, mainnet-write]
+    branches: [main, next]
 
 # Supersede in-flight runs for the same ref so rapid pushes do not queue stale
 # work.
@@ -41,7 +41,7 @@ env:
   FEATURES_EXCEPT_MAINNET_WRITE: live-platform-keyring,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance
 
 jobs:
-  # Prints docs_only=true for a pull request into mainnet-write that changes
+  # Prints docs_only=true for a pull request into next that changes
   # only documentation paths, and docs_only=false for every other event.
   changes:
     name: changes
@@ -294,7 +294,7 @@ jobs:
       - name: Check the proof matrix
         run: python3 .github/scripts/check-proof-matrix.py --configuration feature-on --workspace
 
-  # Runs on a docs-only pull request into mainnet-write only, where clippy,
+  # Runs on a docs-only pull request into next only, where clippy,
   # test, feature-on-clippy, feature-on-test, and windows-storage skip. It
   # builds and runs the tests that .github/docs-tests.tsv lists, the tests
   # that read a documentation path, in both feature states of the test jobs.
@@ -452,7 +452,7 @@ jobs:
         run: .github/scripts/publish-crates.sh --check
       # Many open pull requests conflict in the binary archive on the integration branch; the pull request into main runs the check.
       - name: Check the skill archive
-        if: github.base_ref != 'mainnet-write' && github.ref != 'refs/heads/mainnet-write'
+        if: github.base_ref != 'next' && github.ref != 'refs/heads/next'
         run: .github/scripts/package-skill.sh --check
       - name: Check the signer-set baseline gate
         run: bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh

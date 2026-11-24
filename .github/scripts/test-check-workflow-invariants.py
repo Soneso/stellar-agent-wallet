@@ -39,7 +39,7 @@ REHEARSAL = ".github/workflows/release-rehearsal.yml"
 CI = ".github/workflows/ci.yml"
 TESTNET = ".github/workflows/testnet.yml"
 CHANGELOG = ".github/workflows/changelog.yml"
-CHANGELOG_CONDITION = "github.event_name == 'pull_request' && github.base_ref == 'mainnet-write'"
+CHANGELOG_CONDITION = "github.event_name == 'pull_request' && github.base_ref == 'next'"
 CHANGELOG_IF = f"        if: {CHANGELOG_CONDITION}\n"
 CHANGELOG_ARGS = 'guard --base "$BASE_SHA" --head "$HEAD_SHA" --main-ref refs/remotes/origin/main'
 CHANGELOG_COMMAND = ('set -euo pipefail\n'
@@ -105,7 +105,7 @@ CHANGELOG_VARIANTS = {
              changelog_edit(CHANGELOG_FETCH, CHANGELOG_FETCH.replace("refs/heads/main:", "refs/heads/other:")),
              changelog_edit(CHANGELOG_FETCH + CHANGELOG_GUARD, CHANGELOG_GUARD + CHANGELOG_FETCH)],
     "W12": [changelog_edit(CHANGELOG_GUARD, "")],
-    "W13": [changelog_edit(CHANGELOG_IF, value) for value in ("", CHANGELOG_IF.replace("'mainnet-write'", "'main'"),
+    "W13": [changelog_edit(CHANGELOG_IF, value) for value in ("", CHANGELOG_IF.replace("'next'", "'main'"),
              CHANGELOG_IF.replace("'pull_request'", "'push'"), CHANGELOG_IF.rstrip() + " && false\n")],
     "W14": [changelog_edit("HEAD_SHA: ${{ github.event.pull_request.head.sha }}", "HEAD_SHA: ${{ github.sha }}"),
              changelog_edit("BASE_SHA: ${{ github.event.pull_request.base.sha }}", "BASE_SHA: ${{ github.sha }}")],
@@ -188,8 +188,8 @@ python3() {
     if label == "W17":
         condition = guard["if"].strip()
         condition = condition[3:-2].strip() if condition.startswith("${{") else condition
-        for event, base, expected in (("pull_request", "mainnet-write", True), ("edited", "mainnet-write", True),
-                                      ("pull_request", "main", False), ("push", "mainnet-write", False), ("tag", "", False)):
+        for event, base, expected in (("pull_request", "next", True), ("edited", "next", True),
+                                      ("pull_request", "main", False), ("push", "next", False), ("tag", "", False)):
             name = "pull_request" if event == "edited" else "push" if event == "tag" else event
             expression = condition.replace("github.event_name", repr(name)).replace("github.base_ref", repr(base)).replace("&&", "and")
             if eval(expression, {"__builtins__": {}}, {}) != expected:
@@ -208,7 +208,7 @@ python3() {
     return problems
 APT_LIBUDEV_RUN = ("        run: sudo apt-get -o Acquire::Retries=3 update && "
                    "sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config\n")
-SKILL_ARCHIVE_CONDITION = "github.base_ref != 'mainnet-write' && github.ref != 'refs/heads/mainnet-write'"
+SKILL_ARCHIVE_CONDITION = "github.base_ref != 'next' && github.ref != 'refs/heads/next'"
 SKILL_ARCHIVE_IF = f"        if: {SKILL_ARCHIVE_CONDITION}\n"
 SKILL_ARCHIVE_RUN = "        run: .github/scripts/package-skill.sh --check\n"
 SKILL_ARCHIVE_STEP = "      - name: Check the skill archive\n" + SKILL_ARCHIVE_IF + SKILL_ARCHIVE_RUN
@@ -225,11 +225,11 @@ COVERAGE_IF_LINE = f"    if: {COVERAGE_CONDITION}\n"
 COVERAGE_IF_WRAPPED_LINE = f"    if: ${{{{ {COVERAGE_CONDITION} }}}}\n"
 COVERAGE_IF_SPACED_LINE = f'    if: "  {COVERAGE_CONDITION}  "\n'
 COVERAGE_TYPES_LINE = "    types: [opened, synchronize, reopened, labeled, unlabeled]\n"
-COVERAGE_PUSH_BLOCK = "  push:\n    branches: [mainnet-write, main]\n"
+COVERAGE_PUSH_BLOCK = "  push:\n    branches: [next, main]\n"
 COVERAGE_ON_BLOCK = (
     "on:\n"
     "  pull_request:\n"
-    "    branches: [main, mainnet-write]\n"
+    "    branches: [main, next]\n"
     + COVERAGE_TYPES_LINE
     + COVERAGE_PUSH_BLOCK +
     "  schedule:\n"
@@ -389,7 +389,7 @@ CI_OFF_JOBS = {
              "cargo test --workspace --no-default-features --features test-helpers,"),
 }
 # The dependency and condition lines that skip a ci.yml job on a docs-only
-# pull request into mainnet-write.
+# pull request into next.
 DOCS_ONLY_JOB = ("    needs: changes\n"
                  "    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}\n")
 DOCS_ONLY_FEATURE_JOBS = ("clippy", "doc", "test", "feature-on-clippy", "feature-on-doc", "feature-on-test",
@@ -771,7 +771,7 @@ PASSING = [
         (COVERAGE, COVERAGE_CANCEL_FINAL, COVERAGE_CANCEL_FINAL.replace("if: cancelled()", "if: ${{ cancelled() }}"), 1)]),
     ("coverage parts in another order pass", coverage_move(COVERAGE_OFF_JOB, COVERAGE_GATE_START)),
     ("coverage seed branches in another order pass", [
-        (COVERAGE, COVERAGE_PUSH_BLOCK, "  push:\n    branches: [main, mainnet-write]\n", 1)]),
+        (COVERAGE, COVERAGE_PUSH_BLOCK, "  push:\n    branches: [main, next]\n", 1)]),
     ("save-if as a quoted expression passes", [
         (CI, CACHE_SAVE_LINE, "          save-if: \"${{ github.event_name == 'push' }}\"\n", 9)]),
     ("save-if with inner spaces passes", [
@@ -824,17 +824,17 @@ CASES = [
          "        run: |\n          sudo apt-get -o Acquire::Retries=3 update\n"
          "          sudo apt-get install -y libudev-dev pkg-config\n", 2)], 1),
     ("CI pull request branches without main", "ci-triggers", "pull_request branches must include main", [
-        (CI, "  pull_request:\n    branches: [main, mainnet-write]\n",
-         "  pull_request:\n    branches: [mainnet-write]\n", 1)], 1),
+        (CI, "  pull_request:\n    branches: [main, next]\n",
+         "  pull_request:\n    branches: [next]\n", 1)], 1),
     ("CI adds workflow_dispatch", "ci-triggers",
      "archive condition must be re-evaluated for the new event: workflow_dispatch", [
         (CI, "on:\n", "on:\n  workflow_dispatch:\n", 1)], 1),
     ("skill archive step removed", "skill-archive", "expected exactly one skill archive step", [
         (CI, SKILL_ARCHIVE_STEP, "", 1)], 1),
     ("skill archive skipped for main pull requests", "skill-archive", "skill archive condition differs", [
-        (CI, SKILL_ARCHIVE_IF, SKILL_ARCHIVE_IF.replace("'mainnet-write'", "'main'"), 1)], 1),
+        (CI, SKILL_ARCHIVE_IF, SKILL_ARCHIVE_IF.replace("'next'", "'main'"), 1)], 1),
     ("skill archive skipped for main pushes", "skill-archive", "skill archive condition differs", [
-        (CI, SKILL_ARCHIVE_IF, SKILL_ARCHIVE_IF.replace("refs/heads/mainnet-write", "refs/heads/main"), 1)], 1),
+        (CI, SKILL_ARCHIVE_IF, SKILL_ARCHIVE_IF.replace("refs/heads/next", "refs/heads/main"), 1)], 1),
     ("skill archive always skipped", "skill-archive", "skill archive condition differs", [
         (CI, SKILL_ARCHIVE_IF, "        if: false\n", 1)], 1),
     ("skill archive without integration exception", "skill-archive", "skill archive condition differs", [
@@ -1388,15 +1388,15 @@ CASES = [
      '.github/workflows/notarize-smoke.yml: unreadable: ', [
         (SMOKE, "name: Notarization smoke\n", "name: [Notarization smoke\n", 1)]),
     ("coverage pull_request trigger with a paths filter", "coverage-trigger", "paths filter", [
-        (COVERAGE, "    branches: [main, mainnet-write]\n" + COVERAGE_TYPES_LINE,
-         "    branches: [main, mainnet-write]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1)]),
+        (COVERAGE, "    branches: [main, next]\n" + COVERAGE_TYPES_LINE,
+         "    branches: [main, next]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1)]),
     ("coverage pull_request trigger with a paths-ignore filter", "coverage-trigger", "paths-ignore filter", [
-        (COVERAGE, "    branches: [main, mainnet-write]\n" + COVERAGE_TYPES_LINE,
-         "    branches: [main, mainnet-write]\n    paths-ignore: ['**.md']\n" + COVERAGE_TYPES_LINE, 1)]),
+        (COVERAGE, "    branches: [main, next]\n" + COVERAGE_TYPES_LINE,
+         "    branches: [main, next]\n    paths-ignore: ['**.md']\n" + COVERAGE_TYPES_LINE, 1)]),
     ("coverage pull_request trigger without unlabeled", "coverage-trigger", "lack unlabeled", [
         (COVERAGE, "labeled, unlabeled]", "labeled]", 1)]),
     ("coverage workflow without a pull_request trigger", "coverage-trigger", "trigger is absent", [
-        (COVERAGE, "  pull_request:\n    branches: [main, mainnet-write]\n" + COVERAGE_TYPES_LINE, "", 1)]),
+        (COVERAGE, "  pull_request:\n    branches: [main, next]\n" + COVERAGE_TYPES_LINE, "", 1)]),
     ("coverage job without the label condition", "coverage-condition", "coverage-off job runs without the label condition", [
         (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, ""), 1)]),
     ("coverage job that always measures", "coverage-condition", "coverage-off job runs without the label condition", [
@@ -1419,7 +1419,7 @@ CASES = [
         (COVERAGE, COVERAGE_ON_BLOCK, "on: pull_request\n", 1)]),
     ("coverage pull_request trigger without a configuration", "coverage-trigger",
      "coverage.yml: coverage-trigger: pull_request types are absent", [
-        (COVERAGE, "  pull_request:\n    branches: [main, mainnet-write]\n" + COVERAGE_TYPES_LINE, "  pull_request:\n", 1)]),
+        (COVERAGE, "  pull_request:\n    branches: [main, next]\n" + COVERAGE_TYPES_LINE, "  pull_request:\n", 1)]),
     ("coverage pull_request types as a string", "coverage-trigger",
      "coverage.yml: coverage-trigger: pull_request types are absent", [
         (COVERAGE, COVERAGE_TYPES_LINE, "    types: labeled\n", 1)]),
@@ -1438,8 +1438,8 @@ CASES = [
     ("coverage paths filter and a missing condition", ("coverage-trigger", "coverage-condition"), (
         "coverage.yml: coverage-trigger: pull_request trigger has a paths filter",
         "coverage.yml: coverage-condition: coverage-off job runs without the label condition"), [
-        (COVERAGE, "    branches: [main, mainnet-write]\n" + COVERAGE_TYPES_LINE,
-         "    branches: [main, mainnet-write]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1),
+        (COVERAGE, "    branches: [main, next]\n" + COVERAGE_TYPES_LINE,
+         "    branches: [main, next]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1),
         (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, ""), 1)]),
     ("coverage gate without always()", ("coverage-condition", "ci-feature-jobs"),
      ("coverage gate runs without always() and the label condition", "coverage.yml: ci-feature-jobs: coverage can be bypassed"), [
@@ -1548,10 +1548,10 @@ CASES = [
         (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_OFF + "          merge-multiple: true\n", 1)]),
     ("coverage without push trigger", "coverage-seed", "coverage.yml: coverage-seed: push trigger is absent", [
         (COVERAGE, COVERAGE_PUSH_BLOCK, "", 1)]),
-    ("coverage push on main only", "coverage-seed", "push branches lack mainnet-write", [
+    ("coverage push on main only", "coverage-seed", "push branches lack next", [
         (COVERAGE, COVERAGE_PUSH_BLOCK, "  push:\n    branches: [main]\n", 1)]),
-    ("coverage push on mainnet-write only", "coverage-seed", "push branches lack main", [
-        (COVERAGE, COVERAGE_PUSH_BLOCK, "  push:\n    branches: [mainnet-write]\n", 1)]),
+    ("coverage push on next only", "coverage-seed", "push branches lack main", [
+        (COVERAGE, COVERAGE_PUSH_BLOCK, "  push:\n    branches: [next]\n", 1)]),
     ("coverage push with paths filter", "coverage-seed", "push trigger has a paths filter", [
         (COVERAGE, COVERAGE_PUSH_BLOCK, COVERAGE_PUSH_BLOCK + "    paths: ['**.rs']\n", 1)]),
     ("coverage push with paths-ignore filter", "coverage-seed", "push trigger has a paths filter", [
@@ -2048,7 +2048,7 @@ MUTATIONS = {
     "W11": ('options.get("fetch-depth") != 0', 'options.get("fetch-depth") not in (0, 1)', ["W11"]),
     "W12": ('self.report(workflow, "changelog-guard", "missing integration guard")', 'pass', ["W12"]),
     "W13": ('if condition != CHANGELOG_CONDITION:',
-            'if condition not in (CHANGELOG_CONDITION, CHANGELOG_CONDITION.replace("mainnet-write", "main")):', ["W13"]),
+            'if condition not in (CHANGELOG_CONDITION, CHANGELOG_CONDITION.replace("next", "main")):', ["W13"]),
     "W14": ('if guard.get("env") != expected_env:',
             'if guard.get("env") not in (expected_env, {**expected_env, "HEAD_SHA": "${{ github.sha }}"}):', ["W14"]),
     "W15": ('if self.run_text(guard).strip() != CHANGELOG_GUARD:',
@@ -2272,7 +2272,7 @@ MUTATIONS = {
         "for branch in COVERAGE_SEED_BRANCHES:", "for branch in COVERAGE_SEED_BRANCHES[1:]:", ["coverage push on main only"]),
     "coverage-seed-main-branch": (
         "for branch in COVERAGE_SEED_BRANCHES:", "for branch in COVERAGE_SEED_BRANCHES[:1]:",
-        ["coverage push on mainnet-write only"]),
+        ["coverage push on next only"]),
     "coverage-seed-paths": (
         'if any(key in push for key in ("paths", "paths-ignore")):', "if False:", ["coverage push with paths filter"]),
     "coverage-seed-paths-ignore": (

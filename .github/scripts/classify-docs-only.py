@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print whether a pull request into mainnet-write changes only documentation.
+"""Print whether a pull request into next changes only documentation.
 
 The script reads the event from the environment: EVENT_NAME, BASE_REF,
 BASE_SHA, and HEAD_SHA. It runs ``git diff --name-only --no-renames
@@ -13,7 +13,7 @@ A documentation path is one of:
 - ``changelog.d/*.md``
 - ``skills/stellar-agent-wallet/**/*.md``
 
-The result is true only for a pull_request event whose base is mainnet-write
+The result is true only for a pull_request event whose base is next
 and whose changed files are all documentation paths. Every other case prints
 false: another event or base, a missing or malformed commit, a git error, an
 empty file list, and any other path. ``--no-renames`` lists both sides of a
@@ -25,7 +25,7 @@ import re
 import subprocess
 import sys
 
-INTEGRATION_BRANCH = "mainnet-write"
+INTEGRATION_BRANCH = "next"
 SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
