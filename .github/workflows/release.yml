@@ -142,7 +142,7 @@ jobs:
         # Dependency-graph gate specific to a release cut: cargo-deny runs on
         # every push to main too, but the dependency graph (and the RustSec
         # advisory database) can shift between the last CI run and the tag.
-        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-deny@0.19.9
       - run: cargo deny check
