@@ -427,13 +427,14 @@ if [ -e "$tmp/sudo.log" ]; then
   echo 'FAIL host-libudev: check-host.sh ran sudo' >&2
   exit 1
 fi
-# Fixed download bytes cannot match the reviewed MSVC archive digest.
+# File-specific download bytes make the logged MSVC archive digest reproducible.
 cat > "$tmp/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --output ]; then
-    printf 'fixed download bytes\n' > "$2"
+    [ "${2##*/}" != "${CURL_FAIL_FILE:-}" ] || exit 22
+    printf 'fixed:%s\n' "${2##*/}" > "$2"
     exit 0
   fi
   shift
@@ -441,41 +442,36 @@ done
 exit 2
 STUB
 chmod +x "$tmp/bin/curl"
-touch "$tmp/github-env"
-stub_digest=$(printf 'fixed download bytes\n' |
+printf 'EXISTING=value\n' > "$tmp/github-env"
+stub_digest=$(printf 'fixed:%s\n' libsodium-1.0.22-stable-msvc.zip |
   python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')
-pinned_digest=$(sed -n 's/^SODIUM_MSVC_SHA256=//p' .github/scripts/release/sodium.sh)
-if ! [[ "$pinned_digest" =~ ^[0-9a-f]{64}$ ]]; then
-  echo 'FAIL sodium-digest: sodium.sh holds no single SHA-256 pin' >&2
-  exit 1
-fi
 # The split literal keeps the environment-file scanner of
 # check-feature-discipline.py from reading this fixture line as a write.
-expect sodium-digest 1 env PATH="$tmp/bin:$PATH" "GITHUB""_ENV=$tmp/github-env" \
-  bash .github/scripts/release/sodium.sh
-expect_output sodium-digest 'sodium: MSVC archive SHA-256 differs from the pinned digest'
-# The mismatch message names the pinned and the downloaded digest.
-expect_output sodium-digest "sodium: expected $pinned_digest"
-expect_output sodium-digest "sodium: actual   $stub_digest"
-if [ -s "$tmp/github-env" ]; then
-  echo 'FAIL sodium-digest: exports an unverified install root' >&2
+# shellcheck disable=SC2016 # The inner shell expands its stderr path argument.
+expect sodium-download 0 env PATH="$tmp/bin:$PATH" "GITHUB""_ENV=$tmp/github-env" \
+  bash -c 'bash .github/scripts/release/sodium.sh 2> "$1"' -- "$tmp/sodium-stderr"
+if ! cmp -s "$tmp/output" <(printf 'sodium: libsodium-1.0.22-stable-msvc.zip SHA-256 %s\n' "$stub_digest"); then
+  echo 'FAIL sodium-download: stdout is not exactly the archive digest line' >&2
+  exit 1
+fi
+if [ -s "$tmp/sodium-stderr" ]; then
+  echo 'FAIL sodium-download: stderr is not empty' >&2
   exit 1
 fi
 for name in libsodium-1.0.22-stable-msvc.zip libsodium-1.0.22-stable-msvc.zip.minisig LATEST.tar.gz LATEST.tar.gz.minisig; do
-  [ -s "$RUNNER_TEMP/sodium-dist/$name" ] || { echo "FAIL sodium-digest: missing $name" >&2; exit 1; }
+  [ -s "$RUNNER_TEMP/sodium-dist/$name" ] || { echo "FAIL sodium-download: missing $name" >&2; exit 1; }
 done
-# A copy pinned to the digest of the stub bytes exports the directory once.
-sed "s/^SODIUM_MSVC_SHA256=.*\$/SODIUM_MSVC_SHA256=$stub_digest/" .github/scripts/release/sodium.sh > "$tmp/sodium-pinned.sh"
-if [ "$(grep -c -x "SODIUM_MSVC_SHA256=$stub_digest" "$tmp/sodium-pinned.sh")" != 1 ]; then
-  echo 'FAIL sodium-match: the pinned copy does not set the stub digest' >&2
+if ! cmp -s "$tmp/github-env" <(printf 'EXISTING=value\nSODIUM_DIST_DIR=%s/sodium-dist\n' "$RUNNER_TEMP"); then
+  echo 'FAIL sodium-download: the environment file is not the existing line followed by exactly one SODIUM_DIST_DIR line' >&2
+  cat "$tmp/github-env" >&2
   exit 1
 fi
+# A failed download stops setup before the directory reaches the build.
 : > "$tmp/github-env"
-expect sodium-match 0 env PATH="$tmp/bin:$PATH" "GITHUB""_ENV=$tmp/github-env" \
-  bash "$tmp/sodium-pinned.sh"
-if [ "$(cat "$tmp/github-env")" != "SODIUM_DIST_DIR=$RUNNER_TEMP/sodium-dist" ]; then
-  echo 'FAIL sodium-match: the environment file is not exactly one SODIUM_DIST_DIR line' >&2
-  cat "$tmp/github-env" >&2
+expect sodium-download-fails 22 env PATH="$tmp/bin:$PATH" "GITHUB""_ENV=$tmp/github-env" \
+  CURL_FAIL_FILE=LATEST.tar.gz.minisig bash .github/scripts/release/sodium.sh
+if [ -s "$tmp/github-env" ]; then
+  echo 'FAIL sodium-download-fails: exports an incomplete download directory' >&2
   exit 1
 fi
 

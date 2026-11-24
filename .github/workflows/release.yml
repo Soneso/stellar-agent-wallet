@@ -226,9 +226,10 @@ jobs:
 
       # On MSVC the libsodium build script fetches its prebuilt archive over
       # plain HTTP with no retry, which is flaky from Windows runners. The
-      # sodium setup fetches the archive over HTTPS with retries and pins it by
-      # digest; the build script consumes the local copy and verifies its
-      # minisign signature against the pinned upstream key.
+      # sodium setup fetches libsodium-1.0.22-stable-msvc.zip, LATEST.tar.gz,
+      # and their .minisig files over HTTPS with retries and logs the prebuilt
+      # MSVC archive's SHA-256 digest. The build script verifies each archive's
+      # minisign signature against the key embedded in the pinned libsodium-sys-stable.
       # The vendored OpenSSL build runs OpenSSL's perl-based Configure, which
       # needs a Windows-native Perl with its full module set; the MSYS perl
       # that Git for Windows puts on PATH lacks it. openssl-src honors
