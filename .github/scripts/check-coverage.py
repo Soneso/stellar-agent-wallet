@@ -19,10 +19,12 @@ Usage: ``check-coverage.py <cov.json> --configuration feature-off|feature-on``
 
 import argparse
 import collections
+import fnmatch
 import json
 import pathlib
 import re
 import sys
+import tomllib
 
 # Minimum line-coverage percent per crate for the offline suite.
 OFF_FLOORS = {
@@ -82,8 +84,46 @@ def crate_of(filename: str) -> str | None:
     return match.group(1) if match else None
 
 
-def main(path: str, configuration: str) -> int:
+EXEMPT_CRATE = "stellar-agent-smart-account-acceptance"
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+
+def workspace_members(root):
+    """Map manifest members to the directory names used in coverage reports."""
+    manifest = tomllib.loads((root / "Cargo.toml").read_text())
+    members = {}
+    excluded = manifest["workspace"].get("exclude", [])
+    for member in manifest["workspace"]["members"]:
+        for path in sorted(root.glob(member)):
+            if not (path / "Cargo.toml").is_file():
+                continue
+            if any(fnmatch.fnmatch(path.relative_to(root).as_posix(), pattern) for pattern in excluded):
+                continue
+            if path.name in members:
+                raise ValueError(f"duplicate workspace member directory name: {path.name}")
+            members[path.name] = path
+    if not members:
+        raise ValueError("workspace has no members with Cargo.toml after exclusions")
+    return members
+
+
+def comment_only(path):
+    """The exemption lasts only while at least one Rust file contains comments alone."""
+    files = list((path / "src").rglob("*.rs"))
+    return bool(files) and all(
+        not line.strip() or line.lstrip().startswith("//")
+        for source in files for line in source.read_text().splitlines()
+    )
+
+
+def main(path: str, configuration: str, root=ROOT) -> int:
     floors = FLOORS[configuration]
+    try:
+        members = workspace_members(pathlib.Path(root))
+        exempt = EXEMPT_CRATE in members and comment_only(members[EXEMPT_CRATE])
+    except (OSError, ValueError, KeyError) as error:
+        print(f"error: cannot read workspace sources: {error}", file=sys.stderr)
+        return 1
     document = json.loads(pathlib.Path(path).read_text())
     # covered, total
     per_crate: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0])
@@ -96,19 +136,25 @@ def main(path: str, configuration: str) -> int:
             per_crate[crate][0] += lines["covered"]
             per_crate[crate][1] += lines["count"]
 
-    if not per_crate:
-        print("error: no crate source files found in the coverage document", file=sys.stderr)
-        return 2
-
     failures: list[str] = []
     unlisted: list[str] = []
     total_covered = total_lines = 0
     print(f"{'crate':38} {'covered/total':>15} {'line%':>8} {'floor':>6}  status")
-    for crate in sorted(per_crate):
-        covered, count = per_crate[crate]
+    for crate in sorted(members.keys() | per_crate.keys()):
+        covered, count = per_crate.get(crate, [0, 0])
+        if crate == EXEMPT_CRATE and exempt and count == 0:
+            print(f"{crate}: exempt while src contains only blank lines or // comments")
+            continue
+        if crate not in per_crate or count == 0:
+            reason = "missing from report" if crate not in per_crate else "zero lines in report"
+            if crate == EXEMPT_CRATE:
+                reason += "; exemption ends when src has executable code or no .rs files"
+            failures.append(f"{crate}: {reason}")
+            print(f"{crate}: FAIL: {reason}")
+            continue
         total_covered += covered
         total_lines += count
-        pct = 100.0 * covered / count if count else 100.0
+        pct = 100.0 * covered / count
         floor = floors.get(crate, DEFAULT_FLOOR)
         if crate not in floors:
             unlisted.append(crate)
@@ -140,5 +186,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path")
     parser.add_argument("--configuration", required=True, choices=tuple(FLOORS))
+    parser.add_argument("--root", type=pathlib.Path, default=ROOT)
     args = parser.parse_args()
-    sys.exit(main(args.path, args.configuration))
+    sys.exit(main(args.path, args.configuration, args.root))

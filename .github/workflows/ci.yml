@@ -5,7 +5,7 @@ name: CI
 # skips the jobs that read no documentation path and the workspace build and
 # test jobs; the docs-tests job runs the tests that read documentation in
 # their place. The changes job decides.
-# Pushes to those branches use the paths filter below.
+# Pushes into next use the same classifier; main always runs the full suite.
 # Skill changes run the archive checks on main.
 # The suite covers format, lint, rustdoc, offline tests, dependencies, and licenses.
 # Coverage runs in coverage.yml.
@@ -14,23 +14,14 @@ name: CI
 on:
   push:
     branches: [main, next]
-    # Documentation, the license, and the plugin manifest cannot change a gate
-    # result, so pushes skip them.
-    # Skill changes run CI because release-contracts verifies the archive on main.
-    paths:
-      - '**'
-      - '!**/*.md'
-      - '!LICENSE'
-      - '!.claude-plugin/**'
-      - 'skills/**'
   pull_request:
     branches: [main, next]
 
-# Supersede in-flight runs for the same ref so rapid pushes do not queue stale
-# work.
+# Pull request runs cancel their predecessor. Push, schedule, and dispatch
+# runs each have their own group and never cancel one another.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # These jobs only read the checked-out source; deny the token every other scope.
 permissions:
@@ -41,7 +32,33 @@ env:
   FEATURES_EXCEPT_MAINNET_WRITE: live-platform-keyring,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance
 
 jobs:
-  # Prints docs_only=true for a pull request into next that changes
+  ci-result:
+    name: ci-result (${{ github.base_ref || github.ref_name }})
+    needs: [changes, fmt, clippy, doc, test, feature-on-clippy, feature-on-doc, feature-on-test, docs-tests, feature-discipline, release-shape, inbox-js, mpp-interop, sdk-v17-interop, release-contracts, windows-storage, platform-keyring, deploy-scripts, machete, deny]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Reject a cancelled run
+        if: always() && cancelled()
+        run: exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: always()
+        with:
+          persist-credentials: false
+      - name: Check every CI result
+        if: always()
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+        run: python3 .github/scripts/ci-result.py
+      - name: Reject a run cancelled during result checks
+        if: always() && cancelled()
+        run: exit 1
+
+  # Prints docs_only=true for a pull request or unforced push into next that changes
   # only documentation paths, and docs_only=false for every other event.
   changes:
     name: changes
@@ -61,9 +78,13 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REF: ${{ github.ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+          FORCED: ${{ github.event.forced }}
         run: python3 .github/scripts/classify-docs-only.py >> "$GITHUB_OUTPUT"
 
-  # A job that reads no documentation path skips a docs-only pull request.
+  # A job that reads no documentation path skips a docs-only change.
   # !cancelled() keeps it running when the changes job fails.
   fmt:
     name: fmt
@@ -294,7 +315,7 @@ jobs:
       - name: Check the proof matrix
         run: python3 .github/scripts/check-proof-matrix.py --configuration feature-on --workspace
 
-  # Runs on a docs-only pull request into next only, where clippy,
+  # Runs on a docs-only pull request or push into next, where clippy,
   # test, feature-on-clippy, feature-on-test, and windows-storage skip. It
   # builds and runs the tests that .github/docs-tests.tsv lists, the tests
   # that read a documentation path, in both feature states of the test jobs.
@@ -324,12 +345,11 @@ jobs:
           toolchain: stable
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
-      # The shared key restores the cache that push runs of the test job save;
-      # this job runs on pull requests only, so it never saves.
+      # Restore the full test cache. This five-crate build never saves it.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: test
-          save-if: ${{ github.event_name == 'push' }}
+          save-if: false
       - name: Check the documentation reads
         run: python3 .github/scripts/check-docs-reads.py
       - name: Run the documentation tests, feature off
@@ -474,6 +494,8 @@ jobs:
         run: python3 .github/scripts/test-check-proof-matrix.py
       - name: Self-test the docs-only classifier
         run: python3 .github/scripts/test-classify-docs-only.py
+      - name: Self-test the CI result gate
+        run: python3 .github/scripts/test-ci-result.py
       - name: Check the documentation reads
         run: python3 .github/scripts/check-docs-reads.py
       - name: Self-test the documentation read check

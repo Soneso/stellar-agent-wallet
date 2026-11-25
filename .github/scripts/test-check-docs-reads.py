@@ -2,9 +2,12 @@
 """Run check-docs-reads.py against scratch workspaces and check each verdict."""
 
 import subprocess
+import importlib.util
 import sys
 import tempfile
 from pathlib import Path
+
+from docs_paths import is_documentation
 
 SCRIPT = Path(__file__).with_name("check-docs-reads.py")
 WORKSPACE = '[workspace]\nmembers = ["crates/*"]\nresolver = "2"\n'
@@ -320,6 +323,19 @@ def main():
     scratch = SCRIPT.resolve().parents[2] / "target" / "tmp"
     scratch.mkdir(parents=True, exist_ok=True)
     failures = []
+    for name in ("check-docs-reads.py", "classify-docs-only.py"):
+        spec = importlib.util.spec_from_file_location("docs_consumer", SCRIPT.with_name(name))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if module.is_documentation is not is_documentation:
+            failures.append(f"{name} must import the shared documentation rule")
+    for path, expected in [("README.md", True), ("docs/deep/guide.md", True),
+                           ("changelog.d/fix.fixed.md", True), ("changelog.d/deep/fix.md", False),
+                           ("skills/stellar-agent-wallet/references/guide.md", True),
+                           ("skills/other/guide.md", False), ("src/guide.md", False),
+                           ("docs/code.rs", False), ("docs/../code.md", False)]:
+        if is_documentation(path) != expected:
+            failures.append(f"shared documentation rule: {path}")
     with tempfile.TemporaryDirectory(prefix="check-docs-reads-", dir=scratch) as tmp:
         for label, lib_extra, tests, files, registry, expected, fragments in CASES:
             root = workspace(tmp, lib_extra, tests, files)

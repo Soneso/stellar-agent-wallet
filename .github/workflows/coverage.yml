@@ -25,11 +25,10 @@ on:
     - cron: '41 4 * * 1'
   workflow_dispatch:
 
-# A pull request run supersedes the older run of its ref. Later runs do not
-# cancel a running push, schedule, or dispatch run, so a running seed saves its
-# caches. A newer pending run replaces the older pending run.
+# Pull request runs cancel their predecessor. Push, schedule, and dispatch
+# runs each have their own group and never cancel one another.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # The jobs only read the checked-out source; deny the token every other scope.
@@ -40,13 +39,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify the changed files
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REF: ${{ github.ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+          FORCED: ${{ github.event.forced }}
+        run: python3 .github/scripts/classify-docs-only.py >> "$GITHUB_OUTPUT"
+
   coverage-off:
     name: coverage (feature-off)
+    needs: changes
     # A pull request run reads the complete label set from the event payload
     # and measures when that set contains `coverage`. A label change by a
     # person or with an app token starts a new run. A change made with the
     # workflow token starts none; the triage and stale workflows use that token.
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'coverage')
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -100,11 +124,12 @@ jobs:
 
   coverage-on:
     name: coverage (feature-on)
+    needs: changes
     # A pull request run reads the complete label set from the event payload
     # and measures when that set contains `coverage`. A label change by a
     # person or with an app token starts a new run. A change made with the
     # workflow token starts none; the triage and stale workflows use that token.
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'coverage')
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -156,22 +181,24 @@ jobs:
 
   coverage:
     name: coverage
-    needs: [coverage-off, coverage-on]
+    needs: [changes, coverage-off, coverage-on]
     # always() schedules this job after a failed, cancelled, or skipped
     # measurement, and step 1 then fails it. Steps 2 and 8 fail it in a step
     # evaluation that sees the run cancelled. Without the label the condition
-    # is false, and the check is skipped.
-    if: always() && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'coverage'))
+    # is false, and the check is skipped. Confirmed docs-only pushes also skip.
+    if: always() && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       # PyYAML reads unquoted OFF and ON as booleans; the quotes keep them strings.
       - name: Check both measurements
         env:
+          CHANGES: ${{ needs.changes.result }}
           "OFF": ${{ needs.coverage-off.result }}
           "ON": ${{ needs.coverage-on.result }}
         run: |
           echo "feature-off: $OFF, feature-on: $ON"
+          test "$CHANGES" = success
           test "$OFF" = success
           test "$ON" = success
       - name: Reject a cancelled run before the floors

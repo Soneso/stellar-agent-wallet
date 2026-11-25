@@ -33,6 +33,7 @@ CASES = [
     ("empty list", "next", {}, [], "false"),
     ("base of main", "main", {"docs/new.md": "new\n"}, [], "false"),
     ("source renamed into docs", "next", {}, [("crates/core/src/lib.rs", "docs/lib.md")], "false"),
+    ("docs renamed into source", "next", {}, [("README.md", "crates/core/src/guide.rs")], "false"),
     ("nested changelog.d path", "next", {"changelog.d/sub/entry.md": "- Entry.\n"}, [], "false"),
     ("other skill", "next", {"skills/README.md": "edit\n"}, [], "false"),
 ]
@@ -55,11 +56,39 @@ def write(root, files):
 
 def classify(root, environ):
     env = {key: value for key, value in os.environ.items()
-           if key not in ("EVENT_NAME", "BASE_REF", "BASE_SHA", "HEAD_SHA")}
+           if key not in ("EVENT_NAME", "BASE_REF", "BASE_SHA", "HEAD_SHA", "REF",
+                          "BEFORE_SHA", "AFTER_SHA", "FORCED")}
     env.update(environ)
     result = subprocess.run([sys.executable, str(SCRIPT.resolve())], cwd=root, capture_output=True, text=True,
                             env=env, check=False)
     return result.returncode, result.stdout
+
+
+def push_checks(base, head, code_head, rename_head):
+    push = {"EVENT_NAME": "push", "REF": "refs/heads/next", "BEFORE_SHA": base,
+            "AFTER_SHA": head, "FORCED": "false"}
+    checks = [("docs-only push into next", push, "true")]
+    for label, edits in [
+        ("code push", {"AFTER_SHA": code_head}),
+        ("docs push into main", {"REF": "refs/heads/main"}),
+        ("empty push", {"AFTER_SHA": base}),
+        ("missing before", {"BEFORE_SHA": ""}),
+        ("zero before", {"BEFORE_SHA": "0" * 40}),
+        ("malformed before", {"BEFORE_SHA": "HEAD"}),
+        ("short SHAs in docs push", {"BEFORE_SHA": base[:12], "AFTER_SHA": head[:12]}),
+        ("absent before", {"BEFORE_SHA": "e" * 40}),
+        ("zero after", {"AFTER_SHA": "0" * 40}),
+        ("missing after", {"AFTER_SHA": ""}),
+        ("malformed after", {"AFTER_SHA": "HEAD"}),
+        ("forced push", {"FORCED": "true"}),
+        ("empty FORCED", {"FORCED": ""}),
+        ("malformed FORCED", {"FORCED": "False"}),
+        ("push to another ref", {"REF": "refs/tags/next"}),
+        ("push rename docs to code", {"AFTER_SHA": rename_head}),
+    ]:
+        checks.append((label, dict(push, **edits), "false"))
+    checks.append(("unset FORCED", {key: value for key, value in push.items() if key != "FORCED"}, "false"))
+    return checks
 
 
 def main():
@@ -85,6 +114,8 @@ def main():
             environ = {"EVENT_NAME": "pull_request", "BASE_REF": base_ref, "BASE_SHA": base, "HEAD_SHA": head}
             checks.append((label, environ, expected))
         head = checks[0][1]["HEAD_SHA"]
+        by_label = {label: env["HEAD_SHA"] for label, env, _ in checks}
+        checks.extend(push_checks(base, head, by_label["one .rs file"], by_label["docs renamed into source"]))
         checks += [
             ("push event", {"EVENT_NAME": "push", "BASE_REF": "", "BASE_SHA": base, "HEAD_SHA": head}, "false"),
             ("unknown event", {}, "false"),
