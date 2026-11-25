@@ -2346,8 +2346,9 @@ fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
 /// write context, and every later step reads it from the context. The steps
 /// up to the witness are this verb's: the relayer gate, the engine kind, the
 /// asset and amount, the keyring, the checked client, the reconcile, the
-/// build, the verified policy with the built fee, the signed fee cap, the
-/// audit pre-flight and the bound witness.
+/// verified-policy reload, and the operation start. A fresh readiness check
+/// precedes the build. Policy evaluation with the built fee, the signed fee
+/// cap, the audit pre-flight and the bound witness follow.
 /// [`authorize_and_submit`] runs the rest.
 async fn run_mainnet_pipeline<InitKeyring>(
     args: &PayArgs,
@@ -2435,15 +2436,11 @@ where
     if let Err(e) = check_endpoint_identity(&client, &net_context, budget).await {
         return fail(&Envelope::<()>::err(&e));
     }
-    // The check precedes every account read, so the sequence and the views
-    // the envelope is signed against come from a current endpoint; the
-    // source account read runs under the check's deadline, and the summary
-    // names the ledger the check observed.
+    // Reconciliation runs only after the endpoint passes readiness.
     let readiness_deadline = stellar_agent_network::operational::readiness_deadline();
-    let operational = match check_endpoint_ready(&client, readiness_deadline).await {
-        Ok(report) => report,
-        Err(e) => return fail(&Envelope::<()>::err(&e)),
-    };
+    if let Err(e) = check_endpoint_ready(&client, readiness_deadline).await {
+        return fail(&Envelope::<()>::err(&e));
+    }
     let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
         Ok(v) => v,
         Err(e) => {
@@ -2505,6 +2502,13 @@ where
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
 
+    // Keyring waits in reconciliation, policy reload and operation start
+    // precede this budget. The source read shares this check's deadline.
+    let readiness_deadline = stellar_agent_network::operational::readiness_deadline();
+    let operational = match check_endpoint_ready(&client, readiness_deadline).await {
+        Ok(report) => report,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
     let source = inputs.source;
     let built = match build_unsigned_envelope(
         &client,
@@ -7684,6 +7688,76 @@ pub(crate) mod tests {
             fixture.assert_no_consent_ceremony();
         }
 
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_keychain_wait_between_checks_gets_a_fresh_readiness_budget() {
+            use crate::common::mainnet_write_fixture::SlowKeychain;
+
+            let delay = SlowKeychain::default();
+            let budget = std::time::Duration::from_millis(500);
+            let name = "mainnet-pay-slow-keychain";
+            let fixture = Spec::new(name)
+                .keyring_read_hooks(delay.hooks(name, budget * 2))
+                .primary(delay.on(accounts()))
+                .build()
+                .await;
+            let _budget = stellar_agent_network::operational::set_readiness_budget_for_test(budget);
+            let mut args = memo_args(&fixture);
+            args.fee = Some("auto".to_owned());
+
+            let run = run(&fixture, &args).await;
+
+            delay.assert_between_checks(budget);
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(fixture.summaries().len(), 1, "consent is reached");
+            assert_eq!(
+                &fixture.primary_methods().await[..7],
+                [
+                    "getNetwork",
+                    "getHealth",
+                    "getLedgers",
+                    "getHealth",
+                    "getLedgers",
+                    "getFeeStats",
+                    "getLedgerEntries",
+                ],
+                "the fee and account reads follow the fresh check"
+            );
+            let state = fixture.window_body();
+            assert_eq!(
+                state["last_observation"]["ledger"], 2000,
+                "the submission records the fresh check's ledger"
+            );
+            assert_eq!(
+                state["operations"]["records"][0]["attempts"][0]["pre_exposure_ledger"], 2000,
+                "the exposure bound starts from the fresh check's ledger"
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_failed_second_readiness_check_refuses_before_the_account_read() {
+            let primary = accounts().with_script(|method, index, _| {
+                (method == "getHealth" && index == 1).then(|| json!({"status": "unhealthy"}))
+            });
+            let fixture = Spec::new("mainnet-pay-second-check-fails")
+                .primary(primary)
+                .build()
+                .await;
+            let mut args = memo_args(&fixture);
+            args.fee = Some("auto".to_owned());
+
+            let run = run(&fixture, &args).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "network.endpoint_not_ready").await;
+            assert_eq!(
+                fixture.primary_methods().await,
+                ["getNetwork", "getHealth", "getLedgers", "getHealth"],
+                "the refusal precedes the fee read and the account read"
+            );
+            fixture.assert_no_consent_ceremony();
+        }
+
         /// Operational check: a source account read still running at the
         /// deadline the readiness check ran under, the pre-send budget,
         /// refuses with `network.endpoint_not_ready` before the summary is
@@ -7725,15 +7799,22 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 fixture.primary_methods().await,
-                ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"],
+                [
+                    "getNetwork",
+                    "getHealth",
+                    "getLedgers",
+                    "getHealth",
+                    "getLedgers",
+                    "getLedgerEntries",
+                ],
                 "the refused read is the last request"
             );
             fixture.assert_no_consent_ceremony();
         }
 
-        /// Operational check: the build checks the primary's identity, then its
-        /// readiness, then reads the account; the write checks readiness once
-        /// more, for the rebuild after the confirmation. The confirmation shows
+        /// The build checks identity and readiness before reconciliation, then
+        /// readiness again after the local steps, before reading the account.
+        /// The rebuild checks readiness after confirmation. The confirmation shows
         /// the stored intent with its fee bound, which names no ledger: the
         /// rebuild reads the endpoint again.
         #[tokio::test(flavor = "current_thread")]
@@ -7746,19 +7827,26 @@ pub(crate) mod tests {
             assert_eq!(run.code, 0, "{}", run.envelope);
             let methods = fixture.primary_methods().await;
             assert_eq!(
-                methods.get(..4),
+                methods.get(..6),
                 Some(
-                    ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"]
-                        .map(str::to_owned)
-                        .as_slice()
+                    [
+                        "getNetwork",
+                        "getHealth",
+                        "getLedgers",
+                        "getHealth",
+                        "getLedgers",
+                        "getLedgerEntries"
+                    ]
+                    .map(str::to_owned)
+                    .as_slice()
                 ),
-                "identity, then readiness, then the account read: {methods:?}"
+                "identity, two readiness checks, then the account read: {methods:?}"
             );
             for read in ["getHealth", "getLedgers"] {
                 assert_eq!(
                     methods.iter().filter(|method| *method == read).count(),
-                    2,
-                    "the build and the rebuild check the endpoint: {methods:?}"
+                    3,
+                    "two build checks and one rebuild check: {methods:?}"
                 );
             }
             let summaries = fixture.summaries();
@@ -9510,7 +9598,7 @@ pub(crate) mod tests {
                 let methods = fixture.primary_methods().await;
                 assert_eq!(
                     methods.iter().filter(|m| *m == "getHealth").count(),
-                    2,
+                    3,
                     "the floor read checks readiness again, and the refusal precedes signing \
                      resolution: {methods:?}"
                 );
@@ -9542,7 +9630,7 @@ pub(crate) mod tests {
             let methods = fixture.primary_methods().await;
             assert_eq!(
                 methods.iter().filter(|m| *m == "getHealth").count(),
-                2,
+                3,
                 "the source's floor read refuses before signing resolution: {methods:?}"
             );
         }

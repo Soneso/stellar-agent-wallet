@@ -1523,8 +1523,9 @@ the `approval_attested` audit row.
   and `resolved`. `expired_count` counts all expired entries in the snapshot,
   regardless of this flag.
 - `--output json|table`: envelope JSON (default) or one sanitized row per
-  entry with an expires-in countdown. Table output groups tombstones under
-  `Resolved` when any are listed.
+  entry. Live entries show `(expires in <duration>)`; expired entries show
+  `(expired)`. Table output groups tombstones under `Resolved` when any are
+  listed.
 
 For a muxed destination the payment summary carries `to` (the M address) and
 `to_base` (its G account); the table row reads `to <M> (base account <G>)`,

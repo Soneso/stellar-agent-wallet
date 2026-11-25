@@ -1687,7 +1687,14 @@ The probe runs on the client instance that will carry `sendTransaction`, not on 
 
 ### Endpoint readiness before the account read
 
-After the identity probe, every classic prepare on MCP and every classic value verb on the CLI runs `operational::operational_check` on the same client. It runs before the first account read whose answer the verb signs against, on every network. The CLI mainnet write runs the check in its build and does not repeat it in the write ceremony.
+After the identity probe, every classic prepare on MCP and every classic value verb on the CLI runs `operational::operational_check` on the same client. It runs before the first account read whose answer the verb signs against, on every network.
+
+CLI mainnet `pay` and `claim` check readiness before reservation reconciliation.
+After reconciliation, the verified-policy reload, and `classic_start`, they take
+a fresh readiness deadline and check again. The fee read in `pay` and the
+balance read in `claim` follow that check. Keyring waits in those preceding
+steps consume none of the fresh budget. The canonical rebuild checks readiness
+again after confirmation.
 
 The check reads `getHealth` under the caller's deadline and refuses a status
 other than `healthy`. It then reads the latest ledger through `getLedgers`,
@@ -1714,7 +1721,7 @@ decode errors. Close-time validation after the loop names no attempt count.
 A close-time lag refusal names the ledger and its lag. A host clock that
 cannot be read refuses with `wallet.clock_error` instead.
 
-On MCP and on the CLI mainnet path, the account read that follows the check runs under the same absolute deadline. A read still running at that deadline refuses with `network.endpoint_not_ready`. On MCP, the sequence catch-up after a confirmed submit ends its wait at that deadline and keeps the last account it read. The account read follows the check on the same client. So the sequence the envelope is signed against is at least as fresh as the ledger the check observed. The MCP prepare result carries that ledger as `operational`, and the CLI mainnet summary names it. A stale endpoint therefore refuses before the summary and before the presence ceremony.
+On MCP and on the CLI mainnet path, the account read that follows the check runs under the same absolute deadline. For CLI mainnet `pay` and `claim`, this is the fresh deadline after `classic_start`. A read still running at that deadline refuses with `network.endpoint_not_ready`. On MCP, the sequence catch-up after a confirmed submit ends its wait at that deadline and keeps the last account it read. The account read follows the check on the same client. So the sequence the envelope is signed against is at least as fresh as the ledger the check observed. The MCP prepare result carries that ledger as `operational`. The CLI mainnet summary of a canonical record renders the stored intent and has no ledger line. The summary of an envelope record names that ledger. A stale endpoint therefore refuses before the summary and before the presence ceremony.
 
 Each CLI mainnet verb acquires the audit writer in its build, before the summary. A writer another process holds therefore refuses with its own code before the operator is asked to confirm. The build drops only the handle the acquisition returns. The writer registry keeps the writer and its lock held through the presence ceremony.
 
@@ -1767,7 +1774,7 @@ The confirmation poll asks `getTransaction` every 2 s under the send deadline. N
 
 With a submission recorder present, a timeout, poll failure, unexpected status, or uncertain send returns `submission.tx_timeout`. Each retains the receipt, pending audit row, and potential spending. A reported rejection or on-chain failure also retains accounting; no endpoint supplies definitive failure authority. Success stores the reported chain time separately from its first local observation. Bounded exposure counts through the later of that observation and the signed deadline, plus each admitted window. Untimed exposure stays reserved until an explicit recorded acknowledgement.
 
-A standalone identity check, the one a command or tool runs before its first read, runs under its own deadline. On CLI `pay`, `claim`, sponsored `accounts create`, and `trustline`, the identity check and the readiness check each get a fresh `PRE_SEND_BUDGET` from their start, and so do the resolver probes of their mainnet writes. The MCP prepares of the four classic value tools run the probe, the readiness check and the account reads under one budget from the start of the call, and each MCP commit's probe and resolver probe get their own. A readiness check that outlasts its budget keeps `network.endpoint_not_ready`. `pool init` keeps `--timeout-seconds` for its check. On those four actions `--timeout-seconds` and the profile's `submit_timeout_seconds` bound only the send and the confirmation poll, and the CLI flag falls back to the profile setting, then 60 s. Inside a submission, the identity check runs under the submission's pre-send budget.
+A standalone identity check, the one a command or tool runs before its first read, runs under its own deadline. On CLI `pay`, `claim`, sponsored `accounts create`, and `trustline`, the identity check and each readiness check get a fresh `PRE_SEND_BUDGET` from their start, and so do the resolver probes of their mainnet writes. The MCP prepares of the four classic value tools run the probe, the readiness check and the account reads under one budget from the start of the call, and each MCP commit's probe and resolver probe get their own. A readiness check that outlasts its budget keeps `network.endpoint_not_ready`. `pool init` keeps `--timeout-seconds` for its check. On those four actions `--timeout-seconds` and the profile's `submit_timeout_seconds` bound only the send and the confirmation poll, and the CLI flag falls back to the profile setting, then 60 s. Inside a submission, the identity check runs under the submission's pre-send budget.
 
 The wallet has no automatic failover: the secondary and oracle endpoints verify reads and never send a transaction. It has no circuit breaker either, because the CLI runs one command per process.
 

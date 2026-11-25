@@ -891,9 +891,11 @@ mod tests {
             fixture.primary_methods().await,
             fixture.oracle_methods().await,
         ));
-        // Identity and readiness once, the verb's reads, the rebuild's
-        // readiness check and source read, the resolver's probe and reads
-        // (a claim rereads its balance), the submit probe, the send.
+        // Identity and readiness, a second readiness check before the build
+        // (pay and claim), the verb's reads, the rebuild's readiness check and
+        // source read, the resolver's probe and reads (a claim rereads its
+        // balance), the submit probe, the send.
+        let fresh = ["getHealth", "getLedgers"];
         let rebuild = ["getHealth", "getLedgers", "getLedgerEntries"];
         let send = [
             "getNetwork",
@@ -902,9 +904,10 @@ mod tests {
             "getTransaction",
         ];
         let start = ["getNetwork", "getHealth", "getLedgers"];
-        let primary_of = |reads: &[&str], resolver: &[&str]| -> Vec<String> {
+        let primary_of = |checks: &[&str], reads: &[&str], resolver: &[&str]| -> Vec<String> {
             start
                 .iter()
+                .chain(checks)
                 .chain(reads)
                 .chain(&rebuild)
                 .chain(&["getNetwork"])
@@ -931,6 +934,7 @@ mod tests {
             (
                 "pay",
                 primary_of(
+                    &fresh,
                     &["getLedgerEntries", "getLedgerEntries", "getLedgerEntries"],
                     &account,
                 ),
@@ -939,6 +943,7 @@ mod tests {
             (
                 "claim",
                 primary_of(
+                    &fresh,
                     &["getLedgerEntries", "getLedgerEntries"],
                     &["getLedgerEntries", "getLedgerEntries"],
                 ),
@@ -946,12 +951,12 @@ mod tests {
             ),
             (
                 "trustline",
-                primary_of(&["getLedgerEntries", "getLedgerEntries"], &account),
+                primary_of(&[], &["getLedgerEntries", "getLedgerEntries"], &account),
                 oracle_of(&cross_check),
             ),
             (
                 "create",
-                primary_of(&["getLedgerEntries"], &account),
+                primary_of(&[], &["getLedgerEntries"], &account),
                 oracle_of(&[]),
             ),
         ];
@@ -974,11 +979,13 @@ mod tests {
             .rules(vec![pay_rule("allow", "")])
             .build()
             .await;
+        // The check before reconciliation sees 650, the check before the
+        // build 700, and the rebuild's check 2000.
         for method in ["getHealth", "getLedgers"] {
             let calls = std::sync::atomic::AtomicUsize::new(0);
             Mock::given(body_partial_json(serde_json::json!({"method":method})))
                 .respond_with(move |request: &wiremock::Request| {
-                    let latest = if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 { 700 } else { 2000 };
+                    let latest = match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) { 0 => 650, 1 => 700, _ => 2000 };
                     let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
                     let result = if method == "getHealth" {
                         serde_json::json!({"status":"healthy", "latestLedger":latest, "oldestLedger":1, "ledgerRetentionWindow":2000})
@@ -1033,7 +1040,8 @@ mod tests {
             exposure["pre_exposure_ledger"],
             serde_json::json!(oracle_ledger.map(|value| value.min(700)))
         );
-        // The submission reuses the readiness report and reads the primary once.
+        // The submission reuses the report of the check before the build and
+        // reads the primary once.
         assert_eq!(state["last_observation"]["ledger"], 700);
     }
 

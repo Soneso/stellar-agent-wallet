@@ -282,9 +282,12 @@ pub(crate) struct MainnetWriteRequest<'a> {
     pub(crate) effective_cap: u32,
     /// The independent witness, when one was obtained.
     pub(crate) witness: Option<&'a CrossCheckWitness>,
-    /// What the operational check observed on `client`; the build runs the
-    /// check before its first account read, and the summary names the
-    /// ledger.
+    /// What the last operational check before the build observed on
+    /// `client`; its deadline bounds the build's pre-send reads. Pay and
+    /// claim run that check after reconciliation, the policy reload and the
+    /// operation start; trustline and account creation run their only check
+    /// before them. The submission observation reuses this report, and an
+    /// envelope record's summary names its ledger.
     pub(crate) ledger: OperationalReport,
     /// The operation record the run signs under, opened before the
     /// confirmation; its next attempt opens with the mint and commits

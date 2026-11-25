@@ -33,12 +33,12 @@ function credential({ id = VECTOR_ID, key = VECTOR_KEY } = {}) {
   };
 }
 
-function server(challenge = VECTOR_CHALLENGE) {
+function server(challenge = VECTOR_CHALLENGE, rpId = "localhost") {
   return (url) => {
     if (url === "/enroll/challenge") {
       return jsonReply(200, {
         challenge: b64url(challenge),
-        rp_id: "localhost",
+        rp_id: rpId,
         alg: -7,
         user_verification: "required",
         resident_key: "required",
@@ -50,14 +50,14 @@ function server(challenge = VECTOR_CHALLENGE) {
   };
 }
 
-function mainnetPage(storage, { challenge, id, key } = {}) {
+function mainnetPage(storage, { challenge, id, key, rpId = "localhost", reply, credential: makeCred, attributes } = {}) {
   const page = browser({
-    islands: { "enroll-data": { csrfToken: "f".repeat(64), rpId: "localhost" } },
-    attributes: { "enroll-data": { "data-purpose": "mainnet-approval" } },
+    islands: { "enroll-data": { csrfToken: "f".repeat(64), rpId } },
+    attributes: attributes ?? { "enroll-data": { "data-purpose": "mainnet-approval" } },
     elements: ["label-input", "enroll-btn", "status", "confirmation-code"],
     storage,
-    reply: server(challenge),
-    credential: () => credential({ id, key }),
+    reply: reply ?? server(challenge, rpId),
+    credential: makeCred ?? (() => credential({ id, key })),
   });
   page.byId["label-input"].value = "laptop";
   page.run("../operator_enroll/web/operator-enroll.js");
@@ -77,6 +77,7 @@ test("the mainnet page shows the mainnet code and names the owner's signature", 
   assert.match(page.byId.status.textContent, /mainnet\.approval_credentials/);
   assert.match(page.byId.status.textContent, /signs the policy/);
   assert.doesNotMatch(page.byId.status.textContent, /allowed_credentials/);
+  assert.equal(page.byId["enroll-btn"].disabled, true);
 });
 
 for (const [name, setup, code] of [
@@ -99,7 +100,127 @@ test("the operator enrollment proof does not open a mainnet ceremony", async () 
   await until(() => /no wallet session/.test(page.byId.status.textContent), "the missing mainnet proof status");
   assert.equal(page.credentialCalls.length, 0);
   assert.equal(page.fetches.length, 0);
+  assert.notEqual(page.byId["enroll-btn"].disabled, true);
 });
+
+for (const [originName, rpId] of [
+  ["loopback", "localhost"],
+  ["signed-origin", "approve.example.invalid"],
+]) {
+  test(`mainnet ${originName} enrollment disables Create passkey while pending and after success`, async () => {
+    let resolveChallenge;
+    let resolveCredential;
+    const reply = (url) => {
+      if (url === "/enroll/challenge") {
+        return new Promise((resolve) => {
+          resolveChallenge = resolve;
+        });
+      }
+      return jsonReply(200, { status: "awaiting_confirmation" });
+    };
+    const page = mainnetPage(
+      { [MAINNET_PROOF_KEY]: PROOF },
+      {
+        rpId,
+        reply,
+        credential: () =>
+          new Promise((resolve) => {
+            resolveCredential = resolve;
+          }),
+      }
+    );
+    const btn = page.byId["enroll-btn"];
+
+    btn.listeners.click[0]();
+    assert.equal(btn.disabled, true);
+    btn.listeners.click[0]();
+    assert.equal(page.fetches.length, 1);
+
+    resolveChallenge(
+      jsonReply(200, {
+        challenge: b64url(VECTOR_CHALLENGE),
+        rp_id: rpId,
+        alg: -7,
+        user_verification: "required",
+        resident_key: "required",
+        attestation: "none",
+        timeout_ms: 300000,
+      })
+    );
+    await until(() => page.credentialCalls.length === 1, `the ${originName} passkey creation`);
+    assert.equal(page.credentialCalls[0].publicKey.rp.id, rpId);
+    assert.equal(btn.disabled, true);
+    btn.listeners.click[0]();
+    assert.equal(page.credentialCalls.length, 1);
+
+    resolveCredential(credential());
+    await until(() => page.byId["confirmation-code"].textContent !== "", `the ${originName} confirmation code`);
+    assert.equal(btn.disabled, true);
+    const statusAfterSuccess = page.byId.status.textContent;
+    assert.equal(page.byId["confirmation-code"].textContent, MAINNET_CODE);
+    assert.match(statusAfterSuccess, /Awaiting confirmation/);
+    assert.match(statusAfterSuccess, /at the terminal/);
+
+    btn.listeners.click[0]();
+    assert.equal(page.fetches.length, 2);
+    assert.equal(page.credentialCalls.length, 1);
+    assert.equal(btn.disabled, true);
+    assert.equal(page.byId["confirmation-code"].textContent, MAINNET_CODE);
+    assert.equal(page.byId.status.textContent, statusAfterSuccess);
+  });
+
+  test(`mainnet ${originName} enrollment re-enables Create passkey on rejection and allows a retry`, async () => {
+    let tries = 0;
+    const page = mainnetPage(
+      { [MAINNET_PROOF_KEY]: PROOF },
+      {
+        rpId,
+        credential: () => {
+          if (tries === 1) {
+            throw Object.assign(new Error("user canceled"), { name: "NotAllowedError" });
+          }
+          return credential();
+        },
+      }
+    );
+    const btn = page.byId["enroll-btn"];
+
+    tries = 1;
+    btn.listeners.click[0]();
+    assert.equal(btn.disabled, true);
+    await until(() => /Passkey creation failed/.test(page.byId.status.textContent), `the ${originName} rejection`);
+    assert.equal(btn.disabled, false);
+
+    tries = 2;
+    btn.listeners.click[0]();
+    assert.equal(btn.disabled, true);
+    await until(() => page.byId["confirmation-code"].textContent !== "", `the ${originName} retry confirmation code`);
+    assert.equal(btn.disabled, true);
+    assert.equal(page.byId["confirmation-code"].textContent, MAINNET_CODE);
+    assert.equal(page.credentialCalls[1].publicKey.rp.id, rpId);
+  });
+
+  test(`mainnet ${originName} enrollment early returns leave Create passkey enabled`, () => {
+    const blank = mainnetPage({ [MAINNET_PROOF_KEY]: PROOF }, { rpId });
+    blank.byId["label-input"].value = "   ";
+    blank.byId["enroll-btn"].listeners.click[0]();
+    assert.equal(blank.byId.status.textContent, "Enter a label first.");
+    assert.notEqual(blank.byId["enroll-btn"].disabled, true);
+    assert.equal(blank.fetches.length, 0);
+
+    const noProof = mainnetPage({}, { rpId });
+    noProof.byId["enroll-btn"].listeners.click[0]();
+    assert.match(noProof.byId.status.textContent, /no wallet session/);
+    assert.notEqual(noProof.byId["enroll-btn"].disabled, true);
+    assert.equal(noProof.fetches.length, 0);
+
+    const noPurpose = mainnetPage({ [MAINNET_PROOF_KEY]: PROOF }, { rpId, attributes: {} });
+    noPurpose.byId["enroll-btn"].listeners.click[0]();
+    assert.match(noPurpose.byId.status.textContent, /no enrollment purpose/);
+    assert.notEqual(noPurpose.byId["enroll-btn"].disabled, true);
+    assert.equal(noPurpose.fetches.length, 0);
+  });
+}
 
 const CONSENT_KEY = "stellar-agent-mainnet-presence-session-proof";
 const INBOX_KEY = "stellar-agent-approval-session-proof";

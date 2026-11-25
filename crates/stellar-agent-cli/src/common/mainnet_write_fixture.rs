@@ -292,6 +292,76 @@ impl LateWriter {
     }
 }
 
+/// A one-shot keyring wait armed by the first readiness ledger read.
+#[derive(Clone, Default)]
+pub(crate) struct SlowKeychain {
+    events: Arc<Mutex<Vec<&'static str>>>,
+    elapsed: Arc<Mutex<Option<std::time::Duration>>>,
+}
+
+impl SlowKeychain {
+    /// The latest ledger the first readiness check reports. Every later
+    /// check reports 2000, the ledger of [`ClassicRpc`]'s own answers.
+    pub(crate) const FIRST_CHECK_LEDGER: u32 = 1999;
+
+    /// Records both checks, arms the hook after the first ledger request,
+    /// and answers the first check at [`Self::FIRST_CHECK_LEDGER`].
+    pub(crate) fn on(&self, rpc: ClassicRpc) -> ClassicRpc {
+        let this = self.clone();
+        rpc.with_script(move |method, index, _| {
+            if method == "getLedgers" && index < 2 {
+                this.events.lock().unwrap().push(if index == 0 {
+                    "first check"
+                } else {
+                    "second check"
+                });
+            }
+            if index != 0 {
+                return None;
+            }
+            let mut answer = crate::test_rpc::operational_result(method)?;
+            answer["latestLedger"] = Self::FIRST_CHECK_LEDGER.into();
+            if method == "getLedgers" {
+                answer["cursor"] = Self::FIRST_CHECK_LEDGER.to_string().into();
+            }
+            Some(answer)
+        })
+    }
+
+    /// Delays the first window-key read after the first readiness check.
+    pub(crate) fn hooks(
+        &self,
+        name: &str,
+        delay: std::time::Duration,
+    ) -> Vec<stellar_agent_test_support::keyring_mock::ReadHook> {
+        let key = KeyringEntryRef::default_policy_window_state_key(name);
+        let this = self.clone();
+        vec![stellar_agent_test_support::keyring_mock::ReadHook::new(
+            &key.service,
+            &key.account,
+            Arc::new(move || {
+                let mut events = this.events.lock().unwrap();
+                if events.as_slice() == ["first check"] {
+                    events.push("keyring wait");
+                    drop(events);
+                    let start = std::time::Instant::now();
+                    std::thread::sleep(delay);
+                    *this.elapsed.lock().unwrap() = Some(start.elapsed());
+                }
+            }),
+        )]
+    }
+
+    /// Asserts the keyring wait lies between the checks and exceeds the budget.
+    pub(crate) fn assert_between_checks(&self, budget: std::time::Duration) {
+        assert_eq!(
+            *self.events.lock().unwrap(),
+            ["first check", "keyring wait", "second check"]
+        );
+        assert!(self.elapsed.lock().unwrap().unwrap() > budget);
+    }
+}
+
 /// How the fixture's profile and policy are set up.
 pub(crate) struct Spec {
     name: &'static str,
@@ -307,6 +377,7 @@ pub(crate) struct Spec {
     testnet: bool,
     submit_timeout_seconds: Option<u64>,
     record_keys: bool,
+    keyring_read_hooks: Vec<stellar_agent_test_support::keyring_mock::ReadHook>,
     signed_origin: bool,
     signed_thresholds: Vec<(String, String)>,
 }
@@ -335,6 +406,7 @@ impl Spec {
             testnet: false,
             submit_timeout_seconds: None,
             record_keys: false,
+            keyring_read_hooks: Vec::new(),
             signed_origin: false,
             signed_thresholds: Vec::new(),
         }
@@ -442,6 +514,15 @@ impl Spec {
     pub(crate) async fn build(self) -> MainnetFixture {
         MainnetFixture::new(self).await
     }
+
+    /// Installs read hooks before the ceremony seeds the mock keyring.
+    pub(crate) fn keyring_read_hooks(
+        mut self,
+        hooks: Vec<stellar_agent_test_support::keyring_mock::ReadHook>,
+    ) -> Self {
+        self.keyring_read_hooks = hooks;
+        self
+    }
 }
 
 /// Installs a fresh in-memory mock store and makes every keyring
@@ -450,8 +531,12 @@ impl Spec {
 struct MockKeyringScope(Option<stellar_agent_test_support::keyring_mock::MutationLog>);
 
 impl MockKeyringScope {
-    fn set(record_keys: bool) -> Self {
-        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+    fn set(
+        record_keys: bool,
+        hooks: Vec<stellar_agent_test_support::keyring_mock::ReadHook>,
+    ) -> Self {
+        stellar_agent_test_support::keyring_mock::install_with_read_hooks(hooks)
+            .expect("mock keyring store");
         Self(
             record_keys
                 .then(|| stellar_agent_test_support::keyring_mock::record_mutations().unwrap()),
@@ -526,7 +611,10 @@ impl MainnetFixture {
         );
         let home_guard = StellarAgentHomeGuard::new(home.path());
         let profile_var = ProfileEnvVarGuard::cleared();
-        let keyring = MockKeyringScope::set(spec.record_keys);
+        let keyring = MockKeyringScope::set(
+            spec.record_keys,
+            std::mem::take(&mut spec.keyring_read_hooks),
+        );
         let agent = EnvSigner::new(AGENT_SEED, AGENT_VAR);
         let owner = EnvSigner::new(OWNER_SEED, OWNER_VAR);
         let name = spec.name;

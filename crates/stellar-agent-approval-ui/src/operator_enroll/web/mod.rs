@@ -41,7 +41,7 @@ mod tests {
         use sha2::{Digest as _, Sha256};
         assert_eq!(
             hex::encode(Sha256::digest(OPERATOR_ENROLL_JS)),
-            "a3636dd8ed6ba06c41cb9d84fa1c2edb16fb8aaee82f0de73186f0903876f027"
+            "da747bdae1c0422427f443ed7fdae094c4177fedd7316c30e803d08ee9895b7a"
         );
     }
 

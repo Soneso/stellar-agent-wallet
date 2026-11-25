@@ -26,6 +26,9 @@
 //    The operator types it at the terminal, which enrolls or exports the
 //    credential only when the codes match.
 //
+// The Create passkey button stays disabled while an attempt runs and after the
+// credential is sent. Any failed attempt re-enables it for a retry.
+//
 // The server renders the ceremony's purpose into the data island's
 // data-purpose attribute; the page never reads it from the URL. The purpose
 // selects the session proof key and the code domain, so a code shown for one
@@ -212,7 +215,7 @@
       });
   }
 
-  function enroll(island, purpose) {
+  function enroll(island, purpose, btn) {
     var labelInput = document.getElementById("label-input");
     var label = labelInput ? labelInput.value.trim() : "";
     if (!label) {
@@ -228,6 +231,7 @@
       return;
     }
 
+    btn.disabled = true;
     showCode(null);
     setStatus("Requesting a challenge from the wallet…", "busy");
     var ceremony = {};
@@ -301,6 +305,7 @@
         );
       })
       .catch(function (e) {
+        btn.disabled = false;
         showCode(null);
         // A passkey-creation rejection is a DOMException; every refusal and
         // transport failure this page raises itself is tagged.
@@ -318,11 +323,14 @@
   var btn = document.getElementById("enroll-btn");
   if (btn && island) {
     btn.addEventListener("click", function () {
+      if (btn.disabled) {
+        return;
+      }
       if (!purpose) {
         setStatus("This page names no enrollment purpose. Restart the command for a new link.", "error");
         return;
       }
-      enroll(island, purpose);
+      enroll(island, purpose, btn);
     });
   }
 })();
