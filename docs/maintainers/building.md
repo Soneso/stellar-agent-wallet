@@ -898,7 +898,7 @@ from its suite list, so a new live suite must be added to `SUITES` in
 `.github/scripts/test-run-testnet-acceptance.sh` checks the suite list against
 the files in both directions, the browser suite list, the feature selection,
 and the refusal of an unknown `MAINNET_WRITE` value. The `release contracts` CI
-job runs it with a 20-minute job timeout. The budget covers the signer-set
+job runs it with a 30-minute job timeout. The budget covers the signer-set
 baseline self-test, workflow invariant cases and mutation controls, and the
 other release contract checks.
 
