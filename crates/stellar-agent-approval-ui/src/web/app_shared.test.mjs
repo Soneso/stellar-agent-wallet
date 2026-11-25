@@ -625,14 +625,21 @@ test("local enrollment uses the trimmed label as both passkey user names", async
   assert.equal(JSON.parse(page.fetches[1].init.body).label, "Travel key");
 });
 
-test("local enrollment with an empty label stops before the ceremony", () => {
+test("local enrollment with an empty label stops before the ceremony", async () => {
   for (const label of ["", "   "]) {
     const page = enrollPage({ [ENROLL_PROOF_KEY]: PROOF }, { reply: server() });
     page.byId["label-input"].value = label;
     page.byId["enroll-btn"].listeners.click[0]();
     assert.equal(page.byId.status.textContent, "Enter a label first.");
+    assert.notEqual(page.byId["enroll-btn"].disabled, true);
     assert.equal(page.credentialCalls.length, 0);
     assert.equal(page.fetches.length, 0);
+
+    page.byId["label-input"].value = "laptop";
+    page.byId["enroll-btn"].listeners.click[0]();
+    await until(() => page.byId["confirmation-code"].textContent !== "", "the confirmation code after fixing the label");
+    assert.equal(page.byId["enroll-btn"].disabled, true);
+    assert.equal(page.byId["confirmation-code"].textContent, VECTOR_CODE);
   }
 });
 
@@ -673,6 +680,7 @@ test("enrollment registers over the server challenge and posts the authenticator
   assert.match(page.byId.status.textContent, new RegExp(VECTOR_CODE));
   assert.match(page.byId.status.textContent, /at the terminal/);
   assert.doesNotMatch(page.byId.status.textContent, /Enrolled/);
+  assert.equal(page.byId["enroll-btn"].disabled, true);
 });
 
 for (const [name, setup, code] of [
@@ -716,6 +724,7 @@ test("a refused registration shows the server's error and no code", async () => 
   assert.equal(page.byId.status.textContent, "Enrollment failed: registration_invalid");
   assert.equal(page.byId["confirmation-code"].textContent, "");
   assert.equal(page.byId["confirmation-code"].hidden, true);
+  assert.equal(page.byId["enroll-btn"].disabled, false);
 });
 
 test("a refused challenge request creates no passkey", async () => {
@@ -728,6 +737,7 @@ test("a refused challenge request creates no passkey", async () => {
   assert.equal(page.fetches.length, 1);
   assert.equal(page.credentialCalls.length, 0);
   assert.equal(page.byId.status.textContent, "Enrollment failed: already_completed");
+  assert.equal(page.byId["enroll-btn"].disabled, false);
 });
 
 test("enrollment without a stored proof creates no passkey and sends nothing", async () => {
@@ -737,6 +747,7 @@ test("enrollment without a stored proof creates no passkey and sends nothing", a
   assert.equal(page.credentialCalls.length, 0);
   assert.equal(page.fetches.length, 0);
   assert.match(page.byId.status.textContent, /no wallet session/);
+  assert.notEqual(page.byId["enroll-btn"].disabled, true);
 });
 
 for (const [name, attributes] of [
@@ -749,6 +760,155 @@ for (const [name, attributes] of [
     await until(() => /no enrollment purpose/.test(page.byId.status.textContent), "the purpose refusal");
     assert.equal(page.credentialCalls.length, 0);
     assert.equal(page.fetches.length, 0);
+    assert.notEqual(page.byId["enroll-btn"].disabled, true);
+  });
+}
+
+test("enrollment disables Create passkey while pending and keeps it disabled after success", async () => {
+  let resolveChallenge;
+  let resolveCredential;
+  const reply = (url) => {
+    if (url === "/enroll/challenge") {
+      return new Promise((resolve) => {
+        resolveChallenge = resolve;
+      });
+    }
+    return jsonReply(200, { status: "awaiting_confirmation" });
+  };
+  const page = enrollPage(
+    { [ENROLL_PROOF_KEY]: PROOF },
+    {
+      reply,
+      credential: () =>
+        new Promise((resolve) => {
+          resolveCredential = resolve;
+        }),
+    }
+  );
+  const btn = page.byId["enroll-btn"];
+  assert.notEqual(btn.disabled, true);
+
+  btn.listeners.click[0]();
+  assert.equal(btn.disabled, true, "disabled while the challenge request is pending");
+  assert.equal(page.fetches.length, 1);
+
+  // A second click while the challenge is pending starts no second request.
+  btn.listeners.click[0]();
+  assert.equal(page.fetches.length, 1);
+  assert.equal(page.credentialCalls.length, 0);
+
+  resolveChallenge(
+    jsonReply(200, {
+      challenge: b64url(VECTOR_CHALLENGE),
+      rp_id: "localhost",
+      alg: -7,
+      user_verification: "required",
+      resident_key: "required",
+      attestation: "none",
+      timeout_ms: 300000,
+    })
+  );
+  await until(() => page.credentialCalls.length === 1, "the passkey creation request");
+  assert.equal(btn.disabled, true, "stays disabled while passkey creation is pending");
+
+  // A second click while passkey creation is pending starts no second creation.
+  btn.listeners.click[0]();
+  assert.equal(page.fetches.length, 1);
+  assert.equal(page.credentialCalls.length, 1);
+
+  resolveCredential(defaultCredential());
+  await until(() => page.byId["confirmation-code"].textContent !== "", "the confirmation code");
+  assert.equal(btn.disabled, true, "stays disabled after credential is staged");
+  const statusAfterSuccess = page.byId.status.textContent;
+  assert.equal(page.byId["confirmation-code"].textContent, VECTOR_CODE);
+  assert.match(statusAfterSuccess, /Awaiting confirmation/);
+  assert.match(statusAfterSuccess, /at the terminal/);
+
+  // A click after success starts no new request and preserves the code and status.
+  btn.listeners.click[0]();
+  assert.equal(page.fetches.length, 2);
+  assert.equal(page.credentialCalls.length, 1);
+  assert.equal(btn.disabled, true);
+  assert.equal(page.byId["confirmation-code"].textContent, VECTOR_CODE);
+  assert.equal(page.byId.status.textContent, statusAfterSuccess);
+});
+
+for (const [name, setup, expectedStatus] of [
+  [
+    "passkey rejection",
+    (attempt) => ({
+      reply: server(),
+      credential: () => {
+        if (attempt() === 1) {
+          throw Object.assign(new Error("user canceled"), { name: "NotAllowedError" });
+        }
+        return defaultCredential();
+      },
+    }),
+    /Passkey creation failed/,
+  ],
+  [
+    "refused challenge",
+    (attempt) => ({
+      reply: (url) => (attempt() === 1 ? jsonReply(409, { error: "already_completed" }) : server()(url)),
+      credential: defaultCredential,
+    }),
+    /Enrollment failed: already_completed/,
+  ],
+  [
+    "refused credential",
+    (attempt) => ({
+      reply: (url) =>
+        attempt() === 1
+          ? server({ credentialStatus: 400, credentialBody: { error: "registration_invalid" } })(url)
+          : server()(url),
+      credential: defaultCredential,
+    }),
+    /Enrollment failed: registration_invalid/,
+  ],
+  [
+    "transport failure",
+    (attempt) => ({
+      reply: (url) => (attempt() === 1 ? Promise.reject(new TypeError("network down")) : server()(url)),
+      credential: defaultCredential,
+      globals: { console: { error() {} } },
+    }),
+    /could not reach the wallet/,
+  ],
+  [
+    "unusable authenticator key",
+    (attempt) => ({
+      reply: server(),
+      credential: () => {
+        if (attempt() === 1) {
+          return { rawId: VECTOR_ID.slice().buffer, response: { getPublicKey: () => null } };
+        }
+        return defaultCredential();
+      },
+    }),
+    /usable public key/,
+  ],
+]) {
+  test(`enrollment re-enables Create passkey on ${name} and allows a retry`, async () => {
+    let tries = 0;
+    const hooks = setup(() => tries);
+    const page = enrollPage({ [ENROLL_PROOF_KEY]: PROOF }, hooks);
+    const btn = page.byId["enroll-btn"];
+
+    tries = 1;
+    btn.listeners.click[0]();
+    assert.equal(btn.disabled, true);
+    await until(() => expectedStatus.test(page.byId.status.textContent), `the ${name} error`);
+    assert.equal(btn.disabled, false, "re-enabled after failure");
+    assert.equal(page.byId["confirmation-code"].textContent, "");
+
+    tries = 2;
+    btn.listeners.click[0]();
+    assert.equal(btn.disabled, true, "disabled again during retry");
+    await until(() => page.byId["confirmation-code"].textContent !== "", "the retry confirmation code");
+    assert.equal(btn.disabled, true, "stays disabled after retry succeeds");
+    assert.equal(page.byId["confirmation-code"].textContent, VECTOR_CODE);
+    assert.match(page.byId.status.textContent, /Awaiting confirmation/);
   });
 }
 

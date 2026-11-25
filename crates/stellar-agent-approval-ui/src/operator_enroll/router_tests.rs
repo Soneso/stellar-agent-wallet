@@ -1903,13 +1903,13 @@ async fn loopback_enrollment_transcript_keeps_base_bytes() {
     for (purpose, expected, whole_name) in [
         (
             super::EnrollmentPurpose::RemoteOperator,
-            "c3fd925a12b16b831a924ae80e0190feb6ba1568b5395b74232c8c6211696d9c",
-            "3c716fff370b8feb6b62b5eef5054b9a0910399bfb4cf239199528363ef9817f",
+            "bc088d4b85c679d9d7205548f9c034f2c0af046c83a205ab0b11ad370c15b6ad",
+            "69ef27d9f7d663e72cd41b91040abe54a1c6c05b3a12f1bb1713cc8e10cb1ebe",
         ),
         (
             super::EnrollmentPurpose::MainnetApproval,
-            "fb32326524a0ad04bb94792b8c96710d406788db91f58abe39352e4cf156a95c",
-            "313b09fbeddaad942a7914c1870a4c568843ee24a1e3e12fc012bf3730aa618e",
+            "bf42b9391d4facf3772d553a49616ebbac42a837148f0c85fb647f2bd918d586",
+            "16b91857ac9a3b175491dc0cc1df5d4afc53ddc4d498facb197379827f0f3f2e",
         ),
     ] {
         let transcript = loopback_transcript(purpose).await;

@@ -42,8 +42,18 @@ fn fee_stats(fee: u32) -> Value {
 /// The ledger the oracle reports its entries at from the move on.
 const MOVED_ORACLE_LEDGER: u32 = 1500;
 
-/// The endpoints of a run that moves on while it waits: from the primary's
-/// second readiness check on, the rebuild's, the agent's sequence is
+/// The primary's `getHealth` index of the rebuild's readiness check. Pay and
+/// claim check readiness before reconciliation and again before the build;
+/// account creation and trustline check once before the build.
+fn rebuild_health_index(verb: Verb) -> usize {
+    match verb {
+        Verb::Pay | Verb::Claim => 2,
+        Verb::Create | Verb::Trustline => 1,
+    }
+}
+
+/// The endpoints of a run that moves on while it waits: from the rebuild's
+/// readiness check on ([`rebuild_health_index`]), the agent's sequence is
 /// [`OTHER_SENDS`] higher on both endpoints, the fees are `fee` (first
 /// [`MOVED_FEE`]) and the oracle reports its entries at
 /// [`MOVED_ORACLE_LEDGER`].
@@ -77,8 +87,9 @@ impl Moves {
         let (primary, oracle) = (verb.ledger(), verb.ledger());
         let (advance_primary, advance_oracle) = (primary.clone(), oracle.clone());
         let moves = self.clone();
+        let rebuild = rebuild_health_index(verb);
         let primary = primary.with_script(move |method, index, _| {
-            if method == "getHealth" && index == 1 {
+            if method == "getHealth" && index == rebuild {
                 advance_primary.advance_sequence(&agent(), OTHER_SENDS);
                 advance_oracle.advance_sequence(&agent(), OTHER_SENDS);
                 advance_oracle.report_entries_ledger(MOVED_ORACLE_LEDGER);
@@ -932,8 +943,9 @@ async fn an_elapsed_envelope_record_refuses_before_signing() {
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn canonical_refusals_cross_the_cli_surface() {
-    // From the rebuild's readiness check on, the primary reports the balance
-    // with another amount; the oracle keeps the one the preparation read.
+    // From the rebuild's readiness check on, the primary's third, the primary
+    // reports the balance with another amount; the oracle keeps the one the
+    // preparation read.
     let changing = || {
         let rebuilding = AtomicBool::new(false);
         let (key, changed) =
@@ -941,7 +953,7 @@ async fn canonical_refusals_cross_the_cli_surface() {
         Verb::Claim
             .ledger()
             .with_script(move |method, index, body| {
-                if method == "getHealth" && index == 1 {
+                if method == "getHealth" && index == rebuild_health_index(Verb::Claim) {
                     rebuilding.store(true, Ordering::SeqCst);
                 }
                 (method == "getLedgerEntries"
@@ -1050,13 +1062,13 @@ async fn rebuilt_deadline_row(
     ));
     DEADLINE_CLOCK_MS.store(start, Ordering::SeqCst);
     let end_ms = start + authority_ms;
-    // The rebuild's readiness check is the primary's second; the clock
+    // The rebuild's readiness check is the primary's third; the clock
     // reaches 60 seconds before the authority's end there.
     let primary = Verb::Pay
         .ledger()
         .with_close_clock(deadline_close_secs)
         .with_script(move |method, index, _| {
-            if method == "getHealth" && index == 1 {
+            if method == "getHealth" && index == rebuild_health_index(Verb::Pay) {
                 DEADLINE_CLOCK_MS.store(end_ms - 60_000, Ordering::SeqCst);
             }
             None
@@ -1275,8 +1287,8 @@ async fn cli_canonical_full_path_matrix() {
             MATRIX_CLOCK_MS.store(start, Ordering::SeqCst);
             let unready = |rpc: ClassicRpc| {
                 rpc.with_close_clock(matrix_close_secs)
-                    .with_script(|method, index, _| {
-                        (method == "getHealth" && index == 1).then(|| {
+                    .with_script(move |method, index, _| {
+                        (method == "getHealth" && index == rebuild_health_index(verb)).then(|| {
                             json!({
                                 "status": "unhealthy",
                                 "latestLedger": 2000,

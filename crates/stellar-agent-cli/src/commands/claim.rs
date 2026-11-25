@@ -2018,10 +2018,10 @@ fn render_claim_table(
 /// stored profile of the explicit selection replaces the merged one at the
 /// write context, and every later step reads it from the context. The
 /// endpoint checks and the reconcile run with the context's primary client.
-/// The business id lookup follows under the verified policy, before the
-/// balance read and the build. The policy evaluation with the built fee, the
-/// signed fee cap, the audit pre-flight and the bound witness follow, and
-/// [`authorize_and_submit`] runs the rest.
+/// The business id lookup follows under the reloaded verified policy. A fresh
+/// readiness check then precedes the balance read and the build. The policy
+/// evaluation with the built fee, the signed fee cap, the audit pre-flight
+/// and the bound witness follow, and [`authorize_and_submit`] runs the rest.
 async fn run_mainnet_pipeline<InitKeyring>(
     args: &ClaimArgs,
     resolved: &ResolvedProfileName,
@@ -2094,10 +2094,10 @@ where
         Ok(client) => client,
         Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
     };
-    let checked = match check_claim_endpoint(&client, &net_context).await {
-        Ok(checked) => checked,
-        Err(error) => return ClaimOutcome::failed(claim_error_envelope(&error)),
-    };
+    // Reconciliation runs only after the endpoint passes readiness.
+    if let Err(error) = check_claim_endpoint(&client, &net_context).await {
+        return ClaimOutcome::failed(claim_error_envelope(&error));
+    }
     let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
         Ok(v) => v,
         Err(e) => {
@@ -2154,6 +2154,17 @@ where
         Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
     };
 
+    // Keyring waits in reconciliation, policy reload and operation start
+    // precede this budget. The source read shares this check's deadline.
+    let readiness_deadline = stellar_agent_network::operational::readiness_deadline();
+    let operational = match check_endpoint_ready(&client, readiness_deadline).await {
+        Ok(report) => report,
+        Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
+    };
+    let checked = CheckedEndpoint {
+        operational,
+        readiness_deadline,
+    };
     let built = match build_on_checked_endpoint(&client, &net_context, args, id, checked).await {
         Ok(built) => built,
         Err(failure) => return ClaimOutcome::from_build_failure(failure),
@@ -5062,9 +5073,8 @@ pub(crate) mod tests {
             assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
         }
 
-        /// Operational check: the build checks the primary's identity, then
-        /// its health and latest ledger, and reads the claim entry only after
-        /// both checks.
+        /// The build checks identity and readiness before reconciliation, then
+        /// readiness again after the local steps, before reading the claim entry.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn the_endpoint_checks_precede_the_claim_entry_read() {
@@ -5078,13 +5088,20 @@ pub(crate) mod tests {
 
             let methods = fixture.primary_methods().await;
             assert_eq!(
-                methods.get(..4),
+                methods.get(..6),
                 Some(
-                    ["getNetwork", "getHealth", "getLedgers", "getLedgerEntries"]
-                        .map(str::to_owned)
-                        .as_slice()
+                    [
+                        "getNetwork",
+                        "getHealth",
+                        "getLedgers",
+                        "getHealth",
+                        "getLedgers",
+                        "getLedgerEntries"
+                    ]
+                    .map(str::to_owned)
+                    .as_slice()
                 ),
-                "identity, then readiness, then the claim entry read: {methods:?}"
+                "identity, two readiness checks, then the claim entry read: {methods:?}"
             );
         }
 
@@ -5110,6 +5127,114 @@ pub(crate) mod tests {
                 fixture.primary_methods().await,
                 ["getNetwork", "getHealth", "getLedgers"],
                 "a stale endpoint answers no account read"
+            );
+            fixture.assert_no_consent_ceremony();
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_keychain_wait_between_checks_gets_a_fresh_readiness_budget() {
+            use crate::common::mainnet_write_fixture::SlowKeychain;
+
+            let delay = SlowKeychain::default();
+            let budget = std::time::Duration::from_millis(500);
+            let name = "mainnet-claim-slow-keychain";
+            let fixture = spec(name)
+                .keyring_read_hooks(delay.hooks(name, budget * 2))
+                .primary(delay.on(ledger(true, 100_000_000)))
+                .build()
+                .await;
+            let _budget = stellar_agent_network::operational::set_readiness_budget_for_test(budget);
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            delay.assert_between_checks(budget);
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(fixture.summaries().len(), 1, "consent is reached");
+            assert_eq!(
+                &fixture.primary_methods().await[..7],
+                [
+                    "getNetwork",
+                    "getHealth",
+                    "getLedgers",
+                    "getHealth",
+                    "getLedgers",
+                    "getLedgerEntries",
+                    "getLedgerEntries",
+                ],
+                "the balance and account reads follow the fresh check"
+            );
+            let state = fixture.window_body();
+            assert_eq!(
+                state["last_observation"]["ledger"], 2000,
+                "the submission records the fresh check's ledger"
+            );
+            assert_eq!(
+                state["operations"]["records"][0]["attempts"][0]["pre_exposure_ledger"], 2000,
+                "the exposure bound starts from the fresh check's ledger"
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_failed_second_readiness_check_refuses_before_the_account_read() {
+            let primary = ledger(true, 100_000_000).with_script(|method, index, _| {
+                (method == "getHealth" && index == 1)
+                    .then(|| serde_json::json!({"status": "unhealthy"}))
+            });
+            let fixture = spec("mainnet-claim-second-check-fails")
+                .primary(primary)
+                .build()
+                .await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "network.endpoint_not_ready").await;
+            assert_eq!(
+                fixture.primary_methods().await,
+                ["getNetwork", "getHealth", "getLedgers", "getHealth"]
+            );
+            fixture.assert_no_consent_ceremony();
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_account_read_past_the_readiness_deadline_refuses_before_the_summary() {
+            let primary = ledger(true, 100_000_000);
+            let fixture = spec("mainnet-claim-slow-account")
+                .primary(primary.clone())
+                .build()
+                .await;
+            let budget = std::time::Duration::from_millis(500);
+            let _budget = stellar_agent_network::operational::set_readiness_budget_for_test(budget);
+            let answer_delay = budget * 4;
+            primary.stall_after("getLedgerEntries", 1, answer_delay);
+
+            let started = std::time::Instant::now();
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert!(started.elapsed() >= budget);
+            assert!(started.elapsed() < answer_delay);
+            assert_refused_before_confirmation(&fixture, &run, "network.endpoint_not_ready").await;
+            assert!(
+                run.envelope["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("account read exceeded the readiness deadline"),
+                "{}",
+                run.envelope
+            );
+            assert_eq!(
+                fixture.primary_methods().await,
+                [
+                    "getNetwork",
+                    "getHealth",
+                    "getLedgers",
+                    "getHealth",
+                    "getLedgers",
+                    "getLedgerEntries",
+                    "getLedgerEntries",
+                ]
             );
             fixture.assert_no_consent_ceremony();
         }

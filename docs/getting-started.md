@@ -196,7 +196,8 @@ cargo install --locked stellar-agent-cli@0.2.0-alpha.1
 `stellar-agent-mcp` on crates.io is the server library this executable links;
 it installs nothing. Copy the executable to `stellar-agent-mcp` as in
 [the binstall section](#prebuilt-binaries-cargo-binstall) when an MCP client
-starts that name.
+starts that name. On macOS, read the keychain note at the end of
+[Build from source](#build-from-source) after each update.
 
 ### Build from source
 
@@ -211,6 +212,11 @@ cp target/release/stellar-agent target/release/stellar-agent-mcp
 
 The build writes the executable to `target/release/stellar-agent`, and the
 copy places the same bytes at `target/release/stellar-agent-mcp`.
+
+On macOS, after updating a binary built with `cargo install` or from source,
+the first command can raise one keychain dialog per stored item.
+Choose "Always Allow" to answer each item once for that binary.
+"Allow" asks again on every access.
 
 Default builds enable the `mainnet-write` feature, and builds with
 `--no-default-features` omit it. A prebuilt archive carries the state of its release, which

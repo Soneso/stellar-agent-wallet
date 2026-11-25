@@ -28,10 +28,13 @@
 //! # Output (`--output table`)
 //!
 //! One row per entry: nonce, kind, a one-line wallet-controlled summary, and
-//! the time remaining until expiry. Tombstone entries appear in a separate
-//! section headed `Resolved`. Every rendered field is passed through
-//! [`escape_for_terminal`]: summary values are decoded from an agent-built
-//! envelope and must not be trusted with raw terminal output.
+//! an expiry column showing `(expires in <duration>)` for live entries or
+//! `(expired)` for expired entries. Tombstone entries appear in a separate
+//! section headed `Resolved`. When expired entries are omitted, a trailing
+//! note reports how many were hidden and points to `approve gc`. Every
+//! rendered field is passed through [`escape_for_terminal`]: summary values
+//! are decoded from an agent-built envelope and must not be trusted with raw
+//! terminal output.
 //!
 //! # `--include-expired`
 //!
@@ -39,7 +42,9 @@
 //! (they no longer grant approval and only remain on disk until the next
 //! `approve gc`). `expired_count` always reports the number of expired entries
 //! in the snapshot, regardless of this flag, so the operator can tell whether
-//! a `gc` is due even when expired entries are hidden.
+//! a `gc` is due even when expired entries are hidden. With `--include-expired`,
+//! `--output table` shows those entries as `(expired)` and omits the hidden
+//! entries note.
 //!
 //! # Exit codes
 //!
@@ -190,7 +195,7 @@ pub async fn run(args: ListArgs) -> i32 {
         resolved,
         expired_count,
     });
-    print_success(&envelope, args.output, now_ms);
+    print_success(&envelope, args.output, now_ms, args.include_expired);
     0
 }
 
@@ -198,7 +203,7 @@ pub async fn run(args: ListArgs) -> i32 {
 // Rendering
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn render_table(data: &ListData, now_ms: u64) -> String {
+fn render_table(data: &ListData, now_ms: u64, include_expired: bool) -> String {
     let mut lines = Vec::new();
     if data.pending.is_empty() {
         match &data.profile {
@@ -217,7 +222,7 @@ fn render_table(data: &ListData, now_ms: u64) -> String {
             lines.push(render_pending_row(view, now_ms));
         }
     }
-    if data.expired_count > 0 {
+    if !include_expired && data.expired_count > 0 {
         lines.push(format!(
             "({} expired entr{} not shown; run `approve gc` to clear)",
             data.expired_count,
@@ -227,19 +232,34 @@ fn render_table(data: &ListData, now_ms: u64) -> String {
     lines.join("\n")
 }
 
-fn print_success(envelope: &Envelope<ListData>, format: OutputFormat, now_ms: u64) {
+fn print_success(
+    envelope: &Envelope<ListData>,
+    format: OutputFormat,
+    now_ms: u64,
+    include_expired: bool,
+) {
     match format {
         OutputFormat::Table =>
         {
             #[allow(clippy::print_stdout, reason = "CLI binary intentional user output")]
             if let Some(data) = &envelope.data {
-                println!("{}", render_table(data, now_ms));
+                let table = render_table(data, now_ms, include_expired);
+                #[cfg(test)]
+                RENDERED_TABLES.with(|tables| tables.borrow_mut().push(table.clone()));
+                println!("{table}");
             }
         }
         // `OutputFormat` is `#[non_exhaustive]`; unrecognised future variants
         // fall back to JSON rather than silently joining the table branch.
         _ => render_json(envelope),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tables rendered by `print_success` on the calling thread, oldest first.
+    static RENDERED_TABLES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
@@ -258,9 +278,9 @@ fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
 
 /// Renders one `--output table` row: nonce, kind, one-line summary, expiry.
 ///
-/// `now_ms` is the same snapshot timestamp used to compute `view.expired`,
-/// so the displayed "expires in" duration is relative to the moment the
-/// snapshot was taken, not the entry's creation time.
+/// Live entries show `(expires in <duration>)` relative to `now_ms`, the same
+/// snapshot timestamp used to compute `view.expired`. Expired entries show
+/// `(expired)`.
 ///
 /// Every interpolated field passes through [`escape_for_terminal`] before
 /// being written: the summary values are decoded from an agent-built
@@ -270,17 +290,20 @@ fn render_pending_row(view: &PendingApprovalView, now_ms: u64) -> String {
     let nonce = escape_for_terminal(&view.approval_nonce);
     let kind = escape_for_terminal(view.kind_name);
     let summary = escape_for_terminal(&render_summary_line(view));
-    let expires_in = if view.expired {
-        "expired".to_owned()
+    let expiry = if view.expired {
+        "(expired)".to_owned()
     } else {
-        format_expires_in(view.expires_at_unix_ms, now_ms)
+        format!(
+            "(expires in {})",
+            format_expires_in(view.expires_at_unix_ms, now_ms)
+        )
     };
     let reason = view
         .reason
         .as_deref()
         .map(|reason| format!("  reason: {}", escape_for_terminal(reason)))
         .unwrap_or_default();
-    format!("{nonce}  {kind:<24}  {summary}{reason}  (expires in {expires_in})")
+    format!("{nonce}  {kind:<24}  {summary}{reason}  {expiry}")
 }
 
 /// The base-account note of a muxed destination, or nothing without one.
@@ -418,11 +441,7 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
 /// Formats the remaining time until `expires_at_unix_ms`, relative to
 /// `reference_unix_ms`, as a compact `"<n>m<n>s"` / `"<n>s"` string.
 ///
-/// `reference_unix_ms` is the entry's `created_at_unix_ms` when the caller has
-/// already established the entry is not expired (the CLI process's own
-/// wall-clock read happens once per invocation via `timefmt::now_unix_ms`, so
-/// this uses that same value indirectly through the non-expired branch in
-/// [`render_pending_row`] — see call site).
+/// `reference_unix_ms` is the snapshot timestamp passed by [`render_pending_row`].
 fn format_expires_in(expires_at_unix_ms: u64, reference_unix_ms: u64) -> String {
     let remaining_ms = expires_at_unix_ms.saturating_sub(reference_unix_ms);
     let total_secs = remaining_ms / 1_000;
@@ -689,6 +708,57 @@ mod tests {
         assert_eq!(included_rendered[0]["data"]["expired_count"], 2);
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn list_run_table_forwards_include_expired() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home_guard = StellarAgentHomeGuard::new(home.path());
+        let profile = "__stellar_agent_approve_test_list_table";
+        let path = default_approval_dir()
+            .unwrap()
+            .join(format!("{profile}.toml"));
+        const CREATED_MS: u64 = 1_700_000_000_000;
+        const TTL_MS: u64 = 1_000;
+        let pending_nonce;
+        let rejected_nonce;
+        {
+            let mut store = PendingApprovalStore::open(path).unwrap();
+            let pending = make_timed_payment(CREATED_MS, TTL_MS);
+            pending_nonce = pending.approval_nonce.clone();
+            store.insert(pending, CREATED_MS).unwrap();
+            let rejected = make_timed_payment(CREATED_MS, TTL_MS);
+            rejected_nonce = rejected.approval_nonce.clone();
+            store.insert(rejected, CREATED_MS).unwrap();
+            assert!(store.reject(&rejected_nonce, CREATED_MS, TTL_MS).unwrap());
+        }
+
+        for (include_expired, expected) in [
+            (
+                false,
+                "No pending approvals.\n(2 expired entries not shown; run `approve gc` to clear)"
+                    .to_owned(),
+            ),
+            (
+                true,
+                format!(
+                    "{pending_nonce}  {:<24}  pay 1000000 stroops XLM to {DEST_G}, memo text \"hi\"  (expired)\n\nResolved\n{rejected_nonce}  {:<24}  rejected (PaymentSimulated)  (expired)",
+                    "PaymentSimulated", "Rejected"
+                ),
+            ),
+        ] {
+            RENDERED_TABLES.with(|tables| tables.borrow_mut().clear());
+            let code = run(ListArgs {
+                profile: Some(profile.to_owned()),
+                output: OutputFormat::Table,
+                include_expired,
+            })
+            .await;
+            assert_eq!(code, 0, "include_expired={include_expired}");
+            let tables = RENDERED_TABLES.with(|tables| std::mem::take(&mut *tables.borrow_mut()));
+            assert_eq!(tables, vec![expected], "include_expired={include_expired}");
+        }
+    }
+
     #[test]
     fn render_table_places_tombstones_under_resolved_heading() {
         let dir = TempDir::new().unwrap();
@@ -717,6 +787,7 @@ mod tests {
                 expired_count: 0,
             },
             now_ms,
+            false,
         );
         assert!(!pending_only.contains("Resolved"), "{pending_only}");
 
@@ -728,6 +799,7 @@ mod tests {
                 expired_count: 0,
             },
             now_ms,
+            false,
         );
         assert!(
             both.contains("\n\nResolved\n"),
@@ -748,6 +820,7 @@ mod tests {
                 expired_count: 1,
             },
             now_ms,
+            false,
         );
         assert!(
             resolved_only.starts_with("No pending approvals for profile 'default'."),
@@ -767,6 +840,7 @@ mod tests {
                 expired_count: 2,
             },
             now_ms,
+            false,
         );
         assert!(
             unsaved_plural.starts_with("No pending approvals.\n"),
@@ -776,6 +850,195 @@ mod tests {
             unsaved_plural.contains("(2 expired entries not shown; run `approve gc` to clear)"),
             "{unsaved_plural}"
         );
+    }
+
+    fn make_timed_payment(created_ms: u64, ttl_ms: u64) -> PendingApproval {
+        let mut entry = make_payment_entry(ttl_ms);
+        entry.created_at_unix_ms = created_ms;
+        entry.expires_at_unix_ms = created_ms + ttl_ms;
+        entry
+    }
+
+    #[test]
+    fn render_table_and_rows_format_expired_and_live_expiry_cells() {
+        const CREATED_MS: u64 = 1_700_000_000_000;
+        const LIVE_TTL_MS: u64 = 10 * 60 * 1_000;
+        const EXPIRED_TTL_MS: u64 = 60 * 1_000;
+        const NOW_MS: u64 = CREATED_MS + 9 * 60 * 1_000;
+
+        let pending_view = |ttl_ms: u64| -> PendingApprovalView {
+            let dir = TempDir::new().unwrap();
+            let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+            store
+                .insert(make_timed_payment(CREATED_MS, ttl_ms), CREATED_MS)
+                .unwrap();
+            store.snapshot(NOW_MS).remove(0)
+        };
+        let consumed_at = |ttl_ms: u64| -> (PendingApprovalView, String) {
+            let dir = TempDir::new().unwrap();
+            let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+            let entry = make_timed_payment(CREATED_MS, ttl_ms);
+            let nonce = entry.approval_nonce.clone();
+            store.insert(entry, CREATED_MS).unwrap();
+            assert!(
+                store
+                    .consume(
+                        &nonce,
+                        &"ab".repeat(32),
+                        stellar_agent_core::approval::ConsumedOutcome::Confirmed,
+                    )
+                    .unwrap()
+            );
+            let view = store.snapshot(NOW_MS).remove(0);
+            let ApprovalSummaryView::Consumed {
+                tx_hash_redacted, ..
+            } = &view.summary
+            else {
+                panic!("{:?}", view.summary);
+            };
+            let redacted = tx_hash_redacted.clone();
+            (view, redacted)
+        };
+        let rejected_at = |ttl_ms: u64| -> PendingApprovalView {
+            let dir = TempDir::new().unwrap();
+            let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+            let entry = make_timed_payment(CREATED_MS, ttl_ms);
+            let nonce = entry.approval_nonce.clone();
+            store.insert(entry, CREATED_MS).unwrap();
+            assert!(store.reject(&nonce, CREATED_MS, ttl_ms).unwrap());
+            store.snapshot(NOW_MS).remove(0)
+        };
+
+        let live_pending = pending_view(LIVE_TTL_MS);
+        let expired_pending = pending_view(EXPIRED_TTL_MS);
+        let (live_consumed, live_tx_redacted) = consumed_at(LIVE_TTL_MS);
+        let (expired_consumed, expired_tx_redacted) = consumed_at(EXPIRED_TTL_MS);
+        let live_rejected = rejected_at(LIVE_TTL_MS);
+        let expired_rejected = rejected_at(EXPIRED_TTL_MS);
+
+        assert!(!live_pending.expired);
+        assert!(expired_pending.expired);
+        assert!(!live_consumed.expired);
+        assert!(expired_consumed.expired);
+        assert!(!live_rejected.expired);
+        assert!(expired_rejected.expired);
+
+        let expected_live_pending = format!(
+            "{}  {:<24}  pay 1000000 stroops XLM to {DEST_G}, memo text \"hi\"  (expires in 1m00s)",
+            live_pending.approval_nonce, "PaymentSimulated"
+        );
+        let expected_expired_pending = format!(
+            "{}  {:<24}  pay 1000000 stroops XLM to {DEST_G}, memo text \"hi\"  (expired)",
+            expired_pending.approval_nonce, "PaymentSimulated"
+        );
+        let expected_live_consumed = format!(
+            "{}  {:<24}  spent (PaymentSimulated) on {live_tx_redacted}, outcome confirmed  (expires in 1m00s)",
+            live_consumed.approval_nonce, "Consumed"
+        );
+        let expected_expired_consumed = format!(
+            "{}  {:<24}  spent (PaymentSimulated) on {expired_tx_redacted}, outcome confirmed  (expired)",
+            expired_consumed.approval_nonce, "Consumed"
+        );
+        let expected_live_rejected = format!(
+            "{}  {:<24}  rejected (PaymentSimulated)  (expires in 1m00s)",
+            live_rejected.approval_nonce, "Rejected"
+        );
+        let expected_expired_rejected = format!(
+            "{}  {:<24}  rejected (PaymentSimulated)  (expired)",
+            expired_rejected.approval_nonce, "Rejected"
+        );
+
+        assert_eq!(
+            render_pending_row(&live_pending, NOW_MS),
+            expected_live_pending
+        );
+        assert_eq!(
+            render_pending_row(&expired_pending, NOW_MS),
+            expected_expired_pending
+        );
+        assert_eq!(
+            render_pending_row(&live_consumed, NOW_MS),
+            expected_live_consumed
+        );
+        assert_eq!(
+            render_pending_row(&expired_consumed, NOW_MS),
+            expected_expired_consumed
+        );
+        assert_eq!(
+            render_pending_row(&live_rejected, NOW_MS),
+            expected_live_rejected
+        );
+        assert_eq!(
+            render_pending_row(&expired_rejected, NOW_MS),
+            expected_expired_rejected
+        );
+
+        let table = render_table(
+            &ListData {
+                profile: Some("default".to_owned()),
+                pending: vec![live_pending, expired_pending],
+                resolved: vec![
+                    live_consumed,
+                    expired_consumed,
+                    live_rejected,
+                    expired_rejected,
+                ],
+                expired_count: 3,
+            },
+            NOW_MS,
+            true,
+        );
+        assert_eq!(
+            table,
+            [
+                expected_live_pending,
+                expected_expired_pending,
+                String::new(),
+                "Resolved".to_owned(),
+                expected_live_consumed,
+                expected_expired_consumed,
+                expected_live_rejected,
+                expected_expired_rejected,
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn render_table_hidden_expired_note_matches_omission_flag_and_count() {
+        const NOW_MS: u64 = 1_700_000_000_000;
+
+        for (include_expired, expired_count, expected) in [
+            (false, 0, "No pending approvals for profile 'default'."),
+            (
+                false,
+                1,
+                "No pending approvals for profile 'default'.\n(1 expired entry not shown; run `approve gc` to clear)",
+            ),
+            (
+                false,
+                3,
+                "No pending approvals for profile 'default'.\n(3 expired entries not shown; run `approve gc` to clear)",
+            ),
+            (true, 0, "No pending approvals for profile 'default'."),
+            (true, 1, "No pending approvals for profile 'default'."),
+            (true, 3, "No pending approvals for profile 'default'."),
+        ] {
+            let rendered = render_table(
+                &ListData {
+                    profile: Some("default".to_owned()),
+                    pending: vec![],
+                    resolved: vec![],
+                    expired_count,
+                },
+                NOW_MS,
+                include_expired,
+            );
+            assert_eq!(
+                rendered, expected,
+                "include_expired={include_expired}, expired_count={expired_count}"
+            );
+        }
     }
 
     // ── render_pending_row / render_summary_line ─────────────────────────────
