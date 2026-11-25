@@ -147,8 +147,8 @@ coding agent this prompt with the number in place of NNN:
 > workflow assigns the issue to me. Confirm the assignment before you continue.
 > If nothing assigns it within a few minutes, stop and tell me.
 > 2. Fork and clone with `gh repo fork Soneso/stellar-agent-wallet --clone`,
-> then start a branch named for the change from the current upstream `main`:
-> `git fetch upstream` and `git switch -c <branch> upstream/main`.
+> then start a branch named for the change from the current upstream `next`:
+> `git fetch upstream` and `git switch -c <branch> upstream/next`.
 > 3. Read `AGENTS.md`, the sections "Contributing with a coding agent", "Commit
 > and pull request conventions", and "Writing style" in `CONTRIBUTING.md`, and
 > the section "Self-review before you open a pull request" in
@@ -164,8 +164,9 @@ coding agent this prompt with the number in place of NNN:
 > body that states what was wrong and what the change does. The pull request
 > description fills in `.github/PULL_REQUEST_TEMPLATE.md` with the preflight
 > table and "Closes #NNN". After I confirm, commit with that message, push to
-> my fork, and open the pull request against `main` with `gh pr create` and
-> that description. Keep "Allow edits by maintainers" enabled.
+> my fork, and open the pull request against `next` with
+> `gh pr create --base next` and that description.
+> Keep "Allow edits by maintainers" enabled.
 > 7. When a review comment arrives, show it to me with your proposed answer or
 > change before you reply or push.
 
@@ -216,9 +217,11 @@ issue.
 Work on a branch named for the change, for example `docs/exit-code-2` or
 `fix/claim-refusal-codes`. Changes land through pull requests from a fork. In a
 clone made with `gh repo fork --clone`, start the branch from the current
-upstream `main` with `git fetch upstream` and
-`git switch -c <branch> upstream/main`. Push it to your fork with
-`git push -u origin <branch>`. A push over HTTPS that carries upstream changes
+upstream `next` with `git fetch upstream` and
+`git switch -c <branch> upstream/next`. Pull requests target `next`, the
+integration branch; `main` receives `next` for each release.
+Push it to your fork with `git push -u origin <branch>`.
+A push over HTTPS that carries upstream changes
 to workflow files needs a token with the `workflow` scope. Run
 `gh auth refresh -s workflow` to add the scope to your gh login. CI runs on
 every pull request. On your first contribution, the run starts after a

@@ -23,7 +23,7 @@ in these steps from the checkout root.
    time, following [CONTRIBUTING.md](../../CONTRIBUTING.md#contributing-with-a-coding-agent).
 3. Fork the repository and create a branch whose name says what the change
    does, such as `fix/claim-refusal-codes`. Start it from the current upstream
-   `main` with `git fetch upstream` and `git switch -c <branch> upstream/main`,
+   `next` with `git fetch upstream` and `git switch -c <branch> upstream/next`,
    following [CONTRIBUTING.md](../../CONTRIBUTING.md#contributing-with-a-coding-agent).
 4. Implement the acceptance criteria to
    [The bar for changes in CONTRIBUTING.md](../../CONTRIBUTING.md#the-bar-for-changes).
@@ -44,7 +44,8 @@ in these steps from the checkout root.
    Confirm each new test fails when you revert the behavior it checks, and name
    the tests you probe in the pull request.
 7. Fill in [.github/PULL_REQUEST_TEMPLATE.md](../../.github/PULL_REQUEST_TEMPLATE.md),
-   including the preflight table and the issue it closes. Follow the commit and
+   including the preflight table and the issue it closes. Open the pull request
+   with `gh pr create --base next`. Follow the commit and
    pull request conventions in
    [CONTRIBUTING.md](../../CONTRIBUTING.md#commit-and-pull-request-conventions).
 8. Answer review questions and make requested revisions when the pull request
