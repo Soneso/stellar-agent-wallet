@@ -249,7 +249,7 @@ Apply the `release-signing` settings in this order:
 3. Delete the repository copies of the secrets.
 4. Run the notarization smoke from `main`.
 
-## Bump the publish toolchain
+## Bump the wallet toolchain
 
 `publish.yml` sets `RELEASE_TOOLCHAIN` to an exact Rust release. The `verify`,
 `publish`, and `verify-install` jobs install that release and set
@@ -257,8 +257,12 @@ Apply the `release-signing` settings in this order:
 refuses any other `cargo` or `rustc` version, since the archive bytes can
 depend on the cargo version.
 
-To bump it, change `RELEASE_TOOLCHAIN` in `publish.yml`, `release.yml`, and
-`release-rehearsal.yml` in one pull request and merge it before the dispatch.
+To bump it, change `rust-toolchain.toml`, every workflow `toolchain:` input,
+and the three `RELEASE_TOOLCHAIN` lines in one pull request. Release inputs
+keep `${{ env.RELEASE_TOOLCHAIN }}` and read the updated value.
+`check-workflow-invariants.py` enforces these matching versions.
+The vendored Wasm recipe keeps its separate compiler pins.
+Merge the pull request before the dispatch.
 `rustup check` and `https://static.rust-lang.org/dist/channel-rust-stable.toml`
 show the current stable release.
 

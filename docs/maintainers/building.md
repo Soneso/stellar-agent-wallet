@@ -19,17 +19,14 @@ The toolchain is pinned in `rust-toolchain.toml`:
 
 ```toml
 [toolchain]
-channel = "stable"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
 ```
 
-The channel is `stable` (not a fixed version). With `rustup` installed and the
-`stable` channel not yet installed, the first build in the workspace installs the
-pinned channel with the `rustfmt` and `clippy` components. A `stable` toolchain
-that already exists without them needs `rustup component add rustfmt clippy`.
-Run `rustup update stable` before a gate pass so `clippy` matches the latest
-stable lints.
+With `rustup` installed, the first build in the workspace installs Rust 1.100.0
+and the `rustfmt` and `clippy` components from `rust-toolchain.toml`.
+Local gates and workflow jobs use this same pinned version.
 
 When the `sh.rustup.rs` bootstrap script fails at `mktemp -d`, as it does in a
 sandbox that denies the system temporary directory, run the platform
@@ -42,7 +39,7 @@ uses the target `aarch64-apple-darwin`. On Windows the file is `rustup-init.exe`
 ```bash
 curl --proto '=https' --tlsv1.2 -sSfO https://static.rust-lang.org/rustup/dist/aarch64-apple-darwin/rustup-init
 chmod +x rustup-init
-./rustup-init -y --no-modify-path --profile minimal --default-toolchain stable \
+./rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.100.0 \
   --component rustfmt --component clippy
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 ```
@@ -329,9 +326,10 @@ matches:
   scopes also apply to Markdown files.
 - A fragment under `changelog.d/`, the changelog utility, or its test selects
   `changelog` and `self-test:test-changelog.py`.
-  The changelog workflow selects both workflow invariant gates.
-- A workflow under `.github/workflows/`, a file under `.github/actions/`, or
-  `.github/labels.yml` selects `actionlint`.
+- Any `.yml` or `.yaml` workflow under `.github/workflows/`, or a file under
+  `.github/actions/`, selects `actionlint` and both workflow invariant gates.
+  `rust-toolchain.toml` also selects both workflow invariant gates;
+  `.github/labels.yml` also selects `actionlint`.
 - A file under `.github/scripts/` selects the self-test of the script it
   changes, and a changed shell script also selects shellcheck.
 - A file under `skills/` or `.claude-plugin/` selects the skill archive check.
@@ -412,13 +410,11 @@ gate except `shellcheck-changed`, which needs a changed shell script.
      It also tests `release/check-host.sh` and `derive-alias.sh`; a change to
      those selects it only under `--full`.
    - `test-check-provenance.py`: `check-provenance.py` or a provenance fixture
-5. `workflow-invariants`: a change to `release.yml`, `publish.yml`,
-   `notarize-smoke.yml`, `labels.yml`, `stale.yml`, `triage.yml`,
-   `triage-review.yml`, `triage-sweep.yml`, `welcome.yml`, `coverage.yml`,
-   `release-rehearsal.yml`, `ci.yml`, `vendored-wasm.yml`, or `changelog.yml`
-   under `.github/workflows/`, to
-   `.github/actions/`, or to a file under `.github/scripts/` that one of them
-   names.
+5. `workflow-invariants`: a change to `rust-toolchain.toml`,
+   any `.yml` or `.yaml` file under `.github/workflows/`, or any file under
+   `.github/actions/`. A file under `.github/scripts/` also selects this gate
+   when a workflow in `preflight.sh`'s `INVARIANT_WORKFLOWS` list or a file under
+   `.github/actions/` names it.
    `triage.yml` handles item events; `triage-review.yml` starts `triage-sweep.yml`
    after a submitted review, with a schedule as the fallback; an approving review
    leaves the labels alone.

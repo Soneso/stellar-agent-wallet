@@ -12,7 +12,9 @@ under ``.github/workflows/``.
 Also reads the composite action
 ``.github/actions/macos-sign-notarize/action.yml``, the shared build script
 ``.github/scripts/release/build.sh``, and the host recipe
-``.github/scripts/release/check-host.sh``. Needs PyYAML.
+``.github/scripts/release/check-host.sh``. Toolchain checks read
+``rust-toolchain.toml``, every ``*.yml`` and ``*.yaml`` workflow, and every
+``action.yml`` under ``.github/actions/``. Needs Python 3.11 or later and PyYAML.
 
 A job is credentialed when it references ``secrets.``, passes secrets to a
 reusable workflow, declares ``environment:``, or holds ``id-token: write``,
@@ -233,6 +235,10 @@ runs the function.
   ``release-rehearsal.yml`` differs from that of ``publish.yml``, or either
   build job or the rehearsal's ``verify-crates`` does not install it and pin
   ``RUSTUP_TOOLCHAIN`` between the install and the build or packaging.
+- ``wallet-toolchain``: the repository channel is not an exact Rust version,
+  a workflow or local action installs another toolchain, or a release workflow
+  does not use its matching ``RELEASE_TOOLCHAIN`` value. Toolchain overrides
+  are forbidden except in ``vendored-wasm.yml`` and the release pin line.
 - ``ci-feature-jobs``: a job of ``CI_FEATURE_JOBS`` is missing, it or one of
   its steps sets ``if`` or ``continue-on-error``, or it does not run each of
   its commands unconditionally. A job of ``DOCS_ONLY_SKIPPED_JOBS`` instead
@@ -269,6 +275,7 @@ import fnmatch
 import pathlib
 import re
 import sys
+import tomllib
 from datetime import date
 
 try:
@@ -548,6 +555,7 @@ PACKAGE_CHECKS = {
 INSTALL_CHECK = ('bash "$GITHUB_WORKSPACE/wf/.github/scripts/release/verify-install.sh" "$TAG" '
                  '"$EXPECTED_MAINNET_WRITE"')
 TOOLCHAIN_PIN = 'echo "RUSTUP_TOOLCHAIN=$RELEASE_TOOLCHAIN" >> "$GITHUB_ENV"'
+RELEASE_WORKFLOWS = {"release.yml", "publish.yml", "release-rehearsal.yml"}
 VERIFIED_SOURCE_CHECK = '[ "$(git -C src rev-parse HEAD)" = "$VERIFIED_SHA" ]'
 # The release checks, which no condition may skip and no command may ignore.
 GUARDED_JOBS = {"release.yml": ("verify-packaged", "verify-provenance", "hashes", "publish"),
@@ -1730,6 +1738,68 @@ class Checker:
                 or not releases or any(check >= release for release in releases)):
             self.report("release.yml", rule, "publish must verify sums unconditionally before the release action")
 
+    def check_wallet_toolchain(self):
+        """Every wallet gate installs the repository's exact Rust version."""
+        rule = "wallet-toolchain"
+        try:
+            toolchain = tomllib.loads((self.root / "rust-toolchain.toml").read_text())
+            channel = (toolchain.get("toolchain") or {}).get("channel")
+        except (OSError, tomllib.TOMLDecodeError) as err:
+            self.report("rust-toolchain.toml", rule, str(err))
+            return
+        if not isinstance(channel, str) or not re.fullmatch(r"\d+\.\d+\.\d+", channel):
+            self.report("rust-toolchain.toml", rule, "channel must be an exact Rust version")
+            return
+
+        directory = self.root / WORKFLOW_DIR
+        paths = sorted([*directory.glob("*.yml"), *directory.glob("*.yaml"),
+                        *(self.root / ".github/actions").rglob("action.yml")])
+        for path in paths:
+            relative = path.relative_to(self.root)
+            workflow = relative.parent == WORKFLOW_DIR
+            doc = (self.docs.get(path.name) if workflow and path.name in WORKFLOWS
+                   else self.load(relative))
+            if not isinstance(doc, dict):
+                continue
+            release = workflow and path.name in RELEASE_WORKFLOWS
+            expected = "${{ env.RELEASE_TOOLCHAIN }}" if release else channel
+            if release and (doc.get("env") or {}).get("RELEASE_TOOLCHAIN") != channel:
+                self.report(str(relative), rule, "RELEASE_TOOLCHAIN must equal the repository channel")
+
+            scopes = [(str(relative), doc)]
+            steps = []
+            for name, job in (doc.get("jobs") or {}).items():
+                if isinstance(job, dict):
+                    where = f"{relative}:{name}"
+                    scopes.append((where, job))
+                    steps.extend((f"{where} step {i + 1}", step)
+                                 for i, step in enumerate(job.get("steps") or []))
+            steps.extend((f"{relative} step {i + 1}", step)
+                         for i, step in enumerate((doc.get("runs") or {}).get("steps") or []))
+            for where, step in steps:
+                if not isinstance(step, dict):
+                    continue
+                scopes.append((where, step))
+                if str(step.get("uses") or "").lower().startswith("dtolnay/rust-toolchain@"):
+                    if (step.get("with") or {}).get("toolchain") != expected:
+                        self.report(where, rule, f"with.toolchain must be {expected!r}")
+
+            if workflow and path.name == "vendored-wasm.yml":
+                continue
+            for where, scope in scopes:
+                if "RUSTUP_TOOLCHAIN" in (scope.get("env") or {}):
+                    self.report(where, rule, "RUSTUP_TOOLCHAIN may only be set by the release pin line")
+            for where, step in steps:
+                if not isinstance(step, dict):
+                    continue
+                for line in self.logical_lines(self.run_text(step)):
+                    if release and line.strip() == TOOLCHAIN_PIN:
+                        continue
+                    if re.search(r"\brustup\s+(?:toolchain\s+install|default|override)\b|\bcargo\s+\+\S+", line):
+                        self.report(where, rule, "run must not install or override the toolchain")
+                    if re.search(r"\bRUSTUP_TOOLCHAIN\s*[\"']?\s*=", line):
+                        self.report(where, rule, "RUSTUP_TOOLCHAIN may only be set by the release pin line")
+
     def check_release_toolchain(self):
         publish = (self.docs.get("publish.yml", {}).get("env") or {}).get("RELEASE_TOOLCHAIN")
         for workflow in ("release.yml", REHEARSAL_WORKFLOW):
@@ -2190,6 +2260,7 @@ class Checker:
         self.check_cache_save_if()
         self.check_composite_expressions()
         self.check_release_checks()
+        self.check_wallet_toolchain()
         self.check_release_vars()
         self.check_changelog_workflow()
         self.check_release_fragments()

@@ -18,7 +18,7 @@
 # self-test trigger of their own. Each path selects the gates of every scope
 # class it matches:
 #
-#   workflows  .github/workflows/*.yml, .github/actions/, .github/labels.yml
+#   workflows  .github/workflows/*.yml or *.yaml, .github/actions/, .github/labels.yml
 #   scripts    .github/scripts/
 #   surface    each path that is_scanned of check-install-surface.py accepts:
 #              the Markdown files and manifests that check reads
@@ -73,9 +73,8 @@ POLICY_PIN_CRATE=stellar-agent-core
 # The crate whose Friendbot unit tests build with testnet-helpers alone.
 # Its library tests run whenever the test packages include it.
 TEST_SUPPORT_CRATE=stellar-agent-test-support
-# The workflows that check-workflow-invariants.py reads, as its docstring
-# names them.
-INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm changelog testnet install-surface take"
+# The workflows whose referenced scripts the structural invariants check reads.
+INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm testnet install-surface take"
 
 die() {
   echo "preflight: $*" >&2
@@ -377,9 +376,9 @@ select_self_tests() {
 }
 
 # Selects workflow-invariants and the self-test of the check it runs. The
-# self-test runs check-workflow-invariants.py on copies of the workflows, the
-# action files, and the scripts that the check reads, so a change to any of
-# them can break the self-test.
+# self-test runs check-workflow-invariants.py on copies of rust-toolchain.toml,
+# the workflows, action files, and scripts that the check reads. A change to
+# any of them can break the self-test.
 select_invariant_gates() {
   select_gate workflow-invariants
   select_gate self-test:test-check-workflow-invariants.py
@@ -389,7 +388,7 @@ select_invariant_gates() {
 # $SCRATCH/rust for the package planner, and an existing shell script in
 # $SCRATCH/shell as an operand of the shellcheck-changed gate.
 select_for_path() {
-  local path=$1 name
+  local path=$1
   case "$path" in
     changelog.d/* | .github/scripts/changelog.py | .github/scripts/test-changelog.py) select_gate changelog ;;
   esac
@@ -406,17 +405,10 @@ select_for_path() {
     .github/scripts/proof-matrix.toml | .github/scripts/check-proof-matrix.py) select_gate proof-matrix; select_gate proof-matrix:feature-on ;;
   esac
   case "$path" in
-    .github/workflows/*.yml | .github/actions/* | .github/labels.yml) select_gate actionlint ;;
+    .github/workflows/*.yml | .github/workflows/*.yaml | .github/actions/* | .github/labels.yml) select_gate actionlint ;;
   esac
   case "$path" in
-    .github/actions/*) select_invariant_gates ;;
-    .github/workflows/*.yml)
-      for name in $INVARIANT_WORKFLOWS; do
-        if [ "$path" = ".github/workflows/$name.yml" ]; then
-          select_invariant_gates
-        fi
-      done
-      ;;
+    rust-toolchain.toml | .github/actions/* | .github/workflows/*.yml | .github/workflows/*.yaml) select_invariant_gates ;;
     .github/scripts/*)
       if is_invariant_script "$path"; then
         select_invariant_gates

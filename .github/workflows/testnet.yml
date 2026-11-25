@@ -74,7 +74,7 @@ jobs:
           sudo docker image prune --all --force >/dev/null 2>&1 || true
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
       # stellar-ledger pulls hidapi, which links libudev on Linux for HID device
       # enumeration. The runner ships pkg-config but not the libudev headers.
       - name: Install libudev (Linux hidapi)
@@ -165,7 +165,7 @@ jobs:
           sudo docker image prune --all --force >/dev/null 2>&1 || true
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
       # stellar-ledger pulls hidapi, which links libudev on Linux for HID device
       # enumeration. The runner ships pkg-config but not the libudev headers.
       - name: Install libudev (Linux hidapi)
