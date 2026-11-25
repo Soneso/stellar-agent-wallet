@@ -1,0 +1,1 @@
+- Contributor pull requests target the `next` branch, and `preflight.sh` compares against `next` by default.

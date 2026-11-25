@@ -310,8 +310,8 @@ bash .github/scripts/preflight.sh
 ```
 
 - `--base <ref>` compares the branch with its merge base with `<ref>`. The
-  default is `upstream/main`, or `origin/main` when `upstream/main` is missing
-  or an ancestor of `origin/main`, or `main` when neither exists.
+  default is `upstream/next`, or `origin/next` when `upstream/next` is missing
+  or an ancestor of `origin/next`, or `next` when neither exists.
 - `--full` runs every gate in the registry, with workspace Cargo commands.
   It includes coverage and its floor check.
 - `--list` prints the selected gates, one `<id><TAB><command>` line each in
