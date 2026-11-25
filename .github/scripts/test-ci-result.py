@@ -13,6 +13,19 @@ spec = importlib.util.spec_from_file_location("ci_result", SCRIPT)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 DOCS_REQUIRED = {"changes", "docs-tests", "feature-discipline", "release-contracts"}
+CLASSIFIER = SCRIPT.with_name("classify-docs-only.py")
+
+
+def dispatch_docs_only():
+    """The DOCS_ONLY value classify-docs-only.py prints for a ci.yml dispatch
+    on main, which passes empty pull request and push fields."""
+    env = dict(os.environ, EVENT_NAME="workflow_dispatch", BASE_REF="", BASE_SHA="", HEAD_SHA="",
+               REF="refs/heads/main", BEFORE_SHA="", AFTER_SHA="", FORCED="")
+    output = subprocess.run([sys.executable, str(CLASSIFIER)], capture_output=True, text=True, env=env,
+                            cwd=SCRIPT.parents[2], check=True).stdout
+    if not output.startswith("docs_only=") or output.count("\n") != 1:
+        raise SystemExit(f"FAIL classifier output {output!r}")
+    return output.strip().removeprefix("docs_only=")
 
 
 def main():
@@ -40,6 +53,14 @@ def main():
         ("invalid DOCS_ONLY", full, "yes", 1),
         ("non-object needs", [], "false", 1),
         ("invalid job record", dict(full, fmt=None), "false", 1),
+    ])
+    # A dispatch is a full run: the classifier's real result requires every full job.
+    dispatch = dispatch_docs_only()
+    cases.extend([
+        ("dispatch full success", full, dispatch, 0),
+        ("dispatch required job failed", dict(full, **{"windows-storage": {"result": "failure"}}), dispatch, 1),
+        ("dispatch required job skipped", dict(full, test={"result": "skipped"}), dispatch, 1),
+        ("dispatch runs docs-tests", dict(full, **{"docs-tests": {"result": "success"}}), dispatch, 1),
     ])
     failures = []
     for label, needs, mode, expected in cases:
