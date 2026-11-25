@@ -35,8 +35,9 @@ the review approves with no blocking findings.
 
 ### 3. Tests and coverage
 
-- A pull request that changes Rust code carries the `coverage` label, and the
-  `coverage` check on its head is green.
+- Coverage runs automatically on code pull requests and every pull request into
+  `main`; the `coverage` check on the head is green. The `coverage` label adds a
+  run on a documentation-only pull request into `next`.
 - Line coverage clears the per-crate floors enforced by
   `.github/scripts/check-coverage.py` (a regression ratchet set a few points
   below current offline coverage); 90% per crate is the aspirational target,

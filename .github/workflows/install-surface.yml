@@ -6,8 +6,9 @@ name: Install surface
 # composite actions against each tool's reference workflow pin
 # (.github/scripts/check-gate-tool-versions.sh). Checks the writing style of
 # the Markdown files (.github/scripts/check-docs-style.py) and the syntax of
-# every workflow (actionlint). Runs each check's self-test, the Python ones on
-# 3.13 and 3.11. Runs the self-test of the contributor preflight
+# every workflow (actionlint). On next, runs self-tests when their inputs
+# change; on every other event and uncertain diffs, runs them all. The Python ones run on
+# 3.13 and 3.11. Also selects the self-test of the contributor preflight
 # (.github/scripts/test-preflight.sh) and shellchecks the preflight and its
 # self-test. It has no paths filter, so every pull request runs it, including
 # one that touches only Markdown.
@@ -35,13 +36,27 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Select self-tests
+        id: sel
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REF: ${{ github.ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+          FORCED: ${{ github.event.forced }}
+        run: python3 .github/scripts/classify-self-tests.py >> "$GITHUB_OUTPUT"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.13'
       - name: Check the install surface
         run: python3 .github/scripts/check-install-surface.py
       - name: Self-test Python checks on Python 3.13
+        if: steps.sel.outputs.selftest_docs != 'false'
         run: |
           python3 .github/scripts/test-check-install-surface.py
           python3 .github/scripts/test-check-docs-style.py
@@ -50,11 +65,13 @@ jobs:
       - name: Check the gate tool versions
         run: bash .github/scripts/check-gate-tool-versions.sh
       - name: Self-test the gate tool version check
+        if: steps.sel.outputs.selftest_docs != 'false'
         run: bash .github/scripts/test-check-gate-tool-versions.sh
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
       - name: Self-test Python checks on Python 3.11
+        if: steps.sel.outputs.selftest_docs != 'false'
         run: |
           python3 .github/scripts/test-check-install-surface.py
           python3 .github/scripts/test-check-docs-style.py
@@ -74,6 +91,7 @@ jobs:
       - name: Check workflows
         run: actionlint
       - name: Self-test the preflight
+        if: steps.sel.outputs.selftest_preflight != 'false'
         run: |
           bash .github/scripts/test-preflight.sh
           bash .github/scripts/test-preflight.sh --mutations

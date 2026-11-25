@@ -7,7 +7,7 @@ each rule and message fragment the case expects, in order, a line of its
 output after the previous match must name the rule and hold the fragment. The
 optional exact-count field also pins the number of reported violations. The
 unmodified copy must pass, and so must each copy that a PASSING entry edits
-into another accepted form. Each replacement must match the expected number
+into another accepted form. Each replacement changes every occurrence and must match the expected number
 of times; a case whose text drifted fails. A fixture read from the live
 workflows must match exactly once, or the run stops before any case.
 Each named mutation of the check then must fail the entries it names, and
@@ -17,6 +17,7 @@ mutations that name it.
 """
 
 import ast
+import hashlib
 import pathlib
 import pickle
 import re
@@ -220,14 +221,18 @@ PUBLISH_SCRIPT = ".github/scripts/publish-crates.sh"
 # A full-length commit pin for the actions a case adds; the check matches the
 # action name and ignores the revision.
 PLACEHOLDER_REVISION = "0" * 40
-COVERAGE_LABEL = "github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'coverage')"
+COVERAGE_ELIGIBILITY = "github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)"
+COVERAGE_SUFFIX = "${{ !(" + COVERAGE_ELIGIBILITY + ") && ' (ignored event)' || '' }}"
+COVERAGE_GROUP = ("${{ github.workflow }}-${{ github.event_name == 'pull_request' && ("
+                  + COVERAGE_ELIGIBILITY + ") && github.ref || github.run_id }}")
+COVERAGE_LABEL = "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')"
 COVERAGE_DOCS_SKIP = ("github.event_name == 'push' && needs.changes.result == 'success' && "
                       "needs.changes.outputs.docs_only == 'true'")
-COVERAGE_CONDITION = f"!cancelled() && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
+COVERAGE_CONDITION = f"!cancelled() && ({COVERAGE_ELIGIBILITY}) && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
 COVERAGE_IF_LINE = f"    if: ${{{{ {COVERAGE_CONDITION} }}}}\n"
 COVERAGE_IF_UNWRAPPED_LINE = f'    if: "{COVERAGE_CONDITION}"\n'
 COVERAGE_IF_SPACED_LINE = f'    if: "  ${{{{ {COVERAGE_CONDITION} }}}}  "\n'
-COVERAGE_TYPES_LINE = "    types: [opened, synchronize, reopened, labeled, unlabeled]\n"
+COVERAGE_TYPES_LINE = "    types: [opened, synchronize, reopened, labeled, edited]\n"
 COVERAGE_PUSH_BLOCK = "  push:\n    branches: [next, main]\n"
 COVERAGE_ON_BLOCK = (
     "on:\n"
@@ -242,21 +247,20 @@ COVERAGE_ON_BLOCK = (
 )
 COVERAGE_CANCEL_LINE = "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n"
 COVERAGE_LABEL_COMMENT = (
-    "    # A pull request run reads the complete label set from the event payload\n"
-    "    # and measures when that set contains `coverage`. A label change by a\n"
-    "    # person or with an app token starts a new run. A change made with the\n"
-    "    # workflow token starts none; the triage and stale workflows use that token.\n"
+    "    # Eligible pull requests measure main, code or uncertain diffs, and the\n"
+    "    # coverage label. Label additions evaluate only coverage; edits evaluate only\n"
+    "    # base changes. GITHUB_TOKEN label changes start no workflow.\n"
 )
-COVERAGE_OFF_HEADER = "  coverage-off:\n    name: coverage (feature-off)\n    needs: changes\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
-COVERAGE_ON_HEADER = "  coverage-on:\n    name: coverage (feature-on)\n    needs: changes\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
-COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
-COVERAGE_GATE_START = "  coverage:\n    name: coverage\n"
+COVERAGE_OFF_HEADER = "  coverage-off:\n    name: coverage (feature-off)" + COVERAGE_SUFFIX + "\n    needs: changes\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
+COVERAGE_ON_HEADER = "  coverage-on:\n    name: coverage (feature-on)" + COVERAGE_SUFFIX + "\n    needs: changes\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
+COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_ELIGIBILITY}) && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
+COVERAGE_GATE_START = "  coverage:\n    name: coverage" + COVERAGE_SUFFIX + "\n"
 COVERAGE_GATE_NEEDS = "    needs: [changes, coverage-off, coverage-on]\n"
 COVERAGE_GATE_COMMENT = (
     "    # always() schedules this job after a failed, cancelled, or skipped\n"
     "    # measurement, and step 1 then fails it. Steps 2 and 8 fail it in a step\n"
-    "    # evaluation that sees the run cancelled. Without the label the condition\n"
-    "    # is false, and the check is skipped. Confirmed docs-only pushes also skip.\n"
+    "    # evaluation that sees the run cancelled. Proven docs-only next changes\n"
+    "    # skip, unless a pull request carries the coverage label.\n"
 )
 COVERAGE_GATE_IF_LINE = f"    if: {COVERAGE_GATE_CONDITION}\n"
 COVERAGE_GATE_HEADER = COVERAGE_GATE_START + COVERAGE_GATE_NEEDS + COVERAGE_GATE_COMMENT + COVERAGE_GATE_IF_LINE
@@ -406,6 +410,9 @@ DOCS_TESTS_ON_RUN = ("        run: python3 .github/scripts/run-docs-tests.py "
 def conditional_feature_job(header):
     """Returns the edit that runs a feature job under if: false."""
     job = header.split(":", 1)[0].strip()
+    if job == "feature-discipline":
+        header = "  feature-discipline:\n    needs: changes\n    if: ${{ !cancelled() }}\n"
+        return (CI, header, header.replace("${{ !cancelled() }}", "false"), 1)
     if job in DOCS_ONLY_FEATURE_JOBS:
         return (CI, header + DOCS_ONLY_JOB, header + "    needs: changes\n    if: false\n", 1)
     return (CI, header, header + "    if: false\n", 1)
@@ -630,14 +637,13 @@ PUBLISH_TAG_OUTPUT = (
     "\n"
     "      - uses: actions/checkout"
 )
-# Stands in for the verify job's copy of a text while a case edits the
-# publish job's copy, and is put back by the last edit of the case.
-HELD = "HELD-BY-THE-TEST"
-
-
-def publish_job_only(old, new):
-    """Edits the publish job's copy of a text the verify job also holds."""
-    return [(PUBLISH, old, HELD, 2), (PUBLISH, old, new, 1), (PUBLISH, HELD, old, 1)]
+def publish_job_only(old, new, expected):
+    """Edits every occurrence inside the publish job alone, refusing count drift."""
+    job = live_text(PUBLISH, re.compile(r"  publish:\n.*?(?=\n  [a-z][\w-]*:|\Z)", re.DOTALL), "publish job")
+    count = job.count(old)
+    if count != expected:
+        raise SystemExit(f"{PUBLISH}: publish job: replacement text drift: found {count} times, expected {expected}")
+    return [(PUBLISH, job, job.replace(old, new), 1)]
 
 
 WASM = ".github/workflows/vendored-wasm.yml"
@@ -673,7 +679,7 @@ WASM_OLD_SAVE_GUARD = "        if: github.ref_type != 'tag' && !inputs.publicati
 
 
 def wasm_save_events(events):
-    """The first stellar-cli save guard with another event test in place of push or schedule."""
+    """Both stellar-cli save guards with another event test in place of push or schedule."""
     return [(WASM, SAVE_GUARD, SAVE_GUARD.replace(WASM_SAVE_EVENTS, events), 2)]
 BUILD_TOOLCHAIN = "          toolchain: ${{ env.RELEASE_TOOLCHAIN }}\n          targets: ${{ matrix.target }}\n"
 RELEASE_LAST_LINE = "            release-provenance/*.intoto.jsonl\n"
@@ -786,7 +792,8 @@ PASSING = [
     ("Wasm saves on push and schedule only pass", [
         (WASM, SAVE_GUARD, SAVE_GUARD, 2)]),
     ("rehearsal job that inherits the workflow permissions passes", [
-        (REHEARSAL, REHEARSAL_JOB_PERMISSIONS, "    strategy:\n", 2)]),
+        (REHEARSAL, REHEARSAL_TIMEOUT + REHEARSAL_JOB_PERMISSIONS,
+         REHEARSAL_TIMEOUT + "    strategy:\n", 1)]),
     ("rehearsal workflow env with a date and a float passes", [
         (REHEARSAL, REHEARSAL_ENV,
          REHEARSAL_ENV + "  RELEASE_DATE: 2026-10-21\n  RATIO: 1.5\n", 1)]),
@@ -807,7 +814,7 @@ PASSING = [
 
 # label, expected rule, a fragment that one line naming the rule must hold,
 # [(file, old, new, expected occurrences)], optional exact count; each edit
-# replaces only the first occurrence. A case that expects several lines gives
+# replaces every occurrence. A case that expects several lines gives
 # tuples of rules and fragments of the same length, in output order.
 CASES = [
     ("skill archive step duplicated", "skill-archive", "expected exactly one skill archive step", [
@@ -821,11 +828,11 @@ CASES = [
         (CI, "name: CI\n", "name: CI\ndefaults:\n  run:\n    shell: true {0}\n", 1)]),
     ("apt-get without retries", "apt-retries", "apt-get call lacks -o Acquire::Retries=3", [
         (TESTNET, "sudo apt-get -o Acquire::Retries=3 install -y gnome-keyring dbus",
-         "sudo apt-get install -y gnome-keyring dbus", 2)], 1),
+         "sudo apt-get install -y gnome-keyring dbus", 2)], 2),
     ("apt-get multiline second call without retries", "apt-retries", "apt-get call lacks -o Acquire::Retries=3", [
         (TESTNET, APT_LIBUDEV_RUN,
          "        run: |\n          sudo apt-get -o Acquire::Retries=3 update\n"
-         "          sudo apt-get install -y libudev-dev pkg-config\n", 2)], 1),
+         "          sudo apt-get install -y libudev-dev pkg-config\n", 2)], 2),
     ("CI pull request branches without main", "ci-triggers", "pull_request branches must include main", [
         (CI, "  pull_request:\n    branches: [main, next]\n",
          "  pull_request:\n    branches: [next]\n", 1)], 1),
@@ -850,7 +857,7 @@ CASES = [
         "skill archive check can be bypassed",
         "release-contracts has an unsupported docs-only job condition",
         "DOCS_REQUIRED must match CI docs-only job conditions"), [
-        (CI, "  release-contracts:\n", "  release-contracts:\n    if: false\n", 1)], 3),
+        (CI, "  release-contracts:\n    needs: changes\n    if: ${{ !cancelled() }}\n", "  release-contracts:\n    needs: changes\n    if: false\n", 1)], 4),
     ("crate publish without Wasm dependency", "publish-wasm-gate", "publish must need verify and vendored-wasm", [
         (PUBLISH, "needs: [verify, vendored-wasm]", "needs: verify", 1)]),
     ("crate Wasm call uses another workflow", "publish-wasm-gate", "must call the local workflow", [
@@ -922,7 +929,7 @@ CASES = [
     ("Wasm step continues on error", "release-wasm-gate",
      "vendored-wasm.yml:stellar-cli-25: release-wasm-gate: stellar-cli-25 step 1 continues on error", [
         (WASM, "        run: rustup toolchain install \"$HOST_RUSTC\" --profile minimal\n",
-         "        run: rustup toolchain install \"$HOST_RUSTC\" --profile minimal\n        continue-on-error: true\n", 2)], 1),
+         "        run: rustup toolchain install \"$HOST_RUSTC\" --profile minimal\n        continue-on-error: true\n", 2)], 2),
     ("Wasm rebuild suppresses a failure", "release-wasm-gate",
      "vendored-wasm.yml:rebuild: release-wasm-gate: rebuild step 8 suppresses failures", [
         (WASM, WASM_COMPARE, WASM_COMPARE.replace('-work"\n', '-work" || true\n'), 1)], 1),
@@ -1183,8 +1190,7 @@ CASES = [
         (PUBLISH, PUBLISH_COMPARE_STEP, "", 1)]),
     ("smoke signing job without a clean-checkout check", "credential-order",
      'notarize-smoke.yml:sign: credential-order: no step before ./.github/actions/macos-sign-notarize runs status --porcelain', [
-        (SMOKE, SMOKE_CLEAN_CHECK, 'status=""', 2),
-        (SMOKE, SMOKE_CLEAN_CHECK, 'status=""', 1)]),
+        (SMOKE, SMOKE_CLEAN_CHECK, 'status=""', 2)]),
     ("release signing job without the signing action", "credential-order",
      'release.yml:sign-macos: credential-order: no step uses ./.github/actions/macos-sign-notarize', [
         (RELEASE, "        uses: ./.github/actions/macos-sign-notarize\n",
@@ -1223,8 +1229,7 @@ CASES = [
     ("release signing job without a clean-checkout check", "credential-order",
      "release.yml:sign-macos: credential-order: no step before ./.github/actions/macos-sign-notarize "
      "runs status --porcelain", [
-        (RELEASE, SMOKE_CLEAN_CHECK, 'status=""', 2),
-        (RELEASE, SMOKE_CLEAN_CHECK, 'status=""', 1)]),
+        (RELEASE, SMOKE_CLEAN_CHECK, 'status=""', 2)]),
     ("smoke signing job without the archive validation", "credential-order",
      "notarize-smoke.yml:sign: credential-order: no step before ./.github/actions/macos-sign-notarize "
      "runs validate-input.sh", [
@@ -1232,7 +1237,7 @@ CASES = [
     ("publish job checks ancestry only after the token step", "credential-order",
      "publish.yml:publish: credential-order: no step before rust-lang/crates-io-auth-action "
      "runs check-ref-on-main.sh",
-     publish_job_only(PUBLISH_ANCESTRY_STEP, "") + [(PUBLISH, PUBLISH_AUTH, PUBLISH_AUTH + PUBLISH_ANCESTRY_STEP, 1)]),
+     publish_job_only(PUBLISH_ANCESTRY_STEP, "", 1) + [(PUBLISH, PUBLISH_AUTH, PUBLISH_AUTH + PUBLISH_ANCESTRY_STEP, 1)]),
     ("publish job compares the checksums after the token step", "credential-order",
      "publish.yml:publish: credential-order: no step before rust-lang/crates-io-auth-action "
      "runs compare-crate-sums.py", [
@@ -1240,11 +1245,7 @@ CASES = [
         (PUBLISH, PUBLISH_AUTH, PUBLISH_AUTH + PUBLISH_COMPARE_STEP, 1)]),
     ("publish job without a clean-checkout check", "credential-order",
      "publish.yml:publish: credential-order: no step before rust-lang/crates-io-auth-action "
-     "runs status --porcelain", [
-        (PUBLISH, PUBLISH_CLEAN_CHECK, HELD, 3),
-        (PUBLISH, PUBLISH_CLEAN_CHECK, 'status=""', 2),
-        (PUBLISH, PUBLISH_CLEAN_CHECK, 'status=""', 1),
-        (PUBLISH, HELD, PUBLISH_CLEAN_CHECK, 1)]),
+     "runs status --porcelain", publish_job_only(PUBLISH_CLEAN_CHECK, 'status=""', 2)),
     ("publish job toolchain check that never runs rustc -V", "credential-order",
      "publish.yml:publish: credential-order: no step before rust-lang/crates-io-auth-action runs rustc -V", [
         (PUBLISH, PUBLISH_TOOLCHAIN_STEP,
@@ -1399,20 +1400,20 @@ CASES = [
     ("coverage pull_request trigger with a paths-ignore filter", "coverage-trigger", "paths-ignore filter", [
         (COVERAGE, "    branches: [main, next]\n" + COVERAGE_TYPES_LINE,
          "    branches: [main, next]\n    paths-ignore: ['**.md']\n" + COVERAGE_TYPES_LINE, 1)]),
-    ("coverage pull_request trigger without unlabeled", "coverage-trigger", "lack unlabeled", [
-        (COVERAGE, "labeled, unlabeled]", "labeled]", 1)]),
+    ("coverage pull_request trigger without edited", "coverage-trigger", "lack edited", [
+        (COVERAGE, "labeled, edited]", "labeled]", 1)]),
     ("coverage workflow without a pull_request trigger", "coverage-trigger", "trigger is absent", [
         (COVERAGE, "  pull_request:\n    branches: [main, next]\n" + COVERAGE_TYPES_LINE, "", 1)]),
-    ("coverage job without the label condition", "coverage-condition", "coverage-off job runs without the label condition", [
+    ("coverage job without the measure condition", "coverage-condition", "coverage-off job runs without the measure condition", [
         (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, ""), 1)]),
-    ("coverage job that always measures", "coverage-condition", "coverage-off job runs without the label condition", [
+    ("coverage job that always measures", "coverage-condition", "coverage-off job runs without the measure condition", [
         (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(
             COVERAGE_IF_LINE, "    if: true || contains(github.event.pull_request.labels.*.name, 'coverage')\n"), 1)]),
-    ("coverage job that never measures", "coverage-condition", "coverage-off job runs without the label condition", [
+    ("coverage job that never measures", "coverage-condition", "coverage-off job runs without the measure condition", [
         (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(
             COVERAGE_IF_LINE, "    if: false && contains(github.event.pull_request.labels.*.name, 'coverage')\n"), 1)]),
     ("coverage job without the non-pull-request bypass", "coverage-condition",
-     "coverage-off job runs without the label condition", [
+     "coverage-off job runs without the measure condition", [
         (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(
             COVERAGE_IF_LINE, "    if: contains(github.event.pull_request.labels.*.name, 'coverage')\n"), 1)]),
     ("coverage workflow without its coverage job", "coverage-condition", "job coverage not found", [
@@ -1434,31 +1435,31 @@ CASES = [
         "coverage.yml: coverage-trigger: pull_request types lack synchronize",
         "coverage.yml: coverage-trigger: pull_request types lack reopened",
         "coverage.yml: coverage-trigger: pull_request types lack labeled",
-        "coverage.yml: coverage-trigger: pull_request types lack unlabeled"), [
+        "coverage.yml: coverage-trigger: pull_request types lack edited"), [
         (COVERAGE, COVERAGE_TYPES_LINE, "    types: []\n", 1)]),
     ("coverage pull_request types missing three events", ("coverage-trigger",) * 3, (
         "coverage.yml: coverage-trigger: pull_request types lack synchronize",
         "coverage.yml: coverage-trigger: pull_request types lack reopened",
-        "coverage.yml: coverage-trigger: pull_request types lack unlabeled"), [
+        "coverage.yml: coverage-trigger: pull_request types lack edited"), [
         (COVERAGE, COVERAGE_TYPES_LINE, "    types: [opened, labeled]\n", 1)]),
     ("coverage paths filter and a missing condition", ("coverage-trigger", "coverage-condition"), (
         "coverage.yml: coverage-trigger: pull_request trigger has a paths filter",
-        "coverage.yml: coverage-condition: coverage-off job runs without the label condition"), [
+        "coverage.yml: coverage-condition: coverage-off job runs without the measure condition"), [
         (COVERAGE, "    branches: [main, next]\n" + COVERAGE_TYPES_LINE,
          "    branches: [main, next]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1),
         (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, ""), 1)]),
     ("coverage gate without always()", ("coverage-condition", "ci-feature-jobs"),
-     ("coverage gate runs without always() and the label condition", "coverage.yml: ci-feature-jobs: coverage can be bypassed"), [
+     ("coverage gate runs without always() and the measure condition", "coverage.yml: ci-feature-jobs: coverage can be bypassed"), [
         (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(COVERAGE_GATE_IF_LINE, COVERAGE_IF_LINE), 1)]),
-    ("coverage gate bypasses the label", "coverage-condition", "coverage gate runs without always() and the label condition", [
+    ("coverage gate bypasses the label", "coverage-condition", "coverage gate runs without always() and the measure condition", [
         (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
             COVERAGE_GATE_IF_LINE, f"    if: always() || ({COVERAGE_CONDITION})\n"), 1)]),
-    ("coverage gate skipped on cancellation", "coverage-condition", "coverage gate runs without always() and the label condition", [
+    ("coverage gate skipped on cancellation", "coverage-condition", "coverage gate runs without always() and the measure condition", [
         (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
             COVERAGE_GATE_IF_LINE, f"    if: ${{{{ !cancelled() && ({COVERAGE_CONDITION}) }}}}\n"), 1)]),
-    ("coverage-on without the label condition", "coverage-condition", "coverage-on job runs without the label condition", [
+    ("coverage-on without the measure condition", "coverage-condition", "coverage-on job runs without the measure condition", [
         (COVERAGE, COVERAGE_ON_HEADER, COVERAGE_ON_HEADER.replace(COVERAGE_IF_LINE, ""), 1)]),
-    ("coverage gate renamed", "coverage-condition", "coverage gate is not named coverage", [
+    ("coverage gate renamed", "coverage-names", "coverage must suffix ignored events", [
         (COVERAGE, COVERAGE_GATE_START, "  coverage:\n    name: coverage (gate)\n", 1)]),
     ("coverage-off job removed", ("coverage-condition", "ci-feature-jobs"),
      ("job coverage-off not found", "coverage.yml: ci-feature-jobs: missing coverage-off"), [
@@ -2008,9 +2009,9 @@ CASES = [
     ("coverage job that continues on error", "ci-feature-jobs", "coverage.yml: ci-feature-jobs: coverage-off can be bypassed", [
         (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER + "    continue-on-error: true\n", 1)], 1),
     ("coverage job under another condition", ("coverage-condition", "ci-feature-jobs"), (
-        "coverage.yml: coverage-condition: coverage-off job runs without the label condition",
+        "coverage.yml: coverage-condition: coverage-off job runs without the measure condition",
         "coverage.yml: ci-feature-jobs: coverage-off can be bypassed"), [
-        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, "    if: false\n"), 1)], 2),
+        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, "    if: false\n"), 1)], 3),
     ("coverage workflow without its coverage job for the feature pin",
      ("coverage-condition", "coverage-split", "coverage-split", "ci-feature-jobs"), (
         "coverage.yml: coverage-condition: job coverage not found",
@@ -2019,7 +2020,7 @@ CASES = [
         "coverage.yml: coverage-split: python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration "
         "feature-on runs in measure, expected coverage",
         "coverage.yml: ci-feature-jobs: missing coverage"), [
-        (COVERAGE, COVERAGE_GATE_START, "  measure:\n    name: coverage\n", 1)], 4),
+        (COVERAGE, COVERAGE_GATE_START, "  measure:\n    name: coverage\n", 1)], 6),
 ] + [
     (f"vars context in {where}", "release-vars",
      f"{path}: release-vars: an expression reads the vars context: vars.SAMPLE", [
@@ -2084,10 +2085,10 @@ CASES.extend([
         (CI, CI_FMT_HEADER, CI_FMT_HEADER.split("    if:")[0] + "    if: false\n", 1)]),
     ("ci-result docs-required job with empty condition", "ci-result",
      "release-contracts has an unsupported docs-only job condition", [
-        (CI, "  release-contracts:\n", '  release-contracts:\n    if: ""\n', 1)]),
+        (CI, "  release-contracts:\n    needs: changes\n    if: ${{ !cancelled() }}\n", '  release-contracts:\n    if: ""\n', 1)]),
     ("ci-result docs-tests condition on another job", "ci-result",
      "release-contracts has an unsupported docs-only job condition", [
-        (CI, "  release-contracts:\n", "  release-contracts:\n"
+        (CI, "  release-contracts:\n    needs: changes\n    if: ${{ !cancelled() }}\n", "  release-contracts:\n"
          "    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}\n", 1)]),
     ("ci-result environment differs", "ci-result", "exact environment", [
         (CI, "NEEDS_JSON: ${{ toJSON(needs) }}", "NEEDS_JSON: '{}'", 1)]),
@@ -2101,7 +2102,7 @@ CASES.extend([
         (COVERAGE, '          test "$CHANGES" = success\n', "", 1)]),
     ("coverage measurement missing changes", "coverage-condition", "must need changes", [
         (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace("    needs: changes\n", ""), 1)]),
-    ("coverage skips without successful classifier", "coverage-condition", "label condition", [
+    ("coverage skips without successful classifier", "coverage-condition", "measure condition", [
         (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace("needs.changes.result == 'success' && ", ""), 1)]),
 ])
 for name in ("changes", "docs-tests", "feature-discipline", "release-contracts"):
@@ -2114,7 +2115,7 @@ for workflow in (CI, COVERAGE):
             (workflow, "  push:\n", f"  push:\n    {key}: ['**/*.rs']\n", 1)]))
 for workflow in (CI, COVERAGE, ".github/workflows/install-surface.yml"):
     CASES.append((f"{workflow} shared push group", "push-concurrency", "only pull request", [
-        (workflow, PUSH_GROUP, "  group: ${{ github.workflow }}-${{ github.ref }}\n", 1)]))
+        (workflow, "  group: " + COVERAGE_GROUP + "\n" if workflow == COVERAGE else PUSH_GROUP, "  group: ${{ github.workflow }}-${{ github.ref }}\n", 1)]))
     CASES.append((f"{workflow} cancels push runs", "push-concurrency", "only pull request", [
         (workflow, COVERAGE_CANCEL_LINE, "  cancel-in-progress: true\n", 1)]))
 for event in ("push", "pull_request"):
@@ -2194,6 +2195,202 @@ CASES.extend((label, "wallet-toolchain", message, edits, 1 if label == "reposito
              for label, message, edits in WALLET_TOOLCHAIN_CASES)
 PASSING.append(("vendored Wasm keeps compiler pins", []))
 
+CASES.extend([
+    ("S01 unlabeled is forbidden", "coverage-trigger", "must not include unlabeled", [
+        (".github/workflows/coverage.yml", "labeled, edited]", "labeled, edited, unlabeled]", 1)]),
+    ("S02 eligibility concurrency", "coverage-eligibility", "concurrency", [
+        (".github/workflows/coverage.yml", "  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && (github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && github.ref || github.run_id }}", "  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}", 1)]),
+    ("S03 eligibility changes", "coverage-eligibility", "canonical eligibility", [
+        (".github/workflows/coverage.yml", "  changes:\n    if: ${{ github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null) }}\n    name: changes${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", "  changes:\n    if: ${{ github.event_name != 'pull_request' || false || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null) }}\n    name: changes${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", 1)]),
+    ("S04 ignored name changes", "coverage-names", "suffix ignored events", [
+        (".github/workflows/coverage.yml", "    name: changes${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", "    name: changes\n", 1)]),
+    ("S03 eligibility coverage-off", "coverage-eligibility", "canonical eligibility", [
+        (".github/workflows/coverage.yml", "  coverage-off:\n    name: coverage (feature-off)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n    needs: changes\n    # Eligible pull requests measure main, code or uncertain diffs, and the\n    # coverage label. Label additions evaluate only coverage; edits evaluate only\n    # base changes. GITHUB_TOKEN label changes start no workflow.\n    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}\n", "  coverage-off:\n    name: coverage (feature-off)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n    needs: changes\n    # Eligible pull requests measure main, code or uncertain diffs, and the\n    # coverage label. Label additions evaluate only coverage; edits evaluate only\n    # base changes. GITHUB_TOKEN label changes start no workflow.\n    if: ${{ !cancelled() && (github.event_name != 'pull_request' || false || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}\n", 1)]),
+    ("S04 ignored name coverage-off", "coverage-names", "suffix ignored events", [
+        (".github/workflows/coverage.yml", "    name: coverage (feature-off)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", "    name: coverage (feature-off)\n", 1)]),
+    ("S03 eligibility coverage-on", "coverage-eligibility", "canonical eligibility", [
+        (".github/workflows/coverage.yml", "  coverage-on:\n    name: coverage (feature-on)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n    needs: changes\n    # Eligible pull requests measure main, code or uncertain diffs, and the\n    # coverage label. Label additions evaluate only coverage; edits evaluate only\n    # base changes. GITHUB_TOKEN label changes start no workflow.\n    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}\n", "  coverage-on:\n    name: coverage (feature-on)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n    needs: changes\n    # Eligible pull requests measure main, code or uncertain diffs, and the\n    # coverage label. Label additions evaluate only coverage; edits evaluate only\n    # base changes. GITHUB_TOKEN label changes start no workflow.\n    if: ${{ !cancelled() && (github.event_name != 'pull_request' || false || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}\n", 1)]),
+    ("S04 ignored name coverage-on", "coverage-names", "suffix ignored events", [
+        (".github/workflows/coverage.yml", "    name: coverage (feature-on)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", "    name: coverage (feature-on)\n", 1)]),
+    ("S03 eligibility coverage", "coverage-eligibility", "canonical eligibility", [
+        (".github/workflows/coverage.yml", "  coverage:\n    name: coverage${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n    needs: [changes, coverage-off, coverage-on]\n    # always() schedules this job after a failed, cancelled, or skipped\n    # measurement, and step 1 then fails it. Steps 2 and 8 fail it in a step\n    # evaluation that sees the run cancelled. Proven docs-only next changes\n    # skip, unless a pull request carries the coverage label.\n    if: always() && (github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true')\n", "  coverage:\n    name: coverage${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n    needs: [changes, coverage-off, coverage-on]\n    # always() schedules this job after a failed, cancelled, or skipped\n    # measurement, and step 1 then fails it. Steps 2 and 8 fail it in a step\n    # evaluation that sees the run cancelled. Proven docs-only next changes\n    # skip, unless a pull request carries the coverage label.\n    if: always() && (github.event_name != 'pull_request' || false || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true')\n", 1)]),
+    ("S04 ignored name coverage", "coverage-names", "suffix ignored events", [
+        (".github/workflows/coverage.yml", "    name: coverage${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", "    name: coverage\n", 1)]),
+    ("S05 measure main", ("coverage-condition",) * 3,
+     ("coverage-off job runs without the measure condition",
+      "coverage-on job runs without the measure condition",
+      "coverage gate runs without always() and the measure condition"), [
+        (".github/workflows/coverage.yml", "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')", "github.event_name != 'pull_request' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')", 3)]),
+    ("S05 measure uncertain", ("coverage-condition",) * 3,
+     ("coverage-off job runs without the measure condition",
+      "coverage-on job runs without the measure condition",
+      "coverage gate runs without always() and the measure condition"), [
+        (".github/workflows/coverage.yml", "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')", "github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'coverage')", 3)]),
+    ("S05 measure label", ("coverage-condition",) * 3,
+     ("coverage-off job runs without the measure condition",
+      "coverage-on job runs without the measure condition",
+      "coverage gate runs without always() and the measure condition"), [
+        (".github/workflows/coverage.yml", "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')", "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true')", 3)]),
+    ("S06 condition ci.yml Self-test feature discipline and assertions", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test feature discipline and assertions\n        if: needs.changes.outputs.selftest_rust != 'false'\n", "      - name: Self-test feature discipline and assertions\n", 1)]),
+    ("S07 check feature-discipline", "selftest-checks", "check steps must be unconditional", [
+        (".github/workflows/ci.yml", "      - name: Check feature discipline and assertions\n", "      - name: Check feature discipline and assertions\n        if: false\n", 1)]),
+    ("S08 job feature-discipline needs", "selftest-selection", "even on failure", [
+        (".github/workflows/ci.yml", "  feature-discipline:\n    needs: changes\n    if: ${{ !cancelled() }}\n", "  feature-discipline:\n    if: ${{ !cancelled() }}\n", 1)]),
+    ("S08 job feature-discipline failure", "selftest-selection", "even on failure", [
+        (".github/workflows/ci.yml", "  feature-discipline:\n    needs: changes\n    if: ${{ !cancelled() }}\n", "  feature-discipline:\n    needs: changes\n    if: success()\n", 1)]),
+    ("S08 job feature-discipline errors", "selftest-selection", "even on failure", [
+        (".github/workflows/ci.yml", "  feature-discipline:\n    needs: changes\n    if: ${{ !cancelled() }}\n", "  feature-discipline:\n    needs: changes\n    if: ${{ !cancelled() }}\n    continue-on-error: true\n", 1)]),
+    ("S06 condition ci.yml Self-test the publish tier check", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the publish tier check\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the publish tier check\n", 1)]),
+    ("S06 condition ci.yml Self-test the signer-set baseline gate", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the signer-set baseline gate\n        if: needs.changes.outputs.selftest_rust != 'false'\n", "      - name: Self-test the signer-set baseline gate\n", 1)]),
+    ("S06 condition ci.yml Self-test the ref-on-main check", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the ref-on-main check\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the ref-on-main check\n", 1)]),
+    ("S06 condition ci.yml Self-test the testnet acceptance driver", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the testnet acceptance driver\n        if: needs.changes.outputs.selftest_rust != 'false'\n", "      - name: Self-test the testnet acceptance driver\n", 1)]),
+    ("S06 condition ci.yml Self-test the crates.io existence check", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the crates.io existence check\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the crates.io existence check\n", 1)]),
+    ("S06 condition ci.yml Self-test the publish verification", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the publish verification\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the publish verification\n", 1)]),
+    ("S06 condition ci.yml Self-test the crate checksum comparison", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the crate checksum comparison\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the crate checksum comparison\n", 1)]),
+    ("S06 condition ci.yml Self-test the coverage floor gate", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the coverage floor gate\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the coverage floor gate\n", 1)]),
+    ("S06 condition ci.yml Self-test the proof matrix check", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the proof matrix check\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the proof matrix check\n", 1)]),
+    ("S06 condition ci.yml Self-test the docs-only classifier", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the docs-only classifier\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the docs-only classifier\n", 1)]),
+    ("S06 condition ci.yml Self-test the self-test classifier", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the self-test classifier\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the self-test classifier\n", 1)]),
+    ("S06 condition ci.yml Self-test the CI result gate", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the CI result gate\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the CI result gate\n", 1)]),
+    ("S06 condition ci.yml Self-test the documentation read check", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the documentation read check\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the documentation read check\n", 1)]),
+    ("S06 condition ci.yml Self-test the unsigned archive validation", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the unsigned archive validation\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the unsigned archive validation\n", 1)]),
+    ("S06 condition ci.yml Self-test the workflow structure and the label sync", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the workflow structure and the label sync\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the workflow structure and the label sync\n", 1)]),
+    ("S07 check release-contracts", "selftest-checks", "check steps must be unconditional", [
+        (".github/workflows/ci.yml", "      - name: Check the publish tiers\n", "      - name: Check the publish tiers\n        if: false\n", 1)]),
+    ("S08 job release-contracts needs", "selftest-selection", "even on failure", [
+        (".github/workflows/ci.yml", "  release-contracts:\n    needs: changes\n    if: ${{ !cancelled() }}\n", "  release-contracts:\n    if: ${{ !cancelled() }}\n", 1)]),
+    ("S08 job release-contracts failure", "selftest-selection", "even on failure", [
+        (".github/workflows/ci.yml", "  release-contracts:\n    needs: changes\n    if: ${{ !cancelled() }}\n", "  release-contracts:\n    needs: changes\n    if: success()\n", 1)]),
+    ("S08 job release-contracts errors", "selftest-selection", "even on failure", [
+        (".github/workflows/ci.yml", "  release-contracts:\n    needs: changes\n    if: ${{ !cancelled() }}\n", "  release-contracts:\n    needs: changes\n    if: ${{ !cancelled() }}\n    continue-on-error: true\n", 1)]),
+    ("S06 condition install-surface.yml Self-test Python checks on Python 3.13", "selftest-selection", "self-test condition", [
+        (".github/workflows/install-surface.yml", "      - name: Self-test Python checks on Python 3.13\n        if: steps.sel.outputs.selftest_docs != 'false'\n", "      - name: Self-test Python checks on Python 3.13\n", 1)]),
+    ("S06 condition install-surface.yml Self-test the gate tool version check", "selftest-selection", "self-test condition", [
+        (".github/workflows/install-surface.yml", "      - name: Self-test the gate tool version check\n        if: steps.sel.outputs.selftest_docs != 'false'\n", "      - name: Self-test the gate tool version check\n", 1)]),
+    ("S06 condition install-surface.yml Self-test Python checks on Python 3.11", "selftest-selection", "self-test condition", [
+        (".github/workflows/install-surface.yml", "      - name: Self-test Python checks on Python 3.11\n        if: steps.sel.outputs.selftest_docs != 'false'\n", "      - name: Self-test Python checks on Python 3.11\n", 1)]),
+    ("S06 condition install-surface.yml Self-test the preflight", "selftest-selection", "self-test condition", [
+        (".github/workflows/install-surface.yml", "      - name: Self-test the preflight\n        if: steps.sel.outputs.selftest_preflight != 'false'\n", "      - name: Self-test the preflight\n", 1)]),
+    ("S07 check install-surface", "selftest-checks", "check steps must be unconditional", [
+        (".github/workflows/install-surface.yml", "      - name: Check the install surface\n", "      - name: Check the install surface\n        if: false\n", 1)]),
+    ("S09 unknown test", "selftest-selection", "unknown or mixed", [
+        (".github/workflows/ci.yml", "        run: .github/scripts/test-publish-crates-check.sh\n", "        run: .github/scripts/test-unknown.sh\n", 1)]),
+    ("S10 missing test", "selftest-selection", "inventory differs", [
+        (".github/workflows/ci.yml", "        run: .github/scripts/test-publish-crates-check.sh\n", "        run: true\n", 1)]),
+    ("S11 mixed groups", "selftest-selection", "unknown or mixed", [
+        (".github/workflows/ci.yml", "        run: .github/scripts/test-publish-crates-check.sh\n", "        run: |\n          .github/scripts/test-publish-crates-check.sh\n          bash .github/scripts/test-run-testnet-acceptance.sh\n", 1)]),
+    ("S12 mixed check", "selftest-checks", "separate and fail", [
+        (".github/workflows/ci.yml", "        run: .github/scripts/test-publish-crates-check.sh\n", "        run: |\n          .github/scripts/test-publish-crates-check.sh\n          python3 .github/scripts/check-docs-reads.py\n", 1)]),
+    ("S13 selftest errors", "selftest-checks", "separate and fail", [
+        (".github/workflows/ci.yml", "        run: .github/scripts/test-publish-crates-check.sh\n", "        run: .github/scripts/test-publish-crates-check.sh\n        continue-on-error: true\n", 1)]),
+    ("S14 selftest suppression", "selftest-checks", "separate and fail", [
+        (".github/workflows/ci.yml", "        run: .github/scripts/test-publish-crates-check.sh\n", "        run: |\n          set +e\n          .github/scripts/test-publish-crates-check.sh\n", 1)]),
+    ("S15 depth", "selftest-selector", "full checkout", [
+        (".github/workflows/install-surface.yml", "          fetch-depth: 0\n", "          fetch-depth: 1\n", 1)]),
+    ("S15 checkout", "selftest-selector", "full checkout", [
+        (".github/workflows/install-surface.yml", "      - uses: actions/checkout@", "      - uses: invalid/checkout@", 1)]),
+    ("S15 selector id", "selftest-selector", "full checkout", [
+        (".github/workflows/install-surface.yml", "        id: sel\n", "        id: wrong\n", 1)]),
+    ("S15 name", "selftest-selector", "full checkout", [
+        (".github/workflows/install-surface.yml", "      - name: Select self-tests\n", "      - name: ''\n", 1)]),
+    ("S15 selector skip", "selftest-selector", "full checkout", [
+        (".github/workflows/install-surface.yml", "        id: sel\n", "        id: sel\n        if: false\n", 1)]),
+    ("S15 selector error", "selftest-selector", "full checkout", [
+        (".github/workflows/install-surface.yml", "        id: sel\n", "        id: sel\n        continue-on-error: true\n", 1)]),
+    ("S15 env", "selftest-selector", "full checkout", [
+        (".github/workflows/install-surface.yml", "AFTER_SHA: ${{ github.event.after }}", "AFTER_SHA: ${{ github.sha }}", 1)]),
+    ("S15 command", "selftest-selector", "full checkout", [
+        (".github/workflows/install-surface.yml", "        run: python3 .github/scripts/classify-self-tests.py >> \"$GITHUB_OUTPUT\"\n", "        run: true\n", 1)]),
+    ("S16 output scripts", "docs-classifier", "shared environment", [
+        (".github/workflows/ci.yml", "      selftest_scripts: ${{ steps.classify.outputs.selftest_scripts }}\n", "", 1)]),
+    ("S16 output rust", "docs-classifier", "shared environment", [
+        (".github/workflows/ci.yml", "      selftest_rust: ${{ steps.classify.outputs.selftest_rust }}\n", "", 1)]),
+    ("S16 output docs", "docs-classifier", "shared environment", [
+        (".github/workflows/ci.yml", "      selftest_docs: ${{ steps.classify.outputs.selftest_docs }}\n", "", 1)]),
+    ("S16 output preflight", "docs-classifier", "shared environment", [
+        (".github/workflows/ci.yml", "      selftest_preflight: ${{ steps.classify.outputs.selftest_preflight }}\n", "", 1)]),
+    ("S17 classifier command", "docs-classifier", "shared environment", [
+        (".github/workflows/ci.yml", "          python3 .github/scripts/classify-self-tests.py >> \"$GITHUB_OUTPUT\"\n", "", 1)]),
+    ("S18 inverted false", ("selftest-selection",) * 3,
+     ("install-surface: self-test condition must select docs",) * 3, [
+        (".github/workflows/install-surface.yml", "steps.sel.outputs.selftest_docs != 'false'", "steps.sel.outputs.selftest_docs == 'true'", 3)]),
+    ("S19 unknown group", ("selftest-selection",) * 3,
+     ("feature-discipline: self-test condition must select rust",
+      "release-contracts: self-test condition must select rust",
+      "release-contracts: self-test condition must select rust"), [
+        (".github/workflows/ci.yml", "needs.changes.outputs.selftest_rust != 'false'", "needs.changes.outputs.selftest_unknown != 'false'", 3)]),
+])
+
+INSTALL_JOB = live_text(".github/workflows/install-surface.yml", re.compile(
+    r"  install-surface:\n.*", re.DOTALL), "install job")
+INSTALL_CHECKOUT = live_text(".github/workflows/install-surface.yml", re.compile(
+    r"      - uses: actions/checkout@[^\n]+\n        with:\n"
+    r"          fetch-depth: 0\n          persist-credentials: false\n"), "install checkout")
+CASES.extend([
+    ("S20 empty steps", "selftest-selector", "full checkout", [
+        (".github/workflows/install-surface.yml", INSTALL_JOB,
+         "  install-surface:\n    runs-on: ubuntu-24.04\n    steps: []\n", 1)]),
+    ("S21 checkout only", "selftest-selector", "full checkout", [
+        (".github/workflows/install-surface.yml", INSTALL_JOB,
+         "  install-surface:\n    runs-on: ubuntu-24.04\n    steps:\n" + INSTALL_CHECKOUT, 1)]),
+    ("S22 conditional checkout", "selftest-selector", "full checkout", [
+        (".github/workflows/install-surface.yml", INSTALL_CHECKOUT,
+         INSTALL_CHECKOUT + "        if: false\n", 1)]),
+    ("S23 selector order", "selftest-selector", "full checkout", [
+        (".github/workflows/install-surface.yml", INSTALL_CHECKOUT,
+         INSTALL_CHECKOUT + "      - run: true\n", 1)]),
+])
+
+
+# These cases exercise setup steps as well as commands without a script path.
+for workflow, job, check_name in (
+        (CI, "feature-discipline", "Check feature discipline and assertions"),
+        (CI, "release-contracts", "Check the publish tiers"),
+        (".github/workflows/install-surface.yml", "install-surface", "Check the install surface")):
+    marker = f"      - name: {check_name}\n"
+    CASES.append((f"S24 check errors {job}", "selftest-checks", "check steps must be unconditional", [
+        (workflow, marker, marker + "        continue-on-error: true\n", 1)]))
+    job_text = live_text(workflow, re.compile(
+        rf"  {job}:\n.*?(?=\n  [a-z][\w-]*:|\Z)", re.DOTALL), f"{job} setup fixture")
+    setup = re.search(r"      - uses: (?:dtolnay/rust-toolchain|actions/setup-python)@[^\n]+\n", job_text).group()
+    CASES.append((f"S25 setup condition {job}", "selftest-checks", "check steps must be unconditional", [
+        (workflow, job_text, job_text.replace(setup, setup + "        if: false\n", 1), 1)]))
+
+for label, workflow, command, target in (
+        ("actionlint", ".github/workflows/install-surface.yml", "actionlint",
+         "          bash .github/scripts/test-preflight.sh\n"),
+        ("cargo fetch", CI, "cargo fetch --locked",
+         "          bash .github/scripts/test-check-binary-marker.sh\n"),
+        ("script", CI, ".github/scripts/publish-crates.sh --check",
+         "        run: .github/scripts/test-publish-crates-check.sh\n")):
+    replacement = (target + f"          {command}\n" if label != "script" else
+                   "        run: |\n          .github/scripts/test-publish-crates-check.sh\n"
+                   f"          {command}\n")
+    CASES.append((f"S26 moved {label}", "selftest-checks", "separate and fail", [
+        (workflow, f"        run: {command}\n", "        run: true\n", 1),
+        (workflow, target, replacement, 1)]))
+
+CASES.append(("S27 archive name in another job", "selftest-checks", "check steps must be unconditional", [
+    (".github/workflows/install-surface.yml", "      - name: Check the install surface\n",
+     "      - name: Check the skill archive\n" + SKILL_ARCHIVE_IF, 1)]))
+PASSING.append(("S28 unknown registry group rejected", []))
+
 MUTATIONS = {
     "wallet-toolchain": ("        self.check_wallet_toolchain()\n", "",
                          [label for label, _, _ in WALLET_TOOLCHAIN_CASES]),
@@ -2269,16 +2466,16 @@ MUTATIONS = {
         'if self.run_text(step) != ".github/scripts/package-skill.sh --check":',
         ['skill archive block run passes']),
     "skill-archive-shell": (
-        ' or shell not in (None, "bash"):', ':',
+        ' or shell not in (None, "bash")):', '):',
         ['skill archive step shell bypass', 'skill archive job shell bypass',
          'skill archive workflow shell bypass']),
     "skill-archive-job-skip": (
-        'if self.may_skip(job) or "continue-on-error" in step or shell not in (None, "bash"):',
-        'if "continue-on-error" in step or shell not in (None, "bash"):',
+        'self.unwrap_expression(str(job.get("if", ""))) != "!cancelled()"\n                or job.get("needs") not in ("changes", ["changes"])',
+        'False',
         ['skill archive job skipped']),
     "skill-archive-step-error": (
-        'if self.may_skip(job) or "continue-on-error" in step or shell not in (None, "bash"):',
-        'if self.may_skip(job) or shell not in (None, "bash"):',
+        'or "continue-on-error" in step or shell not in (None, "bash")):',
+        'or shell not in (None, "bash")):',
         ['skill archive continues on error']),
     "skill-archive-unwrap": (
         'if self.unwrap_expression(step.get("if", "")) != SKILL_ARCHIVE_CONDITION:',
@@ -2390,9 +2587,11 @@ MUTATIONS = {
     "coverage-gate-unwrap": (
         "gate_condition = self.unwrap_expression(gate_condition)", "gate_condition = gate_condition",
         ["coverage gate condition wrapped in ${{ }} passes"]),
-    "coverage-gate-name": ('if gate.get("name") != COVERAGE_GATE:', "if False:", ["coverage gate renamed"]),
+    "coverage-gate-name": ('if job.get("name") != title + COVERAGE_SUFFIX:', "if False:",
+                           ["coverage gate renamed"] + [f"S04 ignored name {job}"
+                            for job in ("changes", "coverage-off", "coverage-on", "coverage")]),
     "coverage-part-condition": (
-        "if condition != COVERAGE_CONDITION:", "if False:", ["coverage-on without the label condition"]),
+        "if condition != COVERAGE_CONDITION:", "if False:", ["coverage-on without the measure condition"]),
     "coverage-part-presence": (
         'self.report(workflow, "coverage-condition", f"job {name} not found")', "pass", ["coverage-off job removed"]),
     "coverage-split-owner": ("elif name != owner:", "elif False:", ["feature-off measurement also in coverage-on"]),
@@ -2520,10 +2719,10 @@ MUTATIONS = {
     "coverage-feature-on-pin": (
         '    (COVERAGE_WORKFLOW, "coverage-on"): (COVERAGE_CONDITION, (COVERAGE_ON_COMMAND,)),\n', "",
         ["feature-on measurement without mainnet-write"]),
-    "coverage-trigger-unlabeled": (
-        'COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled", "unlabeled")',
+    "coverage-trigger-edited": (
+        'COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled", "edited")',
         'COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled")',
-        ["coverage pull_request trigger without unlabeled"]),
+        ["coverage pull_request trigger without edited"]),
     "coverage-attempt-name": (
         'if inputs.get("name") not in names:', "if False:",
         ["coverage upload with a fixed name", "coverage download with a fixed name",
@@ -2571,6 +2770,110 @@ COUNT_CASES = [
 ]
 
 
+MUTATIONS.update({
+    "S-unlabeled": (
+        "if \"unlabeled\" in types:", "if False:",
+        ["S01 unlabeled is forbidden"]),
+    "S-eligibility-concurrency": (
+        "if (doc.get(\"concurrency\") or {}).get(\"group\") != COVERAGE_GROUP:", "if False:",
+        ["S02 eligibility concurrency"]),
+    "S-eligibility-conditions": (
+        "if (condition != expected if name == \"changes\" else condition.count(expected) != 1):", "if False:",
+        ["S03 eligibility changes","S03 eligibility coverage-off","S03 eligibility coverage-on","S03 eligibility coverage"]),
+    "S-selection-jobs": (
+        "self.report(workflow, \"selftest-selection\", f\"{name} must run after changes even on failure\")", "pass",
+        ["S08 job feature-discipline needs","S08 job release-contracts failure","S08 job release-contracts errors"]),
+    "S-checks": (
+        "self.report(workflow, \"selftest-checks\", f\"{name}: check steps must be unconditional\")", "pass",
+        ["S07 check feature-discipline","S07 check release-contracts","S07 check install-surface"]),
+    "S-groups": (
+        "if len(groups) != 1 or not groups.issubset(SELFTEST_GROUPS):", "if False:",
+        ["S09 unknown test","S11 mixed groups"]),
+    "S-conditions": (
+        "if step.get(\"if\") != f\"{prefix}.outputs.selftest_{group} != 'false'\":", "if False:",
+        ["S06 condition ci.yml Self-test feature discipline and assertions","S06 condition ci.yml Self-test the publish tier check","S06 condition install-surface.yml Self-test the preflight","S18 inverted false","S19 unknown group"]),
+    "S-mixed": (
+        "self.report(workflow, \"selftest-checks\", f\"{name}: self-tests must be separate and fail on errors\")", "pass",
+        ["S12 mixed check","S13 selftest errors","S14 selftest suppression"]),
+    "S-inventory": (
+        "if seen != set(commands):", "if False:",
+        ["S10 missing test"]),
+    "S-selector": (
+        "self.report(workflow, \"selftest-selector\", \"full checkout must immediately precede the named selector\")", "pass",
+        ["S15 depth","S15 checkout","S15 selector id","S15 name","S15 selector skip","S15 selector error","S15 env","S15 command"]),
+    "S-output": (
+        "or job.get(\"outputs\") != outputs):", "): ",
+        ["S16 output scripts","S16 output rust","S16 output docs","S16 output preflight"]),
+})
+
+
+MUTATIONS["S-selector"][2].extend(["S20 empty steps", "S21 checkout only", "S22 conditional checkout", "S23 selector order"])
+MUTATIONS.update({
+    "S-empty-steps": ("checkout = steps[0] if steps else {}", "checkout = steps[0]", ["S20 empty steps"]),
+    "S-short-steps": ("selector = steps[1] if len(steps) > 1 else {}", "selector = steps[1]", ["S21 checkout only"]),
+})
+
+
+MEASURE = ("github.event_name != 'pull_request' || github.base_ref == 'main' || "
+           "!(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || "
+           "contains(github.event.pull_request.labels.*.name, 'coverage')")
+for name, clause in (
+        ("main", "github.base_ref == 'main' || "),
+        ("uncertain", "!(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || "),
+        ("label", " || contains(github.event.pull_request.labels.*.name, 'coverage')")):
+    MUTATIONS[f"S-measure-{name}"] = (
+        f'COVERAGE_LABEL = "{MEASURE}"', f'COVERAGE_LABEL = "{MEASURE.replace(clause, "")}"',
+        [f"S05 measure {name}"])
+MUTATIONS.update({
+    "S-inverted-false": (
+        "if step.get(\"if\") != f\"{prefix}.outputs.selftest_{group} != 'false'\":",
+        "if step.get(\"if\") != f\"{prefix}.outputs.selftest_{group} == 'true'\":",
+        ["S18 inverted false"]),
+    "S-classifier-command": (
+        "                command += '\\npython3 .github/scripts/classify-self-tests.py >> \"$GITHUB_OUTPUT\"'\n",
+        "", ["S17 classifier command"]),
+    "S-known-groups": (
+        "not groups.issubset(SELFTEST_GROUPS)", "None in groups", ["S28 unknown registry group rejected"]),
+    "S-check-may-skip": (
+        "if self.may_skip(step) and not archive:", 'if "if" in step and "run" in step and not archive:',
+        [f"S{number} {kind} {job}" for number, kind in ((24, "check errors"), (25, "setup condition"))
+         for job in ("feature-discipline", "release-contracts", "install-surface")]),
+    "S-mixed-commands": (
+        "any(line not in tests", 'any(".github/scripts/" in line and line not in tests',
+        ["S26 moved actionlint", "S26 moved cargo fetch"]),
+    "S-archive-owner": (
+        'archive = (owner == "ci.yml:release-contracts"\n                               and step.get("name") == "Check the skill archive")',
+        'archive = (step.get("name") == "Check the skill archive")',
+        ["S27 archive name in another job"]),
+    "S-archive-exception": (
+        "if self.may_skip(step) and not archive:", "if self.may_skip(step):",
+        ["wrapped skill archive condition passes"]),
+})
+MUTATIONS["S-mixed"][2].extend(["S26 moved actionlint", "S26 moved cargo fetch", "S26 moved script"])
+
+
+def registry_group_problems(script):
+    """A registry typo must fail even when the step selects the same unknown group."""
+    import types
+    checker = types.ModuleType("workflow_checker")
+    exec(compile(script.read_text(), str(script), "exec"), checker.__dict__)
+    instance = checker.Checker(ROOT)
+    for workflow in ("ci.yml", "install-surface.yml"):
+        instance.docs[workflow] = instance.load(pathlib.Path(".github/workflows") / workflow)
+    commands = checker.SELFTESTS["install-surface.yml:install-surface"]
+    for command, group in commands.items():
+        if group == "docs":
+            commands[command] = "unknown"
+    for step in instance.docs["install-surface.yml"]["jobs"]["install-surface"]["steps"]:
+        if step.get("if") == "steps.sel.outputs.selftest_docs != 'false'":
+            step["if"] = "steps.sel.outputs.selftest_unknown != 'false'"
+    instance.check_selftest_selection()
+    expected = "install-surface.yml: selftest-selection: install-surface: unknown or mixed self-test group"
+    if instance.violations != [expected] * 3:
+        return [f"unknown registry group: {instance.violations}, expected three group refusals"]
+    return []
+
+
 def copy_tree(destination):
     shutil.copytree(ROOT / ".github", destination / ".github")
     shutil.copy2(ROOT / "rust-toolchain.toml", destination / "rust-toolchain.toml")
@@ -2593,6 +2896,8 @@ def entry_problems(root, label, script=SCRIPT):
     entry with this label, runs script and returns its problems."""
     if label in CHANGELOG_VARIANTS:
         return changelog_group(label, script)
+    if label == "S28 unknown registry group rejected":
+        return registry_group_problems(script)
     copy_tree(root)
     try:
         passing = dict(PASSING)
@@ -2645,7 +2950,7 @@ def changelog_group(label, script):
             if text.count(old) != expected:
                 problems.append(f"{label}: replacement count differs for {old!r}")
                 continue
-            texts[path] = text.replace(old, new, 1)
+            texts[path] = text.replace(old, new)
             yaml.safe_load(texts[path])
         load = checker.Checker.load
         documents = {path: yaml.safe_load(text) for path, text in texts.items()}
@@ -2687,6 +2992,8 @@ def mutation_failures(tmp, selected):
             ast.parse(text)
             path.write_text(text)
             path.touch()
+            if phase == "control":
+                assert hashlib.md5(path.read_bytes()).digest() == hashlib.md5(source.encode()).digest(), "restore differs"
             for label in labels:
                 problems = entry_problems(pathlib.Path(tmp) / "mutant", label, path)
                 if phase == "mutation" and not problems:
@@ -2717,7 +3024,7 @@ def apply_edits(root, edits):
         if count != expected:
             problems.append(f"{relative}: replacement text found {count} times, expected {expected}")
             continue
-        path.write_text(text.replace(old, new, 1))
+        path.write_text(text.replace(old, new))
     return problems
 
 
@@ -2762,6 +3069,66 @@ def case_problems(output, case):
     return problems
 
 
+def coverage_behavior():
+    """Evaluate the actual expressions against an independent event table."""
+    import itertools
+    import yaml
+    doc = yaml.safe_load((ROOT / COVERAGE).read_text())
+    problems = []
+    compiled = {}
+
+    def evaluate(expression, values, cancelled):
+        expression = expression.strip().removeprefix("${{").removesuffix("}}").strip()
+
+        def token(match):
+            word = match.group()
+            if word.startswith("'"):
+                return word
+            if word in values:
+                return f"values[{word!r}]"
+            return {"&&": " and ", "||": " or ", "!": " not ", "null": "None"}.get(word, word)
+
+        if expression not in compiled:
+            source = re.sub(r"'[^']*'|[\w.*]+|&&|\|\||!=|!", token, expression)
+            compiled[expression] = compile(source.strip(), "<coverage expression>", "eval")
+        return eval(compiled[expression], {"__builtins__": {}}, {"values": values, "cancelled": lambda: cancelled,
+                    "always": lambda: True, "contains": lambda values, value: value in values})
+
+    def render(template, values, cancelled):
+        return re.sub(r"\$\{\{(.*?)\}\}", lambda match: str(evaluate(match.group(1), values, cancelled)), template)
+
+    for event, action, base, docs, result, event_label, pr_labels, changed, cancelled in itertools.product(
+            ("pull_request", "push", "schedule", "workflow_dispatch"),
+            ("opened", "synchronize", "reopened", "labeled", "edited", "unlabeled"),
+            ("main", "next"), ("true", "false", ""), ("success", "failure", "skipped"),
+            ("coverage", "other"), ((), ("other",), ("coverage",), ("other", "coverage")),
+            (False, True), (False, True)):
+        if event != "pull_request" and base == "main" and docs == "true":
+            continue  # The classifier cannot prove main docs-only.
+        eligible = (event != "pull_request" or action in ("opened", "synchronize", "reopened")
+                    or (action == "labeled" and event_label == "coverage") or (action == "edited" and changed))
+        proven = result == "success" and docs == "true"
+        measure = eligible and (event != "pull_request" or base == "main" or not proven or "coverage" in pr_labels)
+        measure = measure and not (event == "push" and proven)
+        values = {"github.event_name": event, "github.event.action": action, "github.base_ref": base,
+                  "github.event.label.name": event_label, "github.event.changes.base": {} if changed else None,
+                  "github.event.pull_request.labels.*.name": pr_labels, "needs.changes.result": result,
+                  "needs.changes.outputs.docs_only": docs, "github.workflow": "Coverage",
+                  "github.ref": "refs/pull/1/merge", "github.run_id": 123}
+        for job_id, title in (("changes", "changes"), ("coverage-off", "coverage (feature-off)"),
+                              ("coverage-on", "coverage (feature-on)"), ("coverage", "coverage")):
+            job = doc["jobs"][job_id]
+            expected = eligible if job_id == "changes" else measure and (job_id == "coverage" or not cancelled)
+            if bool(evaluate(job["if"], values, cancelled)) != expected:
+                problems.append(f"{job_id}: eligibility/measurement differs: {values}, cancelled={cancelled}")
+            if render(job["name"], values, cancelled) != title + ("" if eligible else " (ignored event)"):
+                problems.append(f"{job_id}: ignored name differs: {values}")
+        group = "refs/pull/1/merge" if event == "pull_request" and eligible else "123"
+        if render(doc["concurrency"]["group"], values, cancelled) != "Coverage-" + group:
+            problems.append(f"coverage concurrency differs: {values}")
+    return problems
+
+
 def main():
     selected = None
     if len(sys.argv) == 3 and sys.argv[1] == '--case':
@@ -2771,7 +3138,7 @@ def main():
             return 2
     elif len(sys.argv) != 1:
         return 2
-    failures = []
+    failures = coverage_behavior()
     for label, output, exact_count, expected in COUNT_CASES:
         problem = violation_count_problem(output, exact_count)
         if problem != expected:

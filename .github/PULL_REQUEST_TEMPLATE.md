@@ -31,8 +31,9 @@ table here. Also list issue-specific acceptance commands and their exit codes.
 including coverage. Local coverage, machete, and deny are optional reproductions.
 CI runs the offline gates on every pull request; a docs-only pull request into
 `next` runs the reduced set that `docs/maintainers/building.md`
-describes. Pull-request coverage requires the `coverage` label; live
-acceptance uses its separate workflow.
+describes. Coverage runs automatically on every pull request into `main` and
+on code pull requests into `next`; the `coverage` label adds a run on a docs-only
+one. Live acceptance uses its separate workflow.
 -->
 
 -

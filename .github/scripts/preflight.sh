@@ -123,10 +123,10 @@ changelog	python3 .github/scripts/changelog.py check	-	changelog.yml	changelog	C
 self-test:test-changelog.py	python3 .github/scripts/test-changelog.py	-	changelog.yml	changelog	Test changelog fragments
 actionlint	actionlint	actionlint	install-surface.yml	install-surface	Check workflows
 feature-discipline	cargo fetch --locked && python3 .github/scripts/check-feature-discipline.py	cargo,yaml	ci.yml	feature-discipline	Check feature discipline and assertions
-self-test:test-check-feature-discipline.py	python3 .github/scripts/test-check-feature-discipline.py --mutations	cargo,yaml	ci.yml	feature-discipline	Check feature discipline and assertions
-self-test:test-check-binary-marker.sh	bash .github/scripts/test-check-binary-marker.sh	-	ci.yml	feature-discipline	Check feature discipline and assertions
-self-test:test-release-checks.sh	bash .github/scripts/test-release-checks.sh	-	ci.yml	feature-discipline	Check feature discipline and assertions
-self-test:test-check-provenance.py	python3 .github/scripts/test-check-provenance.py --mutations	-	ci.yml	feature-discipline	Check feature discipline and assertions
+self-test:test-check-feature-discipline.py	python3 .github/scripts/test-check-feature-discipline.py --mutations	cargo,yaml	ci.yml	feature-discipline	Self-test feature discipline and assertions
+self-test:test-check-binary-marker.sh	bash .github/scripts/test-check-binary-marker.sh	-	ci.yml	feature-discipline	Self-test feature discipline and assertions
+self-test:test-release-checks.sh	bash .github/scripts/test-release-checks.sh	-	ci.yml	feature-discipline	Self-test feature discipline and assertions
+self-test:test-check-provenance.py	python3 .github/scripts/test-check-provenance.py --mutations	-	ci.yml	feature-discipline	Self-test feature discipline and assertions
 workflow-invariants	python3 .github/scripts/check-workflow-invariants.py	yaml	ci.yml	release-contracts	Check the workflow structure and the label sync
 self-test:test-check-coverage.py	python3 .github/scripts/test-check-coverage.py	-	ci.yml	release-contracts	Self-test the coverage floor gate
 self-test:test-check-crates-exist.sh	bash .github/scripts/test-check-crates-exist.sh	jq	ci.yml	release-contracts	Self-test the crates.io existence check
@@ -137,8 +137,9 @@ self-test:test-check-install-surface.py	python3 .github/scripts/test-check-insta
 self-test:test-check-no-direct-sasignersetbaselined-emit.sh	bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh	-	ci.yml	release-contracts	Self-test the signer-set baseline gate
 self-test:test-check-proof-matrix.py	python3 .github/scripts/test-check-proof-matrix.py	-	ci.yml	release-contracts	Self-test the proof matrix check
 self-test:test-check-ref-on-main.sh	bash .github/scripts/test-check-ref-on-main.sh	-	ci.yml	release-contracts	Self-test the ref-on-main check
-self-test:test-check-workflow-invariants.py	python3 .github/scripts/test-check-workflow-invariants.py	yaml	ci.yml	release-contracts	Check the workflow structure and the label sync
+self-test:test-check-workflow-invariants.py	python3 .github/scripts/test-check-workflow-invariants.py	yaml	ci.yml	release-contracts	Self-test the workflow structure and the label sync
 self-test:test-classify-docs-only.py	python3 .github/scripts/test-classify-docs-only.py	-	ci.yml	release-contracts	Self-test the docs-only classifier
+self-test:test-classify-self-tests.py	python3 .github/scripts/test-classify-self-tests.py	-	ci.yml	release-contracts	Self-test the self-test classifier
 self-test:test-ci-result.py	python3 .github/scripts/test-ci-result.py	-	ci.yml	release-contracts	Self-test the CI result gate
 self-test:test-compare-crate-sums.py	python3 .github/scripts/test-compare-crate-sums.py	-	ci.yml	release-contracts	Self-test the crate checksum comparison
 self-test:test-preflight.sh	bash .github/scripts/test-preflight.sh	-	install-surface.yml	install-surface	Self-test the preflight
@@ -146,11 +147,11 @@ self-test:test-publish-crates-check.sh	.github/scripts/test-publish-crates-check
 self-test:test-publish-crates-verify.sh	bash .github/scripts/test-publish-crates-verify.sh	cargo	ci.yml	release-contracts	Self-test the publish verification
 self-test:test-rebuild-vendored-wasm.sh	bash .github/scripts/test-rebuild-vendored-wasm.sh	shasum	vendored-wasm.yml	check	Self-test (bash 5, GNU tools)
 self-test:test-run-testnet-acceptance.sh	bash .github/scripts/test-run-testnet-acceptance.sh	-	ci.yml	release-contracts	Self-test the testnet acceptance driver
-self-test:test-sync-labels.py	python3 .github/scripts/test-sync-labels.py	yaml	ci.yml	release-contracts	Check the workflow structure and the label sync
-self-test:test-take-workflow.py	python3 .github/scripts/test-take-workflow.py	yaml,jq	ci.yml	release-contracts	Check the workflow structure and the label sync
-self-test:test-triage-workflow.py	python3 .github/scripts/test-triage-workflow.py	yaml,jq	ci.yml	release-contracts	Check the workflow structure and the label sync
+self-test:test-sync-labels.py	python3 .github/scripts/test-sync-labels.py	yaml	ci.yml	release-contracts	Self-test the workflow structure and the label sync
+self-test:test-take-workflow.py	python3 .github/scripts/test-take-workflow.py	yaml,jq	ci.yml	release-contracts	Self-test the workflow structure and the label sync
+self-test:test-triage-workflow.py	python3 .github/scripts/test-triage-workflow.py	yaml,jq	ci.yml	release-contracts	Self-test the workflow structure and the label sync
 self-test:test-validate-unsigned-archive.py	python3 .github/scripts/test-validate-unsigned-archive.py	-	ci.yml	release-contracts	Self-test the unsigned archive validation
-self-test:test-welcome-workflow.py	python3 .github/scripts/test-welcome-workflow.py	jq	ci.yml	release-contracts	Check the workflow structure and the label sync
+self-test:test-welcome-workflow.py	python3 .github/scripts/test-welcome-workflow.py	jq	ci.yml	release-contracts	Self-test the workflow structure and the label sync
 shellcheck-preflight	shellcheck -s bash .github/scripts/preflight.sh .github/scripts/test-preflight.sh	shellcheck	install-surface.yml	install-surface	Shellcheck the preflight
 shellcheck-changed	shellcheck -s bash	shellcheck	-	-	-
 deploy-shellcheck	shellcheck -s bash scripts/deploy/bootstrap.sh scripts/deploy/mcp-launch scripts/deploy/cli-launch scripts/deploy/provision scripts/deploy/validate-macos.sh scripts/deploy/validate-linux.sh scripts/deploy/test-deploy.sh	shellcheck	ci.yml	deploy-scripts	Shellcheck the deployment scripts
@@ -344,6 +345,10 @@ select_self_tests() {
     .github/scripts/check-proof-matrix.py) select_gate self-test:test-check-proof-matrix.py ;;
     .github/scripts/check-ref-on-main.sh) select_gate self-test:test-check-ref-on-main.sh ;;
     .github/scripts/classify-docs-only.py) select_gate self-test:test-classify-docs-only.py ;;
+    .github/scripts/classify-self-tests.py) select_gate self-test:test-classify-self-tests.py ;;
+    .github/scripts/changed_paths.py)
+      select_gate self-test:test-classify-docs-only.py
+      select_gate self-test:test-classify-self-tests.py ;;
     .github/scripts/ci-result.py) select_gate self-test:test-ci-result.py ;;
     .github/scripts/docs_paths.py)
       select_gate self-test:test-classify-docs-only.py

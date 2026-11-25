@@ -36,7 +36,10 @@ in these steps from the checkout root.
    CI runs the offline gates on every pull request; a docs-only pull request
    into `next` runs the reduced set that
    [docs/maintainers/building.md](../../docs/maintainers/building.md) describes.
-   Pull-request coverage requires the `coverage` label; live acceptance uses its separate workflow.
+   Coverage runs automatically on every pull request into `main` and every code
+   pull request into `next`; the `coverage` label adds a run on a docs-only one.
+   Self-tests run when their inputs change, and always on `main`.
+   Live acceptance uses its separate workflow.
    Follow [docs/maintainers/building.md](../../docs/maintainers/building.md#preflight)
    for the gates, and record each exit code and unavailable gate.
 6. Complete the self-review in
