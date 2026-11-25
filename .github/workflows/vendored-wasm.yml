@@ -14,8 +14,9 @@ name: vendored-wasm
 # runs build both stellar-cli binaries from source. The rebuild reads the
 # install roots from this run's artifacts. No job or step continues on an
 # error, and no step of the check, rebuild, or vendored-wasm job suppresses a
-# failure, so the release's signing, provenance, and publication jobs and the
-# crate publish job see every failed check of this workflow.
+# failure. The release's Apple signing and notarization, hashing, cosign
+# signing, provenance, and publication jobs and the crate publish job therefore
+# see every failed check of this workflow.
 #
 # A newer push to a pull request cancels that pull request's older run. Every
 # main, tag, scheduled, and dispatched run has a concurrency group of its own.

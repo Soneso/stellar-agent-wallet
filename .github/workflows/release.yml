@@ -6,9 +6,9 @@ name: Release
 # SHA256SUMS, cosign keyless signatures, SLSA provenance, and a GitHub
 # Release. The release restores and saves no cache, so every build compiles
 # from the locked sources. The vendored-wasm job rebuilds the vendored
-# contract Wasm files of the tagged commit; the hashes job needs it, so the
-# cosign signatures, the provenance, and the publication wait for that
-# rebuild to pass.
+# contract Wasm files of the tagged commit. sign-macos, hashes, and publish
+# need it, so Apple signing and notarization, hashing, cosign signatures,
+# provenance, and publication wait for that rebuild to pass.
 #
 # The per-push CI workflow gates fmt, clippy, tests, and licenses/advisories
 # on every commit that reaches main. The preflight refuses a tag whose commit
@@ -163,8 +163,9 @@ jobs:
 
   # Rebuilds every vendored contract Wasm file of the tagged commit from its
   # pinned source and compares the bytes. On a tag the called workflow's gate
-  # passes only after that rebuild. hashes and publish need this job, so
-  # signing, provenance, and publication wait for the rebuild.
+  # passes only after that rebuild. sign-macos, hashes, and publish need this
+  # job, so Apple signing and notarization, hashing, cosign signing,
+  # provenance, and publication wait for the rebuild.
   vendored-wasm:
     name: vendored-wasm
     needs: preflight
@@ -317,7 +318,7 @@ jobs:
   # signs, notarizes, and packs the archive with tools at absolute paths.
   sign-macos:
     name: sign ${{ matrix.target }}
-    needs: [preflight, build]
+    needs: [preflight, vendored-wasm, build]
     runs-on: macos-26
     timeout-minutes: 60
     # The release-signing environment holds the Apple signing and notarization

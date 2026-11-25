@@ -211,9 +211,11 @@ runs the function.
   in any letter case, or passes a ``cache`` input to an ``actions/setup-*``
   action.
 - ``release-wasm-gate``: the release lacks an unconditional local
-  ``vendored-wasm`` workflow call without inputs or secrets, or ``hashes``
-  or ``publish`` does not need it, so signing, provenance, and publication
-  wait for the rebuild. The called workflow must declare ``workflow_call``.
+  ``vendored-wasm`` workflow call without inputs or secrets, or ``sign-macos``,
+  ``hashes``, or ``publish`` does not need it, or ``sign-macos`` sets ``if``
+  or ``continue-on-error``. Apple signing and notarization, hashing, cosign
+  signing, provenance, and publication therefore wait for the rebuild. The
+  called workflow must declare ``workflow_call``.
   Its cache guards must lead with
   ``github.ref_type != 'tag' && !inputs.publication``. Each cache step
   restores, or saves exactly on ``WASM_SAVE_CONDITION``, so only push and
@@ -1720,6 +1722,12 @@ class Checker:
         if job.get("uses") != "./.github/workflows/vendored-wasm.yml" or any(
                 key in job for key in ("if", "with", "secrets", "continue-on-error")):
             self.report("release.yml", rule, "vendored-wasm must call the local workflow unconditionally without inputs or secrets")
+        self.needs("release.yml", "sign-macos", "vendored-wasm", rule)
+        sign_macos = self.job("release.yml", "sign-macos") or {}
+        if "if" in sign_macos:
+            self.report("release.yml", rule, "sign-macos must not set if")
+        if "continue-on-error" in sign_macos:
+            self.report("release.yml", rule, "sign-macos must not set continue-on-error")
         self.needs("release.yml", "hashes", "vendored-wasm", rule)
         self.needs("release.yml", "publish", "vendored-wasm", rule)
         workflow = "vendored-wasm.yml"

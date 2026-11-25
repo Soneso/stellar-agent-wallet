@@ -1,0 +1,1 @@
+- Release signing and notarization of the macOS binaries start only after the vendored Wasm rebuild of the tagged commit passed.
