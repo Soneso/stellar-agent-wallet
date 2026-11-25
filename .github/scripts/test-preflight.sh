@@ -52,7 +52,7 @@ REAL_PYTHON=$(python3 -c 'import sys; print(sys.executable)')
 FIXTURE="$TMP/fixture"
 
 CASES="changelog-fragments changelog-selection changelog-registry docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
-release-rehearsal-workflow vendored-wasm-workflow
+release-rehearsal-workflow vendored-wasm-workflow unlisted-workflow yaml-workflow
 triage-workflow triage-review-workflow triage-sweep-workflow
 ci-yml-only python-check-script proof-matrix-only shell-check-script testnet-driver-script deploy-scripts deploy-scripts-run skill inbox-web enroll-web bridge-web one-crate sep43-through-mcp two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
@@ -999,12 +999,14 @@ case_changelog_selection() {
   start_case
   edit .github/scripts/changelog.py
   expect_list "${ALWAYS[@]}" changelog self-test:test-changelog.py \
-    feature-discipline self-test:test-check-feature-discipline.py workflow-invariants self-test:test-check-workflow-invariants.py
+    feature-discipline self-test:test-check-feature-discipline.py
+  git checkout -q -- .github/scripts/changelog.py
   edit .github/scripts/test-changelog.py
   expect_list "${ALWAYS[@]}" changelog self-test:test-changelog.py \
-    feature-discipline self-test:test-check-feature-discipline.py workflow-invariants self-test:test-check-workflow-invariants.py
+    feature-discipline self-test:test-check-feature-discipline.py
+  git checkout -q -- .github/scripts/test-changelog.py
   edit .github/workflows/changelog.yml
-  expect_list "${ALWAYS[@]}" changelog self-test:test-changelog.py actionlint \
+  expect_list "${ALWAYS[@]}" actionlint \
     feature-discipline self-test:test-check-feature-discipline.py workflow-invariants self-test:test-check-workflow-invariants.py
 }
 
@@ -1155,6 +1157,20 @@ case_ci_yml_only() {
   start_case
   edit .github/workflows/ci.yml
   expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py
+}
+
+case_unlisted_workflow() {
+  start_case
+  edit .github/workflows/sbom.yml
+  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py \
+    feature-discipline self-test:test-check-feature-discipline.py
+}
+
+case_yaml_workflow() {
+  start_case
+  edit .github/workflows/extra.yaml
+  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py \
+    feature-discipline self-test:test-check-feature-discipline.py
 }
 
 case_python_check_script() {
@@ -1333,7 +1349,7 @@ case_toolchain() {
   start_case
   edit rust-toolchain.toml
   expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-support-friendbot test-vendored-release-cfg \
-    test-policy-pin-release-cfg
+    test-policy-pin-release-cfg workflow-invariants self-test:test-check-workflow-invariants.py
 }
 
 case_unowned_rust_path() {
@@ -1991,8 +2007,8 @@ apply_mutation() {
       replace_line "$file" '    changelog.d/* | .github/scripts/changelog.py | .github/scripts/test-changelog.py) select_gate changelog ;;' \
         '    .github/scripts/changelog.py | .github/scripts/test-changelog.py) select_gate changelog ;;' ;;
     changelog-workflow)
-      replace_line "$file" 'INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm changelog testnet install-surface take"' \
-        'INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm testnet install-surface take"' ;;
+      replace_line "$file" '    rust-toolchain.toml | .github/actions/* | .github/workflows/*.yml | .github/workflows/*.yaml) select_invariant_gates ;;' \
+        '    rust-toolchain.toml | .github/actions/* | .github/workflows/*.yaml) select_invariant_gates ;;' ;;
     changelog-registry)
       replace_line "$file" $'changelog\tpython3 .github/scripts/changelog.py check\t-\tchangelog.yml\tchangelog\tCheck changelog fragments' \
         $'changelog\tpython3 .github/scripts/changelog.py check\t-\tchangelog.yml\tchangelog\tCheck fragment entries' ;;

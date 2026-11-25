@@ -370,7 +370,7 @@ REHEARSAL_PIN_STEP = (
 )
 RELEASE_WORKFLOW_ENV = ('env:\n  EXPECTED_MAINNET_WRITE: "on"\n'
                         "  # The toolchain publish.yml packages with; every build leg compiles with it.\n"
-                        '  RELEASE_TOOLCHAIN: "1.99.0"\n')
+                        '  RELEASE_TOOLCHAIN: "1.100.0"\n')
 REHEARSAL_MARKER_RUN = ('        run: bash .github/scripts/check-packaged-markers.sh target '
                         'target/package-verification-start "$EXPECTED_MAINNET_WRITE"\n')
 # The defining command of each feature job of ci.yml, as its run: line.
@@ -997,7 +997,7 @@ CASES = [
         (WASM, "          name: vendored-wasm-stellar-cli-25\n          path: ${{ runner.temp }}/stellar-cli-artifacts",
          "          name: another-artifact\n          path: ${{ runner.temp }}/stellar-cli-artifacts", 1)]),
     ("release toolchain differs", "release-toolchain", "RELEASE_TOOLCHAIN differs from publish.yml", [
-        (RELEASE, '  RELEASE_TOOLCHAIN: "1.99.0"\n', '  RELEASE_TOOLCHAIN: "1.98.0"\n', 1)]),
+        (RELEASE, '  RELEASE_TOOLCHAIN: "1.100.0"\n', '  RELEASE_TOOLCHAIN: "1.98.0"\n', 1)]),
     ("release build on stable", "release-toolchain", "it installs another toolchain", [
         (RELEASE, BUILD_TOOLCHAIN, BUILD_TOOLCHAIN.replace("${{ env.RELEASE_TOOLCHAIN }}", "stable"), 1)]),
     ("release build without toolchain pin", "release-toolchain", "it does not pin RUSTUP_TOOLCHAIN", [
@@ -1214,8 +1214,8 @@ CASES = [
          "    environment: crates-io\n    env:\n      TAG: ${{ inputs.tag }}\n", 1)]),
     ("publish workflow maps the tag input into its workflow env", "cred-env-validation",
      "publish.yml:publish: cred-env-validation: workflow env TAG_RAW reads ${{ inputs.tag }}", [
-        (PUBLISH, '  RELEASE_TOOLCHAIN: "1.99.0"\n',
-         '  RELEASE_TOOLCHAIN: "1.99.0"\n  TAG_RAW: ${{ inputs.tag }}\n', 1)]),
+        (PUBLISH, '  RELEASE_TOOLCHAIN: "1.100.0"\n',
+         '  RELEASE_TOOLCHAIN: "1.100.0"\n  TAG_RAW: ${{ inputs.tag }}\n', 1)]),
     ("release signing job without the archive validation", "credential-order",
      "release.yml:sign-macos: credential-order: no step before ./.github/actions/macos-sign-notarize "
      "runs validate-input.sh", [
@@ -1831,7 +1831,7 @@ CASES = [
         (REHEARSAL, ROSETTA_STEP, "", 1),
         (REHEARSAL, REHEARSAL_ARCHIVE_DOWNLOAD, REHEARSAL_ARCHIVE_DOWNLOAD + ROSETTA_STEP, 1)], 1),
     ("rehearsal toolchain differs", "release-toolchain", "RELEASE_TOOLCHAIN differs from publish.yml", [
-        (REHEARSAL, '  RELEASE_TOOLCHAIN: "1.99.0"\n', '  RELEASE_TOOLCHAIN: "1.98.0"\n', 1)]),
+        (REHEARSAL, '  RELEASE_TOOLCHAIN: "1.100.0"\n', '  RELEASE_TOOLCHAIN: "1.98.0"\n', 1)]),
     ("rehearsal crates on stable", "release-toolchain", "verify-crates does not package with RELEASE_TOOLCHAIN", [
         (REHEARSAL, "          toolchain: ${{ env.RELEASE_TOOLCHAIN }}\n      # RUSTUP_TOOLCHAIN", "          toolchain: stable\n      # RUSTUP_TOOLCHAIN", 1)]),
     ("rehearsal crates without the toolchain pin", "release-toolchain", "it does not pin RUSTUP_TOOLCHAIN", [
@@ -2136,7 +2136,73 @@ for action in ("actions/checkout", "actions/setup-python"):
     CASES.append((f"{action} wrong action", "changelog-check", "checkout and main fetch", [
         (CHANGELOG, old, "another/action@" + revision, 1)]))
 
+CI_FMT_TOOLCHAIN = live_text(CI, re.compile(
+    r"      - uses: dtolnay/rust-toolchain@[^\n]+\n        with:\n"
+    r"          toolchain: [^\n]+\n          components: rustfmt\n"), "fmt toolchain step")
+TOOLCHAIN_LINE = '          toolchain: "1.100.0"\n'
+TOOLCHAIN_STEP = CI_FMT_TOOLCHAIN.replace("          components: rustfmt\n", "")
+ACTION_TOOLCHAIN_FIXTURE = ".github/actions/toolchain-fixture/action.yml"
+ACTION_TOOLCHAIN_TEXT = "runs:\n  using: composite\n  steps: []\n"
+WALLET_TOOLCHAIN_CASES = [
+    ("ci toolchain on stable", "with.toolchain", [
+        (CI, CI_FMT_TOOLCHAIN, CI_FMT_TOOLCHAIN.replace('"1.100.0"', "stable"), 1)]),
+    ("testnet toolchain differs", "with.toolchain", [
+        (TESTNET, TOOLCHAIN_LINE, TOOLCHAIN_LINE.replace("1.100.0", "1.99.0"), 2)]),
+    ("toolchain input absent", "with.toolchain", [
+        (CI, CI_FMT_TOOLCHAIN, CI_FMT_TOOLCHAIN.replace(TOOLCHAIN_LINE, ""), 1)]),
+    ("mixed-case toolchain action differs", "with.toolchain", [
+        (CI, CI_FMT_TOOLCHAIN, CI_FMT_TOOLCHAIN.replace("dtolnay/rust-toolchain", "DtoLnAy/RuSt-ToOlChAiN")
+         .replace('"1.100.0"', "stable"), 1)]),
+    ("yaml workflow toolchain differs", "with.toolchain", [
+        (CACHE_FIXTURE, CACHE_FIXTURE_TEXT, CACHE_FIXTURE_TEXT + TOOLCHAIN_STEP.replace("1.100.0", "1.99.0"), 1)]),
+    ("ci uses release toolchain expression", "with.toolchain", [
+        (CI, CI_FMT_TOOLCHAIN, CI_FMT_TOOLCHAIN.replace('"1.100.0"', "${{ env.RELEASE_TOOLCHAIN }}"), 1)]),
+    ("repository channel floats", "channel must be an exact Rust version", [
+        ("rust-toolchain.toml", 'channel = "1.100.0"', 'channel = "stable"', 1)]),
+    ("release toolchains differ from repository", "RELEASE_TOOLCHAIN must equal", [
+        (workflow, 'RELEASE_TOOLCHAIN: "1.100.0"', 'RELEASE_TOOLCHAIN: "1.99.0"', 1)
+        for workflow in (RELEASE, PUBLISH, REHEARSAL)]),
+    ("ci installs another toolchain", "run must not install or override", [
+        (CI, CI_FMT_TOOLCHAIN, CI_FMT_TOOLCHAIN + "      - run: rustup toolchain install stable\n", 1)]),
+    ("release preflight uses literal toolchain", "with.toolchain", [
+        (RELEASE, "          toolchain: ${{ env.RELEASE_TOOLCHAIN }}\n", TOOLCHAIN_LINE, 3)]),
+    ("local action toolchain differs", "with.toolchain", [
+        (ACTION_TOOLCHAIN_FIXTURE, ACTION_TOOLCHAIN_TEXT,
+         "runs:\n  using: composite\n  steps:\n" + TOOLCHAIN_STEP.replace("      ", "  ", 1)
+         .replace("        with:", "    with:").replace("          toolchain:", "      toolchain:")
+         .replace("1.100.0", "1.99.0"), 1)]),
+]
+for label, command in (
+    ("rustup default override", "rustup default stable"),
+    ("rustup directory override", "rustup override set stable"),
+    ("cargo explicit toolchain", "cargo +stable metadata"),
+    ("shell toolchain override", "RUSTUP_TOOLCHAIN=stable cargo metadata"),
+    ("release pin line outside release", 'echo "RUSTUP_TOOLCHAIN=$RELEASE_TOOLCHAIN" >> "$GITHUB_ENV"'),
+):
+    message = "RUSTUP_TOOLCHAIN may only" if "RUSTUP_TOOLCHAIN" in command else "run must not install or override"
+    WALLET_TOOLCHAIN_CASES.append((label, message, [
+        (CACHE_FIXTURE, CACHE_FIXTURE_TEXT, CACHE_FIXTURE_TEXT + f"      - run: {command}\n", 1)]))
+for label, old, new in (
+    ("workflow toolchain env override", "jobs:\n", "env: {RUSTUP_TOOLCHAIN: stable}\njobs:\n"),
+    ("job toolchain env override", "    runs-on:", "    env: {RUSTUP_TOOLCHAIN: stable}\n    runs-on:"),
+    ("step toolchain env override", "      - run: 'true'\n",
+     "      - run: 'true'\n        env: {RUSTUP_TOOLCHAIN: stable}\n"),
+):
+    WALLET_TOOLCHAIN_CASES.append((label, "RUSTUP_TOOLCHAIN may only", [
+        (CACHE_FIXTURE, old, new, 1)]))
+CASES.extend((label, "wallet-toolchain", message, edits, 1 if label == "repository channel floats" else None)
+             for label, message, edits in WALLET_TOOLCHAIN_CASES)
+PASSING.append(("vendored Wasm keeps compiler pins", []))
+
 MUTATIONS = {
+    "wallet-toolchain": ("        self.check_wallet_toolchain()\n", "",
+                         [label for label, _, _ in WALLET_TOOLCHAIN_CASES]),
+    "wallet-toolchain-invalid-channel-return": (
+        '            self.report("rust-toolchain.toml", rule, "channel must be an exact Rust version")\n            return\n',
+        '            self.report("rust-toolchain.toml", rule, "channel must be an exact Rust version")\n',
+        ["repository channel floats"]),
+    "wallet-toolchain-wasm-exemption": ('if workflow and path.name == "vendored-wasm.yml":', 'if False:',
+                                       ["vendored Wasm keeps compiler pins"]),
     "coverage-gate-needs-message": (
         'expected changes, coverage-off and coverage-on', 'expected coverage-off and coverage-on',
         ["coverage gate needs one part"]),
@@ -2507,9 +2573,13 @@ COUNT_CASES = [
 
 def copy_tree(destination):
     shutil.copytree(ROOT / ".github", destination / ".github")
+    shutil.copy2(ROOT / "rust-toolchain.toml", destination / "rust-toolchain.toml")
     # A dispatch-only .yaml workflow that the cache-save-if cases edit; the
     # checker reads it as every other workflow outside WORKFLOWS.
     (destination / CACHE_FIXTURE).write_text(CACHE_FIXTURE_TEXT)
+    action = destination / ACTION_TOOLCHAIN_FIXTURE
+    action.parent.mkdir(parents=True)
+    action.write_text(ACTION_TOOLCHAIN_TEXT)
 
 
 def run_check(root, script=SCRIPT):

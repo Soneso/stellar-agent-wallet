@@ -44,9 +44,10 @@ reads secret keys from a named environment variable, not from the command line.
   which the system's udev or systemd package provides, and the system glibc.
   The `x86_64-unknown-linux-gnu` archive is built on Ubuntu 24.04, so it needs
   glibc 2.39 or later.
-- `cargo install` and a build from source need a stable Rust toolchain with
-  edition 2024 support. The repository pins the channel in
-  `rust-toolchain.toml` (`channel = "stable"`).
+- A build from this repository uses Rust 1.100.0, which `rustup` installs on
+  first use from `rust-toolchain.toml`.
+- `cargo install` from crates.io uses your own toolchain, which needs Rust
+  edition 2024 support. The crates declare no `rust-version`.
 - A source build also compiles OpenSSL from vendored source, which needs a C
   compiler and Perl. On Windows this is a native Perl such as Strawberry Perl.
   The MSYS Perl that Git for Windows installs lacks required modules.

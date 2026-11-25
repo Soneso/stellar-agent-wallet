@@ -98,7 +98,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -115,7 +115,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
           components: clippy
       # stellar-ledger pulls hidapi, which links libudev on Linux for HID device
       # enumeration. The runner ships pkg-config but not the libudev headers.
@@ -147,7 +147,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -184,7 +184,7 @@ jobs:
           sudo docker image prune --all --force >/dev/null 2>&1 || true
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -230,7 +230,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
           components: clippy
       # stellar-ledger pulls hidapi, which links libudev on Linux for HID
       # device enumeration. The runner ships pkg-config but not the libudev
@@ -261,7 +261,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -296,7 +296,7 @@ jobs:
           sudo docker image prune --all --force >/dev/null 2>&1 || true
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -342,7 +342,7 @@ jobs:
           sudo docker image prune --all --force >/dev/null 2>&1 || true
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       # Restore the full test cache. This five-crate build never saves it.
@@ -367,7 +367,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
       - name: Fetch the locked graph
         run: cargo fetch --locked
       - name: Check feature discipline and assertions
@@ -395,7 +395,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       # The host recipe that preflight's release-shape row runs too: the
@@ -466,6 +466,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.100.0"
       - name: Self-test the publish tier check
         run: .github/scripts/test-publish-crates-check.sh
       - name: Check the publish tiers
@@ -565,7 +568,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: windows-storage
@@ -679,7 +682,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - name: Install gnome-keyring and dbus
@@ -742,7 +745,7 @@ jobs:
       # explicitly rather than relying on the runner image default.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
       - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-machete@0.9.2
@@ -764,7 +767,7 @@ jobs:
       # default.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: "1.100.0"
       - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-deny@0.19.9

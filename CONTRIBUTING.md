@@ -18,8 +18,11 @@ and it runs the MCP stdio server of the `stellar-agent-mcp` library crate as
 integration tests start that server child, so build both packages first:
 `cargo test -p stellar-agent-cli -p stellar-agent-mcp --no-run`.
 
-The toolchain channel is `stable` (pinned in `rust-toolchain.toml`, with the
-`rustfmt` and `clippy` components) and the workspace targets Rust edition 2024. See
+The repository pins Rust 1.100.0 in `rust-toolchain.toml`. On first use, `rustup`
+installs it with the `rustfmt` and `clippy` components.
+The workspace targets Rust edition 2024. A `cargo install` from crates.io uses
+your own toolchain, which needs edition 2024 support; the crates declare no
+`rust-version`. See
 [docs/maintainers/building.md](docs/maintainers/building.md) for the prerequisites,
 the gate-tool installation, the build commands, and the test tiers.
 
