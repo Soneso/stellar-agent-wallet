@@ -7,7 +7,7 @@ Usage: ``check-workflow-invariants.py [repository-root]``
 Reads ``release.yml``, ``publish.yml``, ``notarize-smoke.yml``, ``labels.yml``,
 ``stale.yml``, ``triage.yml``, ``triage-review.yml``, ``triage-sweep.yml``,
 ``welcome.yml``, ``coverage.yml``, ``release-rehearsal.yml``, ``ci.yml``,
-``vendored-wasm.yml``, and ``changelog.yml``
+``vendored-wasm.yml``, ``changelog.yml``, ``testnet.yml``, ``install-surface.yml``, and ``take.yml``
 under ``.github/workflows/``.
 Also reads the composite action
 ``.github/actions/macos-sign-notarize/action.yml``, the shared build script
@@ -95,17 +95,16 @@ and comment lines skipped. The check fails when any of these holds:
   floors to ``coverage``. Or a part lacks an unconditional upload of its
   ``COVERAGE_EXPORTS`` report after its measurement, with
   ``if-no-files-found: error``.
-- ``coverage-gate``: the gate does not need exactly both parts. Its first
+- ``coverage-gate``: the gate does not need both parts and ``changes``. Its first
   step sets ``if``, lacks a result check, or reads other than
-  ``COVERAGE_RESULT_ENV``. Its second and last steps do not reject a
+  ``COVERAGE_RESULT_ENV``, or fails to require successful classification. Its second and last steps do not reject a
   cancelled run: ``if`` equal to ``cancelled()``, no ``continue-on-error``,
   and ``exit 1`` as the only command. The last step does not follow both
   floors, or another step sets ``if``. Or a report is not downloaded once,
   unconditionally, from this run, before the first floor.
 - ``coverage-seed``: ``coverage.yml`` lacks a ``push`` trigger for both
   ``COVERAGE_SEED_BRANCHES``, filters pushes by path, or lets later runs
-  cancel a running push. A newer pending run still replaces the older pending
-  run.
+  cancel a running push.
 - ``coverage-attempt``: an upload or download of ``coverage.yml`` names
   another artifact than a ``COVERAGE_EXPORTS`` report, whose name ends in
   ``${{ github.run_attempt }}``, or a download sets ``pattern`` or
@@ -113,7 +112,13 @@ and comment lines skipped. The check fails when any of these holds:
 - ``cache-save-if``: a ``Swatinem/rust-cache`` step, in any letter case, of
   any ``*.yml`` or ``*.yaml`` workflow that ``pull_request`` or
   ``pull_request_target`` triggers lacks ``save-if`` equal to
-  ``CACHE_SAVE_CONDITION`` after the check strips one enclosing ``${{ }}``.
+  ``CACHE_SAVE_CONDITION`` after the check strips one enclosing ``${{ }}``, or boolean ``false``.
+- ``ci-result``: the aggregate lacks its base-specific name, complete dependencies,
+  matching script job set, cancellation guard, always-run result check, or exact environment.
+- ``docs-classifier``: CI or coverage filters push paths, changes its classifier
+  inputs or full-history checkout, or docs-tests saves its partial cache.
+- ``push-concurrency``: CI, coverage, or install-surface shares groups between push runs.
+- ``wasm-branches``: vendored Wasm pull request or push branches omit main or next.
 - ``rehearsal-credentials``: ``release-rehearsal.yml`` holds a credential. A
   job is credentialed as above. The workflow permissions, or a job's own
   permissions or the workflow's when it sets none, are anything but exactly
@@ -259,6 +264,7 @@ runs the function.
 - ``release-fragments``: preflight lacks the read-only pending-fragment check immediately after the version header check.
 """
 
+import ast
 import fnmatch
 import pathlib
 import re
@@ -272,7 +278,7 @@ except ImportError:
 
 WORKFLOWS = ("release.yml", "publish.yml", "notarize-smoke.yml", "labels.yml", "stale.yml", "triage.yml",
              "triage-review.yml", "triage-sweep.yml", "welcome.yml", "coverage.yml", "release-rehearsal.yml",
-             "ci.yml", "vendored-wasm.yml", "changelog.yml")
+             "ci.yml", "vendored-wasm.yml", "changelog.yml", "testnet.yml", "install-surface.yml", "take.yml")
 CHANGELOG_CONDITION = "github.event_name == 'pull_request' && github.base_ref == 'next'"
 CHANGELOG_ARGS = 'guard --base "$BASE_SHA" --head "$HEAD_SHA" --main-ref refs/remotes/origin/main'
 CHANGELOG_GUARD = ('set -euo pipefail\n'
@@ -337,16 +343,18 @@ COVERAGE_WORKFLOW = "coverage.yml"
 COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled", "unlabeled")
 # The coverage jobs measure on a push, on the schedule, on a dispatch, and on
 # a pull request whose labels include `coverage`.
-COVERAGE_CONDITION = ("github.event_name != 'pull_request' || "
-                      "contains(github.event.pull_request.labels.*.name, 'coverage')")
+COVERAGE_LABEL = ("github.event_name != 'pull_request' || "
+                  "contains(github.event.pull_request.labels.*.name, 'coverage')")
+COVERAGE_DOCS_SKIP = ("github.event_name == 'push' && needs.changes.result == 'success' && "
+                      "needs.changes.outputs.docs_only == 'true'")
+COVERAGE_CONDITION = f"!cancelled() && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
 # The gate job `coverage` runs after failed, cancelled, or skipped
 # measurements under the same label condition, so its check fails instead of
 # being skipped.
-COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_CONDITION})"
+COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
 COVERAGE_PARTS = ("coverage-off", "coverage-on")
 COVERAGE_GATE = "coverage"
-# Pushes to these branches seed the coverage caches. Later runs do not cancel
-# a running push. A newer pending run replaces the older pending run.
+# Pushes to these branches seed the coverage caches, except docs-only pushes to next.
 COVERAGE_SEED_BRANCHES = ("next", "main")
 COVERAGE_SEED_CANCEL = "github.event_name == 'pull_request'"
 COVERAGE_OFF_COMMAND = ("cargo llvm-cov --workspace --no-default-features --features "
@@ -366,7 +374,8 @@ COVERAGE_EXPORTS = {"coverage-off": (f"cov-feature-off-{COVERAGE_ATTEMPT}", "cov
 # Download inputs that select reports by a pattern or merge several reports.
 COVERAGE_SELECTION_INPUTS = ("pattern", "merge-multiple")
 # The gate's first step reads both part results; the keys are quoted strings.
-COVERAGE_RESULT_ENV = {"OFF": "${{ needs.coverage-off.result }}", "ON": "${{ needs.coverage-on.result }}"}
+COVERAGE_RESULT_ENV = {"OFF": "${{ needs.coverage-off.result }}", "ON": "${{ needs.coverage-on.result }}",
+                       "CHANGES": "${{ needs.changes.result }}"}
 COVERAGE_RESULT_CHECKS = ('test "$OFF" = success', 'test "$ON" = success')
 # The gate steps that fail a cancelled run before and after the floors.
 COVERAGE_CANCEL_CONDITION = "cancelled()"
@@ -601,7 +610,8 @@ CONDITIONED_FEATURE_JOBS = {
     (COVERAGE_WORKFLOW, "coverage-off"): (COVERAGE_CONDITION, (COVERAGE_OFF_COMMAND,)),
     (COVERAGE_WORKFLOW, "coverage-on"): (COVERAGE_CONDITION, (COVERAGE_ON_COMMAND,)),
     (COVERAGE_WORKFLOW, COVERAGE_GATE): (COVERAGE_GATE_CONDITION, (
-        COVERAGE_RESULT_CHECKS[0], COVERAGE_RESULT_CHECKS[1], COVERAGE_OFF_FLOORS, COVERAGE_ON_FLOORS)),
+        COVERAGE_RESULT_CHECKS[0], COVERAGE_RESULT_CHECKS[1], 'test "$CHANGES" = success',
+        COVERAGE_OFF_FLOORS, COVERAGE_ON_FLOORS)),
 }
 # The host recipe: the release build for the host target, which places the
 # stellar-agent-mcp copy, the byte comparison of both names and the marker
@@ -1042,6 +1052,8 @@ class Checker:
                 condition = self.unwrap_expression(condition)
             if condition != COVERAGE_CONDITION:
                 self.report(workflow, "coverage-condition", f"{name} job runs without the label condition")
+            if isinstance(job, dict) and job.get("needs") not in ("changes", ["changes"]):
+                self.report(workflow, "coverage-condition", f"{name} must need changes")
         if COVERAGE_GATE not in jobs:
             self.report(workflow, "coverage-condition", f"job {COVERAGE_GATE} not found")
             return
@@ -1117,14 +1129,16 @@ class Checker:
             return self.normalized(self.run_text(step)) == [COVERAGE_CANCEL_RUN]
 
         needs = gate.get("needs")
-        if not isinstance(needs, list) or set(map(str, needs)) != set(COVERAGE_PARTS):
-            self.report(workflow, rule, f"coverage gate needs {needs}, expected coverage-off and coverage-on")
+        if not isinstance(needs, list) or set(map(str, needs)) != {"changes", *COVERAGE_PARTS}:
+            self.report(workflow, rule, f"coverage gate needs {needs}, expected changes, coverage-off and coverage-on")
         first = steps[0] if steps else {}
         if "if" in first or any(self.runs_line(first.get("run"), check)[0] < 0 for check in COVERAGE_RESULT_CHECKS):
             self.report(workflow, rule, "coverage gate does not check the results first")
         env = first.get("env")
         if env != COVERAGE_RESULT_ENV:
             self.report(workflow, rule, f"coverage gate result check reads {env}")
+        if self.runs_line(first.get("run"), 'test "$CHANGES" = success')[0] < 0:
+            self.report(workflow, rule, "coverage gate must reject failed changes")
         if len(steps) < 2 or not rejects(steps[1]):
             self.report(workflow, rule, "coverage gate does not reject a cancelled run after its result check")
         floors = [index for index, step in enumerate(steps)
@@ -1156,9 +1170,7 @@ class Checker:
                 self.report(workflow, rule, f"coverage gate checks floors before downloading {artifact}")
 
     def check_coverage_seed(self, workflow, doc):
-        """Pushes to both base branches run the workflow without a paths
-        filter. Later runs do not cancel a running push; a newer pending run
-        replaces the older pending run."""
+        """Pushes to both base branches run without a paths filter or cancellation."""
         rule = "coverage-seed"
         triggers = doc.get("on", doc.get(True))
         seeds = triggers if isinstance(triggers, dict) else {}
@@ -1230,6 +1242,8 @@ class Checker:
                     if not RUST_CACHE_ACTION.match(str(step.get("uses") or "")):
                         continue
                     value = (step.get("with") or {}).get("save-if")
+                    if value is False:
+                        continue
                     if not isinstance(value, str) or self.unwrap_expression(value) != CACHE_SAVE_CONDITION:
                         self.report(f"{source.name}:{name} step {index + 1}", "cache-save-if",
                                     "rust-cache saves on pull request runs")
@@ -1796,9 +1810,9 @@ class Checker:
         setup = [step for step in steps if str(step.get("uses", "")).startswith("actions/setup-python@")]
         if (not checkout or self.may_skip(checkout) or options.get("fetch-depth") != 0
                 or "ref" in options or options.get("persist-credentials") is not False
-                or checkout.get("uses") != "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+                or not re.fullmatch(r"actions/checkout@[0-9a-f]{40}", str(checkout.get("uses", "")))
                 or len(setup) != 1 or self.may_skip(setup[0])
-                or setup[0].get("uses") != "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+                or not re.fullmatch(r"actions/setup-python@[0-9a-f]{40}", str(setup[0].get("uses", "")))
                 or str(setup[0].get("with", {}).get("python-version")) != "3.13"
                 or not fetch or self.may_skip(fetch) or fetch.get("shell") != "bash"
                 or self.run_text(fetch).strip() != CHANGELOG_FETCH
@@ -1930,6 +1944,117 @@ class Checker:
         branches = pull_request.get("branches") if isinstance(pull_request, dict) else None
         if not isinstance(branches, list) or "main" not in branches:
             self.report("ci.yml", "ci-triggers", "pull_request branches must include main")
+
+    def check_ci_result(self):
+        workflow, rule = "ci.yml", "ci-result"
+        jobs = self.docs.get(workflow, {}).get("jobs", {})
+        job = jobs.get("ci-result", {})
+        expected = set(jobs) - {"ci-result"}
+        if job.get("name") != "ci-result (${{ github.base_ref || github.ref_name }})":
+            self.report(workflow, rule, "name must identify the base branch")
+        if (self.unwrap_expression(str(job.get("if", ""))) != "always()"
+                or job.get("runs-on") != "ubuntu-24.04"
+                or job.get("permissions") != {"contents": "read"}
+                or "continue-on-error" in job):
+            self.report(workflow, rule, "job must always run with read-only permissions and fail on errors")
+        if job.get("timeout-minutes") != 10:
+            self.report(workflow, rule, "job must have timeout-minutes: 10")
+        needs = job.get("needs")
+        if not isinstance(needs, list) or set(needs) != expected:
+            self.report(workflow, rule, "needs must include every other CI job")
+        script = self.read_script(pathlib.PurePosixPath(".github/scripts/ci-result.py"), rule)
+        docs_required = set()
+        for name in sorted(expected):
+            condition = self.unwrap_expression(str(jobs[name].get("if", "")))
+            if ((name == DOCS_TESTS_JOB and condition == DOCS_TESTS_CONDITION)
+                    or (name != DOCS_TESTS_JOB and "if" not in jobs[name])):
+                docs_required.add(name)
+            elif name == DOCS_TESTS_JOB or condition != DOCS_ONLY_CONDITION:
+                self.report(workflow, rule, f"{name} has an unsupported docs-only job condition")
+        for constant, wanted, message in (
+                ("EXPECTED_JOBS", expected, "job set must equal every other CI job"),
+                ("DOCS_REQUIRED", docs_required, "DOCS_REQUIRED must match CI docs-only job conditions")):
+            try:
+                assignments = [node for node in ast.parse(script or "").body
+                               if isinstance(node, ast.Assign)
+                               and any(isinstance(target, ast.Name) and target.id == constant
+                                       for target in node.targets)]
+                actual = ast.literal_eval(assignments[0].value) if len(assignments) == 1 else None
+                if actual != wanted:
+                    raise ValueError("job set differs")
+            except (ValueError, SyntaxError, TypeError):
+                self.report(workflow, rule, f"ci-result.py {message}")
+        steps = job.get("steps", [])
+        for index, step in enumerate(steps):
+            condition = "always() && cancelled()" if index in (0, len(steps) - 1) else "always()"
+            if (self.unwrap_expression(str(step.get("if", ""))) != condition
+                    or "continue-on-error" in step):
+                self.report(workflow, rule, "every step must always run and fail on errors")
+        first = steps[0] if steps else {}
+        if (self.unwrap_expression(str(first.get("if", ""))) != "always() && cancelled()"
+                or self.run_text(first).strip() != "exit 1"):
+            self.report(workflow, rule, "first step must reject cancellation")
+        last = steps[-1] if steps else {}
+        if (len(steps) < 2 or self.unwrap_expression(str(last.get("if", ""))) != "always() && cancelled()"
+                or self.run_text(last).strip() != "exit 1"):
+            self.report(workflow, rule, "last step must reject cancellation")
+        checkouts = [i for i, step in enumerate(steps)
+                     if str(step.get("uses", "")).startswith("actions/checkout@")
+                     and (step.get("with") or {}).get("persist-credentials") is False]
+        checks = [(i, step) for i, step in enumerate(steps)
+                  if self.run_text(step).strip() == "python3 .github/scripts/ci-result.py"]
+        if (len(checks) != 1 or len(checkouts) != 1 or not 0 < checkouts[0] < checks[0][0]
+                or checks[0][1].get("env") != {"NEEDS_JSON": "${{ toJSON(needs) }}",
+                                              "DOCS_ONLY": "${{ needs.changes.outputs.docs_only }}"}):
+            self.report(workflow, rule, "checkout must precede the result script with its exact environment")
+
+    def check_docs_classifier(self):
+        env = {"EVENT_NAME": "${{ github.event_name }}", "BASE_REF": "${{ github.base_ref }}",
+               "BASE_SHA": "${{ github.event.pull_request.base.sha }}",
+               "HEAD_SHA": "${{ github.event.pull_request.head.sha }}", "REF": "${{ github.ref }}",
+               "BEFORE_SHA": "${{ github.event.before }}", "AFTER_SHA": "${{ github.event.after }}",
+               "FORCED": "${{ github.event.forced }}"}
+        for workflow in ("ci.yml", "coverage.yml"):
+            doc = self.docs.get(workflow, {})
+            triggers = doc.get("on", doc.get(True))
+            triggers = triggers if isinstance(triggers, dict) else {}
+            push = triggers.get("push")
+            push = push if isinstance(push, dict) else {}
+            if "paths" in push or "paths-ignore" in push:
+                self.report(workflow, "docs-classifier", "push must have no paths filter")
+            job = self.job(workflow, "changes") or {}
+            steps = job.get("steps", [])
+            classifiers = [step for step in steps if step.get("id") == "classify"]
+            if (len(classifiers) != 1 or classifiers[0].get("env") != env
+                    or self.run_text(classifiers[0]).strip() !=
+                    'python3 .github/scripts/classify-docs-only.py >> "$GITHUB_OUTPUT"'
+                    or self.may_skip(classifiers[0]) or "if" in job or "needs" in job
+                    or "continue-on-error" in job
+                    or job.get("outputs") != {"docs_only": "${{ steps.classify.outputs.docs_only }}"}):
+                self.report(workflow, "docs-classifier", "changes must call the classifier with the shared environment")
+            if not any(str(step.get("uses", "")).startswith("actions/checkout@")
+                       and (step.get("with") or {}).get("fetch-depth") == 0
+                       and not self.may_skip(step) for step in steps):
+                self.report(workflow, "docs-classifier", "changes must check out full history")
+        for step in (self.job("ci.yml", "docs-tests") or {}).get("steps", []):
+            if RUST_CACHE_ACTION.match(str(step.get("uses", ""))) and (step.get("with") or {}).get("save-if") is not False:
+                self.report("ci.yml", "docs-classifier", "docs-tests must never save its partial test cache")
+
+    def check_push_concurrency(self):
+        for workflow in ("ci.yml", "coverage.yml", "install-surface.yml"):
+            concurrency = self.docs.get(workflow, {}).get("concurrency")
+            concurrency = concurrency if isinstance(concurrency, dict) else {}
+            if (concurrency.get("group") != "${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}"
+                    or self.unwrap_expression(str(concurrency.get("cancel-in-progress", ""))) != "github.event_name == 'pull_request'"):
+                self.report(workflow, "push-concurrency", "only pull request runs may share a group or cancel predecessors")
+        doc = self.docs.get("vendored-wasm.yml", {})
+        triggers = doc.get("on", doc.get(True))
+        triggers = triggers if isinstance(triggers, dict) else {}
+        for event in ("push", "pull_request"):
+            trigger = triggers.get(event)
+            branches = trigger.get("branches") if isinstance(trigger, dict) else None
+            if not isinstance(branches, list) or set(branches) != {"main", "next"}:
+                self.report("vendored-wasm.yml", "wasm-branches", f"{event} must include main and next")
 
     def check_apt_retries(self):
         directory = self.root / WORKFLOW_DIR
@@ -2068,6 +2193,9 @@ class Checker:
         self.check_release_vars()
         self.check_changelog_workflow()
         self.check_release_fragments()
+        self.check_ci_result()
+        self.check_docs_classifier()
+        self.check_push_concurrency()
         return self.violations
 
 

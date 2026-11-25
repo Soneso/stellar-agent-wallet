@@ -17,11 +17,11 @@ on:
   push:
     branches: [main]
 
-# Supersede in-flight runs for the same ref so rapid pushes do not queue stale
-# work.
+# Pull request runs cancel their predecessor. Push, schedule, and dispatch
+# runs each have their own group and never cancel one another.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # The job only reads the checked-out source.
 permissions:

@@ -220,10 +220,13 @@ PUBLISH_SCRIPT = ".github/scripts/publish-crates.sh"
 # A full-length commit pin for the actions a case adds; the check matches the
 # action name and ignores the revision.
 PLACEHOLDER_REVISION = "0" * 40
-COVERAGE_CONDITION = "github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'coverage')"
-COVERAGE_IF_LINE = f"    if: {COVERAGE_CONDITION}\n"
-COVERAGE_IF_WRAPPED_LINE = f"    if: ${{{{ {COVERAGE_CONDITION} }}}}\n"
-COVERAGE_IF_SPACED_LINE = f'    if: "  {COVERAGE_CONDITION}  "\n'
+COVERAGE_LABEL = "github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'coverage')"
+COVERAGE_DOCS_SKIP = ("github.event_name == 'push' && needs.changes.result == 'success' && "
+                      "needs.changes.outputs.docs_only == 'true'")
+COVERAGE_CONDITION = f"!cancelled() && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
+COVERAGE_IF_LINE = f"    if: ${{{{ {COVERAGE_CONDITION} }}}}\n"
+COVERAGE_IF_UNWRAPPED_LINE = f'    if: "{COVERAGE_CONDITION}"\n'
+COVERAGE_IF_SPACED_LINE = f'    if: "  ${{{{ {COVERAGE_CONDITION} }}}}  "\n'
 COVERAGE_TYPES_LINE = "    types: [opened, synchronize, reopened, labeled, unlabeled]\n"
 COVERAGE_PUSH_BLOCK = "  push:\n    branches: [next, main]\n"
 COVERAGE_ON_BLOCK = (
@@ -244,16 +247,16 @@ COVERAGE_LABEL_COMMENT = (
     "    # person or with an app token starts a new run. A change made with the\n"
     "    # workflow token starts none; the triage and stale workflows use that token.\n"
 )
-COVERAGE_OFF_HEADER = "  coverage-off:\n    name: coverage (feature-off)\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
-COVERAGE_ON_HEADER = "  coverage-on:\n    name: coverage (feature-on)\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
-COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_CONDITION})"
+COVERAGE_OFF_HEADER = "  coverage-off:\n    name: coverage (feature-off)\n    needs: changes\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
+COVERAGE_ON_HEADER = "  coverage-on:\n    name: coverage (feature-on)\n    needs: changes\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
+COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
 COVERAGE_GATE_START = "  coverage:\n    name: coverage\n"
-COVERAGE_GATE_NEEDS = "    needs: [coverage-off, coverage-on]\n"
+COVERAGE_GATE_NEEDS = "    needs: [changes, coverage-off, coverage-on]\n"
 COVERAGE_GATE_COMMENT = (
     "    # always() schedules this job after a failed, cancelled, or skipped\n"
     "    # measurement, and step 1 then fails it. Steps 2 and 8 fail it in a step\n"
     "    # evaluation that sees the run cancelled. Without the label the condition\n"
-    "    # is false, and the check is skipped.\n"
+    "    # is false, and the check is skipped. Confirmed docs-only pushes also skip.\n"
 )
 COVERAGE_GATE_IF_LINE = f"    if: {COVERAGE_GATE_CONDITION}\n"
 COVERAGE_GATE_HEADER = COVERAGE_GATE_START + COVERAGE_GATE_NEEDS + COVERAGE_GATE_COMMENT + COVERAGE_GATE_IF_LINE
@@ -756,15 +759,15 @@ PASSING = [
         (WASM, WASM_GATE_IF, WASM_GATE_NEEDS + "    if: ${{ always() }}\n", 1)]),
     ("Wasm gate needs in another order pass", [
         (WASM, WASM_GATE_NEEDS, "    needs: [rebuild, stellar-cli-28, stellar-cli-25, check]\n", 1)]),
-    ("coverage job condition wrapped in ${{ }} passes", [
-        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, COVERAGE_IF_WRAPPED_LINE), 1)]),
+    ("coverage job condition without expression wrapper passes", [
+        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, COVERAGE_IF_UNWRAPPED_LINE), 1)]),
     ("coverage job condition with surrounding whitespace passes", [
         (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, COVERAGE_IF_SPACED_LINE), 1)]),
     ("coverage gate condition wrapped in ${{ }} passes", [
         (COVERAGE, COVERAGE_GATE_HEADER,
          COVERAGE_GATE_HEADER.replace(COVERAGE_GATE_IF_LINE, f"    if: ${{{{ {COVERAGE_GATE_CONDITION} }}}}\n"), 1)]),
     ("coverage gate needs in another order pass", [
-        (COVERAGE, COVERAGE_GATE_NEEDS, "    needs: [coverage-on, coverage-off]\n", 1)]),
+        (COVERAGE, COVERAGE_GATE_NEEDS, "    needs: [changes, coverage-on, coverage-off]\n", 1)]),
     ("coverage gate result keys in single quotes pass", [
         (COVERAGE, COVERAGE_RESULT_ENV_LINES, COVERAGE_RESULT_ENV_LINES.replace('"', "'"), 1)]),
     ("coverage gate cancel condition wrapped in ${{ }} passes", [
@@ -773,9 +776,9 @@ PASSING = [
     ("coverage seed branches in another order pass", [
         (COVERAGE, COVERAGE_PUSH_BLOCK, "  push:\n    branches: [main, next]\n", 1)]),
     ("save-if as a quoted expression passes", [
-        (CI, CACHE_SAVE_LINE, "          save-if: \"${{ github.event_name == 'push' }}\"\n", 9)]),
+        (CI, CACHE_SAVE_LINE, "          save-if: \"${{ github.event_name == 'push' }}\"\n", 8)]),
     ("save-if with inner spaces passes", [
-        (CI, CACHE_SAVE_LINE, "          save-if: ${{  github.event_name == 'push'  }}\n", 9)]),
+        (CI, CACHE_SAVE_LINE, "          save-if: ${{  github.event_name == 'push'  }}\n", 8)]),
     ("cancel-in-progress with inner spaces passes", [
         (COVERAGE, COVERAGE_CANCEL_LINE, "  cancel-in-progress: ${{  github.event_name == 'pull_request'  }}\n", 1)]),
     ("Wasm save guard wrapped in ${{ }} passes", [
@@ -843,8 +846,11 @@ CASES = [
         (CI, SKILL_ARCHIVE_RUN, "        run: true\n", 1)], 1),
     ("skill archive continues on error", "skill-archive", "skill archive check can be bypassed", [
         (CI, SKILL_ARCHIVE_IF, SKILL_ARCHIVE_IF + "        continue-on-error: true\n", 1)], 1),
-    ("skill archive job skipped", "skill-archive", "skill archive check can be bypassed", [
-        (CI, "  release-contracts:\n", "  release-contracts:\n    if: false\n", 1)], 1),
+    ("skill archive job skipped", ("skill-archive", "ci-result", "ci-result"), (
+        "skill archive check can be bypassed",
+        "release-contracts has an unsupported docs-only job condition",
+        "DOCS_REQUIRED must match CI docs-only job conditions"), [
+        (CI, "  release-contracts:\n", "  release-contracts:\n    if: false\n", 1)], 3),
     ("crate publish without Wasm dependency", "publish-wasm-gate", "publish must need verify and vendored-wasm", [
         (PUBLISH, "needs: [verify, vendored-wasm]", "needs: verify", 1)]),
     ("crate Wasm call uses another workflow", "publish-wasm-gate", "must call the local workflow", [
@@ -1489,12 +1495,13 @@ CASES = [
     ("conditional upload", "ci-feature-jobs", "coverage.yml: ci-feature-jobs: coverage-off step can be bypassed", [
         (COVERAGE, COVERAGE_UPLOAD_OFF, COVERAGE_UPLOAD_ACTION + "        if: success()\n"
          + COVERAGE_UPLOAD_OFF[len(COVERAGE_UPLOAD_ACTION):], 1)]),
-    ("coverage gate needs one part", "coverage-gate", "coverage gate needs ['coverage-off'], expected", [
+    ("coverage gate needs one part", "coverage-gate",
+     "coverage gate needs ['coverage-off'], expected changes, coverage-off and coverage-on", [
         (COVERAGE, COVERAGE_GATE_NEEDS, "    needs: [coverage-off]\n", 1)]),
     ("coverage gate result check reads one part twice", "coverage-gate", "coverage gate result check reads", [
         (COVERAGE, COVERAGE_RESULT_ENV_LINES,
          COVERAGE_RESULT_ENV_LINES.replace("needs.coverage-on.result", "needs.coverage-off.result"), 1)]),
-    ("coverage gate result keys unquoted", "coverage-gate", "coverage gate result check reads {False:", [
+    ("coverage gate result keys unquoted", "coverage-gate", ", False:", [
         (COVERAGE, COVERAGE_RESULT_ENV_LINES, COVERAGE_RESULT_ENV_LINES.replace('"', ""), 1)]),
     ("coverage gate result check removed", "ci-feature-jobs",
      'coverage.yml: ci-feature-jobs: coverage does not run unconditionally: test "$ON" = success', [
@@ -2029,7 +2036,136 @@ CASES = [
 # mutated copy and pass against the restored one.
 CASES.extend((label, changelog_rule(label), CHANGELOG_MESSAGES[label], []) for label in CHANGELOG_VARIANTS)
 
+CI_RESULT_SCRIPT = ".github/scripts/ci-result.py"
+CI_RESULT_NAME = "    name: ci-result (${{ github.base_ref || github.ref_name }})\n"
+CI_RESULT_NEEDS = ("    needs: [changes, fmt, clippy, doc, test, feature-on-clippy, feature-on-doc, "
+                   "feature-on-test, docs-tests, feature-discipline, release-shape, inbox-js, mpp-interop, "
+                   "sdk-v17-interop, release-contracts, windows-storage, platform-keyring, deploy-scripts, machete, deny]\n")
+CI_RESULT_CHECK = "      - name: Check every CI result\n        if: always()\n"
+CI_RESULT_FIRST_CANCEL = ("      - name: Reject a cancelled run\n"
+                          "        if: always() && cancelled()\n        run: exit 1\n")
+CI_RESULT_LAST_CANCEL = ("      - name: Reject a run cancelled during result checks\n"
+                         "        if: always() && cancelled()\n        run: exit 1\n")
+CI_RESULT_DOCS_REQUIRED = 'DOCS_REQUIRED = {"changes", "docs-tests", "feature-discipline", "release-contracts"}\n'
+CI_RESULT_TIMEOUT = "    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    permissions:\n"
+CI_FMT_HEADER = ("  fmt:\n    name: fmt\n    needs: changes\n"
+                 "    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}\n")
+PUSH_GROUP = "  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}\n"
+CASES.extend([
+    ("ci-result missing need", "ci-result", "needs must include every other", [
+        (CI, CI_RESULT_NEEDS, CI_RESULT_NEEDS.replace(", deny]", "]"), 1)]),
+    ("ci-result wrong name", "ci-result", "name must identify the base", [
+        (CI, CI_RESULT_NAME, "    name: ci-result\n", 1)]),
+    ("ci-result step not always", "ci-result", "every step must always", [
+        (CI, CI_RESULT_CHECK, CI_RESULT_CHECK.replace("        if: always()\n", ""), 1)]),
+    ("ci-result job set differs", "ci-result", "job set must equal", [
+        (CI_RESULT_SCRIPT, '    "machete", "deny",\n', '    "machete",\n', 1)]),
+    ("ci-result can continue", "ci-result", "job must always run", [
+        (CI, CI_RESULT_NAME, CI_RESULT_NAME + "    continue-on-error: true\n", 1)]),
+    ("ci-result conditional job", "ci-result", "job must always run", [
+        (CI, CI_RESULT_NEEDS + "    if: always()\n", CI_RESULT_NEEDS + "    if: success()\n", 1)]),
+    ("ci-result cancellation ignored", "ci-result", "first step must reject cancellation", [
+        (CI, CI_RESULT_FIRST_CANCEL, CI_RESULT_FIRST_CANCEL.replace("exit 1", "exit 0"), 1)]),
+    ("ci-result without timeout", "ci-result", "timeout-minutes: 10", [
+        (CI, CI_RESULT_TIMEOUT, CI_RESULT_TIMEOUT.replace("    timeout-minutes: 10\n", ""), 1)]),
+    ("ci-result wrong timeout", "ci-result", "timeout-minutes: 10", [
+        (CI, CI_RESULT_TIMEOUT, CI_RESULT_TIMEOUT.replace("timeout-minutes: 10", "timeout-minutes: 20"), 1)]),
+    ("ci-result without final cancellation check", "ci-result", "last step must reject cancellation", [
+        (CI, CI_RESULT_LAST_CANCEL, "", 1)]),
+    ("ci-result final cancellation succeeds", "ci-result", "last step must reject cancellation", [
+        (CI, CI_RESULT_LAST_CANCEL, CI_RESULT_LAST_CANCEL.replace("exit 1", "exit 0"), 1)]),
+    ("ci-result final cancellation can continue", "ci-result", "every step must always", [
+        (CI, CI_RESULT_LAST_CANCEL, CI_RESULT_LAST_CANCEL + "        continue-on-error: true\n", 1)]),
+    ("ci-result docs-required adds skipped job", "ci-result", "DOCS_REQUIRED must match", [
+        (CI_RESULT_SCRIPT, CI_RESULT_DOCS_REQUIRED, CI_RESULT_DOCS_REQUIRED.replace('{', '{"fmt", '), 1)]),
+    ("ci-result docs-only workflow condition differs", "ci-result", "DOCS_REQUIRED must match", [
+        (CI, CI_FMT_HEADER, CI_FMT_HEADER.split("    if:")[0], 1)]),
+    ("ci-result docs-only workflow condition unknown", "ci-result", "unsupported docs-only job condition", [
+        (CI, CI_FMT_HEADER, CI_FMT_HEADER.split("    if:")[0] + "    if: false\n", 1)]),
+    ("ci-result docs-required job with empty condition", "ci-result",
+     "release-contracts has an unsupported docs-only job condition", [
+        (CI, "  release-contracts:\n", '  release-contracts:\n    if: ""\n', 1)]),
+    ("ci-result docs-tests condition on another job", "ci-result",
+     "release-contracts has an unsupported docs-only job condition", [
+        (CI, "  release-contracts:\n", "  release-contracts:\n"
+         "    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}\n", 1)]),
+    ("ci-result environment differs", "ci-result", "exact environment", [
+        (CI, "NEEDS_JSON: ${{ toJSON(needs) }}", "NEEDS_JSON: '{}'", 1)]),
+    ("classifier environment differs", "docs-classifier", "shared environment", [
+        (COVERAGE, "AFTER_SHA: ${{ github.event.after }}", "AFTER_SHA: ${{ github.sha }}", 1)]),
+    ("classifier shallow checkout", "docs-classifier", "full history", [
+        (COVERAGE, "          fetch-depth: 0\n", "          fetch-depth: 1\n", 1)]),
+    ("docs-tests cache saves", "docs-classifier", "never save", [
+        (CI, "          save-if: false\n", CACHE_SAVE_LINE, 1)]),
+    ("coverage changes failure ignored", "coverage-gate", "reject failed changes", [
+        (COVERAGE, '          test "$CHANGES" = success\n', "", 1)]),
+    ("coverage measurement missing changes", "coverage-condition", "must need changes", [
+        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace("    needs: changes\n", ""), 1)]),
+    ("coverage skips without successful classifier", "coverage-condition", "label condition", [
+        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace("needs.changes.result == 'success' && ", ""), 1)]),
+])
+for name in ("changes", "docs-tests", "feature-discipline", "release-contracts"):
+    CASES.append((f"ci-result docs-required omits {name}", "ci-result", "DOCS_REQUIRED must match", [
+        (CI_RESULT_SCRIPT, CI_RESULT_DOCS_REQUIRED,
+         CI_RESULT_DOCS_REQUIRED.replace(f'"{name}", ', '').replace(f', "{name}"', ''), 1)]))
+for workflow in (CI, COVERAGE):
+    for key in ("paths", "paths-ignore"):
+        CASES.append((f"{workflow} push {key}", "docs-classifier", "push must have no paths filter", [
+            (workflow, "  push:\n", f"  push:\n    {key}: ['**/*.rs']\n", 1)]))
+for workflow in (CI, COVERAGE, ".github/workflows/install-surface.yml"):
+    CASES.append((f"{workflow} shared push group", "push-concurrency", "only pull request", [
+        (workflow, PUSH_GROUP, "  group: ${{ github.workflow }}-${{ github.ref }}\n", 1)]))
+    CASES.append((f"{workflow} cancels push runs", "push-concurrency", "only pull request", [
+        (workflow, COVERAGE_CANCEL_LINE, "  cancel-in-progress: true\n", 1)]))
+for event in ("push", "pull_request"):
+    CASES.append((f"Wasm {event} omits next", "wasm-branches", f"{event} must include", [
+        (WASM, f"  {event}:\n    branches: [main, next]", f"  {event}:\n    branches: [main]", 1)]))
+for workflow in (TESTNET, ".github/workflows/install-surface.yml", ".github/workflows/take.yml"):
+    CASES.append((f"{workflow} named permissions", "workflow-permissions", "no top-level permissions", [
+        (workflow, "\npermissions:\n", "\nremoved-permissions:\n", 1)]))
+CASES.append(("testnet checkout credentials", "checkout-credentials", "persist-credentials", [
+    (TESTNET, "          persist-credentials: false\n", "          persist-credentials: true\n", 2)]))
+for action in ("actions/checkout", "actions/setup-python"):
+    old = live_text(CHANGELOG, re.compile(rf"{action}@[0-9a-f]{{40}}"), f"{action} pin")
+    revision = old.split("@")[1]
+    alternative = "b" * 40 if revision == "a" * 40 else "a" * 40
+    PASSING.append((f"{action} another full revision", [(CHANGELOG, old, f"{action}@{alternative}", 1)]))
+    for label, value in (("tag", "v6"), ("short", "abcdef1"), ("branch", "main"), ("uppercase", "A" * 40)):
+        CASES.append((f"{action} {label} revision", "changelog-check", "checkout and main fetch", [
+            (CHANGELOG, old, f"{action}@{value}", 1)]))
+    CASES.append((f"{action} wrong action", "changelog-check", "checkout and main fetch", [
+        (CHANGELOG, old, "another/action@" + revision, 1)]))
+
 MUTATIONS = {
+    "coverage-gate-needs-message": (
+        'expected changes, coverage-off and coverage-on', 'expected coverage-off and coverage-on',
+        ["coverage gate needs one part"]),
+    "ci-result-first-cancel": ('self.report(workflow, rule, "first step must reject cancellation")', 'pass',
+                               ["ci-result cancellation ignored"]),
+    "ci-result-timeout": ('if job.get("timeout-minutes") != 10:', 'if False:',
+                          ["ci-result without timeout", "ci-result wrong timeout"]),
+    "ci-result-final-cancel": ('self.report(workflow, rule, "last step must reject cancellation")', 'pass',
+                               ["ci-result without final cancellation check", "ci-result final cancellation succeeds"]),
+    "ci-result-step-errors": (
+        'self.unwrap_expression(str(step.get("if", ""))) != condition\n                    or "continue-on-error" in step',
+        'self.unwrap_expression(str(step.get("if", ""))) != condition',
+        ["ci-result final cancellation can continue"]),
+    "ci-result-docs-required": ('if actual != wanted:', 'if constant == "EXPECTED_JOBS" and actual != wanted:',
+        [f"ci-result docs-required omits {name}" for name in
+         ("changes", "docs-tests", "feature-discipline", "release-contracts")] +
+        ["ci-result docs-required adds skipped job", "ci-result docs-only workflow condition differs"]),
+    "ci-result-docs-condition": (
+        'self.report(workflow, rule, f"{name} has an unsupported docs-only job condition")', 'pass',
+        ["ci-result docs-only workflow condition unknown", "ci-result docs-required job with empty condition",
+         "ci-result docs-tests condition on another job"]),
+    "push-cancel": (
+        'or self.unwrap_expression(str(concurrency.get("cancel-in-progress", ""))) != "github.event_name == \'pull_request\'"',
+        'or False', [f"{workflow} cancels push runs" for workflow in
+                     (CI, COVERAGE, ".github/workflows/install-surface.yml")]),
+    "coverage-part-unwrapped": ('condition = self.unwrap_expression(condition)', 'condition = condition[3:-2].strip()',
+                                ["coverage job condition without expression wrapper passes"]),
+    "ci-result-needs": ('if not isinstance(needs, list) or set(needs) != expected:', 'if False:',
+                        ["ci-result missing need"]),
     "W01": ('if "push" not in triggers:\n            self.report(workflow, rule, "push trigger is absent")',
             'if False:\n            self.report(workflow, rule, "push trigger is absent")', ["W01"]),
     "W02": ('if "pull_request" not in triggers:', 'if False:', ["W02"]),
@@ -2217,7 +2353,7 @@ MUTATIONS = {
         '.startswith("actions/upload-artifact@"))) and not (',
         ["conditional upload"]),
     "coverage-gate-needs": (
-        "if not isinstance(needs, list) or set(map(str, needs)) != set(COVERAGE_PARTS):", "if False:",
+        "if not isinstance(needs, list) or set(map(str, needs)) != {\"changes\", *COVERAGE_PARTS}:", "if False:",
         ["coverage gate needs one part"]),
     "coverage-gate-env": ("if env != COVERAGE_RESULT_ENV:", "if False:", ["coverage gate result check reads one part twice"]),
     "coverage-gate-env-keys": (
@@ -2298,7 +2434,7 @@ MUTATIONS = {
         ["coverage-on cache saves on pull requests"]),
     "cache-save-if-scope": (
         'for source in sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")]):',
-        "for source in [directory / name for name in WORKFLOWS]:", ["rust-cache in another pull request workflow"]),
+        "for source in [directory / name for name in WORKFLOWS]:", ["rust-cache in a yaml workflow"]),
     "cache-save-if-target": (
         'if not events & {"pull_request", "pull_request_target"}:', 'if not events & {"pull_request"}:',
         ["rust-cache in pull_request_target workflow"]),

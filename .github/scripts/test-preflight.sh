@@ -104,6 +104,7 @@ self-test:test-check-proof-matrix.py	python3 .github/scripts/test-check-proof-ma
 self-test:test-check-ref-on-main.sh	bash .github/scripts/test-check-ref-on-main.sh
 self-test:test-check-workflow-invariants.py	python3 .github/scripts/test-check-workflow-invariants.py
 self-test:test-classify-docs-only.py	python3 .github/scripts/test-classify-docs-only.py
+self-test:test-ci-result.py	python3 .github/scripts/test-ci-result.py
 self-test:test-compare-crate-sums.py	python3 .github/scripts/test-compare-crate-sums.py
 self-test:test-preflight.sh	bash .github/scripts/test-preflight.sh
 self-test:test-publish-crates-check.sh	.github/scripts/test-publish-crates-check.sh
@@ -1159,7 +1160,8 @@ case_ci_yml_only() {
 case_python_check_script() {
   start_case
   edit .github/scripts/check-docs-style.py
-  expect_list "${ALWAYS[@]}" self-test:test-check-docs-style.py
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-check-docs-style.py
 }
 
 # A change to the proof matrix alone selects both matrix checks.
@@ -1172,7 +1174,8 @@ case_proof_matrix_only() {
 case_shell_check_script() {
   start_case
   edit .github/scripts/check-gate-tool-versions.sh
-  expect_list "${ALWAYS[@]}" self-test:test-check-gate-tool-versions.sh \
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-check-gate-tool-versions.sh \
     "shellcheck-changed=shellcheck -s bash .github/scripts/check-gate-tool-versions.sh"
 }
 
@@ -1182,7 +1185,8 @@ case_shell_check_script() {
 case_testnet_driver_script() {
   start_case
   edit .github/scripts/run-testnet-acceptance.sh
-  expect_list "${ALWAYS[@]}" feature-discipline self-test:test-check-feature-discipline.py \
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+    feature-discipline self-test:test-check-feature-discipline.py \
     self-test:test-run-testnet-acceptance.sh \
     "shellcheck-changed=shellcheck -s bash .github/scripts/run-testnet-acceptance.sh"
 }
@@ -1451,8 +1455,8 @@ case_full() {
       *) original=$((original + 1)) ;;
     esac
   done
-  if [ "$original" -ne 64 ] || [ "$added" -ne 2 ]; then
-    fail "the expected registry requires 64 original rows and 2 changelog rows"
+  if [ "$original" -ne 65 ] || [ "$added" -ne 2 ]; then
+    fail "the expected registry requires 65 original rows and 2 changelog rows"
   fi
   expect_list --full "${ids[@]}"
 }
@@ -1527,7 +1531,8 @@ case_release_build_scripts() {
 case_duplicate_triggers() {
   start_case
   edit .github/scripts/check-docs-style.py .github/scripts/test-check-docs-style.py
-  expect_list "${ALWAYS[@]}" self-test:test-check-docs-style.py
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-check-docs-style.py
 }
 
 case_changed_self_test() {
@@ -1715,7 +1720,8 @@ case_unloadable_install_surface_check() {
 case_the_preflight_itself() {
   start_case
   edit .github/scripts/preflight.sh
-  expect_list "${ALWAYS[@]}" self-test:test-preflight.sh shellcheck-preflight
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-preflight.sh shellcheck-preflight
 }
 
 case_registry_completeness() {
@@ -1985,8 +1991,8 @@ apply_mutation() {
       replace_line "$file" '    changelog.d/* | .github/scripts/changelog.py | .github/scripts/test-changelog.py) select_gate changelog ;;' \
         '    .github/scripts/changelog.py | .github/scripts/test-changelog.py) select_gate changelog ;;' ;;
     changelog-workflow)
-      replace_line "$file" 'INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm changelog"' \
-        'INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm"' ;;
+      replace_line "$file" 'INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm changelog testnet install-surface take"' \
+        'INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm testnet install-surface take"' ;;
     changelog-registry)
       replace_line "$file" $'changelog\tpython3 .github/scripts/changelog.py check\t-\tchangelog.yml\tchangelog\tCheck changelog fragments' \
         $'changelog\tpython3 .github/scripts/changelog.py check\t-\tchangelog.yml\tchangelog\tCheck fragment entries' ;;

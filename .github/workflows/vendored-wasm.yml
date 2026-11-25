@@ -34,9 +34,9 @@ on:
         required: false
         default: false
   pull_request:
-    branches: [main]
+    branches: [main, next]
   push:
-    branches: [main]
+    branches: [main, next]
   # Twice a week, so a restore keeps each present stellar-cli entry in use
   # within the seven-day eviction window. Push and schedule runs save missing
   # entries; other events never save.

@@ -75,7 +75,7 @@ POLICY_PIN_CRATE=stellar-agent-core
 TEST_SUPPORT_CRATE=stellar-agent-test-support
 # The workflows that check-workflow-invariants.py reads, as its docstring
 # names them.
-INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm changelog"
+INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm changelog testnet install-surface take"
 
 die() {
   echo "preflight: $*" >&2
@@ -140,6 +140,7 @@ self-test:test-check-proof-matrix.py	python3 .github/scripts/test-check-proof-ma
 self-test:test-check-ref-on-main.sh	bash .github/scripts/test-check-ref-on-main.sh	-	ci.yml	release-contracts	Self-test the ref-on-main check
 self-test:test-check-workflow-invariants.py	python3 .github/scripts/test-check-workflow-invariants.py	yaml	ci.yml	release-contracts	Check the workflow structure and the label sync
 self-test:test-classify-docs-only.py	python3 .github/scripts/test-classify-docs-only.py	-	ci.yml	release-contracts	Self-test the docs-only classifier
+self-test:test-ci-result.py	python3 .github/scripts/test-ci-result.py	-	ci.yml	release-contracts	Self-test the CI result gate
 self-test:test-compare-crate-sums.py	python3 .github/scripts/test-compare-crate-sums.py	-	ci.yml	release-contracts	Self-test the crate checksum comparison
 self-test:test-preflight.sh	bash .github/scripts/test-preflight.sh	-	install-surface.yml	install-surface	Self-test the preflight
 self-test:test-publish-crates-check.sh	.github/scripts/test-publish-crates-check.sh	cargo	ci.yml	release-contracts	Self-test the publish tier check
@@ -344,6 +345,10 @@ select_self_tests() {
     .github/scripts/check-proof-matrix.py) select_gate self-test:test-check-proof-matrix.py ;;
     .github/scripts/check-ref-on-main.sh) select_gate self-test:test-check-ref-on-main.sh ;;
     .github/scripts/classify-docs-only.py) select_gate self-test:test-classify-docs-only.py ;;
+    .github/scripts/ci-result.py) select_gate self-test:test-ci-result.py ;;
+    .github/scripts/docs_paths.py)
+      select_gate self-test:test-classify-docs-only.py
+      select_gate self-test:test-check-docs-reads.py ;;
     .github/scripts/check-workflow-invariants.py) select_gate self-test:test-check-workflow-invariants.py ;;
     .github/scripts/compare-crate-sums.py) select_gate self-test:test-compare-crate-sums.py ;;
     .github/scripts/preflight.sh) select_gate self-test:test-preflight.sh ;;

@@ -65,14 +65,9 @@ These forms stay invisible to the check:
 - a proc macro that reads a documentation file while it expands, and an
   embedding crate that takes a directory, such as ``include_dir!``.
 
-The full suite still covers them, as the workflow triggers set it: every
-pull request into ``main`` runs the full ``ci.yml`` suite (``ci.yml:26-27``);
-every push to ``next`` or ``main`` runs the workspace tests of the
-Coverage workflow, whose push trigger has no paths filter and whose
-measuring jobs run on every push (``coverage.yml:21-22``, ``:48``); a push that
-changes a path other than Markdown, ``LICENSE``, or ``.claude-plugin/**``
-runs ``ci.yml`` (``ci.yml:15-25``). A push that changes only Markdown skips
-``ci.yml``.
+Every pull request and push into ``main`` runs the full ``ci.yml`` suite.
+On ``next``, documentation-only changes run the documentation tests.
+Coverage measures code pushes, labeled pull requests, schedules, and dispatches.
 
 The registry ``.github/docs-tests.tsv`` holds one row per test: package,
 target, and the exact test name with its module path. The target is ``lib``,
@@ -104,6 +99,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+from docs_paths import is_documentation
+
 REGISTRY = ".github/docs-tests.tsv"
 DOC_DIRS = ("docs", "changelog.d", "skills")
 TEST_ATTR = re.compile(r"^(?:[\w:]+::)?(?:test|rstest|test_case|wasm_bindgen_test)\b")
@@ -113,22 +110,6 @@ KEYWORDS = {"if", "while", "for", "match", "loop", "return", "fn", "let", "mut",
             "Some", "None", "Ok", "Err", "assert", "assert_eq", "assert_ne", "format", "vec", "println",
             "panic", "matches", "concat", "env", "include_str", "include_bytes", "include", "cfg"}
 INCLUDES = ("include_str", "include_bytes")
-
-
-def is_documentation(path):
-    """Whether one normalized repository-relative path is a documentation path."""
-    if not path.endswith(".md"):
-        return False
-    parts = path.split("/")
-    if any(part in ("", ".", "..") for part in parts):
-        return False
-    if len(parts) == 1:
-        return True
-    if parts[0] == "docs":
-        return True
-    if parts[0] == "changelog.d":
-        return len(parts) == 2
-    return parts[:2] == ["skills", "stellar-agent-wallet"] and len(parts) > 2
 
 
 def is_documentation_dir(path):
