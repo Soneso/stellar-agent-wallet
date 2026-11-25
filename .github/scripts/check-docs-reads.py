@@ -67,7 +67,8 @@ These forms stay invisible to the check:
 
 Every pull request and push into ``main`` runs the full ``ci.yml`` suite.
 On ``next``, documentation-only changes run the documentation tests.
-Coverage measures code pushes, labeled pull requests, schedules, and dispatches.
+Coverage measures every main pull request and push, code changes into next,
+labeled docs-only pull requests into next, schedules, and dispatches.
 
 The registry ``.github/docs-tests.tsv`` holds one row per test: package,
 target, and the exact test name with its module path. The target is ``lib``,

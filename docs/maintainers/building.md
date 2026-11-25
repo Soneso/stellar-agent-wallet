@@ -247,8 +247,9 @@ runs the complete local registry, including coverage.
 
 CI runs the offline gates on every pull request to `main` or
 `next`. Pull-request
-coverage requires the `coverage` label; live acceptance uses its separate
-workflow. A pull request into `next` that changes only documentation,
+coverage runs automatically on every pull request into `main` and every code
+pull request into `next`. The `coverage` label adds a run on a docs-only pull request.
+Live acceptance uses its separate workflow. A pull request into `next` that changes only documentation,
 as `.github/scripts/classify-docs-only.py` decides, skips the `ci.yml` build
 and test jobs and runs `docs-tests`: the tests that `.github/docs-tests.tsv`
 lists, which `.github/scripts/check-docs-reads.py` keeps complete.
@@ -266,13 +267,30 @@ The check does not see a test that walks the repository root, a helper in
 another package that holds the documentation path, an include whose file name
 arrives as a macro argument, a proc macro that reads a documentation file, or
 an embedding crate that takes a directory; review such code by hand.
-The full suite still covers them: every pull request into `main` runs the full
-`ci.yml` suite, every push to `next` or `main` runs the workspace
-tests of `coverage.yml`, and a push that changes a path other than Markdown,
-`LICENSE`, or `.claude-plugin/**` runs `ci.yml`. A path under `skills/` counts,
-Markdown included.
-A push that changes only Markdown outside `skills/` skips `ci.yml`.
-A pull request retargeted to `main` runs the full set only after a new push.
+The full suite still covers them: every pull request into `main` and push to
+`main` runs the full `ci.yml` suite and coverage. A push to `next` skips the
+full build and test jobs and coverage only for a proven documentation-only
+change; CI still runs the documentation tests. Failed or uncertain coverage
+classification measures the change.
+A pull request retargeted to `main` runs coverage immediately. The full CI set
+and install surface rerun after a new push or a reopen, producing the required
+`ci-result (main)` check.
+
+The `feature-discipline`, `release-contracts`, and `install-surface` jobs keep
+checks unconditional, with the skill archive exception below.
+On pull requests into or pushes to `next`,
+`classify-self-tests.py` selects self-tests by changed inputs; every other event
+and any uncertain diff selects all groups. Missing outputs also run the steps.
+All groups include `.github/**`, every `Cargo.toml` and `Cargo.lock`, the root
+`rust-toolchain.toml`, `Cross.toml`, `deny.toml`, `scripts/**`, and `contracts/**`.
+The `scripts` group also includes any deletion or rename source for CODEOWNERS.
+The `rust` group includes `crates/**`, every `build.rs`, and this building guide.
+The `docs` group includes every Markdown file, `skills/**`, and `.claude-plugin/**`. The
+`preflight` group includes changelog files, `CONTRIBUTING.md`, this guide,
+`skills/**`, the smart-account vendor reference, and the sep7, sep5,
+windows-identity, and test-support `src/lib.rs` files. Both rename endpoints
+count. Local preflight retains its self-tests and runs the full registry with
+`--full`.
 Local coverage, `cargo machete`, and `cargo deny check` are optional
 reproductions. See the build-gate dimension of the
 [review checklist](review-checklist.md#8-build-gates).
@@ -434,7 +452,9 @@ gate except `shellcheck-changed`, which needs a changed shell script.
    - `test-check-workflow-invariants.py`: `check-workflow-invariants.py`, or
      any change that selects `workflow-invariants`, because the self-test
      runs that check on copies of the same files
-   - `test-classify-docs-only.py`: `classify-docs-only.py`
+   - `test-classify-docs-only.py`: `classify-docs-only.py`, `changed_paths.py`, or
+     `docs_paths.py`
+   - `test-classify-self-tests.py`: `classify-self-tests.py` or `changed_paths.py`
    - `test-compare-crate-sums.py`: `compare-crate-sums.py`
    - `test-preflight.sh`: `preflight.sh`
    - `test-publish-crates-check.sh`: `publish-crates.sh`
@@ -494,7 +514,7 @@ The preflight does not carry these CI checks: the `windows-storage` and
 `test` job, the setup steps, and the virtual environment of the workflow checks.
 It also omits the integration changelog guard of `changelog.yml`, the
 measurement and cancellation checks of the `coverage` job, and the Python 3.11
-repeat of the Python self-tests. Nor does it carry the
+repeat of the Python self-tests, or the CI self-test selector step. Nor does it carry the
 rebuild of the `vendored-wasm` workflow: its two stellar-cli build jobs, its
 `rebuild` and `vendored-wasm` jobs, and the rebuild decision of its `check` job.
 
@@ -580,12 +600,22 @@ run. Each run resets its instrumentation data, writes a separate report and
 uses the selected configuration's floors. Live tiers that attempt RPC and
 Friendbot access remain disabled.
 
-CI runs this gate in the Coverage workflow. A push to `next` or
-`main` runs it and seeds the coverage caches. It also runs weekly on main, on a
-pull request that carries the `coverage` label, and on demand through
-`workflow_dispatch`. A failed, canceled, or skipped measurement fails
-`coverage`. A maintainer adds the label to a pull request that changes Rust
-code. Local reproduction is optional.
+CI runs this gate automatically on every pull request into `main` and every
+code pull request into `next`. A proven docs-only pull request into `next`
+skips measurement unless it carries the `coverage` label. Pushes to `main`
+always measure; pushes to `next` skip only proven docs-only changes. Measuring
+pushes seed the coverage caches. The gate also runs weekly on main and on demand
+through `workflow_dispatch`. A failed, canceled, or skipped measurement fails
+`coverage`. A red coverage push on `next` blocks integration through the required
+coverage run on the pull request into `main`, which measures the tree it brings.
+Local reproduction is optional.
+
+Opening, pushing to, or reopening a pull request evaluates coverage. Adding the
+`coverage` label or changing the base also evaluates it. Removing a label starts
+no run. Other label additions and edits measure nothing, use their own
+concurrency group, and suffix every job name with ` (ignored event)` so they
+cannot replace required checks. Eligible pull request runs cancel their
+predecessors; push, schedule, and dispatch runs each have their own group.
 
 Each report artifact carries the run attempt in its name, so `coverage` reads
 only the reports of its own attempt. A rerun of the gate alone, or of one

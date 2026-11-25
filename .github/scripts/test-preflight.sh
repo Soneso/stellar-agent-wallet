@@ -104,6 +104,7 @@ self-test:test-check-proof-matrix.py	python3 .github/scripts/test-check-proof-ma
 self-test:test-check-ref-on-main.sh	bash .github/scripts/test-check-ref-on-main.sh
 self-test:test-check-workflow-invariants.py	python3 .github/scripts/test-check-workflow-invariants.py
 self-test:test-classify-docs-only.py	python3 .github/scripts/test-classify-docs-only.py
+self-test:test-classify-self-tests.py	python3 .github/scripts/test-classify-self-tests.py
 self-test:test-ci-result.py	python3 .github/scripts/test-ci-result.py
 self-test:test-compare-crate-sums.py	python3 .github/scripts/test-compare-crate-sums.py
 self-test:test-preflight.sh	bash .github/scripts/test-preflight.sh
@@ -177,6 +178,7 @@ coverage.yml	coverage	Check both measurements	reads the results of the two measu
 coverage.yml	coverage	Reject a cancelled run before the floors	fails a cancelled CI run
 coverage.yml	coverage	Reject a cancelled run after the floors	fails a cancelled CI run
 install-surface.yml	install-surface	Self-test Python checks on Python 3.11	repeats the Python self-tests on a second interpreter
+install-surface.yml	install-surface	Select self-tests	CI event selection; local preflight retains its self-tests
 install-surface.yml	install-surface	Install actionlint	installs a gate tool on the runner
 vendored-wasm.yml	check	Decide whether the change needs a rebuild	decides whether the CI rebuild jobs run
 EOF
@@ -1467,12 +1469,12 @@ case_full() {
   local original=0 added=0 id
   for id in "${ids[@]}"; do
     case "$id" in
-      changelog | self-test:test-changelog.py) added=$((added + 1)) ;;
+      changelog | self-test:test-changelog.py | self-test:test-classify-self-tests.py) added=$((added + 1)) ;;
       *) original=$((original + 1)) ;;
     esac
   done
-  if [ "$original" -ne 65 ] || [ "$added" -ne 2 ]; then
-    fail "the expected registry requires 65 original rows and 2 changelog rows"
+  if [ "$original" -ne 65 ] || [ "$added" -ne 3 ]; then
+    fail "the expected registry requires 65 original rows, 2 changelog rows, and 1 classifier row"
   fi
   expect_list --full "${ids[@]}"
 }

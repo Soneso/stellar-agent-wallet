@@ -7,6 +7,7 @@ name: CI
 # their place. The changes job decides.
 # Pushes into next use the same classifier; main always runs the full suite.
 # Skill changes run the archive checks on main.
+# Self-tests run when their inputs change on next, and always on main or an uncertain diff.
 # The suite covers format, lint, rustdoc, offline tests, dependencies, and licenses.
 # Coverage runs in coverage.yml.
 # Live testnet tests run in a separate workflow.
@@ -66,6 +67,10 @@ jobs:
     timeout-minutes: 10
     outputs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
+      selftest_scripts: ${{ steps.classify.outputs.selftest_scripts }}
+      selftest_rust: ${{ steps.classify.outputs.selftest_rust }}
+      selftest_docs: ${{ steps.classify.outputs.selftest_docs }}
+      selftest_preflight: ${{ steps.classify.outputs.selftest_preflight }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,7 +87,9 @@ jobs:
           BEFORE_SHA: ${{ github.event.before }}
           AFTER_SHA: ${{ github.event.after }}
           FORCED: ${{ github.event.forced }}
-        run: python3 .github/scripts/classify-docs-only.py >> "$GITHUB_OUTPUT"
+        run: |
+          python3 .github/scripts/classify-docs-only.py >> "$GITHUB_OUTPUT"
+          python3 .github/scripts/classify-self-tests.py >> "$GITHUB_OUTPUT"
 
   # A job that reads no documentation path skips a docs-only change.
   # !cancelled() keeps it running when the changes job fails.
@@ -358,6 +365,8 @@ jobs:
         run: python3 .github/scripts/run-docs-tests.py --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry
 
   feature-discipline:
+    needs: changes
+    if: ${{ !cancelled() }}
     name: feature-discipline
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -378,6 +387,9 @@ jobs:
             --require-hashes --only-binary :all: \
             -r .github/scripts/workflow-check-requirements.txt
           "$RUNNER_TEMP/feature-check/bin/python" .github/scripts/check-feature-discipline.py
+      - name: Self-test feature discipline and assertions
+        if: needs.changes.outputs.selftest_rust != 'false'
+        run: |
           "$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-feature-discipline.py --mutations
           bash .github/scripts/test-check-binary-marker.sh
           bash .github/scripts/test-release-checks.sh
@@ -459,6 +471,8 @@ jobs:
         run: .github/scripts/test-sdk-v17-interop.sh
 
   release-contracts:
+    needs: changes
+    if: ${{ !cancelled() }}
     name: release contracts
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -470,6 +484,7 @@ jobs:
         with:
           toolchain: "1.100.0"
       - name: Self-test the publish tier check
+        if: needs.changes.outputs.selftest_scripts != 'false'
         run: .github/scripts/test-publish-crates-check.sh
       - name: Check the publish tiers
         run: .github/scripts/publish-crates.sh --check
@@ -480,30 +495,45 @@ jobs:
       - name: Check the signer-set baseline gate
         run: bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh
       - name: Self-test the signer-set baseline gate
+        if: needs.changes.outputs.selftest_rust != 'false'
         run: bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh
       - name: Self-test the ref-on-main check
+        if: needs.changes.outputs.selftest_scripts != 'false'
         run: bash .github/scripts/test-check-ref-on-main.sh
       - name: Self-test the testnet acceptance driver
+        if: needs.changes.outputs.selftest_rust != 'false'
         run: bash .github/scripts/test-run-testnet-acceptance.sh
       - name: Self-test the crates.io existence check
+        if: needs.changes.outputs.selftest_scripts != 'false'
         run: bash .github/scripts/test-check-crates-exist.sh
       - name: Self-test the publish verification
+        if: needs.changes.outputs.selftest_scripts != 'false'
         run: bash .github/scripts/test-publish-crates-verify.sh
       - name: Self-test the crate checksum comparison
+        if: needs.changes.outputs.selftest_scripts != 'false'
         run: python3 .github/scripts/test-compare-crate-sums.py
       - name: Self-test the coverage floor gate
+        if: needs.changes.outputs.selftest_scripts != 'false'
         run: python3 .github/scripts/test-check-coverage.py
       - name: Self-test the proof matrix check
+        if: needs.changes.outputs.selftest_scripts != 'false'
         run: python3 .github/scripts/test-check-proof-matrix.py
       - name: Self-test the docs-only classifier
+        if: needs.changes.outputs.selftest_scripts != 'false'
         run: python3 .github/scripts/test-classify-docs-only.py
+      - name: Self-test the self-test classifier
+        if: needs.changes.outputs.selftest_scripts != 'false'
+        run: python3 .github/scripts/test-classify-self-tests.py
       - name: Self-test the CI result gate
+        if: needs.changes.outputs.selftest_scripts != 'false'
         run: python3 .github/scripts/test-ci-result.py
       - name: Check the documentation reads
         run: python3 .github/scripts/check-docs-reads.py
       - name: Self-test the documentation read check
+        if: needs.changes.outputs.selftest_scripts != 'false'
         run: python3 .github/scripts/test-check-docs-reads.py
       - name: Self-test the unsigned archive validation
+        if: needs.changes.outputs.selftest_scripts != 'false'
         run: python3 .github/scripts/test-validate-unsigned-archive.py
       # The runner image documents no PyYAML for its system Python, so the
       # structural workflow check runs from a virtual environment with a
@@ -516,6 +546,9 @@ jobs:
             --require-hashes --only-binary :all: \
             -r .github/scripts/workflow-check-requirements.txt
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/check-workflow-invariants.py
+      - name: Self-test the workflow structure and the label sync
+        if: needs.changes.outputs.selftest_scripts != 'false'
+        run: |
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-check-workflow-invariants.py
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-take-workflow.py
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-sync-labels.py

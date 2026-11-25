@@ -82,13 +82,25 @@ and comment lines skipped. The check fails when any of these holds:
   ``publish.yml`` job passes the script the dispatch commit (``GITHUB_SHA``).
 - ``coverage-trigger``: ``coverage.yml`` has no ``pull_request`` trigger, a
   ``paths`` or ``paths-ignore`` filter, no ``types`` list, or a list missing
-  an event in ``COVERAGE_EVENTS``. The rule reports every missing event.
+  an event in ``COVERAGE_EVENTS``, or includes ``unlabeled``.
+  The rule reports every missing event.
 - ``coverage-condition``: ``coverage.yml`` lacks a job of ``COVERAGE_PARTS``
   or the gate job ``coverage``. A part's ``if`` is not a string equal to
   ``COVERAGE_CONDITION``, or the gate's ``if`` is not a string equal to
   ``COVERAGE_GATE_CONDITION``, after the check strips the surrounding
-  whitespace and one enclosing ``${{ }}``. Or the gate is not named
-  ``coverage``.
+  whitespace and one enclosing ``${{ }}``.
+- ``coverage-eligibility``: job conditions or concurrency do not use the canonical
+  event eligibility expression.
+- ``coverage-names``: a job lacks the ignored-event suffix, allowing an ineligible
+  event to replace a required check.
+- ``selftest-selection``: a self-test has an unknown group, the wrong condition,
+  or a changed command inventory, or its CI job fails to run after changes fails.
+- ``selftest-checks``: a check or setup step can be skipped or allowed to fail.
+  The sole exception is "Check the skill archive", whose archive rule pins
+  ``SKILL_ARCHIVE_CONDITION`` and failure behavior. A self-test step holds
+  only listed self-test commands and cannot suppress failures.
+- ``selftest-selector``: install surface lacks full history or the named selector
+  immediately after checkout with the shared event environment.
 - ``coverage-split``: a ``run:`` line of ``coverage.yml`` that names
   ``cargo llvm-cov`` or ``check-coverage.py`` differs from the two
   measurement and two floor commands, runs in another job than its own, or
@@ -240,8 +252,10 @@ runs the function.
   does not use its matching ``RELEASE_TOOLCHAIN`` value. Toolchain overrides
   are forbidden except in ``vendored-wasm.yml`` and the release pin line.
 - ``ci-feature-jobs``: a job of ``CI_FEATURE_JOBS`` is missing, it or one of
-  its steps sets ``if`` or ``continue-on-error``, or it does not run each of
-  its commands unconditionally. A job of ``DOCS_ONLY_SKIPPED_JOBS`` instead
+  its steps has an unsupported condition or sets ``continue-on-error``, or
+  it does not run each of its commands. The ``feature-discipline`` job needs
+  changes, runs unless cancelled, and selects its self-tests by their inputs.
+  A job of ``DOCS_ONLY_SKIPPED_JOBS`` instead
   needs exactly ``changes`` and sets ``if`` to ``DOCS_ONLY_CONDITION`` within
   at most one enclosing ``${{ }}``. The ``docs-tests`` job is missing, does
   not need exactly ``changes``, sets ``if`` to anything but
@@ -341,24 +355,22 @@ REUSABLE_NEEDS_ALLOWED = {
     ("release.yml", "provenance", "provenance-name"): "needs.preflight.outputs.version",
 }
 ANCESTRY_JOBS = {("release.yml", "preflight"), ("publish.yml", "verify"), ("publish.yml", "publish")}
-# Branch protection requires the `coverage` check. GitHub leaves a required
-# check pending when a paths filter skips its workflow, so the coverage
-# workflow runs on every pull request and its job condition decides whether a
-# run measures. A run starts on every new head, and on every label change made
-# by a person or with an app token.
+# Eligible events measure every main pull request and code changes into next.
+# Ignored labels and edits must not replace required checks or cancel measurements.
 COVERAGE_WORKFLOW = "coverage.yml"
-COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled", "unlabeled")
-# The coverage jobs measure on a push, on the schedule, on a dispatch, and on
-# a pull request whose labels include `coverage`.
-COVERAGE_LABEL = ("github.event_name != 'pull_request' || "
-                  "contains(github.event.pull_request.labels.*.name, 'coverage')")
+COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled", "edited")
+COVERAGE_ELIGIBILITY = "github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)"
+COVERAGE_LABEL = "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')"
 COVERAGE_DOCS_SKIP = ("github.event_name == 'push' && needs.changes.result == 'success' && "
                       "needs.changes.outputs.docs_only == 'true'")
-COVERAGE_CONDITION = f"!cancelled() && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
-# The gate job `coverage` runs after failed, cancelled, or skipped
-# measurements under the same label condition, so its check fails instead of
-# being skipped.
-COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
+COVERAGE_CONDITION = f"!cancelled() && ({COVERAGE_ELIGIBILITY}) && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
+# The gate still rejects failed, cancelled, or skipped measurements.
+COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_ELIGIBILITY}) && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
+COVERAGE_SUFFIX = "${{ !(" + COVERAGE_ELIGIBILITY + ") && ' (ignored event)' || '' }}"
+COVERAGE_NAMES = {"changes": "changes", "coverage-off": "coverage (feature-off)",
+                  "coverage-on": "coverage (feature-on)", "coverage": "coverage"}
+COVERAGE_GROUP = ("${{ github.workflow }}-${{ github.event_name == 'pull_request' && ("
+                  + COVERAGE_ELIGIBILITY + ") && github.ref || github.run_id }}")
 COVERAGE_PARTS = ("coverage-off", "coverage-on")
 COVERAGE_GATE = "coverage"
 # Pushes to these branches seed the coverage caches, except docs-only pushes to next.
@@ -570,6 +582,45 @@ SKILL_ARCHIVE_CONDITION = "github.base_ref != 'next' && github.ref != 'refs/head
 # The feature jobs of ci.yml and the commands that define each of them. The
 # off jobs pass --no-default-features, which keeps mainnet-write off; the
 # binary packages enable it by default.
+SELFTEST_GROUPS = ("scripts", "rust", "docs", "preflight")
+SELFTESTS = {
+    "ci.yml:feature-discipline": {
+        "\"$RUNNER_TEMP/feature-check/bin/python\" .github/scripts/test-check-feature-discipline.py --mutations": "rust",
+        "bash .github/scripts/test-check-binary-marker.sh": "rust",
+        "bash .github/scripts/test-release-checks.sh": "rust",
+        "\"$RUNNER_TEMP/feature-check/bin/python\" .github/scripts/test-check-provenance.py --mutations": "rust",
+    },
+    "ci.yml:release-contracts": {
+        ".github/scripts/test-publish-crates-check.sh": "scripts",
+        "bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh": "rust",
+        "bash .github/scripts/test-check-ref-on-main.sh": "scripts",
+        "bash .github/scripts/test-run-testnet-acceptance.sh": "rust",
+        "bash .github/scripts/test-check-crates-exist.sh": "scripts",
+        "bash .github/scripts/test-publish-crates-verify.sh": "scripts",
+        "python3 .github/scripts/test-compare-crate-sums.py": "scripts",
+        "python3 .github/scripts/test-check-coverage.py": "scripts",
+        "python3 .github/scripts/test-check-proof-matrix.py": "scripts",
+        "python3 .github/scripts/test-classify-docs-only.py": "scripts",
+        "python3 .github/scripts/test-classify-self-tests.py": "scripts",
+        "python3 .github/scripts/test-ci-result.py": "scripts",
+        "python3 .github/scripts/test-check-docs-reads.py": "scripts",
+        "python3 .github/scripts/test-validate-unsigned-archive.py": "scripts",
+        "\"$RUNNER_TEMP/workflow-check/bin/python\" .github/scripts/test-check-workflow-invariants.py": "scripts",
+        "\"$RUNNER_TEMP/workflow-check/bin/python\" .github/scripts/test-take-workflow.py": "scripts",
+        "\"$RUNNER_TEMP/workflow-check/bin/python\" .github/scripts/test-sync-labels.py": "scripts",
+        "\"$RUNNER_TEMP/workflow-check/bin/python\" .github/scripts/test-triage-workflow.py": "scripts",
+        "\"$RUNNER_TEMP/workflow-check/bin/python\" .github/scripts/test-welcome-workflow.py": "scripts",
+        "\"$RUNNER_TEMP/workflow-check/bin/python\" .github/scripts/test-welcome-workflow.py --mutations": "scripts",
+    },
+    "install-surface.yml:install-surface": {
+        "python3 .github/scripts/test-check-install-surface.py": "docs",
+        "python3 .github/scripts/test-check-docs-style.py": "docs",
+        "bash .github/scripts/test-check-gate-tool-versions.sh": "docs",
+        "bash .github/scripts/test-preflight.sh": "preflight",
+        "bash .github/scripts/test-preflight.sh --mutations": "preflight",
+    },
+}
+
 CI_FEATURE_JOBS = {
     "clippy": (
         'cargo clippy --workspace --all-targets --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE" '
@@ -1045,6 +1096,8 @@ class Checker:
         if not isinstance(types, list):
             self.report(workflow, "coverage-trigger", "pull_request types are absent")
             return
+        if "unlabeled" in types:
+            self.report(workflow, "coverage-trigger", "pull_request types must not include unlabeled")
         for event in COVERAGE_EVENTS:
             if event not in types:
                 self.report(workflow, "coverage-trigger", f"pull_request types lack {event}")
@@ -1059,7 +1112,7 @@ class Checker:
             if isinstance(condition, str):
                 condition = self.unwrap_expression(condition)
             if condition != COVERAGE_CONDITION:
-                self.report(workflow, "coverage-condition", f"{name} job runs without the label condition")
+                self.report(workflow, "coverage-condition", f"{name} job runs without the measure condition")
             if isinstance(job, dict) and job.get("needs") not in ("changes", ["changes"]):
                 self.report(workflow, "coverage-condition", f"{name} must need changes")
         if COVERAGE_GATE not in jobs:
@@ -1070,9 +1123,20 @@ class Checker:
         if isinstance(gate_condition, str):
             gate_condition = self.unwrap_expression(gate_condition)
         if gate_condition != COVERAGE_GATE_CONDITION:
-            self.report(workflow, "coverage-condition", "coverage gate runs without always() and the label condition")
-        if gate.get("name") != COVERAGE_GATE:
-            self.report(workflow, "coverage-condition", "coverage gate is not named coverage")
+            self.report(workflow, "coverage-condition", "coverage gate runs without always() and the measure condition")
+
+
+    def check_coverage_eligibility(self, workflow, doc, jobs):
+        if (doc.get("concurrency") or {}).get("group") != COVERAGE_GROUP:
+            self.report(workflow, "coverage-eligibility", "concurrency must isolate ineligible events")
+        for name, title in COVERAGE_NAMES.items():
+            job = jobs.get(name) or {}
+            condition = self.unwrap_expression(str(job.get("if", "")))
+            expected = COVERAGE_ELIGIBILITY if name == "changes" else f"({COVERAGE_ELIGIBILITY})"
+            if (condition != expected if name == "changes" else condition.count(expected) != 1):
+                self.report(workflow, "coverage-eligibility", f"{name} must use canonical eligibility")
+            if job.get("name") != title + COVERAGE_SUFFIX:
+                self.report(workflow, "coverage-names", f"{name} must suffix ignored events")
 
     def check_coverage_split(self, workflow, jobs):
         """Each measurement and floor command runs once, in its own job, and
@@ -1931,10 +1995,16 @@ class Checker:
                               and needs in ("changes", ["changes"]))
                 if not documented or "continue-on-error" in job:
                     self.report("ci.yml", "ci-feature-jobs", f"{name} can be bypassed")
+            elif name == "feature-discipline":
+                if (self.unwrap_expression(str(job.get("if", ""))) != "!cancelled()"
+                        or job.get("needs") not in ("changes", ["changes"]) or "continue-on-error" in job):
+                    self.report("ci.yml", "ci-feature-jobs", f"{name} can be bypassed")
             elif "if" in job or "continue-on-error" in job:
                 self.report("ci.yml", "ci-feature-jobs", f"{name} can be bypassed")
             for step in job.get("steps", []):
-                if "if" in step or "continue-on-error" in step:
+                if ("continue-on-error" in step or ("if" in step and not (
+                        name == "feature-discipline" and self.selftest_commands(step)
+                        and step["if"] == "needs.changes.outputs.selftest_rust != 'false'"))):
                     self.report("ci.yml", "ci-feature-jobs", f"{name} step can be bypassed")
             for command in commands:
                 if self.runs_in_job("ci.yml", name, command, "ci-feature-jobs") < 0:
@@ -1992,7 +2062,9 @@ class Checker:
             return
         step = steps[0]
         shell = self.effective_shell("ci.yml", "release-contracts", step)
-        if self.may_skip(job) or "continue-on-error" in step or shell not in (None, "bash"):
+        if (self.unwrap_expression(str(job.get("if", ""))) != "!cancelled()"
+                or job.get("needs") not in ("changes", ["changes"]) or "continue-on-error" in job
+                or "continue-on-error" in step or shell not in (None, "bash")):
             self.report("ci.yml", "skill-archive", "skill archive check can be bypassed")
         if self.unwrap_expression(step.get("if", "")) != SKILL_ARCHIVE_CONDITION:
             self.report("ci.yml", "skill-archive", "skill archive condition differs from the integration branch exception")
@@ -2037,7 +2109,8 @@ class Checker:
         for name in sorted(expected):
             condition = self.unwrap_expression(str(jobs[name].get("if", "")))
             if ((name == DOCS_TESTS_JOB and condition == DOCS_TESTS_CONDITION)
-                    or (name != DOCS_TESTS_JOB and "if" not in jobs[name])):
+                    or (name != DOCS_TESTS_JOB and "if" not in jobs[name])
+                    or (name in ("feature-discipline", "release-contracts") and condition == "!cancelled()")):
                 docs_required.add(name)
             elif name == DOCS_TESTS_JOB or condition != DOCS_ONLY_CONDITION:
                 self.report(workflow, rule, f"{name} has an unsupported docs-only job condition")
@@ -2095,12 +2168,19 @@ class Checker:
             job = self.job(workflow, "changes") or {}
             steps = job.get("steps", [])
             classifiers = [step for step in steps if step.get("id") == "classify"]
+            command = 'python3 .github/scripts/classify-docs-only.py >> "$GITHUB_OUTPUT"'
+            outputs = {"docs_only": "${{ steps.classify.outputs.docs_only }}"}
+            condition = COVERAGE_ELIGIBILITY if workflow == "coverage.yml" else ""
+            if workflow == "ci.yml":
+                command += '\npython3 .github/scripts/classify-self-tests.py >> "$GITHUB_OUTPUT"'
+                outputs.update({f"selftest_{group}": "${{ steps.classify.outputs.selftest_" + group + " }}"
+                                for group in SELFTEST_GROUPS})
             if (len(classifiers) != 1 or classifiers[0].get("env") != env
-                    or self.run_text(classifiers[0]).strip() !=
-                    'python3 .github/scripts/classify-docs-only.py >> "$GITHUB_OUTPUT"'
-                    or self.may_skip(classifiers[0]) or "if" in job or "needs" in job
+                    or self.run_text(classifiers[0]).strip() != command
+                    or self.may_skip(classifiers[0])
+                    or self.unwrap_expression(str(job.get("if", ""))) != condition or "needs" in job
                     or "continue-on-error" in job
-                    or job.get("outputs") != {"docs_only": "${{ steps.classify.outputs.docs_only }}"}):
+                    or job.get("outputs") != outputs):
                 self.report(workflow, "docs-classifier", "changes must call the classifier with the shared environment")
             if not any(str(step.get("uses", "")).startswith("actions/checkout@")
                        and (step.get("with") or {}).get("fetch-depth") == 0
@@ -2110,11 +2190,69 @@ class Checker:
             if RUST_CACHE_ACTION.match(str(step.get("uses", ""))) and (step.get("with") or {}).get("save-if") is not False:
                 self.report("ci.yml", "docs-classifier", "docs-tests must never save its partial test cache")
 
+
+    @classmethod
+    def selftest_commands(cls, step):
+        return [line for line in cls.normalized(cls.run_text(step))
+                if re.search(r'^(?:bash |python3 |"\$RUNNER_TEMP/[^"]+/bin/python" )?\.github/scripts/test-|--mutations', line)]
+
+    def check_selftest_selection(self):
+        for owner, commands in SELFTESTS.items():
+            workflow, name = owner.split(":")
+            job = self.job(workflow, name) or {}
+            if workflow == "ci.yml" and (
+                    job.get("needs") not in ("changes", ["changes"])
+                    or self.unwrap_expression(str(job.get("if", ""))) != "!cancelled()"
+                    or "continue-on-error" in job):
+                self.report(workflow, "selftest-selection", f"{name} must run after changes even on failure")
+            seen = set()
+            for step in job.get("steps", []):
+                tests = self.selftest_commands(step)
+                if not tests:
+                    # The archive rule owns the sole check-step exception,
+                    # including its exact SKILL_ARCHIVE_CONDITION and errors.
+                    archive = (owner == "ci.yml:release-contracts"
+                               and step.get("name") == "Check the skill archive")
+                    if self.may_skip(step) and not archive:
+                        self.report(workflow, "selftest-checks", f"{name}: check steps must be unconditional")
+                    continue
+                seen.update(tests)
+                groups = {commands.get(command) for command in tests}
+                prefix = "steps.sel" if workflow == "install-surface.yml" else "needs.changes"
+                if len(groups) != 1 or not groups.issubset(SELFTEST_GROUPS):
+                    self.report(workflow, "selftest-selection", f"{name}: unknown or mixed self-test group")
+                    continue
+                group = next(iter(groups))
+                if step.get("if") != f"{prefix}.outputs.selftest_{group} != 'false'":
+                    self.report(workflow, "selftest-selection", f"{name}: self-test condition must select {group}")
+                if ("continue-on-error" in step or self.suppresses(step)
+                        or any(line not in tests
+                               for line in self.normalized(self.run_text(step)))):
+                    self.report(workflow, "selftest-checks", f"{name}: self-tests must be separate and fail on errors")
+            if seen != set(commands):
+                self.report(workflow, "selftest-selection", f"{name}: self-test command inventory differs")
+        workflow = "install-surface.yml"
+        steps = (self.job(workflow, "install-surface") or {}).get("steps", [])
+        checkout = steps[0] if steps else {}
+        selector = steps[1] if len(steps) > 1 else {}
+        env = {"EVENT_NAME": "${{ github.event_name }}", "BASE_REF": "${{ github.base_ref }}",
+               "BASE_SHA": "${{ github.event.pull_request.base.sha }}",
+               "HEAD_SHA": "${{ github.event.pull_request.head.sha }}", "REF": "${{ github.ref }}",
+               "BEFORE_SHA": "${{ github.event.before }}", "AFTER_SHA": "${{ github.event.after }}",
+               "FORCED": "${{ github.event.forced }}"}
+        if (not str(checkout.get("uses", "")).startswith("actions/checkout@")
+                or (checkout.get("with") or {}).get("fetch-depth") != 0 or self.may_skip(checkout)
+                or selector.get("id") != "sel" or not selector.get("name") or self.may_skip(selector)
+                or selector.get("env") != env or self.run_text(selector).strip() !=
+                'python3 .github/scripts/classify-self-tests.py >> "$GITHUB_OUTPUT"'):
+            self.report(workflow, "selftest-selector", "full checkout must immediately precede the named selector")
+
     def check_push_concurrency(self):
         for workflow in ("ci.yml", "coverage.yml", "install-surface.yml"):
             concurrency = self.docs.get(workflow, {}).get("concurrency")
             concurrency = concurrency if isinstance(concurrency, dict) else {}
-            if (concurrency.get("group") != "${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}"
+            group = COVERAGE_GROUP if workflow == "coverage.yml" else "${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}"
+            if (concurrency.get("group") != group
                     or self.unwrap_expression(str(concurrency.get("cancel-in-progress", ""))) != "github.event_name == 'pull_request'"):
                 self.report(workflow, "push-concurrency", "only pull request runs may share a group or cancel predecessors")
         doc = self.docs.get("vendored-wasm.yml", {})
@@ -2170,6 +2308,7 @@ class Checker:
         if workflow == COVERAGE_WORKFLOW:
             self.check_coverage_trigger(workflow, doc)
             self.check_coverage_condition(workflow, jobs)
+            self.check_coverage_eligibility(workflow, doc, jobs)
             self.check_coverage_split(workflow, jobs)
             self.check_coverage_gate(workflow, jobs)
             self.check_coverage_seed(workflow, doc)
@@ -2267,6 +2406,7 @@ class Checker:
         self.check_ci_result()
         self.check_docs_classifier()
         self.check_push_concurrency()
+        self.check_selftest_selection()
         return self.violations
 
 

@@ -5,7 +5,7 @@ Usage: test-welcome-workflow.py [ROOT] [--mutations | --case NAME ...]
 
 The structure case pins the workflow header, ignoring comments and blank lines.
 The ci case reads .github/workflows/ci.yml. In job release-contracts, the step
-"Check the workflow structure and the label sync" holds a line that is exactly
+"Self-test the workflow structure and the label sync" holds a line that is exactly
 "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-welcome-workflow.py,
 and the next line is the same command with --mutations.
 This uses the Python standard library; actionlint checks the YAML syntax.
@@ -30,7 +30,7 @@ from dataclasses import dataclass, field, replace
 WORKFLOW = ".github/workflows/welcome.yml"
 CI_WORKFLOW = ".github/workflows/ci.yml"
 CI_JOB = "release-contracts"
-CI_STEP = "Check the workflow structure and the label sync"
+CI_STEP = "Self-test the workflow structure and the label sync"
 CI_CASE = "ci runs the welcome mutation controls"
 SELF_TEST = ".github/scripts/test-welcome-workflow.py"
 CI_INTERPRETER = '"$RUNNER_TEMP/workflow-check/bin/python"'
