@@ -14,10 +14,14 @@ Each named mutation of the check then must fail the entries it names, and
 the restored check must pass them. With --case LABEL, the run checks the
 unmodified copy and that one failing case or PASSING entry, and the
 mutations that name it.
+Use --decision-case docs|measured|invalid for one decision-shell branch, or
+--coverage-behavior for the workflow expression event table alone.
 """
 
 import ast
 import hashlib
+import itertools
+import os
 import pathlib
 import pickle
 import re
@@ -253,14 +257,16 @@ COVERAGE_LABEL_COMMENT = (
 )
 COVERAGE_OFF_HEADER = "  coverage-off:\n    name: coverage (feature-off)" + COVERAGE_SUFFIX + "\n    needs: changes\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
 COVERAGE_ON_HEADER = "  coverage-on:\n    name: coverage (feature-on)" + COVERAGE_SUFFIX + "\n    needs: changes\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
-COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_ELIGIBILITY}) && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
+COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_ELIGIBILITY})"
+COVERAGE_MEASURE = "${{ (" + COVERAGE_LABEL + ") && !(" + COVERAGE_DOCS_SKIP + ") }}"
+COVERAGE_MEASURED_LINE = "        if: steps.decision.outputs.measured == 'true'\n"
 COVERAGE_GATE_START = "  coverage:\n    name: coverage" + COVERAGE_SUFFIX + "\n"
 COVERAGE_GATE_NEEDS = "    needs: [changes, coverage-off, coverage-on]\n"
 COVERAGE_GATE_COMMENT = (
-    "    # always() schedules this job after a failed, cancelled, or skipped\n"
-    "    # measurement, and step 1 then fails it. Steps 2 and 8 fail it in a step\n"
-    "    # evaluation that sees the run cancelled. Proven docs-only next changes\n"
-    "    # skip, unless a pull request carries the coverage label.\n"
+    "    # A job skipped by its if reports under its unevaluated name. Run on every\n"
+    "    # eligible event so coverage passes docs-only next changes without measuring,\n"
+    "    # unless a pull request carries the coverage label. Step 1 checks the results;\n"
+    "    # steps 2 and 8 reject cancellation before and after the measured floors.\n"
 )
 COVERAGE_GATE_IF_LINE = f"    if: {COVERAGE_GATE_CONDITION}\n"
 COVERAGE_GATE_HEADER = COVERAGE_GATE_START + COVERAGE_GATE_NEEDS + COVERAGE_GATE_COMMENT + COVERAGE_GATE_IF_LINE
@@ -288,11 +294,11 @@ COVERAGE_UPLOAD_ON = (COVERAGE_UPLOAD_ACTION + f"        with:\n          name: 
                       "          path: cov-feature-on.json\n          if-no-files-found: error\n"
                       "          retention-days: 1\n")
 COVERAGE_DOWNLOAD_ACTION = "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2\n"
-COVERAGE_DOWNLOAD_OFF = COVERAGE_DOWNLOAD_ACTION + "        with:\n" + COVERAGE_OFF_NAME
-COVERAGE_DOWNLOAD_ON = COVERAGE_DOWNLOAD_ACTION + f"        with:\n          name: {COVERAGE_ON_EXPORT}\n"
-COVERAGE_OFF_FLOORS_STEP = ("      - name: Enforce per-crate line-coverage floors\n        run: python3 "
+COVERAGE_DOWNLOAD_OFF = COVERAGE_DOWNLOAD_ACTION + COVERAGE_MEASURED_LINE + "        with:\n" + COVERAGE_OFF_NAME
+COVERAGE_DOWNLOAD_ON = COVERAGE_DOWNLOAD_ACTION + COVERAGE_MEASURED_LINE + f"        with:\n          name: {COVERAGE_ON_EXPORT}\n"
+COVERAGE_OFF_FLOORS_STEP = ("      - name: Enforce per-crate line-coverage floors\n" + COVERAGE_MEASURED_LINE + "        run: python3 "
                             ".github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off\n")
-COVERAGE_ON_FLOORS_STEP = ("      - name: Enforce feature-on line-coverage floors\n        run: python3 "
+COVERAGE_ON_FLOORS_STEP = ("      - name: Enforce feature-on line-coverage floors\n" + COVERAGE_MEASURED_LINE + "        run: python3 "
                            ".github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on\n")
 CACHE_SAVE_LINE = "          save-if: ${{ github.event_name == 'push' }}\n"
 RUST_CACHE_USES = "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3\n"
@@ -1522,15 +1528,28 @@ CASES = [
         (COVERAGE, "    branches: [main, next]\n" + COVERAGE_TYPES_LINE,
          "    branches: [main, next]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1),
         (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, ""), 1)]),
+    ("coverage gate retains docs-only clause", "coverage-condition", "canonical eligibility only", [
+        (COVERAGE, COVERAGE_GATE_IF_LINE, COVERAGE_GATE_IF_LINE.rstrip()
+         + f" && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})\n", 1)]),
+    ("coverage decision without label", "coverage-condition", "decision must use the measure expression", [
+        (COVERAGE, "          MEASURE: " + COVERAGE_MEASURE,
+         "          MEASURE: ${{ !(" + COVERAGE_DOCS_SKIP + ") }}", 1)]),
+    ("coverage decision without push exclusion", "coverage-condition", "decision must use the measure expression", [
+        (COVERAGE, "          MEASURE: " + COVERAGE_MEASURE,
+         "          MEASURE: ${{ (" + COVERAGE_LABEL + ") }}", 1)]),
+    ("coverage decision without id", ("coverage-condition", "coverage-gate"),
+     ("decision must use the measure expression", "decision must match the literal template"), [
+        (COVERAGE, "        id: decision\n", "", 1)]),
     ("coverage gate without always()", ("coverage-condition", "ci-feature-jobs"),
-     ("coverage gate runs without always() and the measure condition", "coverage.yml: ci-feature-jobs: coverage can be bypassed"), [
-        (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(COVERAGE_GATE_IF_LINE, COVERAGE_IF_LINE), 1)]),
-    ("coverage gate bypasses the label", "coverage-condition", "coverage gate runs without always() and the measure condition", [
+     ("coverage gate must run on always() and canonical eligibility only", "coverage.yml: ci-feature-jobs: coverage can be bypassed"), [
         (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
-            COVERAGE_GATE_IF_LINE, f"    if: always() || ({COVERAGE_CONDITION})\n"), 1)]),
-    ("coverage gate skipped on cancellation", "coverage-condition", "coverage gate runs without always() and the measure condition", [
+            COVERAGE_GATE_IF_LINE, f"    if: {COVERAGE_ELIGIBILITY}\n"), 1)]),
+    ("coverage gate bypasses eligibility", "coverage-condition", "coverage gate must run on always() and canonical eligibility only", [
         (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
-            COVERAGE_GATE_IF_LINE, f"    if: ${{{{ !cancelled() && ({COVERAGE_CONDITION}) }}}}\n"), 1)]),
+            COVERAGE_GATE_IF_LINE, f"    if: always() || ({COVERAGE_ELIGIBILITY})\n"), 1)]),
+    ("coverage gate skipped on cancellation", "coverage-condition", "coverage gate must run on always() and canonical eligibility only", [
+        (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
+            COVERAGE_GATE_IF_LINE, f"    if: ${{{{ !cancelled() && ({COVERAGE_ELIGIBILITY}) }}}}\n"), 1)]),
     ("coverage-on without the measure condition", "coverage-condition", "coverage-on job runs without the measure condition", [
         (COVERAGE, COVERAGE_ON_HEADER, COVERAGE_ON_HEADER.replace(COVERAGE_IF_LINE, ""), 1)]),
     ("coverage gate renamed", "coverage-names", "coverage must suffix ignored events", [
@@ -1625,7 +1644,7 @@ CASES = [
      "coverage step 4 transfers cov-feature-off-1, not a report of this run attempt", [
         (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_OFF.replace(COVERAGE_OFF_NAME, "          name: cov-feature-off-1\n"), 1)]),
     ("coverage download by pattern", "coverage-attempt", "coverage step 4 downloads with pattern", [
-        (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_ACTION + "        with:\n          pattern: cov-feature-off-*\n", 1)]),
+        (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_ACTION + COVERAGE_MEASURED_LINE + "        with:\n          pattern: cov-feature-off-*\n", 1)]),
     ("coverage download that merges reports", "coverage-attempt", "coverage step 4 downloads with merge-multiple", [
         (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_OFF + "          merge-multiple: true\n", 1)]),
     ("coverage without push trigger", "coverage-seed", "coverage.yml: coverage-seed: push trigger is absent", [
@@ -2297,23 +2316,24 @@ CASES.extend([
     ("S04 ignored name coverage-on", "coverage-names", "suffix ignored events", [
         (".github/workflows/coverage.yml", "    name: coverage (feature-on)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", "    name: coverage (feature-on)\n", 1)]),
     ("S03 eligibility coverage", "coverage-eligibility", "canonical eligibility", [
-        (".github/workflows/coverage.yml", "  coverage:\n    name: coverage${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n    needs: [changes, coverage-off, coverage-on]\n    # always() schedules this job after a failed, cancelled, or skipped\n    # measurement, and step 1 then fails it. Steps 2 and 8 fail it in a step\n    # evaluation that sees the run cancelled. Proven docs-only next changes\n    # skip, unless a pull request carries the coverage label.\n    if: always() && (github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true')\n", "  coverage:\n    name: coverage${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n    needs: [changes, coverage-off, coverage-on]\n    # always() schedules this job after a failed, cancelled, or skipped\n    # measurement, and step 1 then fails it. Steps 2 and 8 fail it in a step\n    # evaluation that sees the run cancelled. Proven docs-only next changes\n    # skip, unless a pull request carries the coverage label.\n    if: always() && (github.event_name != 'pull_request' || false || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true')\n", 1)]),
+        (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
+            COVERAGE_GATE_IF_LINE, COVERAGE_GATE_IF_LINE.replace("github.event.action == 'opened'", "false")), 1)]),
     ("S04 ignored name coverage", "coverage-names", "suffix ignored events", [
         (".github/workflows/coverage.yml", "    name: coverage${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", "    name: coverage\n", 1)]),
     ("S05 measure main", ("coverage-condition",) * 3,
      ("coverage-off job runs without the measure condition",
       "coverage-on job runs without the measure condition",
-      "coverage gate runs without always() and the measure condition"), [
+      "coverage gate decision must use the measure expression"), [
         (".github/workflows/coverage.yml", "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')", "github.event_name != 'pull_request' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')", 3)]),
     ("S05 measure uncertain", ("coverage-condition",) * 3,
      ("coverage-off job runs without the measure condition",
       "coverage-on job runs without the measure condition",
-      "coverage gate runs without always() and the measure condition"), [
+      "coverage gate decision must use the measure expression"), [
         (".github/workflows/coverage.yml", "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')", "github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'coverage')", 3)]),
     ("S05 measure label", ("coverage-condition",) * 3,
      ("coverage-off job runs without the measure condition",
       "coverage-on job runs without the measure condition",
-      "coverage gate runs without always() and the measure condition"), [
+      "coverage gate decision must use the measure expression"), [
         (".github/workflows/coverage.yml", "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')", "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true')", 3)]),
     ("S06 condition ci.yml Self-test feature discipline and assertions", "selftest-selection", "self-test condition", [
         (".github/workflows/ci.yml", "      - name: Self-test feature discipline and assertions\n        if: needs.changes.outputs.selftest_rust != 'false'\n", "      - name: Self-test feature discipline and assertions\n", 1)]),
@@ -2510,6 +2530,11 @@ CASES.extend([
 ])
 
 MUTATIONS = {
+    "coverage-decision-id": (
+        'first.get("id") != "decision"\n                or ', '', ["coverage decision without id"]),
+    "coverage-decision-expression": (
+        'self.unwrap_expression(str((first.get("env") or {}).get("MEASURE", ""))) != self.unwrap_expression(COVERAGE_MEASURE)', 'False',
+        ["coverage decision without label", "coverage decision without push exclusion"]),
     "signature-needs": (
         'for dependency in ("preflight", "provenance", "hashes", "sign"):',
         'for dependency in ("preflight", "provenance", "hashes"):',
@@ -2775,10 +2800,10 @@ MUTATIONS = {
         "if gate_condition != COVERAGE_GATE_CONDITION:", "if False:", ["coverage gate without always()"]),
     "coverage-gate-label": (
         "if gate_condition != COVERAGE_GATE_CONDITION:", 'if not str(gate_condition).startswith("always()"):',
-        ["coverage gate bypasses the label"]),
+        ["coverage gate bypasses eligibility"]),
     "coverage-gate-not-cancelled": (
         "if gate_condition != COVERAGE_GATE_CONDITION:",
-        'if gate_condition not in (COVERAGE_GATE_CONDITION, f"!cancelled() && ({COVERAGE_CONDITION})"):',
+        'if gate_condition not in (COVERAGE_GATE_CONDITION, f"!cancelled() && ({COVERAGE_ELIGIBILITY})"):',
         ["coverage gate skipped on cancellation"]),
     "coverage-gate-unwrap": (
         "gate_condition = self.unwrap_expression(gate_condition)", "gate_condition = gate_condition",
@@ -2852,8 +2877,8 @@ MUTATIONS = {
         "if not (len(steps) > 2 and rejects(steps[-1]) and all(index < len(steps) - 1 for index in floors)):",
         "if False:", ["coverage gate cancel rejection before the floors only"]),
     "coverage-gate-cancel-exemption": (
-        '"continue-on-error" not in step\n                        and self.normalized(self.run_text(step)) == [COVERAGE_CANCEL_RUN])',
-        '"continue-on-error" not in step)', ["coverage gate cancel rejection that never fails"]),
+        'and self.normalized(self.run_text(step)) == [COVERAGE_CANCEL_RUN])',
+        ')', ["coverage gate cancel rejection that never fails"]),
     "coverage-gate-cancel-unwrap": (
         "self.unwrap_expression(condition) != COVERAGE_CANCEL_CONDITION", "condition != COVERAGE_CANCEL_CONDITION",
         ["coverage gate cancel condition wrapped in ${{ }} passes"]),
@@ -3410,6 +3435,126 @@ def registry_group_problems(script):
     return []
 
 
+decision_env = live_text(COVERAGE, re.compile(r"        id: decision\n        env:\n.*?(?=        run:)", re.DOTALL),
+                         "coverage decision environment")
+gate_body = live_text(COVERAGE, re.compile(r"^  coverage:\n.*\Z", re.DOTALL | re.MULTILINE), "coverage gate")
+CASES.extend([
+    ("coverage decision null environment", "coverage-condition", "decision must use the measure expression", [
+        (COVERAGE, decision_env, "        id: decision\n        env: null\n", 1)]),
+    ("coverage gate without steps", "coverage-condition", "decision must use the measure expression", [
+        (COVERAGE, gate_body, gate_body.split("    steps:")[0] + "    steps: []\n", 1)]),
+])
+
+for consumer, block in (
+        ("checkout", "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n" + COVERAGE_MEASURED_LINE),
+        ("download off", COVERAGE_DOWNLOAD_OFF), ("download on", COVERAGE_DOWNLOAD_ON),
+        ("floor off", COVERAGE_OFF_FLOORS_STEP), ("floor on", COVERAGE_ON_FLOORS_STEP)):
+    label = "coverage " + consumer + " without measured guard"
+    rules = ("coverage-condition", "coverage-gate")
+    messages = ("must use the measured guard", "consumer must use the measured guard")
+    if consumer.startswith("download"):
+        rules += ("coverage-gate",)
+        messages += ("coverage gate does not download",)
+    CASES.append((label, rules, messages, [
+        (COVERAGE, block, block.replace(COVERAGE_MEASURED_LINE, ""), 1)]))
+    label = "coverage " + consumer + " with wrong guard"
+    CASES.append((label, ("coverage-condition", "coverage-gate", "ci-feature-jobs"),
+                  ("must use the measured guard", "runs under success()", "coverage step can be bypassed"), [
+        (COVERAGE, block, block.replace(COVERAGE_MEASURED_LINE, "        if: success()\n"), 1)]))
+    label = "coverage " + consumer + " continues on error"
+    CASES.append((label, "ci-feature-jobs", "coverage step can be bypassed", [
+        (COVERAGE, block, block.replace(COVERAGE_MEASURED_LINE,
+         COVERAGE_MEASURED_LINE + "        continue-on-error: true\n"), 1)]))
+
+CASES.append(("coverage unrelated guarded step", ("coverage-gate", "ci-feature-jobs"),
+              ("runs under steps.decision.outputs.measured", "coverage step can be bypassed"), [
+    (COVERAGE, COVERAGE_CANCEL_FINAL,
+     "      - run: echo unrelated\n" + COVERAGE_MEASURED_LINE + COVERAGE_CANCEL_FINAL, 1)]))
+CASES.append(("coverage conditional download", "coverage-gate", "coverage gate does not download", [
+    (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_OFF.replace(
+        COVERAGE_MEASURED_LINE, ""), 1)]))
+
+for name, line in (
+        ("measured true output", '          echo "measured=true" >> "$GITHUB_OUTPUT"\n'),
+        ("measured false output", '            echo "measured=false" >> "$GITHUB_OUTPUT"\n'),
+        ("off skipped check", '            test "$OFF" = skipped\n'),
+        ("docs exit", '            exit 0\n'),
+        ("measure true check", '          test "$MEASURE" = true\n')):
+    CASES.append(("coverage decision without " + name, "coverage-gate",
+                  "decision must match the literal template", [(COVERAGE, line, "", 1)]))
+CASES.extend([
+    ("coverage decision extra line", "coverage-gate", "decision must match the literal template", [
+        (COVERAGE, COVERAGE_CANCEL_EARLY, "          echo extra\n" + COVERAGE_CANCEL_EARLY, 1)]),
+    ("coverage decision extra environment", "coverage-gate", "result check reads", [
+        (COVERAGE, decision_env, decision_env + "          EXTRA: value\n", 1)]),
+])
+PASSING.extend([
+    ("coverage measure expression as written passes", []),
+    ("coverage measured guards wrapped passes", [
+        (COVERAGE, COVERAGE_MEASURED_LINE,
+         "        if: ${{ steps.decision.outputs.measured == 'true' }}\n", 5)]),
+])
+MUTATIONS.update({
+    "coverage-template-id": (
+        'first.get("id") != "decision" or first.get("run") != COVERAGE_DECISION_RUN',
+        'first.get("run") != COVERAGE_DECISION_RUN', ["coverage decision without id"]),
+    "coverage-template-run": (
+        'first.get("run") != COVERAGE_DECISION_RUN', 'False',
+        ["coverage decision without measured true output", "coverage decision without measured false output",
+         "coverage decision without off skipped check", "coverage decision without docs exit",
+         "coverage decision without measure true check", "coverage decision extra line"]),
+    "coverage-consumer-condition": (
+        'self.report(workflow, "coverage-condition", "coverage gate checkout, download and floors must use the measured guard")',
+        'pass', ["coverage checkout without measured guard"]),
+    "coverage-consumer-gate": (
+        'self.report(workflow, rule, "coverage gate consumer must use the measured guard")',
+        'pass', ["coverage floor off without measured guard"]),
+    "coverage-classify-checkout": (
+        '("actions/checkout@", "actions/download-artifact@")', '("actions/download-artifact@",)',
+        ["coverage checkout without measured guard"]),
+    "coverage-classify-download": (
+        '("actions/checkout@", "actions/download-artifact@")', '("actions/checkout@",)',
+        ["coverage download off without measured guard"]),
+    "coverage-classify-floor-off": (
+        'for command in (COVERAGE_OFF_FLOORS, COVERAGE_ON_FLOORS)))',
+        'for command in (COVERAGE_ON_FLOORS,)))', ["coverage floor off without measured guard"]),
+    "coverage-classify-floor-on": (
+        'for command in (COVERAGE_OFF_FLOORS, COVERAGE_ON_FLOORS)))',
+        'for command in (COVERAGE_OFF_FLOORS,)))', ["coverage floor on without measured guard"]),
+    "coverage-classify-unrelated": (
+        'return (str(step.get("uses") or "").startswith',
+        'return True or (str(step.get("uses") or "").startswith', ["coverage unrelated guarded step"]),
+    "coverage-gate-guard-value": (
+        'if "if" in step and not (self.coverage_measured_step(step) and self.unwrap_expression(str(step["if"])) == COVERAGE_MEASURED):',
+        'if "if" in step and not self.coverage_measured_step(step):', ["coverage checkout with wrong guard"]),
+    "coverage-download-guard": (
+        'if len(found) != 1 or self.unwrap_expression(str(found[0][1].get("if", ""))) != COVERAGE_MEASURED:',
+        'if len(found) != 1:', ["coverage conditional download"]),
+    "coverage-feature-guard": (
+        'or (self.coverage_measured_step(step) and self.unwrap_expression(str(step["if"])) == COVERAGE_MEASURED))):',
+        'or self.coverage_measured_step(step))):', ["coverage checkout with wrong guard"]),
+    "coverage-measure-unwrap": (
+        'self.unwrap_expression(str((first.get("env") or {}).get("MEASURE", "")))',
+        'str((first.get("env") or {}).get("MEASURE", ""))', ["coverage measure expression as written passes"]),
+    "coverage-measure-expected-unwrap": (
+        '!= self.unwrap_expression(COVERAGE_MEASURE)', '!= COVERAGE_MEASURE',
+        ["coverage measure expression as written passes"]),
+    "coverage-old-gate": (
+        'if gate_condition != COVERAGE_GATE_CONDITION:',
+        'if gate_condition not in (COVERAGE_GATE_CONDITION, COVERAGE_GATE_CONDITION + f" && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"):',
+        ["coverage gate retains docs-only clause"]),
+})
+for name, needle in (
+        ("condition", 'self.unwrap_expression(str(step.get("if", ""))) != COVERAGE_MEASURED:\n                self.report(workflow, "coverage-condition"'),
+        ("consumer", 'self.unwrap_expression(str(step.get("if", ""))) != COVERAGE_MEASURED:\n                self.report(workflow, rule, "coverage gate consumer'),
+        ("gate", 'self.unwrap_expression(str(step["if"])) == COVERAGE_MEASURED):'),
+        ("download", 'self.unwrap_expression(str(found[0][1].get("if", ""))) != COVERAGE_MEASURED:'),
+        ("feature", 'self.unwrap_expression(str(step["if"])) == COVERAGE_MEASURED))):')):
+    MUTATIONS["coverage-unwrap-" + name] = (
+        needle, needle.replace("self.unwrap_expression(", "str(", 1),
+        ["coverage measured guards wrapped passes"])
+
+
 def copy_tree(destination):
     shutil.copytree(ROOT / ".github", destination / ".github")
     shutil.copy2(ROOT / "rust-toolchain.toml", destination / "rust-toolchain.toml")
@@ -3614,7 +3759,6 @@ def case_problems(output, case):
 
 def coverage_behavior():
     """Evaluate the actual expressions against an independent event table."""
-    import itertools
     import yaml
     doc = yaml.safe_load((ROOT / COVERAGE).read_text())
     problems = []
@@ -3661,18 +3805,63 @@ def coverage_behavior():
         for job_id, title in (("changes", "changes"), ("coverage-off", "coverage (feature-off)"),
                               ("coverage-on", "coverage (feature-on)"), ("coverage", "coverage")):
             job = doc["jobs"][job_id]
-            expected = eligible if job_id == "changes" else measure and (job_id == "coverage" or not cancelled)
+            expected = eligible if job_id in ("changes", "coverage") else measure and not cancelled
             if bool(evaluate(job["if"], values, cancelled)) != expected:
                 problems.append(f"{job_id}: eligibility/measurement differs: {values}, cancelled={cancelled}")
             if render(job["name"], values, cancelled) != title + ("" if eligible else " (ignored event)"):
                 problems.append(f"{job_id}: ignored name differs: {values}")
+        decision = doc["jobs"]["coverage"]["steps"][0]
+        if eligible and bool(evaluate(decision["env"]["MEASURE"], values, cancelled)) != measure:
+            problems.append(f"coverage decision measurement differs: {values}")
         group = "refs/pull/1/merge" if event == "pull_request" and eligible else "123"
         if render(doc["concurrency"]["group"], values, cancelled) != "Coverage-" + group:
             problems.append(f"coverage concurrency differs: {values}")
     return problems
 
 
+def coverage_decision(case=None):
+    """Run the actual decision shell with every result tuple, without actions."""
+    step = yaml.safe_load((ROOT / COVERAGE).read_text())["jobs"]["coverage"]["steps"][0]
+    problems = []
+    modes = {"docs": "false", "measured": "true", "invalid": "unexpected"}
+    for label, measure in modes.items():
+        if case and case != label:
+            continue
+        for changes, off, on in itertools.product(("success", "skipped", "failure", "cancelled", ""), repeat=3):
+            with tempfile.NamedTemporaryFile() as output:
+                result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", step["run"]],
+                    env={**os.environ, "MEASURE": measure, "CHANGES": changes, "OFF": off, "ON": on,
+                         "GITHUB_OUTPUT": output.name}, capture_output=True, text=True, check=False)
+                measured_output = output.read().decode()
+            wanted = "skipped" if label == "docs" else "success"
+            success = label != "invalid" and changes == "success" and off == on == wanted
+            identity = f"decision-{label} {changes}/{off}/{on}"
+            if (result.returncode == 0) != success:
+                problems.append(f"{identity}: exit {result.returncode}, expected success={success}")
+            if success:
+                message = ("The change is docs-only; nothing was measured.\n" if label == "docs"
+                           else "feature-off: success, feature-on: success\n")
+                if result.stdout != message or measured_output != f"measured={measure}\n":
+                    problems.append(f"{identity}: log/output differs: {result.stdout!r}, {measured_output!r}")
+            elif measured_output:
+                problems.append(f"{identity}: failed decision emitted measured output")
+    return problems
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--decision-case":
+        if sys.argv[2] not in ("docs", "measured", "invalid"):
+            print("unknown decision case", file=sys.stderr)
+            return 2
+        problems = coverage_decision(sys.argv[2])
+        for problem in problems:
+            print(problem)
+        return int(bool(problems))
+    if sys.argv[1:] == ["--coverage-behavior"]:
+        problems = coverage_behavior()
+        for problem in problems[:10]:
+            print(problem)
+        return int(bool(problems))
     selected = None
     if len(sys.argv) == 3 and sys.argv[1] == '--case':
         selected = sys.argv[2]
@@ -3681,7 +3870,7 @@ def main():
             return 2
     elif len(sys.argv) != 1:
         return 2
-    failures = coverage_behavior()
+    failures = [] if selected else coverage_behavior() + coverage_decision()
     for label, output, exact_count, expected in COUNT_CASES:
         problem = violation_count_problem(output, exact_count)
         if problem != expected:
