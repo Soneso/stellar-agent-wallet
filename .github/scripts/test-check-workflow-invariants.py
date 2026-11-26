@@ -2248,6 +2248,12 @@ for workflow in (TESTNET, ".github/workflows/install-surface.yml", ".github/work
         (workflow, "\npermissions:\n", "\nremoved-permissions:\n", 1)]))
 CASES.append(("testnet checkout credentials", "checkout-credentials", "persist-credentials", [
     (TESTNET, "          persist-credentials: false\n", "          persist-credentials: true\n", 2)]))
+CASES.append(("testnet config run input", "run-inputs", "run: reads", [
+    (TESTNET, '          elif [ "$MAINNET_WRITE" = true ]; then',
+     '          elif [ "${{ inputs.mainnet_write }}" = true ]; then', 1)]))
+CASES.append(("testnet revision run input", "run-inputs", "run: reads", [
+    (TESTNET, 'run: test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"',
+     'run: test "$(git rev-parse HEAD)" = "${{ inputs.filter }}"', 2)]))
 for action in ("actions/checkout", "actions/setup-python"):
     old = live_text(CHANGELOG, re.compile(rf"{action}@[0-9a-f]{{40}}"), f"{action} pin")
     revision = old.split("@")[1]
@@ -2516,6 +2522,12 @@ CASES.append(("S27 archive name in another job", "selftest-checks", "check steps
 PASSING.append(("S28 unknown registry group rejected", []))
 
 MUTATIONS = {
+    "testnet-input-channel": (r'if re.search(r"\binputs\.", expression):', 'if False:',
+                            ["testnet config run input", "testnet revision run input"]),
+    "testnet-checkout-credentials": ('if with_.get("persist-credentials") not in (False, "false"):',
+                                    'if False:', ["testnet checkout credentials"]),
+    "testnet-permissions": ('if "permissions" not in doc:', 'if False:',
+                           [".github/workflows/testnet.yml named permissions"]),
     "wallet-toolchain": ("        self.check_wallet_toolchain()\n", "",
                          [label for label, _, _ in WALLET_TOOLCHAIN_CASES]),
     "wallet-toolchain-invalid-channel-return": (

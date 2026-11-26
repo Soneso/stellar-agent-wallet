@@ -455,8 +455,11 @@ run uploads no signed archive.
 
 ### Feature-state checks
 
-Release, publish, and rehearsal expect `mainnet-write` to be on. The shared
-build script runs the environment guard immediately before the release recipe.
+Release, publish, and rehearsal expect `mainnet-write` to be on.
+Release acceptance is a dispatch on the frozen `next` commit with
+`full_run=true`, an empty filter, and `mainnet_write=true`.
+Run acceptance before integrating `next` into `main`.
+The shared build script runs the environment guard immediately before the release recipe.
 Archive verification executes both packaged binaries and checks their embedded
 markers. Archive and host checks also refuse three test-override literals:
 `STELLAR_AGENT_HOME`, `STELLAR_AGENT_TEST_`, and `.stellar-agent-test-sandbox`.
