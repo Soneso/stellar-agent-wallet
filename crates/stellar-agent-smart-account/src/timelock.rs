@@ -1132,12 +1132,10 @@ async fn cross_confirm_event(
         secondary_server.get_transaction_raw(&tx_hash_xdr),
     );
 
-    let primary_record = primary_result.map_err(|e| {
-        CrossConfirmError::EventMissing(format!("primary getTransaction failed: {e}"))
-    })?;
-    let secondary_record = secondary_result.map_err(|e| {
-        CrossConfirmError::EventMissing(format!("secondary getTransaction failed: {e}"))
-    })?;
+    let primary_record =
+        primary_result.map_err(|e| CrossConfirmError::EventMissing(format!("primary {e}")))?;
+    let secondary_record =
+        secondary_result.map_err(|e| CrossConfirmError::EventMissing(format!("secondary {e}")))?;
 
     // Check event presence on both RPCs. Contract events that do not decode
     // fail the confirmation closed.
@@ -3361,6 +3359,66 @@ mod tests {
             .mount(&server)
             .await;
         server
+    }
+
+    /// Each endpoint's failure keeps its role, one method prefix, and the
+    /// complete diagnostic with credentials scrubbed.
+    #[tokio::test]
+    async fn cross_confirm_event_names_get_transaction_once() {
+        let operation_id = TimelockOperationId::from_bytes([0x5a; 32]);
+        let healthy = serve_events(serde_json::json!([[scheduled_event_b64(&operation_id)]])).await;
+        let failing = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "method": "getTransaction",
+            })))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().expect("JSON-RPC request");
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "error": {
+                        "code": -32000,
+                        "message": "upstream https://user:SERVERSECRET@archive.example.com:8443/rpc?token=SERVERSECRET failed",
+                    },
+                }))
+            })
+            .expect(2)
+            .mount(&failing)
+            .await;
+        let failing_rpc = format!(
+            "http://operator:ENDPOINTSECRET@{}/rpc?token=ENDPOINTSECRET#fragment",
+            failing.address()
+        );
+        let healthy_rpc = healthy.uri();
+
+        for (role, primary, secondary) in [
+            ("primary", &failing_rpc, &healthy_rpc),
+            ("secondary", &healthy_rpc, &failing_rpc),
+        ] {
+            let outcome = cross_confirm_event(
+                "OperationScheduled",
+                EVENT_TX_HASH,
+                &operation_id,
+                EVENT_TIMELOCK,
+                primary,
+                secondary,
+                "req-rpc-error",
+            )
+            .await;
+            let Err(CrossConfirmError::EventMissing(reason)) = outcome else {
+                panic!("an RPC error must fail event confirmation");
+            };
+            assert_eq!(
+                reason,
+                format!(
+                    r#"{role} RPC endpoint '{}' is unreachable: getTransaction failed: "ErrorObject {{ code: ServerError(-32000), message: \"upstream archive.example.com:8443 failed\", data: None }}""#,
+                    failing.uri()
+                )
+            );
+            assert_eq!(reason.matches("getTransaction failed").count(), 1, "{role}");
+        }
+        failing.verify().await;
     }
 
     /// The expected event in `contractEventsXdr` confirms on both endpoints
