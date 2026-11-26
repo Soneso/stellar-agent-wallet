@@ -148,6 +148,9 @@ def cases() -> list[Case]:
         ("nested link destination", "Read [guide](docs/(licence)/read\u2013write.md).\n"),
         ("escaped link destination", "Read [guide](docs/part\\)/licence).\n"),
         ("reference definition license destination", "[terms]: docs/licence.md\n"),
+        ("escaped delimiter in a definition label", "[terms\\]]: docs/licence\n"),
+        ("escaped delimiter in a definition title", '[terms]: docs/a "a \\"licence\\" title"\n'),
+        ("escaped delimiter in a definition destination", "[terms]: docs/\\<licence\\>\n"),
         ("indented definition with a title", "   [guide]: docs/read\u2013write.md \"read\u2013write\"\n"),
         ("angle definition destination", "[guide]: <docs/read\u2013write.md> 'licence'\n"),
         ("angle URL definition with a title", "[terms]: <https://e.test/a> \"a licence\"\n"),
@@ -182,6 +185,8 @@ def cases() -> list[Case]:
         ("british-licence", "license prose beside autolink", "A licence applies beside <https://example.com/licence>.\n"),
         ("british-licence", "unclosed link destination", "Read [terms](licence.\n"),
         ("british-licence", "reference definition license label", "[licence]: docs/licence.md\n"),
+        ("british-licence", "unbalanced definition destination", "[terms]: docs/(licence\n"),
+        ("british-licence", "empty definition label", "[ ]: docs/licence\n"),
         ("british-licence", "bare URL license prose", "A licence applies beside https://example.com/licence.\n"),
         ("british-licence", "prose after an angle URL definition", "[terms]: <https://e.test/a> licence\n"),
         ("british-licence", "prose after a code span in a definition", "[terms]: `code` licence\n"),
@@ -381,6 +386,18 @@ def main(argv: list[str]) -> int:
             "See https://e.test/a(b)/licence.\nA licence applies.\n",
             "[terms]: " + " " * len('docs/licence "read\u2013write"\r') + "\n"
             "See " + " " * len("https://e.test/a(b)/licence") + ".\nA licence applies.\n",
+        ),
+        (
+            "escaped definition source offsets",
+            '[terms\\]]: docs/\\<licence\\> "a \\"licence\\" title"\r\n'
+            "A licence applies.\n",
+            "[terms\\]]: " + " " * len('docs/\\<licence\\> "a \\"licence\\" title"\r')
+            + "\nA licence applies.\n",
+        ),
+        (
+            "definition after a Unicode separator stays visible",
+            "Read\u2028[terms]: docs/licence\n",
+            "Read\u2028[terms]: docs/licence\n",
         ),
     ]
     for name, text, expected in masks:
