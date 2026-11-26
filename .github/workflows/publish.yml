@@ -8,8 +8,8 @@ name: Publish to crates.io
 # publishes by itself. Four jobs split the work:
 # - verify holds no credential. It builds and packages every workspace member
 #   of the tag, the unpublished one included, with `cargo package --workspace`,
-#   checks the mainnet-write marker of the binaries that package verification
-#   builds, and records the archive checksums in SHA256SUMS.
+#   checks each resulting binary's name, version, and mainnet-write marker,
+#   and records the archive checksums in SHA256SUMS.
 # - vendored-wasm holds no credential. It rebuilds every vendored contract
 #   Wasm file of the verified tag's commit with pinned tools and compares
 #   the bytes. Publish waits for this rebuild to pass.
@@ -20,7 +20,7 @@ name: Publish to crates.io
 #   Publishing (GitHub OIDC, no long-lived registry token).
 # - verify-install holds no credential and runs only after publish. It
 #   installs stellar-agent-cli of the tag's version from crates.io, derives
-#   stellar-agent-mcp, and checks both names.
+#   stellar-agent-mcp, and checks both names, versions, and markers.
 # verify and publish refuse a tag whose commit is not an ancestor of
 # origin/main. The verify, publish, and verify-install jobs check out the tag
 # by its full ref in `src/` and run this workflow's scripts from the dispatched
@@ -153,7 +153,9 @@ jobs:
 
       - name: Verify packaged feature state
         working-directory: src
-        run: bash "$GITHUB_WORKSPACE/wf/.github/scripts/check-packaged-markers.sh" target target/package-verification-start "$EXPECTED_MAINNET_WRITE"
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: bash "$GITHUB_WORKSPACE/wf/.github/scripts/check-packaged-markers.sh" target target/package-verification-start "$EXPECTED_MAINNET_WRITE" "$VERSION"
 
       - name: Record the archive checksums
         working-directory: src
@@ -382,5 +384,5 @@ jobs:
 
       - name: Verify registry installs
         env:
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: bash "$GITHUB_WORKSPACE/wf/.github/scripts/release/verify-install.sh" "$TAG" "$EXPECTED_MAINNET_WRITE"

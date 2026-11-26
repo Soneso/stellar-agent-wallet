@@ -1573,7 +1573,8 @@ case_invariants_helper() {
 # release-rehearsal.yml names the release build scripts in a subdirectory of
 # .github/scripts/, so the computed input set of the invariants gate holds
 # them, and a change to one selects the check and its self-test. A change to
-# sodium.sh also selects the release checks, which hold its stub-download test.
+# sodium.sh, check-host.sh or verify-signatures.sh also selects the release
+# checks, which hold their stub-tool tests.
 case_release_build_scripts() {
   local script
   start_case
@@ -1593,6 +1594,12 @@ case_release_build_scripts() {
   expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
     self-test:test-release-checks.sh "shellcheck-changed=shellcheck -s bash .github/scripts/release/sodium.sh"
   git checkout -q -- .github/scripts/release/sodium.sh
+  for script in check-host.sh verify-signatures.sh; do
+    edit ".github/scripts/release/$script"
+    expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+      self-test:test-release-checks.sh "shellcheck-changed=shellcheck -s bash .github/scripts/release/$script"
+    git checkout -q -- ".github/scripts/release/$script"
+  done
   edit .github/scripts/release/windows-perl.ps1
   expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py
 }

@@ -409,7 +409,7 @@ select_for_path() {
   esac
   case "$path" in
     .github/scripts/check-binary-marker.sh) select_gate self-test:test-check-binary-marker.sh; select_gate self-test:test-release-checks.sh ;;
-    .github/scripts/check-packaged-markers.sh | .github/scripts/release/verify-*.sh | .github/scripts/release/sodium.sh) select_gate self-test:test-release-checks.sh ;;
+    .github/scripts/check-packaged-markers.sh | .github/scripts/release/check-host.sh | .github/scripts/release/verify-*.sh | .github/scripts/release/sodium.sh) select_gate self-test:test-release-checks.sh ;;
     .github/scripts/check-provenance.py | .github/scripts/fixtures/*) select_gate self-test:test-check-provenance.py ;;
     .github/scripts/proof-matrix.toml | .github/scripts/check-proof-matrix.py) select_gate proof-matrix; select_gate proof-matrix:feature-on ;;
   esac

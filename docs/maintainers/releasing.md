@@ -71,6 +71,20 @@ Its `CHANGELOG.md` equals the clean three-way merge over the parents' merge
 base, preserving both sides' lines.
 The guard refuses conflicts; a maintainer resolves and merges them.
 The guard never accepts hand-resolved changelog bytes.
+It protects every `changelog.d/` path present at the PR merge base and paths
+imported from `main` by eligible sync merges, in descendants of those merges.
+A PR may revise a fragment it adds itself before such an import.
+In sync and update merges, the fragment README must equal the incoming
+version, and its first-parent version must equal the merge base.
+The guard refuses two-sided README changes and deletions on either side.
+An update merge may take its second parent from the ancestry of the PR base
+on `next`; its changelog paths must equal the clean three-way result,
+including fragments deleted on `next`.
+Every sync result matches the clean three-way result for every fragment path.
+A deletion requires unchanged bytes and mode on `next` since the merge base
+and absence on `main`; keeping that released fragment also fails.
+The workflow loads the guard from the PR base. These rules apply to every PR
+whose base contains them, including open PRs after their next run.
 
 ## What the release preflight refuses
 
@@ -195,8 +209,8 @@ The build immediately follows the environment setup, and its first action
 checks compiler overrides and cargo configuration files.
 
 Each release verification step must run its check as an unconditional
-command: the archive check, the provenance content and source discipline
-checks, the packaged marker check, and the install check. A comment, an
+command: the archive check, the provenance content, signature, and source
+discipline checks, the packaged marker check, and the install check. A comment, an
 operator that ignores the status, or a condition fails the check. The
 verification jobs hold no publishing or signing credential, their token has
 `contents: read`, and they download the run's artifacts and the registry
@@ -228,7 +242,13 @@ gate passes only after a rebuild.
 
 The `release-publish-sums` rule requires an unconditional checksum check before
 publication. The archives under `all-artifacts` must equal `SHA256SUMS` by
-name, count, and digest.
+name, count, and digest: exactly five archives must be present. `all-signatures`
+must hold six regular, non-symlink bundles: `<archive>.sigstore.json` for each
+archive and `SHA256SUMS.sigstore.json`. Missing, duplicate, or extra bundles fail publication.
+The signing job requires all five manifest-listed archives and `SHA256SUMS`,
+then signs all six files with cosign v3.1.4. Its upload fails on missing files.
+The uncredentialed `verify-provenance` job waits for signing and verifies every
+bundle with the same cosign version, identity, issuer, and workflow SHA.
 
 The build copies `stellar-agent` to `stellar-agent-mcp` and compares the
 bytes, so the `sign-macos` job receives one executable under two names as a
@@ -459,15 +479,17 @@ Release, publish, and rehearsal expect `mainnet-write` to be on.
 Release acceptance is a dispatch on the frozen `next` commit with
 `full_run=true`, an empty filter, and `mainnet_write=true`.
 Run acceptance before integrating `next` into `main`.
-The shared build script runs the environment guard immediately before the release recipe.
-Archive verification executes both packaged binaries and checks their embedded
-markers. Archive and host checks also refuse three test-override literals:
+The shared build script runs the environment guard immediately before the
+release recipe. Archive verification executes both packaged binaries and checks
+their name and version lines and embedded markers. Archive and host checks also
+refuse three test-override literals:
 `STELLAR_AGENT_HOME`, `STELLAR_AGENT_TEST_`, and `.stellar-agent-test-sandbox`.
 Apple signing and notarization (`sign-macos`) depend on the vendored Wasm
 rebuild of the tagged commit. Hashing depends on archive verification and on
 that rebuild. Apple signing and notarization, hashing, cosign signing,
 provenance, and publication therefore wait for that rebuild. Publication depends
-on the provenance content check, the source discipline check, and the rebuild.
+on the provenance content check, signature verification, the source discipline
+check, and the rebuild.
 Crate publication also requires a rebuild of every vendored Wasm file of the
 verified tag's commit from its pinned source with pinned tools and matching
 bytes. A failed, canceled, or skipped rebuild stops it before the registry
@@ -506,9 +528,10 @@ They do not establish compiler execution against a compromised build job.
 the content checker validates the statement's fields.
 
 The publish verification job checks the binaries produced from unpacked crate
-sources, including their freshness. The install check runs only after a real
+sources, including their freshness, names, and validated tag version. The install check runs only after a real
 publish, retries index propagation a bounded number of times, and verifies both
-installed binaries. It holds no publishing credential.
+installed binaries against the validated tag version and their names.
+It holds no publishing credential.
 Package and install inventory rows use these marker checks as their evidence.
 They require no graph claim about registry sources.
 
