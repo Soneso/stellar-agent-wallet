@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The publication archives equal SHA256SUMS by name, count, and digest.
+# Five publication archives match SHA256SUMS; all six bundles are regular files.
 set -euo pipefail
 if [ "$#" -ne 1 ]; then
   echo 'usage: verify-sums.sh <release-dir>' >&2
@@ -13,8 +13,11 @@ import sys
 
 root = pathlib.Path(sys.argv[1])
 try:
+    sums = root / 'release-combined/SHA256SUMS'
+    if sums.is_symlink() or not sums.is_file():
+        raise ValueError('SHA256SUMS is not a regular file')
     expected = {}
-    for line in (root / 'release-combined/SHA256SUMS').read_text().splitlines():
+    for line in sums.read_text().splitlines():
         match = re.fullmatch(r'([0-9a-fA-F]{64}) [ *]([^/\\]+\.(?:tar\.xz|zip))', line)
         if not match:
             raise ValueError('invalid SHA256SUMS entry')
@@ -22,8 +25,8 @@ try:
         if name in expected:
             raise ValueError(f'duplicate SHA256SUMS name: {name}')
         expected[name] = digest.lower()
-    if not expected:
-        raise ValueError('SHA256SUMS is empty')
+    if len(expected) != 5:
+        raise ValueError('SHA256SUMS must list exactly five archives')
     archives = {}
     for path in (root / 'all-artifacts').rglob('*'):
         if path.name.endswith(('.tar.xz', '.zip')):
@@ -41,6 +44,17 @@ try:
             digest = hashlib.file_digest(stream, 'sha256').hexdigest()
         if digest != expected[name]:
             raise ValueError(f'SHA-256 differs: {name}')
+    bundles = {}
+    for path in (root / 'all-signatures').rglob('*.sigstore.json'):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f'bundle is not a regular file: {path.name}')
+        if path.name in bundles:
+            raise ValueError(f'duplicate bundle name: {path.name}')
+        bundles[path.name] = path
+    wanted = {name + '.sigstore.json' for name in (*expected, 'SHA256SUMS')}
+    if bundles.keys() != wanted:
+        raise ValueError(f'bundle set differs: missing={sorted(wanted - bundles.keys())}, '
+                         f'extra={sorted(bundles.keys() - wanted)}')
 except (OSError, UnicodeError, ValueError) as error:
     sys.exit(f'verify-sums: {error}')
 print(f'verify-sums: {len(archives)} archives match SHA256SUMS')

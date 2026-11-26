@@ -44,10 +44,23 @@ Its `CHANGELOG.md` equals the clean three-way merge over the parents' merge
 base, preserving both sides' lines.
 The guard refuses conflicts; a maintainer resolves and merges them.
 The guard never accepts hand-resolved changelog bytes.
+Existing fragments here are paths present at the PR merge base or imported
+from `main`. Imported paths are protected in descendants of their sync merge.
+A PR may revise a fragment it adds itself before such an import.
 Never edit an existing fragment. Add a new file for a further entry.
 Each fragment file belongs to one pull request and is never reused.
 A sync merge deletes fragments that `main` folds and deletes.
 It never deletes a fragment that holds an unreleased entry under this rule.
+The guard requires the clean three-way result for every `changelog.d/` path.
+Deletion requires an unchanged first-parent version since the merge base and
+absence on `main`. In sync and update merges, the README must equal the
+incoming version, and its first-parent version must equal the merge base.
+The guard refuses two-sided README changes and deletions on either side.
+An update merge may take its second parent from the ancestry of the PR base
+on `next`. Its changelog paths must also equal the clean three-way result,
+including fragments deleted on `next`.
+The guard runs from the PR base, so these rules apply to open PRs on their next
+run once their base contains the guard.
 Missing refs, shallow history, unreadable objects, and Git errors fail the
 guard. Supply complete history before retrying.
 The guard uses `git merge-file -p --object-id` on the three file blobs.

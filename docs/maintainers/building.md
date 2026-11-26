@@ -424,9 +424,9 @@ gate except `shellcheck-changed`, which needs a changed shell script.
 4. Three self-tests, each on a change to itself or to a file in its list:
    - `test-check-binary-marker.sh`: `check-binary-marker.sh`
    - `test-release-checks.sh`: `check-binary-marker.sh`,
-     `check-packaged-markers.sh`, `release/verify-*.sh`, or `release/sodium.sh`.
-     It also tests `release/check-host.sh` and `derive-alias.sh`; a change to
-     those selects it only under `--full`.
+     `check-packaged-markers.sh`, `release/verify-*.sh`, `release/check-host.sh`,
+     or `release/sodium.sh`. It also tests `derive-alias.sh`; a change to
+     that script selects it only under `--full`.
    - `test-check-provenance.py`: `check-provenance.py` or a provenance fixture
 5. `workflow-invariants`: a change to `rust-toolchain.toml`,
    any `.yml` or `.yaml` file under `.github/workflows/`, or any file under
@@ -512,7 +512,9 @@ the `.venv` virtual environment of the PyYAML install command.
 The preflight does not carry these CI checks: the `windows-storage` and
 `platform-keyring` jobs, the `stellar-agent-test-support` feature matrix of the
 `test` job, the setup steps, and the virtual environment of the workflow checks.
-It also omits the integration changelog guard of `changelog.yml`, the
+It also omits the integration changelog guard of `changelog.yml`, which
+protects `CHANGELOG.md`, existing unreleased fragments, and the fragment README.
+Other omissions include the
 measurement and cancellation checks of the `coverage` job, and the Python 3.11
 repeat of the Python self-tests, or the CI self-test selector step. Nor does it carry the
 rebuild of the `vendored-wasm` workflow: its two stellar-cli build jobs, its
@@ -1490,9 +1492,10 @@ Each error message names its rule:
 
 Release builds refuse compiler overrides and cargo configuration files
 through the checker's `--env-guard` mode, which `build.sh` runs on its own
-checkout. `check-binary-marker.sh <binary> <on|off>` checks the second version
-line, the embedded expected marker, and the absence of the opposite marker
-and test-override literals.
+checkout. `check-binary-marker.sh <binary> <on|off> <expected-line-1>` checks
+the exact name and version on line 1, removing a trailing carriage return.
+It also checks line 2, the embedded expected marker, and the absence of the
+opposite marker and test-override literals.
 
 The [release provenance boundary](releasing.md#feature-state-checks) combines
 statement-content validation, workflow guards and resolved graphs, and packaged
@@ -1501,10 +1504,11 @@ their packaged or registry source graphs are outside this check.
 
 `check-host.sh` builds the release executable for the host target through
 `build.sh`, which copies it to `stellar-agent-mcp`, compares the two files and
-checks both markers. It then builds the CLI package alone with
+checks both names, workspace versions, and markers. It then builds the CLI package alone with
 `cargo build --locked -p stellar-agent-cli`, copies the debug executable to
 `target/tmp/host-alias/stellar-agent-mcp`, compares the bytes and checks the
-marker under both names; the preflight row `release-shape` runs it.
+name, workspace version, and marker under both names.
+The preflight row `release-shape` runs it.
 It installs nothing, and it stops in these cases:
 
 - On Linux without libudev, it prints the install command and exits 2. The

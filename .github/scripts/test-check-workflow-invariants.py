@@ -359,7 +359,7 @@ INSTALL_RUN = 'run: bash "$GITHUB_WORKSPACE/wf/.github/scripts/release/verify-in
 PROVENANCE_RUN = ('run: python3 .github/scripts/check-provenance.py "provenance/stellar-agent-$VERSION.intoto.jsonl" '
                   'provenance/SHA256SUMS "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$GITHUB_REF"')
 PACKAGE_CHECK_RUN = ('run: bash "$GITHUB_WORKSPACE/wf/.github/scripts/check-packaged-markers.sh" target '
-                     'target/package-verification-start "$EXPECTED_MAINNET_WRITE"')
+                     'target/package-verification-start "$EXPECTED_MAINNET_WRITE" "$VERSION"')
 VERIFY_PACKAGED_STEP = "      - name: Verify packaged binaries\n"
 ROSETTA_STEP = (
     "      - name: Require Rosetta\n"
@@ -376,7 +376,7 @@ RELEASE_WORKFLOW_ENV = ('env:\n  EXPECTED_MAINNET_WRITE: "on"\n'
                         "  # The toolchain publish.yml packages with; every build leg compiles with it.\n"
                         '  RELEASE_TOOLCHAIN: "1.100.0"\n')
 REHEARSAL_MARKER_RUN = ('        run: bash .github/scripts/check-packaged-markers.sh target '
-                        'target/package-verification-start "$EXPECTED_MAINNET_WRITE"\n')
+                        'target/package-verification-start "$EXPECTED_MAINNET_WRITE" "$VERSION"\n')
 # The defining command of each feature job of ci.yml, as its run: line.
 CI_FEATURE_JOBS = {
     "feature-on-clippy": 'cargo clippy --workspace --all-targets --features "mainnet-write,',
@@ -420,7 +420,7 @@ def conditional_feature_job(header):
 
 COVERAGE_OFF_RUN = "        run: cargo llvm-cov --workspace --no-default-features --features test-helpers,"
 # The host recipe lines that build the CLI package alone, and the lines that
-# derive its debug alias, compare the bytes and check both markers.
+# derive its debug alias, compare the bytes and check both names, versions, and markers.
 HOST_ALIAS = "target/tmp/host-alias/stellar-agent-mcp"
 HOST_SINGLE_CLI = ("cargo build --locked -p stellar-agent-cli\n"
                    "mkdir -p target/tmp/host-alias\n")
@@ -428,8 +428,8 @@ HOST_ALIAS_COPY = f"copy_alias target/debug/stellar-agent {HOST_ALIAS}\n"
 HOST_ALIAS_STEPS = (". .github/scripts/release/copy-alias.sh\n"
                     + HOST_ALIAS_COPY
                     + f"cmp target/debug/stellar-agent {HOST_ALIAS}\n"
-                    "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent on\n"
-                    f"bash .github/scripts/check-binary-marker.sh {HOST_ALIAS} on\n")
+                    'bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent on "stellar-agent $version"\n'
+                    f'bash .github/scripts/check-binary-marker.sh {HOST_ALIAS} on "stellar-agent-mcp $version"\n')
 HOST_RELEASE_CMP = 'cmp "target/$target/release/stellar-agent" "target/$target/release/stellar-agent-mcp"\n'
 # The copy and comparison lines of build.sh and of the smoke build step, a
 # plain copy and mv in their place, and the rename line of the copy helper.
@@ -1791,7 +1791,11 @@ CASES = [
         (RELEASE, 'needs: [preflight, vendored-wasm, build, sign-macos, sign, hashes, provenance, verify-provenance]',
          'needs: [preflight, vendored-wasm, build, sign-macos, sign, hashes, provenance]', 1)]),
     ("verify-provenance without provenance", "release-provenance-gate", "verify-provenance must need provenance", [
-        (RELEASE, "needs: [preflight, provenance, hashes]", "needs: [preflight, hashes]", 1)]),
+        (RELEASE, "needs: [preflight, provenance, hashes, sign]", "needs: [preflight, hashes, sign]", 1)]),
+    ("verify-provenance without sign", "release-provenance-gate", "verify-provenance must need sign", [
+        (RELEASE, "needs: [preflight, provenance, hashes, sign]", "needs: [preflight, provenance, hashes]", 1)]),
+    ("signature check removed", "release-provenance-gate", "verify-provenance does not run unconditionally: bash .github/scripts/release/verify-signatures.sh", [
+        (RELEASE, "run: bash .github/scripts/release/verify-signatures.sh", "run: echo .github/scripts/release/verify-signatures.sh", 1)]),
     ("provenance check behind a comment", "release-provenance-gate",
      "verify-provenance does not run unconditionally: python3 .github/scripts/check-provenance.py", [
         (RELEASE, PROVENANCE_RUN, commented(PROVENANCE_RUN), 1)]),
@@ -1938,15 +1942,15 @@ CASES = [
          '--features "$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings', 1)]),
     ("host recipe with a marker check in a subshell", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: unmodelled shell syntax around", [
-        (HOST_SCRIPT, 'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on\n',
-         '( bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on ) || true\n', 1)]),
+        (HOST_SCRIPT, 'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on "stellar-agent-mcp $version"\n',
+         '( bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on "stellar-agent-mcp $version" ) || true\n', 1)]),
     ("host recipe without the MCP marker check", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally", [
-        (HOST_SCRIPT, 'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on\n', "", 1)]),
+        (HOST_SCRIPT, 'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on "stellar-agent-mcp $version"\n', "", 1)]),
     ("host recipe that expects the release CLI off", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
      'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent" on', [
-        (HOST_SCRIPT, '"target/$target/release/stellar-agent" on\n', '"target/$target/release/stellar-agent" off\n', 1)]),
+        (HOST_SCRIPT, '"target/$target/release/stellar-agent" on "stellar-agent $version"\n', '"target/$target/release/stellar-agent" off "stellar-agent $version"\n', 1)]),
     ("host recipe without the single CLI build", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
      "cargo build --locked -p stellar-agent-cli", [
@@ -1954,7 +1958,7 @@ CASES = [
     ("host recipe that expects the debug alias off", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
      f"bash .github/scripts/check-binary-marker.sh {HOST_ALIAS} on", [
-        (HOST_SCRIPT, f"{HOST_ALIAS} on\n", f"{HOST_ALIAS} off\n", 1)]),
+        (HOST_SCRIPT, f'{HOST_ALIAS} on "stellar-agent-mcp $version"\n', f'{HOST_ALIAS} off "stellar-agent-mcp $version"\n', 1)]),
     ("host recipe with the alias steps in a condition", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
      f"cmp target/debug/stellar-agent {HOST_ALIAS}", [
@@ -2406,7 +2410,64 @@ CASES.append(("S27 archive name in another job", "selftest-checks", "check steps
      "      - name: Check the skill archive\n" + SKILL_ARCHIVE_IF, 1)]))
 PASSING.append(("S28 unknown registry group rejected", []))
 
+COSIGN_INSTALLER = "sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532"
+for job in ("sign", "verify-provenance"):
+    text = (ROOT / RELEASE).read_text()
+    block = re.search(
+        rf"(?ms)^  {job}:\n.*?(?=^  [a-z][a-z-]*:|\Z)", text).group()
+    for label, old, new, message in (
+            ("installer pin", COSIGN_INSTALLER, COSIGN_INSTALLER[:-1] + "0", "requires the pinned cosign installer"),
+            ("cosign version", "cosign-release: v3.1.4", "cosign-release: v3.0.0", "requires cosign-release: v3.1.4")):
+        CASES.append((f"{job} {label}", "release-signatures", f"{message}", [
+            (RELEASE, block, block.replace(old, new), 1)]))
+
+VERSION_STEP = re.search(r"(?ms)^      - name: Read workspace version\n.*?(?=^      - name:|\Z)",
+                         (ROOT / REHEARSAL).read_text()).group()
+CASES.extend([
+    ("signature upload tolerates missing files", "release-signatures", "signature upload requires if-no-files-found: error", [
+        (RELEASE, "name: signatures\n          if-no-files-found: error", "name: signatures\n          if-no-files-found: warn", 1)]),
+    ("rehearsal version after build", "release-version-binding", "workspace version must be read before packaging", [
+        (REHEARSAL, VERSION_STEP, "", 1),
+        (REHEARSAL, '        run: bash .github/scripts/check-packaged-markers.sh target target/package-verification-start "$EXPECTED_MAINNET_WRITE" "$VERSION"\n',
+         '        run: bash .github/scripts/check-packaged-markers.sh target target/package-verification-start "$EXPECTED_MAINNET_WRITE" "$VERSION"\n' + VERSION_STEP, 1)], 1),
+    ("rehearsal version step missing", "release-version-binding", "workspace version must be read before packaging", [
+        (REHEARSAL, VERSION_STEP, VERSION_STEP.replace("id: version", "id: unused"), 1)]),
+    ("rehearsal package version binding", "release-version-binding", "packaged check must use the validated version output", [
+        (REHEARSAL, "      - name: Verify packaged feature state\n        env:\n          VERSION: ${{ steps.version.outputs.version }}",
+         "      - name: Verify packaged feature state\n        env:\n          VERSION: 0.0.0", 1)]),
+    ("publish package version binding", "release-version-binding", "packaged check must use the validated version output", [
+        (PUBLISH, "      - name: Verify packaged feature state\n        working-directory: src\n        env:\n          VERSION: ${{ steps.tag.outputs.version }}",
+         "      - name: Verify packaged feature state\n        working-directory: src\n        env:\n          VERSION: 0.0.0", 1)]),
+    ("publish install tag binding", "release-version-binding", "install check must use the validated tag output", [
+        (PUBLISH, "TAG: ${{ steps.tag.outputs.tag }}", "TAG: ${{ inputs.tag }}", 1)]),
+])
+
 MUTATIONS = {
+    "signature-needs": (
+        'for dependency in ("preflight", "provenance", "hashes", "sign"):',
+        'for dependency in ("preflight", "provenance", "hashes"):',
+        ["verify-provenance without sign"]),
+    "signature-command": (
+        'for command in PROVENANCE_CHECKS:', 'for command in (PROVENANCE_CHECKS[0], *PROVENANCE_CHECKS[2:]):',
+        ["signature check removed"]),
+    "signature-installer": (
+        'if [step.get("uses") for step in installers] != [', 'if False and [step.get("uses") for step in installers] != [',
+        ["sign installer pin", "verify-provenance installer pin"]),
+    "signature-version": (
+        'if [(step.get("with") or {}).get("cosign-release") for step in installers] != ["v3.1.4"]:', 'if False:',
+        ["sign cosign version", "verify-provenance cosign version"]),
+    "signature-upload": (
+        'if [(step.get("with") or {}).get("if-no-files-found") for step in uploads] != ["error"]:', 'if False:',
+        ["signature upload tolerates missing files"]),
+    "package-version-binding": (
+        'if any((steps[index].get("env") or {}).get("VERSION") != version for index in checks):', 'if False:',
+        ["publish package version binding", "rehearsal package version binding"]),
+    "package-version-order": (
+        'if len(versions) != 1 or not builds or versions[0] >= builds[0]:', 'if False:',
+        ["rehearsal version after build", "rehearsal version step missing"]),
+    "install-tag-binding": (
+        'if (step.get("env") or {}).get("TAG") != "${{ steps.tag.outputs.tag }}":', 'if False:',
+        ["publish install tag binding"]),
     "wallet-toolchain": ("        self.check_wallet_toolchain()\n", "",
                          [label for label, _, _ in WALLET_TOOLCHAIN_CASES]),
     "wallet-toolchain-invalid-channel-return": (

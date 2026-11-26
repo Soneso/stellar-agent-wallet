@@ -4,6 +4,7 @@
 import ast
 from contextlib import redirect_stderr, redirect_stdout
 import io
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -93,9 +94,24 @@ class History:
     def main(self, commit):
         self.git("update-ref", "refs/remotes/origin/main", commit)
 
+    def fragments(self, entries):
+        rows = []
+        for path, value in entries.items():
+            mode, body = value if isinstance(value, tuple) else ("100644", value)
+            oid = self.git("hash-object", "-w", "--stdin", data=body)
+            rows.append(f"{mode} blob {oid}\t{path}\n")
+        tree = self.git("mktree", data="".join(rows).encode())
+        return f"040000 tree {tree}\tchangelog.d\n"
+
+    def fragment_commit(self, entries, *parents):
+        return self.commit(b"- Initial.\n", *parents, extra=self.fragments(entries))
+
     def assert_guard(self, mod, base, head, expected=0, refused=(), main_ref="refs/remotes/origin/main", merged=()):
-        rc, out, err = cli(mod, ["guard", "--root", str(self.root), "--base", base,
-                                 "--head", head, "--main-ref", main_ref])
+        try:
+            rc, out, err = cli(mod, ["guard", "--root", str(self.root), "--base", base,
+                                     "--head", head, "--main-ref", main_ref])
+        except Exception as error:
+            raise AssertionError(f"guard must report status {expected}; it raises {error!r}") from error
         require(rc == expected, f"guard must return {expected}, receives {rc}: {err}")
         if expected == 0:
             require("integration guard passes" in err and not out, "guard must report a successful history check")
@@ -609,7 +625,7 @@ def cases(mod):
         for command, output, expected in scenarios(
                 (("rev-parse", "--is-shallow-repository"), b"unknown\n", 1),
                 (("rev-parse", "--verify"), b"nonsense\n", 2),
-                (("rev-list", f"{base}..{merge}"), b"nonsense\n", 2),
+                (("rev-list", "--topo-order"), b"nonsense\n", 2),
                 (("rev-list", "--parents"), b"\n", 2),
                 (("diff-tree", "-r"), b"OTHER.md\n", 2),
                 (("merge-base", "--is-ancestor"), b"true\n", 2),
@@ -654,6 +670,8 @@ def cases(mod):
                 "sync merge must delete the unchanged folded fragment")
         require("changelog.d/pending.fixed.md" in paths,
                 "sync merge must preserve the new unreleased fragment")
+        merge = h.commit(b"- Released.\n", base, main, extra=fragments(["pending"]))
+        h.assert_guard(mod, base, merge)
 
     def g23():
         h = History()
@@ -688,6 +706,309 @@ def cases(mod):
         require(err.splitlines() == [f"{merge}: CHANGELOG.md edit is refused. CHANGELOG.md conflicts; "
                                      f"a maintainer resolves and merges it. {FRAGMENT_REMEDY}"],
                 "a conflicting merge must keep its refusal text")
+
+    def fragment_history():
+        h = History()
+        entries = {"old.fixed.md": b"- Original.\n", "README.md": b"Rules.\n"}
+        base = h.fragment_commit(entries, h.initial)
+        h.main(base)
+        return h, entries, base
+
+    def assert_fragment(h, base, head, path, message):
+        err = h.assert_guard(mod, base, head, 1)
+        require(f"{head}: changelog.d/{path}: {message}" in err,
+                "guard must name the refused fragment and reason: " + err)
+
+    def g25():
+        for value in scenarios(b"- Edited.\n", None, ("100755", b"- Original.\n"), ("120000", b"target")):
+            h, entries, base = fragment_history()
+            changed = entries | {"old.fixed.md": value}
+            if value is None:
+                del changed["old.fixed.md"]
+            edit = h.fragment_commit(changed, base)
+            assert_fragment(h, base, edit, "old.fixed.md", "protected path changes outside a sync merge")
+
+    def g26():
+        for value in scenarios(b"Edited rules.\n", None, ("100755", b"Rules.\n"), ("120000", b"target")):
+            h, entries, base = fragment_history()
+            changed = entries | {"README.md": value}
+            if value is None:
+                del changed["README.md"]
+            edit = h.fragment_commit(changed, base)
+            assert_fragment(h, base, edit, "README.md", "protected path changes outside a sync merge")
+        h = History()
+        edit = h.fragment_commit({"README.md": b"New rules.\n"}, h.initial)
+        assert_fragment(h, h.initial, edit, "README.md", "protected path changes outside a sync merge")
+
+    def g27():
+        h, entries, base = fragment_history()
+        edit = h.fragment_commit(entries | {"old.fixed.md": b"- Edited.\n"}, base)
+        revert = h.fragment_commit(entries, edit)
+        err = h.assert_guard(mod, base, revert, 1)
+        require("changelog.d/old.fixed.md: protected path changes" in err, "edit and revert must fail")
+
+    def g28():
+        h, entries, base = fragment_history()
+        added = h.fragment_commit(entries | {"new.fixed.md": b"- New.\n"}, base)
+        edited = h.fragment_commit(entries | {"new.fixed.md": b"- Revised.\n"}, added)
+        h.assert_guard(mod, base, edited)
+        redundant = h.fragment_commit(entries | {"new.fixed.md": b"- Revised in merge.\n"}, added, base)
+        subcase()
+        h.assert_guard(mod, base, redundant)
+
+    def g29():
+        h, entries, base = fragment_history()
+        ours = entries | {"pending.fixed.md": b"- Pending.\n"}
+        left = h.fragment_commit(ours, base)
+        theirs = {"README.md": entries["README.md"]}
+        right = h.fragment_commit(theirs, base)
+        h.main(right)
+        merge = h.fragment_commit(theirs | {"pending.fixed.md": ours["pending.fixed.md"]}, left, right)
+        h.assert_guard(mod, left, merge)
+
+    def g30():
+        h, entries, base = fragment_history()
+        right = h.commit(b"- Initial.\n", base, note=b"Main.\n", extra=h.fragments(entries))
+        h.main(right)
+        merge = h.fragment_commit({"README.md": entries["README.md"]}, base, right)
+        assert_fragment(h, base, merge, "old.fixed.md", "only an unchanged fragment deleted on the incoming branch may be dropped")
+
+    def g31():
+        h, entries, base = fragment_history()
+        left = h.fragment_commit(entries | {"old.fixed.md": b"- Next edit.\n"}, base)
+        right = h.fragment_commit({"README.md": entries["README.md"]}, base)
+        h.main(right)
+        merge = h.fragment_commit({"README.md": entries["README.md"]}, left, right)
+        assert_fragment(h, left, merge, "old.fixed.md", "only an unchanged fragment deleted on the incoming branch may be dropped")
+
+    def g32():
+        h, entries, base = fragment_history()
+        right = h.fragment_commit({"README.md": entries["README.md"]}, base)
+        h.main(right)
+        merge = h.fragment_commit(entries, base, right)
+        assert_fragment(h, base, merge, "old.fixed.md", "fragment differs from the clean three-way merge")
+
+    def g33():
+        h, entries, base = fragment_history()
+        right = h.commit(b"- Initial.\n", base, note=b"Main.\n", extra=h.fragments(entries))
+        h.main(right)
+        for changed in scenarios(entries | {"old.fixed.md": b"- Smuggled.\n"},
+                                 entries | {"smuggled.fixed.md": b"- Smuggled.\n"}):
+            merge = h.fragment_commit(changed, base, right)
+            path = "smuggled.fixed.md" if "smuggled.fixed.md" in changed else "old.fixed.md"
+            assert_fragment(h, base, merge, path, "fragment differs from the clean three-way merge")
+
+    def g34():
+        for incoming in ("main", "next"):
+            for left_body, right_body, result_body in scenarios(
+                    (MERGE_OURS, MERGE_THEIRS, MERGE_BOTH),
+                    (MERGE_OURS, MERGE_OURS, MERGE_OURS),
+                    (MERGE_OURS, MERGE_THEIRS, MERGE_THEIRS),
+                    (MERGE_OURS, MERGE_BASE, MERGE_OURS),
+                    (None, MERGE_BASE, MERGE_BASE),
+                    (None, None, None),
+                    (MERGE_BASE, None, None),
+                    (MERGE_BASE, None, MERGE_BASE),
+                    (MERGE_BASE, MERGE_THEIRS, None),
+                    (MERGE_BASE, MERGE_THEIRS, b"Smuggled.\n")):
+                h, entries, base = fragment_history()
+                original = h.fragment_commit(entries | {"README.md": MERGE_BASE}, base)
+                trees = [{"old.fixed.md": entries["old.fixed.md"]}
+                         | ({"README.md": body} if body is not None else {})
+                         for body in (left_body, right_body, result_body)]
+                left = h.commit(b"- Initial.\n", original, note=b"First parent.\n", extra=h.fragments(trees[0]))
+                right = h.fragment_commit(trees[1], original)
+                h.main(right if incoming == "main" else left)
+                merge = h.fragment_commit(trees[2], left, right)
+                assert_fragment(h, left if incoming == "main" else right, merge, "README.md",
+                                "README.md must remain present and cleanly propagate the incoming version")
+
+    def g35():
+        h, entries, base = fragment_history()
+        theirs = entries | {"README.md": b"Main rules.\n"}
+        right = h.fragment_commit(theirs, base)
+        h.main(right)
+        merge = h.fragment_commit(theirs, base, right)
+        h.assert_guard(mod, base, merge)
+
+    def g36():
+        h, entries, base = fragment_history()
+        theirs = entries | {"imported.fixed.md": b"- Main bytes.\n"}
+        right = h.fragment_commit(theirs, base)
+        h.main(right)
+        merge = h.fragment_commit(theirs | {"imported.fixed.md": b"- Altered bytes.\n"}, base, right)
+        assert_fragment(h, base, merge, "imported.fixed.md", "fragment differs from the clean three-way merge")
+
+    def g37():
+        h, entries, base = fragment_history()
+        theirs = entries | {"imported.fixed.md": b"- Main bytes.\n"}
+        right = h.fragment_commit(theirs, base)
+        h.main(right)
+        merge = h.fragment_commit(theirs, base, right)
+        h.assert_guard(mod, base, merge)
+        edit = h.fragment_commit(theirs | {"imported.fixed.md": b"- Later edit.\n"}, merge)
+        assert_fragment(h, base, edit, "imported.fixed.md", "protected path changes outside a sync merge")
+
+    def g38():
+        h, entries, base = fragment_history()
+        side = h.commit(b"- Initial.\n", base, note=b"Side.\n", extra=h.fragments(entries))
+        merge = h.fragment_commit({"README.md": entries["README.md"]}, base, side)
+        assert_fragment(h, base, merge, "old.fixed.md", "protected path changes outside a sync merge")
+
+    def g39():
+        # The changed next fragment predates the PR; only its sync merge is guarded.
+        for actual, expected in scenarios((MERGE_BOTH, 0), (MERGE_OURS, 1),
+                                          (("100755", MERGE_BOTH), 1)):
+            h = History()
+            base = h.fragment_commit({"entry.fixed.md": MERGE_BASE}, h.initial)
+            left = h.fragment_commit({"entry.fixed.md": MERGE_OURS}, base)
+            right = h.fragment_commit({"entry.fixed.md": MERGE_THEIRS}, base)
+            h.main(right)
+            merge = h.fragment_commit({"entry.fixed.md": actual}, left, right)
+            h.assert_guard(mod, left, merge, expected)
+        h = History()
+        base = h.fragment_commit({"entry.fixed.md": MERGE_BASE}, h.initial)
+        left = h.fragment_commit({"entry.fixed.md": MERGE_OURS}, base)
+        right = h.fragment_commit({"entry.fixed.md": ("120000", MERGE_THEIRS)}, base)
+        h.main(right)
+        merge = h.fragment_commit({"entry.fixed.md": MERGE_BOTH}, left, right)
+        subcase()
+        err = h.assert_guard(mod, left, merge, 1)
+        require("fragment merge conflicts" in err, "a type change must fail even when text merges cleanly")
+        for theirs in scenarios(b"- Conflict.\n", None, ("120000", b"target")):
+            h, entries, base = fragment_history()
+            left_entries = entries | {"old.fixed.md": b"- Next.\n"}
+            left = h.fragment_commit(left_entries, base)
+            right_entries = entries | {"old.fixed.md": theirs}
+            if theirs is None:
+                del right_entries["old.fixed.md"]
+            right = h.fragment_commit(right_entries, base)
+            h.main(right)
+            merge = h.fragment_commit(left_entries, left, right)
+            err = h.assert_guard(mod, left, merge, 1)
+            require(f"{merge}: changelog.d/old.fixed.md: fragment merge conflicts" in err,
+                    "conflicting fragment merge must name the decoded path")
+
+    def g40():
+        # A base-only addition does not protect a fragment created on this PR.
+        h, entries, common = fragment_history()
+        base = h.fragment_commit(entries | {"own.fixed.md": b"- Base.\n"}, common)
+        added = h.fragment_commit(entries | {"own.fixed.md": b"- Own.\n"}, common)
+        edited = h.fragment_commit(entries | {"own.fixed.md": b"- Revised.\n"}, added)
+        h.assert_guard(mod, base, edited)
+
+    def g41():
+        h = History()
+        base = h.fragment_commit({"entry.fixed.md": MERGE_BASE}, h.initial)
+        left = h.fragment_commit({"entry.fixed.md": MERGE_OURS}, base)
+        right = h.fragment_commit({"entry.fixed.md": MERGE_THEIRS}, base)
+        h.main(right)
+        merge = h.fragment_commit({"entry.fixed.md": MERGE_BOTH}, left, right)
+        fragment = h.git("rev-parse", f"{left}:changelog.d/entry.fixed.md")
+        real = mod.git
+        def warning(root, *args, **kwargs):
+            result = real(root, *args, **kwargs)
+            if "merge-file" in args and args[-3] == fragment:
+                result.stderr = b"unexpected merge warning"
+            return result
+        with patch.object(mod, "git", warning):
+            err = h.assert_guard(mod, left, merge, 2)
+            require("unexpected merge output" in err, "fragment merge warnings must report a tool failure")
+
+    def g42():
+        h, entries, base = fragment_history()
+        added = {"new.fixed.md": b"- New from another root.\n"}
+        side = h.commit(b"Other root.\n", path="other.md", extra=h.fragments(added))
+        merge = h.fragment_commit(entries | added, base, side)
+        h.assert_guard(mod, base, merge)
+
+    def g43():
+        h, entries, base = fragment_history()
+        right = h.fragment_commit(entries | {"README.md": b"Main rules.\n"}, base)
+        h.main(right)
+        merge = h.fragment_commit(entries, base, right)
+        assert_fragment(h, base, merge, "README.md",
+                        "README.md must remain present and cleanly propagate the incoming version")
+
+    def g44():
+        for kind in scenarios("fragment", "README", "deleted", "altered", "kept", "compiled"):
+            h, entries, common = fragment_history()
+            own = entries | {"own.fixed.md": b"- Own.\n"}
+            left = h.fragment_commit(own, common)
+            incoming = entries | {"next.fixed.md": b"- Next.\n"}
+            if kind == "README":
+                incoming["README.md"] = b"Next rules.\n"
+            if kind in ("deleted", "kept"):
+                del incoming["old.fixed.md"]
+            body = b"- Next compiled.\n" if kind == "compiled" else b"- Initial.\n"
+            right = h.commit(body, common, extra=h.fragments(incoming))
+            # The incoming parent may be older than the current base.
+            base = h.commit(body, right, note=b"Next tip.\n", extra=h.fragments(incoming))
+            actual = incoming | {"own.fixed.md": own["own.fixed.md"]}
+            if kind == "altered":
+                actual["next.fixed.md"] = b"- Altered.\n"
+            if kind == "kept":
+                actual["old.fixed.md"] = entries["old.fixed.md"]
+            merge = h.commit(body, left, right, extra=h.fragments(actual))
+            if kind in ("altered", "kept"):
+                path = "next.fixed.md" if kind == "altered" else "old.fixed.md"
+                assert_fragment(h, base, merge, path, "fragment differs from the clean three-way merge")
+            else:
+                h.assert_guard(mod, base, merge)
+
+    def g45():
+        for diamond in scenarios(False, True):
+            h, entries, base = fragment_history()
+            added = entries | {"imported.fixed.md": b"- Own.\n"}
+            left = h.fragment_commit(added, base)
+            revised = entries | {"imported.fixed.md": b"- Shared.\n"}
+            edit = h.fragment_commit(revised, left)
+            right = h.fragment_commit(revised, base)
+            h.main(right)
+            if diamond:
+                sync = h.fragment_commit(revised, base, right)
+                head = h.fragment_commit(revised, sync, edit)
+                real = mod.git
+                def sibling_order(root, *args, **kwargs):
+                    result = real(root, *args, **kwargs)
+                    if args[0] == "rev-list" and f"{base}..{head}" in args:
+                        result.stdout = ("\n".join((sync, left, edit, head)) + "\n").encode()
+                    return result
+                with patch.object(mod, "git", sibling_order):
+                    h.assert_guard(mod, base, head)
+            else:
+                head = h.fragment_commit(revised, edit, right)
+            h.assert_guard(mod, base, head)
+            later = h.fragment_commit(added, head)
+            assert_fragment(h, base, later, "imported.fixed.md", "protected path changes outside a sync merge")
+
+    def g46():
+        h, entries, base = fragment_history()
+        head = h.fragment_commit(entries | {"own.fixed.md": b"- Own.\n"}, base)
+        real = mod.git
+        def truncated(root, *args, **kwargs):
+            result = real(root, *args, **kwargs)
+            if args[:3] == ("ls-tree", "-r", "-z"):
+                result.stdout = result.stdout[:-1]
+            return result
+        with patch.object(mod, "git", truncated):
+            err = h.assert_guard(mod, base, head, 2)
+            require("unterminated fragment tree" in err, "truncated ls-tree output must fail as a tool error")
+
+    def g47():
+        h, entries, common = fragment_history()
+        left = h.fragment_commit(entries | {"own.fixed.md": b"- Own.\n"}, common)
+        right = h.fragment_commit(entries | {"next.fixed.md": b"- Next.\n"}, common)
+        merge = h.fragment_commit(entries | {"own.fixed.md": b"- Own.\n", "next.fixed.md": b"- Next.\n"}, left, right)
+        real = mod.git
+        def ambiguous(root, *args, **kwargs):
+            result = real(root, *args, **kwargs)
+            if args == ("merge-base", "--all", left, right):
+                result.stdout += (common + "\n").encode()
+            return result
+        with patch.object(mod, "git", ambiguous):
+            err = h.assert_guard(mod, right, merge, 1)
+            require("ambiguous merge bases" in err, "base updates need a unique merge base")
 
     def d01():
         for path in scenarios("CONTRIBUTING.md", "changelog.d/README.md"):
@@ -758,6 +1079,25 @@ def cases(mod):
 
 
 MUTATIONS = {
+    "G25": ('if left != result and (path in current or path == b"changelog.d/README.md"):', 'if False:'),
+    "G26": ('or path == b"changelog.d/README.md"', ''),
+    "G30": ('elif left is not None and result is None and not (', 'elif False and ('),
+    "G32": ('if result != expected:', 'if False:'),
+    "G34": ('elif path == b"changelog.d/README.md" and (', 'elif False and ('),
+    "G37": ('current.update(theirs.keys() - original.keys())', 'current.update(())'),
+    "G39": ('if result[0] != b"100644" or git(', 'if False and git('),
+    "G39-conflict": ('                    if merged.returncode:', '                    if False:'),
+    "G39-type": ('if any(value is None or value[0] != b"100644" for value in (left, ancestor_value, right)):', 'if False:'),
+    "G41": ('                    if merged.stderr:', '                    if False:'),
+    "G44": ('update = (len(parents) == 2 and ancestor(root, parents[1], base)', 'update = (False and ancestor(root, parents[1], base)'),
+    "G44-compiled": ('allowed = (len(parents) == 2 and (ancestor(root, parents[1], main) or ancestor(root, parents[1], base))',
+                     'allowed = (len(parents) == 2 and ancestor(root, parents[1], main)'),
+    "G45": ('"--topo-order", "--reverse",', ''),
+    "G45-inheritance": ('current = protected.union(*(inherited.get(parent, set()) for parent in parents))', 'current = protected.copy()'),
+    "G45-siblings": ('current = protected.union(*(inherited.get(parent, set()) for parent in parents))', 'current = protected'),
+    "G46": ('if entries and not entries.endswith(b"\\0"):', 'if False:'),
+    "G47": ('if (len(parents) != 2 or not (ancestor(root, parents[1], main) or ancestor(root, parents[1], base))',
+            'if (len(parents) != 2 or not ancestor(root, parents[1], main)'),
     "C01": ('([a-z0-9-]+)', '([a-z0-9_-]+)'),
     "C02": ('|security)\\.md', '|security|misc)\\.md'),
     "C03": ('raise Invalid("line 1: empty fragment")', 'return'),
@@ -820,7 +1160,7 @@ CONSTANT_SUBJECTS = {
     "fold_section": ["C13", "C14", "R13"],
     "section_bounds": ["C14", "R13"],
     "main": ["A01", "A02"],
-    "guard": [f"G{i:02}" for i in range(1, 22)] + ["G24"],
+    "guard": [f"G{i:02}" for i in range(1, 23)] + [f"G{i:02}" for i in range(24, 48)],
 }
 
 
@@ -841,6 +1181,31 @@ def run(mod, selected=None):
             if SUBCASES_RUN == before:
                 SUBCASES_RUN += 1
     return failures
+
+
+def check_mutation(task):
+    source, name, old, new = task
+    require(source.count(old) == 1, f"{name}: mutation target count differs")
+    mutated = source.replace(old, new)
+    actual = run(module(mutated))
+    expected = {"C04": {"C04", "C14"}, "C09": {"C08", "C09"},
+                "G25": {"G25", "G26", "G27", "G37", "G38", "G45"},
+                "G30": {"G30", "G31"},
+                "G32": {"G32", "G33", "G36", "G44"},
+                "G34": {"G34", "G43"},
+                "G37": {"G37", "G45"},
+                "G39-conflict": {"G39"}, "G39-type": {"G39"},
+                "G44": {"G34", "G44"},
+                "G44-compiled": {"G34", "G44", "G47"}, "G45-siblings": {"G45"},
+                "G45": {"G20", "G37", "G45"}, "G45-inheritance": {"G37", "G45"},
+                "R02": {"R02", "R16"}, "R08": {"R07", "R08"},
+                "R12": {"C14", "R12"},
+                "A01": {"A01", "G13", *(f"G{i:02}" for i in range(1, 10)),
+                        *(f"G{i:02}" for i in range(14, 23)), *(f"G{i:02}" for i in range(24, 48))}}.get(name, {name})
+    require(set(actual) == expected, f"{name}: actual failing IDs {actual}")
+    require(not run(module(source)), f"{name}: restored control fails")
+    count = len(cases(module(source)))
+    return f"{name}: parses; failures {sorted(actual)}: {next(iter(actual.values()))}; restored {count}/{count}"
 
 
 def main(argv):
@@ -870,22 +1235,14 @@ def main(argv):
                         print(f"{label}: constant {subject}={value!r} fails: {actual[label]}")
                         covered.add(label)
                         count += 1
-        require(covered == {name for name in all_cases if name not in {"G22", "G23"} and not name.startswith("D")},
+        require(covered == {name for name in all_cases if name not in {"G23"} and not name.startswith("D")},
                 "constant controls must cover every in-process utility case")
         print(f"{count} constant controls fail; {len(covered)} cases covered")
     if argv == ["--mutations"]:
-        for name, (old, new) in MUTATIONS.items():
-            require(source.count(old) == 1, f"{name}: mutation target count differs")
-            mutated = source.replace(old, new)
-            actual = run(module(mutated))
-            expected = {"C04": {"C04", "C14"}, "C09": {"C08", "C09"},
-                        "R02": {"R02", "R16"}, "R08": {"R07", "R08"},
-                        "R12": {"C14", "R12"},
-                        "A01": {"A01", "G13", *(f"G{i:02}" for i in range(1, 10)),
-                                *(f"G{i:02}" for i in range(14, 22)), "G24"}}.get(name, {name})
-            require(set(actual) == expected, f"{name}: actual failing IDs {actual}")
-            require(not run(module(source)), f"{name}: restored control fails")
-            print(f"{name}: parses; failures {sorted(actual)}: {actual[name]}; restored {len(all_cases)}/{len(all_cases)}")
+        tasks = [(source, name, old, new) for name, (old, new) in MUTATIONS.items()]
+        with multiprocessing.get_context("spawn").Pool(processes=4) as pool:
+            for result in pool.imap(check_mutation, tasks):
+                print(result, flush=True)
         print(f"{len(MUTATIONS)} parsing mutants match exact failures; {len(MUTATIONS)} restored controls pass")
     return 0
 

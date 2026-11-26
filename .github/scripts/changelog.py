@@ -248,7 +248,82 @@ def clean_changelog_merge(root, parents, commit):
     return actual[1] == merged.stdout
 
 
+def fragment_tree(root, ref):
+    entries = git(root, "ls-tree", "-r", "-z", ref, "--", "changelog.d").stdout
+    if entries and not entries.endswith(b"\0"):
+        raise OSError("guard: unterminated fragment tree; check Git support and retry")
+    result = {}
+    for entry in entries.split(b"\0")[:-1]:
+        metadata, path = entry.split(b"\t", 1)
+        mode, _, oid = metadata.split()
+        result[path] = (mode, oid)
+    return result
+
+
+def guard_fragments(root, base, head, main, commits):
+    protected = set()
+    for common in object_ids(git(root, "merge-base", "--all", base, head).stdout):
+        protected.update(fragment_tree(root, common))
+    inherited = {}
+    for commit in commits:
+        family = object_ids(git(root, "rev-list", "--parents", "-n", "1", commit).stdout.replace(b" ", b"\n"))
+        parents = family[1:]
+        sync = (len(parents) == 2 and ancestor(root, parents[1], main)
+                and not ancestor(root, parents[1], parents[0]))
+        update = (len(parents) == 2 and ancestor(root, parents[1], base)
+                  and not ancestor(root, parents[1], parents[0]))
+        current = protected.union(*(inherited.get(parent, set()) for parent in parents))
+        ours = fragment_tree(root, parents[0]) if parents else {}
+        actual = fragment_tree(root, commit)
+        original, theirs = {}, {}
+        if sync or update:
+            bases = object_ids(git(root, "merge-base", "--all", *parents).stdout)
+            # The CHANGELOG.md check requires one merge base for either merge.
+            original, theirs = [fragment_tree(root, ref) for ref in (bases[0], parents[1])]
+        for path in ours.keys() | original.keys() | theirs.keys() | actual.keys():
+            left, ancestor_value, right, result = [tree.get(path) for tree in (ours, original, theirs, actual)]
+            reason = None
+            if not (sync or update):
+                if left != result and (path in current or path == b"changelog.d/README.md"):
+                    reason = "protected path changes outside a sync merge"
+            elif path == b"changelog.d/README.md" and (
+                    right is None or left != ancestor_value or result != right):
+                reason = "README.md must remain present and cleanly propagate the incoming version"
+            elif left is not None and result is None and not (
+                    left == ancestor_value and right is None):
+                reason = "only an unchanged fragment deleted on the incoming branch may be dropped"
+            else:
+                if left == right or right == ancestor_value:
+                    expected = left
+                elif left == ancestor_value:
+                    expected = right
+                else:
+                    # Merge regular text blobs only; conflicts and type changes need a maintainer.
+                    if any(value is None or value[0] != b"100644" for value in (left, ancestor_value, right)):
+                        raise Invalid(f"{commit}: {path.decode(errors='backslashreplace')}: fragment merge conflicts")
+                    merged = git(root, "-c", "merge.conflictStyle=merge", "merge-file", "-p", "--object-id",
+                                 left[1].decode(), ancestor_value[1].decode(), right[1].decode(),
+                                 allowed=tuple(range(128)))
+                    if merged.returncode:
+                        raise Invalid(f"{commit}: {path.decode(errors='backslashreplace')}: fragment merge conflicts")
+                    if merged.stderr:
+                        raise OSError("guard: unexpected merge output; check Git support and retry")
+                    if result[0] != b"100644" or git(
+                            root, "cat-file", "blob", result[1].decode()).stdout != merged.stdout:
+                        reason = "fragment differs from the clean three-way merge"
+                    expected = result
+                if result != expected:
+                    reason = "fragment differs from the clean three-way merge"
+            if reason:
+                raise Invalid(f"{commit}: {path.decode(errors='backslashreplace')}: {reason}")
+        if sync or update:
+            current.update(theirs.keys() - original.keys())
+        inherited[commit] = current
+
+
 def guard(root, base, head, main_ref):
+    # The workflow loads this guard from the PR base; every PR whose base contains
+    # these rules follows them, including open PRs after their next workflow run.
     if git(root, "rev-parse", "--is-shallow-repository").stdout != b"false\n":
         raise Invalid("guard: shallow history; supply complete history and retry")
     refs = [object_ids(git(root, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}").stdout)
@@ -256,7 +331,7 @@ def guard(root, base, head, main_ref):
     if any(len(ids) != 1 for ids in refs):
         raise OSError("guard: unexpected ref output; restore complete history and retry")
     base, head, main = [ids[0] for ids in refs]
-    commits = object_ids(git(root, "rev-list", f"{base}..{head}", "--not", main).stdout)
+    commits = object_ids(git(root, "rev-list", "--topo-order", "--reverse", f"{base}..{head}", "--not", main).stdout)
     refused = []
     checked = 0
     for commit in commits:
@@ -272,12 +347,12 @@ def guard(root, base, head, main_ref):
             if changed not in (b"", b"CHANGELOG.md\n"):
                 raise OSError("guard: unexpected diff output; restore complete history and retry")
             if not changed:
-                # A sync merge cannot silently discard incoming main entries.
-                if (len(parents) != 2 or not ancestor(root, parents[1], main)
+                # A merge cannot silently discard incoming changelog entries.
+                if (len(parents) != 2 or not (ancestor(root, parents[1], main) or ancestor(root, parents[1], base))
                         or ancestor(root, parents[1], parents[0])):
                     continue
             checked += 1
-            allowed = (len(parents) == 2 and ancestor(root, parents[1], main)
+            allowed = (len(parents) == 2 and (ancestor(root, parents[1], main) or ancestor(root, parents[1], base))
                        and not ancestor(root, parents[1], parents[0]))
             if not allowed:
                 raise Invalid("use a two-parent sync merge that preserves the clean merge result")
@@ -293,6 +368,7 @@ def guard(root, base, head, main_ref):
             raise OSError(f"{commit}: {error}") from error
     if refused:
         raise Invalid("\n".join(refused))
+    guard_fragments(root, base, head, main, commits)
     print(f"{checked} changelog commits checked; integration guard passes", file=sys.stderr)
     return 0
 

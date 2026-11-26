@@ -281,6 +281,11 @@ Its `CHANGELOG.md` equals the clean three-way merge over the parents' merge
 base, preserving both sides' lines.
 The guard refuses conflicts; a maintainer resolves and merges them.
 The guard never accepts hand-resolved changelog bytes.
+Existing fragments here are paths present at the PR merge base or imported
+from `main`. Imported paths are protected in descendants of their sync merge.
+A PR may revise a fragment it adds itself before such an import.
+An update merge may take its second parent from the ancestry of the PR base
+on `next`; every changelog path must equal the clean three-way result.
 Never edit an existing fragment. Add a new file for a further entry.
 Each fragment file belongs to one pull request and is never reused.
 A sync merge deletes fragments that `main` folds and deletes.

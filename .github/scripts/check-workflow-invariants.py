@@ -181,12 +181,18 @@ runs the function.
   ``release-rehearsal.yml`` does not run ``ARCHIVE_CHECK`` unconditionally.
 - ``release-provenance-gate``: ``publish`` does not need
   ``verify-provenance``, ``verify-provenance`` does not need ``preflight``,
-  ``provenance``, and ``hashes``, or it does not run each command of
+  ``provenance``, ``hashes``, and ``sign``, or it does not run each command of
   ``PROVENANCE_CHECKS`` unconditionally.
+- ``release-signatures``: ``sign`` or ``verify-provenance`` lacks the pinned
+  cosign installer with ``cosign-release: v3.1.4``, or the signature upload
+  does not set ``if-no-files-found: error``.
 - ``publish-dry-gate``: the ``publish.yml`` publish job does not need
   ``verify``, or in ``verify`` and the rehearsal's ``verify-crates`` the
   packaging step does not create the start timestamp before it packages,
   unconditionally, or the next step does not run the packaged marker check.
+- ``release-version-binding``: packaged checks do not use the validated
+  version output, the rehearsal lacks one version step before packaging,
+  or the install check does not use the validated tag output.
 - ``publish-install-gate``: ``verify-install`` does not need ``publish``, or
   does not run the install check of the dispatched commit unconditionally.
 - ``release-check-unconditional``: a job of ``GUARDED_JOBS`` or one of its
@@ -556,15 +562,18 @@ ARCHIVE_CHECK = ('bash .github/scripts/release/verify-archive.sh archives "$VERS
 PROVENANCE_CHECKS = (
     'python3 .github/scripts/check-provenance.py "provenance/stellar-agent-$VERSION.intoto.jsonl" '
     'provenance/SHA256SUMS "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$GITHUB_REF"',
+    'bash .github/scripts/release/verify-signatures.sh "$RUNNER_TEMP/verify-release" '
+    '"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" '
+    '"https://token.actions.githubusercontent.com" "$GITHUB_SHA"',
     "cargo fetch --locked",
     '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/check-feature-discipline.py')
 PACKAGE_START = "touch target/package-verification-start"
 PACKAGE_BUILD = "cargo package --workspace --locked"
 PACKAGE_CHECKS = {
     "publish.yml": ('bash "$GITHUB_WORKSPACE/wf/.github/scripts/check-packaged-markers.sh" target '
-                    'target/package-verification-start "$EXPECTED_MAINNET_WRITE"'),
+                    'target/package-verification-start "$EXPECTED_MAINNET_WRITE" "$VERSION"'),
     "release-rehearsal.yml": ('bash .github/scripts/check-packaged-markers.sh target '
-                              'target/package-verification-start "$EXPECTED_MAINNET_WRITE"'),
+                              'target/package-verification-start "$EXPECTED_MAINNET_WRITE" "$VERSION"'),
 }
 INSTALL_CHECK = ('bash "$GITHUB_WORKSPACE/wf/.github/scripts/release/verify-install.sh" "$TAG" '
                  '"$EXPECTED_MAINNET_WRITE"')
@@ -675,22 +684,22 @@ CONDITIONED_FEATURE_JOBS = {
         COVERAGE_OFF_FLOORS, COVERAGE_ON_FLOORS)),
 }
 # The host recipe: the release build for the host target, which places the
-# stellar-agent-mcp copy, the byte comparison of both names and the marker
+# stellar-agent-mcp copy, the byte comparison of both names and the version and marker
 # check of each; then the build of the CLI package alone, the copy of its
 # debug executable to the alias name with copy_alias, the byte comparison,
-# and the marker check of both debug names.
+# and the name, version, and marker check of both debug names.
 HOST_ALIAS = "target/tmp/host-alias/stellar-agent-mcp"
 HOST_CHECKS = ('bash .github/scripts/release/build.sh "$target"',
                'cmp "target/$target/release/stellar-agent" "target/$target/release/stellar-agent-mcp"',
-               'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent" on',
-               'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on',
+               'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent" on "stellar-agent $version"',
+               'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on "stellar-agent-mcp $version"',
                "cargo build --locked -p stellar-agent-cli",
                "mkdir -p target/tmp/host-alias",
                ". .github/scripts/release/copy-alias.sh",
                f"copy_alias target/debug/stellar-agent {HOST_ALIAS}",
                f"cmp target/debug/stellar-agent {HOST_ALIAS}",
-               "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent on",
-               f"bash .github/scripts/check-binary-marker.sh {HOST_ALIAS} on")
+               'bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent on "stellar-agent $version"',
+               f'bash .github/scripts/check-binary-marker.sh {HOST_ALIAS} on "stellar-agent-mcp $version"')
 # For each job: the action that receives a credential, and the text of the
 # checks that earlier steps must hold. The third entry is the text of the
 # workspace code that reads the downloaded data. A clean-checkout check must
@@ -1573,6 +1582,18 @@ class Checker:
 
     def check_release_gates(self):
         self.check_publish_wasm_gate()
+        for name in ("sign", "verify-provenance"):
+            steps = (self.job("release.yml", name) or {}).get("steps", [])
+            installers = [step for step in steps if step.get("name") == "Install cosign"]
+            if [step.get("uses") for step in installers] != [
+                    "sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532"]:
+                self.report(f"release.yml:{name}", "release-signatures", "requires the pinned cosign installer")
+            if [(step.get("with") or {}).get("cosign-release") for step in installers] != ["v3.1.4"]:
+                self.report(f"release.yml:{name}", "release-signatures", "requires cosign-release: v3.1.4")
+        uploads = [step for step in (self.job("release.yml", "sign") or {}).get("steps", [])
+                   if (step.get("with") or {}).get("name") == "signatures"]
+        if [(step.get("with") or {}).get("if-no-files-found") for step in uploads] != ["error"]:
+            self.report("release.yml:sign", "release-signatures", "signature upload requires if-no-files-found: error")
         self.needs("release.yml", "hashes", "verify-packaged", "release-packaged-gate")
         for dependency in ("preflight", "build", "sign-macos"):
             self.needs("release.yml", "verify-packaged", dependency, "release-packaged-gate")
@@ -1580,7 +1601,7 @@ class Checker:
             if self.runs_in_job(workflow, "verify-packaged", ARCHIVE_CHECK, "release-packaged-gate") < 0:
                 self.report(workflow, "release-packaged-gate", "verify-packaged does not run the archive check unconditionally")
         self.needs("release.yml", "publish", "verify-provenance", "release-provenance-gate")
-        for dependency in ("preflight", "provenance", "hashes"):
+        for dependency in ("preflight", "provenance", "hashes", "sign"):
             self.needs("release.yml", "verify-provenance", dependency, "release-provenance-gate")
         for command in PROVENANCE_CHECKS:
             if self.runs_in_job("release.yml", "verify-provenance", command, "release-provenance-gate") < 0:
@@ -1594,13 +1615,25 @@ class Checker:
             builds, checks = runs(PACKAGE_BUILD), runs(PACKAGE_CHECKS[workflow])
             if len(builds) != 1 or len(checks) != 1 or checks[0] != builds[0] + 1:
                 self.report(workflow, "publish-dry-gate", "packaged marker check must immediately follow package verification")
+            version = "${{ steps.tag.outputs.version }}" if workflow == "publish.yml" else "${{ steps.version.outputs.version }}"
+            if any((steps[index].get("env") or {}).get("VERSION") != version for index in checks):
+                self.report(workflow, "release-version-binding", "packaged check must use the validated version output")
+            if workflow == "release-rehearsal.yml":
+                versions = [i for i, step in enumerate(steps) if step.get("id") == "version"]
+                if len(versions) != 1 or not builds or versions[0] >= builds[0]:
+                    self.report(workflow, "release-version-binding", "workspace version must be read before packaging")
             if builds:
                 run = steps[builds[0]].get("run")
                 if not 0 <= self.runs_line(run, PACKAGE_START)[0] < self.runs_line(run, PACKAGE_BUILD)[0]:
                     self.report(workflow, "publish-dry-gate", "package verification lacks the freshness timestamp")
         self.needs("publish.yml", "verify-install", "publish", "publish-install-gate")
-        if self.runs_in_job("publish.yml", "verify-install", INSTALL_CHECK, "publish-install-gate") < 0:
+        install = self.runs_in_job("publish.yml", "verify-install", INSTALL_CHECK, "publish-install-gate")
+        if install < 0:
             self.report("publish.yml", "publish-install-gate", "verify-install does not run the install check unconditionally")
+        else:
+            step = self.job("publish.yml", "verify-install")["steps"][install]
+            if (step.get("env") or {}).get("TAG") != "${{ steps.tag.outputs.tag }}":
+                self.report("publish.yml", "release-version-binding", "install check must use the validated tag output")
 
     def check_unconditional(self):
         for workflow, names in GUARDED_JOBS.items():

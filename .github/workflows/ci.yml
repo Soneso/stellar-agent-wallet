@@ -411,7 +411,7 @@ jobs:
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       # The host recipe that preflight's release-shape row runs too: the
-      # release build script for the host target, then the marker check of
+      # release build script for the host target, then the name, version, and marker check of
       # both binaries.
       - name: Build and check the release binaries
         run: bash .github/scripts/release/check-host.sh

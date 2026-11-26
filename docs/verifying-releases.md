@@ -4,8 +4,11 @@
 Each release also publishes a `SHA256SUMS` manifest, a
 [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) keyless
 signature bundle for each archive and for `SHA256SUMS`, and SLSA build
-provenance. The checks on this
-page use them to confirm that an archive is the one this repository's release
+provenance. Signing requires five archives and the manifest as regular files.
+Before publication, a job without signing credentials verifies all six bundles
+with cosign v3.1.4 against the exact files, workflow identity, issuer, and SHA.
+Missing, duplicate, extra, symlinked, or non-file bundles fail the release.
+The checks on this page use them to confirm that an archive is the one this repository's release
 workflow built. The commands name the `.tar.xz` archive; for the Windows
 archive, substitute `.zip`.
 
@@ -34,7 +37,10 @@ The keyless signature shows that this repository's release workflow signed the
 archive. The certificate identity names that workflow at the release tag, so a
 signature from any other identity fails the check. Read `<commit>` with
 `git rev-parse v<version>^{commit}` in a clone to bind the certificate to that
-commit:
+commit. The workflow uses `${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}` for the
+repository URL, `${GITHUB_REF}` for the tag ref, and `$GITHUB_SHA` for the commit.
+Signing and verification both install cosign v3.1.4. The verification script
+requires a non-empty identity, issuer, and workflow SHA:
 
 ```bash
 cosign verify-blob \
