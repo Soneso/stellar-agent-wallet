@@ -4,7 +4,10 @@ name: Coverage
 # floors of .github/scripts/check-coverage.py. Measurement runs on pushes to
 # next (except proven docs-only changes) and main, weekly on main, on every
 # pull request into main and code pull request into next, and on demand.
-# The `coverage` label also measures a docs-only pull request into next.
+# Opening, pushing to, or reopening a pull request evaluates coverage.
+# The `coverage` label requires docs-only measurement on the next push or reopen.
+# After retargeting, push or reopen the pull request to evaluate the new base.
+# Editing or labeling a pull request starts no Coverage run.
 #
 # Push runs seed the coverage caches that pull requests into those branches
 # restore. Two parallel jobs measure feature-off and feature-on, and each
@@ -13,14 +16,13 @@ name: Coverage
 # skipped measurement fails it.
 #
 # The workflow has no paths filter: the required check `coverage` reports on
-# every eligible event. A job skipped by its if reports under its unevaluated
-# name, so the required job runs and passes docs-only next changes without
+# every triggered event. The required job passes docs-only next changes without
 # measuring, unless a pull request carries the coverage label.
 
 on:
   pull_request:
     branches: [main, next]
-    types: [opened, synchronize, reopened, labeled, edited]
+    types: [opened, synchronize, reopened]
   push:
     branches: [next, main]
   schedule:
@@ -28,10 +30,10 @@ on:
     - cron: '41 4 * * 1'
   workflow_dispatch:
 
-# Eligible pull request runs cancel their predecessor. Ignored events, pushes,
-# schedules, and dispatches each have their own group.
+# Pull request runs cancel their predecessor. Pushes, schedules, and dispatches
+# each have their own group.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && (github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # The jobs only read the checked-out source; deny the token every other scope.
@@ -43,8 +45,7 @@ env:
 
 jobs:
   changes:
-    if: ${{ github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null) }}
-    name: changes${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}
+    name: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -68,12 +69,11 @@ jobs:
         run: python3 .github/scripts/classify-docs-only.py >> "$GITHUB_OUTPUT"
 
   coverage-off:
-    name: coverage (feature-off)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}
+    name: coverage (feature-off)
     needs: changes
-    # Eligible pull requests measure main, code or uncertain diffs, and the
-    # coverage label. Label additions evaluate only coverage; edits evaluate only
-    # base changes. GITHUB_TOKEN label changes start no workflow.
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
+    # Pull requests measure main, code or uncertain diffs, and the coverage label.
+    # Label changes take effect on the next push or reopen.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -126,12 +126,11 @@ jobs:
           retention-days: 1
 
   coverage-on:
-    name: coverage (feature-on)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}
+    name: coverage (feature-on)
     needs: changes
-    # Eligible pull requests measure main, code or uncertain diffs, and the
-    # coverage label. Label additions evaluate only coverage; edits evaluate only
-    # base changes. GITHUB_TOKEN label changes start no workflow.
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
+    # Pull requests measure main, code or uncertain diffs, and the coverage label.
+    # Label changes take effect on the next push or reopen.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -182,13 +181,13 @@ jobs:
           retention-days: 1
 
   coverage:
-    name: coverage${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}
+    name: coverage
     needs: [changes, coverage-off, coverage-on]
-    # A job skipped by its if reports under its unevaluated name. Run on every
-    # eligible event so coverage passes docs-only next changes without measuring,
-    # unless a pull request carries the coverage label. Step 1 checks the results;
-    # steps 2 and 8 reject cancellation before and after the measured floors.
-    if: always() && (github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null))
+    # Run on every triggered event so coverage passes docs-only next changes
+    # without measuring, unless a pull request carries the coverage label.
+    # Step 1 checks the results; steps 2 and 8 reject cancellation before and
+    # after the measured floors.
+    if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

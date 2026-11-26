@@ -31,9 +31,13 @@ table here. Also list issue-specific acceptance commands and their exit codes.
 including coverage. Local coverage, machete, and deny are optional reproductions.
 CI runs the offline gates on every pull request; a docs-only pull request into
 `next` runs the reduced set that `docs/maintainers/building.md`
-describes. Coverage measures every pull request into `main` and
-code pull requests into `next`; the `coverage` label makes it measure a docs-only
-one. Live acceptance uses its separate workflow.
+describes.
+Opening, pushing to, or reopening a pull request evaluates coverage.
+Coverage measures every pull request into `main` and code pull request into
+`next`.
+The `coverage` label requires docs-only measurement on the next push or reopen.
+Editing or labeling a pull request starts no Coverage run.
+Live acceptance uses its separate workflow.
 -->
 
 -

@@ -22,6 +22,8 @@ ENV = {"EVENT_NAME": "pull_request", "BASE_REF": "next", "BASE_SHA": "a" * 40, "
 
 # Expected groups are independent of the implementation's pattern table.
 PATHS = {
+    ".config/nextest.toml": {"scripts"},
+    ".github/scripts/compare-test-runs.py": GROUPS,
     "unrelated.txt": set(),
     "build.rs": {"rust"},
     "nested/deep/build.rs": {"rust"},

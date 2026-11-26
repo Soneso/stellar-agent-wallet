@@ -79,11 +79,15 @@ optional reproductions of CI checks.
 
 CI runs the offline gates on every pull request; a docs-only pull request into
 `next` runs the reduced set that
-[docs/maintainers/building.md](docs/maintainers/building.md) describes. Pull-request
-coverage measures automatically on eligible events for every pull request into
-`main` and every code pull request into `next`. The required `coverage` job runs
-on every eligible event and passes docs-only changes into `next` without
-measuring; the `coverage` label requires measurement on a docs-only pull request.
+[docs/maintainers/building.md](docs/maintainers/building.md) describes.
+Opening, pushing to, or reopening a pull request evaluates coverage.
+Coverage measures every pull request into `main` and code pull request into
+`next`.
+The required `coverage` job runs on every triggered event.
+It passes docs-only changes into `next` without measuring unless the pull request
+carries the `coverage` label.
+The `coverage` label requires measurement on the next push or reopen.
+Editing or labeling a pull request starts no Coverage run.
 Self-tests run when their inputs change, and always on
 `main`; live acceptance uses its separate workflow. The exact commands, gate-tool installation, and test tiers are in
 [docs/maintainers/building.md](docs/maintainers/building.md).

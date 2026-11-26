@@ -11,6 +11,7 @@ EXPECTED_JOBS = {
     "release-shape", "inbox-js", "mpp-interop", "sdk-v17-interop",
     "release-contracts", "windows-storage", "platform-keyring", "deploy-scripts",
     "machete", "deny",
+    "feature-on-test-shadow", "feature-on-test-extra", "feature-on-test-compare",
 }
 DOCS_REQUIRED = {"changes", "docs-tests", "feature-discipline", "release-contracts"}
 

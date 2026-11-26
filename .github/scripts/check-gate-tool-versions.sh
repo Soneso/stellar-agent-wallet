@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fails when a gate tool version in docs/maintainers/building.md, a workflow,
 # or a composite action differs from the tool's reference pin. The guide and
-# CI install the same cargo-llvm-cov, cargo-machete, and cargo-deny so a local
+# CI install the same cargo-llvm-cov, cargo-machete, cargo-deny, and cargo-nextest so a local
 # gate run reproduces the CI result.
 #
 # TOOLS gives each tool's reference workflow and exact pin count. Each
@@ -26,7 +26,7 @@ ACTION_DIR="$ROOT/.github/actions"
 BUILDING_DOC="$ROOT/docs/maintainers/building.md"
 
 # Each gate tool, the workflow that holds its reference pins, and their count.
-TOOLS=(cargo-llvm-cov=coverage.yml:2 cargo-machete=ci.yml:1 cargo-deny=ci.yml:1)
+TOOLS=(cargo-llvm-cov=coverage.yml:2 cargo-machete=ci.yml:1 cargo-deny=ci.yml:1 cargo-nextest=ci.yml:1)
 VERSION_RE='([0-9][0-9A-Za-z.+-]*)'
 FAILED=0
 

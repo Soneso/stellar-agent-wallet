@@ -54,7 +54,7 @@ FIXTURE="$TMP/fixture"
 CASES="changelog-fragments changelog-selection changelog-registry docs-only upstream-base origin-base synced-fork-base next-before-main-base local-next-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
 release-rehearsal-workflow vendored-wasm-workflow unlisted-workflow yaml-workflow
 triage-workflow triage-review-workflow triage-sweep-workflow
-ci-yml-only python-check-script run-evidence-script proof-matrix-only shell-check-script testnet-driver-script payment-evidence-script deploy-scripts deploy-scripts-run skill inbox-web enroll-web bridge-web one-crate sep43-through-mcp two-owners
+nextest-config compare-test-runs-script ci-yml-only python-check-script run-evidence-script proof-matrix-only shell-check-script testnet-driver-script payment-evidence-script deploy-scripts deploy-scripts-run skill inbox-web enroll-web bridge-web one-crate sep43-through-mcp two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
 unowned-rust-path
 wallet-manifest removed-member untracked-test-file fixture-markdown crate-sources-select-proof-matrix
@@ -114,6 +114,7 @@ self-test:test-classify-docs-only.py	python3 .github/scripts/test-classify-docs-
 self-test:test-classify-self-tests.py	python3 .github/scripts/test-classify-self-tests.py
 self-test:test-ci-result.py	python3 .github/scripts/test-ci-result.py
 self-test:test-compare-crate-sums.py	python3 .github/scripts/test-compare-crate-sums.py
+self-test:test-compare-test-runs.py	python3 .github/scripts/test-compare-test-runs.py
 self-test:test-preflight.sh	bash .github/scripts/test-preflight.sh
 self-test:test-publish-crates-check.sh	.github/scripts/test-publish-crates-check.sh
 self-test:test-publish-crates-verify.sh	bash .github/scripts/test-publish-crates-verify.sh
@@ -165,8 +166,13 @@ NOT_CARRIED=$(
   cat <<'EOF'
 ci.yml	feature-on-clippy	Install libudev (Linux hidapi)	installs Linux system headers on the runner
 ci.yml	feature-on-doc	Install libudev (Linux hidapi)	installs Linux system headers on the runner
-ci.yml	feature-on-test	Free disk space	reclaims runner disk space
-ci.yml	feature-on-test	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+ci.yml	feature-on-test-shadow	Free disk space	reclaims runner disk space
+ci.yml	feature-on-test-shadow	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+ci.yml	feature-on-test-shadow	Capture test executables	CI captures comparison evidence
+ci.yml	feature-on-test-shadow	List the shadow tests	CI captures comparison evidence
+ci.yml	feature-on-test-extra	Free disk space	reclaims runner disk space
+ci.yml	feature-on-test-extra	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+ci.yml	feature-on-test-extra	Run the feature-on doctests	the shadow command already runs doctests
 ci.yml	feature-discipline	Fetch the locked graph	CI prepares the cache; local preflight uses cached locked dependencies
 changelog.yml	changelog	Fetch main for changelog protection	CI supplies the remote ancestry
 changelog.yml	changelog	Protect integration changelog	CI checks the pull request event SHAs
@@ -1692,8 +1698,8 @@ case_full() {
       *) original=$((original + 1)) ;;
     esac
   done
-  if [ "$original" -ne 67 ] || [ "$added" -ne 3 ]; then
-    fail "the expected registry requires 67 original rows, 2 changelog rows, and 1 classifier row"
+  if [ "$original" -ne 68 ] || [ "$added" -ne 3 ]; then
+    fail "the expected registry requires 68 original rows, 2 changelog rows, and 1 classifier row"
   fi
   expect_list --full "${ids[@]}"
 }
@@ -1818,6 +1824,20 @@ case_duplicate_triggers() {
   edit .github/scripts/check-docs-style.py .github/scripts/test-check-docs-style.py
   expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
     self-test:test-check-docs-style.py
+}
+
+case_nextest_config() {
+  start_case
+  mkdir -p .config
+  edit .config/nextest.toml
+  expect_list "${ALWAYS[@]}" self-test:test-compare-test-runs.py
+}
+
+case_compare_test_runs_script() {
+  start_case
+  edit .github/scripts/compare-test-runs.py
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-compare-test-runs.py feature-discipline self-test:test-check-feature-discipline.py
 }
 
 case_changed_self_test() {

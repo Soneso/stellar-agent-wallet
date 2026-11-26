@@ -1,0 +1,10 @@
+[profile.ci]
+fail-fast = false
+retries = 0
+
+[profile.ci.junit]
+path = "junit.xml"
+
+[test-groups]
+# Tests that share a file path or a port across processes join a group with
+# max-threads = 1. The maintainer adds members from a measured run.
