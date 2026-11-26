@@ -1,0 +1,1 @@
+- Recognize Friendbot HTTP 400 responses containing `createAccountAlreadyExist` without regard to ASCII case. CLI and MCP funding report `network.friendbot_account_already_funded`; test funding accepts the existing account.

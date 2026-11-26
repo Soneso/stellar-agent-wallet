@@ -251,9 +251,11 @@ holds the seed, so do not write it to a log or a shared terminal.
 
 To fund an account you already hold, call Friendbot directly. The Friendbot
 server decides whether it pays an existing account, and it pays only below its
-starting balance. When Friendbot refuses an already funded account, the command
-exits `1` with `network.friendbot_account_already_funded`. Mainnet is structurally
-refused (`network.friendbot_mainnet_forbidden`) before any HTTP call.
+starting balance. HTTP 400 with `already funded` or `createAccountAlreadyExist`,
+ignoring ASCII case, exits `1` with `network.friendbot_account_already_funded`.
+An earlier attempt may have created the account. Check its balance before
+continuing. Mainnet is structurally refused
+(`network.friendbot_mainnet_forbidden`) before any HTTP call.
 
 ```bash
 stellar-agent friendbot --account GABC...WXYZ --network testnet

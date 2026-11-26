@@ -37,6 +37,8 @@ mod fee_reserve_boundary;
 mod fees_stats_endpoint_rules;
 #[path = "cli/fresh_v1_ceremony.rs"]
 mod fresh_v1_ceremony;
+#[path = "cli/friendbot_existing_account.rs"]
+mod friendbot_existing_account;
 #[path = "cli/halt_check_discipline.rs"]
 mod halt_check_discipline;
 #[path = "cli/keyring_classification_discipline.rs"]

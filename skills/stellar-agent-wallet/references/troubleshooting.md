@@ -504,7 +504,7 @@ placement against the provider's documentation.
 
 | Code | Meaning | Agent action |
 |---|---|---|
-| `network.friendbot_account_already_funded` | Friendbot refuses to fund the account because its XLM balance is at or above the Friendbot starting balance (10,000 XLM on the SDF testnet). `stellar-agent friendbot`, `accounts create --fund-with-friendbot`, and `stellar_friendbot` report it; the message names the account. An existing account below the starting balance receives that amount instead. | Do not retry. The account is usable as it is: continue with it, or fund a new account if you need a fresh account. |
+| `network.friendbot_account_already_funded` | Friendbot answers HTTP 400 containing `already funded` or `createAccountAlreadyExist`, ignoring ASCII case. The account holds the starting balance or exists from an earlier creation attempt. `stellar-agent friendbot`, `accounts create --fund-with-friendbot`, and `stellar_friendbot` report it; the message names the account. | Check the account balance before continuing. Use that account, or fund a new one if you need a fresh account. |
 
 ## Claim codes
 

@@ -1104,15 +1104,14 @@ async fn read_failure_body_prefix(response: &mut reqwest::Response) -> Vec<u8> {
     prefix
 }
 
-/// Whether a Friendbot failure body reports that the account is already
-/// funded, compared without regard to ASCII case.
+/// Whether the body contains `already funded` or `createAccountAlreadyExist`,
+/// compared without regard to ASCII case.
 ///
 /// Its twin is `reports_already_funded` in `stellar-agent-network`'s
 /// Friendbot module, which production funding uses; both keep one rule.
 fn reports_already_funded(body: &[u8]) -> bool {
-    String::from_utf8_lossy(body)
-        .to_ascii_lowercase()
-        .contains("already funded")
+    let body = String::from_utf8_lossy(body).to_ascii_lowercase();
+    body.contains("already funded") || body.contains("createaccountalreadyexist")
 }
 
 /// Runs the Friendbot request at `url` under `policy` and returns the last
@@ -1421,8 +1420,12 @@ mod tests {
 
     const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     const BUSY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
-    const ALREADY_FUNDED: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 63\r\n\r\n\
-        {\"detail\": \"createAccountAlreadyExist: Account Already Funded\"}";
+    const ALREADY_FUNDED: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/problem+json\r\nContent-Length: 126\r\n\r\n\
+        {\"type\":\"https://stellar.org/horizon-errors/bad_request\",\"title\":\"Bad Request\",\"status\":400,\"detail\":\"Account Already Funded\"}";
+    const ACCOUNT_EXISTS: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/problem+json\r\nContent-Length: 177\r\n\r\n\
+        {\"type\":\"https://stellar.org/horizon-errors/bad_request\",\"title\":\"Bad Request\",\"status\":400,\"detail\":\"createAccountAlreadyExist (AAAAAAAAAGT/////AAAAAQAAAAAAAAAA/////AAAAAA==)\"}";
+    const ACCOUNT_EXISTS_UPPER: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/problem+json\r\nContent-Length: 129\r\n\r\n\
+        {\"type\":\"https://stellar.org/horizon-errors/bad_request\",\"title\":\"Bad Request\",\"status\":400,\"detail\":\"CREATEACCOUNTALREADYEXIST\"}";
 
     /// What the fixture does with one request, chosen by the request's
     /// position among all requests the fixture received.
@@ -1982,6 +1985,8 @@ mod tests {
             OK,
             b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".as_slice(),
             ALREADY_FUNDED,
+            ACCOUNT_EXISTS,
+            ACCOUNT_EXISTS_UPPER,
         ] {
             let friendbot = friendbot_serving(vec![bytes(response)]).await;
             friendbot_fund_with_policy(&friendbot.url, &quick())
@@ -2022,7 +2027,7 @@ mod tests {
 
     #[tokio::test]
     async fn friendbot_timeout_then_already_funded_succeeds() {
-        let friendbot = friendbot_serving(vec![stall(), bytes(ALREADY_FUNDED)]).await;
+        let friendbot = friendbot_serving(vec![stall(), bytes(ACCOUNT_EXISTS)]).await;
 
         friendbot_fund_with_policy(&friendbot.url, &policy(3, 150, [50, 50], 10_000))
             .await

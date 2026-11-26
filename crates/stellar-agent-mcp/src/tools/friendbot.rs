@@ -130,6 +130,18 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<StellarFriendbotArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.friendbot_with_url_validator(args, validate_friendbot_url)
+            .await
+    }
+}
+
+impl WalletServer {
+    /// Runs Friendbot with the caller's URL validator; production supplies the allowlist.
+    async fn friendbot_with_url_validator(
+        &self,
+        args: StellarFriendbotArgs,
+        validate_url: fn(&str) -> Result<(), stellar_agent_network::friendbot::FriendbotUrlError>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         // ── dispatch gate ─────────────────────────────────────────────────────
         // Called unconditionally on every tools/call.
         // NoopPolicyEngine rejects mainnet + destructive with NotImplemented.
@@ -162,7 +174,7 @@ impl WalletServer {
             .ok_or_else(|| {
                 rmcp::ErrorData::invalid_params("no default friendbot URL for this chain", None)
             })?;
-        if let Err(err) = validate_friendbot_url(&friendbot_url) {
+        if let Err(err) = validate_url(&friendbot_url) {
             return Err(rmcp::ErrorData::invalid_params(
                 format!("friendbot_url not allowed: {err}"),
                 None,
@@ -220,5 +232,66 @@ impl WalletServer {
         args: StellarFriendbotArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.stellar_friendbot(Parameters(args)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, reason = "test fixtures and assertions")]
+
+    use super::*;
+    use stellar_agent_core::profile::schema::Profile;
+    use stellar_agent_network::friendbot::validate_friendbot_url_allowing_loopback;
+    use wiremock::matchers::{method, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stellar_friendbot_reports_an_account_created_by_an_earlier_attempt() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().expect("sandbox");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let account = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(query_param("addr", account))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "type": "https://stellar.org/horizon-errors/bad_request",
+                "title": "Bad Request",
+                "status": 400,
+                "detail": "createAccountAlreadyExist (AAAAAAAAAGT/////AAAAAQAAAAAAAAAA/////AAAAAA==)",
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        let server = WalletServer::new(profile).expect("server");
+        let result = server
+            .friendbot_with_url_validator(
+                StellarFriendbotArgs {
+                    chain_id: "stellar:testnet".to_owned(),
+                    account_id: account.to_owned(),
+                    friendbot_url: Some(mock.uri()),
+                },
+                validate_friendbot_url_allowing_loopback,
+            )
+            .await
+            .expect("tool result");
+        assert_eq!(result.is_error, Some(true));
+        let text = &result.content[0].as_text().expect("text envelope").text;
+        let envelope: serde_json::Value = serde_json::from_str(text).expect("JSON envelope");
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(
+            envelope["error"]["code"],
+            "network.friendbot_account_already_funded"
+        );
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains(account)
+        );
+        mock.verify().await;
     }
 }
