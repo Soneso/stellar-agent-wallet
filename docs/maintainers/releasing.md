@@ -565,7 +565,10 @@ The checks that the ruleset of `main` requires include the five feature jobs
 of `ci.yml`: `feature-on-clippy`, `feature-on-test`, `feature-on-doc`,
 `feature-discipline`, and `release-shape`. The `coverage` required check
 needs both coverage measurement jobs and enforces the floors of both feature
-configurations. Coverage runs automatically on every pull request into `main`
-and on code pull requests into `next`; the label also measures docs-only ones.
+configurations when measurement is required. Coverage measures automatically on
+eligible events for every pull request into `main` and code pull requests into
+`next`; the label also measures docs-only ones. The required `coverage` job runs
+on every eligible event and passes docs-only changes into `next` without
+measuring when no pull-request coverage label requires it.
 A red coverage push on `next` blocks integration through the coverage run on
 the pull request into `main`, which measures the tree it brings.

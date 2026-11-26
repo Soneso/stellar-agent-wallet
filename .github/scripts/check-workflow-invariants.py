@@ -89,7 +89,11 @@ The check fails when any of these holds:
   or the gate job ``coverage``. A part's ``if`` is not a string equal to
   ``COVERAGE_CONDITION``, or the gate's ``if`` is not a string equal to
   ``COVERAGE_GATE_CONDITION``, after the check strips the surrounding
-  whitespace and one enclosing ``${{ }}``.
+  whitespace and one enclosing ``${{ }}``. The gate runs on always() plus
+  canonical eligibility only. Its first step must be ``decision`` and pass
+  ``MEASURE`` the label and push docs-only clauses of the measuring jobs,
+  with the same expression unwrapping. Every gate checkout, download and floor
+  step must use the measured output guard, optionally enclosed in ``${{ }}``.
 - ``coverage-eligibility``: job conditions or concurrency do not use the canonical
   event eligibility expression.
 - ``coverage-names``: a job lacks the ignored-event suffix, allowing an ineligible
@@ -111,12 +115,15 @@ The check fails when any of these holds:
   ``COVERAGE_EXPORTS`` report after its measurement, with
   ``if-no-files-found: error``.
 - ``coverage-gate``: the gate does not need both parts and ``changes``. Its first
-  step sets ``if``, lacks a result check, or reads other than
-  ``COVERAGE_RESULT_ENV``, or fails to require successful classification. Its second and last steps do not reject a
+  step sets ``if``, differs from the literal decision id, environment keys and
+  values or line-for-line ``COVERAGE_DECISION_RUN`` template, or fails to require
+  successful classification. Its second and last steps do not reject a
   cancelled run: ``if`` equal to ``cancelled()``, no ``continue-on-error``,
   and ``exit 1`` as the only command. The last step does not follow both
-  floors, or another step sets ``if``. Or a report is not downloaded once,
-  unconditionally, from this run, before the first floor.
+  floors, or another step sets ``if`` except a checkout, download or floor
+  guarded by the measured output (optionally enclosed in ``${{ }}``), or a
+  checkout, download or floor lacks that guard. Or a report is not downloaded once,
+  when measured, from this run, before the first floor.
 - ``coverage-seed``: ``coverage.yml`` lacks a ``push`` trigger for both
   ``COVERAGE_SEED_BRANCHES``, filters pushes by path, or lets later runs
   cancel a running push.
@@ -285,7 +292,9 @@ runs the function.
   ``continue-on-error``, or it does not run each of its commands
   unconditionally. A cancel rejection step of the coverage gate is exempt
   from the step rule: ``if`` equal to ``cancelled()``, no
-  ``continue-on-error``, and ``exit 1`` as its only command. Or
+  ``continue-on-error``, and ``exit 1`` as its only command. Gate checkouts,
+  downloads and floors may use only the measured output guard, without
+  ``continue-on-error``. Or
   ``check-host.sh`` does not run each command of
   ``HOST_CHECKS`` unconditionally.
 - ``skill-archive``: ``release-contracts`` can be bypassed, or its skill
@@ -433,8 +442,10 @@ COVERAGE_LABEL = "github.event_name != 'pull_request' || github.base_ref == 'mai
 COVERAGE_DOCS_SKIP = ("github.event_name == 'push' && needs.changes.result == 'success' && "
                       "needs.changes.outputs.docs_only == 'true'")
 COVERAGE_CONDITION = f"!cancelled() && ({COVERAGE_ELIGIBILITY}) && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
-# The gate still rejects failed, cancelled, or skipped measurements.
-COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_ELIGIBILITY}) && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
+# The gate reports on every eligible event, including docs-only changes.
+COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_ELIGIBILITY})"
+COVERAGE_MEASURE = "${{ (" + COVERAGE_LABEL + ") && !(" + COVERAGE_DOCS_SKIP + ") }}"
+COVERAGE_MEASURED = "steps.decision.outputs.measured == 'true'"
 COVERAGE_SUFFIX = "${{ !(" + COVERAGE_ELIGIBILITY + ") && ' (ignored event)' || '' }}"
 COVERAGE_NAMES = {"changes": "changes", "coverage-off": "coverage (feature-off)",
                   "coverage-on": "coverage (feature-on)", "coverage": "coverage"}
@@ -463,8 +474,23 @@ COVERAGE_EXPORTS = {"coverage-off": (f"cov-feature-off-{COVERAGE_ATTEMPT}", "cov
 COVERAGE_SELECTION_INPUTS = ("pattern", "merge-multiple")
 # The gate's first step reads both part results; the keys are quoted strings.
 COVERAGE_RESULT_ENV = {"OFF": "${{ needs.coverage-off.result }}", "ON": "${{ needs.coverage-on.result }}",
-                       "CHANGES": "${{ needs.changes.result }}"}
+                       "CHANGES": "${{ needs.changes.result }}", "MEASURE": COVERAGE_MEASURE}
 COVERAGE_RESULT_CHECKS = ('test "$OFF" = success', 'test "$ON" = success')
+# Pin the complete decision script literally, including its final newline.
+COVERAGE_DECISION_RUN = '''test "$CHANGES" = success
+if [ "$MEASURE" = false ]; then
+  test "$OFF" = skipped
+  test "$ON" = skipped
+  echo "The change is docs-only; nothing was measured."
+  echo "measured=false" >> "$GITHUB_OUTPUT"
+  exit 0
+fi
+test "$MEASURE" = true
+echo "feature-off: $OFF, feature-on: $ON"
+test "$OFF" = success
+test "$ON" = success
+echo "measured=true" >> "$GITHUB_OUTPUT"
+'''
 # The gate steps that fail a cancelled run before and after the floors.
 COVERAGE_CANCEL_CONDITION = "cancelled()"
 COVERAGE_CANCEL_RUN = "exit 1"
@@ -1251,8 +1277,21 @@ class Checker:
         if isinstance(gate_condition, str):
             gate_condition = self.unwrap_expression(gate_condition)
         if gate_condition != COVERAGE_GATE_CONDITION:
-            self.report(workflow, "coverage-condition", "coverage gate runs without always() and the measure condition")
+            self.report(workflow, "coverage-condition", "coverage gate must run on always() and canonical eligibility only")
+        steps = gate.get("steps", []) or []
+        first = steps[0] if steps else {}
+        if (first.get("id") != "decision"
+                or self.unwrap_expression(str((first.get("env") or {}).get("MEASURE", ""))) != self.unwrap_expression(COVERAGE_MEASURE)):
+            self.report(workflow, "coverage-condition", "coverage gate decision must use the measure expression")
+        for step in steps:
+            if self.coverage_measured_step(step) and self.unwrap_expression(str(step.get("if", ""))) != COVERAGE_MEASURED:
+                self.report(workflow, "coverage-condition", "coverage gate checkout, download and floors must use the measured guard")
 
+    def coverage_measured_step(self, step):
+        """Steps that consume reports only when the gate's decision measured."""
+        return (str(step.get("uses") or "").startswith(("actions/checkout@", "actions/download-artifact@"))
+                or any(command in self.normalized(self.run_text(step))
+                       for command in (COVERAGE_OFF_FLOORS, COVERAGE_ON_FLOORS)))
 
     def check_coverage_eligibility(self, workflow, doc, jobs):
         if (doc.get("concurrency") or {}).get("group") != COVERAGE_GROUP:
@@ -1332,6 +1371,8 @@ class Checker:
         if not isinstance(needs, list) or set(map(str, needs)) != {"changes", *COVERAGE_PARTS}:
             self.report(workflow, rule, f"coverage gate needs {needs}, expected changes, coverage-off and coverage-on")
         first = steps[0] if steps else {}
+        if first.get("id") != "decision" or first.get("run") != COVERAGE_DECISION_RUN:
+            self.report(workflow, rule, "coverage gate decision must match the literal template")
         if "if" in first or any(self.runs_line(first.get("run"), check)[0] < 0 for check in COVERAGE_RESULT_CHECKS):
             self.report(workflow, rule, "coverage gate does not check the results first")
         env = first.get("env")
@@ -1349,7 +1390,9 @@ class Checker:
         for index, step in enumerate(steps):
             if index in (1, len(steps) - 1) and rejects(step):
                 continue
-            if "if" in step:
+            if self.coverage_measured_step(step) and self.unwrap_expression(str(step.get("if", ""))) != COVERAGE_MEASURED:
+                self.report(workflow, rule, "coverage gate consumer must use the measured guard")
+            if "if" in step and not (self.coverage_measured_step(step) and self.unwrap_expression(str(step["if"])) == COVERAGE_MEASURED):
                 self.report(workflow, rule, f"coverage gate step {index + 1} runs under {step['if']}")
         downloads = {}
         for index, step in enumerate(steps):
@@ -1358,7 +1401,7 @@ class Checker:
         first_floor = min(floors, default=len(steps))
         for artifact, _ in COVERAGE_EXPORTS.values():
             found = downloads.get(artifact, [])
-            if len(found) != 1 or "if" in found[0][1]:
+            if len(found) != 1 or self.unwrap_expression(str(found[0][1].get("if", ""))) != COVERAGE_MEASURED:
                 self.report(workflow, rule, f"coverage gate does not download {artifact}")
                 continue
             index, step = found[0]
@@ -2248,13 +2291,15 @@ class Checker:
             if not documented or "continue-on-error" in job:
                 self.report(workflow, "ci-feature-jobs", f"{name} can be bypassed")
             for step in job.get("steps", []):
-                # The coverage gate's cancel rejections may run under cancelled() and only fail.
+                # The coverage gate guards report consumers by its measured output;
+                # cancel rejections may run under cancelled() and only fail.
                 if ("if" in step or "continue-on-error" in step) and not (
                         workflow == COVERAGE_WORKFLOW and name == COVERAGE_GATE
                         and isinstance(step.get("if"), str)
-                        and self.unwrap_expression(step["if"]) == COVERAGE_CANCEL_CONDITION
                         and "continue-on-error" not in step
-                        and self.normalized(self.run_text(step)) == [COVERAGE_CANCEL_RUN]):
+                        and ((self.unwrap_expression(step["if"]) == COVERAGE_CANCEL_CONDITION
+                              and self.normalized(self.run_text(step)) == [COVERAGE_CANCEL_RUN])
+                             or (self.coverage_measured_step(step) and self.unwrap_expression(str(step["if"])) == COVERAGE_MEASURED))):
                     self.report(workflow, "ci-feature-jobs", f"{name} step can be bypassed")
             for command in commands:
                 if self.runs_in_job(workflow, name, command, "ci-feature-jobs") < 0:

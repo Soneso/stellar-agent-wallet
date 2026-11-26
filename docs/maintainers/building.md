@@ -247,8 +247,10 @@ runs the complete local registry, including coverage.
 
 CI runs the offline gates on every pull request to `main` or
 `next`. Pull-request
-coverage runs automatically on every pull request into `main` and every code
-pull request into `next`. The `coverage` label adds a run on a docs-only pull request.
+coverage measures automatically on eligible events for every pull request into
+`main` and every code pull request into `next`. The required `coverage` job runs
+on every eligible event and passes docs-only changes into `next` without
+measuring; the `coverage` label requires measurement on a docs-only pull request.
 Live acceptance uses its separate workflow. A pull request into `next` that changes only documentation,
 as `.github/scripts/classify-docs-only.py` decides, skips the `ci.yml` build
 and test jobs and runs `docs-tests`: the tests that `.github/docs-tests.tsv`
@@ -269,8 +271,9 @@ arrives as a macro argument, a proc macro that reads a documentation file, or
 an embedding crate that takes a directory; review such code by hand.
 The full suite still covers them: every pull request into `main` and push to
 `main` runs the full `ci.yml` suite and coverage. A push to `next` skips the
-full build and test jobs and coverage only for a proven documentation-only
-change; CI still runs the documentation tests. Failed or uncertain coverage
+full build and test jobs and coverage measurement only for a proven
+documentation-only change; CI still runs the documentation tests and the
+required `coverage` job passes without measuring. Failed or uncertain coverage
 classification measures the change.
 A pull request retargeted to `main` runs coverage immediately. The full CI set
 and install surface rerun after a new push or a reopen, producing the required
@@ -616,31 +619,38 @@ current offline coverage. The aspirational target for new code is 90% per
 crate. Coverage measures feature-off and feature-on independently. Two
 parallel report-only checks, `coverage (feature-off)` and
 `coverage (feature-on)`, each write one report. The required check `coverage`
-checks both job results and enforces both floors on the reports of the same
-run. Each run resets its instrumentation data, writes a separate report and
-uses the selected configuration's floors. Live tiers that attempt RPC and
+checks both job results and, when measurement is required, enforces both floors
+on the reports of the same run. Each measuring run resets its instrumentation
+data, writes a separate report and uses the selected configuration's floors.
+Live tiers that attempt RPC and
 Friendbot access remain disabled.
 
-CI runs this gate automatically on every pull request into `main` and every
-code pull request into `next`. A proven docs-only pull request into `next`
-skips measurement unless it carries the `coverage` label. Pushes to `main`
-always measure; pushes to `next` skip only proven docs-only changes. Measuring
+CI runs the required `coverage` job on every eligible event. A job skipped by
+its `if` reports under its unevaluated name, so the required job must run to
+report as `coverage`. A proven docs-only pull request into `next` passes without
+measuring unless it carries the `coverage` label. The decision requires
+successful classification and both measuring jobs skipped; only a measured run
+checks out source, downloads reports and enforces floors. Pushes to `main`
+always measure; pushes to `next` skip measurement only for proven docs-only
+changes and pass `coverage` without measuring. Measuring
 pushes seed the coverage caches. The gate also runs weekly on main and on demand
-through `workflow_dispatch`. A failed, canceled, or skipped measurement fails
-`coverage`. A red coverage push on `next` blocks integration through the required
+through `workflow_dispatch`. A failed, canceled, or unexpectedly skipped
+measurement fails `coverage`. A red coverage push on `next` blocks integration through the required
 coverage run on the pull request into `main`, which measures the tree it brings.
 Local reproduction is optional.
 
 Opening, pushing to, or reopening a pull request evaluates coverage. Adding the
 `coverage` label or changing the base also evaluates it. Removing a label starts
 no run. Other label additions and edits measure nothing, use their own
-concurrency group, and suffix every job name with ` (ignored event)` so they
-cannot replace required checks. Eligible pull request runs cancel their
+concurrency group, and skip all jobs under their unevaluated name templates,
+which match no required check. The name expressions select ` (ignored event)`
+for those events. Eligible pull request runs cancel their
 predecessors; push, schedule, and dispatch runs each have their own group.
 
-Each report artifact carries the run attempt in its name, so `coverage` reads
-only the reports of its own attempt. A rerun of the gate alone, or of one
-measurement job, finds no report of its attempt and fails. After a failed
+Each report artifact carries the run attempt in its name, so a measuring
+`coverage` run reads only the reports of its own attempt. When measurement is
+required, a rerun of the gate alone or of one measurement job finds no report of
+its attempt and fails. After a failed
 download, a maintainer reruns all jobs.
 
 Rust caches in `ci.yml` and `coverage.yml` save on push runs only. A pull
