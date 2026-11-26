@@ -106,7 +106,8 @@ LIVE = {}
 def load(path):
     spec = importlib.util.spec_from_file_location('feature_discipline', path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Mutation and control loads use current source even when cached timestamps match.
+    exec(compile(path.read_bytes(), str(path), 'exec'), module.__dict__)
     return module
 
 
