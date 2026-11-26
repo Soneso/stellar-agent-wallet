@@ -10,13 +10,13 @@ name: vendored-wasm
 # When a change can affect a rebuild, two macOS jobs provide the pinned
 # stellar-cli binaries, and the rebuild job rebuilds every manifest file and
 # compares it byte for byte. The vendored-wasm job reads every job result,
-# and on a tag or crate publication run it passes only after a rebuild. These
+# and on a tag run it passes only after a rebuild. These
 # runs build both stellar-cli binaries from source. The rebuild reads the
 # install roots from this run's artifacts. No job or step continues on an
 # error, and no step of the check, rebuild, or vendored-wasm job suppresses a
 # failure. The release's Apple signing and notarization, hashing, cosign
-# signing, provenance, and publication jobs and the crate publish job therefore
-# see every failed check of this workflow.
+# signing, provenance, and publication jobs see every failed check of this
+# workflow. Crate publication verifies the successful Release run's evidence.
 #
 # A newer push to a pull request cancels that pull request's older run. Every
 # main, tag, scheduled, and dispatched run has a concurrency group of its own.
@@ -25,15 +25,6 @@ name: vendored-wasm
 
 on:
   workflow_call:
-    inputs:
-      source_sha:
-        type: string
-        required: false
-        default: ''
-      publication:
-        type: boolean
-        required: false
-        default: false
   pull_request:
     branches: [main, next]
   push:
@@ -62,7 +53,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.source_sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Tree check
@@ -72,8 +62,6 @@ jobs:
       - name: Decide whether the change needs a rebuild
         id: decide
         env:
-          PUBLICATION: ${{ inputs.publication }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
           EVENT_NAME: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
           PUSH_BEFORE: ${{ github.event.before }}
@@ -81,17 +69,7 @@ jobs:
         run: |
           set -euo pipefail
           event=$EVENT_NAME
-          if [ "$PUBLICATION" = true ]; then
-            if ! [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "publication requires a full source commit SHA" >&2
-              exit 1
-            fi
-            if [ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]; then
-              echo "publication checkout does not match the source commit" >&2
-              exit 1
-            fi
-            event=tag
-          elif [ "$REF_TYPE" = tag ]; then
+          if [ "$REF_TYPE" = tag ]; then
             event=tag
           fi
           case "$event" in
@@ -129,7 +107,7 @@ jobs:
         run: echo "key=stellar-cli-$CLI_VERSION-archive-$CLI_COMMIT-rustc-$HOST_RUSTC-$OS_NAME-$ARCH_NAME-r$RECIPE_REVISION" >>"$GITHUB_OUTPUT"
       - name: Restore the install root
         id: restore
-        if: github.ref_type != 'tag' && !inputs.publication
+        if: github.ref_type != 'tag'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/stellar-cli-25
@@ -176,7 +154,7 @@ jobs:
           retention-days: 1
           if-no-files-found: error
       - name: Save the install root
-        if: github.ref_type != 'tag' && !inputs.publication && (github.event_name == 'push' || github.event_name == 'schedule') && steps.restore.outputs.cache-hit != 'true'
+        if: github.ref_type != 'tag' && (github.event_name == 'push' || github.event_name == 'schedule') && steps.restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/stellar-cli-25
@@ -206,7 +184,7 @@ jobs:
         run: echo "key=stellar-cli-$CLI_VERSION-crates-io-$CLI_COMMIT-rustc-$HOST_RUSTC-$OS_NAME-$ARCH_NAME-r$RECIPE_REVISION" >>"$GITHUB_OUTPUT"
       - name: Restore the install root
         id: restore
-        if: github.ref_type != 'tag' && !inputs.publication
+        if: github.ref_type != 'tag'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/stellar-cli-28
@@ -242,7 +220,7 @@ jobs:
           retention-days: 1
           if-no-files-found: error
       - name: Save the install root
-        if: github.ref_type != 'tag' && !inputs.publication && (github.event_name == 'push' || github.event_name == 'schedule') && steps.restore.outputs.cache-hit != 'true'
+        if: github.ref_type != 'tag' && (github.event_name == 'push' || github.event_name == 'schedule') && steps.restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/stellar-cli-28
@@ -257,7 +235,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.source_sha }}
           persist-credentials: false
       # /bin/bash is Bash 3.2 here; a bash placed earlier on PATH never
       # replaces it.
@@ -312,7 +289,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.source_sha }}
           persist-credentials: false
       - name: Gate on every job result
         env:
@@ -321,5 +297,5 @@ jobs:
           CLI25: ${{ needs.stellar-cli-25.result }}
           CLI28: ${{ needs.stellar-cli-28.result }}
           REBUILD_JOB: ${{ needs.rebuild.result }}
-          REF_TYPE: ${{ inputs.publication && 'publication' || github.ref_type }}
+          REF_TYPE: ${{ github.ref_type }}
         run: bash .github/scripts/rebuild-vendored-wasm.sh --gate "$CHECK" "$REBUILD" "$CLI25" "$CLI28" "$REBUILD_JOB" "$REF_TYPE"

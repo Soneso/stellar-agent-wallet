@@ -515,6 +515,9 @@ jobs:
       - name: Self-test the publish verification
         if: needs.changes.outputs.selftest_scripts != 'false'
         run: bash .github/scripts/test-publish-crates-verify.sh
+      - name: Self-test the publish release evidence
+        if: needs.changes.outputs.selftest_scripts != 'false'
+        run: python3 .github/scripts/test-publish-release-evidence.py --mutations
       - name: Self-test the crate checksum comparison
         if: needs.changes.outputs.selftest_scripts != 'false'
         run: python3 .github/scripts/test-compare-crate-sums.py

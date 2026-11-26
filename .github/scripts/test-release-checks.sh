@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Exercises package, archive, install, host, and signature checks with stub tools.
 set -euo pipefail
+if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != --signatures ]; }; then
+  echo 'usage: test-release-checks.sh [--signatures]' >&2
+  exit 2
+fi
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 mkdir -p target/tmp
@@ -55,6 +59,11 @@ attempts() {
 
 # --signatures runs only the manifest, bundle, and workflow fixtures.
 if [ "${1:-}" != --signatures ]; then
+expect signatures-mode 0 bash .github/scripts/test-release-checks.sh --signatures
+expect_output signatures-mode 'ok signatures-six-exact-pairs'
+expect_output signatures-mode 'ok signatures-restored'
+expect unknown-argument 2 bash .github/scripts/test-release-checks.sh --unknown
+expect signatures-extra-argument 2 bash .github/scripts/test-release-checks.sh --signatures extra
 # Package verification builds the canonical executable into the shared target
 # directory; the check derives the alias from it.
 target_dir="$tmp/target"

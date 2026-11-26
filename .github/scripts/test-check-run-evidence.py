@@ -96,7 +96,7 @@ def answer(world, target, authorization):
         event = query.get("event")
         expected = {"event": event, "head_sha": SHA, "per_page": "100", "page": page}
         if event == "push":
-            expected["branch"] = "main"
+            expected["branch"] = TAG if match[1] == "release.yml" else "main"
         if event not in ("push", "workflow_dispatch") or query != expected or not page.isdigit():
             return 400, {"message": f"unexpected query {query}"}
         runs = [public(run) for run in world.runs if run["_file"] == match[1] and run["_event"] == event]
@@ -105,6 +105,12 @@ def answer(world, target, authorization):
         for run in world.runs:
             if run["id"] == int(match[1]):
                 return 200, public(run)
+    if match := re.fullmatch(r"/actions/runs/([0-9]+)/jobs", relative):
+        run = next((run for run in world.runs if run["id"] == int(match[1])), {})
+        jobs = world.jobs.get((int(match[1]), run.get("run_attempt")))
+        if jobs is not None and query == {"filter": "latest", "per_page": "100", "page": page}:
+            return 200, page_of("jobs", [{"status": "completed", "run_id": int(match[1]),
+                                         "run_attempt": run.get("run_attempt"), **job} for job in jobs], int(page))
     if match := re.fullmatch(r"/actions/runs/([0-9]+)/attempts/([0-9]+)/jobs", relative):
         jobs = world.jobs.get((int(match[1]), int(match[2])))
         if jobs is not None and query == {"per_page": "100", "page": page} and page.isdigit():
@@ -663,7 +669,7 @@ MUTATIONS = {
     "found-message": ('found = "; ".join(refused) or "no matching run"', 'found = "no matching run"',
                       ["failed run"]),
     "refetch-id": ('if (positive(current.get("id")) != run["id"] or ', "if (", ["refetch with another ID"]),
-    "refetch-id-type": ('positive(current.get("id")) != run["id"]', 'current.get("id") != run["id"]',
+    "refetch-id-type": ('if (positive(current.get("id")) != run["id"] or ', 'if (current.get("id") != run["id"] or ',
                         ["refetch with a boolean ID"]),
     "refetch-branch": ('or current.get("head_branch") != run["head_branch"]', "",
                        ["refetch of a dispatch on another branch"]),
@@ -703,12 +709,254 @@ MUTATIONS = {
 }
 
 
+def release_world(change=lambda world, run: None):
+    def setup(world):
+        world.args["--mode"] = "release"
+        run = world.add("release.yml", head_branch=TAG)
+        world.jobs[(run["id"], 1)] = [
+            {"name": "vendored-wasm / " + name, "conclusion": "success"}
+            for name in ("tree check", "stellar-cli 25.2.0", "stellar-cli 28.1.0", "rebuild", "vendored-wasm")]
+        world.jobs[(run["id"], 1)].append({"name": "verify-provenance", "conclusion": "success"})
+        change(world, run)
+        world.expect = {"release.yml": (run["id"], run["run_attempt"], "push")}
+    return setup
+
+
+def release_rerun(world, run):
+    world.jobs[(run["id"], 1)][0]["conclusion"] = "failure"
+    world.jobs[(run["id"], 2)] = [
+        {**job, "conclusion": "success"} for job in world.jobs[(run["id"], 1)]]
+    run["run_attempt"] = 2
+
+
+RELEASE_CASES = [
+    ("release success", release_world(), None),
+    ("release qualified path", release_world(lambda w, r: r.update(
+        path=f".github/workflows/release.yml@refs/tags/{TAG}")), None),
+    ("release zero", release_world(lambda w, r: w.runs.remove(r)), "release.yml: 0 matching"),
+    ("release two", release_world(lambda w, r: w.add("release.yml", head_branch=TAG)), "release.yml: 2 matching"),
+    ("release failed latest", release_world(lambda w, r: r.update(run_attempt=2, conclusion="failure")),
+     "release.yml: run 1006 attempt 2: latest Release attempt must be completed with success"),
+    ("release pending", release_world(lambda w, r: r.update(status="in_progress")),
+     "release.yml: run 1006 attempt 1: latest Release attempt must be completed with success"),
+    ("release rerun success", release_world(release_rerun), None),
+    ("release failed wasm", release_world(lambda w, r: w.jobs[(r["id"], 1)][0].update(conclusion="failure")),
+     "release.yml: run 1006 attempt 1: job 'vendored-wasm / tree check' (completed, failure): must be completed with success"),
+    ("release pending job", release_world(lambda w, r: w.jobs[(r["id"], 1)][0].update(status="in_progress")),
+     "release.yml: run 1006 attempt 1: job 'vendored-wasm / tree check' (in_progress, success): must be completed with success"),
+    ("release failed provenance", release_world(lambda w, r: w.jobs[(r["id"], 1)][-1].update(conclusion="failure")),
+     "release.yml: run 1006 attempt 1: job 'verify-provenance' (completed, failure): must be completed with success"),
+    ("release missing provenance", release_world(lambda w, r: w.jobs[(r["id"], 1)].pop()),
+     "release.yml: run 1006 attempt 1: 0 jobs named 'verify-provenance', expected one"),
+    ("release duplicate provenance", release_world(lambda w, r: w.jobs[(r["id"], 1)].append(
+        {"name": "verify-provenance", "conclusion": "success"})),
+     "release.yml: run 1006 attempt 1: 2 jobs named 'verify-provenance', expected one"),
+    ("release missing wasm", release_world(lambda w, r: w.jobs.update({(r["id"], 1): w.jobs[(r["id"], 1)][-1:]})),
+     "release.yml: run 1006 attempt 1: missing Release jobs:"),
+    ("release invalid ID", release_world(lambda w, r: r.update(id=0)),
+     "release.yml: run 0 attempt 1: Release run ID is not a positive integer"),
+    ("release invalid attempt", release_world(lambda w, r: r.update(run_attempt=0)),
+     "release.yml: run 1006 attempt 0: Release run attempt is not a positive integer"),
+    ("release refetch identity", release_world(lambda w, r: w.hooks.append(on_request(
+        f"/actions/runs/{r['id']}", lambda w: r.update(head_sha=OTHER_SHA)))),
+     "release.yml: run 1006 attempt 1: the latest Release run no longer matches"),
+    ("release refetch ID", release_world(lambda w, r: w.errors.update({
+        f"/actions/runs/{r['id']}": (200, {**public(r), "id": 999})})),
+     "release.yml: run 1006 attempt 1: the latest Release run no longer matches"),
+    ("release lookup race", release_world(lambda w, r: w.hooks.append(on_request(
+        f"/actions/runs/{r['id']}/jobs", lambda w: r.update(status="in_progress")))),
+     "release.yml: run 1006 attempt 1: Release run changed during the job lookup: status"),
+]
+for field, value in (("head_sha", OTHER_SHA), ("head_branch", "v9.9.9"), ("event", "workflow_dispatch"),
+                     ("path", ".github/workflows/ci.yml"), ("repository", {"full_name": "other/repo"}),
+                     ("repository", "invalid")):
+    RELEASE_CASES.append((f"release wrong {field} {value}", release_world(
+        lambda w, r, field=field, value=value: r.update({field: value})), "release.yml: 0 matching"))
+CASES += RELEASE_CASES
+
+MUTATIONS.update({
+    "release-mode": ('if args.mode == "release":', 'if False:', ["release success"]),
+    "release-filter": ('runs = [run for run in runs if self.release_matches(run)]', 'runs = runs',
+                       [case[0] for case in RELEASE_CASES if case[0].startswith("release wrong")]),
+    "release-count": ('if len(runs) != 1:', 'if not runs:', ["release two"]),
+    "release-latest": ('current = self.get(f"/actions/runs/{run[\'id\']}", context=f"{label(run)}: ")', 'current = run',
+                       ["release refetch identity"]),
+    "release-refetch-identity": (' or not self.release_matches(current):', ':',
+                        ["release refetch identity"]),
+    "release-refetch-id": ('positive(current.get("id")) != run["id"] or not self.release_matches(current)',
+                          'not self.release_matches(current)',
+                        ["release refetch ID"]),
+    "release-state": ('if (current.get("status"), current.get("conclusion")) != ("completed", "success"):',
+                      'if False:', ["release failed latest", "release pending"]),
+    "release-wasm": ('if missing:', 'if False:', ["release missing wasm"]),
+    "release-provenance-count": ('if len(provenance) != 1:', 'if False:',
+                                ["release missing provenance", "release duplicate provenance"]),
+    "release-job-state": ('if (job.get("status"), job.get("conclusion")) != ("completed", "success"):',
+                          'if False:', ["release failed wasm", "release pending job", "release failed provenance"]),
+    "release-race": ('if final.get(field) != current.get(field):', 'if False:', ["release lookup race"]),
+    "release-id": ('if positive(run.get("id")) is None:', 'if False:', ["release invalid ID"]),
+    "release-attempt": ('        if attempt is None:\n            raise Failure(f"{label(current)}: Release run attempt',
+                         '        if False:\n            raise Failure(f"{label(current)}: Release run attempt', ["release invalid attempt"]),
+    "release-output": ('output.write(f"run_id={run_id}\\nrun_attempt={attempt}\\n")',
+                       'output.write(f"run_id={run_id}\\nrun_attempt=1\\n")', ["release rerun success"]),
+    "release-return": ('return run["id"], attempt', 'return run["id"], 1', ["release rerun success"]),
+})
+
+
+def release_refetch(fields, final=False, one=False):
+    def change(world, run):
+        if one:
+            world.jobs[(1, 1)] = world.jobs.pop((run["id"], 1))
+            run["id"] = 1
+        path = f"/actions/runs/{run['id']}"
+        normal, changed = public(run), {**public(run), **fields}
+        world.hooks.append(on_request(path, *[
+            lambda w, body=body: w.errors.update({path: (200, body)})
+            for body in ([normal, changed] if final else [changed, normal])]))
+    return release_world(change)
+
+
+for index, name in enumerate(("tree check", "stellar-cli 25.2.0", "stellar-cli 28.1.0", "rebuild", "vendored-wasm")):
+    label = "release missing " + name
+    CASES.append((label, release_world(lambda w, r, i=index: w.jobs[(r["id"], 1)].pop(i)),
+                  "release.yml: run 1006 attempt 1: missing Release jobs: vendored-wasm / " + name))
+    MUTATIONS[label] = ('if missing:', 'if False:', [label])
+
+def release_job_field(world, run, index, field, value):
+    if field == "run_id" and value is True:
+        world.jobs[(1, 1)] = world.jobs.pop((run["id"], 1))
+        run["id"] = 1
+    world.jobs[(run["id"], 1)][index].update({field: value})
+
+
+for name, field, value, message in (
+    ("foreign run", "run_id", 999, "belongs to run 999"),
+    ("boolean run", "run_id", True, "belongs to run True"),
+    ("zero attempt", "run_attempt", 0, "invalid attempt 0, latest is 1"),
+    ("boolean attempt", "run_attempt", True, "invalid attempt True, latest is 1"),
+    ("string attempt", "run_attempt", "1", "invalid attempt 1, latest is 1"),
+    ("future attempt", "run_attempt", 2, "invalid attempt 2, latest is 1"),
+):
+    for index, job_name in ((0, "vendored-wasm / tree check"), (-1, "verify-provenance")):
+        label = f"release job {name} {index}"
+        CASES.append((label, release_world(
+            lambda w, r, i=index, f=field, v=value: release_job_field(w, r, i, f, v)),
+            f"release.yml: run {1 if name == 'boolean run' else 1006} attempt 1: job {job_name!r} (completed, success): {message}"))
+        needle, replacement = {
+            "run_id": ('if positive(job.get("run_id")) != run["id"]:', 'if False:'),
+            "run_attempt": ('if job_attempt is None or job_attempt > attempt:',
+                            'if job_attempt is None:' if value == 2 else 'if job_attempt is not None and job_attempt > attempt:'),
+        }[field]
+        if name == "boolean run":
+            replacement = 'if job.get("run_id") != run["id"]:'
+        MUTATIONS[label] = (needle, replacement, [label])
+
+CASES += [
+    ("release boolean ID", release_world(lambda w, r: r.update(id=True)),
+     "release.yml: run True attempt 1: Release run ID is not a positive integer"),
+    ("release boolean attempt", release_world(lambda w, r: r.update(run_attempt=True)),
+     "release.yml: run 1006 attempt True: Release run attempt is not a positive integer"),
+    ("release run API error", release_world(lambda w, r: w.errors.update(
+        {f"/actions/runs/{r['id']}": (500, {})})),
+     "release.yml: run 1006 attempt 1: GET /actions/runs/1006: HTTP 500"),
+    ("release jobs API error", release_world(lambda w, r: w.errors.update(
+        {f"/actions/runs/{r['id']}/jobs": (500, {})})),
+     "release.yml: run 1006 attempt 1: GET /actions/runs/1006/jobs: HTTP 500"),
+    ("release final API error", release_world(lambda w, r: w.hooks.append(on_request(
+        f"/actions/runs/{r['id']}", lambda w: None,
+        lambda w: w.errors.update({f"/actions/runs/{r['id']}": (500, {})})))),
+     "release.yml: run 1006 attempt 1: GET /actions/runs/1006: HTTP 500"),
+    ("release older job attempt", release_world(lambda w, r: (
+        release_rerun(w, r), w.jobs[(r["id"], 2)][0].update(run_attempt=1))), None),
+    ("release extra wasm failed", release_world(lambda w, r: w.jobs[(r["id"], 1)].append(
+        {"name": "vendored-wasm / extra", "conclusion": "failure"})),
+     "release.yml: run 1006 attempt 1: job 'vendored-wasm / extra' (completed, failure): must be completed with success"),
+    ("release metadata changed", release_refetch({"updated_at": "later", "extra": {}}, final=True), None),
+    ("release current boolean ID", release_refetch({"id": True}, one=True),
+     "release.yml: run 1 attempt 1: the latest Release run no longer matches"),
+    ("release final boolean ID", release_refetch({"id": True}, final=True, one=True),
+     "release.yml: run 1 attempt 1: refetched Release run no longer matches"),
+    ("release final boolean attempt", release_refetch({"run_attempt": True}, final=True),
+     "release.yml: run 1006 attempt 1: refetched Release run no longer matches"),
+    ("release final repository", release_refetch({"repository": {"full_name": "other/repo"}}, final=True),
+     "release.yml: run 1006 attempt 1: refetched Release repository no longer matches"),
+    ("release output unset", release_world(lambda w, r: w.env.update(GITHUB_OUTPUT="unset")),
+     "release.yml: GITHUB_OUTPUT is unset or empty in release mode"),
+    ("release output empty", release_world(lambda w, r: w.env.update(GITHUB_OUTPUT="")),
+     "release.yml: GITHUB_OUTPUT is unset or empty in release mode"),
+]
+for field, value in (("id", 999), ("path", ".github/workflows/other.yml"), ("event", "workflow_dispatch"),
+                     ("head_branch", "v9.9.9"), ("head_sha", OTHER_SHA), ("run_attempt", 2),
+                     ("status", "in_progress"), ("conclusion", "failure")):
+    label = "release final " + field
+    CASES.append((label, release_refetch({field: value}, final=True),
+                  "release.yml: run 1006 attempt 1: Release run changed during the job lookup: " + field))
+    # Matching identity fields still undergo the final repository check.
+    needle = 'if final.get(field) != current.get(field):'
+    MUTATIONS[label] = (needle, f'if field != {field!r} and final.get(field) != current.get(field):', [label])
+
+MUTATIONS.update({
+    "release-current-context": ('current = self.get(f"/actions/runs/{run[\'id\']}", context=f"{label(run)}: ")',
+                                'current = self.get(f"/actions/runs/{run[\'id\']}")', ["release run API error"]),
+    "release-jobs-context": ('"jobs", f"{label(current)}: ")', '"jobs")', ["release jobs API error"]),
+    "release-final-context": ('final = self.get(f"/actions/runs/{run[\'id\']}", context=f"{label(current)}: ")',
+                              'final = self.get(f"/actions/runs/{run[\'id\']}")', ["release final API error"]),
+    "release-current-positive": ('positive(current.get("id")) != run["id"] or not self.release_matches(current)',
+                                'current.get("id") != run["id"] or not self.release_matches(current)',
+                                ["release current boolean ID"]),
+    "release-final-positive": ('positive(final.get("id")) is None or attempt_of(final) is None',
+                              'attempt_of(final) is None', ["release final boolean ID"]),
+    "release-final-attempt": ('positive(final.get("id")) is None or attempt_of(final) is None',
+                             'positive(final.get("id")) is None', ["release final boolean attempt"]),
+    "release-final-repository": ('if not self.release_matches(final):', 'if False:', ["release final repository"]),
+    "release-metadata": ('if final.get(field) != current.get(field):', 'if final != current:', ["release metadata changed"]),
+    "release-older-job": ('job_attempt > attempt:', 'job_attempt != attempt:', ["release older job attempt"]),
+    "release-output-required": ('if not output_path:', 'if False:', ["release output unset", "release output empty"]),
+})
+# Each status/conclusion clause has its own control.
+for name, needle, labels in (
+    ("release-state", 'if (current.get("status"), current.get("conclusion")) != ("completed", "success"):',
+     ("release pending", "release failed latest")),
+    ("release-job-state", 'if (job.get("status"), job.get("conclusion")) != ("completed", "success"):',
+     ("release pending job", "release failed wasm")),
+):
+    del MUTATIONS[name]
+    owner = "current" if name == "release-state" else "job"
+    for omitted, kept, expected, label in (
+        ("status", "conclusion", "success", labels[0]), ("conclusion", "status", "completed", labels[1])
+    ):
+        MUTATIONS[name + "-" + omitted] = (needle, f'if {owner}.get("{kept}") != "{expected}":', [label])
+
+del MUTATIONS["release-filter"]
+for field, label in (("event", "release wrong event workflow_dispatch"),
+                     ("head_branch", "release wrong head_branch v9.9.9"),
+                     ("head_sha", "release wrong head_sha " + OTHER_SHA)):
+    MUTATIONS["release-filter-" + field] = (
+        'all(run.get(key) == value for key, value in expected.items())',
+        f'all(run.get(key) == value for key, value in expected.items() if key != {field!r})', [label])
+for name, needle, replacement, label in (
+    ("path", 'and run.get("path") in (path, f"{path}@refs/tags/{self.args.tag}")', '',
+     "release wrong path .github/workflows/ci.yml"),
+    ("repository", 'run["repository"].get("full_name") == self.args.repository', 'True',
+     "release wrong repository {'full_name': 'other/repo'}"),
+    ("repository-type", 'if not isinstance(run.get("repository"), dict):', 'if False:',
+     "release wrong repository invalid"),
+):
+    MUTATIONS["release-filter-" + name] = (needle, replacement, [label])
+MUTATIONS["release-zero-count"] = ('if len(runs) != 1:', 'if len(runs) > 1:', ["release zero"])
+del MUTATIONS["release-provenance-count"]
+for name, comparison, label in (("missing", "> 1", "release missing provenance"),
+                                ("duplicate", "== 0", "release duplicate provenance")):
+    MUTATIONS["release-provenance-" + name] = ('if len(provenance) != 1:', f'if len(provenance) {comparison}:', [label])
+
+
 def run_case(script, case, url):
     label, setup, expected = case
     world = World()
     setup(world)
     STATE["world"] = world
-    for workflow in WORKFLOWS:
+    workflows = ("release.yml",) if world.args.get("--mode") == "release" else WORKFLOWS
+    for workflow in workflows:
         if expected is None and workflow not in world.expect:
             world.expect[workflow] = (world.push(workflow)["id"], 1, "push")
     options = {"--repository": REPO, "--sha": SHA, "--tag": TAG, "--wait-minutes": "1",
@@ -717,10 +965,20 @@ def run_case(script, case, url):
     command = [sys.executable, "-B", str(script)] + [part for item in options.items() for part in item]
     env = {key: value for key, value in os.environ.items() if "proxy" not in key.lower() and key != "GH_TOKEN"}
     env.update(world.env, NO_PROXY="127.0.0.1")
-    result = subprocess.run(command, capture_output=True, text=True, env=env, timeout=300)
+    with tempfile.TemporaryDirectory() as scratch:
+        output = pathlib.Path(scratch) / "outputs"
+        if world.env.get("GITHUB_OUTPUT") != "unset":
+            env["GITHUB_OUTPUT"] = world.env.get("GITHUB_OUTPUT", str(output))
+        else:
+            env.pop("GITHUB_OUTPUT", None)
+        result = subprocess.run(command, capture_output=True, text=True, env=env, timeout=300)
+        if expected is None and workflows == ("release.yml",):
+            run_id, attempt, _ = world.expect["release.yml"]
+            if not output.exists() or output.read_text() != f"run_id={run_id}\nrun_attempt={attempt}\n":
+                return "Release step outputs differ"
     if expected is None:
         wanted = "".join(f"check-run-evidence: {workflow}: accepted run {world.expect[workflow][0]} attempt "
-                         f"{world.expect[workflow][1]} ({world.expect[workflow][2]})\n" for workflow in WORKFLOWS)
+                         f"{world.expect[workflow][1]} ({world.expect[workflow][2]})\n" for workflow in workflows)
         if result.returncode != 0 or result.stdout != wanted:
             return f"exit {result.returncode}, expected 0 with\n{wanted}got\n{result.stdout}{result.stderr}"
         return None

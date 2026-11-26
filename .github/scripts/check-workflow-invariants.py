@@ -19,8 +19,9 @@ Also reads the composite action
 A job is credentialed when it references ``secrets.``, passes secrets to a
 reusable workflow, declares ``environment:``, or holds ``id-token: write``,
 ``contents: write``, or ``write-all`` (its own permissions, else the
-workflow's). Shell text is read line by line, with continuation lines joined
-and comment lines skipped. The check fails when any of these holds:
+workflow's). Shared shell checks drop comment lines before joining continuation
+lines. The release-evidence template keeps physical lines and comments.
+The check fails when any of these holds:
 
 - ``unreadable``: a workflow or the composite action is missing or is not
   valid YAML.
@@ -73,8 +74,8 @@ and comment lines skipped. The check fails when any of these holds:
   expression other than ``github.action_path``.
 - ``publish-tag-ref``: a ``publish.yml`` checkout uses a ref other than
   ``refs/tags/...`` or ``github.workflow_sha``, or a ``publish.yml`` job has
-  no ``refs/tags/`` checkout. The step-less ``vendored-wasm`` workflow call
-  is exempt; ``publish-wasm-gate`` governs it.
+  no ``refs/tags/`` checkout. The ``release-evidence`` job is exempt;
+  ``publish-release-evidence`` binds its checkout to the verified commit.
 - ``ancestry-check``: the ``release.yml`` preflight or a ``publish.yml`` job
   has no line whose first word is the path of ``check-ref-on-main.sh`` and
   that holds no shell operator. The step of that line sets ``if`` or
@@ -223,7 +224,7 @@ runs the function.
   signing, provenance, and publication therefore wait for the rebuild. The
   called workflow must declare ``workflow_call``.
   Its cache guards must lead with
-  ``github.ref_type != 'tag' && !inputs.publication``. Each cache step
+  ``github.ref_type != 'tag'``. Each cache step
   restores, or saves exactly on ``WASM_SAVE_CONDITION``, so only push and
   schedule runs save. Its rebuild
   must read both stellar-cli artifacts of its own run and use no cache. No
@@ -234,13 +235,21 @@ runs the function.
   unconditionally. The ``vendored-wasm`` job runs on ``always()``, needs
   exactly ``WASM_GATE_NEEDS``, and has one unconditional gate step that runs
   ``WASM_GATE_CALL`` with ``WASM_GATE_ENV``.
-- ``publish-wasm-gate``: crate publication must need verification and a local
-  Wasm workflow call for the verified source SHA with publication enabled.
-  The call needs only verification, holds no secrets, and cannot continue on
-  error. Both jobs run exactly on ``${{ !inputs.verify_only }}``. The reusable
-  workflow declares the source and publication inputs, checks out that source
-  in each repository job, validates the publication checkout in its decide
-  step, and excludes publication runs from every cache.
+- ``publish-release-evidence``: publish needs the compile-free evidence job.
+  It needs verify, runs on ubuntu-24.04 even for verify_only, and has exactly
+  contents: read and actions: read, with no environment or id-token.
+  It checks out the verified SHA and runs release-mode run selection,
+  signature verification, the digest-pinned SLSA verifier, provenance checks
+  bound to the selected run and latest attempt, and the offline tree check.
+  Its steps equal PUBLISH_EVIDENCE_TEMPLATE: the same count, order, keys,
+  and values, with no extra step, key, environment entry, comment, or run line.
+  Run blocks split on newline characters, trim spaces and tabs, and drop empty
+  lines; comments remain. The first differing step and field are reported.
+  The job and template change in the same commit. Job settings and credential
+  expressions remain checked separately; only the two pinned API steps may
+  set GH_TOKEN to github.token. The template does not judge script contents,
+  action behavior, downloaded artifacts, or runtime GitHub evidence.
+  Publish itself runs exactly on ``${{ !inputs.verify_only }}``.
 - ``release-vars``: an expression reads the ``vars`` context in
   ``release.yml``, in a local reusable workflow it calls, or in the
   ``action.yml`` of a local action it uses, followed through every local
@@ -346,7 +355,7 @@ RUST_CACHE_ACTION = re.compile(r"Swatinem/rust-cache(/[\w.-]+)*@", re.IGNORECASE
 CACHE_SAVE_CONDITION = "github.event_name == 'push'"
 # Only push and schedule runs save missing stellar-cli install roots; other
 # events never save.
-WASM_SAVE_CONDITION = ("github.ref_type != 'tag' && !inputs.publication && "
+WASM_SAVE_CONDITION = ("github.ref_type != 'tag' && "
                        "(github.event_name == 'push' || github.event_name == 'schedule') && "
                        "steps.restore.outputs.cache-hit != 'true'")
 SETUP_ACTION = re.compile(r"actions/setup-[\w.-]+@", re.IGNORECASE)
@@ -362,8 +371,43 @@ WASM_GATE_ENV = {
     "CLI25": "${{ needs.stellar-cli-25.result }}",
     "CLI28": "${{ needs.stellar-cli-28.result }}",
     "REBUILD_JOB": "${{ needs.rebuild.result }}",
-    "REF_TYPE": "${{ inputs.publication && 'publication' || github.ref_type }}",
+    "REF_TYPE": "${{ github.ref_type }}",
 }
+# Commands that bind published Release evidence to the verified tag commit.
+RELEASE_EVIDENCE_COMMANDS = (
+    "[ \"$(git rev-parse HEAD)\" = \"$SOURCE_SHA\" ]",
+    "echo \"RELEASE_DIR=$RUNNER_TEMP/release-evidence\" >> \"$GITHUB_ENV\"",
+    "python3 .github/scripts/check-run-evidence.py --mode release \\\n--repository \"$GITHUB_REPOSITORY\" --sha \"$SOURCE_SHA\" --tag \"$TAG\" \\\n--wait-minutes 0 --poll-seconds 0",
+    "mkdir -p \"$RELEASE_DIR\"/{all-artifacts,release-combined,all-signatures,provenance}",
+    "gh release view \"$TAG\" --repo \"$GITHUB_REPOSITORY\" --json isDraft,assets > \"$RELEASE_DIR/release.json\"",
+    "[ \"$(jq -r .isDraft \"$RELEASE_DIR/release.json\")\" = false ]",
+    "gh release download \"$TAG\" --repo \"$GITHUB_REPOSITORY\" --pattern SHA256SUMS --dir \"$RELEASE_DIR/release-combined\"",
+    "jq -e --rawfile sums \"$RELEASE_DIR/release-combined/SHA256SUMS\" --arg provenance \"stellar-agent-${TAG#v}.intoto.jsonl\" \\\n'($sums | split(\"\\n\") | map(select(length > 0) | .[66:])) as $archives | .isDraft == false and ($archives | length) == 5 and ([.assets[].name] | sort) == (($archives + [\"SHA256SUMS\"] + (($archives + [\"SHA256SUMS\"]) | map(. + \".sigstore.json\")) + [$provenance]) | sort)' \"$RELEASE_DIR/release.json\"",
+    "gh release download \"$TAG\" --repo \"$GITHUB_REPOSITORY\" --pattern '*.tar.xz' --pattern '*.zip' --dir \"$RELEASE_DIR/all-artifacts\"",
+    "gh release download \"$TAG\" --repo \"$GITHUB_REPOSITORY\" --pattern '*.sigstore.json' --dir \"$RELEASE_DIR/all-signatures\"",
+    "gh release download \"$TAG\" --repo \"$GITHUB_REPOSITORY\" --pattern '*.intoto.jsonl' --dir \"$RELEASE_DIR/provenance\"",
+    "bash .github/scripts/release/verify-signatures.sh \"$RELEASE_DIR\" \\\n\"https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$TAG\" \\\nhttps://token.actions.githubusercontent.com \"$SOURCE_SHA\"",
+    "shopt -s nullglob dotglob",
+    "verifier=\"$RUNNER_TEMP/slsa-verifier\"",
+    "curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \\\nhttps://github.com/slsa-framework/slsa-verifier/releases/download/v2.7.1/slsa-verifier-linux-amd64 --output \"$verifier\"",
+    "echo \"946dbec729094195e88ef78e1734324a27869f03e2c6bd2f61cbc06bd5350339  $verifier\" | sha256sum --check --strict",
+    "chmod +x \"$verifier\"",
+    "provenance=(\"$RELEASE_DIR\"/provenance/*.intoto.jsonl)",
+    "[ \"${#provenance[@]}\" -eq 1 ]",
+    "for archive in \"$RELEASE_DIR\"/all-artifacts/*; do \\\n\"$verifier\" verify-artifact \"$archive\" --provenance-path \"${provenance[0]}\" \\\n--source-uri \"github.com/$GITHUB_REPOSITORY\" --source-tag \"$TAG\" \\\n--builder-id https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.1.0; \\\ndone",
+    "python3 .github/scripts/check-provenance.py \"${provenance[0]}\" \"$RELEASE_DIR/release-combined/SHA256SUMS\" \\\n\"$SOURCE_SHA\" \"$GITHUB_REPOSITORY\" \"refs/tags/$TAG\" \\\n--run-id \"$RELEASE_RUN_ID\" --run-attempt \"$RELEASE_RUN_ATTEMPT\"",
+    "bash .github/scripts/rebuild-vendored-wasm.sh --check-tree --repo-root \"$GITHUB_WORKSPACE\"",
+)
+PUBLISH_EVIDENCE_ENV = {"TAG": "${{ inputs.tag }}", "SOURCE_SHA": "${{ needs.verify.outputs.sha }}"}
+PUBLISH_EVIDENCE_API = {
+    ("id", "release"): RELEASE_EVIDENCE_COMMANDS[2:3],
+    ("name", "Download the published release assets"): ("set -euo pipefail", *RELEASE_EVIDENCE_COMMANDS[3:11]),
+}
+
+CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+COSIGN_INSTALLER = "sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532"
+COSIGN_VERSION = "v3.1.4"
+
 WASM_REBUILD_CONDITION = "needs.check.outputs.rebuild == 'true'"
 WASM_FULL_MODE = "rebuild-vendored-wasm.sh --repo-root"
 # Inputs that make actions/download-artifact read another run or repository.
@@ -599,7 +643,7 @@ RELEASE_WORKFLOWS = {"release.yml", "publish.yml", "release-rehearsal.yml"}
 VERIFIED_SOURCE_CHECK = '[ "$(git -C src rev-parse HEAD)" = "$VERIFIED_SHA" ]'
 # The release checks, which no condition may skip and no command may ignore.
 GUARDED_JOBS = {"release.yml": ("verify-packaged", "verify-provenance", "hashes", "publish"),
-                "publish.yml": ("verify", "vendored-wasm", "publish", "verify-install"),
+                "publish.yml": ("verify", "publish", "verify-install"),
                 "release-rehearsal.yml": ("verify-packaged", "verify-crates")}
 # The verification jobs, which hold no credential.
 VERIFY_JOBS = (("release.yml", "verify-packaged"), ("release.yml", "verify-provenance"),
@@ -614,6 +658,46 @@ RELEASE_EVIDENCE_STEP = "Require the push CI evidence of the tag commit"
 RELEASE_EVIDENCE_COMMAND = ('python3 .github/scripts/check-run-evidence.py --repository "$GITHUB_REPOSITORY" '
                             '--sha "$GITHUB_SHA" --tag "$GITHUB_REF_NAME" --wait-minutes 80 --poll-seconds 60')
 RELEASE_EVIDENCE_ENV = {"GH_TOKEN": "${{ github.token }}"}
+# The live job and this template change together; run lines retain comments and continuations.
+PUBLISH_EVIDENCE_TEMPLATE = (
+    {
+        "uses": CHECKOUT_ACTION,
+        "with": {"ref": "${{ needs.verify.outputs.sha }}", "persist-credentials": False},
+    },
+    {
+        "name": "Require the verified checkout",
+        "run": "\n".join(("set -euo pipefail", *RELEASE_EVIDENCE_COMMANDS[:2])),
+    },
+    {
+        "name": "Select the successful Release run",
+        "id": "release",
+        "env": RELEASE_EVIDENCE_ENV,
+        "run": "\n".join(PUBLISH_EVIDENCE_API[("id", "release")]),
+    },
+    {
+        "name": "Download the published release assets",
+        "env": RELEASE_EVIDENCE_ENV,
+        "run": "\n".join(PUBLISH_EVIDENCE_API[("name", "Download the published release assets")]),
+    },
+    {
+        "name": "Install cosign",
+        "uses": COSIGN_INSTALLER,
+        "with": {"cosign-release": COSIGN_VERSION},
+    },
+    {
+        "name": "Verify release signatures",
+        "run": RELEASE_EVIDENCE_COMMANDS[11],
+    },
+    {
+        "name": "Verify provenance signatures and run binding",
+        "env": {"RELEASE_RUN_ID": "${{ steps.release.outputs.run_id }}", "RELEASE_RUN_ATTEMPT": "${{ steps.release.outputs.run_attempt }}"},
+        "run": "\n".join(("set -euo pipefail", *RELEASE_EVIDENCE_COMMANDS[12:21])),
+    },
+    {
+        "name": "Check the tagged Wasm tree offline",
+        "run": RELEASE_EVIDENCE_COMMANDS[21],
+    },
+)
 # The SLSA generator call reads its own run, so the provenance job keeps
 # exactly these permissions, this call, and no steps of its own.
 RELEASE_PROVENANCE_PERMISSIONS = {"actions": "read", "id-token": "write", "contents": "write"}
@@ -637,6 +721,7 @@ SELFTESTS = {
         "bash .github/scripts/test-run-testnet-acceptance.sh": "rust",
         "bash .github/scripts/test-check-crates-exist.sh": "scripts",
         "bash .github/scripts/test-publish-crates-verify.sh": "scripts",
+        "python3 .github/scripts/test-publish-release-evidence.py --mutations": "scripts",
         "python3 .github/scripts/test-compare-crate-sums.py": "scripts",
         "python3 .github/scripts/test-check-coverage.py": "scripts",
         "python3 .github/scripts/test-check-proof-matrix.py": "scripts",
@@ -868,8 +953,9 @@ class Checker:
 
     @staticmethod
     def logical_lines(text):
-        joined = re.sub(r"\\\n", " ", "" if text is None else str(text))
-        return [line for line in joined.split("\n") if not line.lstrip(BLANKS).startswith("#")]
+        lines = ("" if text is None else str(text)).split("\n")
+        uncommented = "\n".join(line for line in lines if not line.lstrip(BLANKS).startswith("#"))
+        return re.sub(r"\\\n", " ", uncommented).split("\n")
 
     def runs(self, run, text):
         """Whether a run: block holds text on a line that is not a comment."""
@@ -1017,7 +1103,8 @@ class Checker:
     def check_job(self, workflow, workflow_doc, job_id, job):
         self.jobs_checked += 1
         where = f"{workflow}:{job_id}"
-        credentialed = self.credentialed(job, workflow_doc)
+        # The evidence rule owns this job's permissions and compile restrictions.
+        credentialed = self.credentialed(job, workflow_doc) and (workflow, job_id) != ("publish.yml", "release-evidence")
         dumped = yaml.safe_dump(job)
         environment = job.get("environment")
         if isinstance(environment, dict):
@@ -1059,7 +1146,7 @@ class Checker:
             if uses.startswith("actions/checkout@"):
                 if with_.get("persist-credentials") not in (False, "false"):
                     self.report(step_where, "checkout-credentials", "actions/checkout without persist-credentials: false")
-                if workflow == "publish.yml":
+                if workflow == "publish.yml" and job_id != "release-evidence":
                     ref = str(with_.get("ref", ""))
                     if ref.startswith("refs/tags/"):
                         tag_checkouts += 1
@@ -1102,7 +1189,7 @@ class Checker:
 
         if (workflow, job_id) in CREDENTIAL_GUARDS:
             self.check_credential_order(where, job, steps, *CREDENTIAL_GUARDS[(workflow, job_id)])
-        if workflow == "publish.yml" and tag_checkouts == 0 and job_id != "vendored-wasm":
+        if workflow == "publish.yml" and tag_checkouts == 0 and job_id != "release-evidence":
             self.report(where, "publish-tag-ref", "no checkout of refs/tags/...")
         if (workflow, job_id) in ANCESTRY_JOBS:
             if not ancestry_calls:
@@ -1611,14 +1698,14 @@ class Checker:
             self.report(str(DERIVE_SCRIPT), "signing-order", "derivation operations differ from DERIVE_BODY")
 
     def check_release_gates(self):
-        self.check_publish_wasm_gate()
+        self.check_publish_release_evidence()
         for name in ("sign", "verify-provenance"):
             steps = (self.job("release.yml", name) or {}).get("steps", [])
             installers = [step for step in steps if step.get("name") == "Install cosign"]
             if [step.get("uses") for step in installers] != [
-                    "sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532"]:
+                    COSIGN_INSTALLER]:
                 self.report(f"release.yml:{name}", "release-signatures", "requires the pinned cosign installer")
-            if [(step.get("with") or {}).get("cosign-release") for step in installers] != ["v3.1.4"]:
+            if [(step.get("with") or {}).get("cosign-release") for step in installers] != [COSIGN_VERSION]:
                 self.report(f"release.yml:{name}", "release-signatures", "requires cosign-release: v3.1.4")
         uploads = [step for step in (self.job("release.yml", "sign") or {}).get("steps", [])
                    if (step.get("with") or {}).get("name") == "signatures"]
@@ -1672,7 +1759,7 @@ class Checker:
                 if job is None:
                     self.report(workflow, "release-check-unconditional", f"missing {name}")
                     continue
-                allowed = workflow == "publish.yml" and name in ("publish", "vendored-wasm")
+                allowed = workflow == "publish.yml" and name == "publish"
                 condition = str(job.get("if", "")).strip()
                 if "continue-on-error" in job or ("if" in job and not (allowed and condition == "${{ !inputs.verify_only }}")):
                     self.report(workflow, "release-check-unconditional", f"{name} can be bypassed")
@@ -1734,50 +1821,67 @@ class Checker:
                     if SETUP_ACTION.match(uses) and any(str(key).lower() == "cache" for key in inputs):
                         self.report(f"{workflow}:{name}", "release-cache", f"passes a cache input to {uses}")
 
-    def check_publish_wasm_gate(self):
-        rule = "publish-wasm-gate"
-        workflow = "publish.yml"
-        publish = self.job(workflow, "publish") or {}
-        if not {"verify", "vendored-wasm"}.issubset(publish.get("needs", [])):
-            self.report(workflow, rule, "publish must need verify and vendored-wasm")
-        call = self.job(workflow, "vendored-wasm") or {}
-        if call.get("uses") != "./.github/workflows/vendored-wasm.yml":
-            self.report(workflow, rule, "vendored-wasm must call the local workflow")
-        if call.get("needs") not in ("verify", ["verify"]):
-            self.report(workflow, rule, "vendored-wasm must need exactly verify")
-        for name, job in (("publish", publish), ("vendored-wasm", call)):
-            if job.get("if") != "${{ !inputs.verify_only }}":
-                self.report(workflow, rule, f"{name} must run exactly on !inputs.verify_only")
-        if call.get("with") != {"source_sha": "${{ needs.verify.outputs.sha }}", "publication": True}:
-            self.report(workflow, rule, "vendored-wasm must pass exactly the verified source SHA and publication: true")
-        if any(key in call for key in ("secrets", "continue-on-error")):
-            self.report(workflow, rule, "vendored-wasm must set no secrets or continue-on-error")
-        workflow = "vendored-wasm.yml"
-        doc = self.docs.get(workflow, {})
-        triggers = doc.get("on", doc.get(True)) or {}
-        inputs = ((triggers.get("workflow_call") or {}).get("inputs") or {}) if isinstance(triggers, dict) else {}
-        for name, kind, default in (("source_sha", "string", ""), ("publication", "boolean", False)):
-            if inputs.get(name) != {"type": kind, "required": False, "default": default}:
-                self.report(workflow, rule, f"workflow_call must declare optional {name} with its type and default")
-        for name in ("check", "rebuild", "vendored-wasm"):
-            steps = (self.job(workflow, name) or {}).get("steps", [])
-            checkouts = [step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")]
-            if not checkouts or any((step.get("with") or {}).get("ref") != "${{ inputs.source_sha }}" for step in checkouts):
-                self.report(workflow, rule, f"{name} checkout must use inputs.source_sha")
-        steps = (self.job(workflow, "check") or {}).get("steps", [])
-        decide = next((step for step in steps if step.get("id") == "decide"), {})
-        env = decide.get("env") or {}
-        if env.get("PUBLICATION") != "${{ inputs.publication }}" or env.get("SOURCE_SHA") != "${{ inputs.source_sha }}":
-            self.report(workflow, rule, "decide must read PUBLICATION and SOURCE_SHA from inputs")
-        if '[ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]' not in self.run_text(decide):
-            self.report(workflow, rule, "decide must compare HEAD with SOURCE_SHA")
-        for name, job in (doc.get("jobs") or {}).items():
-            for step in job.get("steps", []):
-                if CACHE_ACTION.match(step.get("uses") or ""):
-                    guard = "github.ref_type != 'tag' && !inputs.publication"
-                    condition = self.unwrap_expression(step.get("if", ""))
-                    if condition != guard and not condition.startswith(guard + " && "):
-                        self.report(f"{workflow}:{name}", rule, f"cache guard must lead with {guard}")
+    @staticmethod
+    def evidence_template_difference(steps):
+        """Name the first differing step and field, keeping physical run lines."""
+        for index in range(max(len(steps), len(PUBLISH_EVIDENCE_TEMPLATE))):
+            location = f"step {index + 1}"
+            if index >= len(steps):
+                return f"{location} field step: missing"
+            if index >= len(PUBLISH_EVIDENCE_TEMPLATE):
+                return f"{location} field step: unexpected"
+            actual, expected = steps[index], PUBLISH_EVIDENCE_TEMPLATE[index]
+            for field in dict.fromkeys([*expected, *actual]):
+                if field not in actual or field not in expected:
+                    return f"{location} field {field}: missing or unexpected"
+                value, wanted = actual[field], expected[field]
+                if field == "run" and isinstance(value, str):
+                    value = [line.strip(BLANKS) for line in value.split("\n") if line.strip(BLANKS)]
+                    wanted = [line.strip(BLANKS) for line in wanted.split("\n") if line.strip(BLANKS)]
+                # YAML serialization preserves scalar types, including nested booleans.
+                if yaml.safe_dump(value, sort_keys=True) != yaml.safe_dump(wanted, sort_keys=True):
+                    return f"{location} field {field}: differs"
+        return None
+
+    def check_publish_release_evidence(self):
+        workflow, rule = "publish.yml", "publish-release-evidence"
+        self.needs(workflow, "publish", "release-evidence", rule)
+        if (self.job(workflow, "publish") or {}).get("if") != "${{ !inputs.verify_only }}":
+            self.report(workflow, rule, "publish must run exactly on !inputs.verify_only")
+        job = self.job(workflow, "release-evidence") or {}
+        steps = job.get("steps", [])
+        if job.get("needs") not in ("verify", ["verify"]):
+            self.report(workflow, rule, "release-evidence must need exactly verify")
+        if job.get("runs-on") != "ubuntu-24.04":
+            self.report(workflow, rule, "release-evidence must run on ubuntu-24.04")
+        if job.get("timeout-minutes") != 15:
+            self.report(workflow, rule, "release-evidence must time out after 15 minutes")
+        if job.get("permissions") != {"contents": "read", "actions": "read"}:
+            self.report(workflow, rule, "release-evidence permissions must be contents: read and actions: read")
+        if any(key in job for key in ("if", "continue-on-error", "environment", "secrets", "uses")):
+            self.report(workflow, rule, "release-evidence must run unconditionally without an environment or secrets")
+        if job.get("env") != PUBLISH_EVIDENCE_ENV:
+            self.report(workflow, rule, "release-evidence job env must contain exactly TAG and SOURCE_SHA")
+        difference = self.evidence_template_difference(steps)
+        if difference:
+            self.report(workflow, rule, f"release-evidence template: {difference}")
+        # Strip only the permitted token value; scan every remaining key and value.
+        scanned_steps = []
+        for index, step in enumerate(steps):
+            env = dict(step.get("env") or {})
+            expected = PUBLISH_EVIDENCE_TEMPLATE[index] if index < len(PUBLISH_EVIDENCE_TEMPLATE) else {}
+            if (expected.get("env") == RELEASE_EVIDENCE_ENV
+                    and env.get("GH_TOKEN") == "${{ github.token }}"):
+                del env["GH_TOKEN"]
+            scanned_steps.append(dict(step, env=env))
+        inherited = {key: self.docs[workflow][key] for key in ("env", "defaults") if key in self.docs[workflow]}
+        scanned = dict(job, steps=scanned_steps)
+        self.check_credential_expressions(workflow, {"release-evidence": scanned, **inherited}, rule)
+        environments = [inherited.get("env"), job.get("env"), *(step["env"] for step in scanned_steps)]
+        for env in environments:
+            for key in env or {}:
+                if str(key).upper() in TOKEN_ENV:
+                    self.report(workflow, rule, f"release-evidence sets forbidden token variable {key}")
 
     def check_release_wasm_gate(self):
         rule = "release-wasm-gate"
@@ -1812,7 +1916,7 @@ class Checker:
                 if name == "rebuild":
                     self.report(where, rule, "rebuild uses a cache")
                 condition = self.unwrap_expression(step.get("if", ""))
-                guard = "github.ref_type != 'tag' && !inputs.publication"
+                guard = "github.ref_type != 'tag'"
                 if condition != guard and not condition.startswith(guard + " && "):
                     self.report(where, rule, f"cache guard must lead with {guard}")
                 uses = str(step.get("uses") or "")

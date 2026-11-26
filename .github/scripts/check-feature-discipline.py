@@ -261,6 +261,8 @@ DATA_SCRIPTS = {
     '.github/scripts/test-publish-crates-verify.sh':
         'reads workspace metadata into a stub fixture and drives '
         'publish-crates.sh with a stub cargo',
+    '.github/scripts/test-publish-release-evidence.py':
+        'drives publish evidence steps with local fixture tools',
     '.github/scripts/test-release-checks.sh':
         'drives the release check scripts with stub cargo, 7z and binaries',
     '.github/scripts/test-run-testnet-acceptance.sh':

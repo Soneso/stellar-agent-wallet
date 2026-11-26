@@ -473,6 +473,10 @@ gate except `shellcheck-changed`, which needs a changed shell script.
    - `test-preflight.sh`: `preflight.sh`
    - `test-publish-crates-check.sh`: `publish-crates.sh`
    - `test-publish-crates-verify.sh`: `publish-crates.sh`
+   - `test-publish-release-evidence.py`: `.github/workflows/publish.yml`,
+     `check-provenance.py`, `fixtures/SHA256SUMS`, or the provenance fixture
+     in `fixtures/`. Its registry row requires `jq`; CI and preflight each run
+     it in its own step.
    - `test-rebuild-vendored-wasm.sh`: `rebuild-vendored-wasm.sh`
    - `test-run-testnet-acceptance.sh`: `run-testnet-acceptance.sh` or
      `check-payment-evidence.py`
@@ -1143,7 +1147,7 @@ The `vendored-wasm` workflow (`.github/workflows/vendored-wasm.yml`) runs
 `.github/scripts/rebuild-vendored-wasm.sh`, which holds the manifest of
 rebuildable files, the exception list, and every pinned version. Tag runs
 happen inside the release through its local reusable workflow call. Crate
-publication calls it for the verified commit of the tag.
+publication verifies that Release run's evidence for the tag and commit.
 
 - The tree check runs on pull requests to `main`, pushes to `main`, tags, crate
   publication, twice a week, and on dispatch. It fails unless every tracked Wasm file is a
@@ -1179,8 +1183,8 @@ publication calls it for the verified commit of the tag.
   or the workflow, and on every tag, scheduled, or dispatched run, two macOS
   jobs provide the pinned stellar-cli binaries. The stellar-cli caches restore
   on pull request, `main`, scheduled, and dispatched runs. Only push and
-  schedule runs save missing entries. A tag or crate
-  publication run builds both binaries from source. Each job packs its install
+  schedule runs save missing entries. A tag run builds both binaries from
+  source. Each job packs its install
   root as a tar artifact to preserve executable permissions. The `rebuild` job
   reads those artifacts from the same run and uses no cache. It rebuilds every
   manifest file from its pinned source with its pinned toolchain and fails
@@ -1199,10 +1203,32 @@ publication calls it for the verified commit of the tag.
   file. An exception is a vendored file that no pinned source rebuilds; the
   tree check holds its bytes at one frozen digest.
 
-The `vendored-wasm` job reads every job result. On a tag or crate publication
-run it passes only after a rebuild. Apple signing and notarization, hashing,
+The `vendored-wasm` job reads every job result. On a tag run it passes only
+after a rebuild. Apple signing and notarization, hashing,
 cosign signing, provenance, and publication wait for the rebuild of the tagged
-commit. Crate publication waits for the rebuild of the verified commit.
+commit. Crate publication checks that run's latest successful attempt,
+published signatures, provenance bound to the run, tag and commit, and the
+tagged tree offline. Its `release-evidence` job compiles nothing and runs
+even with `verify_only=true`.
+
+The `publish-release-evidence` invariant accepts that job's steps only when they
+equal `PUBLISH_EVIDENCE_TEMPLATE` in `.github/scripts/check-workflow-invariants.py`.
+The count, order, keys, and values must match exactly.
+Run blocks split on newline characters, trim spaces and tabs, and drop empty
+lines. Carriage returns, Unicode line separators, and no-break spaces differ
+from the template. Comments remain part of the comparison.
+Any other step, key, environment entry, comment, or run line fails.
+The report names the first differing step and field.
+Change the job and its template in the same commit.
+Job settings and credential expressions have separate checks.
+The step template does not pin inherited defaults or noncredential workflow
+environment variables.
+Job `defaults`, `strategy`, `container`, and `services` are unpinned.
+Trimming and dropping empty lines ignores `\` continuations.
+The `apt-retries` check joins lines after an inline comment ending in `\`.
+The template does not judge the contents of pinned scripts, action behavior,
+downloaded artifacts, or runtime GitHub evidence.
+Runtime checks validate the artifacts and evidence.
 
 Run the identity and deployment gates locally with:
 
@@ -1338,7 +1364,7 @@ and every constant and allowlist entry that pins it in the same change.
   `contracts/multicall-router/`), the rebuild proves the bytes match the
   committed source; review of the source diff remains the defense. A
   compromise of an upstream source at its pinned commit is outside this check.
-- On runs other than tag and crate publication runs, two checks test a cached
+- On runs other than tag runs, two checks test a cached
   stellar-cli binary: its version line and the byte comparison of its output.
   A binary that writes the vendored bytes whatever its input passes both.
   Every workflow of a branch shares the cache. Code that runs in any job on
@@ -1349,7 +1375,7 @@ and every constant and allowlist entry that pins it in the same change.
   the scripts.
 - Cache saves serve future runs that restore the cache. The current rebuild
   consumes the install-root artifacts produced by its own stellar-cli jobs.
-  Tag and crate publication runs build both binaries from source. They gate
+  Tag runs build both binaries from source. They gate
   Apple signing and notarization, hashing, cosign signing, provenance, and
   release and crate publication.
 - Pull-request CI does not run the release-profile tests. The deploy's digest

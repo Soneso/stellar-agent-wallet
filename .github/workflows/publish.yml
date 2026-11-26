@@ -10,9 +10,9 @@ name: Publish to crates.io
 #   of the tag, the unpublished one included, with `cargo package --workspace`,
 #   checks each resulting binary's name, version, and mainnet-write marker,
 #   and records the archive checksums in SHA256SUMS.
-# - vendored-wasm holds no credential. It rebuilds every vendored contract
-#   Wasm file of the verified tag's commit with pinned tools and compares
-#   the bytes. Publish waits for this rebuild to pass.
+# - release-evidence proves the successful Release run of the tag and commit,
+#   verifies its published signatures and provenance, and checks the tree.
+#   It compiles nothing and holds only contents: read and actions: read.
 # - publish runs in the `crates-io` environment and compiles nothing. It
 #   regenerates the archives with `--no-verify`, requires them to equal the
 #   verify job's SHA256SUMS, and uploads each crate with
@@ -35,7 +35,7 @@ on:
         required: true
         type: string
       verify_only:
-        description: "Run only the verify job, which holds no credential"
+        description: "Run crate verification and Release evidence checks without publishing"
         required: false
         type: boolean
         default: false
@@ -184,20 +184,95 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  vendored-wasm:
-    name: vendored-wasm
+  # The tagged commit defines the rebuild recipe. The Release head_sha,
+  # provenance source commit, checkout, and verified tag commit must agree.
+  release-evidence:
+    name: release-evidence
     needs: verify
-    if: ${{ !inputs.verify_only }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
-    uses: ./.github/workflows/vendored-wasm.yml
-    with:
-      source_sha: ${{ needs.verify.outputs.sha }}
-      publication: true
+      actions: read
+    env:
+      TAG: ${{ inputs.tag }}
+      SOURCE_SHA: ${{ needs.verify.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          persist-credentials: false
+
+      - name: Require the verified checkout
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]
+          echo "RELEASE_DIR=$RUNNER_TEMP/release-evidence" >> "$GITHUB_ENV"
+
+      - name: Select the successful Release run
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/check-run-evidence.py --mode release \
+            --repository "$GITHUB_REPOSITORY" --sha "$SOURCE_SHA" --tag "$TAG" \
+            --wait-minutes 0 --poll-seconds 0
+
+      - name: Download the published release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RELEASE_DIR"/{all-artifacts,release-combined,all-signatures,provenance}
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,assets > "$RELEASE_DIR/release.json"
+          [ "$(jq -r .isDraft "$RELEASE_DIR/release.json")" = false ]
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$RELEASE_DIR/release-combined"
+          jq -e --rawfile sums "$RELEASE_DIR/release-combined/SHA256SUMS" --arg provenance "stellar-agent-${TAG#v}.intoto.jsonl" \
+            '($sums | split("\n") | map(select(length > 0) | .[66:])) as $archives | .isDraft == false and ($archives | length) == 5 and ([.assets[].name] | sort) == (($archives + ["SHA256SUMS"] + (($archives + ["SHA256SUMS"]) | map(. + ".sigstore.json")) + [$provenance]) | sort)' "$RELEASE_DIR/release.json"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.tar.xz' --pattern '*.zip' --dir "$RELEASE_DIR/all-artifacts"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sigstore.json' --dir "$RELEASE_DIR/all-signatures"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.intoto.jsonl' --dir "$RELEASE_DIR/provenance"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+
+      - name: Verify release signatures
+        run: |
+          bash .github/scripts/release/verify-signatures.sh "$RELEASE_DIR" \
+            "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$TAG" \
+            https://token.actions.githubusercontent.com "$SOURCE_SHA"
+
+      - name: Verify provenance signatures and run binding
+        env:
+          RELEASE_RUN_ID: ${{ steps.release.outputs.run_id }}
+          RELEASE_RUN_ATTEMPT: ${{ steps.release.outputs.run_attempt }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob dotglob
+          verifier="$RUNNER_TEMP/slsa-verifier"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            https://github.com/slsa-framework/slsa-verifier/releases/download/v2.7.1/slsa-verifier-linux-amd64 --output "$verifier"
+          echo "946dbec729094195e88ef78e1734324a27869f03e2c6bd2f61cbc06bd5350339  $verifier" | sha256sum --check --strict
+          chmod +x "$verifier"
+          provenance=("$RELEASE_DIR"/provenance/*.intoto.jsonl)
+          [ "${#provenance[@]}" -eq 1 ]
+          for archive in "$RELEASE_DIR"/all-artifacts/*; do \
+            "$verifier" verify-artifact "$archive" --provenance-path "${provenance[0]}" \
+              --source-uri "github.com/$GITHUB_REPOSITORY" --source-tag "$TAG" \
+              --builder-id https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.1.0; \
+          done
+          python3 .github/scripts/check-provenance.py "${provenance[0]}" "$RELEASE_DIR/release-combined/SHA256SUMS" \
+            "$SOURCE_SHA" "$GITHUB_REPOSITORY" "refs/tags/$TAG" \
+            --run-id "$RELEASE_RUN_ID" --run-attempt "$RELEASE_RUN_ATTEMPT"
+
+      - name: Check the tagged Wasm tree offline
+        run: bash .github/scripts/rebuild-vendored-wasm.sh --check-tree --repo-root "$GITHUB_WORKSPACE"
 
   publish:
     name: publish (${{ inputs.tag }})
-    needs: [verify, vendored-wasm]
+    needs: [verify, release-evidence]
     if: ${{ !inputs.verify_only }}
     runs-on: ubuntu-24.04
     environment: crates-io
