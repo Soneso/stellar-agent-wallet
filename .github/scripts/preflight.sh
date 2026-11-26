@@ -137,6 +137,7 @@ self-test:test-check-install-surface.py	python3 .github/scripts/test-check-insta
 self-test:test-check-no-direct-sasignersetbaselined-emit.sh	bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh	-	ci.yml	release-contracts	Self-test the signer-set baseline gate
 self-test:test-check-proof-matrix.py	python3 .github/scripts/test-check-proof-matrix.py	-	ci.yml	release-contracts	Self-test the proof matrix check
 self-test:test-check-ref-on-main.sh	bash .github/scripts/test-check-ref-on-main.sh	-	ci.yml	release-contracts	Self-test the ref-on-main check
+self-test:test-check-run-evidence.py	python3 .github/scripts/test-check-run-evidence.py --mutations	-	ci.yml	release-contracts	Self-test the run evidence check
 self-test:test-check-workflow-invariants.py	python3 .github/scripts/test-check-workflow-invariants.py	yaml	ci.yml	release-contracts	Self-test the workflow structure and the label sync
 self-test:test-classify-docs-only.py	python3 .github/scripts/test-classify-docs-only.py	-	ci.yml	release-contracts	Self-test the docs-only classifier
 self-test:test-classify-self-tests.py	python3 .github/scripts/test-classify-self-tests.py	-	ci.yml	release-contracts	Self-test the self-test classifier
@@ -346,6 +347,7 @@ select_self_tests() {
       ;;
     .github/scripts/check-proof-matrix.py) select_gate self-test:test-check-proof-matrix.py ;;
     .github/scripts/check-ref-on-main.sh) select_gate self-test:test-check-ref-on-main.sh ;;
+    .github/scripts/check-run-evidence.py) select_gate self-test:test-check-run-evidence.py ;;
     .github/scripts/classify-docs-only.py) select_gate self-test:test-classify-docs-only.py ;;
     .github/scripts/classify-self-tests.py) select_gate self-test:test-classify-self-tests.py ;;
     .github/scripts/changed_paths.py)

@@ -276,6 +276,19 @@ A pull request retargeted to `main` runs coverage immediately. The full CI set
 and install surface rerun after a new push or a reopen, producing the required
 `ci-result (main)` check.
 
+`ci.yml` also runs on `workflow_dispatch`, which takes no inputs. A dispatched
+run is a full run. For any event other than a pull request or a push into
+`next`, `classify-docs-only.py` prints `docs_only=false` and
+`classify-self-tests.py` selects every self-test group. Every job then runs
+except `docs-tests`, which runs only for a docs-only change. A dispatch on `main` or
+on a tag also checks the skill archive, as a push to `main` does. Its result
+check is `ci-result (<ref name>)`.
+The `ci-triggers` rule of `check-workflow-invariants.py` requires this trigger
+and refuses every other new event. The release preflight accepts a successful
+dispatched run on `main` or on the tag in place of a missing or failed `ci.yml`
+push run of the tagged commit; the `release-ci-evidence` rule pins that check.
+See [What the release preflight refuses](releasing.md#what-the-release-preflight-refuses).
+
 The `feature-discipline`, `release-contracts`, and `install-surface` jobs keep
 checks unconditional, with the skill archive exception below.
 On pull requests into or pushes to `next`,
@@ -449,6 +462,7 @@ gate except `shellcheck-changed`, which needs a changed shell script.
      `check-no-direct-sasignersetbaselined-emit.sh`
    - `test-check-proof-matrix.py`: `check-proof-matrix.py`
    - `test-check-ref-on-main.sh`: `check-ref-on-main.sh`
+   - `test-check-run-evidence.py`: `check-run-evidence.py`
    - `test-check-workflow-invariants.py`: `check-workflow-invariants.py`, or
      any change that selects `workflow-invariants`, because the self-test
      runs that check on copies of the same files
@@ -898,7 +912,7 @@ from its suite list, so a new live suite must be added to `SUITES` in
 `.github/scripts/test-run-testnet-acceptance.sh` checks the suite list against
 the files in both directions, the browser suite list, the feature selection,
 and the refusal of an unknown `MAINNET_WRITE` value. The `release contracts` CI
-job runs it with a 20-minute job timeout. The budget covers the signer-set
+job runs it with a 30-minute job timeout. The budget covers the signer-set
 baseline self-test, workflow invariant cases and mutation controls, and the
 other release contract checks.
 
@@ -1137,9 +1151,9 @@ publication calls it for the verified commit of the tag.
   tree check holds its bytes at one frozen digest.
 
 The `vendored-wasm` job reads every job result. On a tag or crate publication
-run it passes only after a rebuild. Release signing, provenance, and
-publication wait for the rebuild of the tagged commit, and crate publication
-waits for the rebuild of the verified commit.
+run it passes only after a rebuild. Apple signing and notarization, hashing,
+cosign signing, provenance, and publication wait for the rebuild of the tagged
+commit. Crate publication waits for the rebuild of the verified commit.
 
 Run the identity and deployment gates locally with:
 
@@ -1286,8 +1300,9 @@ and every constant and allowlist entry that pins it in the same change.
   the scripts.
 - Cache saves serve future runs that restore the cache. The current rebuild
   consumes the install-root artifacts produced by its own stellar-cli jobs.
-  Tag and crate publication runs build both binaries from source and gate
-  release signing, provenance, and publication.
+  Tag and crate publication runs build both binaries from source. They gate
+  Apple signing and notarization, hashing, cosign signing, provenance, and
+  release and crate publication.
 - Pull-request CI does not run the release-profile tests. The deploy's digest
   check runs in every profile; review and the release-profile test run keep it
   out of a `debug_assertions` gate. The local release gate also checks the

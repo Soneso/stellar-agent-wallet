@@ -119,6 +119,11 @@ def main():
         checks += [
             ("push event", {"EVENT_NAME": "push", "BASE_REF": "", "BASE_SHA": base, "HEAD_SHA": head}, "false"),
             ("unknown event", {}, "false"),
+            # ci.yml passes a dispatch empty pull request and push fields; any ref runs the full suite.
+            *((f"workflow dispatch on {ref}", {"EVENT_NAME": "workflow_dispatch", "BASE_REF": "", "BASE_SHA": "",
+                                               "HEAD_SHA": "", "REF": ref, "BEFORE_SHA": "", "AFTER_SHA": "",
+                                               "FORCED": ""}, "false")
+              for ref in ("refs/heads/main", "refs/tags/v1.2.3", "refs/heads/next")),
             ("git error on an absent commit", {"EVENT_NAME": "pull_request", "BASE_REF": "next",
                                                "BASE_SHA": "0" * 40, "HEAD_SHA": head}, "false"),
             ("malformed head", {"EVENT_NAME": "pull_request", "BASE_REF": "next",

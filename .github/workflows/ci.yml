@@ -6,8 +6,12 @@ name: CI
 # test jobs; the docs-tests job runs the tests that read documentation in
 # their place. The changes job decides.
 # Pushes into next use the same classifier; main always runs the full suite.
+# A manual dispatch runs the full suite on the ref it names; the release
+# preflight accepts one on main or on the tag in place of a missing or failed
+# push run.
 # Skill changes run the archive checks on main.
-# Self-tests run when their inputs change on next, and always on main or an uncertain diff.
+# Self-tests run when their inputs change on next, and always on main, a
+# dispatch, or an uncertain diff.
 # The suite covers format, lint, rustdoc, offline tests, dependencies, and licenses.
 # Coverage runs in coverage.yml.
 # Live testnet tests run in a separate workflow.
@@ -17,6 +21,7 @@ on:
     branches: [main, next]
   pull_request:
     branches: [main, next]
+  workflow_dispatch:
 
 # Pull request runs cancel their predecessor. Push, schedule, and dispatch
 # runs each have their own group and never cancel one another.
@@ -475,7 +480,7 @@ jobs:
     if: ${{ !cancelled() }}
     name: release contracts
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -489,6 +494,7 @@ jobs:
       - name: Check the publish tiers
         run: .github/scripts/publish-crates.sh --check
       # Many open pull requests conflict in the binary archive on the integration branch; the pull request into main runs the check.
+      # A dispatch has no base ref, so a dispatch on main or on a tag runs the check as a push to main does.
       - name: Check the skill archive
         if: github.base_ref != 'next' && github.ref != 'refs/heads/next'
         run: .github/scripts/package-skill.sh --check
@@ -527,6 +533,9 @@ jobs:
       - name: Self-test the CI result gate
         if: needs.changes.outputs.selftest_scripts != 'false'
         run: python3 .github/scripts/test-ci-result.py
+      - name: Self-test the run evidence check
+        if: needs.changes.outputs.selftest_scripts != 'false'
+        run: python3 .github/scripts/test-check-run-evidence.py --mutations
       - name: Check the documentation reads
         run: python3 .github/scripts/check-docs-reads.py
       - name: Self-test the documentation read check
