@@ -1327,15 +1327,15 @@ impl Error for FriendbotFundingError {
 /// became visible on `rpc_url` before returning.
 ///
 /// The funding REQUESTS are best-effort; on-RPC visibility is the sole pass
-/// criterion. This shape covers three distinct environmental flakes without
-/// weakening the check: Friendbot accepting a request whose transaction fails
-/// to land under load (the `TxNoAccount` class), the HTTP request itself
-/// timing out even though Friendbot may still process it, and a re-request
-/// against an account that landed late (Friendbot rejects double funding, but
-/// the account IS there). After one bounded confirm-wait the funding is
-/// re-requested ONCE and a second bounded wait runs before giving up. A flow
-/// whose account never becomes visible fails exactly as it did before — this
-/// never converts a persistent Friendbot outage into a pass.
+/// criterion. This shape covers three environmental flakes without weakening
+/// the check. First, Friendbot accepts a request whose transaction fails to
+/// land under load (the `TxNoAccount` class). Second, the HTTP request times
+/// out while Friendbot may still process it. Third, a re-request reaches an
+/// account that landed late. Friendbot answers it with an already funded 400,
+/// which [`request_friendbot_funding`] counts as funded. After one bounded
+/// confirm-wait the funding is re-requested ONCE and a second bounded wait runs
+/// before giving up. A flow whose account never becomes visible fails, so a
+/// persistent Friendbot outage never becomes a pass.
 async fn fund_with_friendbot(
     friendbot_url: &str,
     rpc_url: &str,
@@ -1369,22 +1369,33 @@ async fn fund_with_friendbot(
     ))))
 }
 
-/// Issues the Friendbot HTTP funding request. Does not confirm the account
-/// became visible — see [`fund_with_friendbot`] for the confirm-wait.
+/// Requests Friendbot funding for `account_id` through [`friendbot_fund`] at
+/// `{friendbot_url}?addr={account_id}`. It does not confirm that the account
+/// became visible; [`fund_with_friendbot`] runs the confirm-wait.
+///
+/// The request counts as funded on a successful HTTP status. Friendbot answers
+/// an account that already exists with a 400 response. Such a 400 counts as
+/// funded when its bounded body reports `already funded` or
+/// `createAccountAlreadyExist`, compared without regard to ASCII case.
+///
+/// # Errors
+///
+/// Every other outcome is an error. Its text is `Friendbot must fund {label}: `
+/// followed by the [`FriendbotFundingError`] display. That display names the
+/// attempt count and the cause: the final status, the transport error, or the
+/// elapsed deadline. It adds the bounded body prefix when a response arrived.
 async fn request_friendbot_funding(
     friendbot_url: &str,
     account_id: &str,
     label: &str,
 ) -> TestnetHelperResult<()> {
-    let response = friendbot_funding_request(format!("{friendbot_url}?addr={account_id}")).await?;
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(Box::new(TestnetHelperError::new(format!(
-            "Friendbot must fund {label}; got {}",
-            response.status()
-        ))))
-    }
+    friendbot_fund(&format!("{friendbot_url}?addr={account_id}"))
+        .await
+        .map_err(|error| {
+            Box::new(TestnetHelperError::new(format!(
+                "Friendbot must fund {label}: {error}"
+            ))) as Box<dyn Error + Send + Sync>
+        })
 }
 
 /// Polls `account_id`'s presence on `client`, bounded by
@@ -1478,7 +1489,18 @@ mod tests {
         fn closed(&self) -> Vec<(usize, Instant)> {
             self.record.lock().expect("record").closed.clone()
         }
+
+        /// The fixture's URL without the `addr` query, the form
+        /// [`request_friendbot_funding`] receives.
+        fn base_url(&self) -> &str {
+            self.url
+                .strip_suffix(&format!("?addr={FIXTURE_ACCOUNT}"))
+                .expect("the fixture URL ends in its addr query")
+        }
     }
+
+    /// The account every fixture request carries in its `addr` query.
+    const FIXTURE_ACCOUNT: &str = "test-account";
 
     impl Drop for Friendbot {
         fn drop(&mut self) {
@@ -1487,7 +1509,7 @@ mod tests {
     }
 
     fn friendbot_url(address: SocketAddr) -> String {
-        format!("http://{address}/?addr=test-account")
+        format!("http://{address}/?addr={FIXTURE_ACCOUNT}")
     }
 
     /// Serves `answers` on a new loopback listener. A request beyond the
@@ -1552,7 +1574,8 @@ mod tests {
                 pending.extend_from_slice(&chunk[..count]);
             };
             let request: Vec<u8> = pending.drain(..end).collect();
-            assert!(request.starts_with(b"GET /?addr=test-account "));
+            let request_line = format!("GET /?addr={FIXTURE_ACCOUNT} ");
+            assert!(request.starts_with(request_line.as_bytes()));
             let ordinal = {
                 let mut record = record.lock().expect("record");
                 record.requests.push(connection);
@@ -2120,5 +2143,48 @@ mod tests {
             assert!(!text.contains("first"), "{text}");
             assert!(!text.contains("500"), "{text}");
         }
+    }
+
+    /// A successful status and each already funded 400 count as funded, each
+    /// after one request.
+    #[tokio::test]
+    async fn request_friendbot_funding_accepts_success_and_already_funded() {
+        let mut refused = Vec::new();
+        for (name, response) in [
+            ("OK", OK),
+            ("ALREADY_FUNDED", ALREADY_FUNDED),
+            ("ACCOUNT_EXISTS", ACCOUNT_EXISTS),
+            ("ACCOUNT_EXISTS_UPPER", ACCOUNT_EXISTS_UPPER),
+        ] {
+            let friendbot = friendbot_serving(vec![bytes(response)]).await;
+            if let Err(error) =
+                request_friendbot_funding(friendbot.base_url(), FIXTURE_ACCOUNT, "funder").await
+            {
+                refused.push(format!("{name}: {error}"));
+            }
+            assert_eq!(friendbot.requests(), [0], "{name}: one request");
+        }
+        assert!(refused.is_empty(), "each counts as funded: {refused:#?}");
+    }
+
+    /// A 400 of another kind fails with the label, the attempt count, the
+    /// status and the body.
+    #[tokio::test]
+    async fn request_friendbot_funding_names_label_and_status_of_other_400() {
+        let friendbot = friendbot_serving(vec![bytes(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 30\r\n\r\nthe address is not a valid key",
+        )])
+        .await;
+
+        let error = request_friendbot_funding(friendbot.base_url(), FIXTURE_ACCOUNT, "deployer")
+            .await
+            .expect_err("a 400 of another kind refuses");
+
+        assert_eq!(
+            error.to_string(),
+            "Friendbot must fund deployer: Friendbot did not fund the account after 1 attempt: \
+             HTTP status 400 Bad Request; body \"the address is not a valid key\""
+        );
+        assert_eq!(friendbot.requests(), [0], "one request");
     }
 }
