@@ -137,6 +137,38 @@ async fn a_request_before_initialize_is_refused_without_its_payload() {
     assert!(!logs.contains(MARKER), "{logs}");
 }
 
+/// A first `server/discover` request gets no stdout response and exits 1.
+#[test]
+#[serial_test::serial]
+fn server_discover_before_initialize_gets_no_response_and_exits_1() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let mut child = crate::common::server_binary::server_command(home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+        })))
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    assert!(
+        stderr.contains("the MCP client must open the session with an initialize request"),
+        "{stderr}"
+    );
+}
+
 /// The `tools/list` request with id 2 that follows each refused line.
 fn tools_list() -> Vec<u8> {
     frame(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))

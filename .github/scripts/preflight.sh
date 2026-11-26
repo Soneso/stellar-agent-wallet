@@ -365,7 +365,7 @@ select_self_tests() {
       select_gate self-test:test-publish-crates-verify.sh
       ;;
     .github/scripts/rebuild-vendored-wasm.sh) select_gate self-test:test-rebuild-vendored-wasm.sh ;;
-    .github/scripts/run-testnet-acceptance.sh) select_gate self-test:test-run-testnet-acceptance.sh ;;
+    .github/scripts/run-testnet-acceptance.sh | .github/scripts/check-payment-evidence.py) select_gate self-test:test-run-testnet-acceptance.sh ;;
     .github/scripts/sync-labels.py | .github/labels.yml | .github/workflows/labels.yml)
       select_gate self-test:test-sync-labels.py
       ;;

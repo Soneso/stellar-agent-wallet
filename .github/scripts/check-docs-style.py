@@ -51,6 +51,7 @@ import bisect
 import json
 import pathlib
 import re
+import string
 import subprocess
 from collections import Counter
 
@@ -139,20 +140,82 @@ def mask_inline(text: str) -> str:
     return "".join(pieces)
 
 
-DEFINITION = re.compile(
-    r"^ {0,3}\[[^\]\n]+\]:[ \t]*(?P<target><[^<>\n]*>|[^\s<>]+)"
-    r"(?:[ \t]+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*\r?$",
-    re.MULTILINE,
-)
+DEFINITION = re.compile(r"^ {0,3}\[.*$", re.MULTILINE)
 SCHEME = re.compile(r"(?<![\w<])[a-zA-Z][a-zA-Z0-9+.-]*://")
 # Sentence punctuation after a bare URL belongs to the prose.
 URL_TAIL = ".,;:!?\"'\u201d\u2019"
 
 
+def closing_delimiter(text: str, start: int, closing: str, forbidden: str) -> int | None:
+    """Find an unescaped closer while rejecting unescaped interior delimiters."""
+    index = start
+    while index < len(text):
+        character = text[index]
+        if character == "\\" and index + 1 < len(text) and text[index + 1] in string.punctuation:
+            index += 2
+            continue
+        if character == closing:
+            return index
+        if character in forbidden:
+            return None
+        index += 1
+    return None
+
+
 def mask_definition(match: re.Match[str]) -> str:
     """Keep the label of a reference definition; mask its destination and title."""
-    cut = match.start("target") - match.start()
-    return match[0][:cut] + blank(match[0][cut:])
+    line = match[0]
+    label_start = line.index("[") + 1
+    text = line.removesuffix("\r")
+    closing = closing_delimiter(text, label_start, "]", "[")
+    if closing is None or text[closing:closing + 2] != "]:":
+        return line
+    label = text[label_start:closing]
+    if not label.strip(" \t") or len(label) > 999:
+        return line
+    index = closing + 2
+    while index < len(text) and text[index] in " \t":
+        index += 1
+    cut = index
+    if index == len(text):
+        return line
+    if text[index] == "<":
+        closing = closing_delimiter(text, index + 1, ">", "<")
+        if closing is None:
+            return line
+        index = closing + 1
+    else:
+        depth = 0
+        while index < len(text) and text[index] not in " \t":
+            character = text[index]
+            if character == "\\" and index + 1 < len(text) and text[index + 1] in string.punctuation:
+                index += 2
+                continue
+            if character.isspace() or character in "<>" or ord(character) < 32 or ord(character) == 127:
+                return line
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                if depth == 0:
+                    return line
+                depth -= 1
+            index += 1
+        if depth:
+            return line
+    end = index
+    while index < len(text) and text[index] in " \t":
+        index += 1
+    if index < len(text):
+        if index == end or text[index] not in "\"'(":
+            return line
+        delimiter = text[index]
+        closing = closing_delimiter(
+            text, index + 1, ")" if delimiter == "(" else delimiter,
+            "(" if delimiter == "(" else "",
+        )
+        if closing is None or text[closing + 1:].strip(" \t"):
+            return line
+    return line[:cut] + blank(line[cut:])
 
 
 def mask_links(text: str) -> str:
