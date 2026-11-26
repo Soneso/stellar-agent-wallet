@@ -6,13 +6,16 @@ name: Release
 # SHA256SUMS, cosign keyless signatures, SLSA provenance, and a GitHub
 # Release. The release restores and saves no cache, so every build compiles
 # from the locked sources. The vendored-wasm job rebuilds the vendored
-# contract Wasm files of the tagged commit; the hashes job needs it, so the
-# cosign signatures, the provenance, and the publication wait for that
-# rebuild to pass.
+# contract Wasm files of the tagged commit. sign-macos, hashes, and publish
+# need it, so Apple signing and notarization, hashing, cosign signatures,
+# provenance, and publication wait for that rebuild to pass.
 #
 # The per-push CI workflow gates fmt, clippy, tests, and licenses/advisories
 # on every commit that reaches main. The preflight refuses a tag whose commit
 # is not an ancestor of origin/main, so a release builds only such a commit.
+# It refuses the tag unless that exact commit has a successful push run on
+# main of ci.yml, coverage.yml, install-surface.yml, vendored-wasm.yml, and
+# changelog.yml; a dispatched ci.yml run can stand in for the ci.yml one.
 # It also checks that the tag matches the workspace version and runs the
 # install-surface check. It runs cargo-deny again because the dependency graph
 # and the advisory database can shift between the last CI run on main and the
@@ -49,9 +52,16 @@ jobs:
   preflight:
     name: preflight
     runs-on: ubuntu-24.04
+    # The run evidence check waits up to 80 min for a pending required run.
     # The crates.io check paces one request per publishable member, up to 30 s
-    # each, so a hanging crates.io needs more than 15 min with the other steps.
-    timeout-minutes: 30
+    # each, and cargo-deny follows, so the other steps need up to 30 min.
+    timeout-minutes: 120
+    # actions: read lets the run evidence check list the workflow runs of
+    # the tag commit. The provenance job also holds it for the SLSA
+    # generator; no other release job does.
+    permissions:
+      contents: read
+      actions: read
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -80,6 +90,14 @@ jobs:
 
       - name: Refuse a tag whose commit is not on main
         run: .github/scripts/check-ref-on-main.sh "$GITHUB_SHA"
+
+      # Each required workflow needs a successful push run on main of the
+      # exact tag commit; a dispatched ci.yml run on main or on the tag stands
+      # in for a missing or failed ci.yml push run.
+      - name: Require the push CI evidence of the tag commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/check-run-evidence.py --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --tag "$GITHUB_REF_NAME" --wait-minutes 80 --poll-seconds 60
 
       - name: Warn when a workspace member is missing on crates.io
         run: .github/scripts/check-crates-exist.sh --warn
@@ -163,8 +181,9 @@ jobs:
 
   # Rebuilds every vendored contract Wasm file of the tagged commit from its
   # pinned source and compares the bytes. On a tag the called workflow's gate
-  # passes only after that rebuild. hashes and publish need this job, so
-  # signing, provenance, and publication wait for the rebuild.
+  # passes only after that rebuild. sign-macos, hashes, and publish need this
+  # job, so Apple signing and notarization, hashing, cosign signing,
+  # provenance, and publication wait for the rebuild.
   vendored-wasm:
     name: vendored-wasm
     needs: preflight
@@ -317,7 +336,7 @@ jobs:
   # signs, notarizes, and packs the archive with tools at absolute paths.
   sign-macos:
     name: sign ${{ matrix.target }}
-    needs: [preflight, build]
+    needs: [preflight, vendored-wasm, build]
     runs-on: macos-26
     timeout-minutes: 60
     # The release-signing environment holds the Apple signing and notarization

@@ -1,0 +1,1 @@
+- The release workflow refuses a tag unless the tagged commit passed the push CI on `main`, and `ci.yml` can be started by hand for a full run.

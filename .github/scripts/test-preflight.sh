@@ -51,17 +51,17 @@ REAL_BASH=$(command -v bash)
 REAL_PYTHON=$(python3 -c 'import sys; print(sys.executable)')
 FIXTURE="$TMP/fixture"
 
-CASES="changelog-fragments changelog-selection changelog-registry docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
+CASES="changelog-fragments changelog-selection changelog-registry docs-only upstream-base origin-base synced-fork-base next-before-main-base local-next-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
 release-rehearsal-workflow vendored-wasm-workflow unlisted-workflow yaml-workflow
 triage-workflow triage-review-workflow triage-sweep-workflow
-ci-yml-only python-check-script proof-matrix-only shell-check-script testnet-driver-script payment-evidence-script deploy-scripts deploy-scripts-run skill inbox-web enroll-web bridge-web one-crate sep43-through-mcp two-owners
+ci-yml-only python-check-script run-evidence-script proof-matrix-only shell-check-script testnet-driver-script payment-evidence-script deploy-scripts deploy-scripts-run skill inbox-web enroll-web bridge-web one-crate sep43-through-mcp two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
 unowned-rust-path
 wallet-manifest removed-member untracked-test-file fixture-markdown crate-sources-select-proof-matrix
 committed-cross-scope-rename staged-rename-record spaces-and-an-apostrophe
 full vendored contracts action-script invariants-helper release-build-scripts duplicate-triggers changed-self-test
 deleted-shell-script deleted-self-test unavailable-tool missing-pyyaml
-exit-aggregation table bad-base malformed-manifest unloadable-install-surface-check
+exit-aggregation table bad-base missing-next-upstream-hint malformed-manifest unloadable-install-surface-check
 the-preflight-itself registry-completeness
 drift drift-new-step drift-unnamed-step drift-removed-step drift-renamed-step
 install-hint coverage-suppression coverage-unavailable coverage-written coverage-off-only-fails coverage-on-only-fails
@@ -102,6 +102,7 @@ self-test:test-check-install-surface.py	python3 .github/scripts/test-check-insta
 self-test:test-check-no-direct-sasignersetbaselined-emit.sh	bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh
 self-test:test-check-proof-matrix.py	python3 .github/scripts/test-check-proof-matrix.py
 self-test:test-check-ref-on-main.sh	bash .github/scripts/test-check-ref-on-main.sh
+self-test:test-check-run-evidence.py	python3 .github/scripts/test-check-run-evidence.py --mutations
 self-test:test-check-workflow-invariants.py	python3 .github/scripts/test-check-workflow-invariants.py
 self-test:test-classify-docs-only.py	python3 .github/scripts/test-classify-docs-only.py
 self-test:test-classify-self-tests.py	python3 .github/scripts/test-classify-self-tests.py
@@ -337,7 +338,7 @@ expect_list() {
   fi
   local extra=() argument
   case "$CASE_NAME" in
-    deleted-install-surface-doc | welcome-workflow | release-workflow | release-rehearsal-workflow | vendored-wasm-workflow | triage-workflow | triage-review-workflow | triage-sweep-workflow | ci-yml-only | python-check-script | proof-matrix-only | shell-check-script | one-crate | sep43-through-mcp | two-owners | target-specific-edge | dev-dependency-edge | optional-dependency-edge | root-manifest | lockfile | wallet-manifest | removed-member | untracked-test-file | crate-sources-select-proof-matrix | staged-rename-record | spaces-and-an-apostrophe | action-script | invariants-helper | release-build-scripts | duplicate-triggers | changed-self-test | deleted-shell-script | deleted-self-test | the-preflight-itself)
+    deleted-install-surface-doc | welcome-workflow | release-workflow | release-rehearsal-workflow | vendored-wasm-workflow | triage-workflow | triage-review-workflow | triage-sweep-workflow | ci-yml-only | python-check-script | run-evidence-script | proof-matrix-only | shell-check-script | one-crate | sep43-through-mcp | two-owners | target-specific-edge | dev-dependency-edge | optional-dependency-edge | root-manifest | lockfile | wallet-manifest | removed-member | untracked-test-file | crate-sources-select-proof-matrix | staged-rename-record | spaces-and-an-apostrophe | action-script | invariants-helper | release-build-scripts | duplicate-triggers | changed-self-test | deleted-shell-script | deleted-self-test | the-preflight-itself)
       extra+=(feature-discipline self-test:test-check-feature-discipline.py)
       ;;
   esac
@@ -1036,55 +1037,88 @@ case_docs_only() {
 }
 
 # Upstream has a workflow commit beyond origin, and the branch changes
-# only Markdown from upstream/main.
+# only Markdown from upstream/next.
 case_upstream_base() {
   start_case
   git remote add origin "$CASE_DIR"
-  git update-ref refs/remotes/origin/main main
+  git update-ref refs/remotes/origin/next main
   git remote add upstream "$CASE_DIR"
   edit .github/workflows/release.yml
   git add .github/workflows/release.yml
   git commit -q -m "edit the upstream workflow"
-  git update-ref refs/remotes/upstream/main HEAD
-  git checkout -q -b docs upstream/main
+  git update-ref refs/remotes/upstream/next HEAD
+  git checkout -q -b docs upstream/next
   edit CHANGELOG.md
   git add CHANGELOG.md
   git commit -q -m "edit the changelog"
-  expect_list --default-base upstream/main "${ALWAYS[@]}"
+  expect_list --default-base upstream/next "${ALWAYS[@]}"
 }
 
-# Origin has a workflow commit beyond local main, and the fixture has no
+# Origin has a workflow commit beyond local next, and the fixture has no
 # upstream remote.
 case_origin_base() {
   start_case
+  git branch next main
   git remote add origin "$CASE_DIR"
   edit .github/workflows/release.yml
   git add .github/workflows/release.yml
   git commit -q -m "edit the origin workflow"
-  git update-ref refs/remotes/origin/main HEAD
-  git checkout -q -b docs origin/main
+  git update-ref refs/remotes/origin/next HEAD
+  git checkout -q -b docs origin/next
   edit CHANGELOG.md
   git add CHANGELOG.md
   git commit -q -m "edit the changelog"
-  expect_list --default-base origin/main "${ALWAYS[@]}"
+  expect_list --default-base origin/next "${ALWAYS[@]}"
 }
 
-# Origin is a synced fork that contains a stale upstream/main plus a workflow
-# commit, and the branch changes only Markdown from origin/main.
+# Origin is a synced fork that contains a stale upstream/next plus a workflow
+# commit, and the branch changes only Markdown from origin/next.
 case_synced_fork_base() {
   start_case
   git remote add origin "$CASE_DIR"
   git remote add upstream "$CASE_DIR"
-  git update-ref refs/remotes/upstream/main main
+  git update-ref refs/remotes/upstream/next main
   edit .github/workflows/release.yml
   git add .github/workflows/release.yml
   git commit -q -m "edit the synced workflow"
-  git update-ref refs/remotes/origin/main HEAD
-  git checkout -q -b docs origin/main
+  git update-ref refs/remotes/origin/next HEAD
+  git checkout -q -b docs origin/next
   edit CHANGELOG.md
   git add CHANGELOG.md
   git commit -q -m "edit the changelog"
-  expect_list --default-base origin/main "${ALWAYS[@]}"
+  expect_list --default-base origin/next "${ALWAYS[@]}"
+}
+
+# Upstream next is the default when both remotes also have main refs.
+case_next_before_main_base() {
+  start_case
+  git remote add origin "$CASE_DIR"
+  git remote add upstream "$CASE_DIR"
+  git update-ref refs/remotes/origin/main main
+  git update-ref refs/remotes/upstream/main main
+  edit .github/workflows/release.yml
+  git add .github/workflows/release.yml
+  git commit -q -m "edit the integration workflow"
+  git update-ref refs/remotes/upstream/next HEAD
+  git checkout -q -b docs upstream/next
+  edit CHANGELOG.md
+  git add CHANGELOG.md
+  git commit -q -m "edit the changelog"
+  expect_list --default-base upstream/next "${ALWAYS[@]}"
+}
+
+# Local next is the default when neither remote has a next ref.
+case_local_next_base() {
+  start_case
+  edit .github/workflows/release.yml
+  git add .github/workflows/release.yml
+  git commit -q -m "edit the local integration workflow"
+  git branch next HEAD
+  git checkout -q -b docs next
+  edit CHANGELOG.md
+  git add CHANGELOG.md
+  git commit -q -m "edit the changelog"
+  expect_list --default-base next "${ALWAYS[@]}"
 }
 
 # The install-surface check reads CONTRIBUTING.md, and its self-test injects
@@ -1180,6 +1214,14 @@ case_python_check_script() {
   edit .github/scripts/check-docs-style.py
   expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
     self-test:test-check-docs-style.py
+}
+
+# release.yml names the run evidence check, which selects its own self-test.
+case_run_evidence_script() {
+  start_case
+  edit .github/scripts/check-run-evidence.py
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-check-run-evidence.py
 }
 
 # A change to the proof matrix alone selects both matrix checks.
@@ -1482,8 +1524,8 @@ case_full() {
       *) original=$((original + 1)) ;;
     esac
   done
-  if [ "$original" -ne 65 ] || [ "$added" -ne 3 ]; then
-    fail "the expected registry requires 65 original rows, 2 changelog rows, and 1 classifier row"
+  if [ "$original" -ne 66 ] || [ "$added" -ne 3 ]; then
+    fail "the expected registry requires 66 original rows, 2 changelog rows, and 1 classifier row"
   fi
   expect_list --full "${ids[@]}"
 }
@@ -1703,16 +1745,52 @@ case_bad_base() {
   start_case
   "$REAL_BASH" "$SCRIPT_REL" --list --base no-such-ref >"$CASE_DIR.out" 2>&1 || rc=$?
   if [ "$rc" -ne 2 ] || [ "$(cat "$CASE_DIR.out")" != \
-    "preflight: cannot find a merge base with no-such-ref; run git fetch origin main or pass --base <ref>" ]; then
+    "preflight: cannot find a merge base with no-such-ref; run git fetch origin next or pass --base <ref>" ]; then
     cat "$CASE_DIR.out" >&2
     fail "a bad base exited $rc"
   fi
   rc=0
-  "$REAL_BASH" "$SCRIPT_REL" --list --base upstream/main >"$CASE_DIR.out" 2>&1 || rc=$?
+  "$REAL_BASH" "$SCRIPT_REL" --list --base upstream/next >"$CASE_DIR.out" 2>&1 || rc=$?
   if [ "$rc" -ne 2 ] || [ "$(cat "$CASE_DIR.out")" != \
-    "preflight: cannot find a merge base with upstream/main; run git fetch upstream main or pass --base <ref>" ]; then
+    "preflight: cannot find a merge base with upstream/next; run git fetch upstream next or pass --base <ref>" ]; then
     cat "$CASE_DIR.out" >&2
     fail "a missing upstream base exited $rc"
+  fi
+  rc=0
+  "$REAL_BASH" "$SCRIPT_REL" --list >"$CASE_DIR.out" 2>&1 || rc=$?
+  if [ "$rc" -ne 2 ] || [ "$(cat "$CASE_DIR.out")" != \
+    "preflight: cannot find a merge base with next; run git fetch origin next or pass --base <ref>" ]; then
+    cat "$CASE_DIR.out" >&2
+    fail "a missing default base without upstream exited $rc"
+  fi
+  git remote add upstream "$CASE_DIR"
+  rc=0
+  "$REAL_BASH" "$SCRIPT_REL" --list --base next >"$CASE_DIR.out" 2>&1 || rc=$?
+  if [ "$rc" -ne 2 ] || [ "$(cat "$CASE_DIR.out")" != \
+    "preflight: cannot find a merge base with next; run git fetch origin next or pass --base <ref>" ]; then
+    cat "$CASE_DIR.out" >&2
+    fail "an explicit next base with upstream exited $rc"
+  fi
+  git update-ref refs/remotes/origin/next "$(git commit-tree 'HEAD^{tree}' -m unrelated)"
+  rc=0
+  "$REAL_BASH" "$SCRIPT_REL" --list >"$CASE_DIR.out" 2>&1 || rc=$?
+  if [ "$rc" -ne 2 ] || [ "$(cat "$CASE_DIR.out")" != \
+    "preflight: cannot find a merge base with origin/next; run git fetch origin next or pass --base <ref>" ]; then
+    cat "$CASE_DIR.out" >&2
+    fail "an unrelated origin base with upstream exited $rc"
+  fi
+}
+
+# A fork that copied only main needs next from its configured upstream.
+case_missing_next_upstream_hint() {
+  local rc=0
+  start_case
+  git remote add upstream "$CASE_DIR"
+  "$REAL_BASH" "$SCRIPT_REL" --list >"$CASE_DIR.out" 2>&1 || rc=$?
+  if [ "$rc" -ne 2 ] || [ "$(cat "$CASE_DIR.out")" != \
+    "preflight: cannot find a merge base with next; run git fetch upstream next or pass --base <ref>" ]; then
+    cat "$CASE_DIR.out" >&2
+    fail "a missing default base with upstream exited $rc"
   fi
 }
 
@@ -1981,7 +2059,7 @@ case_coverage_on_only_fails() {
   assert_clean_calls
 }
 
-MUTATION_CONTROLS="changelog-fragments changelog-workflow changelog-registry rename-source untracked-paths dev-dependencies target-dependencies unique-gates failed-gate unavailable-gate fresh-coverage"
+MUTATION_CONTROLS="changelog-fragments changelog-workflow changelog-registry rename-source untracked-paths dev-dependencies target-dependencies unique-gates failed-gate unavailable-gate fresh-coverage next-before-main-base local-next-base missing-next-upstream-hint"
 
 # Prints the existing case that pins mutation control $1, then the message of
 # the assertion that must end the case log on the mutant.
@@ -1990,6 +2068,9 @@ mutation_case() {
   local end="the run exited 0, expected 1 with the last line 'preflight:" floors
   local end1="the run exited 1, expected 1 with the last line 'preflight:"
   case "$1" in
+    next-before-main-base) echo "next-before-main-base the default base is upstream/main, expected upstream/next" ;;
+    local-next-base) echo "local-next-base the default base is main, expected next" ;;
+    missing-next-upstream-hint) echo "missing-next-upstream-hint a missing default base with upstream exited 2" ;;
     changelog-fragments) echo "changelog-fragments $differs" ;;
     changelog-workflow) echo "changelog-selection $differs" ;;
     changelog-registry) echo "changelog-registry changelog registry differs from workflow commands" ;;
@@ -2014,6 +2095,13 @@ mutation_case() {
 apply_mutation() {
   local file=$2
   case "$1" in
+    next-before-main-base)
+      replace_line "$file" '      BASE=upstream/next' '      BASE=upstream/main' ;;
+    local-next-base)
+      replace_line "$file" '    BASE=next' '    BASE=main' ;;
+    missing-next-upstream-hint)
+      replace_line "$file" '        git remote get-url upstream >/dev/null 2>&1; }; then' \
+        '        false; }; then' ;;
     changelog-fragments)
       replace_line "$file" '    changelog.d/* | .github/scripts/changelog.py | .github/scripts/test-changelog.py) select_gate changelog ;;' \
         '    .github/scripts/changelog.py | .github/scripts/test-changelog.py) select_gate changelog ;;' ;;

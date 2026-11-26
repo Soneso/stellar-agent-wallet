@@ -34,7 +34,11 @@ dispatch.
    It never deletes a fragment that holds an unreleased entry under this rule.
    If a fragment violates this rule, preserve every unreleased item in a new
    file before accepting deletion.
-2. Wait for CI to pass on that `main` commit.
+2. The tag needs no manual wait for CI. The release preflight requires the
+   push CI of that `main` commit and waits up to 80 minutes for a required run
+   that has not finished, as
+   [What the release preflight refuses](#what-the-release-preflight-refuses)
+   describes.
 3. From a checkout of that commit, check the workspace members on crates.io:
 
    ```bash
@@ -77,6 +81,14 @@ these holds:
   `-<prerelease>` suffix of letters, digits, and dots.
 - The tagged commit is not an ancestor of `origin/main`
   (`.github/scripts/check-ref-on-main.sh`).
+- The tagged commit lacks a successful push run on `main` of any of these
+  workflows: `ci.yml`, `coverage.yml`, `install-surface.yml`,
+  `vendored-wasm.yml`, and `changelog.yml`
+  (`.github/scripts/check-run-evidence.py`). The latest attempt of each run
+  counts, and the `ci.yml` run needs a completed, successful
+  `ci-result (main)` job of that run and attempt. A required run that is
+  requested, waiting, pending, queued, or in progress is waited for up to 80
+  minutes.
 - A workspace member's version differs from the tag.
 - A workspace member's `repository` differs from this repository's URL.
 - `CHANGELOG.md` has no heading for the version.
@@ -95,6 +107,30 @@ Only release preparation pull requests to `main` change the compiled
 changelog; reviewers enforce this policy on `main`.
 The release workflow reads the folded entries and leaves the tagged tree
 unchanged.
+
+Only `ci.yml` accepts a dispatched run in place of its push run. When the
+`ci.yml` push run of the tagged commit was cancelled or failed for a reason
+outside the commit, start a full run while `main` still points at the commit:
+
+```bash
+gh workflow run ci.yml --ref main
+```
+
+Once `main` has moved on, dispatch the run on the tag instead:
+
+```bash
+gh workflow run ci.yml --ref v<version>
+```
+
+The check accepts the dispatched run when it succeeds with
+`ci-result (main)` or `ci-result (v<version>)`. Then rerun the failed jobs of
+the Release workflow run. A failed push run of another required workflow
+fails the check; rerun that push run, then the failed Release jobs. A missing
+push run of another required workflow cannot be rerun, and the check accepts
+no dispatched run of that workflow, so the release needs a new commit on
+`main` and a new tag.
+The preflight job holds `actions: read` to list the runs; the workflow token
+reaches only the evidence step.
 
 A tag push runs the `release.yml` of the tagged commit. These checks therefore
 bind only tags whose commit carries them. The settings in
@@ -175,9 +211,11 @@ Both build cold from locked sources. The `release-toolchain` rule requires
 both builds to install `RELEASE_TOOLCHAIN` and pin `RUSTUP_TOOLCHAIN` before
 compilation, with the same value as `publish.yml`.
 
-The `release-wasm-gate` rule requires `hashes` and `publish` to depend on the
-local vendored Wasm workflow call, without conditions, inputs, or secrets, so
-signing, provenance, and publication wait for the rebuild. The called
+The `release-wasm-gate` rule requires `sign-macos`, `hashes`, and `publish` to
+depend on the unconditional local vendored Wasm workflow call without inputs or
+secrets. It also forbids job-level `if` and `continue-on-error` on `sign-macos`.
+Apple signing and notarization, hashing, cosign signing, provenance, and
+publication therefore wait for the rebuild. The called
 workflow declares `workflow_call`; every cache step starts its condition with
 `github.ref_type != 'tag' && !inputs.publication`, so tag and publication runs
 use no cache. Its rebuild runs exactly when the tree check asks
@@ -425,10 +463,11 @@ The shared build script runs the environment guard immediately before the releas
 Archive verification executes both packaged binaries and checks their embedded
 markers. Archive and host checks also refuse three test-override literals:
 `STELLAR_AGENT_HOME`, `STELLAR_AGENT_TEST_`, and `.stellar-agent-test-sandbox`.
-Hashing depends on archive
-verification and on the vendored Wasm rebuild of the tagged commit, so
-signing and provenance wait for that rebuild. Publication depends on the
-provenance content check, the source discipline check, and the rebuild.
+Apple signing and notarization (`sign-macos`) depend on the vendored Wasm
+rebuild of the tagged commit. Hashing depends on archive verification and on
+that rebuild. Apple signing and notarization, hashing, cosign signing,
+provenance, and publication therefore wait for that rebuild. Publication depends
+on the provenance content check, the source discipline check, and the rebuild.
 Crate publication also requires a rebuild of every vendored Wasm file of the
 verified tag's commit from its pinned source with pinned tools and matching
 bytes. A failed, canceled, or skipped rebuild stops it before the registry
