@@ -251,9 +251,11 @@ holds the seed, so do not write it to a log or a shared terminal.
 
 To fund an account you already hold, call Friendbot directly. The Friendbot
 server decides whether it pays an existing account, and it pays only below its
-starting balance. When Friendbot refuses an already funded account, the command
-exits `1` with `network.friendbot_account_already_funded`. Mainnet is structurally
-refused (`network.friendbot_mainnet_forbidden`) before any HTTP call.
+starting balance. HTTP 400 with `already funded` or `createAccountAlreadyExist`,
+ignoring ASCII case, exits `1` with `network.friendbot_account_already_funded`.
+An earlier attempt may have created the account. Check its balance before
+continuing. Mainnet is structurally refused
+(`network.friendbot_mainnet_forbidden`) before any HTTP call.
 
 ```bash
 stellar-agent friendbot --account GABC...WXYZ --network testnet
@@ -904,6 +906,11 @@ reports the build configuration.
 Mainnet writes move real funds. The wallet is alpha software and comes without
 warranty under the Apache-2.0 license. Use mainnet at your own risk. Test each
 flow on testnet first, and start with small amounts and tight policy limits.
+
+Guard against address poisoning: an attacker can send a small payment from a
+look-alike address so it appears in your account history. Select the destination
+from a trusted record. Never copy destinations from recent account history.
+Compare the whole address with the trusted record before sending.
 
 With the feature on, only a typed authorization issued for the action can
 satisfy the mainnet-write guard, and the binary attests its feature state. With

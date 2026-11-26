@@ -1,0 +1,1 @@
+- A release fails when an archive or its signature is missing, the release workflow verifies every Sigstore bundle before it publishes, and the release checks compare the name and version line of each binary.

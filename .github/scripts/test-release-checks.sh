@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Exercises the package, archive, install and host checks with stub tools.
+# Exercises package, archive, install, host, and signature checks with stub tools.
 set -euo pipefail
+if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != --signatures ]; }; then
+  echo 'usage: test-release-checks.sh [--signatures]' >&2
+  exit 2
+fi
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 mkdir -p target/tmp
@@ -9,7 +13,8 @@ trap 'rm -rf "$tmp"' EXIT
 prefix=STELLAR_AGENT_BUILD_MAINNET_WRITE=
 make_binary() {
   mkdir -p "$(dirname "$1")"
-  printf '#!/usr/bin/env bash\nprintf "stub 1\\n%s%s\\n"\n' "$prefix" "${2:-off}" > "$1"
+  # shellcheck disable=SC2016 # The stub evaluates its invocation name and test controls.
+  printf '#!/usr/bin/env bash\nname=${0##*/}; name=${name%%.exe}\nversion=1.0.0\nif [ "$name" = "${BAD_BINARY:-}" ] && [[ "$0" == *"${BAD_STAGE:-}"* ]]; then\n  name=${BAD_NAME:-$name}; version=${BAD_VERSION:-$version}\nfi\nprintf "%%s %%s\\n%s%s\\n" "$name" "$version"\n' "$prefix" "${2:-off}" > "$1"
   chmod +x "$1"
 }
 # A binary whose report depends on its invocation name: the canonical name
@@ -21,7 +26,7 @@ make_name_sensitive() {
   [ "$2" != on ] || opposite=off
   mkdir -p "$(dirname "$1")"
   # shellcheck disable=SC2016 # The stub body expands when the stub runs.
-  printf '#!/usr/bin/env bash\ncase "${0##*/}" in\n  stellar-agent-mcp*) printf "stub 1\\n%s%%s\\n" "%s""%s" ;;\n  *) printf "stub 1\\n%s%s\\n" ;;\nesac\n' \
+  printf '#!/usr/bin/env bash\nname=${0##*/}; name=${name%%.exe}\nprintf "%%s 1.0.0\\n" "$name"\ncase "$name" in\n  stellar-agent-mcp*) printf "%s%%s\\n" "%s""%s" ;;\n  *) printf "%s%s\\n" ;;\nesac\n' \
     "$prefix" "${opposite:0:1}" "${opposite:1}" "$prefix" "$2" > "$1"
   chmod +x "$1"
 }
@@ -52,17 +57,24 @@ attempts() {
   rm "$tmp/count"
 }
 
+# --signatures runs only the manifest, bundle, and workflow fixtures.
+if [ "${1:-}" != --signatures ]; then
+expect signatures-mode 0 bash .github/scripts/test-release-checks.sh --signatures
+expect_output signatures-mode 'ok signatures-six-exact-pairs'
+expect_output signatures-mode 'ok signatures-restored'
+expect unknown-argument 2 bash .github/scripts/test-release-checks.sh --unknown
+expect signatures-extra-argument 2 bash .github/scripts/test-release-checks.sh --signatures extra
 # Package verification builds the canonical executable into the shared target
 # directory; the check derives the alias from it.
 target_dir="$tmp/target"
 cli="$target_dir/debug/stellar-agent"
 make_binary "$cli"
 touch -t 200001010000 "$tmp/start"
-check=(bash .github/scripts/check-packaged-markers.sh "$target_dir" "$tmp/start" off)
+check=(bash .github/scripts/check-packaged-markers.sh "$target_dir" "$tmp/start" off 1.0.0)
 expect package-fresh 0 "${check[@]}"
 expect_output package-fresh "$target_dir/debug/stellar-agent is off"
 expect_output package-fresh "/stellar-agent-mcp is off"
-expect package-start-missing 1 bash .github/scripts/check-packaged-markers.sh "$target_dir" "$tmp/missing" off
+expect package-start-missing 1 bash .github/scripts/check-packaged-markers.sh "$target_dir" "$tmp/missing" off 1.0.0
 expect_output package-start "missing start timestamp"
 expect package-usage 2 bash .github/scripts/check-packaged-markers.sh "$target_dir"
 expect_output package-usage "usage: check-packaged-markers.sh"
@@ -286,6 +298,18 @@ expect archive-windows 0 env PATH="$tmp/bin:$PATH" "${archive[@]}" x86_64-pc-win
 expect_output archive-windows "/stellar-agent.exe is off"
 expect_output archive-windows "/stellar-agent-mcp.exe is off"
 
+# Each caller checks both invocation names and the supplied version.
+for binary in stellar-agent stellar-agent-mcp; do
+  for fault in BAD_NAME=wrong BAD_VERSION=2.0.0; do
+    expect "package-$binary-$fault" 1 env BAD_BINARY="$binary" "$fault" "${check[@]}"
+    expect_output version-line 'version line 1 differs'
+    expect "archive-linux-$binary-$fault" 1 env BAD_BINARY="$binary" "$fault" "${archive[@]}" x86_64-unknown-linux-gnu off
+    expect_output version-line 'version line 1 differs'
+    expect "archive-windows-$binary-$fault" 1 env PATH="$tmp/bin:$PATH" BAD_BINARY="$binary" "$fault" "${archive[@]}" x86_64-pc-windows-msvc off
+    expect_output version-line 'version line 1 differs'
+  done
+done
+
 cat > "$tmp/bin/cargo" <<'STUB'
 #!/usr/bin/env bash
 # The first four calls report the version missing from the registry, as
@@ -415,6 +439,13 @@ expect install-tag 2 "${install[@]}" invalid off
 expect_output install-tag "does not match"
 expect install-usage 2 "${install[@]}" v1.0.0
 expect_output install-usage "usage: verify-install.sh"
+for binary in stellar-agent stellar-agent-mcp; do
+  for fault in BAD_NAME=wrong BAD_VERSION=2.0.0; do
+    expect "install-$binary-$fault" 1 env BAD_BINARY="$binary" "$fault" "${install[@]}" v1.0.0 off
+    expect_output version-line 'version line 1 differs'
+    attempts install-version 5
+  done
+done
 
 # A Linux host without libudev gets the install command; nothing runs sudo.
 printf '#!/usr/bin/env bash\necho Linux\n' > "$tmp/bin/uname"
@@ -427,6 +458,48 @@ if [ -e "$tmp/sudo.log" ]; then
   echo 'FAIL host-libudev: check-host.sh ran sudo' >&2
   exit 1
 fi
+
+# A scratch checkout keeps the real host checker and replaces only build tools.
+host="$tmp/host"
+mkdir -p "$host/.github/scripts/release" "$host/bin"
+cp .github/scripts/release/{check-host,copy-alias}.sh "$host/.github/scripts/release/"
+cp .github/scripts/check-binary-marker.sh "$host/.github/scripts/"
+printf '[workspace.package]\nversion = "1.0.0"\n' > "$host/Cargo.toml"
+make_binary "$host/fixture" on
+cat > "$host/.github/scripts/release/build.sh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "target/$1/release"
+cp "$HOST_BINARY" "target/$1/release/stellar-agent"
+cp "$HOST_BINARY" "target/$1/release/stellar-agent-mcp"
+STUB
+cat > "$host/bin/cargo" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$*" = 'build --locked -p stellar-agent-cli' ] || exit 3
+mkdir -p target/debug
+cp "$HOST_BINARY" target/debug/stellar-agent
+STUB
+printf '#!/usr/bin/env bash\nprintf "host: fixture-target\\n"\n' > "$host/bin/rustc"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$host/bin/pkg-config"
+cp "$tmp/bin/uname" "$host/bin/uname"
+chmod +x "$host/bin/"*
+host_check() (
+  cd "$host"
+  env PATH="$host/bin:$PATH" HOST_BINARY="$host/fixture" "$@" bash .github/scripts/release/check-host.sh
+)
+expect host-valid 0 host_check
+for specification in 'release stellar-agent' 'release stellar-agent-mcp' 'debug stellar-agent' 'host-alias stellar-agent-mcp'; do
+  read -r stage binary <<< "$specification"
+  for fault in BAD_NAME=wrong BAD_VERSION=2.0.0; do
+    expect "host-$stage-$binary-$fault" 1 host_check BAD_STAGE="$stage" BAD_BINARY="$binary" "$fault"
+    expect_output version-line "version line 1 differs from $binary 1.0.0"
+  done
+done
+printf '[workspace.package]\nversion = "invalid"\n' > "$host/Cargo.toml"
+expect host-invalid-version 2 host_check
+expect_output host-invalid-version 'invalid workspace version'
+printf '[workspace.package]\nversion = "1.0.0"\n' > "$host/Cargo.toml"
 # File-specific download bytes make the logged MSVC archive digest reproducible.
 cat > "$tmp/bin/curl" <<'STUB'
 #!/usr/bin/env bash
@@ -475,8 +548,13 @@ if [ -s "$tmp/github-env" ]; then
   exit 1
 fi
 
+fi
+
 release="$tmp/publication"
-mkdir -p "$release/all-artifacts/linux" "$release/all-artifacts/windows" "$release/release-combined"
+mkdir -p "$release/all-artifacts/linux" "$release/all-artifacts/windows" "$release/release-combined" "$release/all-signatures"
+for name in mac-arm.tar.xz mac-intel.tar.xz linux-arm.tar.xz; do
+  printf "%s\\n" "$name" > "$release/all-artifacts/linux/$name"
+done
 printf 'linux archive\n' > "$release/all-artifacts/linux/fixture.tar.xz"
 printf 'windows archive\n' > "$release/all-artifacts/windows/fixture.zip"
 python3 - "$release" <<'PY_SUMS'
@@ -486,10 +564,12 @@ with (root / 'release-combined/SHA256SUMS').open('w') as sums:
     for path in sorted((root / 'all-artifacts').rglob('*')):
         if path.is_file():
             sums.write(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n')
+            (root / "all-signatures" / (path.name + ".sigstore.json")).write_bytes(path.read_bytes())
+(root / "all-signatures/SHA256SUMS.sigstore.json").write_bytes((root / "release-combined/SHA256SUMS").read_bytes())
 PY_SUMS
 sums=(bash .github/scripts/release/verify-sums.sh "$release")
 expect sums-equal 0 "${sums[@]}"
-expect_output sums-equal '2 archives match SHA256SUMS'
+expect_output sums-equal '5 archives match SHA256SUMS'
 cp "$release/all-artifacts/windows/fixture.zip" "$release/all-artifacts/windows/extra.zip"
 expect sums-extra 1 "${sums[@]}"
 expect_output sums-extra 'archive set differs'
@@ -517,7 +597,7 @@ expect sums-duplicate-entry 1 "${sums[@]}"
 expect_output sums-duplicate-entry 'duplicate SHA256SUMS name'
 : > "$release/release-combined/SHA256SUMS"
 expect sums-empty 1 "${sums[@]}"
-expect_output sums-empty 'SHA256SUMS is empty'
+expect_output sums-empty 'SHA256SUMS must list exactly five archives'
 for name in 'linux/fixture.tar.xz' 'linux\fixture.tar.xz'; do
   python3 -c 'import sys; text = open(sys.argv[1]).read(); print(text.replace("  fixture.tar.xz\n", f"  {sys.argv[2]}\n"), end="")' \
     "$tmp/sums" "$name" > "$release/release-combined/SHA256SUMS"
@@ -541,4 +621,202 @@ expect_output sums-directory 'archive is not a regular file: fixture.zip'
 rmdir "$release/all-artifacts/windows/fixture.zip"
 mv "$tmp/fixture.zip" "$release/all-artifacts/windows/fixture.zip"
 expect sums-final 0 "${sums[@]}"
+python3 - "$release" "$tmp" <<'PY_SIGNATURES'
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import textwrap
+
+release, scratch = map(Path, sys.argv[1:])
+tools = scratch / 'cosign-bin'
+tools.mkdir()
+stub = tools / 'cosign'
+stub.write_text('#!' + sys.executable + '''
+import json, os, pathlib, sys
+args = sys.argv[1:]
+with open(os.environ['COSIGN_LOG'], 'a') as log:
+    log.write(json.dumps(args) + '\\n')
+if os.environ.get('COSIGN_FAIL') or pathlib.Path(args[-1]).name == os.environ.get('COSIGN_FAIL_FILE'):
+    sys.exit(9)
+if args[0] == 'sign-blob':
+    assert args[1:3] == ['--yes', '--bundle'] and len(args) == 5
+    pathlib.Path(args[3]).write_bytes(pathlib.Path(args[4]).read_bytes())
+else:
+    assert args[0:2] == ['verify-blob', '--bundle'] and len(args) == 10
+    assert args[3:9] == ['--certificate-identity', 'identity', '--certificate-oidc-issuer',
+                          'issuer', '--certificate-github-workflow-sha', 'sha']
+    assert pathlib.Path(args[2]).read_bytes() == pathlib.Path(args[9]).read_bytes()
+''')
+stub.chmod(0o755)
+log = scratch / 'cosign.log'
+env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'], COSIGN_LOG=str(log))
+verify = ['bash', '.github/scripts/release/verify-signatures.sh']
+sums = ['bash', '.github/scripts/release/verify-sums.sh']
+
+def run(label, command, status=0, message='', extra=None):
+    result = subprocess.run(command, env=env | (extra or {}), capture_output=True, text=True)
+    assert result.returncode == status, (label, result.returncode, result.stdout, result.stderr)
+    assert message in result.stdout + result.stderr, (label, message, result.stderr)
+    print('ok', label)
+
+def check(label, status=1, message='', claims=('identity', 'issuer', 'sha'), extra=None):
+    run(label, verify + [str(release), *claims], status, message, extra)
+
+check('signatures-six-exact-pairs', 0)
+calls = [json.loads(line) for line in log.read_text().splitlines()]
+files = [p for p in (release / 'all-artifacts').rglob('*') if p.is_file()]
+files.append(release / 'release-combined/SHA256SUMS')
+assert len(calls) == 6
+assert {(call[9], call[2]) for call in calls} == {
+    (str(p), str(release / 'all-signatures' / (p.name + '.sigstore.json'))) for p in files}
+for index, label in enumerate(('identity', 'issuer', 'workflow-sha')):
+    claims = ['identity', 'issuer', 'sha']
+    claims[index] = 'wrong'
+    check('wrong-' + label, message='verify-signatures: SHA256SUMS:', claims=claims)
+    claims[index] = ''
+    log.write_text('')
+    check('empty-' + label, 2, 'must be non-empty', claims=claims)
+    assert not log.read_text(), 'empty claims must fail before cosign runs'
+check('cosign-failure', message='verify-signatures: SHA256SUMS:', extra={'COSIGN_FAIL': '1'})
+check('cosign-archive-failure', message='verify-signatures: fixture.zip:', extra={'COSIGN_FAIL_FILE': 'fixture.zip'})
+minimal = scratch / 'without-cosign'
+minimal.mkdir()
+for name in ('bash', 'dirname', 'python3'):
+    (minimal / name).symlink_to(shutil.which(name))
+check('cosign-missing', message='verify-signatures: SHA256SUMS:', extra={'PATH': str(minimal)})
+run('signatures-usage', verify, 2, 'usage: verify-signatures.sh')
+run('sums-usage', sums, 2, 'usage: verify-sums.sh')
+for name in ('fixture.zip.sigstore.json', 'SHA256SUMS.sigstore.json'):
+    bundle = release / 'all-signatures' / name
+    contents = bundle.read_bytes()
+    for kind in ('missing', 'extra', 'duplicate', 'symlink', 'directory'):
+        other = release / 'all-signatures/other'
+        other.mkdir()
+        if kind == 'extra':
+            (other / 'extra.sigstore.json').write_bytes(contents)
+        elif kind == 'duplicate':
+            (other / name).write_bytes(contents)
+        else:
+            bundle.unlink()
+            if kind == 'symlink':
+                bundle.symlink_to(files[0])
+            elif kind == 'directory':
+                bundle.mkdir()
+        check(f'bundle-{name}-{kind}', message='bundle')
+        run(f'sums-bundle-{name}-{kind}', sums + [str(release)], 1, 'bundle')
+        shutil.rmtree(other)
+        if bundle.is_symlink():
+            bundle.unlink()
+        elif bundle.is_dir():
+            bundle.rmdir()
+        bundle.write_bytes(contents)
+manifest = release / 'release-combined/SHA256SUMS'
+original = manifest.read_bytes()
+for count in (4, 6):
+    lines = original.splitlines(keepends=True)
+    manifest.write_bytes(b''.join(lines[:count]) if count == 4 else original + lines[0].replace(b'fixture.tar.xz', b'extra.tar.xz'))
+    check(f'archive-count-{count}', message='exactly five archives')
+manifest.write_bytes(original.replace(b'  ', b' *', 1))
+check('changed-manifest-byte', message='verify-signatures: SHA256SUMS:')
+manifest.write_bytes(original)
+archive = release / 'all-artifacts/windows/fixture.zip'
+contents = archive.read_bytes()
+archive.write_bytes(contents.replace(b'w', b'W', 1))
+check('changed-archive-byte', message='SHA-256 differs: fixture.zip')
+archive.write_bytes(contents)
+for kind in ('missing', 'symlink', 'directory'):
+    manifest.unlink()
+    if kind == 'symlink':
+        manifest.symlink_to(archive)
+    elif kind == 'directory':
+        manifest.mkdir()
+    check('manifest-' + kind, message='SHA256SUMS is not a regular file')
+    if manifest.is_symlink():
+        manifest.unlink()
+    elif manifest.is_dir():
+        manifest.rmdir()
+    manifest.write_bytes(original)
+
+# Execute the signing step itself so a workflow edit cannot restore skipping.
+def workflow_run(workflow, name):
+    step = Path('.github/workflows/' + workflow).read_text().split('      - name: ' + name + '\n', 1)[1]
+    block = step.split('        run: |\n', 1)[1].splitlines(keepends=True)
+    end = next((i for i, line in enumerate(block) if line.strip() and not line.startswith('          ')), len(block))
+    return textwrap.dedent(''.join(block[:end]))
+
+sign = workflow_run('release.yml', 'Sign archives and SHA256SUMS with cosign')
+signroot = scratch / 'signing'
+signroot.mkdir()
+shutil.copytree(release / 'all-artifacts', signroot / 'artifacts')
+shutil.copytree(release / 'release-combined', signroot / 'release-combined')
+log.write_text('')
+run('sign-six', ['bash', '-c', sign], extra={'RUNNER_TEMP': str(signroot)})
+calls = [json.loads(line) for line in log.read_text().splitlines()]
+assert len(calls) == 6 and {Path(c[-1]).name for c in calls} == {p.name for p in files}
+sign_sums = signroot / 'release-combined/SHA256SUMS'
+for kind in ('empty', 'four', 'six', 'duplicate', 'invalid', 'missing', 'symlink', 'directory'):
+    sign_sums.unlink()
+    if kind == 'symlink':
+        sign_sums.symlink_to(manifest)
+    elif kind == 'directory':
+        sign_sums.mkdir()
+    elif kind != 'missing':
+        body = {'empty': b'', 'four': b''.join(original.splitlines(keepends=True)[:4]),
+                'six': original + original.splitlines(keepends=True)[0],
+                'duplicate': b''.join(original.splitlines(keepends=True)[:4]) + original.splitlines(keepends=True)[0],
+                'invalid': b'invalid\n'}[kind]
+        sign_sums.write_bytes(body)
+    log.write_text('')
+    run('sign-manifest-' + kind, ['bash', '-c', sign], 1, 'sign:', {'RUNNER_TEMP': str(signroot)})
+    assert not log.read_text(), 'invalid input must fail before any signing'
+    if sign_sums.is_symlink():
+        sign_sums.unlink()
+    elif sign_sums.is_dir():
+        sign_sums.rmdir()
+    sign_sums.write_bytes(original)
+for kind in ('missing', 'symlink', 'directory', 'duplicate', 'extra', 'duplicate-sums'):
+    path = signroot / 'artifacts/windows/fixture.zip'
+    other = signroot / 'artifacts/linux/fixture.zip'
+    if kind in ('missing', 'symlink', 'directory'):
+        path.unlink()
+        if kind == 'symlink':
+            path.symlink_to(archive)
+        elif kind == 'directory':
+            path.mkdir()
+    else:
+        other = other.with_name({'duplicate': 'fixture.zip', 'extra': 'extra.zip', 'duplicate-sums': 'SHA256SUMS'}[kind])
+        other.write_bytes(contents)
+    log.write_text('')
+    run('sign-archive-' + kind, ['bash', '-c', sign], 1, 'sign:', {'RUNNER_TEMP': str(signroot)})
+    assert not log.read_text(), 'invalid input must fail before any signing'
+    if kind in ('duplicate', 'extra', 'duplicate-sums'):
+        other.unlink()
+    elif path.is_symlink():
+        path.unlink()
+    elif path.is_dir():
+        path.rmdir()
+    path.write_bytes(contents)
+run('sign-cosign-failure', ['bash', '-c', sign], 1, 'sign:', {'RUNNER_TEMP': str(signroot), 'COSIGN_FAIL': '1'})
+duplicate = signroot / 'release-combined/nested/SHA256SUMS'
+duplicate.parent.mkdir()
+duplicate.write_bytes(original)
+run('sign-nested-duplicate-sums', ['bash', '-c', sign], 1, 'duplicate file: SHA256SUMS', {'RUNNER_TEMP': str(signroot)})
+duplicate.unlink()
+
+version_run = workflow_run('release-rehearsal.yml', 'Read workspace version')
+version_root = scratch / 'workspace-version'
+version_root.mkdir()
+output = version_root / 'output'
+for version, status in (('1.2.3-alpha.4', 0), ('bad', 2)):
+    (version_root / 'Cargo.toml').write_text(f'[workspace.package]\nversion = "{version}"\n')
+    output.write_text('')
+    result = subprocess.run(['bash', '-c', version_run], cwd=version_root,
+                            env=env | {'GITHUB_OUTPUT': str(output)}, capture_output=True, text=True)
+    assert result.returncode == status, (version, result.stderr)
+    assert output.read_text() == (f'version={version}\n' if status == 0 else '')
+check('signatures-restored', 0)
+PY_SIGNATURES
 echo 'release assertion tests passed'

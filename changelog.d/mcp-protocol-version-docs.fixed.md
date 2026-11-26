@@ -1,0 +1,1 @@
+- The MCP docs state that the server answers `initialize` with the requested protocol version from 2024-11-05 to 2025-11-25 and does not support the 2026-07-28 revision.

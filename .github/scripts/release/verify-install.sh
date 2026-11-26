@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs stellar-agent-cli of a published tag from crates.io, copies its
 # stellar-agent executable to stellar-agent-mcp with copy_alias of
-# copy-alias.sh, requires equal bytes, and checks the mainnet-write marker
+# copy-alias.sh, requires equal bytes, and checks the name, version, and mainnet-write marker
 # under both names. The install log is a new mktemp file in a new mode-700
 # mktemp directory under RUNNER_TEMP, so no existing path or link is written. The index can lag a
 # completed publish, so an install that cargo reports as missing from the
@@ -46,5 +46,5 @@ bin="$RUNNER_TEMP/verify-install/bin"
 copy_alias "$bin/stellar-agent" "$bin/stellar-agent-mcp"
 cmp "$bin/stellar-agent" "$bin/stellar-agent-mcp"
 for binary in stellar-agent stellar-agent-mcp; do
-  bash "$script_dir/check-binary-marker.sh" "$bin/$binary" "$expected"
+  bash "$script_dir/check-binary-marker.sh" "$bin/$binary" "$expected" "$binary $V"
 done

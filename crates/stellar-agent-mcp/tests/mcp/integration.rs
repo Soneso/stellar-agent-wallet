@@ -22,6 +22,8 @@
 //! 3. `tools/list` → returns `stellar_balances` with the declared schema.
 //! 4. `tools/call stellar_balances` with an absent account → failed tool envelope.
 //! 5. Invalid account arguments and unknown tools → protocol invalid-params errors.
+//! 6. `initialize` with a supported known version → echoes the requested version.
+//! 7. `initialize` with an unknown version → returns `2024-11-05`.
 //!
 //! # Policy-engine gate assertion
 //!
@@ -186,6 +188,60 @@ fn initialize_returns_capabilities() {
         assert!(
             result["capabilities"]["tools"].is_object(),
             "server must advertise tools capability: {response:?}"
+        );
+    }
+}
+
+/// 6. `initialize` echoes each supported known protocol version.
+#[test]
+#[serial]
+fn initialize_protocol_version_echoes_known_versions() {
+    for poisoned in [false, true] {
+        for version in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
+            let mut driver = spawn_server(poisoned, false);
+
+            driver.send(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": version,
+                    "capabilities": {},
+                    "clientInfo": { "name": "test-client", "version": "0.1.0" }
+                }
+            }));
+
+            let response = driver.response(1);
+            assert_eq!(
+                response["result"]["protocolVersion"], version,
+                "requested {version}, poisoned={poisoned}"
+            );
+        }
+    }
+}
+
+/// 7. `initialize` falls back to `2024-11-05` for an unknown protocol version.
+#[test]
+#[serial]
+fn initialize_protocol_version_falls_back_for_unknown_version() {
+    for poisoned in [false, true] {
+        let mut driver = spawn_server(poisoned, false);
+
+        driver.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2099-01-01",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "0.1.0" }
+            }
+        }));
+
+        let response = driver.response(1);
+        assert_eq!(
+            response["result"]["protocolVersion"], "2024-11-05",
+            "unknown version, poisoned={poisoned}"
         );
     }
 }

@@ -14,10 +14,14 @@ Each named mutation of the check then must fail the entries it names, and
 the restored check must pass them. With --case LABEL, the run checks the
 unmodified copy and that one failing case or PASSING entry, and the
 mutations that name it.
+Use --decision-case docs|measured|invalid for one decision-shell branch, or
+--coverage-behavior for the workflow expression event table alone.
 """
 
 import ast
 import hashlib
+import itertools
+import os
 import pathlib
 import pickle
 import re
@@ -253,14 +257,16 @@ COVERAGE_LABEL_COMMENT = (
 )
 COVERAGE_OFF_HEADER = "  coverage-off:\n    name: coverage (feature-off)" + COVERAGE_SUFFIX + "\n    needs: changes\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
 COVERAGE_ON_HEADER = "  coverage-on:\n    name: coverage (feature-on)" + COVERAGE_SUFFIX + "\n    needs: changes\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
-COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_ELIGIBILITY}) && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
+COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_ELIGIBILITY})"
+COVERAGE_MEASURE = "${{ (" + COVERAGE_LABEL + ") && !(" + COVERAGE_DOCS_SKIP + ") }}"
+COVERAGE_MEASURED_LINE = "        if: steps.decision.outputs.measured == 'true'\n"
 COVERAGE_GATE_START = "  coverage:\n    name: coverage" + COVERAGE_SUFFIX + "\n"
 COVERAGE_GATE_NEEDS = "    needs: [changes, coverage-off, coverage-on]\n"
 COVERAGE_GATE_COMMENT = (
-    "    # always() schedules this job after a failed, cancelled, or skipped\n"
-    "    # measurement, and step 1 then fails it. Steps 2 and 8 fail it in a step\n"
-    "    # evaluation that sees the run cancelled. Proven docs-only next changes\n"
-    "    # skip, unless a pull request carries the coverage label.\n"
+    "    # A job skipped by its if reports under its unevaluated name. Run on every\n"
+    "    # eligible event so coverage passes docs-only next changes without measuring,\n"
+    "    # unless a pull request carries the coverage label. Step 1 checks the results;\n"
+    "    # steps 2 and 8 reject cancellation before and after the measured floors.\n"
 )
 COVERAGE_GATE_IF_LINE = f"    if: {COVERAGE_GATE_CONDITION}\n"
 COVERAGE_GATE_HEADER = COVERAGE_GATE_START + COVERAGE_GATE_NEEDS + COVERAGE_GATE_COMMENT + COVERAGE_GATE_IF_LINE
@@ -288,11 +294,11 @@ COVERAGE_UPLOAD_ON = (COVERAGE_UPLOAD_ACTION + f"        with:\n          name: 
                       "          path: cov-feature-on.json\n          if-no-files-found: error\n"
                       "          retention-days: 1\n")
 COVERAGE_DOWNLOAD_ACTION = "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2\n"
-COVERAGE_DOWNLOAD_OFF = COVERAGE_DOWNLOAD_ACTION + "        with:\n" + COVERAGE_OFF_NAME
-COVERAGE_DOWNLOAD_ON = COVERAGE_DOWNLOAD_ACTION + f"        with:\n          name: {COVERAGE_ON_EXPORT}\n"
-COVERAGE_OFF_FLOORS_STEP = ("      - name: Enforce per-crate line-coverage floors\n        run: python3 "
+COVERAGE_DOWNLOAD_OFF = COVERAGE_DOWNLOAD_ACTION + COVERAGE_MEASURED_LINE + "        with:\n" + COVERAGE_OFF_NAME
+COVERAGE_DOWNLOAD_ON = COVERAGE_DOWNLOAD_ACTION + COVERAGE_MEASURED_LINE + f"        with:\n          name: {COVERAGE_ON_EXPORT}\n"
+COVERAGE_OFF_FLOORS_STEP = ("      - name: Enforce per-crate line-coverage floors\n" + COVERAGE_MEASURED_LINE + "        run: python3 "
                             ".github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off\n")
-COVERAGE_ON_FLOORS_STEP = ("      - name: Enforce feature-on line-coverage floors\n        run: python3 "
+COVERAGE_ON_FLOORS_STEP = ("      - name: Enforce feature-on line-coverage floors\n" + COVERAGE_MEASURED_LINE + "        run: python3 "
                            ".github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on\n")
 CACHE_SAVE_LINE = "          save-if: ${{ github.event_name == 'push' }}\n"
 RUST_CACHE_USES = "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3\n"
@@ -359,7 +365,7 @@ INSTALL_RUN = 'run: bash "$GITHUB_WORKSPACE/wf/.github/scripts/release/verify-in
 PROVENANCE_RUN = ('run: python3 .github/scripts/check-provenance.py "provenance/stellar-agent-$VERSION.intoto.jsonl" '
                   'provenance/SHA256SUMS "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$GITHUB_REF"')
 PACKAGE_CHECK_RUN = ('run: bash "$GITHUB_WORKSPACE/wf/.github/scripts/check-packaged-markers.sh" target '
-                     'target/package-verification-start "$EXPECTED_MAINNET_WRITE"')
+                     'target/package-verification-start "$EXPECTED_MAINNET_WRITE" "$VERSION"')
 VERIFY_PACKAGED_STEP = "      - name: Verify packaged binaries\n"
 ROSETTA_STEP = (
     "      - name: Require Rosetta\n"
@@ -474,7 +480,7 @@ RELEASE_EVIDENCE_CASES = [
                   (PROVENANCE_PERMISSIONS, PROVENANCE_PERMISSIONS + "      checks: read\n", 1)),
 ]
 REHEARSAL_MARKER_RUN = ('        run: bash .github/scripts/check-packaged-markers.sh target '
-                        'target/package-verification-start "$EXPECTED_MAINNET_WRITE"\n')
+                        'target/package-verification-start "$EXPECTED_MAINNET_WRITE" "$VERSION"\n')
 # The defining command of each feature job of ci.yml, as its run: line.
 CI_FEATURE_JOBS = {
     "feature-on-clippy": 'cargo clippy --workspace --all-targets --features "mainnet-write,',
@@ -518,7 +524,7 @@ def conditional_feature_job(header):
 
 COVERAGE_OFF_RUN = "        run: cargo llvm-cov --workspace --no-default-features --features test-helpers,"
 # The host recipe lines that build the CLI package alone, and the lines that
-# derive its debug alias, compare the bytes and check both markers.
+# derive its debug alias, compare the bytes and check both names, versions, and markers.
 HOST_ALIAS = "target/tmp/host-alias/stellar-agent-mcp"
 HOST_SINGLE_CLI = ("cargo build --locked -p stellar-agent-cli\n"
                    "mkdir -p target/tmp/host-alias\n")
@@ -526,8 +532,8 @@ HOST_ALIAS_COPY = f"copy_alias target/debug/stellar-agent {HOST_ALIAS}\n"
 HOST_ALIAS_STEPS = (". .github/scripts/release/copy-alias.sh\n"
                     + HOST_ALIAS_COPY
                     + f"cmp target/debug/stellar-agent {HOST_ALIAS}\n"
-                    "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent on\n"
-                    f"bash .github/scripts/check-binary-marker.sh {HOST_ALIAS} on\n")
+                    'bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent on "stellar-agent $version"\n'
+                    f'bash .github/scripts/check-binary-marker.sh {HOST_ALIAS} on "stellar-agent-mcp $version"\n')
 HOST_RELEASE_CMP = 'cmp "target/$target/release/stellar-agent" "target/$target/release/stellar-agent-mcp"\n'
 # The copy and comparison lines of build.sh and of the smoke build step, a
 # plain copy and mv in their place, and the rename line of the copy helper.
@@ -768,12 +774,12 @@ SUMS_STEP = (
     "      - name: Verify the publication archives\n"
     '        run: bash .github/scripts/release/verify-sums.sh "$RUNNER_TEMP/release"\n'
 )
-TAG_GUARD = "        if: github.ref_type != 'tag' && !inputs.publication\n"
+TAG_GUARD = "        if: github.ref_type != 'tag'\n"
 WASM_SAVE_EVENTS = "(github.event_name == 'push' || github.event_name == 'schedule')"
-WASM_SAVE_CONDITION = (f"github.ref_type != 'tag' && !inputs.publication && {WASM_SAVE_EVENTS} && "
+WASM_SAVE_CONDITION = (f"github.ref_type != 'tag' && {WASM_SAVE_EVENTS} && "
                        "steps.restore.outputs.cache-hit != 'true'")
 SAVE_GUARD = f"        if: {WASM_SAVE_CONDITION}\n"
-WASM_OLD_SAVE_GUARD = "        if: github.ref_type != 'tag' && !inputs.publication && steps.restore.outputs.cache-hit != 'true'\n"
+WASM_OLD_SAVE_GUARD = "        if: github.ref_type != 'tag' && steps.restore.outputs.cache-hit != 'true'\n"
 
 
 def wasm_save_events(events):
@@ -800,16 +806,11 @@ WASM_GATE_RUN = ('        run: bash .github/scripts/rebuild-vendored-wasm.sh --g
                  '"$REBUILD_JOB" "$REF_TYPE"\n')
 WASM_DECIDE_RUN = '          echo "rebuild=$rebuild" >>"$GITHUB_OUTPUT"\n'
 
-PUBLISH_WASM_CALL = live_text(PUBLISH, re.compile(r"  vendored-wasm:\n.*?(?=  publish:)", re.DOTALL),
-                              "publication Wasm call")
+PUBLISH_EVIDENCE = live_text(PUBLISH, re.compile(r"  release-evidence:\n.*?(?=  publish:)", re.DOTALL),
+                              "publication Release evidence")
 PUBLISH_SOURCE_STEP = live_text(PUBLISH, re.compile(
     r"      - name: Require the verified source commit\n.*?\n\n", re.DOTALL), "verified source step")
-WASM_REBUILD_CHECKOUT = live_text(WASM, re.compile(
-    r"  rebuild:\n.*?          ref: \$\{\{ inputs.source_sha \}\}\n", re.DOTALL), "rebuild source checkout")
-SOURCE_REF = "          ref: ${{ inputs.source_sha }}\n"
-PUBLICATION_WITH = "      source_sha: ${{ needs.verify.outputs.sha }}\n      publication: true\n"
-PUBLICATION_HEAD = '            if [ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]; then\n'
-PUBLICATION_REF_TYPE = "          REF_TYPE: ${{ inputs.publication && 'publication' || github.ref_type }}\n"
+WASM_REF_TYPE = "          REBUILD_JOB: ${{ needs.rebuild.result }}\n          REF_TYPE: ${{ github.ref_type }}\n"
 WASM_CACHE_COMBINED = ("      - uses: actions/cache@" + PLACEHOLDER_REVISION + "\n" + TAG_GUARD
                        + "        with:\n          path: x\n          key: y\n")
 WASM_SAVE_STEP = "      - name: Save the install root\n"
@@ -857,10 +858,8 @@ PASSING = [
          "        run: |\n          # sudo apt-get update\n          true # sudo apt-get install -y libudev-dev\n", 2)]),
     ("wrapped skill archive condition passes", [
         (CI, SKILL_ARCHIVE_IF, f"        if: ${{{{ {SKILL_ARCHIVE_CONDITION} }}}}\n", 1)]),
-    ("publication call inputs in another order pass", [
-        (PUBLISH, PUBLICATION_WITH, "      publication: true\n      source_sha: ${{ needs.verify.outputs.sha }}\n", 1)]),
     ("wrapped tag cache guard passes", [
-        (WASM, TAG_GUARD, "        if: ${{ github.ref_type != 'tag' && !inputs.publication }}\n", 2)]),
+        (WASM, TAG_GUARD, "        if: ${{ github.ref_type != 'tag' }}\n", 2)]),
     ("wrapped Wasm rebuild and gate conditions pass", [
         (WASM, WASM_REBUILD_IF,
          "    needs: [check, stellar-cli-25, stellar-cli-28]\n    if: ${{ needs.check.outputs.rebuild == 'true' }}\n", 1),
@@ -965,49 +964,8 @@ CASES = [
         "release-contracts has an unsupported docs-only job condition",
         "DOCS_REQUIRED must match CI docs-only job conditions"), [
         (CI, "  release-contracts:\n    needs: changes\n    if: ${{ !cancelled() }}\n", "  release-contracts:\n    needs: changes\n    if: false\n", 1)], 4),
-    ("crate publish without Wasm dependency", "publish-wasm-gate", "publish must need verify and vendored-wasm", [
-        (PUBLISH, "needs: [verify, vendored-wasm]", "needs: verify", 1)]),
-    ("crate Wasm call uses another workflow", "publish-wasm-gate", "must call the local workflow", [
-        (PUBLISH, "uses: ./.github/workflows/vendored-wasm.yml", "uses: ./.github/workflows/ci.yml", 1)]),
-    ("crate Wasm call needs another job", "publish-wasm-gate", "must need exactly verify", [
-        (PUBLISH, PUBLISH_WASM_CALL, PUBLISH_WASM_CALL.replace("needs: verify", "needs: [verify, verify-install]"), 1)]),
-    ("crate Wasm call uses event SHA", "publish-wasm-gate", "must pass exactly the verified source SHA", [
-        (PUBLISH, PUBLICATION_WITH, PUBLICATION_WITH.replace("needs.verify.outputs.sha", "github.sha"), 1)]),
-    ("crate Wasm call without publication", "publish-wasm-gate", "must pass exactly the verified source SHA", [
-        (PUBLISH, "      publication: true\n", "", 1)]),
-    ("crate Wasm call continues on error", "publish-wasm-gate", "must set no secrets or continue-on-error", [
-        (PUBLISH, PUBLISH_WASM_CALL, PUBLISH_WASM_CALL + "    continue-on-error: true\n", 1)]),
-    ("crate Wasm call inherits secrets", "publish-wasm-gate", "must set no secrets or continue-on-error", [
-        (PUBLISH, PUBLISH_WASM_CALL, PUBLISH_WASM_CALL + "    secrets: inherit\n", 1)]),
-    ("crate publish on always", "publish-wasm-gate", "publish must run exactly on !inputs.verify_only", [
-        (PUBLISH, "needs: [verify, vendored-wasm]\n    if: ${{ !inputs.verify_only }}",
-         "needs: [verify, vendored-wasm]\n    if: ${{ always() && !inputs.verify_only }}", 1)]),
-    ("crate Wasm call on always", ("publish-wasm-gate", "release-check-unconditional"),
-     ("vendored-wasm must run exactly on !inputs.verify_only", "vendored-wasm can be bypassed"), [
-        (PUBLISH, PUBLISH_WASM_CALL,
-         PUBLISH_WASM_CALL.replace("${{ !inputs.verify_only }}", "${{ always() && !inputs.verify_only }}"), 1)]),
-    ("Wasm source input wrong default", "publish-wasm-gate", "must declare optional source_sha", [
-        (WASM, "        default: ''\n", "        default: main\n", 1)]),
-    ("Wasm publication input wrong type", "publish-wasm-gate", "must declare optional publication", [
-        (WASM, "        type: boolean\n", "        type: string\n", 1)]),
-    ("Wasm rebuild checkout without source", "publish-wasm-gate", "rebuild checkout must use inputs.source_sha", [
-        (WASM, WASM_REBUILD_CHECKOUT, WASM_REBUILD_CHECKOUT.replace(SOURCE_REF, ""), 1)]),
-    ("Wasm check checkout without source", "publish-wasm-gate", "check checkout must use inputs.source_sha", [
-        (WASM, SOURCE_REF, "", 3)]),
-    ("Wasm gate checkout without source", "publish-wasm-gate", "vendored-wasm checkout must use inputs.source_sha", [
-        (WASM, SOURCE_REF + "          persist-credentials: false\n" + WASM_GATE_STEP,
-         "          persist-credentials: false\n" + WASM_GATE_STEP, 1)]),
-    ("Wasm cache without publication guard", ("publish-wasm-gate", "release-wasm-gate"),
-     ("cache guard must lead", "cache guard must lead"), [
-        (WASM, TAG_GUARD, "        if: github.ref_type != 'tag'\n", 2)]),
-    ("Wasm gate uses event ref type", "release-wasm-gate", "gate step must read each job result and the ref type", [
-        (WASM, PUBLICATION_REF_TYPE, "          REF_TYPE: ${{ github.ref_type }}\n", 1)]),
-    ("Wasm decide without publication env", "publish-wasm-gate", "decide must read PUBLICATION and SOURCE_SHA", [
-        (WASM, "          PUBLICATION: ${{ inputs.publication }}\n", "", 1)]),
-    ("Wasm decide without source env", "publish-wasm-gate", "decide must read PUBLICATION and SOURCE_SHA", [
-        (WASM, "          SOURCE_SHA: ${{ inputs.source_sha }}\n", "", 1)]),
-    ("Wasm decide without HEAD comparison", "publish-wasm-gate", "decide must compare HEAD with SOURCE_SHA", [
-        (WASM, PUBLICATION_HEAD, "            if false; then\n", 1)]),
+    ("Wasm gate uses wrong ref type", "release-wasm-gate", "gate step must read each job result and the ref type", [
+        (WASM, WASM_REF_TYPE, WASM_REF_TYPE.replace("${{ github.ref_type }}", "branch"), 1)]),
     ("crate publish without verified source guard", "credential-order", "no step before rust-lang/crates-io-auth-action runs [ \"$(git -C src", [
         (PUBLISH, PUBLISH_SOURCE_STEP, "", 1)]),
     ("crate publish echoes verified source", "credential-order", "no step before rust-lang/crates-io-auth-action runs [ \"$(git -C src", [
@@ -1454,7 +1412,7 @@ CASES = [
      "publish.yml:verify step 3: publish-tag-ref: checkout ref '' is neither refs/tags/... nor github.workflow_sha", [
         (PUBLISH, "          ref: ${{ github.workflow_sha }}\n", "", 3)]),
     ("another local workflow call in publish.yml", "publish-tag-ref", "no checkout of refs/tags/...", [
-        (PUBLISH, PUBLISH_WASM_CALL, PUBLISH_WASM_CALL + "  extra:\n    needs: verify\n    uses: ./.github/workflows/ci.yml\n\n", 1)]),
+        (PUBLISH, PUBLISH_EVIDENCE, PUBLISH_EVIDENCE + "  extra:\n    needs: verify\n    uses: ./.github/workflows/ci.yml\n\n", 1)]),
     ("release preflight without the ancestry check", "ancestry-check",
      'release.yml:preflight: ancestry-check: no line runs check-ref-on-main.sh as its command', [
         (RELEASE, '      - name: Refuse a tag whose commit is not on main\n'
@@ -1570,15 +1528,28 @@ CASES = [
         (COVERAGE, "    branches: [main, next]\n" + COVERAGE_TYPES_LINE,
          "    branches: [main, next]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1),
         (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, ""), 1)]),
+    ("coverage gate retains docs-only clause", "coverage-condition", "canonical eligibility only", [
+        (COVERAGE, COVERAGE_GATE_IF_LINE, COVERAGE_GATE_IF_LINE.rstrip()
+         + f" && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})\n", 1)]),
+    ("coverage decision without label", "coverage-condition", "decision must use the measure expression", [
+        (COVERAGE, "          MEASURE: " + COVERAGE_MEASURE,
+         "          MEASURE: ${{ !(" + COVERAGE_DOCS_SKIP + ") }}", 1)]),
+    ("coverage decision without push exclusion", "coverage-condition", "decision must use the measure expression", [
+        (COVERAGE, "          MEASURE: " + COVERAGE_MEASURE,
+         "          MEASURE: ${{ (" + COVERAGE_LABEL + ") }}", 1)]),
+    ("coverage decision without id", ("coverage-condition", "coverage-gate"),
+     ("decision must use the measure expression", "decision must match the literal template"), [
+        (COVERAGE, "        id: decision\n", "", 1)]),
     ("coverage gate without always()", ("coverage-condition", "ci-feature-jobs"),
-     ("coverage gate runs without always() and the measure condition", "coverage.yml: ci-feature-jobs: coverage can be bypassed"), [
-        (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(COVERAGE_GATE_IF_LINE, COVERAGE_IF_LINE), 1)]),
-    ("coverage gate bypasses the label", "coverage-condition", "coverage gate runs without always() and the measure condition", [
+     ("coverage gate must run on always() and canonical eligibility only", "coverage.yml: ci-feature-jobs: coverage can be bypassed"), [
         (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
-            COVERAGE_GATE_IF_LINE, f"    if: always() || ({COVERAGE_CONDITION})\n"), 1)]),
-    ("coverage gate skipped on cancellation", "coverage-condition", "coverage gate runs without always() and the measure condition", [
+            COVERAGE_GATE_IF_LINE, f"    if: {COVERAGE_ELIGIBILITY}\n"), 1)]),
+    ("coverage gate bypasses eligibility", "coverage-condition", "coverage gate must run on always() and canonical eligibility only", [
         (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
-            COVERAGE_GATE_IF_LINE, f"    if: ${{{{ !cancelled() && ({COVERAGE_CONDITION}) }}}}\n"), 1)]),
+            COVERAGE_GATE_IF_LINE, f"    if: always() || ({COVERAGE_ELIGIBILITY})\n"), 1)]),
+    ("coverage gate skipped on cancellation", "coverage-condition", "coverage gate must run on always() and canonical eligibility only", [
+        (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
+            COVERAGE_GATE_IF_LINE, f"    if: ${{{{ !cancelled() && ({COVERAGE_ELIGIBILITY}) }}}}\n"), 1)]),
     ("coverage-on without the measure condition", "coverage-condition", "coverage-on job runs without the measure condition", [
         (COVERAGE, COVERAGE_ON_HEADER, COVERAGE_ON_HEADER.replace(COVERAGE_IF_LINE, ""), 1)]),
     ("coverage gate renamed", "coverage-names", "coverage must suffix ignored events", [
@@ -1673,7 +1644,7 @@ CASES = [
      "coverage step 4 transfers cov-feature-off-1, not a report of this run attempt", [
         (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_OFF.replace(COVERAGE_OFF_NAME, "          name: cov-feature-off-1\n"), 1)]),
     ("coverage download by pattern", "coverage-attempt", "coverage step 4 downloads with pattern", [
-        (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_ACTION + "        with:\n          pattern: cov-feature-off-*\n", 1)]),
+        (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_ACTION + COVERAGE_MEASURED_LINE + "        with:\n          pattern: cov-feature-off-*\n", 1)]),
     ("coverage download that merges reports", "coverage-attempt", "coverage step 4 downloads with merge-multiple", [
         (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_OFF + "          merge-multiple: true\n", 1)]),
     ("coverage without push trigger", "coverage-seed", "coverage.yml: coverage-seed: push trigger is absent", [
@@ -1898,7 +1869,11 @@ CASES = [
         (RELEASE, 'needs: [preflight, vendored-wasm, build, sign-macos, sign, hashes, provenance, verify-provenance]',
          'needs: [preflight, vendored-wasm, build, sign-macos, sign, hashes, provenance]', 1)]),
     ("verify-provenance without provenance", "release-provenance-gate", "verify-provenance must need provenance", [
-        (RELEASE, "needs: [preflight, provenance, hashes]", "needs: [preflight, hashes]", 1)]),
+        (RELEASE, "needs: [preflight, provenance, hashes, sign]", "needs: [preflight, hashes, sign]", 1)]),
+    ("verify-provenance without sign", "release-provenance-gate", "verify-provenance must need sign", [
+        (RELEASE, "needs: [preflight, provenance, hashes, sign]", "needs: [preflight, provenance, hashes]", 1)]),
+    ("signature check removed", "release-provenance-gate", "verify-provenance does not run unconditionally: bash .github/scripts/release/verify-signatures.sh", [
+        (RELEASE, "run: bash .github/scripts/release/verify-signatures.sh", "run: echo .github/scripts/release/verify-signatures.sh", 1)]),
     ("provenance check behind a comment", "release-provenance-gate",
      "verify-provenance does not run unconditionally: python3 .github/scripts/check-provenance.py", [
         (RELEASE, PROVENANCE_RUN, commented(PROVENANCE_RUN), 1)]),
@@ -2045,15 +2020,15 @@ CASES = [
          '--features "$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings', 1)]),
     ("host recipe with a marker check in a subshell", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: unmodelled shell syntax around", [
-        (HOST_SCRIPT, 'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on\n',
-         '( bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on ) || true\n', 1)]),
+        (HOST_SCRIPT, 'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on "stellar-agent-mcp $version"\n',
+         '( bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on "stellar-agent-mcp $version" ) || true\n', 1)]),
     ("host recipe without the MCP marker check", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally", [
-        (HOST_SCRIPT, 'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on\n', "", 1)]),
+        (HOST_SCRIPT, 'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on "stellar-agent-mcp $version"\n', "", 1)]),
     ("host recipe that expects the release CLI off", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
      'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent" on', [
-        (HOST_SCRIPT, '"target/$target/release/stellar-agent" on\n', '"target/$target/release/stellar-agent" off\n', 1)]),
+        (HOST_SCRIPT, '"target/$target/release/stellar-agent" on "stellar-agent $version"\n', '"target/$target/release/stellar-agent" off "stellar-agent $version"\n', 1)]),
     ("host recipe without the single CLI build", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
      "cargo build --locked -p stellar-agent-cli", [
@@ -2061,7 +2036,7 @@ CASES = [
     ("host recipe that expects the debug alias off", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
      f"bash .github/scripts/check-binary-marker.sh {HOST_ALIAS} on", [
-        (HOST_SCRIPT, f"{HOST_ALIAS} on\n", f"{HOST_ALIAS} off\n", 1)]),
+        (HOST_SCRIPT, f'{HOST_ALIAS} on "stellar-agent-mcp $version"\n', f'{HOST_ALIAS} off "stellar-agent-mcp $version"\n', 1)]),
     ("host recipe with the alias steps in a condition", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
      f"cmp target/debug/stellar-agent {HOST_ALIAS}", [
@@ -2248,6 +2223,12 @@ for workflow in (TESTNET, ".github/workflows/install-surface.yml", ".github/work
         (workflow, "\npermissions:\n", "\nremoved-permissions:\n", 1)]))
 CASES.append(("testnet checkout credentials", "checkout-credentials", "persist-credentials", [
     (TESTNET, "          persist-credentials: false\n", "          persist-credentials: true\n", 2)]))
+CASES.append(("testnet config run input", "run-inputs", "run: reads", [
+    (TESTNET, '          elif [ "$MAINNET_WRITE" = true ]; then',
+     '          elif [ "${{ inputs.mainnet_write }}" = true ]; then', 1)]))
+CASES.append(("testnet revision run input", "run-inputs", "run: reads", [
+    (TESTNET, 'run: test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"',
+     'run: test "$(git rev-parse HEAD)" = "${{ inputs.filter }}"', 2)]))
 for action in ("actions/checkout", "actions/setup-python"):
     old = live_text(CHANGELOG, re.compile(rf"{action}@[0-9a-f]{{40}}"), f"{action} pin")
     revision = old.split("@")[1]
@@ -2335,23 +2316,24 @@ CASES.extend([
     ("S04 ignored name coverage-on", "coverage-names", "suffix ignored events", [
         (".github/workflows/coverage.yml", "    name: coverage (feature-on)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", "    name: coverage (feature-on)\n", 1)]),
     ("S03 eligibility coverage", "coverage-eligibility", "canonical eligibility", [
-        (".github/workflows/coverage.yml", "  coverage:\n    name: coverage${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n    needs: [changes, coverage-off, coverage-on]\n    # always() schedules this job after a failed, cancelled, or skipped\n    # measurement, and step 1 then fails it. Steps 2 and 8 fail it in a step\n    # evaluation that sees the run cancelled. Proven docs-only next changes\n    # skip, unless a pull request carries the coverage label.\n    if: always() && (github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true')\n", "  coverage:\n    name: coverage${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n    needs: [changes, coverage-off, coverage-on]\n    # always() schedules this job after a failed, cancelled, or skipped\n    # measurement, and step 1 then fails it. Steps 2 and 8 fail it in a step\n    # evaluation that sees the run cancelled. Proven docs-only next changes\n    # skip, unless a pull request carries the coverage label.\n    if: always() && (github.event_name != 'pull_request' || false || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true')\n", 1)]),
+        (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
+            COVERAGE_GATE_IF_LINE, COVERAGE_GATE_IF_LINE.replace("github.event.action == 'opened'", "false")), 1)]),
     ("S04 ignored name coverage", "coverage-names", "suffix ignored events", [
         (".github/workflows/coverage.yml", "    name: coverage${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", "    name: coverage\n", 1)]),
     ("S05 measure main", ("coverage-condition",) * 3,
      ("coverage-off job runs without the measure condition",
       "coverage-on job runs without the measure condition",
-      "coverage gate runs without always() and the measure condition"), [
+      "coverage gate decision must use the measure expression"), [
         (".github/workflows/coverage.yml", "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')", "github.event_name != 'pull_request' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')", 3)]),
     ("S05 measure uncertain", ("coverage-condition",) * 3,
      ("coverage-off job runs without the measure condition",
       "coverage-on job runs without the measure condition",
-      "coverage gate runs without always() and the measure condition"), [
+      "coverage gate decision must use the measure expression"), [
         (".github/workflows/coverage.yml", "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')", "github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'coverage')", 3)]),
     ("S05 measure label", ("coverage-condition",) * 3,
      ("coverage-off job runs without the measure condition",
       "coverage-on job runs without the measure condition",
-      "coverage gate runs without always() and the measure condition"), [
+      "coverage gate decision must use the measure expression"), [
         (".github/workflows/coverage.yml", "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')", "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true')", 3)]),
     ("S06 condition ci.yml Self-test feature discipline and assertions", "selftest-selection", "self-test condition", [
         (".github/workflows/ci.yml", "      - name: Self-test feature discipline and assertions\n        if: needs.changes.outputs.selftest_rust != 'false'\n", "      - name: Self-test feature discipline and assertions\n", 1)]),
@@ -2515,7 +2497,75 @@ CASES.append(("S27 archive name in another job", "selftest-checks", "check steps
      "      - name: Check the skill archive\n" + SKILL_ARCHIVE_IF, 1)]))
 PASSING.append(("S28 unknown registry group rejected", []))
 
+COSIGN_INSTALLER = "sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532"
+for job in ("sign", "verify-provenance"):
+    text = (ROOT / RELEASE).read_text()
+    block = re.search(
+        rf"(?ms)^  {job}:\n.*?(?=^  [a-z][a-z-]*:|\Z)", text).group()
+    for label, old, new, message in (
+            ("installer pin", COSIGN_INSTALLER, COSIGN_INSTALLER[:-1] + "0", "requires the pinned cosign installer"),
+            ("cosign version", "cosign-release: v3.1.4", "cosign-release: v3.0.0", "requires cosign-release: v3.1.4")):
+        CASES.append((f"{job} {label}", "release-signatures", f"{message}", [
+            (RELEASE, block, block.replace(old, new), 1)]))
+
+VERSION_STEP = re.search(r"(?ms)^      - name: Read workspace version\n.*?(?=^      - name:|\Z)",
+                         (ROOT / REHEARSAL).read_text()).group()
+CASES.extend([
+    ("signature upload tolerates missing files", "release-signatures", "signature upload requires if-no-files-found: error", [
+        (RELEASE, "name: signatures\n          if-no-files-found: error", "name: signatures\n          if-no-files-found: warn", 1)]),
+    ("rehearsal version after build", "release-version-binding", "workspace version must be read before packaging", [
+        (REHEARSAL, VERSION_STEP, "", 1),
+        (REHEARSAL, '        run: bash .github/scripts/check-packaged-markers.sh target target/package-verification-start "$EXPECTED_MAINNET_WRITE" "$VERSION"\n',
+         '        run: bash .github/scripts/check-packaged-markers.sh target target/package-verification-start "$EXPECTED_MAINNET_WRITE" "$VERSION"\n' + VERSION_STEP, 1)], 1),
+    ("rehearsal version step missing", "release-version-binding", "workspace version must be read before packaging", [
+        (REHEARSAL, VERSION_STEP, VERSION_STEP.replace("id: version", "id: unused"), 1)]),
+    ("rehearsal package version binding", "release-version-binding", "packaged check must use the validated version output", [
+        (REHEARSAL, "      - name: Verify packaged feature state\n        env:\n          VERSION: ${{ steps.version.outputs.version }}",
+         "      - name: Verify packaged feature state\n        env:\n          VERSION: 0.0.0", 1)]),
+    ("publish package version binding", "release-version-binding", "packaged check must use the validated version output", [
+        (PUBLISH, "      - name: Verify packaged feature state\n        working-directory: src\n        env:\n          VERSION: ${{ steps.tag.outputs.version }}",
+         "      - name: Verify packaged feature state\n        working-directory: src\n        env:\n          VERSION: 0.0.0", 1)]),
+    ("publish install tag binding", "release-version-binding", "install check must use the validated tag output", [
+        (PUBLISH, "TAG: ${{ steps.tag.outputs.tag }}", "TAG: ${{ inputs.tag }}", 1)]),
+])
+
 MUTATIONS = {
+    "coverage-decision-id": (
+        'first.get("id") != "decision"\n                or ', '', ["coverage decision without id"]),
+    "coverage-decision-expression": (
+        'self.unwrap_expression(str((first.get("env") or {}).get("MEASURE", ""))) != self.unwrap_expression(COVERAGE_MEASURE)', 'False',
+        ["coverage decision without label", "coverage decision without push exclusion"]),
+    "signature-needs": (
+        'for dependency in ("preflight", "provenance", "hashes", "sign"):',
+        'for dependency in ("preflight", "provenance", "hashes"):',
+        ["verify-provenance without sign"]),
+    "signature-command": (
+        'for command in PROVENANCE_CHECKS:', 'for command in (PROVENANCE_CHECKS[0], *PROVENANCE_CHECKS[2:]):',
+        ["signature check removed"]),
+    "signature-installer": (
+        'if [step.get("uses") for step in installers] != [', 'if False and [step.get("uses") for step in installers] != [',
+        ["sign installer pin", "verify-provenance installer pin"]),
+    "signature-version": (
+        'if [(step.get("with") or {}).get("cosign-release") for step in installers] != [COSIGN_VERSION]:', 'if False:',
+        ["sign cosign version", "verify-provenance cosign version"]),
+    "signature-upload": (
+        'if [(step.get("with") or {}).get("if-no-files-found") for step in uploads] != ["error"]:', 'if False:',
+        ["signature upload tolerates missing files"]),
+    "package-version-binding": (
+        'if any((steps[index].get("env") or {}).get("VERSION") != version for index in checks):', 'if False:',
+        ["publish package version binding", "rehearsal package version binding"]),
+    "package-version-order": (
+        'if len(versions) != 1 or not builds or versions[0] >= builds[0]:', 'if False:',
+        ["rehearsal version after build", "rehearsal version step missing"]),
+    "install-tag-binding": (
+        'if (step.get("env") or {}).get("TAG") != "${{ steps.tag.outputs.tag }}":', 'if False:',
+        ["publish install tag binding"]),
+    "testnet-input-channel": (r'if re.search(r"\binputs\.", expression):', 'if False:',
+                            ["testnet config run input", "testnet revision run input"]),
+    "testnet-checkout-credentials": ('if with_.get("persist-credentials") not in (False, "false"):',
+                                    'if False:', ["testnet checkout credentials"]),
+    "testnet-permissions": ('if "permissions" not in doc:', 'if False:',
+                           [".github/workflows/testnet.yml named permissions"]),
     "wallet-toolchain": ("        self.check_wallet_toolchain()\n", "",
                          [label for label, _, _ in WALLET_TOOLCHAIN_CASES]),
     "wallet-toolchain-invalid-channel-return": (
@@ -2726,62 +2776,12 @@ MUTATIONS = {
         '        self.check_skill_archive()\n', '',
         ['skill archive step removed', 'skill archive skipped for main pull requests',
          'skill archive skipped for main pushes', 'skill archive command removed']),
-    "publish-wasm-call-check": (
-        '        self.check_publish_wasm_gate()\n', '',
-        ['crate publish without Wasm dependency']),
-    "publish-wasm-needs": (
-        'if not {"verify", "vendored-wasm"}.issubset(publish.get("needs", [])):', 'if False:',
-        ['crate publish without Wasm dependency']),
-    "publish-wasm-local-call": (
-        'if call.get("uses") != "./.github/workflows/vendored-wasm.yml":', 'if False:',
-        ['crate Wasm call uses another workflow']),
-    "publish-wasm-call-needs": (
-        'if call.get("needs") not in ("verify", ["verify"]):', 'if False:',
-        ['crate Wasm call needs another job']),
-    "publish-wasm-condition": (
-        'if job.get("if") != "${{ !inputs.verify_only }}":', 'if False:',
-        ['crate publish on always', 'crate Wasm call on always']),
-    "publish-wasm-with": (
-        'if call.get("with") != {"source_sha": "${{ needs.verify.outputs.sha }}", "publication": True}:', 'if False:',
-        ['crate Wasm call uses event SHA', 'crate Wasm call without publication']),
-    "publish-wasm-no-secrets-or-continue": (
-        'if any(key in call for key in ("secrets", "continue-on-error")):', 'if False:',
-        ['crate Wasm call continues on error', 'crate Wasm call inherits secrets']),
-    "publish-wasm-inputs": (
-        'if inputs.get(name) != {"type": kind, "required": False, "default": default}:', 'if False:',
-        ['Wasm source input wrong default', 'Wasm publication input wrong type']),
-    "publish-wasm-checkouts": (
-        'if not checkouts or any((step.get("with") or {}).get("ref") != "${{ inputs.source_sha }}" for step in checkouts):', 'if False:',
-        ['Wasm rebuild checkout without source', 'Wasm check checkout without source', 'Wasm gate checkout without source']),
-    "publish-wasm-decide-env": (
-        'if env.get("PUBLICATION") != "${{ inputs.publication }}" or env.get("SOURCE_SHA") != "${{ inputs.source_sha }}":', 'if False:',
-        ['Wasm decide without publication env', 'Wasm decide without source env']),
-    "publish-wasm-decide-head": (
-        'if \'[ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]\' not in self.run_text(decide):', 'if False:',
-        ['Wasm decide without HEAD comparison']),
-    "publish-wasm-cache": (
-        '                        self.report(f"{workflow}:{name}", rule, f"cache guard must lead with {guard}")', '                        pass',
-        ['Wasm cache without publication guard']),
-    "release-wasm-publication-cache": (
-        '\n                guard = "github.ref_type != \'tag\' && !inputs.publication"\n',
-        '\n                guard = "github.ref_type != \'tag\'"\n',
-        ['Wasm cache without publication guard']),
-    "publish-wasm-gate-ref": (
-        '"REF_TYPE": "${{ inputs.publication && \'publication\' || github.ref_type }}",', '"REF_TYPE": "${{ github.ref_type }}",',
-        ['Wasm gate uses event ref type']),
+    "release-wasm-ref-type": (
+        '"REF_TYPE": "${{ github.ref_type }}",', '"REF_TYPE": "branch",',
+        ['Wasm gate uses wrong ref type']),
     "publish-verified-source-order": (
         ', VERIFIED_SOURCE_CHECK), "compare-crate-sums.py"),', '), "compare-crate-sums.py"),',
         ['crate publish without verified source guard', 'crate publish echoes verified source']),
-    "publish-local-call-exemption": (
-        'and tag_checkouts == 0 and job_id != "vendored-wasm":', 'and tag_checkouts == 0:',
-        ['publication call inputs in another order pass']),
-    "publish-local-call-scope": (
-        'and tag_checkouts == 0 and job_id != "vendored-wasm":',
-        'and tag_checkouts == 0 and not (not steps and str(job.get("uses", "")).startswith("./.github/workflows/")):',
-        ['another local workflow call in publish.yml']),
-    "publish-call-unconditional": (
-        '"publish.yml": ("verify", "vendored-wasm", "publish", "verify-install"),', '"publish.yml": ("verify", "publish", "verify-install"),',
-        ['crate Wasm call on always']),
     "release-vars-context": (
         "if VARS_CONTEXT.search(EXPRESSION_STRING.sub(\"''\", expression)):", "if False:",
         [f"vars context in {where}" for where, *_ in VARS_LOCATIONS]),
@@ -2800,10 +2800,10 @@ MUTATIONS = {
         "if gate_condition != COVERAGE_GATE_CONDITION:", "if False:", ["coverage gate without always()"]),
     "coverage-gate-label": (
         "if gate_condition != COVERAGE_GATE_CONDITION:", 'if not str(gate_condition).startswith("always()"):',
-        ["coverage gate bypasses the label"]),
+        ["coverage gate bypasses eligibility"]),
     "coverage-gate-not-cancelled": (
         "if gate_condition != COVERAGE_GATE_CONDITION:",
-        'if gate_condition not in (COVERAGE_GATE_CONDITION, f"!cancelled() && ({COVERAGE_CONDITION})"):',
+        'if gate_condition not in (COVERAGE_GATE_CONDITION, f"!cancelled() && ({COVERAGE_ELIGIBILITY})"):',
         ["coverage gate skipped on cancellation"]),
     "coverage-gate-unwrap": (
         "gate_condition = self.unwrap_expression(gate_condition)", "gate_condition = gate_condition",
@@ -2877,8 +2877,8 @@ MUTATIONS = {
         "if not (len(steps) > 2 and rejects(steps[-1]) and all(index < len(steps) - 1 for index in floors)):",
         "if False:", ["coverage gate cancel rejection before the floors only"]),
     "coverage-gate-cancel-exemption": (
-        '"continue-on-error" not in step\n                        and self.normalized(self.run_text(step)) == [COVERAGE_CANCEL_RUN])',
-        '"continue-on-error" not in step)', ["coverage gate cancel rejection that never fails"]),
+        'and self.normalized(self.run_text(step)) == [COVERAGE_CANCEL_RUN])',
+        ')', ["coverage gate cancel rejection that never fails"]),
     "coverage-gate-cancel-unwrap": (
         "self.unwrap_expression(condition) != COVERAGE_CANCEL_CONDITION", "condition != COVERAGE_CANCEL_CONDITION",
         ["coverage gate cancel condition wrapped in ${{ }} passes"]),
@@ -3073,6 +3073,346 @@ MUTATIONS.update({
 MUTATIONS["S-mixed"][2].extend(["S26 moved actionlint", "S26 moved cargo fetch", "S26 moved script"])
 
 
+# Each evidence case changes one property and requires exactly its own rule.
+EVIDENCE_PROPERTIES = [
+    ("needs", "    needs: verify\n", "    needs: verify-install\n",
+     "release-evidence must need exactly verify"),
+    ("runner", "    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-22.04\n",
+     "release-evidence must run on ubuntu-24.04"),
+    ("permissions", "      actions: read\n", "",
+     "release-evidence permissions must be contents: read and actions: read"),
+    ("id-token", "      actions: read\n", "      actions: read\n      id-token: write\n",
+     "release-evidence permissions must be contents: read and actions: read"),
+    ("environment", "    needs: verify\n", "    needs: verify\n    environment: crates-io\n",
+     "release-evidence must run unconditionally without an environment or secrets"),
+    ("verify-only", "    needs: verify\n", "    needs: verify\n    if: ${{ !inputs.verify_only }}\n",
+     "release-evidence must run unconditionally without an environment or secrets"),
+    ("step-if", "      - name: Require the verified checkout\n",
+     "      - name: Require the verified checkout\n        if: false\n", "release-evidence template:"),
+    ("cargo", '          [ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]',
+     '          cargo --version\n          [ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]',
+     "release-evidence template:"),
+    ("compile", '          [ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]',
+     '          make\n          [ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]',
+     "release-evidence template:"),
+    ("toolchain", "      - name: Require the verified checkout\n",
+     "      - uses: dtolnay/rust-toolchain@" + PLACEHOLDER_REVISION + "\n        with:\n          toolchain: ${{ env.RELEASE_TOOLCHAIN }}\n"
+     "      - name: Require the verified checkout\n", "release-evidence template:"),
+    ("checkout", "          ref: ${{ needs.verify.outputs.sha }}\n", "          ref: ${{ github.sha }}\n",
+     "release-evidence template:"),
+    ("run-id", "${{ steps.release.outputs.run_id }}", "${{ github.run_id }}",
+     "release-evidence template:"),
+    ("run-attempt", "${{ steps.release.outputs.run_attempt }}", "${{ github.run_attempt }}",
+     "release-evidence template:"),
+    ("timeout", "    timeout-minutes: 15\n", "    timeout-minutes: 16\n",
+     "release-evidence must time out after 15 minutes"),
+    ("cross", '          [ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]',
+     '          cross check\n          [ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]',
+     "release-evidence template:"),
+    ("cosign-pin", "sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532",
+     "sigstore/cosign-installer@" + PLACEHOLDER_REVISION, "release-evidence template:"),
+    ("cosign-version", "cosign-release: v3.1.4", "cosign-release: v3.1.3", "release-evidence template:"),
+]
+for name, old, new, message in EVIDENCE_PROPERTIES:
+    assert PUBLISH_EVIDENCE.count(old) == 1, name
+    label = "evidence " + name
+    CASES.append((label, "publish-release-evidence", message,
+                  [(PUBLISH, PUBLISH_EVIDENCE, PUBLISH_EVIDENCE.replace(old, new), 1)]))
+CASES.append(("evidence dependency", "publish-release-evidence", "publish must need release-evidence",
+              [(PUBLISH, "needs: [verify, release-evidence]", "needs: [verify]", 1)], 1))
+CASES.append(("evidence publish condition", "publish-release-evidence", "publish must run exactly on !inputs.verify_only",
+              [(PUBLISH, "    if: ${{ !inputs.verify_only }}\n", "", 1)], 1))
+MUTATIONS["evidence-publish-condition"] = (
+    '        if (self.job(workflow, "publish") or {}).get("if") != "${{ !inputs.verify_only }}":',
+    '        if False:', ["evidence publish condition"])
+MUTATIONS["evidence-credential-scope"] = (
+    ' and (workflow, job_id) != ("publish.yml", "release-evidence")', '', ["evidence environment"])
+MUTATIONS["evidence-call"] = ('        self.check_publish_release_evidence()\n', '', ["evidence dependency"])
+PASSING.append(("evidence needs list passes", [
+    (PUBLISH, PUBLISH_EVIDENCE, PUBLISH_EVIDENCE.replace("    needs: verify\n", "    needs: [verify]\n"), 1)]))
+
+
+EVIDENCE_COMMANDS = (
+    '[ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]',
+    'echo "RELEASE_DIR=$RUNNER_TEMP/release-evidence" >> "$GITHUB_ENV"',
+    'python3 .github/scripts/check-run-evidence.py --mode release --repository "$GITHUB_REPOSITORY" --sha "$SOURCE_SHA" --tag "$TAG" --wait-minutes 0 --poll-seconds 0',
+    'mkdir -p "$RELEASE_DIR"/{all-artifacts,release-combined,all-signatures,provenance}',
+    'gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,assets > "$RELEASE_DIR/release.json"',
+    '[ "$(jq -r .isDraft "$RELEASE_DIR/release.json")" = false ]',
+    'gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$RELEASE_DIR/release-combined"',
+    'jq -e --rawfile sums "$RELEASE_DIR/release-combined/SHA256SUMS" --arg provenance "stellar-agent-${TAG#v}.intoto.jsonl" \'($sums | split("\\n") | map(select(length > 0) | .[66:])) as $archives | .isDraft == false and ($archives | length) == 5 and ([.assets[].name] | sort) == (($archives + ["SHA256SUMS"] + (($archives + ["SHA256SUMS"]) | map(. + ".sigstore.json")) + [$provenance]) | sort)\' "$RELEASE_DIR/release.json"',
+    'gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern \'*.tar.xz\' --pattern \'*.zip\' --dir "$RELEASE_DIR/all-artifacts"',
+    'gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern \'*.sigstore.json\' --dir "$RELEASE_DIR/all-signatures"',
+    'gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern \'*.intoto.jsonl\' --dir "$RELEASE_DIR/provenance"',
+    'bash .github/scripts/release/verify-signatures.sh "$RELEASE_DIR" "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$TAG" https://token.actions.githubusercontent.com "$SOURCE_SHA"',
+    'shopt -s nullglob dotglob',
+    'verifier="$RUNNER_TEMP/slsa-verifier"',
+    'curl --proto \'=https\' --tlsv1.2 --fail --silent --show-error --location https://github.com/slsa-framework/slsa-verifier/releases/download/v2.7.1/slsa-verifier-linux-amd64 --output "$verifier"',
+    'echo "946dbec729094195e88ef78e1734324a27869f03e2c6bd2f61cbc06bd5350339 $verifier" | sha256sum --check --strict',
+    'chmod +x "$verifier"',
+    'provenance=("$RELEASE_DIR"/provenance/*.intoto.jsonl)',
+    '[ "${#provenance[@]}" -eq 1 ]',
+    'for archive in "$RELEASE_DIR"/all-artifacts/*; do "$verifier" verify-artifact "$archive" --provenance-path "${provenance[0]}" --source-uri "github.com/$GITHUB_REPOSITORY" --source-tag "$TAG" --builder-id https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.1.0; done',
+    'python3 .github/scripts/check-provenance.py "${provenance[0]}" "$RELEASE_DIR/release-combined/SHA256SUMS" "$SOURCE_SHA" "$GITHUB_REPOSITORY" "refs/tags/$TAG" --run-id "$RELEASE_RUN_ID" --run-attempt "$RELEASE_RUN_ATTEMPT"',
+    'bash .github/scripts/rebuild-vendored-wasm.sh --check-tree --repo-root "$GITHUB_WORKSPACE"',
+)
+
+# Each command is independently removed, quoted, prefixed, commented, or bypassed.
+import yaml
+
+
+def evidence_job_edit(change):
+    job = yaml.safe_load(PUBLISH_EVIDENCE)["release-evidence"]
+    change(job)
+    return "\n".join("  " + line for line in yaml.safe_dump({"release-evidence": job}, sort_keys=False).splitlines()) + "\n\n"
+
+
+def command_edit(job, command, variant):
+    for step in job["steps"]:
+        lines = [re.sub(r"[ \t]+", " ", line.strip()) for line in
+                 re.sub(r"\\\n", " ", step.get("run", "")).splitlines()]
+        if command not in lines:
+            continue
+        if variant == "shell":
+            step["shell"] = "sh"
+        elif variant == "condition":
+            step["if"] = False
+        else:
+            changed = {"missing": "true", "echo": "echo " + repr(command),
+                       "prefix": "false && " + command, "comment": "# " + command}[variant]
+            step["run"] = "\n".join(changed if line == command else line for line in lines)
+        return
+    raise AssertionError(command)
+
+
+for number, command in enumerate(EVIDENCE_COMMANDS):
+    for variant in ("missing", "echo", "prefix", "comment", "shell", "condition"):
+        label = f"evidence command-{number}-{variant}"
+        edited = evidence_job_edit(lambda job: command_edit(job, command, variant))
+        CASES.append((label, "publish-release-evidence", "release-evidence template:",
+                      [(PUBLISH, PUBLISH_EVIDENCE, edited, 1)]))
+
+for name, addition, message in (
+    ("secret", {"env": {"EXTRA": "${{ secrets.RELEASE_KEY }}"}}, "an expression reads secrets"),
+    ("token-expression", {"env": {"EXTRA": "${{ github.token }}"}}, "an expression reads the workflow token"),
+    ("github-context", {"env": {"EXTRA": "${{ toJson(github) }}"}}, "an expression reads the github context"),
+    ("token-key", {"env": {"${{ github.token }}": "value"}}, "an expression reads the workflow token"),
+    ("malformed-expression", {"env": {"EXTRA": "${{ github.token"}}, "unterminated expression"),
+    ("token-variable", {"env": {"GH_TOKEN": "literal"}}, "release-evidence sets forbidden token variable GH_TOKEN"),
+    ("other-token", {"env": {"GITHUB_TOKEN": "literal"}}, "release-evidence sets forbidden token variable GITHUB_TOKEN"),
+):
+    label = "evidence credential-" + name
+    edited = evidence_job_edit(lambda job: job["steps"].append(dict(name="Extra", run="true", **addition)))
+    CASES.append((label, "publish-release-evidence", message, [(PUBLISH, PUBLISH_EVIDENCE, edited, 1)]))
+    if "variable" in message:
+        needle = '                if str(key).upper() in TOKEN_ENV:\n                    self.report(workflow, rule, f"release-evidence'
+        replacement = '                if False:\n                    self.report(workflow, rule, f"release-evidence'
+    else:
+        needle = '        self.check_credential_expressions(workflow, {"release-evidence": scanned, **inherited}, rule)\n'
+        replacement = ""
+    MUTATIONS[label] = (needle, replacement, [label])
+
+for name, change, message in (
+    ("api-secret", lambda j: j["steps"][2]["env"].update(EXTRA="${{ secrets.RELEASE_KEY }}"),
+     "an expression reads secrets"),
+    ("api-token-value", lambda j: j["steps"][2]["env"].update(GH_TOKEN="${{ secrets.RELEASE_KEY }}"),
+     "an expression reads secrets"),
+    ("non-api-token", lambda j: j["steps"][-1].update(env={"GH_TOKEN": "${{ github.token }}"}),
+     "an expression reads the workflow token"),
+    ("job-token", lambda j: j["env"].update(GH_TOKEN="literal"), "release-evidence sets forbidden token variable"),
+    ("job-secret", lambda j: j["env"].update(EXTRA="${{ secrets.RELEASE_KEY }}"), "an expression reads secrets"),
+):
+    label = "evidence credential-" + name
+    CASES.append((label, "publish-release-evidence", message,
+                  [(PUBLISH, PUBLISH_EVIDENCE, evidence_job_edit(change), 1)]))
+    needle = ('        self.check_credential_expressions(workflow, {"release-evidence": scanned, **inherited}, rule)\n'
+              if "expression" in message else
+              '                if str(key).upper() in TOKEN_ENV:\n                    self.report(workflow, rule, f"release-evidence')
+    replacement = "" if "expression" in message else needle.replace('str(key).upper() in TOKEN_ENV', 'False')
+    MUTATIONS[label] = (needle, replacement, [label])
+
+CASES.append(("evidence build comments refused", "publish-release-evidence", "release-evidence template:", [
+    (PUBLISH, PUBLISH_EVIDENCE, PUBLISH_EVIDENCE.replace('          set -euo pipefail',
+     '          # cargo cross build rustup\n          set -euo pipefail\t# cargo cross build rustup', 1), 1)]))
+
+for name, change, message in (
+    ("command-order", lambda j: j["steps"][-2].update(run=j["steps"][-2]["run"].replace(
+        '          ', '').replace('chmod +x "$verifier"\n', '').replace(
+            'echo "946dbec', 'chmod +x "$verifier"\necho "946dbec')), "release-evidence template:"),
+    ("cosign-missing", lambda j: j["steps"].pop(4), "release-evidence template:"),
+    ("cosign-duplicate", lambda j: j["steps"].insert(4, j["steps"][4]), "release-evidence template:"),
+):
+    label = "evidence " + name
+    CASES.append((label, "publish-release-evidence", message,
+                  [(PUBLISH, PUBLISH_EVIDENCE, evidence_job_edit(change), 1)]))
+PASSING.append(("evidence API tokens pass", []))
+MUTATIONS["evidence-api-token-mask"] = ('                del env["GH_TOKEN"]', '                pass', ["evidence API tokens pass"])
+CASES.append(("evidence selection-command-missing", "publish-release-evidence",
+              "release-evidence template:",
+              [(PUBLISH, PUBLISH_EVIDENCE, evidence_job_edit(
+                  lambda j: command_edit(j, EVIDENCE_COMMANDS[2], "missing")), 1)]))
+
+for name, change, message in (
+    ("selection-id", lambda j: j["steps"][2].pop("id"), "release-evidence template:"),
+    ("job-env", lambda j: j["env"].update(EXTRA="value"), "job env must contain exactly TAG and SOURCE_SHA"),
+    ("job-sha", lambda j: j["env"].update(SOURCE_SHA="other"), "job env must contain exactly TAG and SOURCE_SHA"),
+    ("job-tag", lambda j: j["env"].update(TAG="other"), "job env must contain exactly TAG and SOURCE_SHA"),
+    ("selection-env", lambda j: j["steps"][2]["env"].update(EXTRA="value"), "release-evidence template:"),
+    ("download-env", lambda j: j["steps"][3]["env"].update(EXTRA="value"), "release-evidence template:"),
+    ("api-token-missing", lambda j: j["steps"][2].pop("env"), "release-evidence template:"),
+    ("api-token-literal", lambda j: j["steps"][2]["env"].update(GH_TOKEN="literal"), "release-evidence template:"),
+    ("download-name", lambda j: j["steps"][3].update(name="Other API step"), "release-evidence template:"),
+    ("selection-extra-command", lambda j: j["steps"][2].update(run=j["steps"][2]["run"] + "echo extra\n"), "release-evidence template:"),
+    ("download-extra-command", lambda j: j["steps"][3].update(run=j["steps"][3]["run"] + "echo extra\n"), "release-evidence template:"),
+    ("checkout-order", lambda j: j["steps"].insert(5, j["steps"].pop(0)), "release-evidence template:"),
+    ("cosign-signature-order", lambda j: j["steps"].insert(5, j["steps"].pop(4)), "release-evidence template:"),
+    ("cosign-provenance-order", lambda j: j["steps"].insert(6, j["steps"].pop(4)), "release-evidence template:"),
+    ("step-suppression", lambda j: j["steps"].append({"run": "set +e"}), "release-evidence template:"),
+    ("step-continue", lambda j: j["steps"][-1].update({"continue-on-error": True}), "release-evidence template:"),
+    ("job-continue", lambda j: j.update({"continue-on-error": True}), "must run unconditionally without an environment or secrets"),
+    ("job-secrets", lambda j: j.update(secrets={}), "must run unconditionally without an environment or secrets"),
+    ("job-uses", lambda j: j.update(uses="./.github/workflows/vendored-wasm.yml"), "must run unconditionally without an environment or secrets"),
+    ("checkout-duplicate", lambda j: j["steps"].insert(0, j["steps"][0]), "release-evidence template:"),
+    ("checkout-missing", lambda j: j["steps"].pop(0), "release-evidence template:"),
+):
+    label = "evidence " + name
+    CASES.append((label, "publish-release-evidence", message,
+                  [(PUBLISH, PUBLISH_EVIDENCE, evidence_job_edit(change), 1)]))
+
+for name, command in (("double", 'echo "a # b"; cargo build'),
+                      ("single", "echo 'a # b'; cargo build"),
+                      ("escaped", r'echo \" "a # b"; cargo build'),
+                      ("nested", 'echo "$(echo "a # b")"; make')):
+    label = "evidence quoted-comment-" + name
+    CASES.append((label, "publish-release-evidence", "release-evidence template:",
+                  [(PUBLISH, PUBLISH_EVIDENCE, evidence_job_edit(lambda j, c=command: j["steps"].append({"run": c})), 1)]))
+
+# Live job edits must report the first differing field.
+for name, change, message in (
+    ("non-api-env", lambda j: j["steps"][1].update(env={"TAG": "other", "SOURCE_SHA": "other", "RELEASE_DIR": "/tmp/other"}),
+     "step 2 field env: missing or unexpected"),
+    ("renamed-download", lambda j: (j["steps"][3].update(name="Other"), j["steps"][3].pop("env")),
+     "step 4 field name: differs"),
+    ("api-comment-continuation", lambda j: j["steps"][2].update(run=j["steps"][2]["run"] + "# x \\\nmake\n"),
+     "step 3 field run: differs"),
+    ("checkout-after-command", lambda j: j["steps"].insert(1, j["steps"].pop(0)),
+     "step 1 field uses: missing or unexpected"),
+    ("last-step-missing", lambda j: j["steps"].pop(), "step 8 field step: missing"),
+    ("extra-step", lambda j: j["steps"].append({"run": "true"}), "step 9 field step: unexpected"),
+    ("extra-key", lambda j: j["steps"][1].update(timeout=1), "step 2 field timeout: missing or unexpected"),
+    ("run-type", lambda j: j["steps"][-1].update(run=True), "step 8 field run: differs"),
+    ("with-type", lambda j: j["steps"][0]["with"].update({"persist-credentials": 0}), "step 1 field with: differs"),
+    ("run-inner-space", lambda j: j["steps"][1].update(run=j["steps"][1]["run"].replace("git rev-parse", "git  rev-parse")),
+     "step 2 field run: differs"),
+    ("run-physical-lines", lambda j: j["steps"][2].update(run=EVIDENCE_COMMANDS[2]), "step 3 field run: differs"),
+    ("run-carriage-return", lambda j: j["steps"][1].update(run=j["steps"][1]["run"].replace("\n", "\r\n", 1)),
+     "step 2 field run: differs"),
+    ("run-line-separator", lambda j: j["steps"][1].update(run=j["steps"][1]["run"].replace("\n", "\u2028", 1)),
+     "step 2 field run: differs"),
+    ("run-no-break-space", lambda j: j["steps"][1].update(run="\xa0" + j["steps"][1]["run"]),
+     "step 2 field run: differs"),
+    ("first-difference", lambda j: (j["steps"][1].update(name="Other"), j["steps"][2].pop("id")),
+     "step 2 field name: differs"),
+):
+    label = "evidence " + name
+    CASES.append((label, "publish-release-evidence", "release-evidence template: " + message,
+                  [(PUBLISH, PUBLISH_EVIDENCE, evidence_job_edit(change), 1)], 1))
+
+
+def evidence_run_whitespace(job):
+    for step in job["steps"]:
+        if "run" in step:
+            step["run"] = "\n \t\n".join(" \t" + line.strip() + " \t" for line in step["run"].splitlines()) + "\n"
+
+
+PASSING.append(("evidence run whitespace passes", [
+    (PUBLISH, PUBLISH_EVIDENCE, evidence_job_edit(evidence_run_whitespace), 1)]))
+# The template control covers every crafted step edit.
+MUTATIONS["evidence-template"] = (
+    "difference = self.evidence_template_difference(steps)", "difference = None",
+    [case[0] for case in CASES if case[1] == "publish-release-evidence" and "release-evidence template:" in case[2]])
+for name, needle, replacement, labels in (
+    ("step-count", "range(max(len(steps), len(PUBLISH_EVIDENCE_TEMPLATE)))",
+     "range(min(len(steps), len(PUBLISH_EVIDENCE_TEMPLATE)))",
+     ["evidence last-step-missing", "evidence extra-step"]),
+    ("step-number", 'location = f"step {index + 1}"', 'location = f"step {index}"',
+     ["evidence first-difference"]),
+    ("api-position", "PUBLISH_EVIDENCE_TEMPLATE[index] if index < len(PUBLISH_EVIDENCE_TEMPLATE) else {}",
+     "{}", ["evidence API tokens pass"]),
+    ("missing-step", 'return f"{location} field step: missing"', "return None", ["evidence last-step-missing"]),
+    ("extra-step", 'return f"{location} field step: unexpected"', "return None", ["evidence extra-step"]),
+    ("missing-field", 'return f"{location} field {field}: missing or unexpected"', "return None", ["evidence selection-id"]),
+    ("extra-field", "dict.fromkeys([*expected, *actual])", "expected", ["evidence extra-key"]),
+    ("field-value", "if yaml.safe_dump(value, sort_keys=True) != yaml.safe_dump(wanted, sort_keys=True):",
+     "if False:", ["evidence download-name"]),
+    ("scalar-types", "yaml.safe_dump(value, sort_keys=True) != yaml.safe_dump(wanted, sort_keys=True)",
+     "value != wanted", ["evidence with-type"]),
+    ("run-trim", r'line.strip(BLANKS) for line in value.split("\n")', r'line for line in value.split("\n")',
+     ["evidence run whitespace passes"]),
+    ("run-empty", r'value.split("\n") if line.strip(BLANKS)', r'value.split("\n")', ["evidence run whitespace passes"]),
+    ("run-line-boundary", r'value.split("\n") if line.strip(BLANKS)', 'value.splitlines() if line.strip(BLANKS)',
+     ["evidence run-carriage-return", "evidence run-line-separator"]),
+    ("run-blank-characters", r'line.strip(BLANKS) for line in value.split("\n") if line.strip(BLANKS)',
+     r'line.strip() for line in value.split("\n") if line.strip()', ["evidence run-no-break-space"]),
+    ("run-normalize", 'if field == "run" and isinstance(value, str):', "if False:", ["evidence API tokens pass"]),
+    ("first-field", 'return f"{location} field {field}: differs"', 'continue', ["evidence first-difference"]),
+    ("api-token-scope", 'expected.get("env") == RELEASE_EVIDENCE_ENV', "True", ["evidence credential-non-api-token"]),
+    ("api-token-value", 'and env.get("GH_TOKEN") == "${{ github.token }}"', 'and "GH_TOKEN" in env',
+     ["evidence credential-api-token-value"]),
+):
+    MUTATIONS["evidence-" + name] = (needle, replacement, labels)
+
+# Job rules have separate controls for each forbidden key.
+for name, condition in (
+    ("needs", 'job.get("needs") not in ("verify", ["verify"])'),
+    ("runner", 'job.get("runs-on") != "ubuntu-24.04"'),
+    ("timeout", 'job.get("timeout-minutes") != 15'),
+    ("permissions", 'job.get("permissions") != {"contents": "read", "actions": "read"}'),
+    ("job-env", 'job.get("env") != PUBLISH_EVIDENCE_ENV'),
+):
+    MUTATIONS["evidence-" + name] = ("if " + condition + ":", "if False:", ["evidence " + name])
+for name, key in (("verify-only", "if"), ("environment", "environment"), ("job-continue", "continue-on-error"),
+                  ("job-secrets", "secrets"), ("job-uses", "uses")):
+    keys = ("if", "continue-on-error", "environment", "secrets", "uses")
+    needle = "(" + ", ".join('"' + item + '"' for item in keys) + ")"
+    replacement = "(" + ", ".join('"' + item + '"' for item in keys if item != key) + ")"
+    MUTATIONS["evidence-" + name] = (needle, replacement, ["evidence " + name])
+
+CASES.append(("comment continuation exposes cross", "cred-compile", "runs cross: cross build --release", [
+    before_sign_macos_tools("      - run: |\n          # x \\\n          cross build --release\n\n")], 1))
+MUTATIONS["logical-comment-continuation"] = (
+    'uncommented = "\\n".join(line for line in lines if not line.lstrip(BLANKS).startswith("#"))',
+    'uncommented = "\\n".join(lines)\n        uncommented = "\\n".join(line for line in re.sub(r"\\\\\\n", " ", uncommented).split("\\n") if not line.lstrip(BLANKS).startswith("#"))',
+    ["comment continuation exposes cross"])
+
+EVIDENCE_INHERITED = {
+    "evidence inherited token": ({"env": {"GH_TOKEN": "literal"}}, "sets forbidden token variable GH_TOKEN"),
+    "evidence inherited secret": ({"env": {"EXTRA": "${{ secrets.RELEASE_KEY }}"}}, "an expression reads secrets"),
+    "evidence inherited defaults": ({"defaults": {"run": {"working-directory": "${{ github.token }}"}}},
+                                    "an expression reads the workflow token"),
+}
+for label, (_, message) in EVIDENCE_INHERITED.items():
+    CASES.append((label, "publish-release-evidence", message, [], 1))
+    needle = ('inherited.get("env"), job.get("env")' if label.endswith("token") else
+              'self.check_credential_expressions(workflow, {"release-evidence": scanned, **inherited}, rule)')
+    replacement = ('job.get("env")' if label.endswith("token") else
+                   'self.check_credential_expressions(workflow, {"release-evidence": scanned}, rule)')
+    MUTATIONS[label] = (needle, replacement, [label])
+
+
+def evidence_inherited_problems(script, label):
+    """Check this rule alone because other jobs also reject inherited credentials."""
+    import types
+    checker = types.ModuleType("workflow_checker")
+    exec(compile(script.read_text(), str(script), "exec"), checker.__dict__)
+    instance = checker.Checker(ROOT)
+    instance.docs["publish.yml"] = yaml.safe_load((ROOT / PUBLISH).read_text())
+    instance.docs["publish.yml"].update(EVIDENCE_INHERITED[label][0])
+    instance.check_publish_release_evidence()
+    case = next(case for case in CASES if case[0] == label)
+    return case_problems("\n".join(instance.violations), case)
+
+
 def registry_group_problems(script):
     """A registry typo must fail even when the step selects the same unknown group."""
     import types
@@ -3095,6 +3435,126 @@ def registry_group_problems(script):
     return []
 
 
+decision_env = live_text(COVERAGE, re.compile(r"        id: decision\n        env:\n.*?(?=        run:)", re.DOTALL),
+                         "coverage decision environment")
+gate_body = live_text(COVERAGE, re.compile(r"^  coverage:\n.*\Z", re.DOTALL | re.MULTILINE), "coverage gate")
+CASES.extend([
+    ("coverage decision null environment", "coverage-condition", "decision must use the measure expression", [
+        (COVERAGE, decision_env, "        id: decision\n        env: null\n", 1)]),
+    ("coverage gate without steps", "coverage-condition", "decision must use the measure expression", [
+        (COVERAGE, gate_body, gate_body.split("    steps:")[0] + "    steps: []\n", 1)]),
+])
+
+for consumer, block in (
+        ("checkout", "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n" + COVERAGE_MEASURED_LINE),
+        ("download off", COVERAGE_DOWNLOAD_OFF), ("download on", COVERAGE_DOWNLOAD_ON),
+        ("floor off", COVERAGE_OFF_FLOORS_STEP), ("floor on", COVERAGE_ON_FLOORS_STEP)):
+    label = "coverage " + consumer + " without measured guard"
+    rules = ("coverage-condition", "coverage-gate")
+    messages = ("must use the measured guard", "consumer must use the measured guard")
+    if consumer.startswith("download"):
+        rules += ("coverage-gate",)
+        messages += ("coverage gate does not download",)
+    CASES.append((label, rules, messages, [
+        (COVERAGE, block, block.replace(COVERAGE_MEASURED_LINE, ""), 1)]))
+    label = "coverage " + consumer + " with wrong guard"
+    CASES.append((label, ("coverage-condition", "coverage-gate", "ci-feature-jobs"),
+                  ("must use the measured guard", "runs under success()", "coverage step can be bypassed"), [
+        (COVERAGE, block, block.replace(COVERAGE_MEASURED_LINE, "        if: success()\n"), 1)]))
+    label = "coverage " + consumer + " continues on error"
+    CASES.append((label, "ci-feature-jobs", "coverage step can be bypassed", [
+        (COVERAGE, block, block.replace(COVERAGE_MEASURED_LINE,
+         COVERAGE_MEASURED_LINE + "        continue-on-error: true\n"), 1)]))
+
+CASES.append(("coverage unrelated guarded step", ("coverage-gate", "ci-feature-jobs"),
+              ("runs under steps.decision.outputs.measured", "coverage step can be bypassed"), [
+    (COVERAGE, COVERAGE_CANCEL_FINAL,
+     "      - run: echo unrelated\n" + COVERAGE_MEASURED_LINE + COVERAGE_CANCEL_FINAL, 1)]))
+CASES.append(("coverage conditional download", "coverage-gate", "coverage gate does not download", [
+    (COVERAGE, COVERAGE_DOWNLOAD_OFF, COVERAGE_DOWNLOAD_OFF.replace(
+        COVERAGE_MEASURED_LINE, ""), 1)]))
+
+for name, line in (
+        ("measured true output", '          echo "measured=true" >> "$GITHUB_OUTPUT"\n'),
+        ("measured false output", '            echo "measured=false" >> "$GITHUB_OUTPUT"\n'),
+        ("off skipped check", '            test "$OFF" = skipped\n'),
+        ("docs exit", '            exit 0\n'),
+        ("measure true check", '          test "$MEASURE" = true\n')):
+    CASES.append(("coverage decision without " + name, "coverage-gate",
+                  "decision must match the literal template", [(COVERAGE, line, "", 1)]))
+CASES.extend([
+    ("coverage decision extra line", "coverage-gate", "decision must match the literal template", [
+        (COVERAGE, COVERAGE_CANCEL_EARLY, "          echo extra\n" + COVERAGE_CANCEL_EARLY, 1)]),
+    ("coverage decision extra environment", "coverage-gate", "result check reads", [
+        (COVERAGE, decision_env, decision_env + "          EXTRA: value\n", 1)]),
+])
+PASSING.extend([
+    ("coverage measure expression as written passes", []),
+    ("coverage measured guards wrapped passes", [
+        (COVERAGE, COVERAGE_MEASURED_LINE,
+         "        if: ${{ steps.decision.outputs.measured == 'true' }}\n", 5)]),
+])
+MUTATIONS.update({
+    "coverage-template-id": (
+        'first.get("id") != "decision" or first.get("run") != COVERAGE_DECISION_RUN',
+        'first.get("run") != COVERAGE_DECISION_RUN', ["coverage decision without id"]),
+    "coverage-template-run": (
+        'first.get("run") != COVERAGE_DECISION_RUN', 'False',
+        ["coverage decision without measured true output", "coverage decision without measured false output",
+         "coverage decision without off skipped check", "coverage decision without docs exit",
+         "coverage decision without measure true check", "coverage decision extra line"]),
+    "coverage-consumer-condition": (
+        'self.report(workflow, "coverage-condition", "coverage gate checkout, download and floors must use the measured guard")',
+        'pass', ["coverage checkout without measured guard"]),
+    "coverage-consumer-gate": (
+        'self.report(workflow, rule, "coverage gate consumer must use the measured guard")',
+        'pass', ["coverage floor off without measured guard"]),
+    "coverage-classify-checkout": (
+        '("actions/checkout@", "actions/download-artifact@")', '("actions/download-artifact@",)',
+        ["coverage checkout without measured guard"]),
+    "coverage-classify-download": (
+        '("actions/checkout@", "actions/download-artifact@")', '("actions/checkout@",)',
+        ["coverage download off without measured guard"]),
+    "coverage-classify-floor-off": (
+        'for command in (COVERAGE_OFF_FLOORS, COVERAGE_ON_FLOORS)))',
+        'for command in (COVERAGE_ON_FLOORS,)))', ["coverage floor off without measured guard"]),
+    "coverage-classify-floor-on": (
+        'for command in (COVERAGE_OFF_FLOORS, COVERAGE_ON_FLOORS)))',
+        'for command in (COVERAGE_OFF_FLOORS,)))', ["coverage floor on without measured guard"]),
+    "coverage-classify-unrelated": (
+        'return (str(step.get("uses") or "").startswith',
+        'return True or (str(step.get("uses") or "").startswith', ["coverage unrelated guarded step"]),
+    "coverage-gate-guard-value": (
+        'if "if" in step and not (self.coverage_measured_step(step) and self.unwrap_expression(str(step["if"])) == COVERAGE_MEASURED):',
+        'if "if" in step and not self.coverage_measured_step(step):', ["coverage checkout with wrong guard"]),
+    "coverage-download-guard": (
+        'if len(found) != 1 or self.unwrap_expression(str(found[0][1].get("if", ""))) != COVERAGE_MEASURED:',
+        'if len(found) != 1:', ["coverage conditional download"]),
+    "coverage-feature-guard": (
+        'or (self.coverage_measured_step(step) and self.unwrap_expression(str(step["if"])) == COVERAGE_MEASURED))):',
+        'or self.coverage_measured_step(step))):', ["coverage checkout with wrong guard"]),
+    "coverage-measure-unwrap": (
+        'self.unwrap_expression(str((first.get("env") or {}).get("MEASURE", "")))',
+        'str((first.get("env") or {}).get("MEASURE", ""))', ["coverage measure expression as written passes"]),
+    "coverage-measure-expected-unwrap": (
+        '!= self.unwrap_expression(COVERAGE_MEASURE)', '!= COVERAGE_MEASURE',
+        ["coverage measure expression as written passes"]),
+    "coverage-old-gate": (
+        'if gate_condition != COVERAGE_GATE_CONDITION:',
+        'if gate_condition not in (COVERAGE_GATE_CONDITION, COVERAGE_GATE_CONDITION + f" && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"):',
+        ["coverage gate retains docs-only clause"]),
+})
+for name, needle in (
+        ("condition", 'self.unwrap_expression(str(step.get("if", ""))) != COVERAGE_MEASURED:\n                self.report(workflow, "coverage-condition"'),
+        ("consumer", 'self.unwrap_expression(str(step.get("if", ""))) != COVERAGE_MEASURED:\n                self.report(workflow, rule, "coverage gate consumer'),
+        ("gate", 'self.unwrap_expression(str(step["if"])) == COVERAGE_MEASURED):'),
+        ("download", 'self.unwrap_expression(str(found[0][1].get("if", ""))) != COVERAGE_MEASURED:'),
+        ("feature", 'self.unwrap_expression(str(step["if"])) == COVERAGE_MEASURED))):')):
+    MUTATIONS["coverage-unwrap-" + name] = (
+        needle, needle.replace("self.unwrap_expression(", "str(", 1),
+        ["coverage measured guards wrapped passes"])
+
+
 def copy_tree(destination):
     shutil.copytree(ROOT / ".github", destination / ".github")
     shutil.copy2(ROOT / "rust-toolchain.toml", destination / "rust-toolchain.toml")
@@ -3115,6 +3575,8 @@ def run_check(root, script=SCRIPT):
 def entry_problems(root, label, script=SCRIPT):
     """Copies the tree to root, applies the edits of the CASES or PASSING
     entry with this label, runs script and returns its problems."""
+    if label in EVIDENCE_INHERITED:
+        return evidence_inherited_problems(script, label)
     if label in CHANGELOG_VARIANTS:
         return changelog_group(label, script)
     if label == "S28 unknown registry group rejected":
@@ -3281,6 +3743,11 @@ def case_problems(output, case):
     """
     _, rule, fragment, _, *count = case
     problems = []
+    if case[1] == "publish-release-evidence":
+        other = [line for line in output.splitlines() if re.match(r"^.+: [a-z][a-z-]*: ", line)
+                 and ": publish-release-evidence: " not in line]
+        if other:
+            problems.append(f"evidence case fails another rule: {other}")
     missing = first_unmatched(output, expectations(rule, fragment))
     if missing is not None:
         problems.append(f"no {missing[0]} violation with {missing[1]!r} reported in order: {output.strip()}")
@@ -3292,7 +3759,6 @@ def case_problems(output, case):
 
 def coverage_behavior():
     """Evaluate the actual expressions against an independent event table."""
-    import itertools
     import yaml
     doc = yaml.safe_load((ROOT / COVERAGE).read_text())
     problems = []
@@ -3339,18 +3805,63 @@ def coverage_behavior():
         for job_id, title in (("changes", "changes"), ("coverage-off", "coverage (feature-off)"),
                               ("coverage-on", "coverage (feature-on)"), ("coverage", "coverage")):
             job = doc["jobs"][job_id]
-            expected = eligible if job_id == "changes" else measure and (job_id == "coverage" or not cancelled)
+            expected = eligible if job_id in ("changes", "coverage") else measure and not cancelled
             if bool(evaluate(job["if"], values, cancelled)) != expected:
                 problems.append(f"{job_id}: eligibility/measurement differs: {values}, cancelled={cancelled}")
             if render(job["name"], values, cancelled) != title + ("" if eligible else " (ignored event)"):
                 problems.append(f"{job_id}: ignored name differs: {values}")
+        decision = doc["jobs"]["coverage"]["steps"][0]
+        if eligible and bool(evaluate(decision["env"]["MEASURE"], values, cancelled)) != measure:
+            problems.append(f"coverage decision measurement differs: {values}")
         group = "refs/pull/1/merge" if event == "pull_request" and eligible else "123"
         if render(doc["concurrency"]["group"], values, cancelled) != "Coverage-" + group:
             problems.append(f"coverage concurrency differs: {values}")
     return problems
 
 
+def coverage_decision(case=None):
+    """Run the actual decision shell with every result tuple, without actions."""
+    step = yaml.safe_load((ROOT / COVERAGE).read_text())["jobs"]["coverage"]["steps"][0]
+    problems = []
+    modes = {"docs": "false", "measured": "true", "invalid": "unexpected"}
+    for label, measure in modes.items():
+        if case and case != label:
+            continue
+        for changes, off, on in itertools.product(("success", "skipped", "failure", "cancelled", ""), repeat=3):
+            with tempfile.NamedTemporaryFile() as output:
+                result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", step["run"]],
+                    env={**os.environ, "MEASURE": measure, "CHANGES": changes, "OFF": off, "ON": on,
+                         "GITHUB_OUTPUT": output.name}, capture_output=True, text=True, check=False)
+                measured_output = output.read().decode()
+            wanted = "skipped" if label == "docs" else "success"
+            success = label != "invalid" and changes == "success" and off == on == wanted
+            identity = f"decision-{label} {changes}/{off}/{on}"
+            if (result.returncode == 0) != success:
+                problems.append(f"{identity}: exit {result.returncode}, expected success={success}")
+            if success:
+                message = ("The change is docs-only; nothing was measured.\n" if label == "docs"
+                           else "feature-off: success, feature-on: success\n")
+                if result.stdout != message or measured_output != f"measured={measure}\n":
+                    problems.append(f"{identity}: log/output differs: {result.stdout!r}, {measured_output!r}")
+            elif measured_output:
+                problems.append(f"{identity}: failed decision emitted measured output")
+    return problems
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--decision-case":
+        if sys.argv[2] not in ("docs", "measured", "invalid"):
+            print("unknown decision case", file=sys.stderr)
+            return 2
+        problems = coverage_decision(sys.argv[2])
+        for problem in problems:
+            print(problem)
+        return int(bool(problems))
+    if sys.argv[1:] == ["--coverage-behavior"]:
+        problems = coverage_behavior()
+        for problem in problems[:10]:
+            print(problem)
+        return int(bool(problems))
     selected = None
     if len(sys.argv) == 3 and sys.argv[1] == '--case':
         selected = sys.argv[2]
@@ -3359,7 +3870,7 @@ def main():
             return 2
     elif len(sys.argv) != 1:
         return 2
-    failures = coverage_behavior()
+    failures = [] if selected else coverage_behavior() + coverage_decision()
     for label, output, exact_count, expected in COUNT_CASES:
         problem = violation_count_problem(output, exact_count)
         if problem != expected:

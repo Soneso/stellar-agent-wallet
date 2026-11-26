@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Verify the version line, feature marker, and absence of test overrides.
 set -euo pipefail
-if [ "$#" -ne 2 ] || { [ "$2" != on ] && [ "$2" != off ]; }; then
-  echo 'usage: check-binary-marker.sh <binary> <on|off>' >&2
+if [ "$#" -ne 3 ] || { [ "$2" != on ] && [ "$2" != off ]; }; then
+  echo 'usage: check-binary-marker.sh <binary> <on|off> <expected-line-1>' >&2
   exit 2
 fi
 binary=$1
@@ -11,6 +11,11 @@ opposite=on
 [ "$expected" != on ] || opposite=off
 prefix=STELLAR_AGENT_BUILD_MAINNET_WRITE=
 version=$("$binary" --version)
+line1=$(printf '%s\n' "$version" | sed -n '1p')
+if [ "${line1%$'\r'}" != "$3" ]; then
+  echo "marker: version line 1 differs from $3" >&2
+  exit 1
+fi
 line=$(printf '%s\n' "$version" | sed -n '2p' | tr -d '\r')
 if [ "$line" != "$prefix$expected" ]; then
   echo "marker: version line 2 differs from $prefix$expected" >&2

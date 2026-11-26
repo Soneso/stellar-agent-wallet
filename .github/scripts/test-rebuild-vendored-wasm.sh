@@ -13,6 +13,10 @@
 # system configuration and commits with a placeholder identity, and
 # CARGO_HOME is an empty scratch directory.
 set -euo pipefail
+if [ "$#" -ne 0 ]; then
+  echo 'usage: test-rebuild-vendored-wasm.sh (no arguments)' >&2
+  exit 2
+fi
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd -P)
 SCRIPT="$ROOT/.github/scripts/rebuild-vendored-wasm.sh"
@@ -1019,7 +1023,7 @@ gate_fails() {
   expect_rc 1 "gate '$1' '$2' '$3' '$4' '$5' '$6'"
   expect_out "gate FAIL" "gate '$1' '$2' '$3' '$4' '$5' '$6'"
 }
-for ref_type in branch tag publication ""; do
+for ref_type in branch tag ""; do
   for value in failure cancelled; do
     gate_fails "$value" true success success success "$ref_type"
     gate_fails "$value" false skipped skipped skipped "$ref_type"
@@ -1044,19 +1048,18 @@ done
 gate_fails success false skipped skipped skipped tag
 expect_out "gate FAIL: a tag run must rebuild the vendored Wasm files" "gate tag rebuild false"
 gate_fails success false skipped skipped skipped publication
-expect_out "gate FAIL: a publication run must rebuild the vendored Wasm files" "gate publication rebuild false"
-gate success true success success success publication
-expect_rc 0 "gate publication rebuild true"
-expect_out "gate PASS: the vendored Wasm files were rebuilt and matched" "gate publication rebuild true"
+expect_out "gate FAIL: the ref type is 'publication', not branch, tag, or empty" "gate publication rebuild false"
+gate_fails success true success success success publication
+expect_out "gate FAIL: the ref type is 'publication', not branch, tag, or empty" "gate publication rebuild true"
 gate_fails success true success success success pull_request
-expect_out "gate FAIL: the ref type is 'pull_request', not branch, tag, publication, or empty" "gate unknown ref type"
+expect_out "gate FAIL: the ref type is 'pull_request', not branch, tag, or empty" "gate unknown ref type"
 gate success true success success success
 expect_rc 2 "gate with five arguments"
 expect_out "usage:" "gate with five arguments"
 gate success true success success success tag extra
 expect_rc 2 "gate with seven arguments"
 expect_out "usage:" "gate with seven arguments"
-pass "19 --gate passes only the two passing combinations, and on a tag or publication run only the rebuild; every failure, cancelled, or skipped input elsewhere, an empty rebuild, an unknown ref type, and a wrong argument count fail"
+pass "19 --gate passes only the two passing combinations, and on a tag run only the rebuild; every failure, cancelled, or skipped input elsewhere, an empty rebuild, an unknown ref type, and a wrong argument count fail"
 
 # 20. --exec refuses before running the command, and runs a passing command in
 # its directory under the allowlist.

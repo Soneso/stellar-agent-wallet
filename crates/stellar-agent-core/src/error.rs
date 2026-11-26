@@ -2890,17 +2890,17 @@ pub enum NetworkError {
         waited_secs: u64,
     },
 
-    /// Friendbot refuses to fund an account at or above the Friendbot starting balance.
+    /// Friendbot reports that the account is already funded or already exists.
     ///
-    /// Friendbot creates a missing account and pays an existing account whose
-    /// balance is below the starting balance. At or above that balance, it
-    /// answers HTTP 400 with an "account already funded" detail.
-    /// The account is usable as it is; no funding transaction is sent.
+    /// HTTP 400 carries `already funded` for an account at or above the
+    /// starting balance, or `createAccountAlreadyExist` for an account created
+    /// by an earlier attempt. Both tokens match without regard to ASCII case.
+    /// The account is usable; check its balance before continuing.
     ///
     /// `account_id` holds the public account ID (`G…`), shown in full for
     /// operator auditability, matching [`NetworkError::AccountNotFound`].
     #[error(
-        "account '{account_id}' already holds the Friendbot starting balance; Friendbot funds only an account below it"
+        "account '{account_id}' is already funded or was created by an earlier Friendbot attempt; check its balance before continuing"
     )]
     FriendbotAccountAlreadyFunded {
         /// The public account ID (`G…`) Friendbot refused to fund.
@@ -6817,7 +6817,7 @@ mod tests {
         assert_eq!(err.code(), "network.friendbot_account_already_funded");
         assert_eq!(
             err.message(),
-            "account 'GABCDEFGHIJKLMNOPQR' already holds the Friendbot starting balance; Friendbot funds only an account below it"
+            "account 'GABCDEFGHIJKLMNOPQR' is already funded or was created by an earlier Friendbot attempt; check its balance before continuing"
         );
     }
 

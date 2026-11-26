@@ -146,6 +146,7 @@ self-test:test-compare-crate-sums.py	python3 .github/scripts/test-compare-crate-
 self-test:test-preflight.sh	bash .github/scripts/test-preflight.sh	-	install-surface.yml	install-surface	Self-test the preflight
 self-test:test-publish-crates-check.sh	.github/scripts/test-publish-crates-check.sh	cargo	ci.yml	release-contracts	Self-test the publish tier check
 self-test:test-publish-crates-verify.sh	bash .github/scripts/test-publish-crates-verify.sh	cargo	ci.yml	release-contracts	Self-test the publish verification
+self-test:test-publish-release-evidence.py	python3 .github/scripts/test-publish-release-evidence.py --mutations	jq	ci.yml	release-contracts	Self-test the publish release evidence
 self-test:test-rebuild-vendored-wasm.sh	bash .github/scripts/test-rebuild-vendored-wasm.sh	shasum	vendored-wasm.yml	check	Self-test (bash 5, GNU tools)
 self-test:test-run-testnet-acceptance.sh	bash .github/scripts/test-run-testnet-acceptance.sh	-	ci.yml	release-contracts	Self-test the testnet acceptance driver
 self-test:test-sync-labels.py	python3 .github/scripts/test-sync-labels.py	yaml	ci.yml	release-contracts	Self-test the workflow structure and the label sync
@@ -365,7 +366,7 @@ select_self_tests() {
       select_gate self-test:test-publish-crates-verify.sh
       ;;
     .github/scripts/rebuild-vendored-wasm.sh) select_gate self-test:test-rebuild-vendored-wasm.sh ;;
-    .github/scripts/run-testnet-acceptance.sh) select_gate self-test:test-run-testnet-acceptance.sh ;;
+    .github/scripts/run-testnet-acceptance.sh | .github/scripts/check-payment-evidence.py) select_gate self-test:test-run-testnet-acceptance.sh ;;
     .github/scripts/sync-labels.py | .github/labels.yml | .github/workflows/labels.yml)
       select_gate self-test:test-sync-labels.py
       ;;
@@ -409,9 +410,12 @@ select_for_path() {
   esac
   case "$path" in
     .github/scripts/check-binary-marker.sh) select_gate self-test:test-check-binary-marker.sh; select_gate self-test:test-release-checks.sh ;;
-    .github/scripts/check-packaged-markers.sh | .github/scripts/release/verify-*.sh | .github/scripts/release/sodium.sh) select_gate self-test:test-release-checks.sh ;;
+    .github/scripts/check-packaged-markers.sh | .github/scripts/release/check-host.sh | .github/scripts/release/verify-*.sh | .github/scripts/release/sodium.sh) select_gate self-test:test-release-checks.sh ;;
     .github/scripts/check-provenance.py | .github/scripts/fixtures/*) select_gate self-test:test-check-provenance.py ;;
     .github/scripts/proof-matrix.toml | .github/scripts/check-proof-matrix.py) select_gate proof-matrix; select_gate proof-matrix:feature-on ;;
+  esac
+  case "$path" in
+    .github/workflows/publish.yml | .github/scripts/check-provenance.py | .github/scripts/fixtures/SHA256SUMS | .github/scripts/fixtures/stellar-agent-0.1.0-alpha.12.intoto.jsonl) select_gate self-test:test-publish-release-evidence.py ;;
   esac
   case "$path" in
     .github/workflows/*.yml | .github/workflows/*.yaml | .github/actions/* | .github/labels.yml) select_gate actionlint ;;

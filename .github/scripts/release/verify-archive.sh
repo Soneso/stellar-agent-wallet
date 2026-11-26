@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Executes the two binaries from the exact archive that will be distributed.
 # Before anything runs, both names must be regular files with one link each,
-# not symbolic links, and must hold equal bytes. The marker check then runs
+# not symbolic links, and must hold equal bytes. The name, version, and marker check runs
 # under each name.
 #
 # Usage: verify-archive.sh <archive-dir> <version> <target> <on|off>
@@ -41,5 +41,5 @@ if ! cmp -s "$unpack/$stem/stellar-agent$suffix" "$unpack/$stem/stellar-agent-mc
   exit 1
 fi
 for binary in stellar-agent stellar-agent-mcp; do
-  bash .github/scripts/check-binary-marker.sh "$unpack/$stem/$binary$suffix" "$expected"
+  bash .github/scripts/check-binary-marker.sh "$unpack/$stem/$binary$suffix" "$expected" "$binary $version"
 done

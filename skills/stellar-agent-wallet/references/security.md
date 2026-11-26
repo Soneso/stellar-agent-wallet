@@ -63,6 +63,10 @@ describe an attempted reset that did not take effect.
 
 ## Quick rules for an agent
 
+- Guard against address poisoning: an attacker can send a small payment from a
+  look-alike address so it appears in your account history. Select the destination
+  from a trusted record. Never copy destinations from recent account history.
+  Compare the whole address with the trusted record before sending.
 - Branch on the result envelope and wire codes. Never re-issue a refused commit
   with an altered amount, asset, or destination to "get around" a deny.
 - A `policy.approval_required` or `RequireApproval` outcome means a human operator

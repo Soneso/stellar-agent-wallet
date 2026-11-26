@@ -34,8 +34,11 @@ submission checks. See
 - Transport: MCP JSON-RPC over stdio. The client spawns the binary as a
   subprocess and exchanges newline-delimited JSON-RPC on the subprocess
   stdin/stdout.
-- Protocol version: `2024-11-05`. Declared capabilities: `tools` and
-  `resources`.
+- Protocol version: the server answers `initialize` with the requested version
+  when it is `2024-11-05`, `2025-03-26`, `2025-06-18`, or `2025-11-25`.
+  For a version it does not know, it answers with `2024-11-05`.
+  The `2026-07-28` revision is not supported. Declared capabilities: `tools`
+  and `resources`.
 - Server identity reported at initialize: name `stellar-agent-mcp`, version
   equal to the crate's package version.
 
@@ -349,6 +352,10 @@ not know. A line before it that is not a JSON-RPC message, or one over the line
 limit, gets its `-32700` answer, and the server keeps waiting for
 `initialize`. A line before it that is not a JSON-RPC message and holds a
 `method` the server does not know and no `id` is skipped without an answer.
+
+A first request other than `initialize` or `ping`, such as `server/discover`
+from the `2026-07-28` specification, gets no answer; restart the server and
+open the session with `initialize`.
 
 List the tools and the resources, and read one resource:
 
@@ -1000,7 +1007,7 @@ envelope.
 | `stellar_claim` | Simulate claiming a claimable balance by ID: fetch the entry, run the claimant / predicate / trustline guards, render the typed preview, mint a single-use nonce. | No signing; no submission. Not annotated read-only (mints the single-use nonce the commit step consumes). |
 | `stellar_claim_commit` | Recheck record, witness, sign, submit. A mainnet commit of an intent stored under `business_id` rebuilds the envelope from that intent without the nonce. | Signs and submits. Two-phase verb; approval spine. |
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances for an account. | Read-only. |
-| `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
+| `stellar_friendbot` | Fund a testnet account via Friendbot. HTTP 400 containing `already funded` or `createAccountAlreadyExist`, ignoring ASCII case, returns `network.friendbot_account_already_funded`. Check the balance of an account created by an earlier attempt. | Mutating, testnet-only; gated. |
 | `stellar_transaction_status` | Reconcile one submitted transaction against the chain and update the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. The way out of `submission.tx_timeout`. A reported failure or missing transaction does not release possible spending. Reports `record.release_code` for an accounting disposition such as `submission.accounting_expired`, `record.settlement_evidence: "unavailable"` with an optional `record.settlement_decision_id`, and `reservation` for a hold that remains. On a mainnet profile an authenticated classic attempt reports cached recovery evidence or `UNKNOWN` and sends no additional lookup. For an unmanaged record the primary's `FAILED` and `NOT_FOUND` decide nothing alone; the oracle the enablement binds is asked as well. On mainnet the call reconciles only with the startup enablement record and a fresh check of it, which refuses with `network.mainnet_write_forbidden`; without a record it answers from the stored state and the primary's lookup. | Reads the chain and writes the wallet's record; moves no value and never sends. Not annotated read-only. |
 
 `stellar_claim_commit` witnesses the source account and complete fresh

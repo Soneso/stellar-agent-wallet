@@ -11,7 +11,9 @@ generator's generic one. Its environment is an object with exactly the 15
 keys in ENVIRONMENT_KEYS. The github_sha1, github_ref and
 github_repository_owner values match the commit, ref and repository owner
 arguments; github_ref_type is tag and github_event_name is push. Other
-environment values vary per run and are not compared. Its parameters hold
+environment values vary per run. Optional --run-id and --run-attempt bind
+github_run_id to the selected run and cap github_run_attempt at its latest
+attempt. Its parameters hold
 only the vars context, a mapping of names to string values.
 The release workflow, the workflows it calls and its local actions
 never read that context, which check-workflow-invariants.py enforces.
@@ -69,7 +71,7 @@ def check_environment(environment, sha, repository, ref):
             raise ValueError(f'invocation.environment {key} differs')
 
 
-def check(document, sums, sha, repository, ref):
+def check(document, sums, sha, repository, ref, run_id=None, run_attempt=None):
     envelope = document.get('dsseEnvelope') if isinstance(document, dict) else None
     if not isinstance(envelope, dict):
         raise ValueError('not a Sigstore bundle with a DSSE envelope')
@@ -85,6 +87,15 @@ def check(document, sums, sha, repository, ref):
         raise ValueError('buildType differs')
     check_parameters(predicate['invocation'].get('parameters'))
     check_environment(predicate['invocation'].get('environment'), sha, repository, ref)
+    if run_id is not None or run_attempt is not None:
+        environment = predicate['invocation']['environment']
+        values = (run_id, run_attempt, environment['github_run_id'], environment['github_run_attempt'])
+        if not all(isinstance(value, str) and re.fullmatch(r'[1-9][0-9]*', value) for value in values):
+            raise ValueError('run binding needs positive decimal strings')
+        if environment['github_run_id'] != run_id:
+            raise ValueError('provenance run ID differs')
+        if int(environment['github_run_attempt']) > int(run_attempt):
+            raise ValueError('provenance run attempt exceeds latest attempt')
     source = predicate['invocation']['configSource']
     if source['entryPoint'] != '.github/workflows/release.yml':
         raise ValueError('entry point differs')
@@ -114,10 +125,12 @@ def main():
     parser.add_argument('sha')
     parser.add_argument('repository', help='owner/name, as GITHUB_REPOSITORY holds it')
     parser.add_argument('ref', help='the tag ref, as GITHUB_REF holds it')
+    parser.add_argument('--run-id')
+    parser.add_argument('--run-attempt')
     args = parser.parse_args()
     try:
         check(json.loads(args.bundle.read_text()), args.sums.read_text(), args.sha,
-              args.repository, args.ref)
+              args.repository, args.ref, args.run_id, args.run_attempt)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f'provenance: {error}', file=sys.stderr)
         return 1

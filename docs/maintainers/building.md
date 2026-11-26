@@ -247,8 +247,10 @@ runs the complete local registry, including coverage.
 
 CI runs the offline gates on every pull request to `main` or
 `next`. Pull-request
-coverage runs automatically on every pull request into `main` and every code
-pull request into `next`. The `coverage` label adds a run on a docs-only pull request.
+coverage measures automatically on eligible events for every pull request into
+`main` and every code pull request into `next`. The required `coverage` job runs
+on every eligible event and passes docs-only changes into `next` without
+measuring; the `coverage` label requires measurement on a docs-only pull request.
 Live acceptance uses its separate workflow. A pull request into `next` that changes only documentation,
 as `.github/scripts/classify-docs-only.py` decides, skips the `ci.yml` build
 and test jobs and runs `docs-tests`: the tests that `.github/docs-tests.tsv`
@@ -269,8 +271,9 @@ arrives as a macro argument, a proc macro that reads a documentation file, or
 an embedding crate that takes a directory; review such code by hand.
 The full suite still covers them: every pull request into `main` and push to
 `main` runs the full `ci.yml` suite and coverage. A push to `next` skips the
-full build and test jobs and coverage only for a proven documentation-only
-change; CI still runs the documentation tests. Failed or uncertain coverage
+full build and test jobs and coverage measurement only for a proven
+documentation-only change; CI still runs the documentation tests and the
+required `coverage` job passes without measuring. Failed or uncertain coverage
 classification measures the change.
 A pull request retargeted to `main` runs coverage immediately. The full CI set
 and install surface rerun after a new push or a reopen, producing the required
@@ -437,9 +440,9 @@ gate except `shellcheck-changed`, which needs a changed shell script.
 4. Three self-tests, each on a change to itself or to a file in its list:
    - `test-check-binary-marker.sh`: `check-binary-marker.sh`
    - `test-release-checks.sh`: `check-binary-marker.sh`,
-     `check-packaged-markers.sh`, `release/verify-*.sh`, or `release/sodium.sh`.
-     It also tests `release/check-host.sh` and `derive-alias.sh`; a change to
-     those selects it only under `--full`.
+     `check-packaged-markers.sh`, `release/verify-*.sh`, `release/check-host.sh`,
+     or `release/sodium.sh`. It also tests `derive-alias.sh`; a change to
+     that script selects it only under `--full`.
    - `test-check-provenance.py`: `check-provenance.py` or a provenance fixture
 5. `workflow-invariants`: a change to `rust-toolchain.toml`,
    any `.yml` or `.yaml` file under `.github/workflows/`, or any file under
@@ -473,8 +476,13 @@ gate except `shellcheck-changed`, which needs a changed shell script.
    - `test-preflight.sh`: `preflight.sh`
    - `test-publish-crates-check.sh`: `publish-crates.sh`
    - `test-publish-crates-verify.sh`: `publish-crates.sh`
+   - `test-publish-release-evidence.py`: `.github/workflows/publish.yml`,
+     `check-provenance.py`, `fixtures/SHA256SUMS`, or the provenance fixture
+     in `fixtures/`. Its registry row requires `jq`; CI and preflight each run
+     it in its own step.
    - `test-rebuild-vendored-wasm.sh`: `rebuild-vendored-wasm.sh`
-   - `test-run-testnet-acceptance.sh`: `run-testnet-acceptance.sh`
+   - `test-run-testnet-acceptance.sh`: `run-testnet-acceptance.sh` or
+     `check-payment-evidence.py`
    - `test-sync-labels.py`: `sync-labels.py`, `.github/labels.yml`, or
      `.github/workflows/labels.yml`
    - `test-take-workflow.py`: `.github/workflows/take.yml`
@@ -518,15 +526,17 @@ gate except `shellcheck-changed`, which needs a changed shell script.
     also runs on a change under `crates/stellar-agent-webauthn-bridge/src/web/`.
 20. `interop:mpp` and `interop:sdk-v17`: `--full` only.
 
-`package-skill.sh`, `release-preflight-version-check.sh`, `run-docs-tests.py`,
-and `check-payment-evidence.py` have no self-test.
+`package-skill.sh`, `release-preflight-version-check.sh`, and
+`run-docs-tests.py` have no self-test.
 The preflight runs the workflow checks with `python3`, which needs PyYAML importable, for example from
 the `.venv` virtual environment of the PyYAML install command.
 
 The preflight does not carry these CI checks: the `windows-storage` and
 `platform-keyring` jobs, the `stellar-agent-test-support` feature matrix of the
 `test` job, the setup steps, and the virtual environment of the workflow checks.
-It also omits the integration changelog guard of `changelog.yml`, the
+It also omits the integration changelog guard of `changelog.yml`, which
+protects `CHANGELOG.md`, existing unreleased fragments, and the fragment README.
+Other omissions include the
 measurement and cancellation checks of the `coverage` job, and the Python 3.11
 repeat of the Python self-tests, or the CI self-test selector step. Nor does it carry the
 rebuild of the `vendored-wasm` workflow: its two stellar-cli build jobs, its
@@ -609,31 +619,38 @@ current offline coverage. The aspirational target for new code is 90% per
 crate. Coverage measures feature-off and feature-on independently. Two
 parallel report-only checks, `coverage (feature-off)` and
 `coverage (feature-on)`, each write one report. The required check `coverage`
-checks both job results and enforces both floors on the reports of the same
-run. Each run resets its instrumentation data, writes a separate report and
-uses the selected configuration's floors. Live tiers that attempt RPC and
+checks both job results and, when measurement is required, enforces both floors
+on the reports of the same run. Each measuring run resets its instrumentation
+data, writes a separate report and uses the selected configuration's floors.
+Live tiers that attempt RPC and
 Friendbot access remain disabled.
 
-CI runs this gate automatically on every pull request into `main` and every
-code pull request into `next`. A proven docs-only pull request into `next`
-skips measurement unless it carries the `coverage` label. Pushes to `main`
-always measure; pushes to `next` skip only proven docs-only changes. Measuring
+CI runs the required `coverage` job on every eligible event. A job skipped by
+its `if` reports under its unevaluated name, so the required job must run to
+report as `coverage`. A proven docs-only pull request into `next` passes without
+measuring unless it carries the `coverage` label. The decision requires
+successful classification and both measuring jobs skipped; only a measured run
+checks out source, downloads reports and enforces floors. Pushes to `main`
+always measure; pushes to `next` skip measurement only for proven docs-only
+changes and pass `coverage` without measuring. Measuring
 pushes seed the coverage caches. The gate also runs weekly on main and on demand
-through `workflow_dispatch`. A failed, canceled, or skipped measurement fails
-`coverage`. A red coverage push on `next` blocks integration through the required
+through `workflow_dispatch`. A failed, canceled, or unexpectedly skipped
+measurement fails `coverage`. A red coverage push on `next` blocks integration through the required
 coverage run on the pull request into `main`, which measures the tree it brings.
 Local reproduction is optional.
 
 Opening, pushing to, or reopening a pull request evaluates coverage. Adding the
 `coverage` label or changing the base also evaluates it. Removing a label starts
 no run. Other label additions and edits measure nothing, use their own
-concurrency group, and suffix every job name with ` (ignored event)` so they
-cannot replace required checks. Eligible pull request runs cancel their
+concurrency group, and skip all jobs under their unevaluated name templates,
+which match no required check. The name expressions select ` (ignored event)`
+for those events. Eligible pull request runs cancel their
 predecessors; push, schedule, and dispatch runs each have their own group.
 
-Each report artifact carries the run attempt in its name, so `coverage` reads
-only the reports of its own attempt. A rerun of the gate alone, or of one
-measurement job, finds no report of its attempt and fails. After a failed
+Each report artifact carries the run attempt in its name, so a measuring
+`coverage` run reads only the reports of its own attempt. When measurement is
+required, a rerun of the gate alone or of one measurement job finds no report of
+its attempt and fails. After a failed
 download, a maintainer reruns all jobs.
 
 Rust caches in `ci.yml` and `coverage.yml` save on push runs only. A pull
@@ -859,9 +876,10 @@ crates, so a test build of `stellar-agent-smart-account` alone compiles none
 of them.
 
 These tests require network reachability to testnet RPC and Friendbot. Testnet is
-the default network; Friendbot funding is testnet-only. Live acceptance runs
-with `mainnet-write` off by default: the runner passes `--no-default-features`
-to every suite. With `MAINNET_WRITE=on`, each suite of a crate that declares a
+the default network; Friendbot funding is testnet-only. The local driver defaults
+to `MAINNET_WRITE=off`; workflow dispatch defaults to `mainnet_write=true`.
+The driver passes `--no-default-features` to every suite.
+With `MAINNET_WRITE=on`, each suite of a crate that declares a
 `mainnet-write` feature also enables that feature, which is the build the
 binaries ship by default. A crate without the feature builds as with
 `MAINNET_WRITE=off`. Any other value fails the run before the first suite.
@@ -916,9 +934,39 @@ job runs it with a 30-minute job timeout. The budget covers the signer-set
 baseline self-test, workflow invariant cases and mutation controls, and the
 other release contract checks.
 
-Each result line carries the wall seconds of the attempt that produced the
-result. A retried suite also carries the seconds of all its attempts, as in
-`pass (retry, 412 s, 830 s total)`. Console and workflow summary headers name
+Before the first suite, each share builds the isolated CLI, even when its
+selection contains no smart-account CLI test. A failed build stops the share
+before any suite. The feature-off command is:
+
+```bash
+cargo build --locked --release -p stellar-agent-cli --bin stellar-agent \
+  --no-default-features --features test-helpers \
+  --features stellar-agent-network/test-helpers
+```
+
+The on state replaces `test-helpers` in the first feature argument with
+`mainnet-write,test-helpers`. Dependency helpers isolate keyring and storage
+paths as in the CLI child tests. Product features and release builds keep
+their definitions. The five caps, list-rules, and horizon CLI tests fail
+before network access if the binary is missing, unreadable, or lacks isolation.
+Each child uses a marked `StateSandbox` through `cli_child::cli_command`.
+
+A first failed attempt keeps the suite and share failed. Ordinary test
+failures get one diagnostic retry after 60 seconds; browser suites can get
+a third attempt after 90 seconds. A build error, zero-test pass, or record setup
+failure gets no retry.
+Each attempt retains `<suite>.attempt-<n>.log` and
+`<suite>.attempt-<n>.status` under `target/tmp/testnet-attempts/`.
+Output streams live to the job log. A `.metrics` sidecar retains elapsed seconds
+and the skip count across the logging pipeline. A directory or record reservation
+failure fails the share with its own note in the summary.
+`TESTNET_ATTEMPT_DIR` overrides that directory. Existing records are never
+replaced or deleted; another invocation continues the numbering.
+The summary lists every attempt status for each suite whose first attempt failed.
+
+Each result line carries the wall seconds of the last attempt.
+A retried suite also carries the seconds of all its attempts.
+Console and workflow summary headers name
 the share, selected suite count and build, `mainnet-write off` or `mainnet-write on`.
 The summary closes with the leg's wall time. In a workflow run the step summary table has a `seconds`
 column with each suite's seconds across its attempts.
@@ -927,18 +975,33 @@ The same script backs the `Testnet acceptance` workflow
 (`.github/workflows/testnet.yml`), which runs on manual dispatch and on a
 weekly schedule; it is deliberately not part of per-push CI. A dispatch takes
 an optional suite filter input, a `keyring` choice of `headless` (the default)
-or `platform` for native-capable suites, and the boolean `mainnet_write` input, which
-runs every suite against the build with `mainnet-write` on. A scheduled run
-builds with `mainnet-write` off.
+or `platform` for native-capable suites, and the boolean `mainnet_write` input,
+which defaults to `true`. The boolean `full_run` defaults to `false` and controls
+continuation after failure; it never changes the selection.
+
+The checkout-free `config` job chooses the feature state once.
+A schedule computes `floor((epoch_seconds - 345600) / 604800)` at job start:
+even weeks use on, odd weeks use off. Weeks begin Monday at 00:00 UTC.
+Rerunning failed jobs retains the config output; a full rerun within the same
+Monday-to-Sunday week computes the same state.
 
 The workflow chains `acceptance-1` with `SHARE=1/2` and `acceptance-2` with
 `SHARE=2/2`. Each job has a 360-minute limit. The second job waits for the first
-and runs after failure unless the workflow is canceled. Both jobs honor
-`TESTNET_SCHEDULE=off` on scheduled events. Workflow concurrency serializes runs,
+and requires successful config and either successful share 1, or failed share 1
+with `full_run=true`. A canceled workflow never starts share 2.
+Scheduled jobs require `refs/heads/main` and honor `TESTNET_SCHEDULE=off`.
+Manual dispatch bypasses the schedule switch. Workflow concurrency serializes runs,
 and each driver serializes its selected suites. Both jobs use the filter,
 build selection, browser setup, and secondary RPC environment. Each job then
-checks its payment evidence with `check-payment-evidence.py` and uploads it as
-an artifact, also after a failed run.
+checks its payment evidence with `check-payment-evidence.py`.
+Both jobs explicitly check out `github.sha` and verify HEAD before the driver.
+Every evidence row must match that revision and the config feature state.
+The checker requires all selected payment tests, including the full filtered
+registry when live execution has no share. Local fixture selection stays separate.
+Every outcome uploads evidence and attempt records; artifact names include
+the feature state and `github.run_attempt`.
+Both shares keep the cache prefix `testnet` and share `testnet-on` or
+`testnet-off` through the config output. No artifacts transfer between shares.
 
 The browser suites need a Chromium binary on `PATH` (or the `CHROME` env var).
 Among them, the mainnet consent browser suite
@@ -1094,7 +1157,7 @@ The `vendored-wasm` workflow (`.github/workflows/vendored-wasm.yml`) runs
 `.github/scripts/rebuild-vendored-wasm.sh`, which holds the manifest of
 rebuildable files, the exception list, and every pinned version. Tag runs
 happen inside the release through its local reusable workflow call. Crate
-publication calls it for the verified commit of the tag.
+publication verifies that Release run's evidence for the tag and commit.
 
 - The tree check runs on pull requests to `main`, pushes to `main`, tags, crate
   publication, twice a week, and on dispatch. It fails unless every tracked Wasm file is a
@@ -1130,8 +1193,8 @@ publication calls it for the verified commit of the tag.
   or the workflow, and on every tag, scheduled, or dispatched run, two macOS
   jobs provide the pinned stellar-cli binaries. The stellar-cli caches restore
   on pull request, `main`, scheduled, and dispatched runs. Only push and
-  schedule runs save missing entries. A tag or crate
-  publication run builds both binaries from source. Each job packs its install
+  schedule runs save missing entries. A tag run builds both binaries from
+  source. Each job packs its install
   root as a tar artifact to preserve executable permissions. The `rebuild` job
   reads those artifacts from the same run and uses no cache. It rebuilds every
   manifest file from its pinned source with its pinned toolchain and fails
@@ -1150,10 +1213,32 @@ publication calls it for the verified commit of the tag.
   file. An exception is a vendored file that no pinned source rebuilds; the
   tree check holds its bytes at one frozen digest.
 
-The `vendored-wasm` job reads every job result. On a tag or crate publication
-run it passes only after a rebuild. Apple signing and notarization, hashing,
+The `vendored-wasm` job reads every job result. On a tag run it passes only
+after a rebuild. Apple signing and notarization, hashing,
 cosign signing, provenance, and publication wait for the rebuild of the tagged
-commit. Crate publication waits for the rebuild of the verified commit.
+commit. Crate publication checks that run's latest successful attempt,
+published signatures, provenance bound to the run, tag and commit, and the
+tagged tree offline. Its `release-evidence` job compiles nothing and runs
+even with `verify_only=true`.
+
+The `publish-release-evidence` invariant accepts that job's steps only when they
+equal `PUBLISH_EVIDENCE_TEMPLATE` in `.github/scripts/check-workflow-invariants.py`.
+The count, order, keys, and values must match exactly.
+Run blocks split on newline characters, trim spaces and tabs, and drop empty
+lines. Carriage returns, Unicode line separators, and no-break spaces differ
+from the template. Comments remain part of the comparison.
+Any other step, key, environment entry, comment, or run line fails.
+The report names the first differing step and field.
+Change the job and its template in the same commit.
+Job settings and credential expressions have separate checks.
+The step template does not pin inherited defaults or noncredential workflow
+environment variables.
+Job `defaults`, `strategy`, `container`, and `services` are unpinned.
+Trimming and dropping empty lines ignores `\` continuations.
+The `apt-retries` check joins lines after an inline comment ending in `\`.
+The template does not judge the contents of pinned scripts, action behavior,
+downloaded artifacts, or runtime GitHub evidence.
+Runtime checks validate the artifacts and evidence.
 
 Run the identity and deployment gates locally with:
 
@@ -1289,7 +1374,7 @@ and every constant and allowlist entry that pins it in the same change.
   `contracts/multicall-router/`), the rebuild proves the bytes match the
   committed source; review of the source diff remains the defense. A
   compromise of an upstream source at its pinned commit is outside this check.
-- On runs other than tag and crate publication runs, two checks test a cached
+- On runs other than tag runs, two checks test a cached
   stellar-cli binary: its version line and the byte comparison of its output.
   A binary that writes the vendored bytes whatever its input passes both.
   Every workflow of a branch shares the cache. Code that runs in any job on
@@ -1300,7 +1385,7 @@ and every constant and allowlist entry that pins it in the same change.
   the scripts.
 - Cache saves serve future runs that restore the cache. The current rebuild
   consumes the install-root artifacts produced by its own stellar-cli jobs.
-  Tag and crate publication runs build both binaries from source. They gate
+  Tag runs build both binaries from source. They gate
   Apple signing and notarization, hashing, cosign signing, provenance, and
   release and crate publication.
 - Pull-request CI does not run the release-profile tests. The deploy's digest
@@ -1407,8 +1492,10 @@ Each error message names its rule:
   `mainnet-write` in the state its record relies on. The only executable
   target of the queried packages is `stellar-agent` of the CLI package, and
   the metadata must list exactly that one; its graph view includes the MCP
-  closure. The paired CLI and MCP prebuild of the testnet driver has one
-  reviewed record per job and feature state. A record relies on the
+  closure. The paired CLI and MCP prebuild and the isolated CLI build of the
+  testnet driver each have one reviewed record per share and feature state.
+  The isolated build's function, call count, and feature lists are pinned.
+  A record relies on the
   feature when its feature list names `mainnet-write`, or when it keeps the
   default features and selects the workspace, the CLI package, or the MCP
   package. A
@@ -1484,9 +1571,10 @@ Each error message names its rule:
   Rustflags and rustdocflags inputs that contain `--cfg` also fail.
   The invocation inventory refuses a compiler argument that passes `--cfg`.
 - D8: no workflow, named script, or this guide enables every feature.
-- D9: only the CI feature-on jobs and the feature-on coverage job name
-  `mainnet-write` in a feature list; release-shaped builds activate it through the binary
-  defaults.
+- D9: CI feature-on jobs and the feature-on coverage job may name
+  `mainnet-write` in feature lists. The testnet driver's resolved suite lists
+  and exact isolated on-state build are allowed only in its two acceptance jobs.
+  Release-shaped builds activate the feature through the binary defaults.
 - D10: the feature list of `ci.yml` and the list in this guide equal the
   declared features except `default` and `mainnet-write`.
 - D11: the release, publish, and rehearsal workflows expect the marker on.
@@ -1504,9 +1592,10 @@ Each error message names its rule:
 
 Release builds refuse compiler overrides and cargo configuration files
 through the checker's `--env-guard` mode, which `build.sh` runs on its own
-checkout. `check-binary-marker.sh <binary> <on|off>` checks the second version
-line, the embedded expected marker, and the absence of the opposite marker
-and test-override literals.
+checkout. `check-binary-marker.sh <binary> <on|off> <expected-line-1>` checks
+the exact name and version on line 1, removing a trailing carriage return.
+It also checks line 2, the embedded expected marker, and the absence of the
+opposite marker and test-override literals.
 
 The [release provenance boundary](releasing.md#feature-state-checks) combines
 statement-content validation, workflow guards and resolved graphs, and packaged
@@ -1515,10 +1604,11 @@ their packaged or registry source graphs are outside this check.
 
 `check-host.sh` builds the release executable for the host target through
 `build.sh`, which copies it to `stellar-agent-mcp`, compares the two files and
-checks both markers. It then builds the CLI package alone with
+checks both names, workspace versions, and markers. It then builds the CLI package alone with
 `cargo build --locked -p stellar-agent-cli`, copies the debug executable to
 `target/tmp/host-alias/stellar-agent-mcp`, compares the bytes and checks the
-marker under both names; the preflight row `release-shape` runs it.
+name, workspace version, and marker under both names.
+The preflight row `release-shape` runs it.
 It installs nothing, and it stops in these cases:
 
 - On Linux without libudev, it prints the install command and exits 2. The
@@ -1533,6 +1623,7 @@ It installs nothing, and it stops in these cases:
 The release rehearsal checks both executable names from every packed archive on a
 native runner, including Rosetta for the Intel macOS archive. Its crate job
 packages with the publish toolchain and checks fresh package-verification
-outputs. Live acceptance builds with `mainnet-write` off by default: the runner
-passes `--no-default-features` to every suite. `MAINNET_WRITE=on` adds the
+outputs. Dispatch acceptance defaults to `mainnet_write=true`; the local driver
+defaults to off, and schedules alternate at Monday 00:00 UTC.
+The driver passes `--no-default-features` to every suite. `MAINNET_WRITE=on` adds the
 feature to each suite whose crate declares it.

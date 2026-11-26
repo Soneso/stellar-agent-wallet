@@ -9,7 +9,7 @@ checker="$root/.github/scripts/check-binary-marker.sh"
 prefix=STELLAR_AGENT_BUILD_MAINNET_WRITE=
 run_case() {
   local label=$1 expected=$2 rc=$3 actual=0
-  bash "$checker" "$tmp/binary" "$expected" > "$tmp/output" 2>&1 || actual=$?
+  bash "$checker" "$tmp/binary" "$expected" "stellar-agent 1.0.0" > "$tmp/output" 2>&1 || actual=$?
   if [ "$actual" -ne "$rc" ]; then
     echo "FAIL $label: exit $actual, expected $rc" >&2
     cat "$tmp/output" >&2
@@ -18,22 +18,22 @@ run_case() {
   echo "ok $label"
 }
 for state in off on; do
-  printf '#!/usr/bin/env bash\nprintf "stub 1\\n%s%s\\n"\n' "$prefix" "$state" > "$tmp/binary"
+  printf '#!/usr/bin/env bash\nprintf "stellar-agent 1.0.0\\n%s%s\\n"\n' "$prefix" "$state" > "$tmp/binary"
   chmod +x "$tmp/binary"
   run_case "valid-$state" "$state" 0
   run_case "version-line-$state" "$([ "$state" = off ] && echo on || echo off)" 1
 done
-printf '#!/usr/bin/env bash\nprintf "stub 1\\n%s%s\\n"\n# %soff\n' "$prefix" on "$prefix" > "$tmp/binary"
+printf '#!/usr/bin/env bash\nprintf "stellar-agent 1.0.0\\n%s%s\\n"\n# %soff\n' "$prefix" on "$prefix" > "$tmp/binary"
 run_case opposite-bytes on 1
-printf '#!/usr/bin/env bash\nprintf "stub 1\\n%%s%%s\\n" "%s" on\n' "$prefix" > "$tmp/binary"
+printf '#!/usr/bin/env bash\nprintf "stellar-agent 1.0.0\\n%%s%%s\\n" "%s" on\n' "$prefix" > "$tmp/binary"
 run_case expected-bytes on 1
-printf '#!/usr/bin/env bash\nprintf "stub 1\\nincorrect\\n"\n# %soff\n' "$prefix" > "$tmp/binary"
+printf '#!/usr/bin/env bash\nprintf "stellar-agent 1.0.0\\nincorrect\\n"\n# %soff\n' "$prefix" > "$tmp/binary"
 run_case version-line-only off 1
-printf '#!/usr/bin/env bash\nprintf "stub 1\\n%soff\\n"\nexit 1\n' "$prefix" > "$tmp/binary"
+printf '#!/usr/bin/env bash\nprintf "stellar-agent 1.0.0\\n%soff\\n"\nexit 1\n' "$prefix" > "$tmp/binary"
 run_case version-exit off 1
 run_case invalid-expectation invalid 2
 for literal in STELLAR_AGENT_HOME STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE .stellar-agent-test-sandbox; do
-  printf '#!/usr/bin/env bash\nprintf "stub 1\\n%soff\\n"\n# %s\n' "$prefix" "$literal" > "$tmp/binary"
+  printf '#!/usr/bin/env bash\nprintf "stellar-agent 1.0.0\\n%soff\\n"\n# %s\n' "$prefix" "$literal" > "$tmp/binary"
   label="test-override-$literal"
   [ "$literal" != .stellar-agent-test-sandbox ] || label='a binary holding the sandbox marker is refused'
   run_case "$label" off 1
@@ -44,5 +44,18 @@ for literal in STELLAR_AGENT_HOME STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE .stellar-
     cat "$tmp/output" >&2
     exit 1
   fi
+done
+for line in 'wrong 1.0.0' 'stellar-agent 2.0.0' 'stellar-agent 1.0.0 extra'; do
+  printf '#!/usr/bin/env bash\nprintf "%s\\n%son\\n"\n' "$line" "$prefix" > "$tmp/binary"
+  run_case "wrong-first-line-$line" on 1
+  grep -Fq 'version line 1 differs from stellar-agent 1.0.0' "$tmp/output"
+done
+printf '#!/usr/bin/env bash\nprintf "stellar-agent 1.0.0\\r\\n%son\\n"\n' "$prefix" > "$tmp/binary"
+run_case trailing-carriage-return on 0
+for count in 0 1 2 4; do
+  args=("$tmp/binary" on 'stellar-agent 1.0.0' extra)
+  actual=0
+  bash "$checker" "${args[@]:0:$count}" > "$tmp/output" 2>&1 || actual=$?
+  [ "$actual" -eq 2 ] || { echo "FAIL argument count $count: $actual"; exit 1; }
 done
 echo 'binary marker tests passed'

@@ -7,17 +7,18 @@
 # the target directory, newer than the start timestamp, comes from that step.
 # The script copies that candidate to stellar-agent-mcp in a temporary
 # directory, with the candidate's .exe suffix if it has one, requires equal
-# bytes, and checks the marker under both names.
+# bytes, and checks the name, version, and marker under both names.
 #
-# Usage: check-packaged-markers.sh <target-dir> <start-timestamp> <on|off>
+# Usage: check-packaged-markers.sh <target-dir> <start-timestamp> <on|off> <version>
 set -euo pipefail
-if [ "$#" -ne 3 ]; then
-  echo 'usage: check-packaged-markers.sh <target-dir> <start-timestamp> <on|off>' >&2
+if [ "$#" -ne 4 ]; then
+  echo 'usage: check-packaged-markers.sh <target-dir> <start-timestamp> <on|off> <version>' >&2
   exit 2
 fi
 target_dir=${1%/}
 started=$2
 expected=$3
+version=$4
 [ -f "$started" ] || { echo 'packaged marker: missing start timestamp' >&2; exit 1; }
 script_dir=$(cd "$(dirname "$0")" && pwd)
 binary=stellar-agent
@@ -40,5 +41,5 @@ trap 'rm -rf "$alias_dir"' EXIT
 alias="$alias_dir/stellar-agent-mcp$suffix"
 cp "$candidate" "$alias"
 cmp "$candidate" "$alias"
-bash "$script_dir/check-binary-marker.sh" "$candidate" "$expected"
-bash "$script_dir/check-binary-marker.sh" "$alias" "$expected"
+bash "$script_dir/check-binary-marker.sh" "$candidate" "$expected" "stellar-agent $version"
+bash "$script_dir/check-binary-marker.sh" "$alias" "$expected" "stellar-agent-mcp $version"

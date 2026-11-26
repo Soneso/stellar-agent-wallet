@@ -31,6 +31,11 @@ on:
           Run every suite against the build with mainnet-write on
         type: boolean
         required: false
+        default: true
+      full_run:
+        description: Continue share 2 after a failed share 1
+        type: boolean
+        required: false
         default: false
   schedule:
     # Weekly, Monday 05:00 UTC.
@@ -50,19 +55,47 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  config:
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'schedule' || (vars.TESTNET_SCHEDULE != 'off' && github.ref == 'refs/heads/main')
+    outputs:
+      feature_state: ${{ steps.mode.outputs.feature_state }}
+    steps:
+      - name: Select feature state
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MAINNET_WRITE: ${{ inputs.mainnet_write }}
+        run: |
+          if [ "$EVENT_NAME" = schedule ]; then
+            week=$(( ($(date -u +%s) - 345600) / 604800 ))
+            if [ "$((week % 2))" -eq 0 ]; then state=on; else state=off; fi
+          elif [ "$MAINNET_WRITE" = true ]; then
+            state=on
+          else
+            state=off
+          fi
+          echo "feature_state=$state" >> "$GITHUB_OUTPUT"
+
   acceptance-1:
+    needs: config
     name: testnet acceptance (share 1/2)
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     # Setting the repository variable TESTNET_SCHEDULE to "off" disables the
-    # weekly run without a commit; manual dispatch always runs.
-    if: github.event_name != 'schedule' || vars.TESTNET_SCHEDULE != 'off'
+    # weekly run without a commit; manual dispatch bypasses this switch.
+    if: github.event_name != 'schedule' || (vars.TESTNET_SCHEDULE != 'off' && github.ref == 'refs/heads/main')
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Verify checked-out revision
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
       # The smart-account dependency closure plus every compiled test binary is
       # large; reclaim space the build does not need.
       - name: Free disk space
@@ -99,6 +132,7 @@ jobs:
           # The testnet feature set builds a different dependency graph from
           # the offline jobs; keep it in its own cache.
           prefix-key: testnet
+          shared-key: testnet-${{ needs.config.outputs.feature_state }}
       # Platform selection requires a functioning Secret Service. The private
       # D-Bus session keeps the store and all acceptance children on one bus.
       - name: Install gnome-keyring (Linux Secret Service for the CLI v1-policy suite)
@@ -112,13 +146,13 @@ jobs:
       # Serialization, inter-suite pacing, one-retry-with-cooldown, the
       # zero-tests-executed guard, and the per-suite durations all live in the
       # driver script so the same entrypoint runs locally and in CI. A
-      # scheduled run has no inputs and builds with mainnet-write off.
+      # scheduled run uses the Monday-based state from config.
       - name: Run testnet acceptance suites
         env:
           SHARE: 1/2
           STELLAR_AGENT_PAYMENT_EVIDENCE_DIR: ${{ github.workspace }}/target/tmp/payment-evidence
           FILTER: ${{ inputs.filter }}
-          MAINNET_WRITE: ${{ inputs.mainnet_write && 'on' || 'off' }}
+          MAINNET_WRITE: ${{ needs.config.outputs.feature_state }}
           STELLAR_AGENT_TEST_KEYRING: ${{ inputs.keyring || 'headless' }}
           STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL: ${{ vars.TESTNET_SECONDARY_RPC_URL }}
         run: |
@@ -131,29 +165,38 @@ jobs:
         if: always()
         env:
           PAYMENT_FILTER: ${{ inputs.filter }}
-        run: python3 .github/scripts/check-payment-evidence.py target/tmp/payment-evidence --execution live-testnet --share 1/2 --filter "$PAYMENT_FILTER"
+          EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_FEATURE_STATE: ${{ needs.config.outputs.feature_state }}
+        run: python3 .github/scripts/check-payment-evidence.py target/tmp/payment-evidence --execution live-testnet --share 1/2 --filter "$PAYMENT_FILTER" --expected-revision "$EXPECTED_REVISION" --expected-feature-state "$EXPECTED_FEATURE_STATE"
       - name: Retain payment evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: payment-evidence-share-1-mainnet-${{ inputs.mainnet_write && 'on' || 'off' }}
-          path: target/tmp/payment-evidence/*.jsonl
+          name: payment-evidence-share-1-mainnet-${{ needs.config.outputs.feature_state }}-attempt-${{ github.run_attempt }}
+          path: |
+            target/tmp/payment-evidence/*.jsonl
+            target/tmp/testnet-attempts/
           if-no-files-found: warn
 
   acceptance-2:
-    needs: acceptance-1
+    needs: [config, acceptance-1]
     name: testnet acceptance (share 2/2)
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     # Setting the repository variable TESTNET_SCHEDULE to "off" disables the
-    # weekly run without a commit; manual dispatch always runs.
-    if: ${{ !cancelled() && (github.event_name != 'schedule' || vars.TESTNET_SCHEDULE != 'off') }}
+    # weekly run without a commit; manual dispatch bypasses this switch.
+    if: ${{ !cancelled() && needs.config.result == 'success' && (github.event_name != 'schedule' || (vars.TESTNET_SCHEDULE != 'off' && github.ref == 'refs/heads/main')) && (needs.acceptance-1.result == 'success' || (inputs.full_run && needs.acceptance-1.result == 'failure')) }}
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Verify checked-out revision
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
       # The smart-account dependency closure plus every compiled test binary is
       # large; reclaim space the build does not need.
       - name: Free disk space
@@ -190,6 +233,7 @@ jobs:
           # The testnet feature set builds a different dependency graph from
           # the offline jobs; keep it in its own cache.
           prefix-key: testnet
+          shared-key: testnet-${{ needs.config.outputs.feature_state }}
       # Platform selection requires a functioning Secret Service. The private
       # D-Bus session keeps the store and all acceptance children on one bus.
       - name: Install gnome-keyring (Linux Secret Service for the CLI v1-policy suite)
@@ -203,13 +247,13 @@ jobs:
       # Serialization, inter-suite pacing, one-retry-with-cooldown, the
       # zero-tests-executed guard, and the per-suite durations all live in the
       # driver script so the same entrypoint runs locally and in CI. A
-      # scheduled run has no inputs and builds with mainnet-write off.
+      # scheduled run uses the Monday-based state from config.
       - name: Run testnet acceptance suites
         env:
           SHARE: 2/2
           STELLAR_AGENT_PAYMENT_EVIDENCE_DIR: ${{ github.workspace }}/target/tmp/payment-evidence
           FILTER: ${{ inputs.filter }}
-          MAINNET_WRITE: ${{ inputs.mainnet_write && 'on' || 'off' }}
+          MAINNET_WRITE: ${{ needs.config.outputs.feature_state }}
           STELLAR_AGENT_TEST_KEYRING: ${{ inputs.keyring || 'headless' }}
           STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL: ${{ vars.TESTNET_SECONDARY_RPC_URL }}
         run: |
@@ -222,11 +266,15 @@ jobs:
         if: always()
         env:
           PAYMENT_FILTER: ${{ inputs.filter }}
-        run: python3 .github/scripts/check-payment-evidence.py target/tmp/payment-evidence --execution live-testnet --share 2/2 --filter "$PAYMENT_FILTER"
+          EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_FEATURE_STATE: ${{ needs.config.outputs.feature_state }}
+        run: python3 .github/scripts/check-payment-evidence.py target/tmp/payment-evidence --execution live-testnet --share 2/2 --filter "$PAYMENT_FILTER" --expected-revision "$EXPECTED_REVISION" --expected-feature-state "$EXPECTED_FEATURE_STATE"
       - name: Retain payment evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: payment-evidence-share-2-mainnet-${{ inputs.mainnet_write && 'on' || 'off' }}
-          path: target/tmp/payment-evidence/*.jsonl
+          name: payment-evidence-share-2-mainnet-${{ needs.config.outputs.feature_state }}-attempt-${{ github.run_attempt }}
+          path: |
+            target/tmp/payment-evidence/*.jsonl
+            target/tmp/testnet-attempts/
           if-no-files-found: warn

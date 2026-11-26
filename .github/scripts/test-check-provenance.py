@@ -11,6 +11,7 @@ import argparse
 import base64
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -104,6 +105,69 @@ MUTATIONS = {
         "unexpected = [str(key) for key in parameters if key != 'vars']",
         f'{CONFIGURATION}: unexpected keys diagnostic differs'),
 }
+
+
+BINDING_CASES = (
+    ('other-run', '2002', '1', None, 'provenance run ID differs'),
+    ('future-attempt', '2001', '1', '2', 'provenance run attempt exceeds latest attempt'),
+    ('equal-attempt', '2001', '1', None, None),
+    ('lower-attempt', '2001', '2', None, None),
+    ('decimal-future-attempt', '2001', '2', '10', 'provenance run attempt exceeds latest attempt'),
+    ('decimal-lower-attempt', '2001', '10', '2', None),
+    ('invalid-attempt', '2001', '2', '0', 'run binding needs positive decimal strings'),
+    ('missing-latest', '2001', None, None, 'run binding needs positive decimal strings'),
+    ('missing-run', None, '1', None, 'run binding needs positive decimal strings'),
+    ('integer-attempt', '2001', '2', 1, 'run binding needs positive decimal strings'),
+)
+for name, needle, replacement, assertion in (
+    ('other-run', "if environment['github_run_id'] != run_id:", 'if False:', 'accepted'),
+    ('future-attempt', "if int(environment['github_run_attempt']) > int(run_attempt):", 'if False:', 'accepted'),
+    ('equal-attempt', "if int(environment['github_run_attempt']) > int(run_attempt):",
+     "if int(environment['github_run_attempt']) >= int(run_attempt):", 'refused'),
+    ('lower-attempt', "if int(environment['github_run_attempt']) > int(run_attempt):",
+     "if int(environment['github_run_attempt']) != int(run_attempt):", 'refused'),
+    ('decimal-future-attempt', "if int(environment['github_run_attempt']) > int(run_attempt):",
+     "if environment['github_run_attempt'] > run_attempt:", 'accepted'),
+    ('decimal-lower-attempt', "if int(environment['github_run_attempt']) > int(run_attempt):",
+     "if environment['github_run_attempt'] > run_attempt:", 'refused'),
+    ('invalid-attempt', "re.fullmatch(r'[1-9][0-9]*', value)", "re.fullmatch(r'[0-9]+', value)", 'accepted'),
+    ('integer-attempt', "isinstance(value, str) and re.fullmatch(r'[1-9][0-9]*', value)",
+     "re.fullmatch(r'[1-9][0-9]*', str(value))", 'accepted'),
+    ('missing-run', 'if run_id is not None or run_attempt is not None:', 'if run_id is not None:', 'accepted'),
+    ('missing-latest', 'if run_id is not None or run_attempt is not None:', 'if run_attempt is not None:', 'accepted'),
+):
+    MUTATIONS['binding-' + name] = (needle, replacement, f'run-binding {name}: {assertion}', name)
+MUTATIONS['binding-cli'] = ('args.repository, args.ref, args.run_id, args.run_attempt)',
+                          'args.repository, args.ref)', 'run-binding cli: accepted', 'cli')
+
+
+def run_binding(module, checker, document, sums, sha, repository, ref, selected):
+    environment = json.loads(base64.b64decode(document['dsseEnvelope']['payload']))['predicate']['invocation']['environment']
+    for name, run_id, latest, attempt, expected in BINDING_CASES:
+        if selected and selected != name:
+            continue
+        wrapped = document if attempt is None else with_field(document, 'environment',
+                                                               {**environment, 'github_run_attempt': attempt})
+        try:
+            module.check(wrapped, sums, sha, repository, ref, run_id, latest)
+        except ValueError as error:
+            assert expected is not None, f'run-binding {name}: refused: {error}'
+            assert str(error) == expected, f'run-binding {name}: diagnostic differs: {error}'
+        else:
+            assert expected is None, f'run-binding {name}: accepted'
+        print(f'ok run-binding {name}')
+    if selected in (None, 'cli'):
+        argv, errors = sys.argv, io.StringIO()
+        try:
+            sys.argv = [str(checker), str(FIXTURE), str(HERE / 'fixtures/SHA256SUMS'), sha, repository, ref,
+                        '--run-id', '2002', '--run-attempt', '1']
+            with contextlib.redirect_stderr(errors):
+                result = module.main()
+        finally:
+            sys.argv = argv
+        assert result == 1 and errors.getvalue() == 'provenance: provenance run ID differs\n', \
+            'run-binding cli: accepted'
+        print('ok run-binding cli')
 
 
 def load(path):
@@ -202,14 +266,17 @@ def named_mutations(checker):
     source = checker.read_text()
     (ROOT / 'target/tmp').mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=ROOT / 'target/tmp') as scratch:
-        for name, (needle, replacement, assertion) in MUTATIONS.items():
+        for name, mutation in MUTATIONS.items():
+            needle, replacement, assertion, *case = mutation
             assert source.count(needle) == 1, f'{name}: mutation target differs'
             path = pathlib.Path(scratch) / (name + '.py')
             for phase, text in (('mutation', source.replace(needle, replacement, 1)), ('control', source)):
                 path.write_text(text)
                 path.touch()
+                if phase == 'control':
+                    assert hashlib.md5(path.read_bytes()).digest() == hashlib.md5(source.encode()).digest()
                 result = subprocess.run([sys.executable, '-B', str(pathlib.Path(__file__).resolve()),
-                                         '--checker', str(path)], text=True, capture_output=True)
+                                         '--checker', str(path)] + (['--case', case[0]] if case else []), text=True, capture_output=True)
                 if phase == 'mutation':
                     assert result.returncode == 1 and 'FAIL ' + assertion in result.stderr, \
                         f'{name}: expected assertion does not fail: {result.stdout}\n{result.stderr}'
@@ -219,7 +286,7 @@ def named_mutations(checker):
                     print(f'ok control-{name}')
 
 
-def assertions(module, checker):
+def assertions(module, checker, selected=None):
     document = json.loads(FIXTURE.read_text())
     sums = (HERE / 'fixtures/SHA256SUMS').read_text()
     envelope = document['dsseEnvelope']
@@ -227,6 +294,9 @@ def assertions(module, checker):
     source = statement['predicate']['invocation']['configSource']
     sha = source['digest']['sha1']
     repository, ref = re.fullmatch(r'git\+https://github\.com/([^@]+)@(.+)', source['uri']).groups()
+    run_binding(module, checker, document, sums, sha, repository, ref, selected)
+    if selected:
+        return 0
     module.check(document, sums, sha, repository, ref)
     configuration(module, checker, document, sums, sha, repository, ref)
     cases = {
@@ -285,11 +355,14 @@ def assertions(module, checker):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--case')
     parser.add_argument('--mutations', action='store_true')
     parser.add_argument('--checker', type=pathlib.Path, default=HERE / 'check-provenance.py')
     args = parser.parse_args()
+    if args.case is not None and args.case not in [row[0] for row in BINDING_CASES] + ['cli']:
+        parser.error(f'unknown case: {args.case}')
     try:
-        result = assertions(load(args.checker), args.checker)
+        result = assertions(load(args.checker), args.checker, args.case)
         if result == 0 and args.mutations:
             named_mutations(args.checker)
     except AssertionError as error:

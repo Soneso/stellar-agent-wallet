@@ -80,9 +80,11 @@ optional reproductions of CI checks.
 CI runs the offline gates on every pull request; a docs-only pull request into
 `next` runs the reduced set that
 [docs/maintainers/building.md](docs/maintainers/building.md) describes. Pull-request
-coverage runs automatically for every pull request into `main` and every code
-pull request into `next`. The `coverage` label adds a run on a docs-only pull
-request into `next`. Self-tests run when their inputs change, and always on
+coverage measures automatically on eligible events for every pull request into
+`main` and every code pull request into `next`. The required `coverage` job runs
+on every eligible event and passes docs-only changes into `next` without
+measuring; the `coverage` label requires measurement on a docs-only pull request.
+Self-tests run when their inputs change, and always on
 `main`; live acceptance uses its separate workflow. The exact commands, gate-tool installation, and test tiers are in
 [docs/maintainers/building.md](docs/maintainers/building.md).
 
@@ -284,6 +286,11 @@ Its `CHANGELOG.md` equals the clean three-way merge over the parents' merge
 base, preserving both sides' lines.
 The guard refuses conflicts; a maintainer resolves and merges them.
 The guard never accepts hand-resolved changelog bytes.
+Existing fragments here are paths present at the PR merge base or imported
+from `main`. Imported paths are protected in descendants of their sync merge.
+A PR may revise a fragment it adds itself before such an import.
+An update merge may take its second parent from the ancestry of the PR base
+on `next`; every changelog path must equal the clean three-way result.
 Never edit an existing fragment. Add a new file for a further entry.
 Each fragment file belongs to one pull request and is never reused.
 A sync merge deletes fragments that `main` folds and deletes.

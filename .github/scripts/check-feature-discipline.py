@@ -24,7 +24,9 @@ Rules:
       runner label, and an unknown or unresolved runner fails; the testnet
       acceptance driver's feature list resolves for both values of
       MAINNET_WRITE from the reviewed text of its suite_features function,
-      and a driver whose function or assignment differs fails; feature-off
+      and a driver whose function or assignment differs fails; the isolated
+      CLI build has one record per share and state with its exact feature list;
+      feature-off
       records refuse mainnet-write on any resolved package, and each
       selected binary gets a root view of the one resolution, whose
       positive-control closure feature-on records require; a compiler
@@ -75,9 +77,10 @@ Rules:
       case, such as an action's rustflags input, holds no --cfg
   D8  no workflow document, read whole, no named script and not
       building.md enables every feature
-  D9  only the CI feature-on jobs and the feature-on coverage job name
-      mainnet-write in a feature list; release-shaped builds activate it through the
-      binary defaults
+  D9  CI feature-on jobs and the feature-on coverage job may name
+      mainnet-write in feature lists; the testnet driver's resolved suite lists
+      and exact isolated on-state build are allowed only in its acceptance jobs;
+      release-shaped builds activate it through the binary defaults
   D10 the CI and documented feature lists equal the declared features
       except default and mainnet-write
   D11 the release, publish and rehearsal workflows expect the marker on
@@ -201,6 +204,16 @@ TESTNET_FEATURES_ASSIGNMENT = 'features=$(suite_features "$crate" "$feature" "$t
 # exists. The inventory reads this one reviewed command for those suites
 # only, once per job and feature list.
 TESTNET_PREBUILD = 'cargo test -p stellar-agent-cli -p "$crate" --no-default-features --features "$features" --no-run'
+TESTNET_BINARY_OFF = 'cargo build --locked --release -p stellar-agent-cli --bin stellar-agent --no-default-features --features test-helpers --features stellar-agent-network/test-helpers'
+TESTNET_BINARY_ON = 'cargo build --locked --release -p stellar-agent-cli --bin stellar-agent --no-default-features --features mainnet-write,test-helpers --features stellar-agent-network/test-helpers'
+TESTNET_BINARY_FUNCTION = '''build_acceptance_binary() {
+  if [ "$MAINNET_WRITE" = on ]; then
+    cargo build --locked --release -p stellar-agent-cli --bin stellar-agent --no-default-features --features mainnet-write,test-helpers --features stellar-agent-network/test-helpers
+  else
+    cargo build --locked --release -p stellar-agent-cli --bin stellar-agent --no-default-features --features test-helpers --features stellar-agent-network/test-helpers
+  fi
+}'''
+TESTNET_BINARY_CALL = '  build_acceptance_binary || exit 3'
 REFUSED_VARS = ['RUST' + 'C', 'RUSTC_' + 'WRAPPER', 'RUSTC_WORKSPACE_' + 'WRAPPER',
                 'CARGO_BUILD_' + 'RUSTC*', 'RUST' + 'FLAGS', 'CARGO_ENCODED_' + 'RUSTFLAGS',
                 'CARGO_BUILD_' + 'RUSTFLAGS', 'CARGO_TARGET_*_' + 'RUSTFLAGS',
@@ -229,7 +242,7 @@ ENV_FILE_READERS = {
 }
 # D3 and D9 read the cargo and cross text of these scripts as data, each
 # for the reason given. Every other named script is scanned for commands.
-# D9 allows the testnet driver's resolved mainnet-write lists only in the two testnet acceptance jobs.
+# D9 allows the driver's resolved lists and exact isolated on-state build only in the two acceptance jobs.
 DATA_SCRIPTS = {
     '.github/scripts/preflight.sh':
         'its registry rows mirror CI steps for local runs, and '
@@ -248,6 +261,8 @@ DATA_SCRIPTS = {
     '.github/scripts/test-publish-crates-verify.sh':
         'reads workspace metadata into a stub fixture and drives '
         'publish-crates.sh with a stub cargo',
+    '.github/scripts/test-publish-release-evidence.py':
+        'drives publish evidence steps with local fixture tools',
     '.github/scripts/test-release-checks.sh':
         'drives the release check scripts with stub cargo, 7z and binaries',
     '.github/scripts/test-run-testnet-acceptance.sh':
@@ -989,6 +1004,11 @@ def testnet_feature_lists(root, source, entry):
 
 
 def inventory(root, workflows, scripts):
+    if TESTNET_DRIVER in scripts:
+        source = scripts[TESTNET_DRIVER]
+        functions = re.findall(r'^build_acceptance_binary\(\)[ \t]*\{\n.*?^\}', source, re.M | re.S)
+        if functions != [TESTNET_BINARY_FUNCTION] or source.splitlines().count(TESTNET_BINARY_CALL) != 1:
+            raise ValueError(f'{TESTNET_DRIVER}: isolated binary build differs from the reviewed text')
     rows = []
     def add(workflow, job, step, source, command, env, runner, matrix):
         words = shlex.split(command)
@@ -1013,7 +1033,7 @@ def inventory(root, workflows, scripts):
                 if (words[0] == 'cross') == (target == 'aarch64-unknown-linux-gnu'):
                     builds.append({**values, 'TARGET': target})
             variants = builds
-        if source.endswith('run-testnet-acceptance.sh'):
+        if source.endswith('run-testnet-acceptance.sh') and family != 'build':
             prebuild = command == TESTNET_PREBUILD
             if '--no-run' in words and not prebuild:
                 raise ValueError(f'{TESTNET_DRIVER}: the paired prebuild differs from the reviewed text')
@@ -1533,7 +1553,7 @@ class Checker:
         yield 'building.md', (self.root / 'docs/maintainers/building.md').read_text()
 
     def D9(self):
-        """CI feature-on jobs and the feature-on coverage job may name mainnet-write; the testnet driver's resolved lists are allowed only in the two testnet acceptance jobs."""
+        """Allow the reviewed testnet suite lists and isolated build only in the two acceptance jobs."""
         for workflow, document in self.workflows.items():
             top = document.get('env', {})
             jobs = document.get('jobs') or {'composite': {'steps': document.get('runs', {}).get('steps', [])}}
@@ -1557,7 +1577,10 @@ class Checker:
                     env = {**top, **job.get('env', {}), **step.get('env', {})}
                     calls = list(commands(text, where))
                     for path, source in scripts:
-                        calls.extend(script_commands(path, source))
+                        calls.extend(command for command in script_commands(path, source)
+                                     if not (path.as_posix() == TESTNET_DRIVER
+                                             and command == TESTNET_BINARY_ON
+                                             and (workflow, job_name, TESTNET_DRIVER) in TESTNET_ACTIVATION_ALLOWANCE))
                     for command in calls:
                         if activates(command, env):
                             self.fail('D9', f'{where}: feature activation outside allowed jobs: {command}')
@@ -1565,6 +1588,8 @@ class Checker:
             if path in DATA_SCRIPTS:
                 continue
             for command in script_commands(pathlib.Path(path), text):
+                if path == TESTNET_DRIVER and command == TESTNET_BINARY_ON:
+                    continue
                 if activates(command, {}):
                     self.fail('D9', f'{path}: feature activation: {command}')
 
@@ -1790,6 +1815,10 @@ def env_file_problem(line):
 # package selection, feature flags, edge kinds, target, runner, selected
 # binaries and expected feature state here.
 INVOCATIONS = [
+    {'workflow':'testnet.yml','job':'acceptance-1','step':'Run testnet acceptance suites','source':'.github/scripts/run-testnet-acceptance.sh','command':'cargo build --locked --release -p stellar-agent-cli --bin stellar-agent --no-default-features --features test-helpers --features stellar-agent-network/test-helpers','relied_on':'off','selection':['-p','stellar-agent-cli'],'features':['--no-default-features','--features','test-helpers','--features','stellar-agent-network/test-helpers'],'edges':'normal,build','target':'x86_64-unknown-linux-gnu','bins':['stellar-agent'],'runner':'ubuntu-24.04'},
+    {'workflow':'testnet.yml','job':'acceptance-1','step':'Run testnet acceptance suites','source':'.github/scripts/run-testnet-acceptance.sh','command':'cargo build --locked --release -p stellar-agent-cli --bin stellar-agent --no-default-features --features mainnet-write,test-helpers --features stellar-agent-network/test-helpers','relied_on':'on','selection':['-p','stellar-agent-cli'],'features':['--no-default-features','--features','mainnet-write,test-helpers','--features','stellar-agent-network/test-helpers'],'edges':'normal,build','target':'x86_64-unknown-linux-gnu','bins':['stellar-agent'],'runner':'ubuntu-24.04'},
+    {'workflow':'testnet.yml','job':'acceptance-2','step':'Run testnet acceptance suites','source':'.github/scripts/run-testnet-acceptance.sh','command':'cargo build --locked --release -p stellar-agent-cli --bin stellar-agent --no-default-features --features test-helpers --features stellar-agent-network/test-helpers','relied_on':'off','selection':['-p','stellar-agent-cli'],'features':['--no-default-features','--features','test-helpers','--features','stellar-agent-network/test-helpers'],'edges':'normal,build','target':'x86_64-unknown-linux-gnu','bins':['stellar-agent'],'runner':'ubuntu-24.04'},
+    {'workflow':'testnet.yml','job':'acceptance-2','step':'Run testnet acceptance suites','source':'.github/scripts/run-testnet-acceptance.sh','command':'cargo build --locked --release -p stellar-agent-cli --bin stellar-agent --no-default-features --features mainnet-write,test-helpers --features stellar-agent-network/test-helpers','relied_on':'on','selection':['-p','stellar-agent-cli'],'features':['--no-default-features','--features','mainnet-write,test-helpers','--features','stellar-agent-network/test-helpers'],'edges':'normal,build','target':'x86_64-unknown-linux-gnu','bins':['stellar-agent'],'runner':'ubuntu-24.04'},
     {'workflow': 'release-rehearsal.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "aarch64-apple-darwin" --bin stellar-agent','relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'aarch64-apple-darwin', 'bins': ['stellar-agent'], 'runner': 'macos-26'},
     {'workflow': 'release.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "aarch64-apple-darwin" --bin stellar-agent','relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'aarch64-apple-darwin', 'bins': ['stellar-agent'], 'runner': 'macos-26'},
     {'workflow': 'release-rehearsal.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-apple-darwin" --bin stellar-agent','relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-apple-darwin', 'bins': ['stellar-agent'], 'runner': 'macos-26'},
