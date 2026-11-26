@@ -213,6 +213,13 @@ After merging, the loader resolves derived fields and validates:
   profile. A provider key in the URL path or query passes this rule and stays
   in the file; a `credential` in the role's provider record keeps it in the
   keyring (see [Provider credentials](#provider-credentials)).
+
+  RPC, secondary, and oracle requests connect directly and ignore
+  `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`. Friendbot, SEP-10,
+  SEP-45, anchor, and `stellar.toml` requests honor these variables. SOCKS
+  proxies are not supported. The `stellar.toml` fetch still resolves the home
+  domain locally before sending the request through the proxy.
+
 - Provider records must match their role's URL and satisfy the chain's
   independence rules in [Provider attestations](#provider-attestations) and
   the credential rules in [Provider credentials](#provider-credentials).
