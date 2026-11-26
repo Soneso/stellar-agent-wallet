@@ -1655,9 +1655,9 @@ async fn signed_origin_login_continues_to_the_selected_id() {
         .unwrap();
     assert_eq!(presence.approval_nonce(), nonce);
     assert!(f.stored().attestation_blob_b64.is_none());
-    let address = handle.local_addr();
+    let tasks = handle.listener_tasks();
     handle.shutdown().await.unwrap();
-    assert!(std::net::TcpListener::bind(address).is_ok());
+    assert!(tasks[0].is_finished(), "listener stopped after shutdown");
 }
 
 #[test]

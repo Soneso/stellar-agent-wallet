@@ -1,6 +1,7 @@
 //! A mocked Stellar RPC endpoint for the command tests, answering by JSON-RPC
-//! method, the observations the endpoint tests make, and the zero-config setup
-//! those tests run under.
+//! method. The module also holds the observations the endpoint tests make
+//! and the zero-config setup those tests run under. Its runner gives a test
+//! body the stack the binary gives a command body.
 //!
 //! The endpoint reports one network passphrase, which a test can change
 //! between calls. It answers `getLedgerEntries` for the accounts and the
@@ -843,6 +844,40 @@ pub(crate) async fn fail_read_of_with_text(server: &MockServer, key: &str, text:
         .await;
 }
 
+/// Runs the async test body that `make` returns on a fresh thread.
+///
+/// The thread has the [`crate::BODY_STACK_SIZE`] stack the binary gives a
+/// command body. The body runs to completion on a current-thread Tokio
+/// runtime of its own, with the IO and time drivers enabled. The call returns
+/// once that thread ends.
+///
+/// The test harness gives a test thread the Rust default stack of 2 MiB. A
+/// command body that fits the binary's stack can overflow that thread. The
+/// body thread carries the calling thread's name, so a crash report names the
+/// test. A panic in the body resumes on the calling thread, so the test
+/// reports the original assertion.
+pub(crate) fn on_body_stack<F>(make: impl FnOnce() -> F + Send + 'static)
+where
+    F: Future<Output = ()>,
+{
+    let mut builder = std::thread::Builder::new().stack_size(crate::BODY_STACK_SIZE);
+    if let Some(name) = std::thread::current().name() {
+        builder = builder.name(name.to_owned());
+    }
+    let thread = builder
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(make());
+        })
+        .expect("test body thread");
+    thread
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+}
+
 /// The profile name a witness test derives from its signer's variable.
 pub(crate) fn profile_name_for(signer: &EnvSigner) -> String {
     signer.var.to_ascii_lowercase().replace('_', "-")
@@ -940,5 +975,67 @@ pub(crate) fn counting_initializer(
     move || {
         calls.set(calls.get() + 1);
         Ok(())
+    }
+}
+
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::on_body_stack;
+
+    /// Fills 4 MiB of the calling thread's stack: more than the 2 MiB a test
+    /// thread has, less than [`crate::BODY_STACK_SIZE`].
+    #[inline(never)]
+    fn fill_stack() {
+        let bytes = [0x5a_u8; 4 * 1024 * 1024];
+        std::hint::black_box(&bytes);
+    }
+
+    #[test]
+    fn on_body_stack_runs_the_body_with_the_binary_stack_and_runtime_drivers() {
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&ran);
+        let caller = std::thread::current().id();
+        on_body_stack(move || async move {
+            assert_ne!(std::thread::current().id(), caller, "a thread of its own");
+            assert_eq!(
+                tokio::runtime::Handle::current().runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::CurrentThread
+            );
+            fill_stack();
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            assert!(listener.local_addr().unwrap().ip().is_loopback());
+            flag.store(true, Ordering::SeqCst);
+        });
+        assert!(ran.load(Ordering::SeqCst), "the body ran to completion");
+    }
+
+    #[test]
+    fn on_body_stack_names_the_body_thread_after_the_calling_thread() {
+        let caller = std::thread::current().name().map(str::to_owned);
+        assert!(caller.is_some(), "the harness names a test thread");
+        on_body_stack(move || async move {
+            assert_eq!(std::thread::current().name(), caller.as_deref());
+        });
+        std::thread::spawn(|| {
+            on_body_stack(|| async {
+                assert_eq!(std::thread::current().name(), None);
+            });
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn on_body_stack_resumes_a_body_panic_on_the_calling_thread() {
+        let payload = std::panic::catch_unwind(|| {
+            on_body_stack(|| async { panic!("the original assertion") });
+        })
+        .expect_err("the body panic reaches the caller");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"the original assertion")
+        );
     }
 }

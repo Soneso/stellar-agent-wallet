@@ -273,6 +273,13 @@ impl std::fmt::Debug for RemoteServeHandle {
 }
 
 impl RemoteServeHandle {
+    /// Observes the listener task; completion means its listener was dropped.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    pub fn listener_tasks(&self) -> [tokio::task::AbortHandle; 1] {
+        [self.server_join.abort_handle()]
+    }
+
     /// Exposes session timing and CSRF state to adversarial listener tests.
     #[cfg(feature = "test-helpers")]
     #[must_use]

@@ -13,6 +13,10 @@ categories = ["authentication", "cryptography::cryptocurrencies"]
 [lib]
 name = "stellar_agent_webauthn_bridge"
 
+[features]
+# Exposes listener task completion to dependent crates' tests.
+test-helpers = ["stellar-agent-loopback-http/test-helpers"]
+
 [dependencies]
 # HTTP framework for the localhost bridge listener.
 # default-features = false; only tokio + http1 + json are enabled.
@@ -61,6 +65,7 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+stellar-agent-loopback-http = { workspace = true, features = ["test-helpers"] }
 stellar-agent-smart-account = { path = "../stellar-agent-smart-account", features = ["test-helpers"] }
 # HTTP client for integration tests (healthz, callbacks).
 reqwest = { workspace = true, features = ["json"] }

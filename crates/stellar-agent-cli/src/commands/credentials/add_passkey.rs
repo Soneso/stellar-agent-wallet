@@ -873,6 +873,7 @@ mod tests {
 
         let (bridge, mgr, _store) = start_test_registration(&dir, "opened").await;
         let bridge_addr = bridge.local_addr();
+        let listener_tasks = bridge.listener_tasks();
         let handle = mgr
             .prepare_registration("laptop", bridge_addr, None)
             .await
@@ -894,10 +895,7 @@ mod tests {
         .expect("the interrupt ends the registration wait");
         assert!(matches!(end, RegistrationEnd::Interrupted), "{end:?}");
         probe.assert_private_handoff(&handle.url, &handle.nonce);
-        assert!(
-            std::net::TcpStream::connect(bridge_addr).is_err(),
-            "the bridge stopped"
-        );
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
         crate::common::render::take_rendered_for_test();
         assert_eq!(finish_registration(end, &mgr, &mut writer, "laptop"), 1);
         let rendered = crate::common::render::take_rendered_for_test();
@@ -965,6 +963,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (bridge, mgr, store) = start_test_registration(&dir, tag).await;
         let bridge_addr = bridge.local_addr();
+        let listener_tasks = bridge.listener_tasks();
         let handle = mgr
             .prepare_registration("laptop", bridge_addr, None)
             .await
@@ -1015,10 +1014,7 @@ mod tests {
         )
         .await
         .expect("the registration ends");
-        assert!(
-            std::net::TcpStream::connect(bridge_addr).is_err(),
-            "the bridge stopped before the prompt"
-        );
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
 
         crate::common::render::take_rendered_for_test();
         let exit = finish_registration(end, &mgr, &mut writer, "laptop");

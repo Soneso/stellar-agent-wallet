@@ -92,6 +92,7 @@ rustls-pki-types = { workspace = true, optional = true, features = ["std"] }
 # on core's test helpers for the display form of the confirmation code the
 # registrar reports, and adds the HTTPS client for signed-origin listeners.
 test-helpers = [
+    "stellar-agent-loopback-http/test-helpers",
     "stellar-agent-core/test-helpers",
     "dep:rustls",
     "dep:tokio-rustls",
@@ -99,6 +100,7 @@ test-helpers = [
 ]
 
 [dev-dependencies]
+stellar-agent-loopback-http = { workspace = true, features = ["test-helpers"] }
 # ServiceExt::oneshot for in-process router tests.
 tower = { workspace = true }
 # Temporary directories for store/keyring test isolation.

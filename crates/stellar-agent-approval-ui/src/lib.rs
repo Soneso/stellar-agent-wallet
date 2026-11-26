@@ -258,6 +258,16 @@ impl std::fmt::Debug for ServeHandle {
 }
 
 impl ServeHandle {
+    /// Observes listener task completion for shutdown assertions.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    pub fn listener_tasks(&self) -> Vec<tokio::task::AbortHandle> {
+        match &self.server {
+            InboxServer::Single { join, .. } => vec![join.abort_handle()],
+            InboxServer::Pair(server) => server.listener_tasks().into(),
+        }
+    }
+
     /// The actual bound socket address (with the OS-assigned port when `0` was
     /// requested).
     #[must_use]

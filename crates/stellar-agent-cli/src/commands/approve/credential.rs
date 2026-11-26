@@ -310,6 +310,8 @@ where
             return 1;
         }
     };
+    #[cfg(test)]
+    signed_tests::record_listener_tasks(handle.listener_tasks());
     let end = enroll_until_done(
         handle,
         crate::common::mainnet_presence::OpenMode::Operator,
@@ -753,6 +755,7 @@ pub(crate) mod tests {
     ) -> (EnrollmentEnd, SoftwareRegistrar, String) {
         let (handle, url, token) = start().await;
         let addr = handle.local_addr();
+        let listener_tasks = handle.listener_tasks();
         let registrar = SoftwareRegistrar::new([0x21; 32], vec![0x5a; 20]);
         let probe = HandoffProbe::default();
         let (typed_tx, typed_rx) = tokio::sync::oneshot::channel::<io::Result<Option<String>>>();
@@ -822,10 +825,7 @@ pub(crate) mod tests {
             .expect("the enrollment ends");
             end
         };
-        assert!(
-            std::net::TcpStream::connect(addr).is_err(),
-            "the server stopped"
-        );
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
         if mode == crate::common::mainnet_presence::OpenMode::Private {
             let file = probe.redirect_file();
             assert!(!probe.launched()[0].contains(&token));
@@ -1056,7 +1056,7 @@ pub(crate) mod tests {
                             assert!(matches!(end, EnrollmentEnd::Expired));
                         } else {
                             let (handle, _, _) = start().await;
-                            let addr = handle.local_addr();
+                            let listener_tasks = handle.listener_tasks();
                             let end = expire_enrollment(
                                 enroll_until_done(
                                     handle,
@@ -1072,9 +1072,9 @@ pub(crate) mod tests {
                             )
                             .await;
                             assert!(matches!(end, EnrollmentEnd::Expired));
-                            assert!(
-                                std::net::TcpStream::connect(addr).is_err(),
-                                "the server stopped"
+                            crate::common::test_support::assert_listeners_stopped(
+                                &listener_tasks,
+                                2,
                             );
                             assert!(!enroll_trace::prompted());
                         }
@@ -1096,7 +1096,7 @@ pub(crate) mod tests {
         .await;
         assert!(matches!(end, EnrollmentEnd::Mismatch));
         let (handle, _, _) = start().await;
-        let addr = handle.local_addr();
+        let listener_tasks = handle.listener_tasks();
         let result = stellar_agent_test_support::timing::drive_call(
             enroll_until_done(
                 handle,
@@ -1110,7 +1110,7 @@ pub(crate) mod tests {
         )
         .await;
         assert!(matches!(result, EnrollmentEnd::Canceled));
-        assert!(std::net::TcpStream::connect(addr).is_err());
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
     }
 
     /// The rendered envelope of `end`, with the exit code.
@@ -1320,7 +1320,7 @@ pub(crate) mod tests {
     async fn credential_enrollment_uses_private_open() {
         let never_typed = || std::future::pending::<io::Result<Option<String>>>();
         let (handle, url, token) = start().await;
-        let addr = handle.local_addr();
+        let listener_tasks = handle.listener_tasks();
         let probe = HandoffProbe::default();
         let end = tokio::time::timeout(
             Duration::from_secs(30),
@@ -1337,16 +1337,13 @@ pub(crate) mod tests {
         .expect("the interrupt ends the wait");
         assert!(matches!(end, EnrollmentEnd::Canceled), "{end:?}");
         probe.assert_private_handoff(&url, &token);
-        assert!(
-            std::net::TcpStream::connect(addr).is_err(),
-            "the server stopped"
-        );
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
         let (exit, envelope) = rendered(end);
         assert_eq!(exit, 1);
         assert_eq!(envelope["error"]["code"], CANCELED.0);
 
         let (handle, _url, token) = start().await;
-        let addr = handle.local_addr();
+        let listener_tasks = handle.listener_tasks();
         let probe = HandoffProbe::default();
         let end = tokio::time::timeout(
             Duration::from_secs(30),
@@ -1364,10 +1361,7 @@ pub(crate) mod tests {
         assert!(matches!(end, EnrollmentEnd::BrowserRequired), "{end:?}");
         probe.assert_failed_open_left_nothing(&token);
         assert!(!probe.waited());
-        assert!(
-            std::net::TcpStream::connect(addr).is_err(),
-            "the server stopped"
-        );
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
         let (exit, envelope) = rendered(end);
         assert_eq!(exit, 1);
         assert_eq!(

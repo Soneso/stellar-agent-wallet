@@ -440,10 +440,7 @@ pub(crate) mod listener_driver {
         if mode == OpenMode::Operator {
             let url = handle.bootstrap_url().to_owned();
             let unavailable = || WalletError::Approval(ApprovalFailure::PresenceUnavailable);
-            let port = url::Url::parse(&url)
-                .map_err(|_| unavailable())?
-                .port()
-                .ok_or_else(unavailable)?;
+            let listener_tasks = handle.listener_tasks().ok_or_else(unavailable)?;
             let ceremony = presence_until_done(
                 handle,
                 mode,
@@ -454,7 +451,7 @@ pub(crate) mod listener_driver {
             let browser = submit(&url, nonce, flags);
             let (presence, sent) = tokio::join!(ceremony, browser);
             sent?;
-            if std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+            if listener_tasks.iter().any(|task| !task.is_finished()) {
                 return Err(unavailable());
             }
             return presence;
@@ -883,6 +880,7 @@ mod tests {
             } else {
                 entry.expires_at_unix_ms
             };
+            let listener_tasks = handle.listener_tasks();
             let (result, ()) = tokio::join!(
                 signed_presence_until_done(handle, &entry.approval_nonce, expires, interrupt),
                 drive
@@ -899,8 +897,7 @@ mod tests {
                     }
                 );
             }
-            std::net::TcpListener::bind(address)
-                .expect("shutdown releases the socket before the adapter returns");
+            crate::common::test_support::assert_listeners_stopped(&listener_tasks, 1);
         }
     }
 
@@ -1109,11 +1106,7 @@ mod tests {
             let fixture = MainnetConsentFixture::new("main");
             let entry = fixture.payment(600_000);
             let handle = presence_handle(&fixture, &entry).await;
-            let url = handle.bootstrap_url().to_owned();
-            let addr = url::Url::parse(&url)
-                .unwrap()
-                .socket_addrs(|| None)
-                .unwrap()[0];
+            let listener_tasks = handle.listener_tasks().unwrap();
             let ceremony = presence_until_done(
                 handle,
                 OpenMode::Operator,
@@ -1141,7 +1134,7 @@ mod tests {
                     "approval.presence_expired"
                 }
             );
-            assert!(std::net::TcpStream::connect(addr).is_err());
+            crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
             let store =
                 stellar_agent_core::approval::PendingApprovalStore::open(fixture.store_path())
                     .unwrap();

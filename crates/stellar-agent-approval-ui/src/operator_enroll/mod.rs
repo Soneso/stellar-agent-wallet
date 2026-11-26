@@ -322,6 +322,13 @@ impl std::fmt::Debug for OperatorEnrollHandle {
 }
 
 impl OperatorEnrollHandle {
+    /// Observes completion of both listener tasks for shutdown assertions.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    pub fn listener_tasks(&self) -> [tokio::task::AbortHandle; 2] {
+        self.server.listener_tasks()
+    }
+
     /// The IPv4 address of the listener pair, `127.0.0.1:<port>` (the
     /// OS-assigned port when `0` was requested). `[::1]` is bound on the same
     /// port.
@@ -967,16 +974,12 @@ mod tests {
                 std::io::ErrorKind::AddrInUse,
                 "no other socket can bind [::1]:{port}"
             );
+            let tasks = handle.listener_tasks();
+            assert_eq!(tasks.len(), 2, "one listener task per bound family");
             handle.shutdown().await.expect("clean shutdown");
-            assert!(tokio::net::TcpStream::connect(ipv6).await.is_err());
-            assert!(
-                tokio::net::TcpStream::connect(SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::LOCALHOST),
-                    port
-                ))
-                .await
-                .is_err()
-            );
+            for task in tasks {
+                assert!(task.is_finished(), "listener stopped after shutdown");
+            }
         }
     }
 

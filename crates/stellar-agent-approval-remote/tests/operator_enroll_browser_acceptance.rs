@@ -1403,8 +1403,9 @@ async fn signed_origin_enrollment_browser_exports_policy_credential() {
     );
     assert!(!counters.exists(), "enrollment writes no credential store");
     assert_eq!(std::fs::read(fixture.policy_path()).unwrap(), policy);
+    let tasks = handle.listener_tasks();
     handle.shutdown().await.expect("enrollment listener stops");
-    assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+    assert!(tasks[0].is_finished(), "listener stopped after shutdown");
 
     trusted_browser::sign_origin_policy(
         &fixture,

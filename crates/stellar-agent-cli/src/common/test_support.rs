@@ -2,6 +2,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, reason = "test assertions")]
 
+/// Proves shutdown from the server's tasks, independent of reuse of its port.
+pub(crate) fn assert_listeners_stopped(tasks: &[tokio::task::AbortHandle], expected: usize) {
+    assert_eq!(tasks.len(), expected, "one listener task per bound family");
+    for task in tasks {
+        assert!(task.is_finished(), "the listener task must have stopped");
+    }
+}
+
 /// Snapshots sorted relative paths and file contents beneath the root.
 pub(crate) fn tree(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
     fn walk(
