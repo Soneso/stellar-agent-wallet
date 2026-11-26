@@ -26,6 +26,7 @@
 //! Compiled only under `--features testnet-integration`:
 //!
 //! ```text
+//! cargo build --locked --release -p stellar-agent-cli --bin stellar-agent --no-default-features --features test-helpers --features stellar-agent-network/test-helpers
 //! cargo test --features testnet-integration --test smart_account_list_rules_testnet_acceptance
 //! ```
 //!
@@ -42,6 +43,10 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+mod acceptance;
+
+use stellar_agent_test_support::{cli_child, sandbox::StateSandbox};
+
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -583,10 +588,10 @@ async fn h2_valid_until_some_decoded_correctly_on_testnet() {
 ///
 /// # Pre-requisite
 ///
-/// The release binary must be built before running this test:
+/// The isolated release binary must be built before running this test:
 ///
 /// ```text
-/// cargo build --release -p stellar-agent-cli
+/// cargo build --locked --release -p stellar-agent-cli --bin stellar-agent --no-default-features --features test-helpers --features stellar-agent-network/test-helpers
 /// cargo test --features testnet-integration \
 ///     --test smart_account_list_rules_testnet_acceptance h3_cli_envelope_shape
 /// ```
@@ -594,29 +599,9 @@ async fn h2_valid_until_some_decoded_correctly_on_testnet() {
 #[tokio::test]
 async fn h3_cli_envelope_shape_on_testnet() {
     stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
-    // ── Locate the release binary ─────────────────────────────────────────────
-    // CARGO_MANIFEST_DIR is the `crates/stellar-agent-smart-account` directory;
-    // walk up two levels to reach the workspace root, then descend into the
-    // release output directory.
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .expect("crates/")
-        .parent()
-        .expect("workspace root");
-    let binary = workspace_root.join("target/release/stellar-agent");
-
-    if !binary.exists() {
-        eprintln!(
-            "SKIP: release binary not found at {}. \
-             Run `cargo build --release -p stellar-agent-cli` first.",
-            binary.display()
-        );
-        // Not a hard failure: the binary smoke gate is enforced separately.
-        // Return gracefully so the full testnet acceptance run does not
-        // gate-fail on a missing pre-built binary.
-        return;
-    }
+    let binary = acceptance::require_acceptance_binary(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/stellar-agent"),
+    );
 
     eprintln!("using binary: {}", binary.display());
 
@@ -689,9 +674,9 @@ async fn h3_cli_envelope_shape_on_testnet() {
     eprintln!("deleted rule {rule_1_id}; sparse-ID gap created");
 
     // ── Invoke the CLI binary ─────────────────────────────────────────────────
-    stellar_agent_test_support::sandbox::require_isolated_executable(&binary)
-        .expect("isolated acceptance child");
-    let output = std::process::Command::new(&binary)
+    let sandbox = StateSandbox::new().expect("CLI sandbox");
+    let output = cli_child::cli_command(&binary, sandbox.path())
+        .expect("isolated CLI child")
         .args([
             "smart-account",
             "list-rules",

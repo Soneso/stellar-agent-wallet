@@ -12,7 +12,7 @@
 //! Feature flags: `testnet-integration` + `deploy-cli`. Run with:
 //!
 //! ```text
-//! cargo build --release -p stellar-agent-cli
+//! cargo build --locked --release -p stellar-agent-cli --bin stellar-agent --no-default-features --features test-helpers --features stellar-agent-network/test-helpers
 //! cargo test --features "testnet-integration,deploy-cli" --test smart_account_caps_testnet_acceptance
 //! ```
 //!
@@ -21,8 +21,7 @@
 //! Tests require live testnet access and Friendbot funding. They are excluded
 //! from default `cargo test` runs.
 //!
-//! If the release binary is not built, the signer-cap and policy-cap tests log a
-//! skip message and return without failing.
+//! A missing, unreadable, or non-isolated binary fails before any network call.
 //!
 //! # Reference cross-check
 //!
@@ -48,6 +47,10 @@
     clippy::print_stderr,
     reason = "test-only; panics and diagnostic output are acceptable in testnet acceptance tests"
 )]
+
+mod acceptance;
+
+use stellar_agent_test_support::{cli_child, sandbox::StateSandbox};
 
 use std::time::Duration;
 
@@ -212,7 +215,7 @@ fn release_binary() -> std::path::PathBuf {
 ///
 /// # Design
 ///
-/// The test exercises the production CLI binary, not library internals, so
+/// The test exercises the isolated CLI binary, not library internals, so
 /// that any future regression that reorders or drops the cap-check in `add_run`
 /// is caught end-to-end. The substrate setup (deploy + install 15-signer rule +
 /// `decode_signer_count_from_scval` assertion) remains as a precondition guard:
@@ -233,11 +236,9 @@ fn release_binary() -> std::path::PathBuf {
 /// 7. Assert the stdout JSON envelope has `ok: false` and
 ///    `error.code == "validation.context_rule_caps_exceeded"`.
 ///
-/// # Graceful skip
+/// # Required binary
 ///
-/// If the release binary is not present, the test logs a skip message and
-/// returns without failing. The binary smoke gate enforces that the binary is
-/// built before sealing.
+/// A missing, unreadable, or non-isolated binary fails before any network call.
 ///
 /// # Reference cross-check
 ///
@@ -253,19 +254,7 @@ fn release_binary() -> std::path::PathBuf {
 #[tokio::test]
 async fn h1_16th_signer_refused() {
     stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
-    // ── Locate the release binary ─────────────────────────────────────────────
-    let binary = release_binary();
-    if !binary.exists() {
-        eprintln!(
-            "SKIP: release binary not found at {}. \
-             Run `cargo build --release -p stellar-agent-cli` first.",
-            binary.display()
-        );
-        // Not a hard failure: the binary smoke gate is enforced separately.
-        // Return gracefully so the full testnet acceptance run does not
-        // gate-fail on a missing pre-built binary.
-        return;
-    }
+    let binary = acceptance::require_acceptance_binary(release_binary());
     eprintln!("h1: using binary: {}", binary.display());
 
     // ── Step 1: Generate and fund the primary operator signer ────────────────
@@ -370,9 +359,9 @@ async fn h1_16th_signer_refused() {
         smart_account_strkey, rule_id_str, sixteenth_signer_g, TESTNET_RPC_URL, signer_env_var
     );
 
-    stellar_agent_test_support::sandbox::require_isolated_executable(&binary)
-        .expect("isolated acceptance child");
-    let output = std::process::Command::new(&binary)
+    let sandbox = StateSandbox::new().expect("CLI sandbox");
+    let output = cli_child::cli_command(&binary, sandbox.path())
+        .expect("isolated CLI child")
         .args([
             "smart-account",
             "signers",
@@ -387,6 +376,8 @@ async fn h1_16th_signer_refused() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
             "--signer-secret-env",
             signer_env_var,
         ])
@@ -751,7 +742,7 @@ async fn deploy_five_distinct_policies_h2(
 ///
 /// # Design
 ///
-/// Mirrors the `h1_16th_signer_refused` pattern: the test exercises the production CLI binary
+/// Mirrors the `h1_16th_signer_refused` pattern: the test exercises the isolated CLI binary
 /// end-to-end. A substrate setup (deploy + install 5-policy rule +
 /// `decode_policy_count_from_scval` assertion) acts as a precondition guard.
 ///
@@ -785,6 +776,10 @@ async fn deploy_five_distinct_policies_h2(
 /// 7. Assert exit code is non-zero.
 /// 8. Assert the JSON envelope carries `validation.context_rule_caps_exceeded`.
 ///
+/// # Required binary
+///
+/// A missing, unreadable, or non-isolated binary fails before any network call.
+///
 /// # Reference cross-check
 ///
 /// - OZ `mod.rs:524` SHA `a9c4216`: `pub const MAX_POLICIES: u32 = 5`.
@@ -803,16 +798,7 @@ async fn deploy_five_distinct_policies_h2(
 #[tokio::test]
 async fn h2_6th_policy_refused() {
     stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
-    // ── Locate the release binary ─────────────────────────────────────────────
-    let binary = release_binary();
-    if !binary.exists() {
-        eprintln!(
-            "SKIP: release binary not found at {}. \
-             Run `cargo build --release -p stellar-agent-cli` first.",
-            binary.display()
-        );
-        return;
-    }
+    let binary = acceptance::require_acceptance_binary(release_binary());
     eprintln!("h2: using binary: {}", binary.display());
 
     // ── Step 1: Generate and fund the operator signer ────────────────────────
@@ -961,9 +947,9 @@ async fn h2_6th_policy_refused() {
         smart_account_strkey, rule_id_str, sixth_policy_strkey, TESTNET_RPC_URL, signer_env_var
     );
 
-    stellar_agent_test_support::sandbox::require_isolated_executable(&binary)
-        .expect("isolated acceptance child");
-    let output = std::process::Command::new(&binary)
+    let sandbox = StateSandbox::new().expect("CLI sandbox");
+    let output = cli_child::cli_command(&binary, sandbox.path())
+        .expect("isolated CLI child")
         .args([
             "smart-account",
             "rules",
@@ -980,6 +966,8 @@ async fn h2_6th_policy_refused() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
             "--signer-secret-env",
             signer_env_var,
         ])

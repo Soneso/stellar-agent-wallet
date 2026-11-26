@@ -375,6 +375,104 @@ REHEARSAL_PIN_STEP = (
 RELEASE_WORKFLOW_ENV = ('env:\n  EXPECTED_MAINNET_WRITE: "on"\n'
                         "  # The toolchain publish.yml packages with; every build leg compiles with it.\n"
                         '  RELEASE_TOOLCHAIN: "1.100.0"\n')
+CI_DISPATCH = "  workflow_dispatch:\n"
+EVIDENCE_NAME = "      - name: Require the push CI evidence of the tag commit\n"
+EVIDENCE_ENV = "        env:\n          GH_TOKEN: ${{ github.token }}\n"
+EVIDENCE_RUN = ('        run: python3 .github/scripts/check-run-evidence.py --repository "$GITHUB_REPOSITORY" '
+                '--sha "$GITHUB_SHA" --tag "$GITHUB_REF_NAME" --wait-minutes 80 --poll-seconds 60\n')
+EVIDENCE_STEP = EVIDENCE_NAME + EVIDENCE_ENV + EVIDENCE_RUN
+ANCESTRY_STEP = ('      - name: Refuse a tag whose commit is not on main\n'
+                 '        run: .github/scripts/check-ref-on-main.sh "$GITHUB_SHA"\n')
+WARN_STEP = "      - name: Warn when a workspace member is missing on crates.io\n"
+VERSION_STEP = "      - name: Verify tag matches workspace version\n"
+PREFLIGHT_PERMISSIONS = "    permissions:\n      contents: read\n      actions: read\n    outputs:\n"
+WORKFLOW_PERMISSIONS = "permissions:\n  contents: read\n\nenv:\n"
+# The tail of the release vendored-wasm call; WASM_CALL below holds the whole job.
+EVIDENCE_WASM_CALL = ("    needs: preflight\n    permissions:\n      contents: read\n"
+                      "    uses: ./.github/workflows/vendored-wasm.yml\n")
+PROVENANCE_PERMISSIONS = "      actions: read\n      id-token: write\n"
+EVIDENCE_COMMAND = "the evidence step must run its command unconditionally in bash with only the token"
+PROVENANCE_USES = "    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0\n"
+PREFLIGHT_STEPS_START = "    outputs:\n      version: ${{ steps.version.outputs.version }}\n    steps:\n"
+EVIDENCE_ORDER = "the evidence step must directly follow the ancestry step"
+EVIDENCE_PERMISSIONS = "preflight must hold exactly contents: read and actions: read, unconditionally"
+
+
+def evidence_case(label, fragment, *edits):
+    return (label, "release-ci-evidence", fragment, [(RELEASE, old, new, count) for old, new, count in edits])
+
+
+RELEASE_EVIDENCE_CASES = [
+    evidence_case("evidence step removed", EVIDENCE_ORDER, (EVIDENCE_STEP, "", 1)),
+    evidence_case("evidence step duplicated", EVIDENCE_ORDER, (EVIDENCE_STEP, EVIDENCE_STEP * 2, 1)),
+    evidence_case("evidence step before the ancestry step", EVIDENCE_ORDER,
+                  (EVIDENCE_STEP, "", 1), (ANCESTRY_STEP, EVIDENCE_STEP + ANCESTRY_STEP, 1)),
+    evidence_case("evidence step after another step", EVIDENCE_ORDER,
+                  (EVIDENCE_STEP, "", 1), (VERSION_STEP, EVIDENCE_STEP + VERSION_STEP, 1)),
+    evidence_case("ancestry step removed", EVIDENCE_ORDER, (ANCESTRY_STEP, "", 1)),
+    evidence_case("evidence step with if", EVIDENCE_COMMAND, (EVIDENCE_NAME, EVIDENCE_NAME + "        if: always()\n", 1)),
+    evidence_case("evidence step with continue-on-error", EVIDENCE_COMMAND,
+                  (EVIDENCE_NAME, EVIDENCE_NAME + "        continue-on-error: true\n", 1)),
+    evidence_case("evidence command changed", EVIDENCE_COMMAND, ("--wait-minutes 80", "--wait-minutes 0", 1)),
+    evidence_case("evidence command suppressed", EVIDENCE_COMMAND, ("--poll-seconds 60\n", "--poll-seconds 60 || true\n", 1)),
+    evidence_case("evidence step with another env", EVIDENCE_COMMAND,
+                  (EVIDENCE_ENV, EVIDENCE_ENV + "          EXTRA: value\n", 1)),
+    evidence_case("evidence step without the token", EVIDENCE_COMMAND, (EVIDENCE_ENV, "", 1)),
+    # Each token below is added while the evidence step keeps its own.
+    evidence_case("evidence step with another shell", EVIDENCE_COMMAND,
+                  (EVIDENCE_NAME, EVIDENCE_NAME + "        shell: true {0}\n", 1)),
+    evidence_case("evidence step under a job default shell", EVIDENCE_COMMAND,
+                  (PREFLIGHT_STEPS_START, PREFLIGHT_STEPS_START.replace(
+                      "    steps:\n", "    defaults:\n      run:\n        shell: sh\n    steps:\n"), 1)),
+    evidence_case("token in the job env", "job env sets a token variable",
+                  (PREFLIGHT_PERMISSIONS, PREFLIGHT_PERMISSIONS.replace(
+                      "    outputs:\n", "    env:\n      GH_TOKEN: ${{ github.token }}\n    outputs:\n"), 1)),
+    evidence_case("token name in the job env", "job env sets a token variable",
+                  (PREFLIGHT_PERMISSIONS, PREFLIGHT_PERMISSIONS.replace(
+                      "    outputs:\n", "    env:\n      gh_token: fixed\n    outputs:\n"), 1)),
+    evidence_case("github token under another name in the job env", "an expression reads the workflow token",
+                  (PREFLIGHT_PERMISSIONS, PREFLIGHT_PERMISSIONS.replace(
+                      "    outputs:\n", "    env:\n      API: ${{ github.token }}\n    outputs:\n"), 1)),
+    evidence_case("token in the workflow env", "workflow env sets a token variable",
+                  (RELEASE_WORKFLOW_ENV, RELEASE_WORKFLOW_ENV + "  GITHUB_TOKEN: ${{ github.token }}\n", 1)),
+    evidence_case("token variable in another preflight step", "step 6 sets a token variable",
+                  (WARN_STEP, WARN_STEP + "        env:\n          GITHUB_TOKEN: fixed\n", 1)),
+    evidence_case("token in another preflight step", "an expression reads secrets",
+                  (WARN_STEP, WARN_STEP + "        env:\n          API: ${{ secrets.GITHUB_TOKEN }}\n", 1)),
+    evidence_case("indexed github token in a preflight step", "other than by a named property",
+                  (WARN_STEP, WARN_STEP + "        env:\n          API: ${{ github['token'] }}\n", 1)),
+    evidence_case("whole github context in a preflight step", "other than by a named property",
+                  (WARN_STEP, WARN_STEP + "        env:\n          API: ${{ toJSON(github) }}\n", 1)),
+    evidence_case("evidence step reads the token through working-directory", "an expression reads the workflow token",
+                  (EVIDENCE_NAME, EVIDENCE_NAME + "        working-directory: ${{ github.token }}\n", 1)),
+    evidence_case("github token under another name in the workflow env", "an expression reads the workflow token",
+                  (RELEASE_WORKFLOW_ENV, RELEASE_WORKFLOW_ENV + "  API: ${{ github.token }}\n", 1)),
+    evidence_case("token in the workflow defaults", "an expression reads the workflow token",
+                  (WORKFLOW_PERMISSIONS, WORKFLOW_PERMISSIONS.replace(
+                      "\nenv:\n", "\ndefaults:\n  run:\n    working-directory: ${{ github.token }}\n\nenv:\n"), 1)),
+    evidence_case("token in the preflight outputs", "an expression reads the workflow token",
+                  (PREFLIGHT_STEPS_START, PREFLIGHT_STEPS_START.replace(
+                      "    steps:\n", "      token: ${{ github.token }}\n    steps:\n"), 1)),
+    evidence_case("provenance with another generator", "provenance must hold no actions scope",
+                  (PROVENANCE_USES, PROVENANCE_USES.replace("@v2.1.0", "@v2.0.0"), 1)),
+    evidence_case("provenance with steps", "provenance must hold no actions scope",
+                  (PROVENANCE_USES, PROVENANCE_USES + "    steps:\n      - run: echo\n", 1)),
+    evidence_case("preflight without actions: read", EVIDENCE_PERMISSIONS,
+                  (PREFLIGHT_PERMISSIONS, PREFLIGHT_PERMISSIONS.replace("      actions: read\n", ""), 1)),
+    evidence_case("conditional preflight", EVIDENCE_PERMISSIONS,
+                  (PREFLIGHT_PERMISSIONS, "    if: always()\n" + PREFLIGHT_PERMISSIONS, 1)),
+    evidence_case("actions: read on another release job", "vendored-wasm must hold no actions scope",
+                  (EVIDENCE_WASM_CALL, EVIDENCE_WASM_CALL.replace(
+                      "      contents: read\n", "      contents: read\n      actions: read\n"), 1)),
+    evidence_case("read-all on another release job", "vendored-wasm must hold no actions scope",
+                  (EVIDENCE_WASM_CALL, EVIDENCE_WASM_CALL.replace(
+                      "    permissions:\n      contents: read\n", "    permissions: read-all\n"), 1)),
+    evidence_case("actions: read on the workflow", "the workflow must hold no actions scope",
+                  (WORKFLOW_PERMISSIONS, WORKFLOW_PERMISSIONS.replace("  contents: read\n",
+                                                                      "  contents: read\n  actions: read\n"), 1)),
+    evidence_case("provenance gains a scope", "provenance must hold no actions scope",
+                  (PROVENANCE_PERMISSIONS, PROVENANCE_PERMISSIONS + "      checks: read\n", 1)),
+]
 REHEARSAL_MARKER_RUN = ('        run: bash .github/scripts/check-packaged-markers.sh target '
                         'target/package-verification-start "$EXPECTED_MAINNET_WRITE" "$VERSION"\n')
 # The defining command of each feature job of ci.yml, as its run: line.
@@ -748,6 +846,10 @@ VARS_LOCATIONS = (
 PASSING = [
     ("W17", changelog_edit(CHANGELOG_IF, '        if: "  ${{ ' + CHANGELOG_CONDITION + ' }}  "\n')),
     ("W15 main-only changelog changes pass", []),
+    ("CI workflow_dispatch as an empty mapping passes", [(CI, CI_DISPATCH, "  workflow_dispatch: {}\n", 1)]),
+    ("release evidence step token passes", []),
+    ("workflow env without a token passes",
+     [(RELEASE, RELEASE_WORKFLOW_ENV, RELEASE_WORKFLOW_ENV + "  SAMPLE: ${{ github.ref_name }}\n", 1)]),
     ("skill archive block run passes", [
         (CI, SKILL_ARCHIVE_RUN, "        run: |\n          .github/scripts/package-skill.sh --check\n", 1)]),
     ("apt-get in comments passes", [
@@ -836,9 +938,14 @@ CASES = [
     ("CI pull request branches without main", "ci-triggers", "pull_request branches must include main", [
         (CI, "  pull_request:\n    branches: [main, next]\n",
          "  pull_request:\n    branches: [next]\n", 1)], 1),
-    ("CI adds workflow_dispatch", "ci-triggers",
-     "archive condition must be re-evaluated for the new event: workflow_dispatch", [
-        (CI, "on:\n", "on:\n  workflow_dispatch:\n", 1)], 1),
+    ("CI adds repository_dispatch", "ci-triggers",
+     "archive condition must be re-evaluated for the new event: repository_dispatch", [
+        (CI, "on:\n", "on:\n  repository_dispatch:\n", 1)], 1),
+    ("CI without workflow_dispatch", "ci-triggers", "workflow_dispatch must be a trigger without inputs", [
+        (CI, CI_DISPATCH, "", 1)], 1),
+    ("CI workflow_dispatch with inputs", "ci-triggers", "workflow_dispatch must be a trigger without inputs", [
+        (CI, CI_DISPATCH, CI_DISPATCH + "    inputs:\n      full:\n        type: boolean\n", 1)], 1),
+    *RELEASE_EVIDENCE_CASES,
     ("skill archive step removed", "skill-archive", "expected exactly one skill archive step", [
         (CI, SKILL_ARCHIVE_STEP, "", 1)], 1),
     ("skill archive skipped for main pull requests", "skill-archive", "skill archive condition differs", [
@@ -2145,6 +2252,12 @@ for workflow in (TESTNET, ".github/workflows/install-surface.yml", ".github/work
         (workflow, "\npermissions:\n", "\nremoved-permissions:\n", 1)]))
 CASES.append(("testnet checkout credentials", "checkout-credentials", "persist-credentials", [
     (TESTNET, "          persist-credentials: false\n", "          persist-credentials: true\n", 2)]))
+CASES.append(("testnet config run input", "run-inputs", "run: reads", [
+    (TESTNET, '          elif [ "$MAINNET_WRITE" = true ]; then',
+     '          elif [ "${{ inputs.mainnet_write }}" = true ]; then', 1)]))
+CASES.append(("testnet revision run input", "run-inputs", "run: reads", [
+    (TESTNET, 'run: test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"',
+     'run: test "$(git rev-parse HEAD)" = "${{ inputs.filter }}"', 2)]))
 for action in ("actions/checkout", "actions/setup-python"):
     old = live_text(CHANGELOG, re.compile(rf"{action}@[0-9a-f]{{40}}"), f"{action} pin")
     revision = old.split("@")[1]
@@ -2284,6 +2397,8 @@ CASES.extend([
         (".github/workflows/ci.yml", "      - name: Self-test the self-test classifier\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the self-test classifier\n", 1)]),
     ("S06 condition ci.yml Self-test the CI result gate", "selftest-selection", "self-test condition", [
         (".github/workflows/ci.yml", "      - name: Self-test the CI result gate\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the CI result gate\n", 1)]),
+    ("S06 condition ci.yml Self-test the run evidence check", "selftest-selection", "self-test condition", [
+        (".github/workflows/ci.yml", "      - name: Self-test the run evidence check\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the run evidence check\n", 1)]),
     ("S06 condition ci.yml Self-test the documentation read check", "selftest-selection", "self-test condition", [
         (".github/workflows/ci.yml", "      - name: Self-test the documentation read check\n        if: needs.changes.outputs.selftest_scripts != 'false'\n", "      - name: Self-test the documentation read check\n", 1)]),
     ("S06 condition ci.yml Self-test the unsigned archive validation", "selftest-selection", "self-test condition", [
@@ -2468,6 +2583,12 @@ MUTATIONS = {
     "install-tag-binding": (
         'if (step.get("env") or {}).get("TAG") != "${{ steps.tag.outputs.tag }}":', 'if False:',
         ["publish install tag binding"]),
+    "testnet-input-channel": (r'if re.search(r"\binputs\.", expression):', 'if False:',
+                            ["testnet config run input", "testnet revision run input"]),
+    "testnet-checkout-credentials": ('if with_.get("persist-credentials") not in (False, "false"):',
+                                    'if False:', ["testnet checkout credentials"]),
+    "testnet-permissions": ('if "permissions" not in doc:', 'if False:',
+                           [".github/workflows/testnet.yml named permissions"]),
     "wallet-toolchain": ("        self.check_wallet_toolchain()\n", "",
                          [label for label, _, _ in WALLET_TOOLCHAIN_CASES]),
     "wallet-toolchain-invalid-channel-return": (
@@ -2575,8 +2696,105 @@ MUTATIONS = {
         'if not isinstance(branches, list) or "main" not in branches:', 'if False:',
         ['CI pull request branches without main']),
     "ci-trigger-events": (
-        'for event in sorted(set(triggers) - {"push", "pull_request"}):', 'for event in ():',
-        ['CI adds workflow_dispatch']),
+        'for event in sorted(set(triggers) - {"push", "pull_request", "workflow_dispatch"}):', 'for event in ():',
+        ['CI adds repository_dispatch']),
+    "ci-trigger-dispatch": (
+        'if "workflow_dispatch" not in triggers or triggers["workflow_dispatch"] not in (None, {}):', 'if False:',
+        ['CI without workflow_dispatch', 'CI workflow_dispatch with inputs']),
+    "ci-trigger-dispatch-inputs": (
+        'if "workflow_dispatch" not in triggers or triggers["workflow_dispatch"] not in (None, {}):',
+        'if "workflow_dispatch" not in triggers:', ['CI workflow_dispatch with inputs']),
+    "ci-trigger-dispatch-mapping": (
+        'triggers["workflow_dispatch"] not in (None, {}):', 'triggers["workflow_dispatch"] is not None:',
+        ['CI workflow_dispatch as an empty mapping passes']),
+    "release-evidence-upper": (
+        '{str(key).upper() for key in env} & TOKEN_ENV', '{str(key) for key in env} & TOKEN_ENV',
+        ['token name in the job env']),
+    "release-evidence-check": (
+        '        self.check_release_ci_evidence()\n', '',
+        [case[0] for case in RELEASE_EVIDENCE_CASES]),
+    "release-evidence-permissions": (
+        'if job.get("permissions") != RELEASE_EVIDENCE_PERMISSIONS or self.may_skip(job):',
+        'if self.may_skip(job):', ['preflight without actions: read']),
+    "release-evidence-job-skip": (
+        'if job.get("permissions") != RELEASE_EVIDENCE_PERMISSIONS or self.may_skip(job):',
+        'if job.get("permissions") != RELEASE_EVIDENCE_PERMISSIONS:', ['conditional preflight']),
+    "release-evidence-provenance": (
+        'if (owner == "provenance" and permissions == RELEASE_PROVENANCE_PERMISSIONS\n',
+        'if (owner == "provenance"\n', ['provenance gains a scope']),
+    "release-evidence-provenance-uses": (
+        '                    and node.get("uses") == RELEASE_PROVENANCE_USES and "steps" not in node):',
+        '                    and "steps" not in node):', ['provenance with another generator']),
+    "release-evidence-provenance-steps": (
+        '                    and node.get("uses") == RELEASE_PROVENANCE_USES and "steps" not in node):',
+        '                    and node.get("uses") == RELEASE_PROVENANCE_USES):', ['provenance with steps']),
+    "release-evidence-string": (
+        'if isinstance(permissions, str) or (isinstance(permissions, dict) and "actions" in permissions):',
+        'if isinstance(permissions, dict) and "actions" in permissions:', ['read-all on another release job']),
+    "release-evidence-actions": (
+        'if isinstance(permissions, str) or (isinstance(permissions, dict) and "actions" in permissions):',
+        'if isinstance(permissions, str):',
+        ['actions: read on another release job', 'actions: read on the workflow', 'provenance gains a scope']),
+    "release-evidence-count": (
+        'if len(evidence) != 1 or len(ancestry) != 1 or evidence[0] != ancestry[0] + 1:',
+        'if not evidence or len(ancestry) != 1 or evidence[0] != ancestry[0] + 1:', ['evidence step duplicated']),
+    "release-evidence-order": (
+        'if len(evidence) != 1 or len(ancestry) != 1 or evidence[0] != ancestry[0] + 1:',
+        'if len(evidence) != 1 or len(ancestry) != 1 or evidence[0] > ancestry[0] + 1:',
+        ['evidence step before the ancestry step']),
+    "release-evidence-directly": (
+        'if len(evidence) != 1 or len(ancestry) != 1 or evidence[0] != ancestry[0] + 1:',
+        'if len(evidence) != 1 or len(ancestry) != 1 or evidence[0] < ancestry[0]:',
+        ['evidence step after another step']),
+    "release-evidence-ancestry": (
+        'if len(evidence) != 1 or len(ancestry) != 1 or evidence[0] != ancestry[0] + 1:',
+        'if len(evidence) != 1 or (ancestry and evidence[0] != ancestry[0] + 1):', ['ancestry step removed']),
+    "release-evidence-skip": (
+        'if self.may_skip(step) or self.effective_shell(', 'if self.effective_shell(',
+        ['evidence step with if', 'evidence step with continue-on-error']),
+    "release-evidence-shell": (
+        'self.effective_shell(workflow, "preflight", step) not in (None, "bash") \\', 'False \\',
+        ['evidence step with another shell', 'evidence step under a job default shell']),
+    "release-evidence-command": (
+        '                    or self.run_text(step).strip() != RELEASE_EVIDENCE_COMMAND \\\n', '',
+        ['evidence command changed', 'evidence command suppressed']),
+    "release-evidence-env": (
+        '                    or step.get("env") != RELEASE_EVIDENCE_ENV:',
+        '                    or False:', ['evidence step with another env', 'evidence step without the token']),
+    "release-evidence-workflow-env": (
+        'for owner, env in [("workflow env", doc.get("env")), ', 'for owner, env in [',
+        ['token in the workflow env']),
+    "release-evidence-job-env": (
+        '("job env", job.get("env")),\n', '\n', ['token in the job env', 'token name in the job env']),
+    "release-evidence-steps": (
+        'step.get("env")) for i, step in enumerate(steps) if i not in evidence)]:',
+        'step.get("env")) for i, step in enumerate(steps) if False)]:', ['token variable in another preflight step']),
+    "release-evidence-names": (
+        'if isinstance(env, dict) and {str(key).upper() for key in env} & TOKEN_ENV:', 'if False:',
+        ['token in the job env', 'token name in the job env', 'token in the workflow env',
+         'token variable in another preflight step']),
+    "release-evidence-expressions": (
+        '        self.check_credential_expressions(f"{workflow}:preflight", {"preflight": scanned, **inherited}, rule)\n',
+        '', ['github token under another name in the job env', 'token in another preflight step',
+             'indexed github token in a preflight step', 'whole github context in a preflight step',
+             'token in the workflow defaults', 'token in the preflight outputs']),
+    "release-evidence-own-token": (
+        'if not (i in evidence and key == "env")}', 'if True}', ['release evidence step token passes']),
+    "release-evidence-step-env-key": (
+        'if not (i in evidence and key == "env")}', 'if i not in evidence}',
+        ['evidence step reads the token through working-directory']),
+    "release-evidence-inherited-env": (
+        'for key in ("env", "defaults") if key in doc}', 'for key in ("defaults",) if key in doc}',
+        ['github token under another name in the workflow env']),
+    "release-evidence-inherited-scope": (
+        'inherited = {key: doc[key] for key in ("env", "defaults") if key in doc}', 'inherited = dict(doc)',
+        ['workflow env without a token passes']),
+    "release-evidence-inherited": (
+        'inherited = {key: doc[key] for key in ("env", "defaults") if key in doc}', 'inherited = {}',
+        ['token in the workflow defaults']),
+    "release-evidence-defaults": (
+        'for key in ("env", "defaults") if key in doc}', 'for key in ("env",) if key in doc}',
+        ['token in the workflow defaults']),
     "skill-archive-check": (
         '        self.check_skill_archive()\n', '',
         ['skill archive step removed', 'skill archive skipped for main pull requests',
@@ -2867,7 +3085,7 @@ MUTATIONS.update({
         ["S09 unknown test","S11 mixed groups"]),
     "S-conditions": (
         "if step.get(\"if\") != f\"{prefix}.outputs.selftest_{group} != 'false'\":", "if False:",
-        ["S06 condition ci.yml Self-test feature discipline and assertions","S06 condition ci.yml Self-test the publish tier check","S06 condition install-surface.yml Self-test the preflight","S18 inverted false","S19 unknown group"]),
+        ["S06 condition ci.yml Self-test feature discipline and assertions","S06 condition ci.yml Self-test the publish tier check","S06 condition install-surface.yml Self-test the preflight","S06 condition ci.yml Self-test the run evidence check","S18 inverted false","S19 unknown group"]),
     "S-mixed": (
         "self.report(workflow, \"selftest-checks\", f\"{name}: self-tests must be separate and fail on errors\")", "pass",
         ["S12 mixed check","S13 selftest errors","S14 selftest suppression"]),

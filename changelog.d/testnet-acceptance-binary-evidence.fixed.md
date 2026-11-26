@@ -1,0 +1,1 @@
+- Smart-account testnet acceptance tests fail when their binary is missing, and the payment evidence check requires the tested commit and feature state.

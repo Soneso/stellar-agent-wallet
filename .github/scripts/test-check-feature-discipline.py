@@ -17,6 +17,7 @@ violate too.
 """
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -742,7 +743,7 @@ def testnet_driver(m, function=None, assignment=None, extra=''):
     mainnet-write, crate b does not."""
     function = m.TESTNET_FEATURES_FUNCTION if function is None else function
     assignment = m.TESTNET_FEATURES_ASSIGNMENT if assignment is None else assignment
-    return (function + '\n'
+    return (m.TESTNET_BINARY_FUNCTION + '\n' + m.TESTNET_BINARY_CALL + '\n' + function + '\n'
             'SUITES=(\n  "a testnet-acceptance a_testnet"\n  "b testnet-integration b_testnet"\n)\n'
             'run_suite() {\n  local crate="$1" feature="$2" target="$3" features\n'
             f'  {assignment}\n{extra}'
@@ -763,7 +764,8 @@ def testnet_inventory(m, tmp, driver, manifests=('a', 'b')):
 @unit('testnet-driver-features')
 def case_testnet_driver_features(m, tmp, checker):
     rows = testnet_inventory(m, tmp, testnet_driver(m))
-    found = sorted((row['job'], row['selection'][1], row['features'][-1], row['relied_on']) for row in rows)
+    found = sorted((row['job'], row['selection'][1], row['features'][-1], row['relied_on'])
+                   for row in rows if '--test' in row['command'])
     assert found == [('acceptance-1', 'a', 'mainnet-write,testnet-acceptance', 'on'),
                      ('acceptance-1', 'a', 'testnet-acceptance', 'off'),
                      ('acceptance-2', 'b', 'testnet-integration', 'off')], f'testnet-driver-features: {found}'
@@ -797,8 +799,40 @@ def case_testnet_driver_partitions(m, tmp, checker):
     assert sorted(map(str, rows)) == sorted(map(str, reviewed)), 'reviewed share inventory differs'
     for index in (1, 2):
         targets = {re.search(r'--test "([^" ]+)"', row['command'])[1]
-                   for row in rows if row['job'] == f'acceptance-{index}' and '--no-run' not in row['command']}
+                   for row in rows if row['job'] == f'acceptance-{index}' and '--test' in row['command']}
         assert targets == {entry['target'] for entry in full[index - 1::2]}
+
+
+@unit('testnet-driver-binary')
+def case_testnet_driver_binary(m, tmp, checker):
+    source = testnet_driver(m)
+    rows = testnet_inventory(m, tmp / 'valid', source)
+    builds = [row for row in rows if row['command'].startswith('cargo build ')]
+    assert len(builds) == 4, 'one isolated build per share and feature state'
+    for job in ('acceptance-1', 'acceptance-2'):
+        found = {row['relied_on']: row for row in builds if row['job'] == job}
+        for state, command in (('off', m.TESTNET_BINARY_OFF), ('on', m.TESTNET_BINARY_ON)):
+            row = found[state]
+            assert row['command'] == command
+            assert row['selection'] == ['-p', 'stellar-agent-cli']
+            assert row['edges'] == 'normal,build' and row['bins'] == ['stellar-agent']
+            assert row['features'] == ['--no-default-features', '--features',
+                                      ('mainnet-write,' if state == 'on' else '') + 'test-helpers',
+                                      '--features', 'stellar-agent-network/test-helpers']
+    for index, broken in enumerate((
+            source.replace(m.TESTNET_BINARY_FUNCTION, ''),
+            source.replace(m.TESTNET_BINARY_CALL, ''),
+            source.replace(m.TESTNET_BINARY_CALL, m.TESTNET_BINARY_CALL + '\n' + m.TESTNET_BINARY_CALL),
+            source.replace('if [ "$MAINNET_WRITE" = on ]', 'if [ "$MAINNET_WRITE" = off ]'),
+            source.replace(m.TESTNET_BINARY_OFF, m.TESTNET_BINARY_OFF.replace(' --features stellar-agent-network/test-helpers', '')),
+            source.replace(m.TESTNET_BINARY_ON, m.TESTNET_BINARY_ON.replace('mainnet-write,test-helpers', 'test-helpers')),
+    )):
+        try:
+            testnet_inventory(m, tmp / str(index), broken)
+        except ValueError as error:
+            assert 'isolated binary build differs' in str(error)
+        else:
+            raise AssertionError('changed or missing isolated binary build accepted')
 
 
 @unit('testnet-driver-reviewed-text')
@@ -836,15 +870,30 @@ def case_testnet_driver_activation(m, tmp, checker):
     c = bare_checker(m, root, workflows, scripts)
     c.D9()
     expected = f'D9: testnet.yml:nightly: feature activation outside allowed jobs: {m.TESTNET_DRIVER} (mainnet-write,'
-    assert c.errors and all(error.startswith(expected) for error in c.errors), \
+    assert c.errors and any(error.startswith(expected) for error in c.errors), \
         f'testnet-driver-activation: nightly fixture accepted or wrong failure: {c.errors}'
+    assert any('testnet.yml:nightly:' in error and m.TESTNET_BINARY_ON in error for error in c.errors), \
+        'testnet-driver-activation: isolated build allowed in another job'
+    workflows, scripts = m.workflow_inputs(ROOT)
+    scripts[m.TESTNET_DRIVER] += '\ncargo test -p stellar-agent-cli --features mainnet-write\n'
+    c = bare_checker(m, ROOT, workflows, scripts)
+    c.D9()
+    assert f'D9: {m.TESTNET_DRIVER}: feature activation: cargo test -p stellar-agent-cli --features mainnet-write' in c.errors, \
+        'testnet-driver-activation: another command allowed in the script'
+    assert any('testnet.yml:acceptance-1:' in error and 'cargo test -p stellar-agent-cli --features mainnet-write' in error
+               for error in c.errors), 'testnet-driver-activation: another command allowed in the job'
+    scripts['.github/scripts/foreign-build.sh'] = m.TESTNET_BINARY_ON
+    c = bare_checker(m, ROOT, workflows, scripts)
+    c.D9()
+    assert any('.github/scripts/foreign-build.sh: feature activation:' in error for error in c.errors), \
+        'testnet-driver-activation: another script allowed'
 
 
 def prebuild_driver(m, children='"m_child" "m_child_two"', prebuild=None):
     """A testnet acceptance driver with three MCP suites, two of them
     child-driver suites in share 1/2, and one suite of crate b."""
     prebuild = m.TESTNET_PREBUILD if prebuild is None else prebuild
-    return (m.TESTNET_FEATURES_FUNCTION + '\n'
+    return (m.TESTNET_BINARY_FUNCTION + '\n' + m.TESTNET_BINARY_CALL + '\n' + m.TESTNET_FEATURES_FUNCTION + '\n'
             f'CHILD_DRIVER_SUITES=(\n  {children}\n)\n'
             'SUITES=(\n  "stellar-agent-mcp testnet-acceptance m_child"\n'
             '  "stellar-agent-mcp testnet-acceptance m_plain"\n'
@@ -2140,7 +2189,26 @@ MUTATIONS = {
         'd9-coverage-allowance coverage-on: accepted form rejected'),
     'D9-testnet-detection': ('testnet-driver-activation',
         'if path.as_posix() == TESTNET_DRIVER:', 'if False:',
-        'testnet-driver-activation: nightly fixture accepted or wrong failure: []'),
+        'testnet-driver-activation: nightly fixture accepted or wrong failure:'),
+    'D3-testnet-binary': ('testnet-driver-binary',
+        'if functions != [TESTNET_BINARY_FUNCTION] or source.splitlines().count(TESTNET_BINARY_CALL) != 1:',
+        'if False:', 'changed or missing isolated binary build accepted'),
+    'D3-testnet-build-expansion': ('testnet-driver-binary',
+        "if source.endswith('run-testnet-acceptance.sh') and family != 'build':",
+        "if source.endswith('run-testnet-acceptance.sh'):",
+        'one isolated build per share and feature state'),
+    'D9-testnet-build-job': ('testnet-driver-activation',
+        'and (workflow, job_name, TESTNET_DRIVER) in TESTNET_ACTIVATION_ALLOWANCE',
+        'and True', 'testnet-driver-activation: isolated build allowed in another job'),
+    'D9-testnet-build-command': ('testnet-driver-activation',
+        'and command == TESTNET_BINARY_ON\n',
+        'and True\n', 'testnet-driver-activation: another command allowed in the job'),
+    'D9-testnet-build-script': ('testnet-driver-activation',
+        'if path == TESTNET_DRIVER and command == TESTNET_BINARY_ON:',
+        'if command == TESTNET_BINARY_ON:', 'testnet-driver-activation: another script allowed'),
+    'D9-testnet-script-command': ('testnet-driver-activation',
+        'if path == TESTNET_DRIVER and command == TESTNET_BINARY_ON:',
+        'if path == TESTNET_DRIVER:', 'testnet-driver-activation: another command allowed in the script'),
     'D8-mapping-flags': ('workflow-flag-guards',
         'yield name, json.dumps(document)',
         "yield name, '\\n'.join(run_text(step) for job in document.get('jobs', {}).values() for step in job.get('steps', []))",
@@ -2181,6 +2249,7 @@ def named_mutations(checker, directory, selected=None):
             f'{name}: expected assertion does not fail: {result.stdout}\n{result.stderr}'
         print(f'ok mutation-{name}: {result.stderr.strip()}')
         path.write_text(source)
+        assert hashlib.md5(path.read_bytes()).digest() == hashlib.md5(source.encode()).digest(), 'restore differs'
         path.touch()
         result = subprocess.run([sys.executable, str(HERE / 'test-check-feature-discipline.py'),
                                  '--case', case, '--checker', str(path)], text=True, capture_output=True)

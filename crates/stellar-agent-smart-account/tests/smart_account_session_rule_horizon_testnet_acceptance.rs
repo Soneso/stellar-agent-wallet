@@ -16,17 +16,14 @@
 //! Feature flag: `testnet-integration`. Run with:
 //!
 //! ```text
-//! cargo build --release -p stellar-agent-cli
+//! cargo build --locked --release -p stellar-agent-cli --bin stellar-agent --no-default-features --features test-helpers --features stellar-agent-network/test-helpers
 //! cargo test --features testnet-integration --test smart_account_session_rule_horizon_testnet_acceptance
 //! ```
 //!
 //! Tests require live testnet access and Friendbot funding. They are excluded
 //! from default `cargo test` runs.
 //!
-//! If the release binary is not built, the tests log a skip message and
-//! return without failing (matching the graceful-skip pattern from the caps
-//! acceptance test). The binary smoke gate enforces that the binary is built
-//! before sealing.
+//! A missing, unreadable, or non-isolated binary fails before any network call.
 //!
 //! # Reference cross-check
 //!
@@ -48,6 +45,10 @@
     clippy::print_stderr,
     reason = "test-only; panics and diagnostic output are acceptable in testnet acceptance tests"
 )]
+
+mod acceptance;
+
+use stellar_agent_test_support::{cli_child, sandbox::StateSandbox};
 
 use std::time::Duration;
 
@@ -199,23 +200,14 @@ fn release_binary() -> std::path::PathBuf {
 /// `OVERSIZED_VALID_UNTIL = 4_000_000_000` is ~600 yrs out from the current
 /// testnet ledger, so `horizon = 4_000_000_000 - current_ledger ≫ 1000`.
 ///
-/// # Graceful skip
+/// # Required binary
 ///
-/// If the release binary is not present, the test logs a skip message and
-/// returns without failing.
+/// A missing, unreadable, or non-isolated binary fails before any network call.
 ///
 #[tokio::test]
 async fn h_a_install_horizon_exceeded() {
-    // ── Locate the release binary ─────────────────────────────────────────────
-    let binary = release_binary();
-    if !binary.exists() {
-        eprintln!(
-            "[H-A] SKIP: release binary not found at {}. \
-             Run `cargo build --release -p stellar-agent-cli` first.",
-            binary.display()
-        );
-        return;
-    }
+    stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
+    let binary = acceptance::require_acceptance_binary(release_binary());
     eprintln!("[H-A] using binary: {}", binary.display());
 
     // ── Step 1: Fresh signer + fund ───────────────────────────────────────────
@@ -238,9 +230,9 @@ async fn h_a_install_horizon_exceeded() {
         sa_strkey, signer_g, valid_until_str, TESTNET_RPC_URL, signer_env_var
     );
 
-    stellar_agent_test_support::sandbox::require_isolated_executable(&binary)
-        .expect("isolated acceptance child");
-    let output = std::process::Command::new(&binary)
+    let sandbox = StateSandbox::new().expect("CLI sandbox");
+    let output = cli_child::cli_command(&binary, sandbox.path())
+        .expect("isolated CLI child")
         .args([
             "smart-account",
             "rules",
@@ -259,6 +251,8 @@ async fn h_a_install_horizon_exceeded() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
             "--signer-secret-env",
             signer_env_var,
         ])
@@ -324,24 +318,14 @@ async fn h_a_install_horizon_exceeded() {
 /// `rule_id`. The actual horizon-refusal test uses the binary's `set-valid-until`
 /// subcommand with `OVERSIZED_VALID_UNTIL`.
 ///
-/// # Graceful skip
+/// # Required binary
 ///
-/// If the release binary is not present, the test logs a skip message and
-/// returns without failing.
+/// A missing, unreadable, or non-isolated binary fails before any network call.
 ///
 #[tokio::test]
 async fn h_b_update_horizon_exceeded() {
     stellar_agent_test_support::keyring_mock::install().expect("install the in-memory keyring");
-    // ── Locate the release binary ─────────────────────────────────────────────
-    let binary = release_binary();
-    if !binary.exists() {
-        eprintln!(
-            "[H-B] SKIP: release binary not found at {}. \
-             Run `cargo build --release -p stellar-agent-cli` first.",
-            binary.display()
-        );
-        return;
-    }
+    let binary = acceptance::require_acceptance_binary(release_binary());
     eprintln!("[H-B] using binary: {}", binary.display());
 
     // ── Step 1: Fresh signer + fund ───────────────────────────────────────────
@@ -406,9 +390,9 @@ async fn h_b_update_horizon_exceeded() {
     // threshold-policy and therefore bypasses the signer-divergence check.
     // This lets us reach the horizon-cap gate (which fires inside simulate)
     // without needing a pre-seeded audit-log baseline for rule 1.
-    stellar_agent_test_support::sandbox::require_isolated_executable(&binary)
-        .expect("isolated acceptance child");
-    let output = std::process::Command::new(&binary)
+    let sandbox = StateSandbox::new().expect("CLI sandbox");
+    let output = cli_child::cli_command(&binary, sandbox.path())
+        .expect("isolated CLI child")
         .args([
             "smart-account",
             "rules",
@@ -425,6 +409,8 @@ async fn h_b_update_horizon_exceeded() {
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
+            "--secondary-rpc-url",
+            stellar_agent_test_support::testnet_secondary_rpc_url(),
             "--signer-secret-env",
             signer_env_var,
         ])
