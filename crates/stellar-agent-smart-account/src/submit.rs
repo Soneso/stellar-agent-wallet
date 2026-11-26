@@ -4640,13 +4640,19 @@ mod tests {
             }
         }
 
-        /// Submits on `path` through `primary` with `secondary` as the witness.
+        /// Submits on `path` through `primary` with `secondary` as the witness,
+        /// in a marked wallet home of its own. The home is set before the
+        /// shared admission fixture first resolves wallet state.
         async fn submit_with(
             path: SigningPath,
             primary: &AuthTreeEndpoint,
             secondary: Option<&str>,
             horizon: Option<HorizonCheck>,
         ) -> Outcome {
+            // The guard drops before the sandbox.
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
             submit_with_control(
                 path,
                 primary,

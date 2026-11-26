@@ -263,6 +263,7 @@ fn expected_pin(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPin {
 /// the resolved hash, whole or as its first eight bytes, nor the executable
 /// summary, and no other channel of the refusal holds them.
 #[test]
+#[serial_test::serial]
 fn external_ref_refused_without_accept_mutable_verifier() {
     for kind in [ContractKind::Verifier, ContractKind::Policy] {
         let resolved = allowlisted_hash(kind);
@@ -335,6 +336,7 @@ fn external_ref_refused_without_accept_mutable_verifier() {
 /// position, and the created row built from the pin records both and reads
 /// back through the audit reader.
 #[tokio::test]
+#[serial_test::serial]
 async fn external_ref_installs_with_accept_mutable_verifier() {
     for kind in [ContractKind::Verifier, ContractKind::Policy] {
         let resolved = allowlisted_hash(kind);
@@ -453,6 +455,7 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
 /// shares the first eight bytes, for a verifier and for a policy.
 #[cfg(feature = "test-helpers")]
 #[tokio::test]
+#[serial_test::serial]
 async fn external_ref_pin_refuses_the_same_reference_resolving_to_a_suffix_twin() {
     use stellar_agent_smart_account::managers::verifiers::test_helpers;
 
@@ -564,6 +567,7 @@ async fn external_ref_pin_refuses_the_same_reference_resolving_to_a_suffix_twin(
 /// chain, its serialized form, the MCP error envelope or the wallet's logs,
 /// which hold the refusing path's events.
 #[test]
+#[serial_test::serial]
 fn external_ref_outside_allowlist_needs_both_flags() {
     let unknown = [0xd1u8; 32];
     let markers = [hex::encode(unknown), hex::encode(&unknown[..8])];
@@ -699,6 +703,7 @@ fn external_ref_outside_allowlist_needs_both_flags() {
 /// channel of the refusal names the contract, the resolved hash, whole or as
 /// its first eight bytes, or the summary of either executable.
 #[test]
+#[serial_test::serial]
 fn probe_observing_a_different_executable_is_refused_as_executable_changed() {
     for kind in [ContractKind::Verifier, ContractKind::Policy] {
         let allowlisted = allowlisted_hash(kind);

@@ -107,6 +107,7 @@ fn mutable_verifier_ledger_entries(verifier: &ScAddress) -> serde_json::Value {
 /// non-zero `Admin` storage key succeeds with `mutable_override: true` and one
 /// pending mutable override naming the verifier, and writes no audit row.
 #[tokio::test]
+#[serial_test::serial]
 async fn accept_mutable_verifier_succeeds_with_a_pending_override_and_writes_no_row() {
     let verifier = verifier_addr();
     let smart_account = smart_account_addr();

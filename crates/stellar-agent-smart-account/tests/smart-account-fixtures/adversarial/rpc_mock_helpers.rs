@@ -10,6 +10,8 @@
 //! - `account_key_xdr` / `account_entry_xdr` / `contract_instance_entry_xdr` — XDR builders.
 //! - `KNOWN_WASM_HASH` — the allowlisted wasm hash byte array from `THRESHOLD_POLICY_WASM_HASHES[0]`.
 //! - `manager_two_url` — constructs a `SignersManager` with separate primary and secondary URLs.
+//! - `isolated_home` / `isolated_audit_writer`: a marked `STELLAR_AGENT_HOME` for a
+//!   `#[serial]` test, alone or with a temporary audit writer.
 //! - `write_baseline_for_observed` — writes a `SaSignerSetBaselined` audit entry.
 //! - `zero_sc_address` / `zero_policy_sc_address` — helper addresses.
 //! - `signer_set_n_of_n` — builds an `ObservedSignerSet` with N identical Ed25519 signers.
@@ -1109,6 +1111,68 @@ pub fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, tempfile::TempDi
     let path = dir.path().join("audit.jsonl");
     let writer = AuditWriter::open(path.clone(), None).expect("AuditWriter::open must succeed");
     (Arc::new(Mutex::new(writer)), path, dir)
+}
+
+// ── Wallet-home isolation ─────────────────────────────────────────────────────
+
+/// A marked wallet home that `STELLAR_AGENT_HOME` names until drop.
+///
+/// Wallet state the test reaches, such as the process-wide signing admission
+/// fixture, resolves below this home. The guard field drops before the
+/// sandbox, so the variable never names a removed directory.
+pub struct IsolatedHome {
+    _guard: stellar_agent_test_support::StellarAgentHomeGuard,
+    sandbox: stellar_agent_test_support::sandbox::StateSandbox,
+}
+
+impl IsolatedHome {
+    /// The marked home directory.
+    pub fn path(&self) -> &std::path::Path {
+        self.sandbox.path()
+    }
+}
+
+/// Creates a marked sandbox and points `STELLAR_AGENT_HOME` at it.
+///
+/// # Panics
+/// Panics when the calling test does not hold the `#[serial]` lock, which the
+/// home guard requires, or when the sandbox cannot be created.
+pub fn isolated_home() -> IsolatedHome {
+    assert!(
+        serial_test::is_locked_serially(None),
+        "an isolated wallet home requires the #[serial] lock"
+    );
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new()
+        .expect("the marked wallet home must be created");
+    let guard = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    IsolatedHome {
+        _guard: guard,
+        sandbox,
+    }
+}
+
+/// The audit directory of [`isolated_audit_writer`], held with its wallet home.
+pub struct IsolatedAuditDir {
+    _home: IsolatedHome,
+    dir: tempfile::TempDir,
+}
+
+impl IsolatedAuditDir {
+    /// The directory holding `audit.jsonl`.
+    pub fn path(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+}
+
+/// [`tmp_audit_writer`] inside an [`isolated_home`].
+///
+/// Returns `(writer, path, dir)`. Caller must hold `dir` for the duration of
+/// the test: its drop restores `STELLAR_AGENT_HOME` and deletes both
+/// directories.
+pub fn isolated_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, IsolatedAuditDir) {
+    let home = isolated_home();
+    let (writer, path, dir) = tmp_audit_writer();
+    (writer, path, IsolatedAuditDir { _home: home, dir })
 }
 
 /// Writes a `SaSignerSetBaselined` audit entry for `(rule_id, smart_account_redacted, observed)`.

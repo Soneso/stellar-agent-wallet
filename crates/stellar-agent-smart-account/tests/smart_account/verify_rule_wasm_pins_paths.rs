@@ -1,7 +1,9 @@
 //! Mock-driven path tests for `ContextRuleManager::verify_rule_wasm_pins`.
 //!
 //! All tests hold the serial lock because the RPC client's proxy cache and
-//! HTTP-proxy environment variables are process-global state.
+//! HTTP-proxy environment variables are process-global state. Each audit
+//! writer comes from `isolated_audit_writer`, so every test also holds its own
+//! marked `STELLAR_AGENT_HOME`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,8 +34,9 @@ use crate::rpc_mock_helpers;
 
 use combined_rpc_responder::{CombinedRpcResponder, SequencedSimulate};
 use rpc_mock_helpers::{
-    SOURCE_G, build_context_rule_scval_xdr, build_simulate_response, manager_one_url,
-    manager_two_url, policy_sc_address, signer_set_n_of_n, tmp_audit_writer, zero_sc_address,
+    IsolatedAuditDir, SOURCE_G, build_context_rule_scval_xdr, build_simulate_response,
+    isolated_audit_writer, manager_one_url, manager_two_url, policy_sc_address, signer_set_n_of_n,
+    zero_sc_address,
 };
 
 const ACCOUNT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
@@ -54,8 +57,8 @@ async fn manager_with_rule(
     rule_id: u32,
     policies: Vec<stellar_xdr::ScAddress>,
     account_g: &str,
-) -> (ContextRuleManager, MockServer, tempfile::TempDir) {
-    let (audit_writer, audit_log_path, tmp_dir) = tmp_audit_writer();
+) -> (ContextRuleManager, MockServer, IsolatedAuditDir) {
+    let (audit_writer, audit_log_path, tmp_dir) = isolated_audit_writer();
     let signers = signer_set_n_of_n(0);
     let rule_xdr = build_context_rule_scval_xdr(rule_id, &signers, &policies);
     let simulate = SequencedSimulate::new(vec![build_simulate_response(&rule_xdr)]);
@@ -89,7 +92,7 @@ async fn manager_with_rule(
     )
     .expect("ContextRuleManager::new must succeed");
     // The caller keeps `tmp_dir` in scope for the test's lifetime, and its
-    // drop removes the directory.
+    // drop restores `STELLAR_AGENT_HOME` and removes both directories.
     (manager, server, tmp_dir)
 }
 
@@ -318,7 +321,7 @@ async fn verify_pins_mixed_drift_and_unavailable_preserves_both_statuses_and_cod
     )));
 
     for verifier_drifts in [true, false] {
-        let (audit, audit_log_path, _tmp_dir) = tmp_audit_writer();
+        let (audit, audit_log_path, _tmp_dir) = isolated_audit_writer();
         audit
             .lock()
             .unwrap()
@@ -480,7 +483,7 @@ async fn single_verifier_report(
         .try_into()
         .unwrap(),
     )));
-    let (audit, audit_log_path, _dir) = tmp_audit_writer();
+    let (audit, audit_log_path, _dir) = isolated_audit_writer();
     audit.lock().unwrap().write_entry(created).unwrap();
     let available: serde_json::Value =
         serde_json::from_str(&contract_instance_ledger_entries_json(&verifier, live)).unwrap();

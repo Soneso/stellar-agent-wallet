@@ -53,6 +53,7 @@ fn verifier_addr() -> ScAddress {
 /// Two-RPC consultation fires `NetworkRpcDivergence` BEFORE the drift check,
 /// ensuring a compromised primary cannot suppress upgrade detection.
 #[tokio::test]
+#[serial_test::serial]
 async fn rpc_suppression_fires_divergence_before_drift_check() {
     let verifier = verifier_addr();
 

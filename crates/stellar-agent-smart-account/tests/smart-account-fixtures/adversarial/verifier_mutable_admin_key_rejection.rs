@@ -110,6 +110,7 @@ fn mutable_verifier_ledger_entries(verifier: &ScAddress) -> serde_json::Value {
 /// non-zero `Admin` storage key must return `SaError::VerifierMutable` with
 /// `wire_code = "sa.verifier_mutable"`.
 #[tokio::test]
+#[serial_test::serial]
 async fn verifier_with_admin_key_rejected_without_override() {
     let verifier = verifier_addr();
     let smart_account = smart_account_addr();

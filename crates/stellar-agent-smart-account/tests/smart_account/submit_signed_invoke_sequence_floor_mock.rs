@@ -40,7 +40,9 @@ use wiremock::{
 
 use crate::rpc_mock_helpers;
 
-use rpc_mock_helpers::{SOURCE_G, SorobanRpcDispatcher, build_ledger_entries_account};
+use rpc_mock_helpers::{
+    IsolatedHome, SOURCE_G, SorobanRpcDispatcher, build_ledger_entries_account, isolated_home,
+};
 
 const NETWORK_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const CHAIN_ID: &str = "stellar:testnet";
@@ -128,13 +130,10 @@ fn dummy_host_function() -> HostFunction {
     })
 }
 
-/// Step 1's account fetch calls `hook.floor()` — proven by mounting a
-/// `simulateTransaction` ERROR response (Step 2) so `submit_signed_invoke`
-/// returns promptly right after the fetch, without needing a full
-/// simulate/auth/submit success fixture.
-#[tokio::test]
-#[serial_test::serial]
-async fn initial_fetch_consults_the_sequence_floor_hook() {
+/// A marked wallet home and an RPC that serves the source account and fails
+/// the simulation. The caller holds both for the test.
+async fn simulate_error_rpc() -> (IsolatedHome, MockServer) {
+    let home = isolated_home();
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let server = MockServer::start().await;
     let ledger_resp = build_ledger_entries_account(SOURCE_G);
@@ -147,6 +146,17 @@ async fn initial_fetch_consults_the_sequence_floor_hook() {
         .respond_with(SorobanRpcDispatcher::new(ledger_resp, simulate_error))
         .mount(&server)
         .await;
+    (home, server)
+}
+
+/// Step 1's account fetch calls `hook.floor()` — proven by mounting a
+/// `simulateTransaction` ERROR response (Step 2) so `submit_signed_invoke`
+/// returns promptly right after the fetch, without needing a full
+/// simulate/auth/submit success fixture.
+#[tokio::test]
+#[serial_test::serial]
+async fn initial_fetch_consults_the_sequence_floor_hook() {
+    let (_home, server) = simulate_error_rpc().await;
 
     let signer = AllZeroPubkeySigner;
     let hook = SpyHook::default();
@@ -199,18 +209,7 @@ async fn initial_fetch_consults_the_sequence_floor_hook() {
 #[tokio::test]
 #[serial_test::serial]
 async fn no_hook_reproduces_plain_fetch_behaviour() {
-    stellar_agent_test_support::keyring_mock::install().unwrap();
-    let server = MockServer::start().await;
-    let ledger_resp = build_ledger_entries_account(SOURCE_G);
-    let simulate_error = serde_json::json!({
-        "error": "Error(Contract, #9999)",
-        "latestLedger": 1000
-    });
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .respond_with(SorobanRpcDispatcher::new(ledger_resp, simulate_error))
-        .mount(&server)
-        .await;
+    let (_home, server) = simulate_error_rpc().await;
 
     let signer = AllZeroPubkeySigner;
     let auth_rule_ids = [ContextRuleId::new(0)];
