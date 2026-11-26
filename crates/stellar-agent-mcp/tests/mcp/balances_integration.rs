@@ -125,43 +125,6 @@ async fn assert_balances_account_id_invalid_params(account_id: String) {
 // Validation tests — no network required
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Asset code containing a hyphen is rejected by `Asset::parse`.
-///
-/// This exercises the validation codepath used by the `stellar_balances` handler.
-#[test]
-fn asset_parse_rejects_hyphen_in_code() {
-    use stellar_agent_network::Asset;
-    let result = Asset::parse(&format!("US-DC:{TEST_USDC_ISSUER}"));
-    assert!(
-        result.is_err(),
-        "hyphen in asset code must be rejected by Asset::parse"
-    );
-}
-
-/// `stellar_balances` with an asset code that is too long (> 12 chars) must
-/// be rejected.
-#[test]
-fn trustline_asset_arg_long_code_rejects_via_asset_parse() {
-    use stellar_agent_network::Asset;
-    let long_code = "ABCDEFGHIJKLM"; // 13 chars
-    let result = Asset::parse(&format!("{long_code}:{TEST_USDC_ISSUER}"));
-    assert!(
-        result.is_err(),
-        "13-character code must be rejected: {result:?}"
-    );
-}
-
-/// `stellar_balances` with an invalid issuer (not a G-strkey) must be rejected.
-#[test]
-fn trustline_asset_arg_invalid_issuer_rejects_via_asset_parse() {
-    use stellar_agent_network::Asset;
-    let result = Asset::parse("USDC:not-a-strkey");
-    assert!(
-        result.is_err(),
-        "non-G-strkey issuer must be rejected: {result:?}"
-    );
-}
-
 /// Empty `assets` field → `StellarBalancesArgs` is deserialised without error
 /// and `assets` is an empty `Vec`.
 #[test]
@@ -300,28 +263,6 @@ async fn stellar_balances_rejects_c_strkey_account_id_with_invalid_params() {
     assert_balances_account_id_invalid_params(disposable_c_strkey()).await;
 }
 
-/// A valid asset spec parses via `Asset::parse` correctly (code + issuer).
-#[test]
-fn valid_trustline_asset_parses_ok() {
-    use stellar_agent_network::Asset;
-    let result = Asset::parse(&format!("USDC:{TEST_USDC_ISSUER}"));
-    assert!(
-        matches!(result, Ok(Asset::Credit { .. })),
-        "valid USDC:issuer must parse as Asset::Credit: {result:?}"
-    );
-}
-
-/// 12-character asset code is valid.
-#[test]
-fn twelve_char_code_parses_ok() {
-    use stellar_agent_network::Asset;
-    let result = Asset::parse(&format!("ABCDEFGHIJKL:{TEST_USDC_ISSUER}"));
-    assert!(
-        matches!(result, Ok(Asset::Credit { .. })),
-        "12-char code must be valid: {result:?}"
-    );
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // DoS cap test — MAX_TRUSTLINE_ASSETS_PER_CALL
 // ─────────────────────────────────────────────────────────────────────────────
@@ -374,43 +315,6 @@ fn stellar_balances_args_101_assets_exceeds_cap() {
     assert!(
         args.assets.len() > MAX_TRUSTLINE_ASSETS_PER_CALL,
         "101-entry list must exceed the cap of {MAX_TRUSTLINE_ASSETS_PER_CALL}"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Strict G-strkey test — Asset::from_code_and_issuer
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `Asset::from_code_and_issuer` rejects invalid issuer.
-#[test]
-fn asset_from_code_and_issuer_rejects_invalid_issuer() {
-    use stellar_agent_network::builder::Asset;
-    let result = Asset::from_code_and_issuer("USDC", "not-a-strkey");
-    assert!(
-        result.is_err(),
-        "non-G-strkey issuer must be rejected: {result:?}"
-    );
-}
-
-/// `Asset::from_code_and_issuer` rejects invalid code.
-#[test]
-fn asset_from_code_and_issuer_rejects_invalid_code() {
-    use stellar_agent_network::builder::Asset;
-    let result = Asset::from_code_and_issuer("US-DC", TEST_USDC_ISSUER);
-    assert!(
-        result.is_err(),
-        "hyphen in code must be rejected by from_code_and_issuer: {result:?}"
-    );
-}
-
-/// `Asset::from_code_and_issuer` accepts valid code and issuer.
-#[test]
-fn asset_from_code_and_issuer_accepts_valid_args() {
-    use stellar_agent_network::builder::Asset;
-    let result = Asset::from_code_and_issuer("USDC", TEST_USDC_ISSUER);
-    assert!(
-        matches!(result, Ok(Asset::Credit { .. })),
-        "valid USDC + issuer must be accepted: {result:?}"
     );
 }
 

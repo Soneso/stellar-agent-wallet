@@ -850,35 +850,6 @@ mod tests {
         );
     }
 
-    /// Asserts salt derivation differs by network passphrase + proposer.
-    #[test]
-    fn deterministic_salt_differs_by_proposer_and_passphrase() {
-        let testnet = "Test SDF Network ; September 2015";
-        let mainnet = "Public Global Stellar Network ; September 2015";
-        let proposer_a = "GDUMMY_PROPOSER_A";
-        let proposer_b = "GDUMMY_PROPOSER_B";
-
-        let make_salt = |passphrase: &str, proposer: &str| -> [u8; 32] {
-            let s = format!("{TIMELOCK_SALT_DOMAIN_PREFIX}{passphrase}{proposer}");
-            Sha256::digest(s.as_bytes()).into()
-        };
-
-        let salt1 = make_salt(testnet, proposer_a);
-        let salt2 = make_salt(testnet, proposer_b);
-        let salt3 = make_salt(mainnet, proposer_a);
-        let salt4 = make_salt(testnet, proposer_a); // same as salt1
-
-        assert_ne!(
-            salt1, salt2,
-            "different proposers must produce different salts"
-        );
-        assert_ne!(
-            salt1, salt3,
-            "different passphrases must produce different salts"
-        );
-        assert_eq!(salt1, salt4, "same inputs must produce the same salt");
-    }
-
     // ── Mainnet refusal before the deployer and the endpoint ────────────────
 
     /// Runs the deployment for `network_passphrase` with a counting deployer

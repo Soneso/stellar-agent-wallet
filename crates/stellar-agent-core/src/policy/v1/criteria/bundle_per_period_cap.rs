@@ -704,19 +704,6 @@ mod tests {
         );
     }
 
-    // ── is_bundle_level returns true ─────────────────────────────────────
-
-    /// `is_bundle_level()` must return `true` — this criterion runs once at bundle-level.
-    #[test]
-    fn is_bundle_level_returns_true() {
-        let w = Window::parse("1d").unwrap();
-        let c = BundlePerPeriodCapCriterion::new("native".into(), w, 1_000_000_000);
-        assert!(
-            c.is_bundle_level(),
-            "bundle_per_period_cap must be bundle-level"
-        );
-    }
-
     // ── XLM and native normalise ────────────────────────────────────────
 
     /// Cap configured as "XLM" matches inners with asset "native".

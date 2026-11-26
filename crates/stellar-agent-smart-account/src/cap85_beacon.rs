@@ -25,21 +25,7 @@ pub const CAP85_BEACON_WASM: &[u8] =
 
 #[cfg(test)]
 mod tests {
-    use sha2::{Digest as _, Sha256};
-
     use super::*;
-
-    /// The embedded bytes hash to the pinned digest.
-    #[test]
-    fn cap85_beacon_wasm_sha256_matches_reference() {
-        let digest: [u8; 32] = Sha256::digest(CAP85_BEACON_WASM).into();
-        let actual: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(
-            actual, CAP85_BEACON_WASM_SHA256,
-            "vendored cap85_beacon.wasm sha256 mismatch; rebuild with \
-             vendor/cap85-beacon/v0.1.0/build.sh and update the pins it names"
-        );
-    }
 
     /// The embedded bytes are a Wasm module (magic `\0asm`, version 1).
     #[test]

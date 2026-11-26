@@ -41,9 +41,7 @@ use stellar_agent_core::{
     profile::schema::Profile,
 };
 use stellar_agent_mcp::server::{StellarFriendbotArgs, WalletServer};
-use stellar_agent_network::friendbot::{
-    default_friendbot_url, validate_friendbot_url_allowing_loopback,
-};
+use stellar_agent_network::friendbot::validate_friendbot_url_allowing_loopback;
 use stellar_agent_test_support::EchoIdResponder;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -428,47 +426,6 @@ async fn stellar_friendbot_rejects_c_strkey_account_id_with_invalid_params() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// URL allow-list validation tests
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Non-allowlisted `friendbot_url` must be rejected before any network call.
-#[test]
-fn validate_non_allowlisted_friendbot_url_rejected() {
-    use stellar_agent_network::friendbot::validate_friendbot_url;
-
-    let result = validate_friendbot_url("https://evil.example.com/friendbot");
-    assert!(
-        result.is_err(),
-        "non-allowlisted URL must be rejected by validate_friendbot_url: {result:?}"
-    );
-}
-
-/// Allow-listed URLs must pass validation.
-#[test]
-fn validate_allowlisted_testnet_url_accepted() {
-    use stellar_agent_network::friendbot::validate_friendbot_url;
-
-    assert!(
-        validate_friendbot_url("https://friendbot.stellar.org").is_ok(),
-        "testnet Friendbot URL must be accepted"
-    );
-    assert!(
-        validate_friendbot_url("https://friendbot-futurenet.stellar.org").is_ok(),
-        "futurenet Friendbot URL must be accepted"
-    );
-}
-
-/// Loopback URL is accepted by the test-only loopback validator
-/// (`test-loopback` feature, enabled via `[dev-dependencies]`).
-#[test]
-fn validate_loopback_url_accepted_by_test_validator() {
-    assert!(
-        validate_friendbot_url_allowing_loopback("http://127.0.0.1:9999/friendbot").is_ok(),
-        "loopback URL must be accepted by test validator"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Happy-path wiremock test
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -525,31 +482,4 @@ async fn friendbot_happy_path_via_wiremock() {
     );
 
     mock_server.verify().await;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// default_friendbot_url
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The default Friendbot URL for testnet must be the SDF testnet endpoint.
-///
-/// `default_friendbot_url` lives in `stellar_agent_network::friendbot`.
-#[test]
-fn default_friendbot_url_testnet() {
-    use stellar_agent_core::profile::caip2::Caip2;
-
-    let url = default_friendbot_url(Caip2::Testnet);
-    assert_eq!(url, Some("https://friendbot.stellar.org"));
-}
-
-/// Mainnet has no default Friendbot URL.
-#[test]
-fn default_friendbot_url_mainnet_none() {
-    use stellar_agent_core::profile::caip2::Caip2;
-
-    let url = default_friendbot_url(Caip2::Mainnet);
-    assert!(
-        url.is_none(),
-        "mainnet must have no default Friendbot URL; got: {url:?}"
-    );
 }

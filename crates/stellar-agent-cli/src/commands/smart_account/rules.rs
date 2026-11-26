@@ -5222,31 +5222,6 @@ mod tests {
     // invoking only the info! call directly (not the full async handler, which
     // would require a live RPC endpoint).
 
-    use stellar_agent_test_support::CaptureWriter;
-
-    /// `ListArgs` is a transparent type alias for
-    /// `sa_list_rules::ListRulesArgs`.
-    ///
-    /// This assertion holds at compile time: the `type ListArgs = ...` declaration
-    /// in the parent module guarantees that any `&ListArgs` is assignable from
-    /// `&sa_list_rules::ListRulesArgs`. This test makes the relationship explicit
-    /// in the test suite so a future maintainer cannot inadvertently break it by
-    /// introducing a wrapper.
-    #[test]
-    fn list_args_is_type_alias_for_list_rules_args() {
-        // Construct a value of the concrete type and assign it to the alias.
-        // If the alias diverges from `ListRulesArgs`, this will fail to compile.
-        fn accepts_list_args(_: &ListArgs) {}
-        fn accepts_list_rules_args(_: &sa_list_rules::ListRulesArgs) {}
-
-        // Both fn-pointer casts are compile-time proofs: if the alias ever
-        // diverges from `sa_list_rules::ListRulesArgs`, one of these casts
-        // will fail to compile. No runtime assertion is needed — the alias
-        // identity is a compile-time invariant, not a runtime value.
-        let _ = accepts_list_args as fn(&ListArgs);
-        let _ = accepts_list_rules_args as fn(&sa_list_rules::ListRulesArgs);
-    }
-
     /// JSON envelope byte-identity by construction.
     ///
     /// Both `smart-account rules list` and `smart-account list-rules` share the same
@@ -5314,50 +5289,6 @@ mod tests {
         assert_eq!(parsed["rules_skipped"].as_u64(), Some(0));
         assert_eq!(parsed["gaps_seen"].as_u64(), Some(0));
         assert!(parsed["audit_log_missing"].is_array());
-    }
-
-    /// Dispatch-site log carries `command = "smart-account rules list"`.
-    ///
-    /// The structured-log row emitted at the `list_rules_run` dispatch site must
-    /// carry `command = "smart-account rules list"` verbatim so audit-log forensic
-    /// correlation can distinguish the operator-invoked command from the
-    /// `smart-account list-rules` alias.
-    ///
-    /// Strategy: emit the same `tracing::info!` call that `list_rules_run` emits
-    /// (without invoking the async handler — which would require a live RPC) and
-    /// capture the output via [`CaptureWriter`].
-    #[test]
-    fn list_rules_dispatch_log_carries_command_name() {
-        let capture = CaptureWriter::new();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-
-        // Emit the same structured event that `list_rules_run` emits at the
-        // dispatch site.
-        let network = TargetNetwork::Testnet;
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            tracing::info!(
-                command = "smart-account rules list",
-                network = %network,
-                "smart-account rules list: dispatching to list-rules handler"
-            );
-        });
-
-        let log_output = capture.captured_str();
-
-        // The log line must contain the operator-invoked command name verbatim.
-        assert!(
-            log_output.contains("smart-account rules list"),
-            "dispatch-site log must contain 'smart-account rules list'; captured: {log_output}"
-        );
-        // The message must NOT contain "smart-account list-rules" — that is emitted
-        // by `sa::list_rules::run` at its own dispatch site (distinct event).
-        // (No assertion needed for the positive case on the list-rules side — that is
-        //  tested by the list_rules module's own tests in sa/list_rules.rs.)
     }
 
     // ─────────────────────────────────────────────────────────────────────────

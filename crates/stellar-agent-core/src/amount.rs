@@ -1558,6 +1558,14 @@ mod tests {
                 "display mismatch for {stroops} stroops"
             );
         }
+        assert_eq!(
+            StellarAmount::from_stroops(100).as_xlm_decimal_string(),
+            "0.0000100"
+        );
+        assert_eq!(
+            StellarAmount::from_stroops(1_000_000_000_000).as_xlm_decimal_string(),
+            "100000.0000000"
+        );
     }
 
     /// Pins the exact decimal string at the `i64` extremes so no caller can

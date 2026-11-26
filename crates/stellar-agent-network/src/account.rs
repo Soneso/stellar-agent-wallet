@@ -1575,8 +1575,6 @@ fn map_signer_fetch_error(e: &RpcError, endpoint: &RpcEndpoint) -> WalletError {
     reason = "test-only; assertions via unwrap/expect/panic are idiomatic in unit tests"
 )]
 mod tests {
-    use stellar_agent_core::STROOPS_PER_XLM;
-
     use super::*;
     use crate::redact::rpc_error_fixtures::{
         ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_error, xdr_error,
@@ -2213,38 +2211,6 @@ mod tests {
         assert!(
             b.balance_stroops().is_err(),
             "invalid balance string must return Err"
-        );
-    }
-
-    #[test]
-    fn format_stroops_zero() {
-        assert_eq!(
-            StellarAmount::from_stroops(0).as_xlm_decimal_string(),
-            "0.0000000"
-        );
-    }
-
-    #[test]
-    fn format_stroops_one_xlm() {
-        assert_eq!(
-            StellarAmount::from_stroops(STROOPS_PER_XLM).as_xlm_decimal_string(),
-            "1.0000000"
-        );
-    }
-
-    #[test]
-    fn format_stroops_fractional() {
-        assert_eq!(
-            StellarAmount::from_stroops(100).as_xlm_decimal_string(),
-            "0.0000100"
-        );
-    }
-
-    #[test]
-    fn format_stroops_large() {
-        assert_eq!(
-            StellarAmount::from_stroops(1_000_000_000_000_i64).as_xlm_decimal_string(),
-            "100000.0000000"
         );
     }
 

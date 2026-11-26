@@ -2695,76 +2695,7 @@ mod tests {
         );
     }
 
-    // ── ScopeId::specificity ────────────────────────────────────────────────
-
-    #[test]
-    fn scope_id_specificity_all_profiles_returns_1() {
-        assert_eq!(ScopeId::AllProfiles.specificity(), 1);
-    }
-
-    #[test]
-    fn scope_id_specificity_profile_returns_2() {
-        assert_eq!(ScopeId::Profile("alice".into()).specificity(), 2);
-    }
-
-    #[test]
-    fn scope_id_specificity_profile_project_returns_3() {
-        let s = ScopeId::ProfileProject {
-            profile: "alice".into(),
-            project: "p1".into(),
-        };
-        assert_eq!(s.specificity(), 3);
-    }
-
-    // ── ScopeId::matches ────────────────────────────────────────────────────
-
-    #[test]
-    fn scope_id_all_profiles_matches_any_profile_and_any_project() {
-        let s = ScopeId::AllProfiles;
-        assert!(s.matches("alice", None));
-        assert!(s.matches("alice", Some("proj")));
-        assert!(s.matches("bob", Some("other")));
-    }
-
-    #[test]
-    fn scope_id_profile_matches_correct_profile_no_project() {
-        let s = ScopeId::Profile("alice".into());
-        assert!(s.matches("alice", None));
-        assert!(!s.matches("bob", None));
-    }
-
-    #[test]
-    fn scope_id_profile_does_not_match_when_project_given() {
-        // Profile scope matches the profile regardless of project presence.
-        let s = ScopeId::Profile("alice".into());
-        // Profile scope matches alice even with a project set.
-        assert!(s.matches("alice", Some("p1")));
-        assert!(!s.matches("bob", Some("p1")));
-    }
-
-    #[test]
-    fn scope_id_profile_project_requires_both_matching() {
-        let s = ScopeId::ProfileProject {
-            profile: "alice".into(),
-            project: "p1".into(),
-        };
-        assert!(s.matches("alice", Some("p1")));
-        assert!(!s.matches("alice", None));
-        assert!(!s.matches("alice", Some("p2")));
-        assert!(!s.matches("bob", Some("p1")));
-    }
-
     // ── RuleMatch::matches ──────────────────────────────────────────────────
-
-    #[test]
-    fn rule_match_wildcard_tool_matches_any_tool() {
-        let m = RuleMatch {
-            tool: "*".into(),
-            chain: "stellar:testnet".into(),
-        };
-        let t = tool("stellar_pay", "stellar:testnet");
-        assert!(m.matches(&t));
-    }
 
     #[test]
     fn rule_match_wildcard_chain_matches_any_chain() {
@@ -2774,26 +2705,6 @@ mod tests {
         };
         let t = tool("stellar_pay", "stellar:mainnet");
         assert!(m.matches(&t));
-    }
-
-    #[test]
-    fn rule_match_exact_name_and_chain_matches() {
-        let m = RuleMatch {
-            tool: "stellar_pay".into(),
-            chain: "stellar:mainnet".into(),
-        };
-        let t = tool("stellar_pay", "stellar:mainnet");
-        assert!(m.matches(&t));
-    }
-
-    #[test]
-    fn rule_match_wrong_tool_name_does_not_match() {
-        let m = RuleMatch {
-            tool: "stellar_pay".into(),
-            chain: "*".into(),
-        };
-        let t = tool("stellar_balances", "stellar:testnet");
-        assert!(!m.matches(&t));
     }
 
     #[test]

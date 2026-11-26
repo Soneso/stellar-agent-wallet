@@ -1115,17 +1115,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn matching_names_produce_no_refusal() {
-        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let profile = named_profile("alice");
-        assert_eq!(profile_name_mismatch_refusal(&profile, "alice"), None);
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn copied_profile_file_refuses_without_naming_either_profile() {
         #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1198,19 +1187,6 @@ mod tests {
             !message.contains("names profile"),
             "no profile name can be derived, so none may be reported: {message}"
         );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn the_synthesised_first_run_profile_reconciles_as_default() {
-        #[allow(clippy::unwrap_used, reason = "fixture sandbox setup must succeed")]
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        // The MCP server's no-name startup path loads or synthesises `default`;
-        // that profile must pass the reconciliation check unchanged.
-        let profile = named_profile("default");
-        assert_eq!(profile_name_mismatch_refusal(&profile, "default"), None);
     }
 
     #[test]

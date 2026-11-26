@@ -554,6 +554,135 @@ fn deny_reason_wire_codes_are_unique() {
         "variants list count drifted from DenyReason variant count.  \
          Update enumerate_deny_reason_for_test, the variants vec, and this assertion."
     );
+
+    // Fixed-example payload and literal wire-code assertions folded from the
+    // standalone unit tests, kept outside the uniqueness inventory above.
+    assert_eq!(
+        DenyReason::PerTxCapExceeded {
+            asset: "XLM".into(),
+            max_stroops: 100,
+            attempted_stroops: 200,
+        }
+        .code(),
+        "per_tx_cap_exceeded"
+    );
+    assert_eq!(
+        DenyReason::PerPeriodCapExceeded {
+            asset: "XLM".into(),
+            window: "rolling_24h".into(),
+            max_stroops: 100,
+            attempted_stroops: 200,
+            period_used_stroops: 50,
+        }
+        .code(),
+        "per_period_cap_exceeded"
+    );
+    assert_eq!(
+        DenyReason::RateLimitExceeded {
+            window: "rolling_1h".into(),
+            max_calls: 10,
+            calls_in_window: 11,
+        }
+        .code(),
+        "rate_limit_exceeded"
+    );
+    assert_eq!(
+        DenyReason::CounterpartyDenied {
+            kind: "ADDRESS".into(),
+            value: "GABC123".into(),
+        }
+        .code(),
+        "counterparty_denied"
+    );
+    assert_eq!(
+        DenyReason::MinimumReserveBreached {
+            reserve_required_stroops: 5_000_000,
+            balance_stroops: 4_000_000,
+        }
+        .code(),
+        "minimum_reserve_breached"
+    );
+    assert_eq!(
+        DenyReason::OwnerSignatureStale {
+            rotated_at: "2026-04-29T00:00:00Z".into(),
+        }
+        .code(),
+        "owner_signature_stale"
+    );
+    assert_eq!(DenyReason::NoMatchingRule.code(), "no_matching_rule");
+    assert_eq!(
+        DenyReason::CounterpartyKindUnsupported {
+            kind: "SEP10_IDENTITY".into(),
+        }
+        .code(),
+        "counterparty_kind_unsupported"
+    );
+    assert_eq!(
+        DenyReason::EvaluationError {
+            detail: "internal".into(),
+        }
+        .code(),
+        "evaluation_error"
+    );
+    assert_eq!(DenyReason::ExplicitRuleDeny.code(), "explicit_rule_deny");
+    assert_eq!(
+        DenyReason::InnerInvocationCountCapExceeded {
+            max: 50,
+            attempted: 51,
+        }
+        .code(),
+        "inner_invocation_count_cap_exceeded"
+    );
+    assert_eq!(
+        DenyReason::BundleAggregateCapExceeded {
+            asset: Some("USDC:GISSUER".into()),
+            max: 100_000_000_000,
+            sum: 120_000_000_000,
+        }
+        .code(),
+        "bundle_aggregate_cap_exceeded"
+    );
+    assert_eq!(
+        DenyReason::BundleContainsGenericKind { inner_index: 2 }.code(),
+        "bundle_contains_generic_kind"
+    );
+    assert_eq!(
+        DenyReason::BundleDenied {
+            inner_index: 0,
+            deny_reason: Box::new(DenyReason::NoMatchingRule),
+        }
+        .code(),
+        "bundle_denied"
+    );
+    assert_eq!(
+        DenyReason::HomeDomainNotResolved {
+            home_domain: "circle.com".into(),
+        }
+        .code(),
+        "home_domain_not_resolved"
+    );
+    assert_eq!(
+        DenyReason::QuorumNotSatisfied {
+            groups_short_by: vec![],
+            combinator: "And".to_owned(),
+        }
+        .code(),
+        "quorum_not_satisfied"
+    );
+    assert_eq!(
+        DenyReason::Sep10SessionMissing {
+            account_id: "GABC1".into(),
+        }
+        .code(),
+        "sep10.session_missing"
+    );
+    assert_eq!(
+        DenyReason::Sep45SessionMissing {
+            contract_id: "CABC1".into(),
+        }
+        .code(),
+        "sep45.session_missing"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

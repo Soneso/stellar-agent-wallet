@@ -47,7 +47,6 @@ const MIGRATED_TESTS: [(&str, &[&str]); 3] = [
             "tools_call_stellar_balances_invalid_strkey_returns_invalid_params",
             "tools_call_unknown_tool_returns_error",
             "policy_engine_allows_stellar_balances_read_only",
-            "decision_allow_propagates",
         ],
     ),
     (

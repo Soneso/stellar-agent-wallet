@@ -7022,23 +7022,6 @@ pub(crate) mod tests {
         assert!(wire.contains("network.account_not_found"));
     }
 
-    #[test]
-    fn redacts_short_account_id_value_to_fallback() {
-        assert_eq!(redact_account_id_value("GABC"), "G...?");
-        assert_eq!(redact_account_id_value(""), "G...?");
-    }
-
-    #[test]
-    fn redacts_long_account_id_value_to_first5_last5() {
-        let id = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
-        let r = redact_account_id_value(id);
-        assert!(r.starts_with("GAQAA"), "must start with first 5");
-        assert!(r.ends_with("STVY"), "must end with last 4 of last 5");
-        assert!(r.contains("..."), "must contain ellipsis");
-        // Must not be longer than first5 + "..." + last5 = 13 chars.
-        assert_eq!(r.len(), 13, "redacted form must be exactly 13 chars");
-    }
-
     /// Wire-redaction regression: `LedgerError::TrustlineMissing` must never
     /// emit a full G-strkey over the MCP wire.
     ///

@@ -5701,32 +5701,6 @@ fn next_archive_suffix(now: &str, newest: Option<&str>) -> Option<String> {
     (next.len() == ARCHIVE_COUNTER_WIDTH).then(|| format!("{base}-{next}"))
 }
 
-// ── Recover chain hash from existing file ────────────────────────────────────
-
-/// Reads the last JSON line from `path` and re-derives the hash of that entry.
-///
-/// Used when re-opening an existing log file to recover the chain state.
-/// The lock MUST be held before calling this function.
-///
-/// Uses a reverse 4-KiB chunk scan so startup recovery reads only the trailing
-/// line in the normal case. If the trailing line is malformed, falls back to
-/// the legacy full-file scan so mid-line truncation can still recover the last
-/// complete JSON line.
-///
-/// # Errors
-///
-/// Returns [`WriterError::Io`] or [`WriterError::Serialise`] on failure.
-#[cfg(test)]
-fn read_last_entry_hash(path: &Path) -> Result<String, WriterError> {
-    match read_last_entry_hash_rev(path) {
-        Ok(hash) => Ok(hash),
-        Err(WriterError::Serialise(_)) | Err(WriterError::Hash(_)) => {
-            read_last_entry_hash_full_scan(path)
-        }
-        Err(err) => Err(err),
-    }
-}
-
 /// The result of replaying a byte range of the active log file.
 struct ChainScan {
     /// Entry hash of the last entry in the replayed range, or the seed hash
@@ -6757,84 +6731,6 @@ fn read_line_ending_at(file: &File, end_offset: u64) -> io::Result<Option<Vec<u8
         return Ok(None);
     }
     Ok(Some(line))
-}
-
-#[cfg(test)]
-fn read_last_entry_hash_rev(path: &Path) -> Result<String, WriterError> {
-    const REV_CHUNK: usize = 4096;
-
-    let mut file = File::open(path)?;
-    let len = file.metadata()?.len();
-    if len == 0 {
-        return Ok(ZERO_BLOCK_HASH.to_owned());
-    }
-
-    let mut pos = len;
-    let mut tail = Vec::new();
-    while pos > 0 {
-        let chunk_size = usize::try_from(std::cmp::min(REV_CHUNK as u64, pos))
-            .map_err(|_| io::Error::other("audit log chunk size overflow"))?;
-        pos -= chunk_size as u64;
-        file.seek(SeekFrom::Start(pos))?;
-
-        let mut chunk = vec![0u8; chunk_size];
-        file.read_exact(&mut chunk)?;
-        chunk.append(&mut tail);
-        tail = chunk;
-
-        while tail.last() == Some(&b'\n') {
-            tail.pop();
-        }
-        if tail.is_empty() {
-            continue;
-        }
-        if let Some(idx) = tail.iter().rposition(|&byte| byte == b'\n') {
-            return parse_entry_hash_from_line(&tail[idx + 1..]);
-        }
-    }
-
-    parse_entry_hash_from_line(&tail)
-}
-
-#[cfg(test)]
-fn read_last_entry_hash_full_scan(path: &Path) -> Result<String, WriterError> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-
-    let mut last_hash = ZERO_BLOCK_HASH.to_owned();
-    let mut last_error = None;
-    for line_result in reader.lines() {
-        let line = line_result?;
-        if !line.trim().is_empty() {
-            match parse_entry_hash_from_line(line.as_bytes()) {
-                Ok(hash) => {
-                    last_hash = hash;
-                    last_error = None;
-                }
-                Err(err) => {
-                    last_error = Some(err);
-                }
-            }
-        }
-    }
-
-    if last_hash == ZERO_BLOCK_HASH
-        && let Some(err) = last_error
-    {
-        return Err(err);
-    }
-    Ok(last_hash)
-}
-
-#[cfg(test)]
-fn parse_entry_hash_from_line(line: &[u8]) -> Result<String, WriterError> {
-    if line.is_empty() {
-        return Ok(ZERO_BLOCK_HASH.to_owned());
-    }
-
-    let entry: AuditEntry = serde_json::from_slice(line).map_err(WriterError::Serialise)?;
-    let hash = compute_entry_hash_streamed(&entry, &entry.previous_entry_hash)?;
-    Ok(hash)
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -11698,75 +11594,6 @@ mod tests {
                 "expected ChainBrokenAtOpen"
             ),
         }
-    }
-
-    #[test]
-    fn read_last_entry_hash_empty_file_returns_zero_block_hash() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.jsonl");
-        File::create(&path).unwrap();
-
-        assert_eq!(read_last_entry_hash(&path).unwrap(), ZERO_BLOCK_HASH);
-    }
-
-    #[test]
-    fn read_last_entry_hash_single_line_without_trailing_newline() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.jsonl");
-        let (mut line, expected_hash) = serialised_entry_line(ZERO_BLOCK_HASH);
-        line.pop();
-        fs::write(&path, line).unwrap();
-
-        assert_eq!(read_last_entry_hash(&path).unwrap(), expected_hash);
-    }
-
-    #[test]
-    fn read_last_entry_hash_multi_line_uses_final_entry() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.jsonl");
-        let (first, first_hash) = serialised_entry_line(ZERO_BLOCK_HASH);
-        let (second, second_hash) = serialised_entry_line(&first_hash);
-        let mut contents = first;
-        contents.extend_from_slice(&second);
-        fs::write(&path, contents).unwrap();
-
-        assert_eq!(read_last_entry_hash(&path).unwrap(), second_hash);
-    }
-
-    #[test]
-    fn read_last_entry_hash_large_file_reads_trailing_entry() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.jsonl");
-        let (line, expected_hash) = serialised_entry_line(ZERO_BLOCK_HASH);
-        let mut contents = vec![b'\n'; 10 * 1024 * 1024];
-        contents.extend_from_slice(&line);
-        fs::write(&path, contents).unwrap();
-
-        assert_eq!(read_last_entry_hash(&path).unwrap(), expected_hash);
-    }
-
-    #[test]
-    fn read_last_entry_hash_ignores_trailing_newline_padding() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.jsonl");
-        let (line, expected_hash) = serialised_entry_line(ZERO_BLOCK_HASH);
-        let mut contents = line;
-        contents.extend_from_slice(b"\n\n\n");
-        fs::write(&path, contents).unwrap();
-
-        assert_eq!(read_last_entry_hash(&path).unwrap(), expected_hash);
-    }
-
-    #[test]
-    fn read_last_entry_hash_falls_back_after_truncated_trailing_line() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.jsonl");
-        let (line, expected_hash) = serialised_entry_line(ZERO_BLOCK_HASH);
-        let mut contents = line;
-        contents.extend_from_slice(br#"{"truncated":"#);
-        fs::write(&path, contents).unwrap();
-
-        assert_eq!(read_last_entry_hash(&path).unwrap(), expected_hash);
     }
 
     #[test]

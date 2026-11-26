@@ -6193,28 +6193,6 @@ mod tests {
         assert_eq!(ctx.get("rule_id").and_then(|v| v.as_u64()), Some(5));
     }
 
-    /// Verifies that a `SpendingLimitPolicyIdentificationFailed` error
-    /// round-trips via serde and has the correct wire code.
-    #[test]
-    fn spending_limit_policy_identification_failed_round_trip() {
-        let err = SaError::SpendingLimitPolicyIdentificationFailed {
-            rule_id: 2,
-            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            observed_policy_count: 2,
-            request_id: "req-sl-002".to_owned(),
-        };
-        assert_eq!(
-            err.wire_code(),
-            "sa.spending_limit_policy_identification_failed"
-        );
-        let json = serde_json::to_string(&err).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            value.get("wire_code").and_then(|v| v.as_str()),
-            Some("sa.spending_limit_policy_identification_failed")
-        );
-    }
-
     /// Verifies that a `WeightedThresholdNotInstalled` error round-trips via
     /// serde and has the correct wire code.
     #[test]
@@ -6233,28 +6211,6 @@ mod tests {
         );
         let ctx = value.get("context").unwrap();
         assert_eq!(ctx.get("rule_id").and_then(|v| v.as_u64()), Some(5));
-    }
-
-    /// Verifies that a `WeightedThresholdPolicyIdentificationFailed` error
-    /// round-trips via serde and has the correct wire code.
-    #[test]
-    fn weighted_threshold_policy_identification_failed_round_trip() {
-        let err = SaError::WeightedThresholdPolicyIdentificationFailed {
-            rule_id: 2,
-            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            observed_policy_count: 2,
-            request_id: "req-wt-002".to_owned(),
-        };
-        assert_eq!(
-            err.wire_code(),
-            "sa.weighted_threshold_policy_identification_failed"
-        );
-        let json = serde_json::to_string(&err).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            value.get("wire_code").and_then(|v| v.as_str()),
-            Some("sa.weighted_threshold_policy_identification_failed")
-        );
     }
 
     /// The policy identification refusals state the check and the number of
@@ -6547,27 +6503,6 @@ mod tests {
             assert!(ctx.get("smart_account_redacted").is_some());
             assert!(ctx.get("detail").is_some());
         }
-    }
-
-    /// Verifies that `VerifierAllowlistEmpty` round-trips via serde and has
-    /// the correct wire code.
-    #[test]
-    fn verifier_allowlist_empty_round_trip() {
-        let err = SaError::VerifierAllowlistEmpty {
-            request_id: "req-empty-rt-001".to_owned(),
-        };
-        assert_eq!(err.wire_code(), "sa.verifier_allowlist_empty");
-        let json = serde_json::to_string(&err).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            value.get("wire_code").and_then(|v| v.as_str()),
-            Some("sa.verifier_allowlist_empty"),
-            "wire_code must match: {json}"
-        );
-        assert!(
-            value.get("context").is_some(),
-            "context field must be present: {json}"
-        );
     }
 
     /// Verifies the `MIGRATION_PHASES` closed set has exactly 5 entries and

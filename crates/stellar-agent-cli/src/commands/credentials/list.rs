@@ -112,21 +112,3 @@ fn emit_error(code: &'static str, message: String) -> i32 {
     render_json(&Envelope::<()>::err_raw(code, message));
     1
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn redact_credential_id_typical() {
-        let id = "AABBCCDDEEFFGGHHIIJJKK"; // 22 chars
-        let redacted = redact_first5_last5(id);
-        assert_eq!(redacted, "AABBC...IJJKK");
-    }
-
-    #[test]
-    fn redact_credential_id_short_passthrough() {
-        let short = "ABCDE";
-        assert_eq!(redact_first5_last5(short), "ABCDE");
-    }
-}

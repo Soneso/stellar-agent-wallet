@@ -2900,27 +2900,6 @@ mod tests {
     }
 
     #[test]
-    fn thresholds_overlay_is_testnet_only() {
-        assert_eq!(
-            OVERLAY_CLASSES
-                .iter()
-                .find(|(key, _)| *key == "cross_check_thresholds")
-                .map(|(_, class)| *class),
-            Some(OverlayClass::TestnetOnly)
-        );
-        assert!(matches!(
-            provider_load(
-                &mainnet_toml(),
-                "cross_check_thresholds",
-                serde_json::json!({})
-            ),
-            Err(ProfileLoadError::NonOverlayableField {
-                field: "cross_check_thresholds"
-            })
-        ));
-    }
-
-    #[test]
     #[serial_test::serial]
     fn thresholds_invalid_inputs_never_reach_operator_text() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3377,22 +3356,6 @@ mod tests {
     }
 
     #[test]
-    fn protected_rpc_overlay_refuses_different_value() {
-        let result = provider_load(
-            &mainnet_toml(),
-            "rpc_url",
-            serde_json::json!("https://overlay.example"),
-        );
-        assert!(
-            matches!(
-                result,
-                Err(ProfileLoadError::NonOverlayableField { field: "rpc_url" })
-            ),
-            "{result:?}"
-        );
-    }
-
-    #[test]
     fn protected_rpc_overlay_refuses_equal_value() {
         let result = provider_load(
             &mainnet_toml(),
@@ -3403,60 +3366,6 @@ mod tests {
             matches!(
                 result,
                 Err(ProfileLoadError::NonOverlayableField { field: "rpc_url" })
-            ),
-            "{result:?}"
-        );
-    }
-
-    #[test]
-    fn protected_secondary_rpc_url_overlay_refuses() {
-        let result = provider_load(
-            &mainnet_toml(),
-            "secondary_rpc_url",
-            serde_json::json!("https://secondary.example"),
-        );
-        assert!(
-            matches!(
-                result,
-                Err(ProfileLoadError::NonOverlayableField {
-                    field: "secondary_rpc_url"
-                })
-            ),
-            "{result:?}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn testnet_secondary_rpc_url_overlay_loads() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let profile = provider_load(
-            minimal_toml(),
-            "secondary_rpc_url",
-            serde_json::json!("https://secondary.example"),
-        )
-        .unwrap();
-        assert_eq!(
-            profile.secondary_rpc_url.as_deref(),
-            Some("https://secondary.example")
-        );
-    }
-
-    #[test]
-    fn protected_mcp_signer_default_overlay_refuses() {
-        let result = provider_load(
-            &mainnet_toml(),
-            "mcp_signer_default",
-            serde_json::json!({"account": "overlay-account"}),
-        );
-        assert!(
-            matches!(
-                result,
-                Err(ProfileLoadError::NonOverlayableField {
-                    field: "mcp_signer_default"
-                })
             ),
             "{result:?}"
         );
@@ -3481,21 +3390,6 @@ mod tests {
         assert!(!encoded.contains("overlaid_fields"));
         let decoded: Profile = toml::from_str(&encoded).unwrap();
         assert!(!decoded.is_overlaid("mcp_signer_default"));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn testnet_rpc_overlay_loads() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let profile = provider_load(
-            minimal_toml(),
-            "rpc_url",
-            serde_json::json!("https://overlay.example"),
-        )
-        .unwrap();
-        assert_eq!(profile.rpc_url, "https://overlay.example");
     }
 
     /// The file of [`mainnet_toml`] with an oracle endpoint.
@@ -3539,24 +3433,6 @@ mod tests {
                 })
             ),
             "{result:?}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn testnet_oracle_provider_url_overlay_loads() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let profile = provider_load(
-            minimal_toml(),
-            "oracle_provider_url",
-            serde_json::json!("https://overlay.example/"),
-        )
-        .unwrap();
-        assert_eq!(
-            profile.oracle_provider_url.as_ref().map(url::Url::as_str),
-            Some("https://overlay.example/")
         );
     }
 

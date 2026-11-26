@@ -326,19 +326,6 @@ mod tests {
         }
     }
 
-    /// Wire code is stable.
-    #[test]
-    fn wire_code_stable() {
-        assert_eq!(
-            DenyReason::QuorumNotSatisfied {
-                groups_short_by: vec![],
-                combinator: "And".to_owned(),
-            }
-            .code(),
-            "quorum_not_satisfied"
-        );
-    }
-
     /// `Default` impl matches `new()`.
     #[test]
     fn default_impl_matches_new() {

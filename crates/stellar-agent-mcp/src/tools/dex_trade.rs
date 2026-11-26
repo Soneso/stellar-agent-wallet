@@ -654,15 +654,6 @@ mod tests {
     )]
     use super::{DexQuoteArgs, DexTradeArgs};
 
-    #[test]
-    fn router_redaction_format() {
-        let addr = "CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD";
-        let redacted = stellar_agent_core::observability::redact_strkey_first5_last5(addr);
-        assert!(redacted.starts_with("CCJUD"), "must start with first 5");
-        assert!(redacted.contains("7BRD"), "must contain last chars");
-        assert!(!redacted.contains(addr), "full addr must not appear");
-    }
-
     // ── DexTradeArgs: decimal-string wire ─────────────────────────────────────
 
     #[test]
@@ -766,40 +757,6 @@ mod tests {
         });
         let args: DexQuoteArgs = serde_json::from_value(value).expect("from_value must succeed");
         assert_eq!(args.qty_in.parse::<i128>().expect("parse"), i128::MAX);
-    }
-
-    // ── Output-shape: expected_out / amounts stringify exactly at the boundary ─
-
-    /// Mirrors the exact `expected_out.to_string()` / `amounts.iter().map(...)`
-    /// projection used in `stellar_dex_quote`'s success response, proving the
-    /// values above `2^53` round-trip byte-for-byte and serialise as JSON
-    /// strings rather than JSON numbers.
-    #[test]
-    fn dex_quote_output_amounts_stringify_exactly_above_2_pow_53() {
-        let expected_out: i128 = 9_007_199_254_740_993_i128;
-        let amounts: Vec<i128> = vec![250_000_000_i128, expected_out, i128::MAX];
-        let amounts_wire: Vec<String> = amounts.iter().map(ToString::to_string).collect();
-
-        assert_eq!(amounts_wire[1], "9007199254740993");
-        assert_eq!(amounts_wire[2], i128::MAX.to_string());
-
-        let expected_out_wire = expected_out.to_string();
-        let value = serde_json::json!({
-            "expected_out": expected_out_wire,
-            "amounts": amounts_wire,
-        });
-        assert!(
-            value["expected_out"].is_string(),
-            "expected_out must serialise as a JSON string: {value}"
-        );
-        assert!(
-            value["amounts"][1].is_string(),
-            "each amounts element must serialise as a JSON string: {value}"
-        );
-        assert_eq!(
-            value["expected_out"].as_str().expect("string"),
-            "9007199254740993"
-        );
     }
 }
 

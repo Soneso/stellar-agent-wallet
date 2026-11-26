@@ -461,13 +461,4 @@ mod tests {
         let criterion = Sep45SessionActiveCriterion::new();
         assert_eq!(criterion.kind(), "sep45_session_active");
     }
-
-    /// `DenyReason::Sep45SessionMissing` wire code matches the plan spec.
-    #[test]
-    fn deny_reason_wire_code_is_correct() {
-        let r = DenyReason::Sep45SessionMissing {
-            contract_id: "CABC1".into(),
-        };
-        assert_eq!(r.code(), "sep45.session_missing");
-    }
 }

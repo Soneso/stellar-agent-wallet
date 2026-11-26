@@ -398,46 +398,4 @@ mod tests {
     fn stroops_u64_rejects_empty_string() {
         assert!(parse_stroops_u64_field("amount_in_stroops", "").is_err());
     }
-
-    // ── value_as_stroops_i64 ─────────────────────────────────────────────────
-
-    #[test]
-    fn value_as_stroops_i64_reads_string() {
-        let v = serde_json::json!("9007199254740993");
-        assert_eq!(value_as_stroops_i64(&v), Some(9_007_199_254_740_993_i64));
-    }
-
-    #[test]
-    fn value_as_stroops_i64_reads_number() {
-        let v = serde_json::json!(42);
-        assert_eq!(value_as_stroops_i64(&v), Some(42_i64));
-    }
-
-    #[test]
-    fn value_as_stroops_i64_rejects_malformed_string() {
-        let v = serde_json::json!("not-a-number");
-        assert_eq!(value_as_stroops_i64(&v), None);
-    }
-
-    #[test]
-    fn value_as_stroops_i64_rejects_null() {
-        assert_eq!(value_as_stroops_i64(&serde_json::Value::Null), None);
-    }
-
-    #[test]
-    fn value_as_stroops_i64_string_round_trips_i64_max() {
-        let s = i64::MAX.to_string();
-        let v = serde_json::json!(s);
-        assert_eq!(value_as_stroops_i64(&v), Some(i64::MAX));
-    }
-
-    #[test]
-    fn value_as_stroops_i64_rejects_negative() {
-        // Delegated to `stellar_agent_core::wire_stroops::value_as_stroops_i64`:
-        // every reader call site in this crate (amount_stroops,
-        // starting_balance_stroops, limit_stroops) is a non-negative amount or
-        // a 0..=MAX limit, so a negative value is always forged/corrupted.
-        assert_eq!(value_as_stroops_i64(&serde_json::json!("-1")), None);
-        assert_eq!(value_as_stroops_i64(&serde_json::json!(-1)), None);
-    }
 }

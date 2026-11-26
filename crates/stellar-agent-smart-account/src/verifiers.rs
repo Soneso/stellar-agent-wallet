@@ -1820,20 +1820,6 @@ mod tests {
         );
     }
 
-    /// Wire-code round-trip: `NetworksTomlParse` serialises with the expected
-    /// adjacently-tagged shape and its wire code is stable.
-    #[test]
-    fn wire_code_round_trip_config_parse() {
-        let err = SaError::NetworksTomlParse {
-            position: "line 1, column 7".to_owned(),
-            path: PathBuf::from("/tmp/networks.toml"),
-        };
-        assert_eq!(err.wire_code(), "sa.networks_toml_parse");
-        let json = serde_json::to_string(&err).expect("serialize");
-        assert!(json.contains("\"wire_code\""));
-        assert!(json.contains("sa.networks_toml_parse"));
-    }
-
     fn simple_threshold_sha256() -> String {
         "4c14f402df29675d4155283698c436ee588aacb39adc313845010a565c07567d".to_owned()
     }

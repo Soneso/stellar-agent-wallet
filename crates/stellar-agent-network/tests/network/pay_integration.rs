@@ -31,9 +31,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use stellar_agent_core::StellarAmount;
-use stellar_agent_core::error::{
-    ErrorCategory, NetworkError, SubmissionError, ValidationError, WalletError,
-};
+use stellar_agent_core::error::{ErrorCategory, NetworkError, ValidationError, WalletError};
 use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
 use stellar_agent_network::{StellarRpcClient, submit_transaction_and_wait};
 use stellar_agent_test_support::EchoIdResponder;
@@ -154,35 +152,6 @@ fn account_not_found_error_code() {
     });
     assert_eq!(err.code(), "network.account_not_found");
     assert!(err.message().contains(SRC_ACCOUNT));
-}
-
-/// Verifies that the `TxTimeout` error code and display are stable.
-#[test]
-fn tx_timeout_error_code() {
-    // SubmissionError::TxTimeout is the submit-timeout surface.
-    // Use a full 64-char hex hash to exercise the hash-redaction display path.
-    let full_hash = "aabbccddeeff001122334455667788990011223344556677889900aabbccddeeff";
-    let err = WalletError::Submission(SubmissionError::TxTimeout {
-        tx_hash: full_hash.to_owned(),
-        seconds: 60,
-    });
-    assert_eq!(err.code(), "submission.tx_timeout");
-    assert_eq!(err.category(), ErrorCategory::Submission);
-    // Display redacts hash to first-8-last-8.
-    let msg = err.message();
-    assert!(msg.contains("..."), "display must redact the hash: {msg}");
-    assert!(
-        msg.contains("60"),
-        "display must include timeout seconds: {msg}"
-    );
-    assert!(!msg.contains(full_hash), "must NOT show full hash: {msg}");
-}
-
-/// Mainnet write forbidden code is stable.
-#[test]
-fn mainnet_write_forbidden_code() {
-    let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
-    assert_eq!(err.code(), "network.mainnet_write_forbidden");
 }
 
 /// Invalid XDR in submit returns a protocol error.

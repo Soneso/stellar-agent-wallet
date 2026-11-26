@@ -597,19 +597,3 @@ fn policy_engine_allows_stellar_balances_read_only() {
         "stellar_balances must be allowed on mainnet (read-only)"
     );
 }
-
-/// Unit test: decision `Allow` propagates correctly through the dispatch site.
-///
-/// This asserts the call-site discipline: every tools/call invokes
-/// `policy_engine.evaluate` and propagates `Decision::Allow` correctly.
-#[test]
-fn decision_allow_propagates() {
-    use stellar_agent_core::policy::Decision;
-
-    let decision = Decision::Allow;
-    // The server dispatch site matches on Decision::Allow and proceeds.
-    assert!(
-        matches!(decision, Decision::Allow),
-        "Decision::Allow must be matched correctly"
-    );
-}

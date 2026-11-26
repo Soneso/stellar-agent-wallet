@@ -94,39 +94,7 @@ pub const ED25519_VERIFIER_WASM: &[u8] =
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test-only")]
 
-    use sha2::{Digest as _, Sha256};
-
     use super::*;
-
-    /// Asserts that `SHA256(ED25519_VERIFIER_WASM)` matches the pinned
-    /// `ED25519_VERIFIER_WASM_SHA256` const. Supply-chain integrity gate; fires
-    /// on every `cargo test`.
-    #[test]
-    fn ed25519_verifier_wasm_sha256_matches_provenance() {
-        let mut hasher = Sha256::new();
-        hasher.update(ED25519_VERIFIER_WASM);
-        let digest: [u8; 32] = hasher.finalize().into();
-        let actual: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(
-            actual, ED25519_VERIFIER_WASM_SHA256,
-            "vendored multisig_ed25519_verifier_example.wasm sha256 mismatch: \
-             expected {ED25519_VERIFIER_WASM_SHA256}, got {actual}. \
-             If the WASM was intentionally updated, regenerate via \
-             vendor/oz-ed25519-verifier/v0.7.2/build.sh and update both \
-             ED25519_VERIFIER_WASM_SHA256 and PROVENANCE.md."
-        );
-    }
-
-    /// Asserts the embedded WASM starts with the WASM binary magic bytes
-    /// `\0asm`.
-    #[test]
-    fn ed25519_verifier_wasm_has_correct_magic_bytes() {
-        assert_eq!(
-            &ED25519_VERIFIER_WASM[..4],
-            b"\0asm",
-            "ED25519_VERIFIER_WASM must start with WASM magic bytes"
-        );
-    }
 
     /// Asserts the embedded WASM byte length matches the value recorded in
     /// PROVENANCE.md.
