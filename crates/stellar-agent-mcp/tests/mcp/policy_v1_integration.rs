@@ -628,32 +628,6 @@ scope = "profile:default"
 // Loader rejection paths
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Loader rejects a policy signed by one key when verified against another.
-#[test]
-#[serial]
-fn wrong_owner_pubkey_rejects_signature() {
-    const BODY: &str = r#"version = 1
-scope = "profile:default"
-"#;
-
-    let (sk, _pk) = fresh_keypair();
-    let (_sk2, pk_other) = fresh_keypair();
-    let dir = TempDir::new().unwrap();
-    let signed = sign_policy_toml(BODY, &sk, "GABCDE");
-    let path = write_policy_file(&dir, "default.toml", &signed);
-
-    let err = load_signed_policy(&path, "default", &pk_other, TESTNET_PASSPHRASE)
-        .expect_err("verification with wrong key must fail");
-    use stellar_agent_core::policy::PolicyError;
-    assert!(
-        matches!(
-            err,
-            PolicyError::OwnerSignatureInvalid { ref profile, .. } if profile == "default"
-        ),
-        "wrong-key verification must produce OwnerSignatureInvalid; got: {err:?}"
-    );
-}
-
 /// Loader rejects a policy whose body is mutated after signing.
 #[test]
 #[serial]

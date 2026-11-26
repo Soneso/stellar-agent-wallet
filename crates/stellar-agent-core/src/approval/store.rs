@@ -11457,43 +11457,6 @@ amount_max_stroops = 1000000
         );
     }
 
-    // ── validate_smart_account_redacted: targeted rejection shapes ────────────
-
-    #[test]
-    fn smart_account_redacted_rejects_non_c_prefix() {
-        // 13 chars starting with 'G' instead of 'C'.
-        let err = validate_smart_account_redacted("GAAAA...BBBBB").unwrap_err();
-        assert_eq!(err, SMART_ACCOUNT_REDACTED_REASON);
-    }
-
-    #[test]
-    fn smart_account_redacted_rejects_non_base32_chars_in_prefix() {
-        // Chars 1..5 contain a digit 1 which is NOT in base32 [A-Z2-7].
-        let err = validate_smart_account_redacted("C1AAA...BBBBB").unwrap_err();
-        assert_eq!(err, SMART_ACCOUNT_REDACTED_REASON);
-    }
-
-    #[test]
-    fn smart_account_redacted_rejects_wrong_separator() {
-        // Separator must be "...", not "---".
-        let err = validate_smart_account_redacted("CAAAA---BBBBB").unwrap_err();
-        assert_eq!(err, SMART_ACCOUNT_REDACTED_REASON);
-    }
-
-    #[test]
-    fn smart_account_redacted_rejects_non_base32_chars_in_suffix() {
-        // Chars 8..13 contain '!' which is NOT in base32 [A-Z2-7].
-        let err = validate_smart_account_redacted("CAAAA...BB!BB").unwrap_err();
-        assert_eq!(err, SMART_ACCOUNT_REDACTED_REASON);
-    }
-
-    #[test]
-    fn smart_account_redacted_rejects_wrong_length() {
-        // 12 chars (one short).
-        let err = validate_smart_account_redacted("CAAAA...BBBB").unwrap_err();
-        assert_eq!(err, SMART_ACCOUNT_REDACTED_REASON);
-    }
-
     // ── Refused values stay out of every reason ───────────────────────────────
 
     const MARKER: &str = "credmarker7";

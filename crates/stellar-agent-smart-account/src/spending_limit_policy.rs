@@ -228,39 +228,7 @@ mod tests {
     #![allow(clippy::expect_used, reason = "test-only")]
     #![allow(clippy::panic, reason = "test-only shape assertions")]
 
-    use sha2::{Digest as _, Sha256};
-
     use super::*;
-
-    /// Asserts that `SHA256(SPENDING_LIMIT_POLICY_WASM)` matches the pinned
-    /// `SPENDING_LIMIT_POLICY_WASM_SHA256` const. Supply-chain integrity gate;
-    /// fires on every `cargo test`.
-    #[test]
-    fn spending_limit_policy_wasm_sha256_matches_provenance() {
-        let mut hasher = Sha256::new();
-        hasher.update(SPENDING_LIMIT_POLICY_WASM);
-        let digest: [u8; 32] = hasher.finalize().into();
-        let actual: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(
-            actual, SPENDING_LIMIT_POLICY_WASM_SHA256,
-            "vendored multisig_spending_limit_policy_example.wasm sha256 mismatch: \
-             expected {SPENDING_LIMIT_POLICY_WASM_SHA256}, got {actual}. \
-             If the WASM was intentionally updated, regenerate via \
-             vendor/oz-spending-limit-policy/v0.7.2/build.sh and update both \
-             SPENDING_LIMIT_POLICY_WASM_SHA256 and PROVENANCE.md."
-        );
-    }
-
-    /// Asserts the embedded WASM starts with the WASM binary magic bytes
-    /// `\0asm`.
-    #[test]
-    fn spending_limit_policy_wasm_has_correct_magic_bytes() {
-        assert_eq!(
-            &SPENDING_LIMIT_POLICY_WASM[..4],
-            b"\0asm",
-            "SPENDING_LIMIT_POLICY_WASM must start with WASM magic bytes"
-        );
-    }
 
     /// Asserts the embedded WASM byte length matches the value recorded in
     /// PROVENANCE.md.

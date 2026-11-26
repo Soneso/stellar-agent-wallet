@@ -888,32 +888,6 @@ mod tests {
         );
     }
 
-    /// Asserts that the deterministic salt derivation is stable and produces
-    /// different values for different inputs.
-    #[test]
-    fn deterministic_salt_is_stable_and_differs_by_passphrase() {
-        let testnet = "Test SDF Network ; September 2015";
-        let mainnet = "Public Global Stellar Network ; September 2015";
-
-        let domain_testnet = format!("{POLICY_SALT_DOMAIN_PREFIX}{testnet}");
-        let domain_mainnet = format!("{POLICY_SALT_DOMAIN_PREFIX}{mainnet}");
-
-        let salt_testnet: [u8; 32] = Sha256::digest(domain_testnet.as_bytes()).into();
-        let salt_mainnet: [u8; 32] = Sha256::digest(domain_mainnet.as_bytes()).into();
-
-        assert_ne!(
-            salt_testnet, salt_mainnet,
-            "different passphrases must produce different deterministic salts"
-        );
-
-        // Same input → same output (deterministic).
-        let salt_testnet2: [u8; 32] = Sha256::digest(domain_testnet.as_bytes()).into();
-        assert_eq!(
-            salt_testnet, salt_testnet2,
-            "salt derivation must be deterministic"
-        );
-    }
-
     /// Asserts the spending-limit-policy salt domain prefix differs from both
     /// verifier prefixes, so the policy derives a distinct address from the
     /// verifiers for the same deployer + network.

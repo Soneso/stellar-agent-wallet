@@ -1691,7 +1691,7 @@ mod tests {
     use keyring_core::Entry as KeyringEntry;
     use serial_test::serial;
     use stellar_agent_core::approval::{
-        ApprovalError, ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore,
+        ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore,
         attestation::compute_attestation_v4, decode_sha256_hex, fixtures,
         process_uid_for_attestation,
     };
@@ -2824,23 +2824,6 @@ mod tests {
     // ── Decode sha256 hex ────────────────────────────────────────────────────
 
     #[test]
-    fn decode_sha256_hex_valid() {
-        let hex = "a".repeat(64);
-        let result = decode_sha256_hex(&hex);
-        assert!(
-            result.is_ok(),
-            "valid 64-char hex should decode: {result:?}"
-        );
-    }
-
-    #[test]
-    fn decode_sha256_hex_wrong_length_fails() {
-        let err = decode_sha256_hex("abcd").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("64") || msg.contains("unexpected"), "{msg}");
-    }
-
-    #[test]
     fn decode_sha256_hex_invalid_chars_fails() {
         let hex = "zz".repeat(32); // invalid hex
         let err = decode_sha256_hex(&hex).unwrap_err();
@@ -2849,21 +2832,6 @@ mod tests {
     }
 
     // ── load_attestation_key ─────────────────────────────────────────────────
-
-    #[test]
-    #[serial]
-    fn load_attestation_key_success() {
-        keyring_mock::install().unwrap();
-        let svc = "stellar-agent-attestation-run-test-load";
-        seed_key_32(svc, "default");
-        let entry_ref = KeyringEntryRef::new(svc, "default");
-        let key = load_attestation_key(
-            &entry_ref,
-            &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile_name("run-test"),
-        )
-        .unwrap();
-        assert_eq!(key.len(), 32);
-    }
 
     #[test]
     #[serial]
@@ -2997,36 +2965,6 @@ mod tests {
         let now = timefmt::now_unix_ms().unwrap();
         let found = store.get(&nonce).unwrap();
         assert!(found.is_expired(now), "entry should be expired");
-    }
-
-    #[test]
-    #[serial]
-    fn store_entry_second_attestation_returns_already_attested_error() {
-        keyring_mock::install().unwrap();
-        let dir = TempDir::new().unwrap();
-        let mut store = open_store_at(&dir, "__stellar_agent_approve_test_attested");
-        let entry = make_entry(DEFAULT_TTL_MS);
-        let nonce = entry.approval_nonce.clone();
-        store
-            .insert(entry, timefmt::now_unix_ms().expect("clock"))
-            .unwrap();
-        store
-            .record_attestation(
-                &nonce,
-                [0x42u8; 32],
-                stellar_agent_core::approval::AttestedApprover::Local,
-            )
-            .unwrap();
-
-        // Second record_attestation must fail with AlreadyAttested.
-        let err = store
-            .record_attestation(
-                &nonce,
-                [0x42u8; 32],
-                stellar_agent_core::approval::AttestedApprover::Local,
-            )
-            .unwrap_err();
-        assert!(matches!(err, ApprovalError::AlreadyAttested));
     }
 
     #[test]

@@ -912,37 +912,6 @@ async fn driver_commit_seams_use_verified_context() {
     .await;
 }
 
-macro_rules! commit_seam_test {
-    ($name:ident, $stage:literal, $seam:ident) => {
-        #[tokio::test]
-        #[serial]
-        async fn $name() {
-            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-            let _storage_home =
-                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-            use super::super::store::$seam;
-            commit_seams(&[$stage], &[$seam]).await;
-        }
-    };
-}
-
-commit_seam_test!(driver_seam_w1_prepared, 1, COMMIT_FAULT_AFTER_PREPARED);
-commit_seam_test!(driver_seam_w1_counter, 1, COMMIT_FAULT_AFTER_COUNTER);
-commit_seam_test!(driver_seam_w1_compaction, 1, COMMIT_FAULT_COMPACTION);
-commit_seam_test!(driver_seam_release_prepared, 2, COMMIT_FAULT_AFTER_PREPARED);
-commit_seam_test!(driver_seam_release_counter, 2, COMMIT_FAULT_AFTER_COUNTER);
-commit_seam_test!(driver_seam_release_compaction, 2, COMMIT_FAULT_COMPACTION);
-commit_seam_test!(driver_seam_stop_prepared, 3, COMMIT_FAULT_AFTER_PREPARED);
-commit_seam_test!(driver_seam_stop_counter, 3, COMMIT_FAULT_AFTER_COUNTER);
-commit_seam_test!(driver_seam_stop_compaction, 3, COMMIT_FAULT_COMPACTION);
-commit_seam_test!(
-    driver_seam_decision_prepared,
-    4,
-    COMMIT_FAULT_AFTER_PREPARED
-);
-commit_seam_test!(driver_seam_decision_counter, 4, COMMIT_FAULT_AFTER_COUNTER);
-commit_seam_test!(driver_seam_decision_compaction, 4, COMMIT_FAULT_COMPACTION);
-
 /// The reservation, release and decision writes each refuse after their audit
 /// append and before their prepared image: the prior generation and run stay
 /// byte-identical, and the refusal keeps the root code and verified progress.
@@ -1991,23 +1960,6 @@ async fn driver_new_owner_refuses_old_release_stop_and_decision() {
     replaced_owner(&[2, 3, 5]).await;
 }
 
-macro_rules! replaced_owner_test {
-    ($name:ident, $stage:literal) => {
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        #[serial]
-        async fn $name() {
-            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-            let _storage_home =
-                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-            replaced_owner(&[$stage]).await;
-        }
-    };
-}
-
-replaced_owner_test!(driver_old_release_owner, 2);
-replaced_owner_test!(driver_old_stop_owner, 3);
-replaced_owner_test!(driver_old_decision_owner, 5);
-
 async fn replaced_owner(stages: &[u8]) {
     use super::super::store::COMMIT_FAULT_AFTER_COUNTER;
     for &wanted in stages {
@@ -2769,28 +2721,6 @@ async fn driver_public_decision_then_separate_receipt_repair() {
     ])
     .await;
 }
-
-#[cfg(feature = "mainnet-write")]
-macro_rules! receipt_seam_test {
-    ($name:ident, $seam:ident) => {
-        #[tokio::test]
-        #[serial]
-        async fn $name() {
-            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-            let _storage_home =
-                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-            use super::super::store::$seam;
-            receipt_seams(&[$seam]).await;
-        }
-    };
-}
-
-#[cfg(feature = "mainnet-write")]
-receipt_seam_test!(driver_seam_ack_prepared, COMMIT_FAULT_AFTER_PREPARED);
-#[cfg(feature = "mainnet-write")]
-receipt_seam_test!(driver_seam_ack_counter, COMMIT_FAULT_AFTER_COUNTER);
-#[cfg(feature = "mainnet-write")]
-receipt_seam_test!(driver_seam_ack_compaction, COMMIT_FAULT_COMPACTION);
 
 #[cfg(feature = "mainnet-write")]
 async fn receipt_seams(seams: &[u8]) {

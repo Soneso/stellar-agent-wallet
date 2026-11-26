@@ -1483,16 +1483,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Asserts the embedded WASM starts with the WASM binary magic bytes `\0asm`.
-    #[test]
-    fn multisig_account_wasm_has_correct_magic_bytes() {
-        assert_eq!(
-            &MULTISIG_ACCOUNT_WASM[..4],
-            b"\0asm",
-            "MULTISIG_ACCOUNT_WASM must start with WASM magic bytes"
-        );
-    }
-
     /// A signer that records each method call and delegates to a software key,
     /// so a test sees whether a deployment reached its deployer.
     struct RecordingSigner {

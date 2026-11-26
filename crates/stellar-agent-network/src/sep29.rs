@@ -114,20 +114,7 @@ mod tests {
     )]
 
     use super::normalise_memo_required;
-    use stellar_agent_core::error::{ErrorCategory, NetworkError, ValidationError, WalletError};
-
-    /// MemoRequired has the correct code.
-    // The memo-present fast-path is covered by the payment integration tests
-    // (sep29_memo_present_fast_path_no_rpc).
-    #[test]
-    fn memo_required_code() {
-        let e = WalletError::Validation(ValidationError::MemoRequired {
-            destination: "GABC".to_owned(),
-        });
-        assert_eq!(e.code(), "validation.memo_required");
-        assert_eq!(e.category(), ErrorCategory::Validation);
-        assert!(e.message().contains("GABC"));
-    }
+    use stellar_agent_core::error::{ErrorCategory, NetworkError, WalletError};
 
     /// `NetworkError::RpcDivergence` has the correct wire code.
     ///

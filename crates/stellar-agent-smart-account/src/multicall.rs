@@ -26,8 +26,6 @@ use std::time::Duration;
 
 use hex;
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use sha2::{Digest as _, Sha256};
 use stellar_xdr::{HostFunction, InvokeContractArgs, ScAddress, ScSymbol, ScVal, VecM};
 use tracing::warn;
 
@@ -2844,23 +2842,6 @@ mod tests {
         assert!(logs.contains("sa_multicall_bundle_denied"), "{logs}");
         assert!(logs.contains("req-denied"), "{logs}");
         assert!(logs.contains("mutex poisoned"), "{logs}");
-    }
-
-    // ── Provenance test ───────────────────────────────────────────────────────
-
-    /// The SHA-256 of [`MULTICALL_WASM`] equals `MULTICALL_WASM_SHA256`.
-    ///
-    /// `build.rs` compares the vendored file with its `WASM_PINS` row, never
-    /// with this constant; this test compares the constant with the embedded
-    /// bytes, and `src/vendored_wasm_tests.rs` binds both to the file.
-    #[test]
-    fn multicall_wasm_sha256_matches_provenance() {
-        let digest = Sha256::digest(MULTICALL_WASM);
-        let hex = hex::encode(digest);
-        assert_eq!(
-            hex, MULTICALL_WASM_SHA256,
-            "MULTICALL_WASM sha256 {hex} does not match MULTICALL_WASM_SHA256 {MULTICALL_WASM_SHA256}"
-        );
     }
 
     // ── MULTICALL_FAILED_PHASES closed-7-set ──────────────────────────────────

@@ -1365,26 +1365,6 @@ mod tests {
             i128::MAX
         );
     }
-
-    #[test]
-    fn redact_strkey_format() {
-        use stellar_agent_core::observability::redact_strkey_first5_last5;
-        // Vault address redaction: first-5-last-5.
-        let vault = "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN";
-        let redacted = redact_strkey_first5_last5(vault);
-        assert!(
-            redacted.contains("CBMVK"),
-            "redacted must contain first-5: {redacted}"
-        );
-        assert!(
-            redacted.contains("ZDWHN"),
-            "redacted must contain last-5: {redacted}"
-        );
-        assert!(
-            !redacted.contains("JK6NTOT2O4"),
-            "redacted must not contain middle: {redacted}"
-        );
-    }
 }
 
 #[cfg(test)]

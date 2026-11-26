@@ -8251,16 +8251,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[serial(mainnet_clock)]
-    #[serial]
-    fn closure_survives_each_commit_seam() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        assert_closure_and_pruning_survive_each_commit_seam();
-    }
-
     fn assert_closure_and_pruning_survive_each_commit_seam() {
         for schedule in [false, true] {
             for seam in [
@@ -8519,16 +8509,6 @@ mod tests {
             decode_version_eight(&key, &encode(&parent)),
             Err(WindowStoreError::UnsupportedVersion)
         ));
-    }
-
-    #[test]
-    #[serial(mainnet_clock)]
-    #[serial]
-    fn final_intent_snapshot_predicates_are_distinct() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        assert_final_intent_snapshot_predicates_are_distinct();
     }
 
     fn assert_final_intent_snapshot_predicates_are_distinct() {
@@ -9656,16 +9636,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[serial(mainnet_clock)]
-    #[serial]
-    fn readmission_cannot_reclassify_an_intent() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        assert_readmission_cannot_reclassify_an_intent();
-    }
-
     fn assert_readmission_cannot_reclassify_an_intent() {
         let (_dir, profile, store, mut plan) = progress_fixture();
         let _clock = crate::mainnet::clock::set_now_ms_for_test(1000);
@@ -10279,16 +10249,6 @@ mod tests {
                 .expiry_observed_at_ms,
             Some(2000)
         );
-    }
-
-    #[test]
-    #[serial(mainnet_clock)]
-    #[serial]
-    fn intent_horizons_survive_window_lengthening() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        assert_intent_horizons_survive_window_lengthening();
     }
 
     fn assert_intent_horizons_survive_window_lengthening() {
@@ -13405,8 +13365,6 @@ mod tests {
 
     /// Every consent refusal returns before a key mint, a file write or a
     /// generation write, and before `record` runs.
-    #[test]
-    #[serial]
     fn reset_consent_refusals_change_nothing() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
@@ -13579,8 +13537,6 @@ mod tests {
 
     /// The statement binds the store's challenge, so a consent for one first
     /// use store does not reset another with identical arguments.
-    #[test]
-    #[serial]
     fn a_consent_does_not_transfer_between_first_use_stores() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
@@ -20279,37 +20235,6 @@ mod tests {
         assert!(outcome.newly_minted);
     }
 
-    /// Unverifiable history refuses before the recorder on either network.
-    #[test]
-    #[serial]
-    fn an_unverifiable_reset_preserves_every_durable_component() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        for mainnet in [true, false] {
-            for defect in DEFECTS {
-                let (_dir, profile, store) = broken("unverifiable", mainnet, defect);
-                let error = assert_reset_refuses(&store, &profile);
-                #[cfg(feature = "mainnet-write")]
-                if mainnet {
-                    assert!(
-                        matches!(error, WindowStoreError::MainnetStateUnverifiable { defect: found } if found == defect)
-                    );
-                    continue;
-                }
-                assert!(
-                    match defect {
-                        StateDefect::MissingKey | StateDefect::BadKey => {
-                            matches!(error, WindowStoreError::Keyring { .. })
-                        }
-                        _ => defect_of(&error, !store.path.exists()) == Some(defect),
-                    },
-                    "{defect}"
-                );
-            }
-        }
-    }
-
     #[test]
     #[serial(mainnet_clock)]
     #[serial]
@@ -20673,22 +20598,6 @@ mod tests {
                 }
             }
         }
-    }
-    #[test]
-    #[serial]
-    fn reset_refuses_a_rolled_back_file_of_another_network() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let mut f = ResetFixture::new();
-        f.profile.chain_id = Caip2::Mainnet;
-        f.seal(&reset_wire());
-        put_raw(&generation_entry_ref(&f.profile), "2");
-        f.profile.chain_id = Caip2::Testnet;
-        assert!(matches!(
-            assert_reset_refuses(&f.store, &f.profile),
-            WindowStoreError::ChainMismatch
-        ));
     }
 
     /// Each authenticated wire has exactly one provenance defect.

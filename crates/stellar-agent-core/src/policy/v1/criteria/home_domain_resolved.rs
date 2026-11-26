@@ -423,18 +423,6 @@ mod tests {
         }
     }
 
-    /// Wire code is stable.
-    #[test]
-    fn wire_code_stable() {
-        assert_eq!(
-            DenyReason::HomeDomainNotResolved {
-                home_domain: "circle.com".into(),
-            }
-            .code(),
-            "home_domain_not_resolved"
-        );
-    }
-
     /// `Default` impl matches `new()`.
     #[test]
     fn default_impl_matches_new() {

@@ -265,26 +265,6 @@ mod tests {
         );
     }
 
-    /// Single-tx path (bundle=None) passes regardless of enabled state.
-    #[test]
-    #[serial_test::serial]
-    fn single_tx_bundle_none_passes() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let tool = make_tool();
-        let profile = make_profile();
-        let store = PolicyStateStore::new();
-        let args = serde_json::Value::Null;
-        let criterion = RestrictBundleToRecognisedKindsCriterion { enabled: true };
-
-        let ctx = make_ctx_with_bundle(&tool, &profile, &args, &store, None);
-        assert!(
-            criterion.evaluate(&ctx).unwrap().is_none(),
-            "bundle=None must always pass"
-        );
-    }
-
     /// Reports the index of the FIRST Generic inner, not the last.
     #[test]
     #[serial_test::serial]

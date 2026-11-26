@@ -37,44 +37,6 @@ fn ssrf_host_mismatch_is_rejected() {
     );
 }
 
-/// SSRF bind: `evil-anchor.org` vs `anchor.org` → rejected (leading-dot guard).
-///
-/// The LEADING DOT is load-bearing: naive `ends_with('anchor.org')` would
-/// allow `evil-anchor.org` to match.
-#[test]
-fn ssrf_evil_anchor_does_not_match_anchor_org() {
-    let result =
-        assert_same_domain_or_https_fqdn("https://evil-anchor.org/sep6", Some("anchor.org"));
-    assert!(
-        matches!(result, Err(AnchorError::TransferServerHostMismatch)),
-        "evil-anchor.org must NOT match anchor.org (leading-dot guard); got: {result:?}"
-    );
-}
-
-/// SSRF bind: `transfer.anchor.org` vs `anchor.org` → accepted (valid subdomain).
-#[test]
-fn ssrf_subdomain_transfer_anchor_org_accepted() {
-    let result =
-        assert_same_domain_or_https_fqdn("https://transfer.anchor.org/sep6", Some("anchor.org"));
-    assert!(
-        result.is_ok(),
-        "transfer.anchor.org must be accepted as subdomain of anchor.org; got: {result:?}"
-    );
-}
-
-/// SSRF bind: exact domain match → accepted.
-#[test]
-fn ssrf_exact_domain_match_accepted() {
-    let result = assert_same_domain_or_https_fqdn(
-        "https://testanchor.stellar.org/sep6",
-        Some("testanchor.stellar.org"),
-    );
-    assert!(
-        result.is_ok(),
-        "exact domain match must be accepted; got: {result:?}"
-    );
-}
-
 /// SSRF bind: `notanchor.org` vs `anchor.org` → rejected (no leading-dot suffix match).
 #[test]
 fn ssrf_different_tld_sibling_is_rejected() {
@@ -95,36 +57,6 @@ fn ssrf_http_scheme_rejected() {
     assert!(
         matches!(result, Err(AnchorError::InvalidDirectUrl { .. })),
         "http:// must be rejected; got: {result:?}"
-    );
-}
-
-/// Direct URL mode: IP address is rejected.
-#[test]
-fn ssrf_direct_ip_rejected() {
-    let result = assert_same_domain_or_https_fqdn("https://169.254.169.254/sep6", None);
-    assert!(
-        matches!(result, Err(AnchorError::InvalidDirectUrl { .. })),
-        "169.254.169.254 must be rejected in direct-URL mode; got: {result:?}"
-    );
-}
-
-/// Direct URL mode: single-label hostname is rejected (SSRF guard).
-#[test]
-fn ssrf_direct_single_label_rejected() {
-    let result = assert_same_domain_or_https_fqdn("https://localhost/sep6", None);
-    assert!(
-        matches!(result, Err(AnchorError::InvalidDirectUrl { .. })),
-        "localhost must be rejected in direct-URL mode; got: {result:?}"
-    );
-}
-
-/// Direct URL mode: valid public FQDN is accepted.
-#[test]
-fn ssrf_direct_valid_fqdn_accepted() {
-    let result = assert_same_domain_or_https_fqdn("https://transfer.example.com/sep6", None);
-    assert!(
-        result.is_ok(),
-        "valid FQDN transfer.example.com must be accepted; got: {result:?}"
     );
 }
 

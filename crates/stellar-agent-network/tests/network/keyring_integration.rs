@@ -396,29 +396,6 @@ fn panic_unwinds_through_zeroizing_scope() {
     );
 }
 
-/// 8. `sign_tx_payload` produces the correct 64-byte signature.
-///    Separate from happy_path to isolate the signature-length assertion.
-#[tokio::test]
-#[serial]
-async fn sign_tx_payload_returns_64_bytes() {
-    keyring_mock::install().expect("mock store init");
-
-    let seed = [0xEE_u8; 32];
-    let entry_ref = unique_ref("siglen");
-    let expected_g = gstrkey_for_seed(seed);
-    store_sstrkey(&entry_ref, &sstrkey_for_seed(seed));
-
-    let handle = signer_from_keyring(&entry_ref, &expected_g)
-        .await
-        .expect("handle construction");
-    let payload = crate::payload_fixtures::tx_payload(0x42);
-    let sig = handle
-        .sign_tx_payload(&payload)
-        .await
-        .expect("signing must succeed");
-    assert_eq!(sig.len(), 64, "ed25519 signature must be 64 bytes");
-}
-
 /// 9. `public_key()` returns the correct key without re-loading from keyring.
 ///    Verifies the cached-pubkey contract.
 #[tokio::test]

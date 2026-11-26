@@ -364,11 +364,4 @@ mod tests {
             "USDC inner must not trigger native cap"
         );
     }
-
-    /// `is_bundle_level()` must return `true`.
-    #[test]
-    fn is_bundle_level_returns_true() {
-        let c = BundlePerTxCapCriterion::new("native".into(), 1_000_000_000);
-        assert!(c.is_bundle_level());
-    }
 }

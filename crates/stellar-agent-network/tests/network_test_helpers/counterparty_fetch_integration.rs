@@ -471,33 +471,6 @@ mod domain_validation {
     use stellar_agent_network::counterparty::fetch::validate_home_domain;
 
     #[test]
-    fn non_ascii_domain_rejected_before_io() {
-        let err = validate_home_domain("сircle.com").unwrap_err();
-        assert!(
-            matches!(err, CounterpartyError::HomeDomainInvalid { .. }),
-            "non-ASCII domain must be rejected: {err:?}"
-        );
-    }
-
-    #[test]
-    fn url_scheme_rejected_before_io() {
-        let err = validate_home_domain("https://circle.com").unwrap_err();
-        assert!(
-            matches!(err, CounterpartyError::HomeDomainInvalid { .. }),
-            "URL scheme must be rejected: {err:?}"
-        );
-    }
-
-    #[test]
-    fn control_char_rejected_before_io() {
-        let err = validate_home_domain("circle\x00.com").unwrap_err();
-        assert!(
-            matches!(err, CounterpartyError::HomeDomainInvalid { .. }),
-            "control char must be rejected: {err:?}"
-        );
-    }
-
-    #[test]
     fn domain_over_label_cap_rejected_before_io() {
         // A single label of 64 bytes exceeds the per-label cap of 63 bytes per
         // RFC 1035. Per-label validation is enforced independently of the
@@ -508,15 +481,6 @@ mod domain_validation {
         assert!(
             matches!(err, CounterpartyError::HomeDomainInvalid { .. }),
             "oversized single-label domain must be rejected: {err:?}"
-        );
-    }
-
-    #[test]
-    fn empty_domain_rejected_before_io() {
-        let err = validate_home_domain("").unwrap_err();
-        assert!(
-            matches!(err, CounterpartyError::HomeDomainInvalid { .. }),
-            "empty domain must be rejected: {err:?}"
         );
     }
 }

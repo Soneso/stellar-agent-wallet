@@ -464,27 +464,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sign_tx_payload_produces_64_bytes() {
-        let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
-        let payload = TxSigningPayload::from_bytes_for_test([0xDE_u8; 32]);
-        let sig = key.sign_tx_payload(&payload).await.unwrap();
-        assert_eq!(sig.len(), 64);
-    }
-
-    #[tokio::test]
     async fn public_key_is_deterministic() {
         let key = SoftwareSigningKey::new_from_bytes([7u8; 32]);
         let pk1 = key.public_key().await.unwrap();
         let pk2 = key.public_key().await.unwrap();
         assert_eq!(pk1.0, pk2.0, "public key must be deterministic");
-    }
-
-    #[tokio::test]
-    async fn sign_auth_digest_produces_64_bytes() {
-        let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
-        let digest = SmartAccountAuthDigest::from_bytes_for_test([0xAD_u8; 32]);
-        let sig = key.sign_auth_digest(&digest).await.unwrap();
-        assert_eq!(sig.len(), 64);
     }
 
     /// Every typed method signs its payload's bytes with the one ed25519

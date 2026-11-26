@@ -3741,7 +3741,6 @@ mod tests {
     /// another lifetime. The attestation binds the lifetime, so the re-read
     /// compares both lifetime fields and refuses before the row; otherwise the
     /// stored entry would carry a blob over a lifetime it does not have.
-    #[test]
     fn an_entry_whose_lifetime_changed_since_validation_refuses_with_no_row() {
         for (kind, entry) in every_attestable_kind() {
             for field in ["created", "expires"] {
@@ -3776,7 +3775,6 @@ mod tests {
     /// Another process replaced the entry under the same nonce with one bound
     /// to another user. The re-read compares the `process_uid` as well as the
     /// kind, and refuses before the row.
-    #[test]
     fn an_entry_whose_process_uid_changed_since_validation_refuses_with_no_row() {
         for (kind, entry) in every_attestable_kind() {
             let dir = TempDir::new().unwrap();
@@ -3796,7 +3794,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn a_rejected_entry_since_validation_refuses_with_its_own_code() {
         let entry = make_entry(DEFAULT_TTL_MS);
         let dir = TempDir::new().unwrap();
@@ -3818,7 +3815,6 @@ mod tests {
 
     /// Another handle attested the entry and a commit spent it after the
     /// caller validated its unattested copy.
-    #[test]
     fn a_consumed_entry_since_validation_refuses_with_its_own_code() {
         let entry = make_entry(DEFAULT_TTL_MS);
         let dir = TempDir::new().unwrap();

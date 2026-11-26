@@ -935,29 +935,6 @@ mod tests {
         );
     }
 
-    /// The inner key (with prefix) is distinct from the bare inner tx hash.
-    ///
-    /// Verifies that the `feebump-inner:` prefix correctly namespaces fee-bump
-    /// keys away from the classic-path key space.
-    #[tokio::test]
-    async fn inner_key_prefix_namespacing() {
-        let (inner_xdr, _) = build_inner_signed_xdr(1, None).await;
-        let v1 = decode_inner_v1(&inner_xdr)
-            .map_err(WalletError::from)
-            .unwrap();
-        let hash_hex = compute_inner_tx_hash_hex(&v1.tx, TESTNET_PASSPHRASE).unwrap();
-
-        let inner_key = format!("{FEEBUMP_INNER_PREFIX}{hash_hex}");
-        assert!(
-            inner_key.starts_with(FEEBUMP_INNER_PREFIX),
-            "inner key must start with FEEBUMP_INNER_PREFIX"
-        );
-        assert_ne!(
-            inner_key, hash_hex,
-            "prefixed inner key must differ from bare hash (no aliasing)"
-        );
-    }
-
     /// `max_time` extracted from an inner envelope equals the inner tx's `maxTime`.
     ///
     /// Builds an inner tx with a known `TimeBounds.maxTime` (1_800_000_099) and

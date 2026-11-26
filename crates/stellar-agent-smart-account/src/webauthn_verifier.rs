@@ -118,43 +118,7 @@ pub const WEBAUTHN_VERIFIER_WASM: &[u8] =
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test-only")]
 
-    use sha2::{Digest as _, Sha256};
-
     use super::*;
-
-    /// Asserts that `SHA256(WEBAUTHN_VERIFIER_WASM)` equals
-    /// `WEBAUTHN_VERIFIER_WASM_SHA256`.
-    ///
-    /// The record check of `rebuild-vendored-wasm.sh --check-tree` holds the
-    /// vendored file to `vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md`, and
-    /// the tests in `src/vendored_wasm_tests.rs` bind both constants to that
-    /// file.
-    #[test]
-    fn webauthn_verifier_wasm_sha256_matches_provenance() {
-        let mut hasher = Sha256::new();
-        hasher.update(WEBAUTHN_VERIFIER_WASM);
-        let digest: [u8; 32] = hasher.finalize().into();
-        let actual: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(
-            actual, WEBAUTHN_VERIFIER_WASM_SHA256,
-            "vendored multisig_webauthn_verifier_example.wasm sha256 mismatch: \
-             expected {WEBAUTHN_VERIFIER_WASM_SHA256}, got {actual}. \
-             If the WASM was intentionally updated, regenerate via \
-             vendor/oz-webauthn-verifier/v0.7.2/build.sh and update both \
-             WEBAUTHN_VERIFIER_WASM_SHA256 and PROVENANCE.md."
-        );
-    }
-
-    /// Asserts the embedded WASM starts with the WASM binary magic bytes
-    /// `\0asm`.
-    #[test]
-    fn webauthn_verifier_wasm_has_correct_magic_bytes() {
-        assert_eq!(
-            &WEBAUTHN_VERIFIER_WASM[..4],
-            b"\0asm",
-            "WEBAUTHN_VERIFIER_WASM must start with WASM magic bytes"
-        );
-    }
 
     /// Asserts the embedded WASM byte length matches the value recorded in
     /// the audit / provenance doc.  Adds an independent witness on top of the

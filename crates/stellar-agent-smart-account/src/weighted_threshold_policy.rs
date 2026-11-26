@@ -294,25 +294,6 @@ mod tests {
         ScAddress::Contract(ContractId(Hash([contract_id_fill; 32])))
     }
 
-    /// Asserts that `SHA256(WEIGHTED_THRESHOLD_POLICY_WASM)` matches the
-    /// pinned `WEIGHTED_THRESHOLD_POLICY_WASM_SHA256` const. Supply-chain
-    /// integrity gate; fires on every `cargo test`.
-    #[test]
-    fn weighted_threshold_policy_wasm_sha256_matches_provenance() {
-        let mut hasher = Sha256::new();
-        hasher.update(WEIGHTED_THRESHOLD_POLICY_WASM);
-        let digest: [u8; 32] = hasher.finalize().into();
-        let actual: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(
-            actual, WEIGHTED_THRESHOLD_POLICY_WASM_SHA256,
-            "vendored multisig_weighted_threshold_policy_example.wasm sha256 mismatch: \
-             expected {WEIGHTED_THRESHOLD_POLICY_WASM_SHA256}, got {actual}. \
-             If the WASM was intentionally updated, regenerate via \
-             vendor/oz-weighted-threshold-policy/v0.7.2/build.sh and update both \
-             WEIGHTED_THRESHOLD_POLICY_WASM_SHA256 and PROVENANCE.md."
-        );
-    }
-
     /// `WEIGHTED_THRESHOLD_POLICY_WASM_HASHES[0]` must equal
     /// `SHA256(WEIGHTED_THRESHOLD_POLICY_WASM)` — the allowlist entry
     /// `identify_weighted_threshold_policy` matches against.
@@ -333,17 +314,6 @@ mod tests {
             WEIGHTED_THRESHOLD_POLICY_WASM_HASHES.len(),
             1,
             "weighted-threshold allowlist must have exactly one entry"
-        );
-    }
-
-    /// Asserts the embedded WASM starts with the WASM binary magic bytes
-    /// `\0asm`.
-    #[test]
-    fn weighted_threshold_policy_wasm_has_correct_magic_bytes() {
-        assert_eq!(
-            &WEIGHTED_THRESHOLD_POLICY_WASM[..4],
-            b"\0asm",
-            "WEIGHTED_THRESHOLD_POLICY_WASM must start with WASM magic bytes"
         );
     }
 

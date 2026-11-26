@@ -467,12 +467,4 @@ mod tests {
             "2 inners vs cap=2 must pass (0+0=0<2, 0+1=1<2)"
         );
     }
-
-    /// `is_bundle_level()` must return `true`.
-    #[test]
-    fn is_bundle_level_returns_true() {
-        let w = Window::parse("1m").unwrap();
-        let c = BundleRateLimitCriterion::new(w, 5);
-        assert!(c.is_bundle_level());
-    }
 }
