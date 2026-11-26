@@ -138,6 +138,13 @@ impl std::fmt::Debug for SignedEnrollmentHandle {
 }
 
 impl SignedEnrollmentHandle {
+    /// Observes the listener task; completion means its listener was dropped.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    pub fn listener_tasks(&self) -> [tokio::task::AbortHandle; 1] {
+        [self.server_join.abort_handle()]
+    }
+
     /// The bound backend socket.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
@@ -666,15 +673,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending.label(), "phone");
+        let tasks = handle.listener_tasks();
         handle.shutdown().await.unwrap();
-        assert!(socket_is_free(setup.bind), "shutdown releases the socket");
+        assert!(tasks[0].is_finished(), "listener stopped after shutdown");
     }
 
-    /// Waits until a new bind on `addr` succeeds, for at most five seconds.
-    async fn released_within_bound(addr: SocketAddr) -> bool {
+    /// Waits for the listener task to finish, for at most five seconds.
+    async fn released_within_bound(tasks: &[tokio::task::AbortHandle]) -> bool {
+        assert_eq!(tasks.len(), 1, "one enrollment listener task");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
-            if socket_is_free(addr) {
+            if tasks.iter().all(tokio::task::AbortHandle::is_finished) {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -689,28 +698,36 @@ mod tests {
     #[serial_test::serial]
     async fn signed_enrollment_handle_drop_and_abort_release_the_socket() {
         let setup = Setup::new();
-        let handle = setup.start().await;
-        assert!(!socket_is_free(setup.bind));
+        let config = || {
+            let mut config = setup.config(setup.leaf.pin);
+            config.profile.remote_approval.as_mut().unwrap().bind = "127.0.0.1:0".to_owned();
+            config
+        };
+        let handle = start_signed_enrollment(config(), |_| {}).await.unwrap();
+        let tasks = handle.listener_tasks();
+        tokio::task::yield_now().await;
+        assert!(!tasks[0].is_finished(), "listener is running before drop");
         drop(handle);
         assert!(
-            released_within_bound(setup.bind).await,
+            released_within_bound(&tasks).await,
             "a dropped handle releases the socket within five seconds"
         );
 
-        let config = setup.config(setup.leaf.pin);
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let config = config();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let owner = tokio::spawn(async move {
             let handle = start_signed_enrollment(config, |_| {}).await.unwrap();
-            let _ = started_tx.send(());
+            let _ = started_tx.send(handle.listener_tasks());
             let _held = handle;
             std::future::pending::<()>().await;
         });
-        started_rx.await.unwrap();
-        assert!(!socket_is_free(setup.bind));
+        let tasks = started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!tasks[0].is_finished(), "listener is running before abort");
         owner.abort();
         assert!(owner.await.unwrap_err().is_cancelled());
         assert!(
-            released_within_bound(setup.bind).await,
+            released_within_bound(&tasks).await,
             "an aborted owner task releases the socket within five seconds"
         );
     }

@@ -338,8 +338,10 @@ impl Commands {
 /// take more than 1 MiB in a debug build, whose frames and future state
 /// machines are not compacted. Each role therefore runs on a thread with this
 /// stack, the size the Linux and macOS main thread provides, so every
-/// platform and build profile runs the body with the same stack.
-const BODY_STACK_SIZE: usize = 8 * 1024 * 1024;
+/// platform and build profile runs the body with the same stack. A unit test
+/// whose command body needs more than the test thread's stack runs it on a
+/// thread of this size through `test_rpc::on_body_stack`.
+pub(crate) const BODY_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 /// Opens native storage only for the explicit live acceptance entry point.
 #[cfg(feature = "live-platform-keyring")]

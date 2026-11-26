@@ -1506,12 +1506,11 @@ async fn the_mainnet_inbox_binds_both_families() {
         std::net::TcpListener::bind(ipv6).unwrap_err().kind(),
         std::io::ErrorKind::AddrInUse
     );
+    let tasks = handle.listener_tasks();
+    assert_eq!(tasks.len(), 2, "one listener task per bound family");
     handle.shutdown().await.unwrap();
-    for addr in [SocketAddr::from(([127, 0, 0, 1], port)), ipv6] {
-        assert!(
-            tokio::net::TcpStream::connect(addr).await.is_err(),
-            "{addr} closed after shutdown"
-        );
+    for task in tasks {
+        assert!(task.is_finished(), "listener stopped after shutdown");
     }
 }
 
@@ -1527,22 +1526,31 @@ async fn the_testnet_inbox_keeps_one_listener() {
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     stellar_agent_test_support::keyring_mock::install().unwrap();
     let dir = TempDir::new().unwrap();
-    let (held_v6, port) = (0..64)
-        .find_map(|_| {
-            let held = std::net::TcpListener::bind("[::1]:0").unwrap();
-            let port = held.local_addr().unwrap().port();
-            std::net::TcpListener::bind(("127.0.0.1", port))
-                .is_ok()
-                .then_some((held, port))
-        })
-        .expect("a port free on 127.0.0.1 among 64 held on ::1");
-    let handle = start_serve(config_for(
-        SocketAddr::from(([127, 0, 0, 1], port)),
-        dir.path().join("default.toml"),
-        dir.path().join("audit.log"),
-    ))
-    .await
-    .expect("the testnet inbox needs only 127.0.0.1");
+    // Retry the actual start while IPv6 is held, without reserving and then
+    // releasing an IPv4 port that another test could take.
+    let mut started = None;
+    for _ in 0..64 {
+        let held_v6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let port = held_v6.local_addr().unwrap().port();
+        match start_serve(config_for(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            dir.path().join("default.toml"),
+            dir.path().join("audit.log"),
+        ))
+        .await
+        {
+            Ok(handle) => {
+                started = Some((held_v6, port, handle));
+                break;
+            }
+            Err(ServeStartError::Bind {
+                kind: std::io::ErrorKind::AddrInUse,
+                ..
+            }) => {}
+            Err(error) => panic!("the testnet inbox needs only 127.0.0.1: {error}"),
+        }
+    }
+    let (held_v6, port, handle) = started.expect("an IPv4 listener alongside a held IPv6 socket");
     assert_eq!(
         handle.local_addr(),
         SocketAddr::from(([127, 0, 0, 1], port))
@@ -1552,16 +1560,16 @@ async fn the_testnet_inbox_keeps_one_listener() {
         handle.bootstrap_url(),
         format!("http://127.0.0.1:{port}/bootstrap/{token}")
     );
-    drop(held_v6);
-    let ipv6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
-    assert!(
-        std::net::TcpListener::bind(ipv6).is_ok(),
-        "the testnet inbox binds nothing on [::1]"
+    assert_eq!(
+        handle.listener_tasks().len(),
+        1,
+        "only IPv4 has a listener task"
     );
     let bootstrap =
         localhost_request(handle.local_addr(), &format!("/bootstrap/{token}"), None).await;
     assert!(bootstrap.starts_with("HTTP/1.1 200"), "{bootstrap}");
     handle.shutdown().await.unwrap();
+    drop(held_v6);
 }
 
 #[tokio::test]

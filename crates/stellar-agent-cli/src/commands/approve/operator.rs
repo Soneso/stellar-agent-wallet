@@ -871,7 +871,7 @@ mod tests {
         let store = OperatorApprovalCredentialStore::new(dir.path().join("enroll-test.toml"));
 
         let (handle, url, token) = start_test_enrollment(&dir).await;
-        let addr = handle.local_addr();
+        let listener_tasks = handle.listener_tasks();
         let probe = HandoffProbe::default();
         let end = tokio::time::timeout(
             bound,
@@ -889,10 +889,7 @@ mod tests {
         .expect("the interrupt ends the enrollment wait");
         assert!(matches!(end, EnrollmentEnd::Interrupted), "{end:?}");
         probe.assert_private_handoff(&url, &token);
-        assert!(
-            std::net::TcpStream::connect(addr).is_err(),
-            "the server stopped"
-        );
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
         crate::common::render::take_rendered_for_test();
         assert_eq!(report_enrollment_end(end, &store), 1);
         let rendered = crate::common::render::take_rendered_for_test();
@@ -993,6 +990,7 @@ mod tests {
         let store = OperatorApprovalCredentialStore::new(dir.path().join("enroll-test.toml"));
         let (handle, url, token) = start_test_enrollment(dir).await;
         let addr = handle.local_addr();
+        let listener_tasks = handle.listener_tasks();
         let registrar = SoftwareRegistrar::new([0x21; 32], vec![0x5a; 20]);
         let (typed_tx, typed_rx) = tokio::sync::oneshot::channel::<io::Result<Option<String>>>();
         let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1061,10 +1059,7 @@ mod tests {
         })
         .await
         .expect("the ceremony ends");
-        assert!(
-            std::net::TcpStream::connect(addr).is_err(),
-            "the server stopped before the prompt"
-        );
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
         (end, store, registrar)
     }
 

@@ -27,6 +27,14 @@ use super::tests::{Typing, Wrap};
 use super::*;
 use crate::common::test_support::tree;
 
+thread_local! {
+    static LISTENER_TASKS: std::cell::Cell<Option<[tokio::task::AbortHandle; 1]>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn record_listener_tasks(tasks: [tokio::task::AbortHandle; 1]) {
+    LISTENER_TASKS.set(Some(tasks));
+}
+
 /// A signed origin with a nondefault public port.
 const SIGNED_NONDEFAULT: &str = "https://approve.example.invalid:8443";
 /// The same host at the default port.
@@ -132,10 +140,6 @@ impl SignedSetup {
         .unwrap();
     }
 
-    fn socket_is_free(&self) -> bool {
-        std::net::TcpListener::bind(self.bind).is_ok()
-    }
-
     async fn request(
         &self,
         method: &str,
@@ -212,6 +216,7 @@ async fn signed_run(
     args: EnrollApprovalCredentialArgs,
     browser: Browser,
 ) -> SignedRun {
+    LISTENER_TASKS.take();
     let (code_tx, code_rx) = tokio::sync::oneshot::channel::<String>();
     let (typed_tx, typed_rx) = tokio::sync::oneshot::channel::<io::Result<Option<String>>>();
     let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel::<()>();
@@ -333,7 +338,12 @@ async fn signed_run(
     )
     .await
     .expect("the signed run ends");
-    assert!(setup.socket_is_free(), "the listener is released");
+    let tasks = LISTENER_TASKS.take();
+    if driven.is_some() {
+        crate::common::test_support::assert_listeners_stopped(&tasks.unwrap(), 1);
+    } else {
+        assert!(tasks.is_none(), "a refused start creates no listener task");
+    }
     let (code, page_code) = driven.map_or((None, None), |(code, page)| (Some(code), page));
     SignedRun {
         exit,
@@ -386,7 +396,7 @@ async fn substitute_headers(setup: &SignedSetup) {
 }
 
 /// One refused signed run: exit 1, one envelope with `code`, no code
-/// handed out and the configured socket free. Returns the envelope.
+/// handed out and no listener task started. Returns the envelope.
 async fn refused(
     setup: &SignedSetup,
     args: EnrollApprovalCredentialArgs,
@@ -565,7 +575,6 @@ async fn signed_enrollment_refuses_missing_pem_without_fallback() {
                 );
                 assert!(run.code.is_none());
                 drop(socket);
-                assert!(setup.socket_is_free());
             }
             let (cert, key) = stellar_agent_approval_remote::tls::tls_file_paths("main").unwrap();
             assert!(
@@ -576,9 +585,9 @@ async fn signed_enrollment_refuses_missing_pem_without_fallback() {
     }
 }
 
-/// [`signed_run`] for a refusal that may happen while the test holds the
-/// configured socket, so the release check is the caller's.
+/// [`signed_run`] for a refusal while the test may hold the configured socket.
 async fn signed_run_held(setup: &SignedSetup, args: EnrollApprovalCredentialArgs) -> SignedRun {
+    LISTENER_TASKS.take();
     let (code_tx, code_rx) = tokio::sync::oneshot::channel::<String>();
     let on_code = move |code: &str| {
         let _ = code_tx.send(code.to_owned());
@@ -591,6 +600,10 @@ async fn signed_run_held(setup: &SignedSetup, args: EnrollApprovalCredentialArgs
         (exit, code_rx.await.ok())
     })
     .await;
+    assert!(
+        LISTENER_TASKS.take().is_none(),
+        "a refused start creates no listener task"
+    );
     let _ = setup;
     SignedRun {
         exit,
@@ -858,7 +871,6 @@ async fn origin_from_refuses_before_bind_with_existing_codes() {
     assert_eq!(run.rendered[0]["error"]["code"], "approval.listener_busy");
     assert!(run.code.is_none());
     drop(held);
-    assert!(setup.socket_is_free());
 
     setup.edit_remote(|remote| remote["enabled"] = serde_json::json!(false));
     let envelope = refused(&setup, setup.args(&path, &[]), "internal.unexpected_state").await;
@@ -1232,6 +1244,7 @@ async fn unavailable_run(setup: &SignedSetup, path: &std::path::Path) -> SignedR
         .await
         .unwrap();
         assert!(!format!("{handle:?}").contains(handle.enrollment_code()));
+        let tasks = handle.listener_tasks();
         let stop = handle.stop_trigger();
         let code = code_rx.await.unwrap();
         let driver = async {
@@ -1257,11 +1270,11 @@ async fn unavailable_run(setup: &SignedSetup, path: &std::path::Path) -> SignedR
             driver
         );
         assert!(matches!(end, EnrollmentEnd::Unavailable), "{end:?}");
+        crate::common::test_support::assert_listeners_stopped(&tasks, 1);
         (report(end, "main", SIGNED_RP_ID), code)
     })
     .await;
     assert_eq!(exit, 1);
-    assert!(setup.socket_is_free(), "the stopped listener is released");
     SignedRun {
         exit,
         rendered,

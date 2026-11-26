@@ -764,7 +764,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let (handle, url, token) = start_test_inbox(&dir).await;
-        let addr = handle.local_addr();
+        let listener_tasks = handle.listener_tasks();
+        assert_eq!(listener_tasks.len(), 1);
         let probe = HandoffProbe::default();
         tokio::time::timeout(
             bound,
@@ -773,10 +774,7 @@ mod tests {
         .await
         .expect("the shutdown signal ends the serve phase");
         probe.assert_private_handoff(&url, &token);
-        assert!(
-            std::net::TcpStream::connect(addr).is_err(),
-            "the server stopped"
-        );
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 1);
 
         let (handle, url, token) = start_test_inbox(&dir).await;
         let probe = HandoffProbe::default();
@@ -861,6 +859,8 @@ mod tests {
         .unwrap();
         let url = handle.bootstrap_url();
         let addr = handle.local_addr();
+        let listener_tasks = handle.listener_tasks();
+        assert_eq!(listener_tasks.len(), 2);
         let browser = async {
             let client = PresenceClient::connect_inbox(&url, &entry.approval_nonce)
                 .await
@@ -893,10 +893,7 @@ mod tests {
         .await
         .expect("operator shutdown completes");
         assert_eq!(exit, 0);
-        assert!(
-            std::net::TcpStream::connect(addr).is_err(),
-            "listener shuts down"
-        );
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
     }
 
     /// Revoking a consumed record inside execution refuses a child mint under

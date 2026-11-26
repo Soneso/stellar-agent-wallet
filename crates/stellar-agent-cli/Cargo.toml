@@ -129,6 +129,7 @@ stellar-agent-windows-identity = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+stellar-agent-webauthn-bridge = { workspace = true, features = ["test-helpers"] }
 # Independent TLS fixtures for signed-origin binary ceremonies.
 stellar-agent-approval-remote = { path = "../stellar-agent-approval-remote", features = ["test-helpers"] }
 # test-helpers exposes the enrollment test support: a software registrar and

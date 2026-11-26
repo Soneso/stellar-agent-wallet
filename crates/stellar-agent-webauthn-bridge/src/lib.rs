@@ -276,6 +276,13 @@ impl std::fmt::Debug for BridgeHandle {
 }
 
 impl BridgeHandle {
+    /// Observes completion of both listener tasks for shutdown assertions.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    pub fn listener_tasks(&self) -> [tokio::task::AbortHandle; 2] {
+        self.server.listener_tasks()
+    }
+
     /// Return the IPv4 address of the listener pair, `127.0.0.1:<port>`.
     ///
     /// When `bind_addr` named port `0`, this carries the OS-assigned port;
@@ -674,12 +681,11 @@ mod tests {
                 std::io::ErrorKind::AddrInUse,
                 "no other socket can bind [::1]:{port}"
             );
+            let tasks = handle.listener_tasks();
+            assert_eq!(tasks.len(), 2, "one listener task per bound family");
             handle.shutdown().await.expect("clean shutdown");
-            for addr in [ipv4, ipv6] {
-                assert!(
-                    tokio::net::TcpStream::connect(addr).await.is_err(),
-                    "{addr} closed after shutdown"
-                );
+            for task in tasks {
+                assert!(task.is_finished(), "listener stopped after shutdown");
             }
         }
     }

@@ -553,6 +553,13 @@ impl std::fmt::Debug for MainnetPresenceHandle {
 }
 
 impl MainnetPresenceHandle {
+    /// Observes listener task completion before shutdown consumes the server.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    pub fn listener_tasks(&self) -> Option<[tokio::task::AbortHandle; 2]> {
+        self.server.as_ref().map(PairServer::listener_tasks)
+    }
+
     /// The private bootstrap destination, passed only to the private opener.
     #[must_use]
     pub fn bootstrap_url(&self) -> &str {

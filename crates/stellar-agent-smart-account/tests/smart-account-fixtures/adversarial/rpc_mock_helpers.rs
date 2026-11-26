@@ -1120,16 +1120,10 @@ pub fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, tempfile::TempDi
 /// Wallet state the test reaches, such as the process-wide signing admission
 /// fixture, resolves below this home. The guard field drops before the
 /// sandbox, so the variable never names a removed directory.
+#[must_use]
 pub struct IsolatedHome {
     _guard: stellar_agent_test_support::StellarAgentHomeGuard,
-    sandbox: stellar_agent_test_support::sandbox::StateSandbox,
-}
-
-impl IsolatedHome {
-    /// The marked home directory.
-    pub fn path(&self) -> &std::path::Path {
-        self.sandbox.path()
-    }
+    _sandbox: stellar_agent_test_support::sandbox::StateSandbox,
 }
 
 /// Creates a marked sandbox and points `STELLAR_AGENT_HOME` at it.
@@ -1147,11 +1141,12 @@ pub fn isolated_home() -> IsolatedHome {
     let guard = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
     IsolatedHome {
         _guard: guard,
-        sandbox,
+        _sandbox: sandbox,
     }
 }
 
 /// The audit directory of [`isolated_audit_writer`], held with its wallet home.
+#[must_use]
 pub struct IsolatedAuditDir {
     _home: IsolatedHome,
     dir: tempfile::TempDir,
@@ -1164,11 +1159,15 @@ impl IsolatedAuditDir {
     }
 }
 
-/// [`tmp_audit_writer`] inside an [`isolated_home`].
+/// [`tmp_audit_writer`] paired with an [`isolated_home`].
 ///
 /// Returns `(writer, path, dir)`. Caller must hold `dir` for the duration of
 /// the test: its drop restores `STELLAR_AGENT_HOME` and deletes both
 /// directories.
+///
+/// # Panics
+/// Panics when the calling test does not hold the `#[serial]` lock, or when
+/// the wallet home, audit directory, or audit writer cannot be created.
 pub fn isolated_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, IsolatedAuditDir) {
     let home = isolated_home();
     let (writer, path, dir) = tmp_audit_writer();

@@ -395,6 +395,13 @@ impl fmt::Debug for PairServer {
 }
 
 impl PairServer {
+    /// Observes both listener tasks; completion means their listeners were dropped.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    pub fn listener_tasks(&self) -> [tokio::task::AbortHandle; 2] {
+        self.tasks.each_ref().map(|task| task.0.abort_handle())
+    }
+
     /// Spawns `serve` once per listener, each with its own shutdown signal,
     /// and makes the end of either task, a panic or an abort included,
     /// request the end of the other.
@@ -511,19 +518,6 @@ mod tests {
         SocketAddr::from((Ipv6Addr::LOCALHOST, port))
     }
 
-    /// A listener on `[::1]:P` for a port P that is free on `127.0.0.1`
-    /// when this returns.
-    fn competitor_on_ipv6() -> (std::net::TcpListener, u16) {
-        for _ in 0..64 {
-            let competitor = std::net::TcpListener::bind(v6(0)).unwrap();
-            let port = competitor.local_addr().unwrap().port();
-            if std::net::TcpListener::bind(v4(port)).is_ok() {
-                return (competitor, port);
-            }
-        }
-        panic!("no port free on 127.0.0.1 among 64 held on ::1");
-    }
-
     /// Whether `addr` accepts a TCP connection within a second.
     async fn accepts(addr: SocketAddr) -> bool {
         matches!(
@@ -552,10 +546,10 @@ mod tests {
         String::from_utf8(raw).unwrap()
     }
 
-    /// Waits until neither address on `port` accepts a connection.
-    async fn both_close(port: u16, why: &str) {
+    /// Waits until both listener tasks finish and drop their listeners.
+    async fn both_close(tasks: &[tokio::task::AbortHandle; 2], why: &str) {
         tokio::time::timeout(WAIT, async {
-            while accepts(v4(port)).await || accepts(v6(port)).await {
+            while tasks.iter().any(|task| !task.is_finished()) {
                 tokio::task::yield_now().await;
             }
         })
@@ -565,17 +559,24 @@ mod tests {
 
     #[tokio::test]
     async fn an_ephemeral_pair_skips_a_port_held_on_ipv6() {
-        let (_competitor, held) = competitor_on_ipv6();
+        let LoopbackPair {
+            v4: listener,
+            v6: _competitor,
+            port: held,
+        } = LoopbackPair::bind(0).await.unwrap();
+        let queued = tokio::net::TcpStream::connect(v4(held)).await.unwrap();
+        let mut first = Some(listener);
         let offered = Arc::new(Mutex::new(Vec::new()));
         let record = Arc::clone(&offered);
-        let mut calls = 0_u32;
         let pair = bind_ephemeral_with(
             move || {
-                calls += 1;
-                let port = if calls == 1 { held } else { 0 };
+                let first = first.take();
                 let record = Arc::clone(&record);
                 async move {
-                    let listener = TcpListener::bind(v4(port)).await?;
+                    let listener = match first {
+                        Some(listener) => listener,
+                        None => TcpListener::bind(v4(0)).await?,
+                    };
                     record.lock().unwrap().push(listener.local_addr()?.port());
                     Ok(listener)
                 }
@@ -593,39 +594,39 @@ mod tests {
         assert_eq!(pair.v4.local_addr().unwrap(), v4(pair.port()));
         assert_eq!(pair.v6.local_addr().unwrap(), v6(pair.port()));
         assert_eq!(pair.v4_addr(), v4(pair.port()));
-        assert!(
-            std::net::TcpListener::bind(v4(held)).is_ok(),
-            "the IPv4 listener on the skipped port is released"
-        );
+        queued_connection_closes(queued).await;
         assert!(accepts(v4(pair.port())).await);
         assert!(accepts(v6(pair.port())).await);
     }
 
     #[tokio::test]
     async fn a_fixed_port_held_on_either_family_refuses() {
-        let (competitor, port) = competitor_on_ipv6();
-        assert_eq!(
-            LoopbackPair::bind(port).await.unwrap_err(),
-            PairBindError::PortUnavailable {
-                port,
-                family: LoopbackFamily::V6,
-                kind: io::ErrorKind::AddrInUse,
+        for addr in [v4(0), v6(0)] {
+            let competitor = TcpListener::bind(addr).await.unwrap();
+            let port = competitor.local_addr().unwrap().port();
+            let error = LoopbackPair::bind(port).await.unwrap_err();
+            if addr.is_ipv4() {
+                assert!(matches!(error, PairBindError::PortUnavailable {
+                    port: refused, family: LoopbackFamily::V4, kind: io::ErrorKind::AddrInUse,
+                } if refused == port));
+            } else {
+                // IPv4 may already be held by another test when only IPv6 is ours.
+                assert!(matches!(error, PairBindError::PortUnavailable {
+                    port: refused, kind: io::ErrorKind::AddrInUse, ..
+                } if refused == port));
             }
-        );
-        drop(competitor);
-        let competitor = std::net::TcpListener::bind(v4(port)).unwrap();
-        assert_eq!(
-            LoopbackPair::bind(port).await.unwrap_err(),
-            PairBindError::PortUnavailable {
-                port,
-                family: LoopbackFamily::V4,
-                kind: io::ErrorKind::AddrInUse,
-            }
-        );
-        drop(competitor);
-        let pair = LoopbackPair::bind(port).await.unwrap();
-        assert_eq!(pair.port(), port);
-        assert_eq!(pair.v6.local_addr().unwrap(), v6(port));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fixed_port_with_both_families_available_succeeds() {
+        let LoopbackPair { v4, v6, port } = LoopbackPair::bind(0).await.unwrap();
+        let pair = bind_fixed_with(port, |_| async move { Ok(v4) }, |_| async move { Ok(v6) })
+            .await
+            .expect("both successful binds produce a fixed-port pair");
+        assert_eq!(pair.port(), port, "the pair keeps the requested port");
+        assert_eq!(pair.v4.local_addr().unwrap(), self::v4(port));
+        assert_eq!(pair.v6.local_addr().unwrap(), self::v6(port));
     }
 
     /// A fixed port whose IPv6 bind fails after IPv4 is held refuses with
@@ -639,7 +640,7 @@ mod tests {
     async fn a_fixed_port_refused_on_ipv6_releases_the_ipv4_listener() {
         let listener = TcpListener::bind(v4(0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let mut queued = tokio::net::TcpStream::connect(v4(port)).await.unwrap();
+        let queued = tokio::net::TcpStream::connect(v4(port)).await.unwrap();
         let error = bind_fixed_with(
             port,
             move |requested| {
@@ -661,6 +662,10 @@ mod tests {
                 kind: io::ErrorKind::AddrInUse,
             }
         );
+        queued_connection_closes(queued).await;
+    }
+
+    async fn queued_connection_closes(mut queued: tokio::net::TcpStream) {
         let mut byte = [0_u8; 1];
         let read = tokio::time::timeout(WAIT, queued.read(&mut byte))
             .await
@@ -680,7 +685,8 @@ mod tests {
                 let record = Arc::clone(&record);
                 async move {
                     let listener = TcpListener::bind(v4(0)).await?;
-                    record.lock().unwrap().push(listener.local_addr()?.port());
+                    let queued = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+                    record.lock().unwrap().push(queued);
                     Ok(listener)
                 }
             },
@@ -698,19 +704,31 @@ mod tests {
         );
         assert_eq!(error.family(), Some(LoopbackFamily::V6));
         assert_eq!(error.kind(), Some(io::ErrorKind::AddrNotAvailable));
-        let offered = offered.lock().unwrap().clone();
+        let offered = std::mem::take(&mut *offered.lock().unwrap());
         assert_eq!(offered.len(), 1, "a missing family is not retried");
-        assert!(
-            std::net::TcpListener::bind(v4(offered[0])).is_ok(),
-            "no IPv4 listener stays bound"
-        );
+        for queued in offered {
+            queued_connection_closes(queued).await;
+        }
     }
 
     #[tokio::test]
     async fn exhausted_attempts_refuse() {
-        let (_competitor, held) = competitor_on_ipv6();
+        let mut competitors = Vec::new();
+        let mut listeners = Vec::new();
+        let mut queued = Vec::new();
+        for _ in 0..3 {
+            let pair = LoopbackPair::bind(0).await.unwrap();
+            queued.push(
+                tokio::net::TcpStream::connect(pair.v4_addr())
+                    .await
+                    .unwrap(),
+            );
+            competitors.push(pair.v6);
+            listeners.push(pair.v4);
+        }
+        let mut listeners = listeners.into_iter();
         let error = bind_ephemeral_with(
-            || TcpListener::bind(v4(held)),
+            || std::future::ready(Ok(listeners.next().unwrap())),
             |port| TcpListener::bind(v6(port)),
             3,
         )
@@ -718,7 +736,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, PairBindError::Exhausted { attempts: 3 });
         assert_eq!(error.family(), None);
-        assert!(std::net::TcpListener::bind(v4(held)).is_ok());
+        for stream in queued {
+            queued_connection_closes(stream).await;
+        }
 
         // An IPv4 port another socket holds costs one attempt as well.
         let mut calls = 0_u32;
@@ -803,6 +823,8 @@ mod tests {
         let pair = LoopbackPair::bind(0).await.unwrap();
         let port = pair.port();
         let server = pair.serve(router);
+        let tasks = server.listener_tasks();
+        assert_eq!(tasks.len(), 2, "one listener task per bound family");
 
         assert!(get_text(v4(port), "/count").await.ends_with("\r\n\r\n1"));
         assert!(get_text(v6(port), "/count").await.ends_with("\r\n\r\n2"));
@@ -814,12 +836,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!accepts(v4(port)).await, "IPv4 closed after shutdown");
-        assert!(!accepts(v6(port)).await, "IPv6 closed after shutdown");
+        assert!(tasks.iter().all(tokio::task::AbortHandle::is_finished));
 
         // A server that ends on its own stops its sibling.
         let pair = LoopbackPair::bind(0).await.unwrap();
-        let port = pair.port();
         let server = PairServer::spawn(pair, |listener, signal| async move {
             if listener.local_addr()?.is_ipv4() {
                 return Ok(());
@@ -828,19 +848,19 @@ mod tests {
                 .with_graceful_shutdown(signal.requested())
                 .await
         });
+        let tasks = server.listener_tasks();
+        assert_eq!(tasks.len(), 2, "one listener task per bound family");
         tokio::time::timeout(WAIT, server.join())
             .await
             .expect("the IPv6 server stops when the IPv4 server ends")
             .unwrap();
-        assert!(!accepts(v4(port)).await);
-        assert!(!accepts(v6(port)).await);
+        assert!(tasks.iter().all(tokio::task::AbortHandle::is_finished));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_join_timeout_closes_listeners_that_ignore_shutdown() {
         for ignores in [[true, true], [false, true], [true, false]] {
             let pair = LoopbackPair::bind(0).await.unwrap();
-            let port = pair.port();
             let (observed, mut observations) = tokio::sync::mpsc::unbounded_channel();
             let server = PairServer::spawn(pair, |listener, signal| {
                 let observed = observed.clone();
@@ -855,17 +875,24 @@ mod tests {
                     Ok(())
                 }
             });
+            let listener_tasks = server.listener_tasks();
+            assert_eq!(
+                listener_tasks.len(),
+                2,
+                "one listener task per bound family"
+            );
+            assert_ne!(listener_tasks[0].id(), listener_tasks[1].id());
             server.shutdown();
             for _ in 0..2 {
                 observations.recv().await.unwrap();
             }
 
             assert!(server.join_with_timeout(Duration::ZERO).await.is_err());
-            // Synchronous probes cannot give an unawaited cancellation a turn.
-            for addr in [v4(port), v6(port)] {
+            // Check without yielding: cancellation must finish before the join returns.
+            for task in listener_tasks {
                 assert!(
-                    std::net::TcpStream::connect(addr).is_err(),
-                    "both listeners are closed when the timed join returns: {ignores:?}, {addr}"
+                    task.is_finished(),
+                    "both listener tasks stopped when the timed join returns: {ignores:?}"
                 );
             }
         }
@@ -891,8 +918,10 @@ mod tests {
         let port = pair.port();
         let server = pair.serve(Router::new());
         assert!(accepts(v6(port)).await);
+        let tasks = server.listener_tasks();
+        assert_eq!(tasks.len(), 2, "one listener task per bound family");
         drop(server);
-        both_close(port, "both listeners close when the server is dropped").await;
+        both_close(&tasks, "both listeners stop when the server is dropped").await;
 
         // A pending join that is dropped aborts both servers.
         let pair = LoopbackPair::bind(0).await.unwrap();
@@ -900,20 +929,21 @@ mod tests {
         let server = pair.serve(Router::new());
         assert!(accepts(v4(port)).await);
         assert!(accepts(v6(port)).await);
+        let tasks = server.listener_tasks();
+        assert_eq!(tasks.len(), 2, "one listener task per bound family");
         assert!(
             tokio::time::timeout(Duration::from_millis(50), server.join())
                 .await
                 .is_err(),
             "nothing asked the servers to stop"
         );
-        both_close(port, "both listeners close when a pending join is dropped").await;
+        both_close(&tasks, "both listeners stop when a pending join is dropped").await;
     }
 
     #[tokio::test]
     async fn a_panicking_listener_task_stops_its_sibling() {
         for panicking in [LoopbackFamily::V4, LoopbackFamily::V6] {
             let pair = LoopbackPair::bind(0).await.unwrap();
-            let port = pair.port();
             let server = PairServer::spawn(pair, move |listener, signal| async move {
                 let family = if listener.local_addr()?.is_ipv4() {
                     LoopbackFamily::V4
@@ -927,18 +957,16 @@ mod tests {
                     .with_graceful_shutdown(signal.requested())
                     .await
             });
+            let tasks = server.listener_tasks();
+            assert_eq!(tasks.len(), 2, "one listener task per bound family");
             let error = tokio::time::timeout(WAIT, server.join())
                 .await
                 .unwrap_or_else(|_| panic!("join completes after the {panicking} task panics"))
                 .unwrap_err();
             assert_eq!(error.to_string(), "task panicked", "{panicking}");
             assert!(
-                !accepts(v4(port)).await,
-                "IPv4 closed after the {panicking} task panics"
-            );
-            assert!(
-                !accepts(v6(port)).await,
-                "IPv6 closed after the {panicking} task panics"
+                tasks.iter().all(tokio::task::AbortHandle::is_finished),
+                "both listeners stopped after the {panicking} task panics"
             );
         }
     }
@@ -960,8 +988,8 @@ mod tests {
             .with_state((entered, release))
     }
 
-    /// Shutdown closes both addresses and `join` waits for the response in
-    /// flight; dropping the server closes both addresses without waiting,
+    /// Shutdown waits for the response in flight before its tasks finish;
+    /// dropping the server stops both listener tasks without waiting,
     /// and the response in flight finishes in its connection task.
     #[tokio::test]
     async fn shutdown_waits_for_a_request_in_flight_and_drop_does_not() {
@@ -971,6 +999,8 @@ mod tests {
             let pair = LoopbackPair::bind(0).await.unwrap();
             let port = pair.port();
             let server = pair.serve(slow_router(Arc::clone(&entered), Arc::clone(&release)));
+            let tasks = server.listener_tasks();
+            assert_eq!(tasks.len(), 2, "one listener task per bound family");
             let request = tokio::spawn(get_text(v6(port), "/slow"));
             tokio::time::timeout(WAIT, entered.notified())
                 .await
@@ -990,7 +1020,21 @@ mod tests {
                 drop(server);
                 None
             };
-            both_close(port, "both addresses close while a request is in flight").await;
+            if graceful {
+                tokio::time::timeout(WAIT, async {
+                    while !tasks[0].is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the idle IPv4 listener task stops while IPv6 has a request in flight");
+                assert!(
+                    !tasks[1].is_finished(),
+                    "the busy IPv6 listener task waits for its request"
+                );
+            } else {
+                both_close(&tasks, "both listeners stop while a request is in flight").await;
+            }
             assert!(!request.is_finished(), "the handler has not answered yet");
 
             release.notify_one();
@@ -1003,6 +1047,7 @@ mod tests {
                     .expect("join completes once the response is sent")
                     .unwrap();
             }
+            assert!(tasks.iter().all(tokio::task::AbortHandle::is_finished));
         }
     }
 }

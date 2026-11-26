@@ -66,6 +66,7 @@ mod rpc_mock_helpers {
 /// A fixture outside the `#[serial]` lock is refused before it sets
 /// `STELLAR_AGENT_HOME`.
 #[test]
+#[serial_test::parallel]
 #[should_panic(expected = "an isolated wallet home requires the #[serial] lock")]
 fn an_audit_writer_outside_the_serial_lock_is_refused() {
     let _audit = rpc_mock_helpers::tmp_audit_writer();

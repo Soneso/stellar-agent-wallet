@@ -4643,12 +4643,22 @@ mod tests {
         /// Submits on `path` through `primary` with `secondary` as the witness,
         /// in a marked wallet home of its own. The home is set before the
         /// shared admission fixture first resolves wallet state.
+        ///
+        /// Callers must hold the `#[serial]` lock and await calls sequentially:
+        /// overlapping calls interleave process-wide home guards.
+        ///
+        /// # Panics
+        /// Panics without the `#[serial]` lock or if the sandbox cannot be created.
         async fn submit_with(
             path: SigningPath,
             primary: &AuthTreeEndpoint,
             secondary: Option<&str>,
             horizon: Option<HorizonCheck>,
         ) -> Outcome {
+            assert!(
+                serial_test::is_locked_serially(None),
+                "submit_with requires the #[serial] lock"
+            );
             // The guard drops before the sandbox.
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
             let _storage_home =
@@ -4664,6 +4674,14 @@ mod tests {
                 ),
             )
             .await
+        }
+
+        #[tokio::test]
+        #[serial_test::parallel]
+        #[should_panic(expected = "submit_with requires the #[serial] lock")]
+        async fn submit_with_refuses_without_the_serial_lock() {
+            let primary = endpoint(LEDGER).start().await;
+            let _outcome = submit_with(SigningPath::Single, &primary, None, None).await;
         }
 
         async fn submit_with_control(
