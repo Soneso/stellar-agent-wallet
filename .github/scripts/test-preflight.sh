@@ -60,6 +60,7 @@ unowned-rust-path
 wallet-manifest removed-member untracked-test-file fixture-markdown crate-sources-select-proof-matrix
 committed-cross-scope-rename staged-rename-record spaces-and-an-apostrophe
 full vendored contracts action-script invariants-helper release-build-scripts duplicate-triggers changed-self-test
+publish-evidence-workflow publish-evidence-provenance publish-evidence-sums publish-evidence-fixture publish-evidence-jq
 deleted-shell-script deleted-self-test unavailable-tool missing-pyyaml
 exit-aggregation table bad-base missing-next-upstream-hint malformed-manifest unloadable-install-surface-check
 the-preflight-itself registry-completeness
@@ -111,6 +112,7 @@ self-test:test-compare-crate-sums.py	python3 .github/scripts/test-compare-crate-
 self-test:test-preflight.sh	bash .github/scripts/test-preflight.sh
 self-test:test-publish-crates-check.sh	.github/scripts/test-publish-crates-check.sh
 self-test:test-publish-crates-verify.sh	bash .github/scripts/test-publish-crates-verify.sh
+self-test:test-publish-release-evidence.py	python3 .github/scripts/test-publish-release-evidence.py --mutations
 self-test:test-rebuild-vendored-wasm.sh	bash .github/scripts/test-rebuild-vendored-wasm.sh
 self-test:test-run-testnet-acceptance.sh	bash .github/scripts/test-run-testnet-acceptance.sh
 self-test:test-sync-labels.py	python3 .github/scripts/test-sync-labels.py
@@ -1524,8 +1526,8 @@ case_full() {
       *) original=$((original + 1)) ;;
     esac
   done
-  if [ "$original" -ne 66 ] || [ "$added" -ne 3 ]; then
-    fail "the expected registry requires 66 original rows, 2 changelog rows, and 1 classifier row"
+  if [ "$original" -ne 67 ] || [ "$added" -ne 3 ]; then
+    fail "the expected registry requires 67 original rows, 2 changelog rows, and 1 classifier row"
   fi
   expect_list --full "${ids[@]}"
 }
@@ -1602,6 +1604,47 @@ case_release_build_scripts() {
   done
   edit .github/scripts/release/windows-perl.ps1
   expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py
+  git checkout -q -- .github/scripts/release/windows-perl.ps1
+  edit .github/scripts/test-publish-release-evidence.py
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-publish-release-evidence.py
+}
+
+case_publish_evidence_workflow() {
+  start_case
+  edit .github/workflows/publish.yml
+  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-publish-release-evidence.py \
+    feature-discipline self-test:test-check-feature-discipline.py
+}
+
+case_publish_evidence_provenance() {
+  start_case
+  edit .github/scripts/check-provenance.py
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-check-provenance.py self-test:test-publish-release-evidence.py \
+    feature-discipline self-test:test-check-feature-discipline.py
+}
+
+case_publish_evidence_sums() {
+  start_case
+  edit .github/scripts/fixtures/SHA256SUMS
+  expect_list "${ALWAYS[@]}" self-test:test-check-provenance.py self-test:test-publish-release-evidence.py \
+    feature-discipline self-test:test-check-feature-discipline.py
+}
+
+case_publish_evidence_fixture() {
+  start_case
+  edit .github/scripts/fixtures/stellar-agent-0.1.0-alpha.12.intoto.jsonl
+  expect_list "${ALWAYS[@]}" self-test:test-check-provenance.py self-test:test-publish-release-evidence.py \
+    feature-discipline self-test:test-check-feature-discipline.py
+}
+
+case_publish_evidence_jq() {
+  start_case
+  if [ "$(awk -F '\t' '$1 == "self-test:test-publish-release-evidence.py" { print $3 }' "$SCRIPT_REL")" != jq ]; then
+    fail "the publish evidence registry row must require jq"
+  fi
 }
 
 case_duplicate_triggers() {
@@ -2066,7 +2109,7 @@ case_coverage_on_only_fails() {
   assert_clean_calls
 }
 
-MUTATION_CONTROLS="changelog-fragments changelog-workflow changelog-registry rename-source untracked-paths dev-dependencies target-dependencies unique-gates failed-gate unavailable-gate fresh-coverage next-before-main-base local-next-base missing-next-upstream-hint"
+MUTATION_CONTROLS="changelog-fragments changelog-workflow changelog-registry rename-source untracked-paths dev-dependencies target-dependencies unique-gates failed-gate unavailable-gate fresh-coverage next-before-main-base local-next-base missing-next-upstream-hint publish-evidence-workflow publish-evidence-provenance publish-evidence-sums publish-evidence-fixture publish-evidence-jq"
 
 # Prints the existing case that pins mutation control $1, then the message of
 # the assertion that must end the case log on the mutant.
@@ -2081,6 +2124,8 @@ mutation_case() {
     changelog-fragments) echo "changelog-fragments $differs" ;;
     changelog-workflow) echo "changelog-selection $differs" ;;
     changelog-registry) echo "changelog-registry changelog registry differs from workflow commands" ;;
+    publish-evidence-workflow | publish-evidence-provenance | publish-evidence-sums | publish-evidence-fixture) echo "$1 $differs" ;;
+    publish-evidence-jq) echo "publish-evidence-jq the publish evidence registry row must require jq" ;;
     rename-source) echo "committed-cross-scope-rename $differs" ;;
     untracked-paths) echo "untracked-test-file $differs" ;;
     dev-dependencies) echo "dev-dependency-edge $differs" ;;
@@ -2118,6 +2163,19 @@ apply_mutation() {
     changelog-registry)
       replace_line "$file" $'changelog\tpython3 .github/scripts/changelog.py check\t-\tchangelog.yml\tchangelog\tCheck changelog fragments' \
         $'changelog\tpython3 .github/scripts/changelog.py check\t-\tchangelog.yml\tchangelog\tCheck fragment entries' ;;
+    publish-evidence-workflow | publish-evidence-provenance | publish-evidence-sums | publish-evidence-fixture)
+      local selection='    .github/workflows/publish.yml | .github/scripts/check-provenance.py | .github/scripts/fixtures/SHA256SUMS | .github/scripts/fixtures/stellar-agent-0.1.0-alpha.12.intoto.jsonl) select_gate self-test:test-publish-release-evidence.py ;;'
+      local omitted
+      case "$1" in
+        publish-evidence-workflow) omitted='.github/workflows/publish.yml | ' ;;
+        publish-evidence-provenance) omitted='.github/scripts/check-provenance.py | ' ;;
+        publish-evidence-sums) omitted='.github/scripts/fixtures/SHA256SUMS | ' ;;
+        publish-evidence-fixture) omitted=' | .github/scripts/fixtures/stellar-agent-0.1.0-alpha.12.intoto.jsonl' ;;
+      esac
+      replace_line "$file" "$selection" "${selection/"$omitted"/}" ;;
+    publish-evidence-jq)
+      replace_line "$file" $'self-test:test-publish-release-evidence.py\tpython3 .github/scripts/test-publish-release-evidence.py --mutations\tjq\tci.yml\trelease-contracts\tSelf-test the publish release evidence' \
+        $'self-test:test-publish-release-evidence.py\tpython3 .github/scripts/test-publish-release-evidence.py --mutations\t-\tci.yml\trelease-contracts\tSelf-test the publish release evidence' ;;
     rename-source)
       replace_line "$file" '  git diff --name-only -z --no-renames --merge-base "$BASE" -- >"$SCRATCH/diff" ||' \
         '  git diff --name-only -z --merge-base "$BASE" -- >"$SCRATCH/diff" ||' ;;

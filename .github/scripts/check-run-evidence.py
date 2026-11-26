@@ -2,7 +2,7 @@
 """Require the push CI evidence of a release tag's commit.
 
 Usage: check-run-evidence.py --repository OWNER/NAME --sha SHA --tag TAG
-       --wait-minutes N --poll-seconds N [--api-url URL]
+       --wait-minutes N --poll-seconds N [--api-url URL] [--mode ci|release]
 
 Reads the GitHub REST API with the token in GH_TOKEN. Each workflow of
 REQUIRED_WORKFLOWS needs a run of exactly the commit SHA on main, started by
@@ -21,6 +21,12 @@ a run whose latest attempt is not a success fails the check.
 Prints the accepted run ID and attempt per workflow and exits 0. Exits 1 on
 every failure with a message that names the workflow, and the run ID and
 attempt where one exists. Uses the standard library only.
+
+With --mode release, require exactly one release.yml push run on the tag
+and commit. Its latest attempt and every vendored-wasm and verify-provenance
+job must succeed. Require the tree check, both stellar-cli builds, rebuild,
+and gate by name. Each job belongs to this run and an attempt no later than
+the latest. Write run_id and run_attempt to GITHUB_OUTPUT.
 """
 
 import argparse
@@ -44,6 +50,9 @@ WAITING = ("requested", "waiting", "pending", "queued", "in_progress")
 REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 SHA = re.compile(r"[0-9a-f]{40}")
 TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?")
+RELEASE_WASM_JOBS = {"vendored-wasm / " + name for name in (
+    "tree check", "stellar-cli 25.2.0", "stellar-cli 28.1.0", "rebuild", "vendored-wasm")}
+RELEASE_RUN_FIELDS = ("id", "path", "event", "head_branch", "head_sha", "run_attempt", "status", "conclusion")
 
 
 class Failure(Exception):
@@ -220,12 +229,67 @@ class Evidence:
                     raise Failure(problem)
             attempt = latest
 
+    def release_matches(self, run):
+        if not isinstance(run.get("repository"), dict):
+            return False
+        path = ".github/workflows/release.yml"
+        expected = {"event": "push", "head_branch": self.args.tag, "head_sha": self.args.sha}
+        return (run["repository"].get("full_name") == self.args.repository
+                and run.get("path") in (path, f"{path}@refs/tags/{self.args.tag}")
+                and all(run.get(key) == value for key, value in expected.items()))
+
+    def release(self):
+        runs = self.pages("/actions/workflows/release.yml/runs",
+                          {"event": "push", "branch": self.args.tag, "head_sha": self.args.sha}, "workflow_runs")
+        runs = [run for run in runs if self.release_matches(run)]
+        if len(runs) != 1:
+            raise Failure(f"{len(runs)} matching Release runs, expected exactly one")
+        run = runs[0]
+        if positive(run.get("id")) is None:
+            raise Failure(f"{label(run)}: Release run ID is not a positive integer")
+        current = self.get(f"/actions/runs/{run['id']}", context=f"{label(run)}: ")
+        if positive(current.get("id")) != run["id"] or not self.release_matches(current):
+            raise Failure(f"{label(run)}: the latest Release run no longer matches")
+        attempt = attempt_of(current)
+        if attempt is None:
+            raise Failure(f"{label(current)}: Release run attempt is not a positive integer")
+        if (current.get("status"), current.get("conclusion")) != ("completed", "success"):
+            raise Failure(f"{label(current)}: latest Release attempt must be completed with success")
+        jobs = self.pages(f"/actions/runs/{run['id']}/jobs", {"filter": "latest"}, "jobs", f"{label(current)}: ")
+        wasm = [job for job in jobs if str(job.get("name", "")).startswith("vendored-wasm / ")]
+        provenance = [job for job in jobs if job.get("name") == "verify-provenance"]
+        missing = RELEASE_WASM_JOBS - {job.get("name") for job in wasm}
+        if missing:
+            raise Failure(f"{label(current)}: missing Release jobs: {', '.join(sorted(missing))}")
+        if len(provenance) != 1:
+            raise Failure(f"{label(current)}: {len(provenance)} jobs named 'verify-provenance', expected one")
+        for job in wasm + provenance:
+            job_label = f"{label(current)}: job {job.get('name')!r} ({job.get('status')}, {job.get('conclusion')})"
+            if (job.get("status"), job.get("conclusion")) != ("completed", "success"):
+                raise Failure(f"{job_label}: must be completed with success")
+            if positive(job.get("run_id")) != run["id"]:
+                raise Failure(f"{job_label}: belongs to run {job.get('run_id')}")
+            job_attempt = positive(job.get("run_attempt"))
+            if job_attempt is None or job_attempt > attempt:
+                raise Failure(f"{job_label}: invalid attempt {job.get('run_attempt')}, latest is {attempt}")
+        # A rerun during the job lookup requires a fresh evidence check.
+        final = self.get(f"/actions/runs/{run['id']}", context=f"{label(current)}: ")
+        if positive(final.get("id")) is None or attempt_of(final) is None:
+            raise Failure(f"{label(current)}: refetched Release run no longer matches")
+        for field in RELEASE_RUN_FIELDS:
+            if final.get(field) != current.get(field):
+                raise Failure(f"{label(current)}: Release run changed during the job lookup: {field}")
+        if not self.release_matches(final):
+            raise Failure(f"{label(current)}: refetched Release repository no longer matches")
+        return run["id"], attempt
+
 
 def arguments(argv):
     parser = argparse.ArgumentParser(description="Require the push CI evidence of a release tag's commit.")
     parser.add_argument("--repository", required=True)
     parser.add_argument("--sha", required=True)
     parser.add_argument("--tag", required=True)
+    parser.add_argument("--mode", choices=("ci", "release"), default="ci")
     parser.add_argument("--wait-minutes", type=int, required=True)
     parser.add_argument("--poll-seconds", type=int, required=True)
     parser.add_argument("--api-url", default="https://api.github.com")
@@ -255,6 +319,16 @@ def main(argv=None):
         if not token:
             raise Failure("GH_TOKEN is empty")
         evidence = Evidence(args, token)
+        if args.mode == "release":
+            workflow = "release.yml"
+            output_path = os.environ.get("GITHUB_OUTPUT")
+            if not output_path:
+                raise Failure("GITHUB_OUTPUT is unset or empty in release mode")
+            run_id, attempt = evidence.release()
+            with open(output_path, "a", encoding="utf-8") as output:
+                output.write(f"run_id={run_id}\nrun_attempt={attempt}\n")
+            print(f"check-run-evidence: release.yml: accepted run {run_id} attempt {attempt} (push)")
+            return 0
         selected = []
         for workflow in REQUIRED_WORKFLOWS:
             selected.append((workflow, *evidence.select(workflow)))

@@ -24,8 +24,8 @@
 #       Prints true or false: whether the change can affect a rebuild.
 #   --gate <check-result> <rebuild> <cli-25-result> <cli-28-result> <rebuild-result> <ref-type>
 #       Exits 0 only for a passing combination of the workflow's job results.
-#       <ref-type> is publication, or the run's github.ref_type: branch, tag,
-#       or empty. A tag or publication run passes only with a rebuild, so it
+#       <ref-type> is the run's github.ref_type: branch, tag,
+#       or empty. A tag run passes only with a rebuild, so it
 #       never publishes Wasm files that this run did not rebuild and compare.
 #   --exec --dir <dir> -- <command...>
 #       Applies the environment refusals for <dir>, then runs the command in
@@ -1407,9 +1407,9 @@ mode_gate() {
   local check=$1 rebuild=$2 cli25=$3 cli28=$4 rebuilt=$5 ref_type=$6
   echo "check=$check rebuild=$rebuild stellar-cli-25=$cli25 stellar-cli-28=$cli28 rebuild-job=$rebuilt ref-type=$ref_type"
   case "$ref_type" in
-    branch | tag | publication | '') ;;
+    branch | tag | '') ;;
     *)
-      echo "$NAME: gate FAIL: the ref type is '$ref_type', not branch, tag, publication, or empty"
+      echo "$NAME: gate FAIL: the ref type is '$ref_type', not branch, tag, or empty"
       return 1
       ;;
   esac
@@ -1427,7 +1427,7 @@ mode_gate() {
       return 1
       ;;
     false)
-      if [ "$ref_type" = tag ] || [ "$ref_type" = publication ]; then
+      if [ "$ref_type" = tag ]; then
         echo "$NAME: gate FAIL: a $ref_type run must rebuild the vendored Wasm files"
         return 1
       fi

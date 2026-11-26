@@ -8,6 +8,14 @@ provenance. Signing requires five archives and the manifest as regular files.
 Before publication, a job without signing credentials verifies all six bundles
 with cosign v3.1.4 against the exact files, workflow identity, issuer, and SHA.
 Missing, duplicate, extra, symlinked, or non-file bundles fail the release.
+Crate publication verifies these six bundles again from the published GitHub
+Release. It verifies SLSA signatures for all five archives with slsa-verifier
+v2.7.1, whose binary must match the pinned SHA-256 before execution.
+Its compile-free `release-evidence` job requires a successful Release run for
+the same tag and commit. The provenance names that run and an attempt no
+later than its latest. The job also checks the tagged Wasm tree offline.
+It refuses drafts and any release asset inventory beyond the five manifest
+archives, `SHA256SUMS`, their six bundles, and the provenance file.
 The checks on this page use them to confirm that an archive is the one this repository's release
 workflow built. The commands name the `.tar.xz` archive; for the Windows
 archive, substitute `.zip`.

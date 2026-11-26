@@ -167,7 +167,7 @@ No job that holds a credential compiles code or runs dependency code.
 | `release.yml` | `provenance` | OIDC token, `contents: write` | no |
 | `release.yml` | `publish` | `contents: write` | no |
 | `publish.yml` | `verify` | none | yes |
-| `publish.yml` | `vendored-wasm` | none | yes |
+| `publish.yml` | `release-evidence` | `contents: read`, `actions: read` | no |
 | `publish.yml` | `publish` | OIDC token for crates.io, in `crates-io` | no |
 | `publish.yml` | `verify-install` | none | yes |
 | `notarize-smoke.yml` | `build` | none | yes |
@@ -231,7 +231,7 @@ secrets. It also forbids job-level `if` and `continue-on-error` on `sign-macos`.
 Apple signing and notarization, hashing, cosign signing, provenance, and
 publication therefore wait for the rebuild. The called
 workflow declares `workflow_call`; every cache step starts its condition with
-`github.ref_type != 'tag' && !inputs.publication`, so tag and publication runs
+`github.ref_type != 'tag'`, so tag runs
 use no cache. Its rebuild runs exactly when the tree check asks
 for one, reads both stellar-cli artifacts of its own run, uses no cache, and
 rebuilds and compares unconditionally. No job or step of it continues on an
@@ -239,6 +239,22 @@ error, and no step of the tree check, the rebuild, or the gate suppresses a
 failure. The gate job runs on `always()`, needs the four other jobs, and runs
 the gate command with each job result and the run's ref type. On a tag the
 gate passes only after a rebuild.
+
+The `publish-release-evidence` rule makes crate publication depend on
+`release-evidence`. This job holds only `contents: read` and `actions: read`.
+It has no environment, toolchain installation, Cargo command, or compile step.
+It checks the Release run, signatures, provenance with run binding, and tree.
+Its steps must match a pinned template in count, order, keys, and values.
+Run blocks split on newline characters, trim spaces and tabs, and drop empty
+lines; comments remain part of the comparison. Any other step, key, environment
+entry, comment, or run line fails. The report names the first differing step and
+field. Change the job and its template in the same commit.
+Job settings and credential expressions have separate checks. Only the API steps
+receive `GH_TOKEN: ${{ github.token }}`; every other expression reads no secret or
+token. The job times out after 15 minutes.
+The template does not judge scripts, actions, downloaded artifacts, or runtime
+GitHub evidence. See [the template limits](building.md#vendored-wasm-rebuild)
+for the settings and shell behavior it does not pin.
 
 The `release-publish-sums` rule requires an unconditional checksum check before
 publication. The archives under `all-artifacts` must equal `SHA256SUMS` by
@@ -337,11 +353,17 @@ gh workflow run publish.yml --ref main -f tag=v<version>
   which builds and packages every workspace member, the unpublished
   acceptance member included. It uploads the archive checksums as
   `SHA256SUMS` and holds no credential.
-- `vendored-wasm` rebuilds every vendored contract Wasm file of the tag's
-  verified commit from its pinned source with the pinned tools and compares
-  the bytes. It holds no credential and builds both stellar-cli binaries
-  from source.
-- `publish` starts only after that rebuild passes and the `crates-io` approval.
+- `release-evidence` requires exactly one Release push run for the tag and
+  verified commit. Its latest attempt, every reusable Wasm job, and
+  `verify-provenance` must succeed. It verifies the published release's six
+  cosign bundles and the SLSA signatures for all five archives.
+  The Wasm jobs must include the tree check, both stellar-cli builds, rebuild,
+  and gate. Each checked job belongs to that run and an attempt no later than its latest.
+  The release must be published, with exactly the five manifest archives,
+  `SHA256SUMS`, six bundles, and the named provenance file. Any other asset fails.
+  The provenance must name that run, an attempt no later than its latest,
+  and the tag's commit. The job also checks the tagged Wasm tree offline.
+- `publish` starts only after verification, Release evidence, and the `crates-io` approval.
   It refuses a tag that moves after verification. It regenerates the archives
   without building and requires them to equal `SHA256SUMS`. It then mints a
   short-lived token through Trusted Publishing and uploads each crate with
@@ -352,13 +374,16 @@ gh workflow run publish.yml --ref main -f tag=v<version>
 - After a partial run, dispatch the same tag again. A crate already on
   crates.io passes when its checksum matches.
 
-`-f verify_only=true` runs only `verify`, for example to rehearse a tag before
-the approval.
+`-f verify_only=true` runs `verify` and `release-evidence`, for example to
+rehearse a tag before the approval.
 
 The `verify` and `publish` jobs package the tag's tree and run the scripts of
-the commit the dispatch runs on, which is `main` for a publish. The
-`vendored-wasm` job runs the rebuild script of the tagged commit, so a tag
-whose script does not accept the `publication` ref type stops at that gate.
+the commit the dispatch runs on, which is `main` for a publish.
+`release-evidence` checks out the verified tag commit, which defines the rebuild
+recipe. The Release head SHA, provenance source commit, checkout, and tag
+commit must agree. It uses published GitHub Release assets, which outlive
+the seven-day Actions artifacts. Draft releases and missing or extra archives
+or bundles fail the check.
 The tier lists in `publish-crates.sh` must match the tag's publishable
 workspace members, so a tag with another member set stops before any upload.
 Every tag up to `v0.1.0-alpha.9` has another member set, so none of them can be
@@ -490,10 +515,9 @@ that rebuild. Apple signing and notarization, hashing, cosign signing,
 provenance, and publication therefore wait for that rebuild. Publication depends
 on the provenance content check, signature verification, the source discipline
 check, and the rebuild.
-Crate publication also requires a rebuild of every vendored Wasm file of the
-verified tag's commit from its pinned source with pinned tools and matching
-bytes. A failed, canceled, or skipped rebuild stops it before the registry
-credential is requested.
+Crate publication proves that the Release run rebuilt and gated the vendored
+Wasm of the verified tag commit. Failed, canceled, or skipped Release jobs
+stop publication before the registry credential is requested.
 
 The generic SLSA generator records source identity and checksum subjects.
 It records the `vars` context, which holds the repository, organization, and
@@ -505,7 +529,9 @@ with exactly the 15 keys in `ENVIRONMENT_KEYS` in
 Its `github_sha1`, `github_ref` and `github_repository_owner` values must match
 the commit, ref and repository owner arguments. Its `github_ref_type` must be
 `tag`, and its `github_event_name` must be `push`.
-The other environment values vary per run and are not compared.
+For crate publication, `github_run_id` must equal the selected Release run ID.
+Its positive `github_run_attempt` must not exceed that run's latest attempt.
+Other environment values vary per run and are not compared.
 The checker also pins the generic build type, the builder, the source,
 and the exact subjects. The release workflow, the reusable workflows it calls,
 and its local actions never read the `vars` context, and the `release-vars`

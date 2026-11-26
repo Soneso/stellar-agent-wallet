@@ -1,0 +1,1 @@
+- Crate publication verifies the Release run's signatures, provenance, and vendored Wasm evidence for the tag and commit without rebuilding the Wasm.
