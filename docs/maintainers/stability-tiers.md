@@ -7,7 +7,8 @@ What each workspace crate is for, how settled its API is, and what a
 deployer can rely on. Tiers express support intent and relative maturity.
 They are not SemVer guarantees. Every crate is pre-1.0: any surface may
 change between alpha releases. `CHANGELOG.md` and the pending fragments in
-`changelog.d/` record every change that matters.
+`changelog.d/` record every change that a wallet user sees, as
+[Changelog entries](../../CONTRIBUTING.md#changelog-entries) defines.
 Release preparation folds them into the versioned CHANGELOG.
 What the tiers add is where change is likely, where it is avoided,
 and where a report of breakage is treated as a bug rather than as expected

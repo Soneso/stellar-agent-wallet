@@ -50,5 +50,6 @@ Confirm each item for this description, the documentation, and the code comments
 - [ ] No history of how the code got there.
 - [ ] No contrast with imagined wrong behavior.
 - [ ] Comments state invariants.
+- [ ] A change a wallet user sees adds a fragment under `changelog.d/`, as [Changelog entries](https://github.com/Soneso/stellar-agent-wallet/blob/main/CONTRIBUTING.md#changelog-entries) states.
 - [ ] I understand every line of the change and can answer questions about it.
 - [ ] Every new test fails when the behavior it pins is reverted (the self-review section of the review checklist).
