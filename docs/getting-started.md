@@ -905,6 +905,11 @@ Mainnet writes move real funds. The wallet is alpha software and comes without
 warranty under the Apache-2.0 license. Use mainnet at your own risk. Test each
 flow on testnet first, and start with small amounts and tight policy limits.
 
+Guard against address poisoning: an attacker can send a small payment from a
+look-alike address so it appears in your account history. Select the destination
+from a trusted record. Never copy destinations from recent account history.
+Compare the whole address with the trusted record before sending.
+
 With the feature on, only a typed authorization issued for the action can
 satisfy the mainnet-write guard, and the binary attests its feature state. With
 the feature off, no code path in the binary can satisfy the guard.
