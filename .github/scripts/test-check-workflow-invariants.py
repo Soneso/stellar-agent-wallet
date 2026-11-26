@@ -338,6 +338,29 @@ REHEARSAL_SODIUM_STEP = (
     "      - name: Prefetch libsodium dist (Windows)\n"
     "        if: matrix.target == 'x86_64-pc-windows-msvc'\n"
 )
+REHEARSAL_PROBE_STEP = (
+    '      - name: Verify optimized Wasm identity and deployment security\n'
+    "        if: matrix.target == 'x86_64-unknown-linux-gnu'\n"
+    '        shell: bash\n'
+    '        run: |\n'
+    '          cargo test --release --locked --target x86_64-unknown-linux-gnu -p stellar-agent-smart-account \\\n'
+    '            --features test-helpers,deploy-cli --lib --test vendored_wasm_release_cfg -- \\\n'
+    '            vendored_wasm_tests deployment::deploy::tests:: \\\n'
+    '            vendored_table_entries embedded_wasm_constants digest_constants \\\n'
+    '            verifier_allowlist_ threshold_policy_hashes weighted_threshold_policy_hashes \\\n'
+    '            deploy_smart_account_dry_run deploy_webauthn_verifier_dry_run \\\n'
+    '            deploy_ed25519_verifier_dry_run deploy_spending_limit_policy_dry_run \\\n'
+    '            deploy_timelock_controller_dry_run deploy_policy_dry_run\n'
+    '\n'
+)
+REHEARSAL_BUILD_STEP = (
+    '      - name: Build binaries\n'
+    '        shell: bash\n'
+    '        env:\n'
+    '          TARGET: ${{ matrix.target }}\n'
+    '        run: bash .github/scripts/release/build.sh "$TARGET"\n'
+    '\n'
+)
 REHEARSAL_EXACT = "expected exactly contents: read"
 
 
@@ -409,6 +432,7 @@ def evidence_case(label, fragment, *edits):
 
 
 RELEASE_EVIDENCE_CASES = [
+
     evidence_case("evidence step removed", EVIDENCE_ORDER, (EVIDENCE_STEP, "", 1)),
     evidence_case("evidence step duplicated", EVIDENCE_ORDER, (EVIDENCE_STEP, EVIDENCE_STEP * 2, 1)),
     evidence_case("evidence step before the ancestry step", EVIDENCE_ORDER,
@@ -845,6 +869,7 @@ VARS_LOCATIONS = (
 # label, [(file, old, new, expected occurrences)];
 # the edited copy must pass.
 PASSING = [
+    ('optimized probes pass', [(REHEARSAL, REHEARSAL_PROBE_STEP, REHEARSAL_PROBE_STEP, 1)]),
     ("W17", changelog_edit(CHANGELOG_IF, '        if: "  ${{ ' + CHANGELOG_CONDITION + ' }}  "\n')),
     ("W15 main-only changelog changes pass", []),
     ("CI workflow_dispatch as an empty mapping passes", [(CI, CI_DISPATCH, "  workflow_dispatch: {}\n", 1)]),
@@ -918,6 +943,91 @@ PASSING = [
 # replaces every occurrence. A case that expects several lines gives
 # tuples of rules and fragments of the same length, in output order.
 CASES = [
+    ('optimized probes job absent', 'rehearsal-security-probes',
+     'expected exactly one optimized security probe step', [
+        (REHEARSAL, '  build:\n',
+         '  other-build:\n', 1)]),
+    ('optimized probes missing', 'rehearsal-security-probes',
+     'expected exactly one optimized security probe step', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         '', 1)]),
+    ('optimized probes duplicated', 'rehearsal-security-probes',
+     'expected exactly one optimized security probe step', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         REHEARSAL_PROBE_STEP * 2, 1)]),
+    ('optimized probes duplicate renamed', 'rehearsal-security-probes',
+     'expected exactly one optimized security probe step', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         REHEARSAL_PROBE_STEP + REHEARSAL_PROBE_STEP.replace(
+             'Verify optimized Wasm identity and deployment security', 'Other probe'), 1)]),
+    ('optimized probes before build', 'rehearsal-security-probes',
+     'probes must immediately follow Build binaries', [
+        (REHEARSAL, REHEARSAL_BUILD_STEP + REHEARSAL_PROBE_STEP,
+         REHEARSAL_PROBE_STEP + REHEARSAL_BUILD_STEP, 1)]),
+    ('optimized probes separated', 'rehearsal-security-probes',
+     'probes must immediately follow Build binaries', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         '      - run: echo gap\n\n' + REHEARSAL_PROBE_STEP, 1)]),
+    ('optimized probes build renamed', 'rehearsal-security-probes',
+     'probes must immediately follow Build binaries', [
+        (REHEARSAL, REHEARSAL_BUILD_STEP,
+         REHEARSAL_BUILD_STEP.replace('Build binaries', 'Compile binaries'), 1)]),
+    ('optimized probes guard changed', 'rehearsal-security-probes',
+     'probe step differs from the required guard and command', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         REHEARSAL_PROBE_STEP.replace("if: matrix.target == 'x86_64-unknown-linux-gnu'", "if: matrix.target == 'aarch64-unknown-linux-gnu'"), 1)]),
+    ('optimized probes filter dropped', 'rehearsal-security-probes',
+     'probe step differs from the required guard and command', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         REHEARSAL_PROBE_STEP.replace('vendored_wasm_tests ', ''), 1)]),
+    ('optimized probes features changed', 'rehearsal-security-probes',
+     'probe step differs from the required guard and command', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         REHEARSAL_PROBE_STEP.replace('test-helpers,deploy-cli', 'test-helpers'), 1)]),
+    ('optimized probes release dropped', 'rehearsal-security-probes',
+     'probe step differs from the required guard and command', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         REHEARSAL_PROBE_STEP.replace('--release ', ''), 1)]),
+    ('optimized probes no-run added', 'rehearsal-security-probes',
+     'probe step differs from the required guard and command', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         REHEARSAL_PROBE_STEP.replace('cargo test ', 'cargo test --no-run '), 1)]),
+    ('optimized probes continue-on-error', 'rehearsal-security-probes',
+     'probe step differs from the required guard and command', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         REHEARSAL_PROBE_STEP.replace('        shell: bash', '        continue-on-error: true\n        shell: bash'), 1)]),
+    ('optimized probes failure swallowed', 'rehearsal-security-probes',
+     'probe step differs from the required guard and command', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         REHEARSAL_PROBE_STEP.replace('deploy_policy_dry_run\n', 'deploy_policy_dry_run || true\n'), 1)]),
+    ('optimized probes jobs prefix', 'rehearsal-security-probes',
+     'probe step differs from the required guard and command', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         REHEARSAL_PROBE_STEP.replace('cargo test ', 'CARGO_BUILD_JOBS=6 cargo test '), 1)]),
+    ('optimized probes jobs step env', 'rehearsal-security-probes',
+     'probe step differs from the required guard and command', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         REHEARSAL_PROBE_STEP.replace('        shell: bash', '        env:\n          CARGO_BUILD_JOBS: 6\n        shell: bash'), 1)]),
+    ('optimized probes name changed', 'rehearsal-security-probes',
+     'probe step differs from the required guard and command', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         REHEARSAL_PROBE_STEP.replace('Verify optimized Wasm identity and deployment security', 'Other probe'), 1)]),
+    ('optimized probes command absent', 'rehearsal-security-probes',
+     'probe step differs from the required guard and command', [
+        (REHEARSAL, REHEARSAL_PROBE_STEP,
+         REHEARSAL_PROBE_STEP.split('        run: |')[0] + '        run: echo skipped\n\n', 1)]),
+    ('optimized probes workflow jobs', 'rehearsal-security-probes',
+     'CARGO_BUILD_JOBS must be unset', [
+        (REHEARSAL, '  EXPECTED_MAINNET_WRITE: "on"\n',
+         '  EXPECTED_MAINNET_WRITE: "on"\n  CARGO_BUILD_JOBS: 6\n', 1)]),
+    ('optimized probes job jobs', 'rehearsal-security-probes',
+     'CARGO_BUILD_JOBS must be unset', [
+        (REHEARSAL, '    timeout-minutes: 120\n',
+         '    timeout-minutes: 120\n    env:\n      CARGO_BUILD_JOBS: 6\n', 1)]),
+    ('optimized probes job suppression', 'rehearsal-security-probes',
+     'probe job must not suppress failures', [
+        (REHEARSAL, '    timeout-minutes: 120\n',
+         '    timeout-minutes: 120\n    continue-on-error: true\n', 1)]),
     ("skill archive step duplicated", "skill-archive", "expected exactly one skill archive step", [
         (CI, SKILL_ARCHIVE_STEP, SKILL_ARCHIVE_STEP * 2, 1)], 1),
     ("skill archive step shell bypass", "skill-archive", "skill archive check can be bypassed", [
@@ -1715,7 +1825,7 @@ CASES = [
     ("rehearsal job ID that reads the workflow token", "rehearsal-credentials",
      "release-rehearsal.yml:${{ github.token }}: rehearsal-credentials: "
      "an expression reads the workflow token: github.token", [
-        (REHEARSAL, "  build:\n", "  '${{ github.token }}':\n", 1)], 5),
+        (REHEARSAL, "  build:\n", "  '${{ github.token }}':\n", 1)], 6),
     ("rehearsal step env key with an unterminated expression", "rehearsal-credentials",
      "release-rehearsal.yml:build: rehearsal-credentials: unterminated expression", [
         (REHEARSAL, REHEARSAL_SODIUM_STEP,
@@ -2535,6 +2645,22 @@ MUTATIONS = {
     "coverage-decision-expression": (
         'self.unwrap_expression(str((first.get("env") or {}).get("MEASURE", ""))) != self.unwrap_expression(COVERAGE_MEASURE)', 'False',
         ["coverage decision without label", "coverage decision without push exclusion"]),
+    'optimized-job-fallback': ('        workflow = "release-rehearsal.yml"\n        job = self.job(workflow, "build") or {}', '        workflow = "release-rehearsal.yml"\n        job = self.job(workflow, "build")', ['optimized probes job absent']),
+    'optimized-workflow': ('workflow = "release-rehearsal.yml"\n        job = self.job(workflow, "build") or {}', 'workflow = "release.yml"\n        job = self.job(workflow, "build") or {}', ['optimized probes pass']),
+    'optimized-index': ('index = probes[0]', 'index = probes[0] + 1', ['optimized probes pass']),
+    'optimized-build-selection': ('builds = [i for i, step in enumerate(steps) if step.get("name") == "Build binaries"]', 'builds = []', ['optimized probes pass']),
+    'optimized-normalization': ('actual = {**steps[index], "run": self.normalized(self.run_text(steps[index])),', 'actual = {**steps[index], "run": [self.run_text(steps[index])],', ['optimized probes pass']),
+    'optimized-command-value': ('REHEARSAL_PROBE_COMMAND = "cargo test --release --locked', 'REHEARSAL_PROBE_COMMAND = "cargo test --locked', ['optimized probes pass']),
+
+    'optimized-early-return': ('            self.report(workflow, rule, "expected exactly one optimized security probe step")\n            return', '            self.report(workflow, rule, "expected exactly one optimized security probe step")\n            pass', ['optimized probes missing']),
+    'optimized-count': ('if len(probes) != 1:', 'if len(probes) < 1:', ['optimized probes duplicated']),
+    'optimized-name-match': ('if step.get("name") == REHEARSAL_PROBE_NAME', 'if False', ['optimized probes command absent']),
+    'optimized-command-match': (r'or any(re.search(r"(?:^|[;&|] *)cargo test [^#;&|]*\bvendored_wasm_release_cfg\b", line)', 'or any(False', ['optimized probes duplicate renamed']),
+    'optimized-position': ('if builds != [index - 1]:', 'if False:', ['optimized probes before build', 'optimized probes separated', 'optimized probes build renamed']),
+    'optimized-shape': ('if actual != expected:', 'if False:', ['optimized probes guard changed', 'optimized probes filter dropped', 'optimized probes features changed', 'optimized probes release dropped', 'optimized probes no-run added', 'optimized probes continue-on-error', 'optimized probes failure swallowed', 'optimized probes jobs prefix', 'optimized probes jobs step env', 'optimized probes name changed', 'optimized probes command absent']),
+    'optimized-job-suppression': ('if "continue-on-error" in job:\n            self.report(workflow, rule, "probe job must not suppress failures")', 'if False:\n            self.report(workflow, rule, "probe job must not suppress failures")', ['optimized probes job suppression']),
+    'optimized-dispatch': ('        self.check_rehearsal_security_probes()', '        pass', ['optimized probes missing']),
+
     "signature-needs": (
         'for dependency in ("preflight", "provenance", "hashes", "sign"):',
         'for dependency in ("preflight", "provenance", "hashes"):',
@@ -3553,6 +3679,145 @@ for name, needle in (
     MUTATIONS["coverage-unwrap-" + name] = (
         needle, needle.replace("self.unwrap_expression(", "str(", 1),
         ["coverage measured guards wrapped passes"])
+
+
+REHEARSAL_PROBE_SETUP = "      - name: Provide a native Perl for the vendored OpenSSL build (Windows)\n"
+
+# Each environment scope reports each forbidden variable independently.
+PROBE_VARIABLES = ("CARGO_BUILD_JOBS", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
+                   "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS", "CARGO_PROFILE_DEV_OPT_LEVEL")
+
+
+def probe_extra_step(run):
+    return "      - run: |\n" + "".join("          " + line + "\n" for line in run.split("\n")) + "\n"
+
+
+for scope, anchor, indent in (
+        ("workflow", REHEARSAL_ENV, "  "),
+        ("job", REHEARSAL_TIMEOUT, "      "),
+        ("probe", "        shell: bash\n", "          ")):
+    for variable in PROBE_VARIABLES:
+        env = ("" if scope == "workflow" else indent[:-2] + "env:\n") + indent + variable + ": '1'\n"
+        old = REHEARSAL_PROBE_STEP if scope == "probe" else anchor
+        new = old.replace(anchor, env + anchor) if scope == "probe" else old + env
+        CASES.append((f"optimized env {scope} {variable}", "rehearsal-security-probes",
+                      f"{scope} env: {variable} must be unset", [(REHEARSAL, old, new, 1)]))
+
+for label, run in (
+        ("comment", "# cargo test --test vendored_wasm_release_cfg\n\ntrue"),
+        ("inline comment", "cargo test --help # vendored_wasm_release_cfg"),
+        ("non-test", "cargo check --test vendored_wasm_release_cfg"),
+        ("echo", "echo vendored_wasm_release_cfg"),
+        ("target suffix", "cargo test --test vendored_wasm_release_cfg_other"),
+        ("semicolon", "cargo test --help; echo vendored_wasm_release_cfg"),
+        ("pipe", "cargo test --help | echo vendored_wasm_release_cfg"),
+        ("ordinary env", 'echo "OTHER=1" >> "$GITHUB_ENV"'),
+        ("env key prefix", 'echo "OTHER_RUSTFLAGS=1" >> "$GITHUB_ENV"'),
+        ("other file", 'echo "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true" >> "$OTHER"'),
+        ("env comment", '# echo "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true" >> "$GITHUB_ENV"\ntrue')):
+    PASSING.append((f"optimized {label} passes", [
+        (REHEARSAL, REHEARSAL_PROBE_SETUP, probe_extra_step(run) + REHEARSAL_PROBE_SETUP, 1)]))
+
+PASSING.extend([
+    ("optimized wrapped guard passes", [(REHEARSAL, REHEARSAL_PROBE_STEP,
+        REHEARSAL_PROBE_STEP.replace("if: matrix.target == 'x86_64-unknown-linux-gnu'",
+                                    "if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}"), 1)]),
+    ("optimized later env passes", [(REHEARSAL, REHEARSAL_PROBE_STEP,
+        REHEARSAL_PROBE_STEP + probe_extra_step('echo "RUSTFLAGS=x" >> "$GITHUB_ENV"'), 1)]),
+    ("optimized unrelated inherited env passes", [(REHEARSAL, REHEARSAL_ENV,
+        REHEARSAL_ENV + "  OTHER: '1'\n  RUSTFLAGS_EXTRA: '1'\n", 1)]),
+])
+for label, run, variable in (
+        ("earlier env", 'echo "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true" >> "$GITHUB_ENV"', PROBE_VARIABLES[3]),
+        ("braced env", 'echo "RUSTFLAGS=x" >> "${GITHUB_ENV}"', "RUSTFLAGS"),
+        ("powershell env", 'Add-Content $env:GITHUB_ENV "CARGO_ENCODED_RUSTFLAGS=x"', "CARGO_ENCODED_RUSTFLAGS"),
+        ("multiline env", 'echo "CARGO_BUILD_JOBS<<EOF" >> "$GITHUB_ENV"', "CARGO_BUILD_JOBS")):
+    CASES.append((f"optimized {label}", "rehearsal-security-probes",
+                  f"step 7 writes {variable} to GITHUB_ENV before probes", [
+        (REHEARSAL, REHEARSAL_PROBE_SETUP, probe_extra_step(run) + REHEARSAL_PROBE_SETUP, 1)]))
+
+CASES.extend([
+    ("optimized joined duplicate", "rehearsal-security-probes",
+     "expected exactly one optimized security probe step", [(REHEARSAL, REHEARSAL_PROBE_STEP,
+        REHEARSAL_PROBE_STEP + probe_extra_step("true; cargo test --test vendored_wasm_release_cfg"), 1)]),
+    ("optimized env reports each variable", ("rehearsal-security-probes",) * len(PROBE_VARIABLES),
+     tuple(f"workflow env: {key} must be unset" for key in PROBE_VARIABLES), [(REHEARSAL, REHEARSAL_ENV,
+        REHEARSAL_ENV + "".join(f"  {key}: '1'\n" for key in PROBE_VARIABLES), 1)], len(PROBE_VARIABLES)),
+])
+
+PROBE_OWNERS = '(("workflow", self.docs[workflow]), ("job", job), ("probe", steps[index]))'
+for scope, owner in (("workflow", "self.docs[workflow]"), ("job", "job"), ("probe", "steps[index]")):
+    MUTATIONS[f"optimized-owner-{scope}"] = (
+        PROBE_OWNERS, PROBE_OWNERS.replace(f'("{scope}", {owner})', f'("{scope}", {{}})'),
+        [f"optimized env {scope} CARGO_BUILD_JOBS"])
+for variable in PROBE_VARIABLES[:3] + ("CARGO_PROFILE_",):
+    needle = 'forbidden = r"(?:CARGO_BUILD_JOBS|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_PROFILE_\\w*)"'
+    MUTATIONS[f"optimized-forbid-{variable}"] = (
+        needle, needle.replace(variable, "ALLOWED_" + variable, 1),
+        [f"optimized env workflow {PROBE_VARIABLES[3] if variable == 'CARGO_PROFILE_' else variable}"])
+MUTATIONS.update({
+    "optimized-comment-removal": (
+        "for line in self.normalized(self.run_text(step)))]",
+        "for line in [line.lstrip('# ') for line in self.run_text(step).splitlines()])]",
+        ["optimized comment passes"]),
+    "optimized-cargo-test": (
+        r'cargo test [^#;&|]*\bvendored_wasm_release_cfg\b',
+        r'cargo (?:test|check) [^#;&|]*\bvendored_wasm_release_cfg\b',
+        ["optimized non-test passes"]),
+    "optimized-inline-comment": (
+        r'cargo test [^#;&|]*\bvendored_wasm_release_cfg\b',
+        r'cargo test [^;&|]*\bvendored_wasm_release_cfg\b',
+        ["optimized inline comment passes"]),
+    "optimized-invocation": (
+        r'(?:^|[;&|] *)cargo test [^#;&|]*\bvendored_wasm_release_cfg\b',
+        r'\bvendored_wasm_release_cfg\b', ["optimized echo passes"]),
+    "optimized-guard-unwrap": (
+        'self.unwrap_expression(steps[index].get("if", ""))', 'steps[index].get("if", "")',
+        ["optimized wrapped guard passes"]),
+    "optimized-env-match": (
+        'if re.fullmatch(forbidden, str(key)):', 'if False:', ["optimized env probe RUSTFLAGS"]),
+    "optimized-env-fullmatch": (
+        'if re.fullmatch(forbidden, str(key)):', 'if re.match(forbidden, str(key)):',
+        ["optimized unrelated inherited env passes"]),
+    "optimized-env-slice": (
+        'enumerate(steps[:index])', 'enumerate(steps)', ["optimized later env passes"]),
+    "optimized-env-earlier": (
+        'enumerate(steps[:index])', 'enumerate([])', ["optimized earlier env"]),
+    "optimized-env-path": (
+        r'if re.search(r"\$(?:GITHUB_ENV\b|\{GITHUB_ENV\}|env:GITHUB_ENV\b)", line):',
+        'if True:', ["optimized other file passes"]),
+    "optimized-env-normalized": (
+        'for line in self.normalized(self.run_text(step)):\n                if re.search',
+        'for line in self.run_text(step).splitlines():\n                if re.search',
+        ["optimized env comment passes"]),
+    "optimized-env-key": (
+        r'for key in re.findall(r"\b(" + forbidden + r")(?==|<<)", line):',
+        'for key in ["RUSTFLAGS"]:', ["optimized ordinary env passes"]),
+    "optimized-env-dollar": (
+        r'GITHUB_ENV\b|\{GITHUB_ENV\}|env:GITHUB_ENV\b',
+        r'OTHER_ENV\b|\{GITHUB_ENV\}|env:GITHUB_ENV\b', ["optimized earlier env"]),
+    "optimized-env-braces": (
+        r'GITHUB_ENV\b|\{GITHUB_ENV\}|env:GITHUB_ENV\b',
+        r'GITHUB_ENV\b|\{OTHER_ENV\}|env:GITHUB_ENV\b', ["optimized braced env"]),
+    "optimized-env-powershell": (
+        r'GITHUB_ENV\b|\{GITHUB_ENV\}|env:GITHUB_ENV\b',
+        r'GITHUB_ENV\b|\{GITHUB_ENV\}|env:OTHER_ENV\b', ["optimized powershell env"]),
+    "optimized-env-assignment": (r'(?==|<<)', r'(?=<<)', ["optimized earlier env"]),
+    "optimized-env-multiline": (r'(?==|<<)', r'(?==)', ["optimized multiline env"]),
+    "optimized-command-separator": (r'(?:^|[;&|] *)cargo test', r'^cargo test', ["optimized joined duplicate"]),
+    "optimized-target-boundary": (
+        r'\bvendored_wasm_release_cfg\b", line)', r'\bvendored_wasm_release_cfg", line)',
+        ["optimized target suffix passes"]),
+    "optimized-semicolon": (r'[^#;&|]*', r'[^#&|]*', ["optimized semicolon passes"]),
+    "optimized-pipe": (r'[^#;&|]*', r'[^#;&]*', ["optimized pipe passes"]),
+    "optimized-env-key-boundary": (
+        r're.findall(r"\b(" + forbidden', r're.findall(r"(" + forbidden', ["optimized env key prefix passes"]),
+    "optimized-env-step-number": ('f"step {earlier + 1} writes {key}', 'f"step {earlier} writes {key}',
+                                  ["optimized earlier env"]),
+    "optimized-env-each": (
+        'for key in (owner.get("env") or {}):', 'for key in list(owner.get("env") or {})[:1]:',
+        ["optimized env reports each variable"]),
+})
 
 
 def copy_tree(destination):

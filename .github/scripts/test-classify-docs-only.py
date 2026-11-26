@@ -22,6 +22,13 @@ BASE_FILES = {
 CASES = [
     ("docs only", "next", {"docs/maintainers/building.md": "edit\n", "docs/new.md": "new\n"}, [], "true"),
     ("root README.md only", "next", {"README.md": "edit\n"}, [], "true"),
+    ("PR template only", "next", {".github/PULL_REQUEST_TEMPLATE.md": "edit\n"}, [], "true"),
+    ("PR template and doc", "next",
+     {".github/PULL_REQUEST_TEMPLATE.md": "edit\n", "CONTRIBUTING.md": "edit\n"}, [], "true"),
+    ("issue template", "next", {".github/ISSUE_TEMPLATE/x.md": "edit\n"}, [], "false"),
+    ("lowercase PR template", "next", {".github/pull_request_template.md": "edit\n"}, [], "false"),
+    ("PR template directory", "next", {".github/PULL_REQUEST_TEMPLATE/x.md": "edit\n"}, [], "false"),
+    ("other workflow", "next", {".github/workflows/x.yml": "name: x\n"}, [], "false"),
     ("changelog.d only", "next", {"changelog.d/topic.changed.md": "- Entry.\n"}, [], "true"),
     ("skill reference only", "next",
      {"skills/stellar-agent-wallet/references/cli-reference.md": "edit\n"}, [], "true"),

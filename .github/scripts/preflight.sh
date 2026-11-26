@@ -2,17 +2,19 @@
 # Runs the local CI gates that apply to the files a branch changes, then
 # prints one table row per gate for the pull request description.
 #
-# Usage: preflight.sh [--base <ref>] [--full] [--list]
+# Usage: preflight.sh [--base <ref>] [--full | --quick] [--list]
 #
 #   --base <ref>  Compares the branch with its merge base with <ref>. The
 #                 default is upstream/next, or origin/next when upstream/next
 #                 is missing or an ancestor of origin/next, or next when
 #                 neither exists.
 #   --full        Selects every gate, with workspace Cargo commands.
+#   --quick       Selects ten checks with workspace commands, without a diff
+#                 or merge base. Cannot combine with --full or --base.
 #   --list        Prints the selected gates as <id><TAB><command>, one per
 #                 line in registry order, and runs nothing.
 #
-# The changed set is the union of the paths that differ from the merge base
+# Outside --quick, the changed set unites paths that differ from the merge base
 # and the paths git status lists, untracked files included. Deleted paths stay
 # in the set: they select gates, but they are never a shellcheck operand or a
 # self-test trigger of their own. Each path selects the gates of every scope
@@ -24,14 +26,15 @@
 #              the Markdown files and manifests that check reads
 #   skill      skills/, .claude-plugin/
 #   inbox-js   crates/stellar-agent-approval-ui/src/web/,
-#              crates/stellar-agent-approval-ui/src/operator_enroll/web/ and
+#              crates/stellar-agent-approval-ui/src/operator_enroll/web/,
+#              crates/stellar-agent-approval-remote/src/web/ and
 #              crates/stellar-agent-webauthn-bridge/src/web/
 #   rust       crates/, tests/, examples/, and the root files Cargo.toml,
 #              Cargo.lock, rust-toolchain.toml, rustfmt.toml, Cross.toml, and
 #              deny.toml
 #
-# A docs path outside the surface scope adds no gates beyond the three always
-# gates. Directory scopes also apply to Markdown files. A path under interop/
+# Outside --quick, a docs path outside the surface scope adds no gates beyond
+# the four always gates. Directory scopes also apply to Markdown files. A path under interop/
 # adds no gate of its own; the interop harnesses run under --full.
 # select_for_path holds the triggers, and plan_surface_self_test the trigger
 # of the surface scope. Every trigger of workflow-invariants also selects the
@@ -40,6 +43,8 @@
 #
 # Clippy, rustdoc, and tests select the owning packages and their direct
 # dependents when every changed Rust path belongs to a workspace member.
+# Normal, dev, and build dependencies, including target tables, count.
+# --full and --quick keep workspace commands instead of narrowing packages.
 # Unowned paths, including root manifests, the lockfile, the toolchain, and
 # deleted members, select workspace commands. Tests use the declared subset
 # of the offline features; clippy and rustdoc use every declared feature
@@ -54,7 +59,7 @@
 # Exit codes: 0 when every selected gate ran and passed, and 1 when a gate
 # failed or was unavailable. Exit code 2 means a usage error, a missing
 # prerequisite, a base without a merge base, an unreadable workspace
-# manifest, or, without --full, a check-install-surface.py that Python cannot
+# manifest, or, without --full or --quick, a check-install-surface.py that Python cannot
 # load.
 #
 # Needs bash 3.2 or later, git, python3 3.11 or later (for tomllib), awk,
@@ -82,7 +87,7 @@ die() {
 }
 
 usage() {
-  echo "usage: preflight.sh [--base <ref>] [--full] [--list]" >&2
+  echo "usage: preflight.sh [--base <ref>] [--full | --quick] [--list] (--quick excludes --base)" >&2
   exit 2
 }
 
@@ -122,7 +127,7 @@ docs-reads	python3 .github/scripts/check-docs-reads.py	-	ci.yml	release-contract
 changelog	python3 .github/scripts/changelog.py check	-	changelog.yml	changelog	Check changelog fragments
 self-test:test-changelog.py	python3 .github/scripts/test-changelog.py	-	changelog.yml	changelog	Test changelog fragments
 actionlint	actionlint	actionlint	install-surface.yml	install-surface	Check workflows
-feature-discipline	cargo fetch --locked && python3 .github/scripts/check-feature-discipline.py	cargo,yaml	ci.yml	feature-discipline	Check feature discipline and assertions
+feature-discipline	python3 .github/scripts/check-feature-discipline.py	cargo,yaml	ci.yml	feature-discipline	Check feature discipline and assertions
 self-test:test-check-feature-discipline.py	python3 .github/scripts/test-check-feature-discipline.py --mutations	cargo,yaml	ci.yml	feature-discipline	Self-test feature discipline and assertions
 self-test:test-check-binary-marker.sh	bash .github/scripts/test-check-binary-marker.sh	-	ci.yml	feature-discipline	Self-test feature discipline and assertions
 self-test:test-release-checks.sh	bash .github/scripts/test-release-checks.sh	-	ci.yml	feature-discipline	Self-test feature discipline and assertions
@@ -433,7 +438,7 @@ select_for_path() {
       select_gate inbox-js
       select_gate mainnet-presence-js
       ;;
-    crates/stellar-agent-webauthn-bridge/src/web/*)
+    crates/stellar-agent-webauthn-bridge/src/web/* | crates/stellar-agent-approval-remote/src/web/*)
       select_gate inbox-js
       ;;
   esac
@@ -612,9 +617,11 @@ shared = workspace.get("dependencies", {})
 def dependency_tables(manifest):
     yield manifest.get("dependencies", {})
     yield manifest.get("dev-dependencies", {})
+    yield manifest.get("build-dependencies", {})
     for platform in manifest.get("target", {}).values():
         yield platform.get("dependencies", {})
         yield platform.get("dev-dependencies", {})
+        yield platform.get("build-dependencies", {})
 
 
 def member_of(member, key, entry):
@@ -731,8 +738,16 @@ PY
 # Sets SELECTED_POSITIONS to the registry positions of the selected gates, in
 # order and each once.
 plan() {
-  local full=$1 path position
+  local full=$1 quick=$2 path position id
   SELECTED=""
+  if [ "$quick" -eq 1 ]; then
+    for id in docs-style install-surface docs-reads changelog feature-discipline \
+      fmt clippy rustdoc feature-on:clippy feature-on:doc; do
+      select_gate "$id"
+    done
+    SELECTED_POSITIONS=$(printf '%s' "$SELECTED" | sort -nu)
+    return
+  fi
   : >"$SCRATCH/rust"
   : >"$SCRATCH/shell"
   INVARIANT_SCRIPTS=$(invariant_script_paths)
@@ -940,11 +955,12 @@ run_gates() {
 }
 
 main() {
-  local full=0 list=0 top tmp_root
+  local full=0 quick=0 base_given=0 list=0 top tmp_root
   BASE=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --base)
+        base_given=1
         if [ "$#" -lt 2 ]; then
           usage
         fi
@@ -955,6 +971,10 @@ main() {
         full=1
         shift
         ;;
+      --quick)
+        quick=1
+        shift
+        ;;
       --list)
         list=1
         shift
@@ -962,16 +982,23 @@ main() {
       *) usage ;;
     esac
   done
+  if [ "$quick" -eq 1 ] && { [ "$full" -eq 1 ] || [ "$base_given" -eq 1 ]; }; then
+    usage
+  fi
   check_prerequisites
   top=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a Git checkout"
   cd "$top"
-  resolve_base
+  if [ "$quick" -eq 0 ]; then
+    resolve_base
+  fi
   tmp_root=${TMPDIR:-/tmp}
   SCRATCH=$(mktemp -d "${tmp_root%/}/preflight.XXXXXX")
   trap 'rm -rf "$SCRATCH"' EXIT
-  collect_changed_set
+  if [ "$quick" -eq 0 ]; then
+    collect_changed_set
+  fi
   load_registry
-  plan "$full"
+  plan "$full" "$quick"
   if [ "$list" -eq 1 ]; then
     print_list
     exit 0

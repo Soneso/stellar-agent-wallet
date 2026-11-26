@@ -244,6 +244,8 @@ separate `llvm-cov-target` subtree.
 Start local verification with `bash .github/scripts/preflight.sh` and run the
 issue-specific acceptance commands. `bash .github/scripts/preflight.sh --full`
 runs the complete local registry, including coverage.
+`bash .github/scripts/preflight.sh --quick` runs ten workspace checks without
+resolving a merge base or selecting changed paths.
 
 CI runs the offline gates on every pull request to `main` or
 `next`. Pull-request
@@ -255,6 +257,10 @@ Live acceptance uses its separate workflow. A pull request into `next` that chan
 as `.github/scripts/classify-docs-only.py` decides, skips the `ci.yml` build
 and test jobs and runs `docs-tests`: the tests that `.github/docs-tests.tsv`
 lists, which `.github/scripts/check-docs-reads.py` keeps complete.
+The classifier accepts `docs/**/*.md`, root `*.md`, `changelog.d/*.md`,
+`skills/stellar-agent-wallet/**/*.md`, and exactly `.github/PULL_REQUEST_TEMPLATE.md`.
+No other `.github/` path qualifies. The read checker covers the first four
+path patterns; the template exception applies only to classification.
 The check counts as a documentation read an `include_str!` or `include_bytes!`
 of a documentation path, in an attribute too, and a crate-level inner
 `#![doc = include_str!(..)]`.
@@ -305,7 +311,7 @@ The `docs` group includes every Markdown file, `skills/**`, and `.claude-plugin/
 `preflight` group includes changelog files, `CONTRIBUTING.md`, this guide,
 `skills/**`, the smart-account vendor reference, and the sep7, sep5,
 windows-identity, and test-support `src/lib.rs` files. Both rename endpoints
-count. Local preflight retains its self-tests and runs the full registry with
+count. Outside `--quick`, local preflight retains its self-tests and runs the full registry with
 `--full`.
 Local coverage, `cargo machete`, and `cargo deny check` are optional
 reproductions. See the build-gate dimension of the
@@ -330,6 +336,12 @@ bash .github/scripts/preflight.sh
   or an ancestor of `origin/next`, or `next` when neither exists.
 - `--full` runs every gate in the registry, with workspace Cargo commands.
   It includes coverage and its floor check.
+- `--quick` runs exactly `docs-style`, `install-surface`, `docs-reads`,
+  `changelog`, `feature-discipline`, `fmt`, `clippy`, `rustdoc`,
+  `feature-on:clippy`, and `feature-on:doc`, in registry order.
+  It keeps workspace commands, ignores changed paths and package narrowing,
+  and resolves no merge base. It cannot combine with `--full` or `--base`.
+  `--quick --list` prints those ten rows and runs nothing.
 - `--list` prints the selected gates, one `<id><TAB><command>` line each in
   registry order, and runs nothing.
 
@@ -347,9 +359,9 @@ command that the preflight prints when PyYAML is missing:
 python3 -m venv .venv && .venv/bin/python -m pip install --require-hashes -r .github/scripts/workflow-check-requirements.txt && export PATH=$PWD/.venv/bin:$PATH
 ```
 
-The changed set is the union of the paths that differ from the merge base and
+Outside `--quick`, the changed set is the union of the paths that differ from the merge base and
 the paths that `git status` lists. It includes untracked and deleted files.
-Every run includes the four always gates: `docs-style`, `install-surface`,
+Every run except `--quick` includes the four always gates: `docs-style`, `install-surface`,
 `gate-tool-versions`, and `docs-reads`. Each path selects the gates of every scope class it
 matches:
 
@@ -373,13 +385,15 @@ matches:
 - A file under `interop/` adds no gate of its own, since the interop
   harnesses run under `--full`.
 
-Clippy, rustdoc, and tests select the packages that own the changed Rust
+Without `--full` or `--quick`, clippy, rustdoc, and tests select the packages that own the changed Rust
 paths, in path order, followed by their direct dependents, sorted by name.
 A selection that holds `stellar-agent-mcp` also takes `stellar-agent-cli`,
 whose executable the MCP tests start.
 Cargo builds the required dependency closures. A dependent names an owner by
 `path`, directly or through `workspace = true`, in `[dependencies]`,
-`[dev-dependencies]`, or a target-specific dependency table.
+`[dev-dependencies]`, `[build-dependencies]`, or any of their target-specific tables.
+Renamed dependencies count too. Each selected package appears once; transitive-only
+dependents are not added.
 
 Clippy and rustdoc use the same `-p` list as tests, with every declared feature
 except `default` and `mainnet-write`. Clippy, rustdoc, and tests pass
@@ -421,12 +435,13 @@ without `--full`, and so do the coverage floors when the coverage run failed or
 was unavailable. The script exits 0 when no gate failed and none was
 unavailable, and 1 otherwise. It exits 2 for a usage error, a missing
 prerequisite, a base without a merge base, an unreadable workspace manifest,
-or, without `--full`, an install surface check that Python cannot load.
+or, without `--full` or `--quick`, an install surface check that Python cannot load.
 
 The registry, in run order, with what selects each gate. `--full` selects every
 gate except `shellcheck-changed`, which needs a changed shell script.
+`--quick` selects only the ten rows listed above, independently of these triggers.
 
-1. `docs-style`, `install-surface`, `gate-tool-versions`, and `docs-reads`: every run.
+1. `docs-style`, `install-surface`, `gate-tool-versions`, and `docs-reads`: every run except `--quick`.
    `changelog` and its self-test `test-changelog.py`: a change under
    `changelog.d/` or to `changelog.py`. A change to the self-test also runs
    `changelog`.
@@ -434,9 +449,9 @@ gate except `shellcheck-changed`, which needs a changed shell script.
 3. `feature-discipline` and its self-test: a change to a manifest, the
    lockfile, a workflow, a composite action, a file under `.github/scripts/`,
    `Cross.toml`, a cargo config path, a build script, a Rust source under
-   `crates/`, or this guide. The checker fetches the locked graph, then
-   checks the topology, the workflow commands, and the resolved features
-   offline.
+   `crates/`, or this guide. Preflight runs the checker alone, using cached
+   locked dependencies to check the topology, workflow commands, and resolved
+   features offline. CI keeps its separate fetch step.
 4. Three self-tests, each on a change to itself or to a file in its list:
    - `test-check-binary-marker.sh`: `check-binary-marker.sh`
    - `test-release-checks.sh`: `check-binary-marker.sh`,
@@ -523,7 +538,9 @@ gate except `shellcheck-changed`, which needs a changed shell script.
 19. `inbox-js` and `mainnet-presence-js`: a change under
     `crates/stellar-agent-approval-ui/src/web/` or
     `crates/stellar-agent-approval-ui/src/operator_enroll/web/`. `inbox-js`
-    also runs on a change under `crates/stellar-agent-webauthn-bridge/src/web/`.
+    also runs on a change under `crates/stellar-agent-webauthn-bridge/src/web/`
+    or `crates/stellar-agent-approval-remote/src/web/`, including deletions.
+    Those two paths do not select `mainnet-presence-js`.
 20. `interop:mpp` and `interop:sdk-v17`: `--full` only.
 
 `package-skill.sh`, `release-preflight-version-check.sh`, and
@@ -1240,7 +1257,19 @@ The template does not judge the contents of pinned scripts, action behavior,
 downloaded artifacts, or runtime GitHub evidence.
 Runtime checks validate the artifacts and evidence.
 
-Run the identity and deployment gates locally with:
+The release rehearsal runs the optimized Wasm identity and deployment security
+probes on its Linux x86_64 build, immediately after building the binaries.
+A failed probe fails the build job. The `rehearsal-security-probes` invariant
+requires exactly one probe step on the x86_64 Linux leg, with the exact
+`cargo test --release` command and filters below, and no failure suppression.
+CI adds `--locked` and `--target x86_64-unknown-linux-gnu`.
+The probe, job, and workflow environments leave `CARGO_BUILD_JOBS`, `RUSTFLAGS`,
+`CARGO_ENCODED_RUSTFLAGS`, and every `CARGO_PROFILE_*` variable unset.
+Earlier build steps cannot write these variables to `$GITHUB_ENV`.
+The checker identifies probes by name or a normalized `cargo test` command
+naming `vendored_wasm_release_cfg`; comments and blank lines do not count.
+The Linux guard also accepts the `${{ ... }}` expression wrapper.
+Reproduce the identity and deployment gates locally with:
 
 ```sh
 CARGO_BUILD_JOBS=6 cargo test -p stellar-agent-smart-account \
@@ -1388,10 +1417,11 @@ and every constant and allowlist entry that pins it in the same change.
   Tag runs build both binaries from source. They gate
   Apple signing and notarization, hashing, cosign signing, provenance, and
   release and crate publication.
-- Pull-request CI does not run the release-profile tests. The deploy's digest
-  check runs in every profile; review and the release-profile test run keep it
-  out of a `debug_assertions` gate. The local release gate also checks the
-  integration target against the library compiled in the release profile.
+- The release rehearsal runs the release-profile probes on its x86_64 Linux
+  build. The deploy's digest check runs in every profile; review and these
+  probes keep it out of a `debug_assertions` gate. The rehearsal also checks
+  the integration target against the library compiled in the release profile.
+  Use the local `cargo test --release` command above to reproduce these probes.
 - GitHub disables scheduled runs of a public repository after 60 days without
   repository activity.
 - The first workflow run proves what a local run cannot: the runner image's C++
@@ -1436,8 +1466,15 @@ registries and unknown git sources are denied.
 
 ### Feature discipline and release markers
 
+Prepare the locked dependencies online when the Cargo cache needs them:
+
 ```bash
 cargo fetch --locked
+```
+
+Run the checks with the populated cache:
+
+```bash
 python3 .github/scripts/check-feature-discipline.py
 python3 .github/scripts/test-check-feature-discipline.py --mutations
 bash .github/scripts/test-check-binary-marker.sh
@@ -1447,6 +1484,10 @@ bash .github/scripts/release/check-host.sh
 ```
 
 The checker reads metadata and Cargo trees with `--locked --offline`.
+Preflight runs it without fetching. A cold or incomplete cache fails visibly;
+populate the cache with the explicit preparation command above before retrying.
+The reviewed rehearsal probe invocation has five matrix rows because the
+inventory ignores step conditions, including the probe's Linux x86_64 guard.
 Each resolving inventory row uses its explicit target, or the runner's
 triple from `RUNNER_TARGETS` in the checker:
 
@@ -1557,8 +1598,9 @@ Each error message names its rule:
   check, including `printf`, `tee`, `Set-Content`, multiline entries, options
   other than `-Path` and `-Value`, arrays, and reads. In a named Python
   script no line may hold `GITHUB_ENV` in any case, apart from the two
-  workflow invariants files, which spell the toolchain pin as text they
-  compare. The scanner does not read the value of a referenced variable: a
+  workflow invariants files. These read environment-file writes for the
+  `release-toolchain` and `rehearsal-security-probes` rules.
+  The scanner does not read the value of a referenced variable: a
   variable whose value holds a line break, or backslashes under a shell
   whose `echo` expands them, writes more than one entry. The `echo` form
   admits references because the toolchain pins need them. A function or
@@ -1621,8 +1663,9 @@ It installs nothing, and it stops in these cases:
   engine.
 
 The release rehearsal checks both executable names from every packed archive on a
-native runner, including Rosetta for the Intel macOS archive. Its crate job
-packages with the publish toolchain and checks fresh package-verification
+native runner, including Rosetta for the Intel macOS archive. Its Linux x86_64
+build also runs the optimized Wasm identity and deployment security probes above.
+Its crate job packages with the publish toolchain and checks fresh package-verification
 outputs. Dispatch acceptance defaults to `mainnet_write=true`; the local driver
 defaults to off, and schedules alternate at Monday 00:00 UTC.
 The driver passes `--no-default-features` to every suite. `MAINNET_WRITE=on` adds the

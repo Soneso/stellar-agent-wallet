@@ -1244,6 +1244,30 @@ def case_cargo_error(m, tmp, checker):
         m.subprocess.run = original
 
 
+@unit('rehearsal-security-inventory')
+def case_rehearsal_security_inventory(m, tmp, checker):
+    workflows, scripts = m.workflow_inputs(ROOT)
+    found = [row for row in m.inventory(ROOT, workflows, scripts)
+             if row['step'] == 'Verify optimized Wasm identity and deployment security']
+    reviewed = [row for row in m.INVOCATIONS
+                if row['step'] == 'Verify optimized Wasm identity and deployment security']
+    assert sorted(reviewed, key=lambda row: json.dumps(row, sort_keys=True)) == found, \
+        'rehearsal security inventory drift'
+    command = "cargo test --release --locked --target x86_64-unknown-linux-gnu -p stellar-agent-smart-account --features test-helpers,deploy-cli --lib --test vendored_wasm_release_cfg -- vendored_wasm_tests deployment::deploy::tests:: vendored_table_entries embedded_wasm_constants digest_constants verifier_allowlist_ threshold_policy_hashes weighted_threshold_policy_hashes deploy_smart_account_dry_run deploy_webauthn_verifier_dry_run deploy_ed25519_verifier_dry_run deploy_spending_limit_policy_dry_run deploy_timelock_controller_dry_run deploy_policy_dry_run"
+    expected = {'workflow': 'release-rehearsal.yml', 'job': 'build',
+                'step': 'Verify optimized Wasm identity and deployment security',
+                'source': 'release-rehearsal.yml', 'command': command,
+                'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'],
+                'features': ['--features', 'test-helpers,deploy-cli'],
+                'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu',
+                'bins': None}
+    normalized = sorted([{**row, 'command': ' '.join(row['command'].split())} for row in reviewed],
+                        key=lambda row: row['runner'])
+    assert normalized == [{**expected, 'runner': runner} for runner in
+                          ('macos-26', 'macos-26', 'ubuntu-24.04', 'ubuntu-24.04', 'windows-2025')], \
+        'rehearsal security inventory must retain all five matrix expansions'
+
+
 @unit('inventory-order')
 def case_inventory_order(m, tmp, checker):
     c = m.Checker(ROOT)

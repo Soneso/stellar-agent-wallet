@@ -10,12 +10,14 @@ current public alpha, and a high-level summary of the security model.
 
 ## Supported versions
 
-This project is a pre-1.0 public alpha. Only the latest `0.1.x` alpha is supported.
+This project is a pre-1.0 public alpha. Only the latest `0.2.x` alpha is supported.
+All older releases, including the `0.1.x` line, are unsupported.
 
 | Version | Supported |
 | ------- | --------- |
-| latest `0.1.x` | Yes |
-| any older `0.1.x` | No |
+| latest `0.2.x` alpha | Yes |
+| any older `0.2.x` alpha | No |
+| `0.1.x` and all earlier lines | No |
 
 There are no backports to earlier alpha builds. Install the latest tagged release
 (see the [README](README.md) for the release archives and crates.io install paths)
@@ -34,7 +36,7 @@ Please include:
 
 - A description of the vulnerability and its impact.
 - Steps to reproduce, including any required profile configuration or environment.
-- The affected version or commit (the `0.1.x` build, or the source commit you built from).
+- The affected version or commit (for example, `0.2.0-alpha.1`, or the source commit you built from).
 - Any proof-of-concept input, log excerpt, or transaction envelope, with secrets redacted.
 
 Do not include real secret seeds, private keys, or keyring secrets in a report. The

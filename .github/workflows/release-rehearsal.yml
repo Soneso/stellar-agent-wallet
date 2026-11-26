@@ -110,6 +110,19 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: bash .github/scripts/release/build.sh "$TARGET"
 
+      - name: Verify optimized Wasm identity and deployment security
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          cargo test --release --locked --target x86_64-unknown-linux-gnu -p stellar-agent-smart-account \
+            --features test-helpers,deploy-cli --lib --test vendored_wasm_release_cfg -- \
+            vendored_wasm_tests deployment::deploy::tests:: \
+            vendored_table_entries embedded_wasm_constants digest_constants \
+            verifier_allowlist_ threshold_policy_hashes weighted_threshold_policy_hashes \
+            deploy_smart_account_dry_run deploy_webauthn_verifier_dry_run \
+            deploy_ed25519_verifier_dry_run deploy_spending_limit_policy_dry_run \
+            deploy_timelock_controller_dry_run deploy_policy_dry_run
+
       - name: Read the workspace version
         id: version
         shell: bash

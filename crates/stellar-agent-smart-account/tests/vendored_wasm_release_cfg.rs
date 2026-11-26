@@ -2,7 +2,9 @@
 //!
 //! The table, embedded constants, digest constants, allowlists, and public
 //! deployment wrappers have independent file assertions here. CI runs this
-//! target in its ordinary test job; the local release gate also runs it.
+//! target in its ordinary test job and in the release rehearsal's x86_64 Linux
+//! build. Reproduce the optimized probes with the local `cargo test --release`
+//! command in `docs/maintainers/building.md`, under "What the workflow proves".
 //! Enabled features include those unified through dev-dependencies.
 
 #![allow(

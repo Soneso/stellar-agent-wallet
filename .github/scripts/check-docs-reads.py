@@ -4,13 +4,15 @@
 Usage: check-docs-reads.py [--root ROOT] [--registry FILE] [--list]
 
 The check scans the Rust sources of every workspace member for reads of a
-documentation path, the paths .github/scripts/classify-docs-only.py treats as
-documentation:
+documentation path under the shared is_documentation rule:
 
 - ``docs/**/*.md``
 - ``*.md`` at the repository root
 - ``changelog.d/*.md``
 - ``skills/stellar-agent-wallet/**/*.md``
+
+The classifier also accepts exactly ``.github/PULL_REQUEST_TEMPLATE.md``
+for docs-only CI. That exception does not extend this check's scope.
 
 The documentation directories are ``docs``, ``changelog.d``, and ``skills``
 with their subdirectories.

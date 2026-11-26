@@ -15,3 +15,8 @@ def is_documentation(path):
     if parts[0] == "changelog.d":
         return len(parts) == 2
     return parts[:2] == ["skills", "stellar-agent-wallet"] and len(parts) > 2
+
+
+def is_docs_only_path(path):
+    """Whether a path qualifies for docs-only CI, including the PR template."""
+    return path == ".github/PULL_REQUEST_TEMPLATE.md" or is_documentation(path)

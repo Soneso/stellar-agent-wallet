@@ -1,0 +1,1 @@
+- Support only the latest `0.2.x` alpha in the security policy; older releases, including `0.1.x`, are unsupported.
