@@ -101,6 +101,7 @@ fn ledger_entries(contract: &ScAddress, entry_xdr: &str) -> serde_json::Value {
 /// undecodable instance as `UndecodableInstance`, the SAC instance, a
 /// built-in executable with no Wasm code, as `NoWasmCode`.
 #[tokio::test]
+#[serial_test::serial]
 async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
     let contract = contract_addr();
     for (entry_xdr, reason) in [
@@ -231,6 +232,7 @@ fn assert_contract_absent(capture: &WarningCapture, message: &str, error: &SaErr
 /// override flags are set. The refusal comes from identification, before
 /// either override branch; no audit row is written and no pin is returned.
 #[tokio::test]
+#[serial_test::serial]
 async fn external_ref_without_live_tag_entry_rejected_before_any_override() {
     use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
 
@@ -362,6 +364,7 @@ async fn received_methods(server: &MockServer) -> Vec<String> {
 /// endpoints, so no mutability probe runs and no transaction is built or
 /// simulated, no audit row is written and no pin is returned.
 #[tokio::test]
+#[serial_test::serial]
 async fn contract_without_wasm_code_is_refused_under_every_override_combination() {
     let contract = contract_addr();
     let contract_strkey =

@@ -59,6 +59,7 @@ fn smart_account_addr() -> ScAddress {
 /// Display, Debug and source chain, its serialized form, the MCP error
 /// envelope or the wallet's logs, which hold the observation event.
 #[test]
+#[serial_test::serial]
 fn verifier_unknown_wasm_hash_rejected_without_override() {
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let (result, logs) = wallet_traced(async move {
@@ -158,6 +159,7 @@ fn verifier_wasm_not_in_allowlist_wire_code_is_consistent() {
 
 #[cfg(feature = "test-helpers")]
 #[tokio::test]
+#[serial_test::serial]
 async fn a_revoked_verifier_is_refused_with_both_overrides() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -201,6 +203,7 @@ async fn a_revoked_verifier_is_refused_with_both_overrides() {
 
 #[cfg(feature = "test-helpers")]
 #[tokio::test]
+#[serial_test::serial]
 async fn identify_verifier_refuses_a_revoked_verifier() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

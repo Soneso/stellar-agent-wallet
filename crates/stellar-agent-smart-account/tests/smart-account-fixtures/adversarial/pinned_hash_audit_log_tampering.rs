@@ -23,6 +23,7 @@ use uuid::Uuid;
 use super::rpc_mock_helpers::{ZERO_CONTRACT_REDACTED, manager_one_url, tmp_audit_writer};
 
 #[test]
+#[serial_test::serial]
 fn pinned_hash_tampering_returns_audit_log_error_before_pin_extraction() {
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let rule_id = 1;
