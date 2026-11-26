@@ -61,6 +61,7 @@ fn verifier_addr() -> ScAddress {
 /// on-chain hash returned by the mock RPC, `verify_pinned_verifier_against_chain`
 /// returns `SaError::VerifierHashDrift` and emits a `SaVerifierHashDrift` audit row.
 #[tokio::test]
+#[serial_test::serial]
 async fn verifier_wasm_hash_drift_detected_and_audit_row_emitted() {
     let verifier = verifier_addr();
 
@@ -159,6 +160,7 @@ async fn verifier_wasm_hash_drift_detected_and_audit_row_emitted() {
 /// source chain, the serialized form, the MCP error envelope, or the
 /// wallet's logs, which hold the manager's events.
 #[test]
+#[serial_test::serial]
 fn a_pinned_revoked_verifier_refuses_after_the_pin_matches() {
     let revoked = [0xee; 32];
     let revoked_full = hex::encode(revoked);
@@ -249,6 +251,7 @@ fn a_pinned_revoked_verifier_refuses_after_the_pin_matches() {
 /// before the refusal returns, carries the observed hash's first eight bytes
 /// and the executable summary.
 #[test]
+#[serial_test::serial]
 fn the_drift_refusal_holds_no_observed_hash_and_the_drift_row_keeps_it() {
     let pinned = WasmHashPin::new([0x01; 32]);
     let observed: [u8; 32] = std::array::from_fn(|i| 0x9d ^ u8::try_from(i).unwrap());
@@ -413,6 +416,7 @@ async fn check_against(
 /// of the observed one, and writing the drift row. The exact pinned hash
 /// passes.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_unlisted_equal_prefix_twin_refuses_as_drift_under_both_overrides() {
     let (pinned, twin) = pinned_and_twin();
     for overrides in [false, true] {
@@ -447,6 +451,7 @@ async fn an_unlisted_equal_prefix_twin_refuses_as_drift_under_both_overrides() {
 /// the revoked hash is never assigned to a hash that only shares its prefix,
 /// and the pin comparison refuses first.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_twin_of_a_pinned_revoked_verifier_refuses_as_drift() {
     let revoked = [0xeeu8; 32];
     let mut twin = revoked;

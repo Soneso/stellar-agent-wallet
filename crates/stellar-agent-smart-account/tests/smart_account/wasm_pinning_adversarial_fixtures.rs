@@ -42,6 +42,10 @@
 //!
 //! The remaining fixtures run under default `cargo test`.
 //!
+//! A fixture that opens its audit writer through `tmp_audit_writer` also
+//! holds its own marked `STELLAR_AGENT_HOME`, so it passes alone in a fresh
+//! process. It runs under `#[serial]`, which the home guard requires.
+//!
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -51,7 +55,21 @@
 
 // ── Shared RPC mock helpers ───────────────────────────────────────────────────
 
-use crate::rpc_mock_helpers;
+/// The shared RPC mock helpers, with `tmp_audit_writer` resolving to
+/// `isolated_audit_writer`: every fixture that opens its audit writer also
+/// holds its own marked `STELLAR_AGENT_HOME` and runs under `#[serial]`.
+mod rpc_mock_helpers {
+    pub(super) use crate::rpc_mock_helpers::isolated_audit_writer as tmp_audit_writer;
+    pub(super) use crate::rpc_mock_helpers::*;
+}
+
+/// A fixture outside the `#[serial]` lock is refused before it sets
+/// `STELLAR_AGENT_HOME`.
+#[test]
+#[should_panic(expected = "an isolated wallet home requires the #[serial] lock")]
+fn an_audit_writer_outside_the_serial_lock_is_refused() {
+    let _audit = rpc_mock_helpers::tmp_audit_writer();
+}
 
 use crate::combined_rpc_responder;
 

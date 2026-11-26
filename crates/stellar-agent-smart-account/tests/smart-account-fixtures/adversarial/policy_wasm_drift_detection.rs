@@ -66,6 +66,7 @@ fn policy_addr() -> ScAddress {
 /// which hold the drift warning. The drift row keeps the observed hash's
 /// first eight bytes and the executable summary.
 #[test]
+#[serial_test::serial]
 fn policy_wasm_hash_drift_detected_and_audit_row_emitted() {
     let live_wasm_hash = THRESHOLD_POLICY_WASM_HASHES[0];
     let observed_full = hex::encode(live_wasm_hash);
@@ -187,6 +188,7 @@ fn policy_wasm_hash_drift_detected_and_audit_row_emitted() {
 /// exact pinned hash passes. The error names the full pin; the drift audit
 /// row keeps the observed hash and executable.
 #[tokio::test]
+#[serial_test::serial]
 async fn an_equal_prefix_policy_twin_refuses_as_drift_outside_the_allowlist() {
     let pinned = [0x42u8; 32];
     let mut twin = pinned;

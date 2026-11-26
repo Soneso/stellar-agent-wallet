@@ -305,13 +305,15 @@ async fn submit(
 }
 
 /// [`submit`] on `path`. `Outcome::signs` counts the signing primitives of
-/// every signer the submission holds.
+/// every signer the submission holds. The submission runs in its own marked
+/// `STELLAR_AGENT_HOME`.
 async fn submit_on(
     path: SigningPath,
     host_function: InvokeContractArgs,
     declared: DeclaredSubInvocations<'_>,
     tree: impl Fn(&InvokeContractArgs) -> SorobanAuthorizedInvocation + Send + Sync + 'static,
 ) -> Outcome {
+    let _home = rpc_helpers::isolated_home();
     let mock = MockServer::start().await;
     let simulations = Arc::new(AtomicUsize::new(0));
     let sent = Arc::new(Mutex::new(Vec::new()));

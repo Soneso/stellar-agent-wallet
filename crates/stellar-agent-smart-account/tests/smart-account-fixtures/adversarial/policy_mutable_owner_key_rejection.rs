@@ -115,6 +115,7 @@ fn mutable_policy_ledger_entries(policy: &ScAddress) -> serde_json::Value {
 /// Verifies the refusal path: a mutable policy is rejected when
 /// `accept_mutable_verifier` is not set.
 #[tokio::test]
+#[serial_test::serial]
 async fn policy_with_owner_key_rejected_without_override() {
     let policy = policy_addr();
     let smart_account = smart_account_addr();

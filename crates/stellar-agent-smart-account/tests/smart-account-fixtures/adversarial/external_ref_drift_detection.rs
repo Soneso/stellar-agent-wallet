@@ -285,6 +285,7 @@ fn reference_summary(tag: &str, resolved: impl std::fmt::Display) -> String {
 /// Signing proceeds while the owner's tag entry holds the pinned hash, and
 /// the cache keeps the observed reference.
 #[tokio::test]
+#[serial_test::serial]
 async fn pinned_external_ref_matches_while_tag_holds_pinned_hash() {
     for kind in [Kind::Verifier, Kind::Policy] {
         let resolved = resolved_hash(kind);
@@ -311,6 +312,7 @@ async fn pinned_external_ref_matches_while_tag_holds_pinned_hash() {
 /// The owner repointing the tag is drift naming the reference and the new
 /// hash.
 #[tokio::test]
+#[serial_test::serial]
 async fn owner_repointing_the_tag_is_drift() {
     let repointed = [0xe7u8; 32];
     for kind in [Kind::Verifier, Kind::Policy] {
@@ -337,6 +339,7 @@ async fn owner_repointing_the_tag_is_drift() {
 /// first eight bytes is drift. The error names the full pin; the drift audit
 /// row keeps the observed hash and executable.
 #[tokio::test]
+#[serial_test::serial]
 async fn owner_repointing_the_tag_to_an_equal_prefix_twin_is_drift() {
     for kind in [Kind::Verifier, Kind::Policy] {
         let resolved = resolved_hash(kind);
@@ -363,6 +366,7 @@ async fn owner_repointing_the_tag_to_an_equal_prefix_twin_is_drift() {
 /// An instance converted to a Wasm executable whose hash equals the pinned
 /// resolved hash is drift: the executable kind changed.
 #[tokio::test]
+#[serial_test::serial]
 async fn reference_converted_to_wasm_with_the_pinned_hash_is_drift() {
     for kind in [Kind::Verifier, Kind::Policy] {
         let resolved = resolved_hash(kind);
@@ -387,6 +391,7 @@ async fn reference_converted_to_wasm_with_the_pinned_hash_is_drift() {
 /// An expired tag entry is drift, reported as resolved `unset` with no
 /// observed hash.
 #[tokio::test]
+#[serial_test::serial]
 async fn expired_tag_entry_is_drift() {
     for kind in [Kind::Verifier, Kind::Policy] {
         let resolved = resolved_hash(kind);
@@ -411,6 +416,7 @@ async fn expired_tag_entry_is_drift() {
 /// A different tag on the same owner resolving to the same hash is drift:
 /// the reference changed.
 #[tokio::test]
+#[serial_test::serial]
 async fn different_tag_resolving_to_the_same_hash_is_drift() {
     for kind in [Kind::Verifier, Kind::Policy] {
         let resolved = resolved_hash(kind);
@@ -435,6 +441,7 @@ async fn different_tag_resolving_to_the_same_hash_is_drift() {
 /// With a pinned Wasm contract, the instance becoming an external reference
 /// that resolves to the pinned Wasm hash is drift.
 #[tokio::test]
+#[serial_test::serial]
 async fn pinned_wasm_becoming_a_reference_to_the_same_hash_is_drift() {
     for kind in [Kind::Verifier, Kind::Policy] {
         let pinned = resolved_hash(kind);
@@ -458,6 +465,7 @@ async fn pinned_wasm_becoming_a_reference_to_the_same_hash_is_drift() {
 /// contract and an unresolved external reference are drift against a zero
 /// pin and report no observed hash.
 #[tokio::test]
+#[serial_test::serial]
 async fn absent_code_against_a_zero_pin_is_drift() {
     let zero = full(&[0u8; 32]);
     for kind in [Kind::Verifier, Kind::Policy] {
