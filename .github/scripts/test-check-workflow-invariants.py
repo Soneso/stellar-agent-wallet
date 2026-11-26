@@ -923,6 +923,21 @@ CASES = [
     ("signing without Wasm dependency", "release-wasm-gate", "hashes must need vendored-wasm", [
         (RELEASE, "needs: [preflight, vendored-wasm, build, sign-macos, verify-packaged]",
          "needs: [preflight, build, sign-macos, verify-packaged]", 1)], 1),
+    ("Apple signing without Wasm dependency", "release-wasm-gate", "sign-macos must need vendored-wasm", [
+        (RELEASE, "  sign-macos:\n    name: sign ${{ matrix.target }}\n    needs: [preflight, vendored-wasm, build]\n",
+         "  sign-macos:\n    name: sign ${{ matrix.target }}\n    needs: [preflight, build]\n", 1)], 1),
+    ("Apple signing with always condition", "release-wasm-gate", "sign-macos must not set if", [
+        (RELEASE, "  sign-macos:\n    name: sign ${{ matrix.target }}\n    needs: [preflight, vendored-wasm, build]\n",
+         "  sign-macos:\n    name: sign ${{ matrix.target }}\n    needs: [preflight, vendored-wasm, build]\n"
+         "    if: ${{ always() }}\n", 1)], 1),
+    ("Apple signing with not-cancelled condition", "release-wasm-gate", "sign-macos must not set if", [
+        (RELEASE, "  sign-macos:\n    name: sign ${{ matrix.target }}\n    needs: [preflight, vendored-wasm, build]\n",
+         "  sign-macos:\n    name: sign ${{ matrix.target }}\n    needs: [preflight, vendored-wasm, build]\n"
+         "    if: ${{ !cancelled() }}\n", 1)], 1),
+    ("Apple signing continues on error", "release-wasm-gate", "sign-macos must not set continue-on-error", [
+        (RELEASE, "  sign-macos:\n    name: sign ${{ matrix.target }}\n    needs: [preflight, vendored-wasm, build]\n",
+         "  sign-macos:\n    name: sign ${{ matrix.target }}\n    needs: [preflight, vendored-wasm, build]\n"
+         "    continue-on-error: true\n", 1)], 2),
     ("Wasm rebuild job continues on error", "release-wasm-gate",
      "vendored-wasm.yml:rebuild: release-wasm-gate: rebuild continues on error", [
         (WASM, WASM_REBUILD_JOB, WASM_REBUILD_JOB + "    continue-on-error: true\n", 1)], 1),

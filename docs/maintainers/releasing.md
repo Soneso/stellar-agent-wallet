@@ -175,9 +175,11 @@ Both build cold from locked sources. The `release-toolchain` rule requires
 both builds to install `RELEASE_TOOLCHAIN` and pin `RUSTUP_TOOLCHAIN` before
 compilation, with the same value as `publish.yml`.
 
-The `release-wasm-gate` rule requires `hashes` and `publish` to depend on the
-local vendored Wasm workflow call, without conditions, inputs, or secrets, so
-signing, provenance, and publication wait for the rebuild. The called
+The `release-wasm-gate` rule requires `sign-macos`, `hashes`, and `publish` to
+depend on the unconditional local vendored Wasm workflow call without inputs or
+secrets. It also forbids job-level `if` and `continue-on-error` on `sign-macos`.
+Apple signing and notarization, hashing, cosign signing, provenance, and
+publication therefore wait for the rebuild. The called
 workflow declares `workflow_call`; every cache step starts its condition with
 `github.ref_type != 'tag' && !inputs.publication`, so tag and publication runs
 use no cache. Its rebuild runs exactly when the tree check asks
@@ -422,10 +424,11 @@ build script runs the environment guard immediately before the release recipe.
 Archive verification executes both packaged binaries and checks their embedded
 markers. Archive and host checks also refuse three test-override literals:
 `STELLAR_AGENT_HOME`, `STELLAR_AGENT_TEST_`, and `.stellar-agent-test-sandbox`.
-Hashing depends on archive
-verification and on the vendored Wasm rebuild of the tagged commit, so
-signing and provenance wait for that rebuild. Publication depends on the
-provenance content check, the source discipline check, and the rebuild.
+Apple signing and notarization (`sign-macos`) depend on the vendored Wasm
+rebuild of the tagged commit. Hashing depends on archive verification and on
+that rebuild. Apple signing and notarization, hashing, cosign signing,
+provenance, and publication therefore wait for that rebuild. Publication depends
+on the provenance content check, the source discipline check, and the rebuild.
 Crate publication also requires a rebuild of every vendored Wasm file of the
 verified tag's commit from its pinned source with pinned tools and matching
 bytes. A failed, canceled, or skipped rebuild stops it before the registry
