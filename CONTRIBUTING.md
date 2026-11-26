@@ -256,6 +256,23 @@ tense, which the next section sets.
 
 ## Changelog entries
 
+A pull request adds a fragment when it changes what a wallet user sees.
+That covers the behavior of a CLI command, an MCP tool, or a library API.
+It also covers configuration and the user documentation: `README.md`,
+`SECURITY.md`, `docs/` outside `docs/maintainers/`, and
+`skills/stellar-agent-wallet/`.
+A change under `skills/stellar-agent-wallet/` also rebuilds the skill archive
+`skills/stellar-agent-wallet.zip` with `bash .github/scripts/package-skill.sh`.
+`bash .github/scripts/package-skill.sh --check` confirms the rebuilt archive.
+A change to tests, CI, `.github/`, maintainer documentation, or contributor
+guidance alone adds no fragment.
+A documentation change picks its category like a code change.
+Use `added` for a new guide or section.
+Use `fixed` for a correction of wrong guidance.
+Use `changed` for every other documentation change.
+`changelog.py check` validates fragments but does not require one.
+Reviewers apply this rule.
+
 A fragment is a pending changelog entry under `changelog.d/`.
 It supplies the entry that source compatibility policies require.
 Add one `<slug>.<category>.md` file for each category your change needs.
@@ -274,6 +291,13 @@ For example, `changelog.d/account-timeouts.fixed.md` contains:
 
 ```markdown
 - Retry an account lookup after a network timeout.
+```
+
+A documentation fix on the branch `docs/policy-check-exit-codes` adds
+`changelog.d/docs-policy-check-exit-codes.fixed.md`, which contains:
+
+```markdown
+- Correct the `profile policy-check` exit codes in the troubleshooting guide.
 ```
 
 Keep `CHANGELOG.md` and the fragment README unchanged in contributing pull
