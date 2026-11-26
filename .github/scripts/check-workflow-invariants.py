@@ -174,6 +174,14 @@ runs the function.
   smoke's build step differ from ``SMOKE_BUILD``, or those of
   ``copy-alias.sh`` differ from ``COPY_HELPER_BODY``: comments and blank lines
   are dropped and each run of blanks collapses to one space.
+- ``rehearsal-security-probes``: the build job lacks exactly one optimized
+  probe step immediately after ``Build binaries``, its name, Linux x86_64
+  guard, bash shell or normalized command differs, or it has extra keys.
+  A probe matches by name or a normalized cargo test command naming the
+  integration target; comments do not count. The guard allows expression wrappers.
+  Workflow, job and probe env must leave ``CARGO_BUILD_JOBS``, ``RUSTFLAGS``,
+  ``CARGO_ENCODED_RUSTFLAGS`` and ``CARGO_PROFILE_*`` unset, as must earlier
+  steps writing to ``GITHUB_ENV``. Job ``continue-on-error`` is also refused.
 - ``signing-order``: ``sign-notarize.sh`` lacks the contiguous normalized
   ``SIGN_BLOCK``, which signs and verifies ``stellar-agent``, derives the
   alias from the signed file and packs both names; a codesign call other
@@ -498,6 +506,9 @@ COVERAGE_CANCEL_RUN = "exit 1"
 # dispatch. Its token reads the repository contents and nothing else, and no
 # expression of the workflow reads a secret or the workflow token.
 REHEARSAL_WORKFLOW = "release-rehearsal.yml"
+REHEARSAL_PROBE_NAME = "Verify optimized Wasm identity and deployment security"
+REHEARSAL_PROBE_COMMAND = "cargo test --release --locked --target x86_64-unknown-linux-gnu -p stellar-agent-smart-account --features test-helpers,deploy-cli --lib --test vendored_wasm_release_cfg -- vendored_wasm_tests deployment::deploy::tests:: vendored_table_entries embedded_wasm_constants digest_constants verifier_allowlist_ threshold_policy_hashes weighted_threshold_policy_hashes deploy_smart_account_dry_run deploy_webauthn_verifier_dry_run deploy_ed25519_verifier_dry_run deploy_spending_limit_policy_dry_run deploy_timelock_controller_dry_run deploy_policy_dry_run"
+
 REHEARSAL_PERMISSIONS = {"contents": "read"}
 # Shared release build and platform setup scripts.
 RELEASE_SCRIPTS = pathlib.PurePosixPath(".github/scripts/release")
@@ -1689,6 +1700,42 @@ class Checker:
         if dependency not in values:
             self.report(workflow, rule, f"{name} must need {dependency}")
 
+    def check_rehearsal_security_probes(self):
+        workflow = "release-rehearsal.yml"
+        job = self.job(workflow, "build") or {}
+        steps = job.get("steps", [])
+        probes = [i for i, step in enumerate(steps)
+                  if step.get("name") == REHEARSAL_PROBE_NAME
+                  or any(re.search(r"(?:^|[;&|] *)cargo test [^#;&|]*\bvendored_wasm_release_cfg\b", line)
+                         for line in self.normalized(self.run_text(step)))]
+        rule = "rehearsal-security-probes"
+        if len(probes) != 1:
+            self.report(workflow, rule, "expected exactly one optimized security probe step")
+            return
+        index = probes[0]
+        builds = [i for i, step in enumerate(steps) if step.get("name") == "Build binaries"]
+        if builds != [index - 1]:
+            self.report(workflow, rule, "probes must immediately follow Build binaries")
+        expected = {"name": REHEARSAL_PROBE_NAME,
+                    "if": "matrix.target == 'x86_64-unknown-linux-gnu'",
+                    "shell": "bash", "run": [REHEARSAL_PROBE_COMMAND]}
+        actual = {**steps[index], "run": self.normalized(self.run_text(steps[index])),
+                  "if": self.unwrap_expression(steps[index].get("if", ""))}
+        if actual != expected:
+            self.report(workflow, rule, "probe step differs from the required guard and command")
+        forbidden = r"(?:CARGO_BUILD_JOBS|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_PROFILE_\w*)"
+        for scope, owner in (("workflow", self.docs[workflow]), ("job", job), ("probe", steps[index])):
+            for key in (owner.get("env") or {}):
+                if re.fullmatch(forbidden, str(key)):
+                    self.report(workflow, rule, f"{scope} env: {key} must be unset")
+        for earlier, step in enumerate(steps[:index]):
+            for line in self.normalized(self.run_text(step)):
+                if re.search(r"\$(?:GITHUB_ENV\b|\{GITHUB_ENV\}|env:GITHUB_ENV\b)", line):
+                    for key in re.findall(r"\b(" + forbidden + r")(?==|<<)", line):
+                        self.report(workflow, rule, f"step {earlier + 1} writes {key} to GITHUB_ENV before probes")
+        if "continue-on-error" in job:
+            self.report(workflow, rule, "probe job must not suppress failures")
+
     def check_shared_build(self):
         for workflow in ("release.yml", "release-rehearsal.yml"):
             job = self.job(workflow, "build") or {}
@@ -2544,6 +2591,7 @@ class Checker:
 
     def check_release_checks(self):
         self.check_shared_build()
+        self.check_rehearsal_security_probes()
         self.check_release_gates()
         self.check_unconditional()
         self.check_verification_credentials()

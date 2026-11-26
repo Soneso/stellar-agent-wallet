@@ -9,6 +9,11 @@ dispatch.
 
 ## Cut a release tag
 
+The release rehearsal runs the optimized Wasm identity and deployment security
+probes after building the Linux x86_64 binaries. A failed probe fails that job.
+See [What the workflow proves](building.md#what-the-workflow-proves)
+for the local reproduction command.
+
 1. Prepare the release in a pull request to `main`.
    Bump the workspace version, every internal dependency pin, and documentation
    pins as [Building and testing](building.md) describes.
@@ -207,6 +212,8 @@ secret, and no expression that reads the workflow token. Both build jobs must
 call the shared build, Perl, and libsodium scripts under `.github/scripts/release/`.
 The build immediately follows the environment setup, and its first action
 checks compiler overrides and cargo configuration files.
+The rehearsal then runs the optimized Wasm identity and deployment security
+probes on the x86_64 Linux leg. A failed probe fails that build job.
 
 Each release verification step must run its check as an unconditional
 command: the archive check, the provenance content, signature, and source
@@ -463,6 +470,10 @@ with the release's setup steps and its build command. The version is the
 target as the release does and uploads each as the artifact
 `rehearsal-<target>`, kept for 7 days. The macOS archives are unsigned and not
 notarized, and the run hashes, attests, and publishes nothing.
+After building the x86_64 Linux binaries, the rehearsal runs the optimized
+Wasm identity and deployment security probes. A failed probe fails the job.
+The [local reproduction command](building.md#what-the-workflow-proves)
+runs these probes with `cargo test --release`.
 
 The workflow holds no credential: its token reads the repository contents and
 nothing else. The release and rehearsal restore and save no cache, so both

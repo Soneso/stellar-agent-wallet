@@ -13,6 +13,7 @@ A documentation path is one of:
 - ``*.md`` at the repository root
 - ``changelog.d/*.md``
 - ``skills/stellar-agent-wallet/**/*.md``
+- exactly ``.github/PULL_REQUEST_TEMPLATE.md``
 
 The result is true only for a pull request or unforced push into next
 whose changed files are all documentation paths. Every other case prints
@@ -25,7 +26,7 @@ import os
 import sys
 
 from changed_paths import collect
-from docs_paths import is_documentation
+from docs_paths import is_docs_only_path
 
 
 def classify(environ):
@@ -33,7 +34,7 @@ def classify(environ):
     files, reason = collect(environ)
     if files is None:
         return False, reason
-    others = [path for path in files if not is_documentation(path)]
+    others = [path for path in files if not is_docs_only_path(path)]
     if others:
         return False, f"{len(others)} of {len(files)} changed files are not documentation, first {others[0]}"
     return True, f"all {len(files)} changed files are documentation"

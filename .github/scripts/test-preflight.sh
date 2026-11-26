@@ -6,8 +6,8 @@
 # sources, and the cap85-beacon record of the smart-account crate. It also
 # holds .github, scripts/deploy, CHANGELOG.md, CONTRIBUTING.md, the building
 # guide, and the skill.
-# Each case copies that repository, changes it on a branch, and runs
-# preflight.sh against main, or against the default base in the base cases.
+# Each case copies that repository onto a branch. Scoped cases use main;
+# base cases use the default base, and quick cases resolve no base.
 #
 # Planning cases compare the whole --list output with the expected gates. The
 # package cases pin the clippy, rustdoc, and test packages, and check them
@@ -66,10 +66,15 @@ exit-aggregation table bad-base missing-next-upstream-hint malformed-manifest un
 the-preflight-itself registry-completeness
 drift drift-new-step drift-unnamed-step drift-removed-step drift-renamed-step
 install-hint coverage-suppression coverage-unavailable coverage-written coverage-off-only-fails coverage-on-only-fails
-release-shape-libudev"
+release-shape-libudev remote-web remote-web-deleted remote-non-web
+build-path build-workspace build-renamed target-build-path target-build-workspace target-build-renamed
+quick-clean quick-dirty quick-list quick-full-conflict quick-base-conflict quick-base-main-conflict quick-full-first-conflict
+feature-discipline-success feature-discipline-failure"
 
 ALWAYS=(docs-style install-surface gate-tool-versions docs-reads)
 RUST=(fmt clippy rustdoc)
+QUICK=(docs-style install-surface docs-reads changelog feature-discipline fmt clippy rustdoc
+  feature-on:clippy feature-on:doc)
 # The scripts that preflight.sh executes by path; an execution case replaces
 # them with logging stubs.
 DIRECT_SCRIPTS=(package-skill.sh publish-crates.sh test-mpp-interop.sh test-publish-crates-check.sh
@@ -88,7 +93,7 @@ docs-reads	python3 .github/scripts/check-docs-reads.py
 changelog	python3 .github/scripts/changelog.py check
 self-test:test-changelog.py	python3 .github/scripts/test-changelog.py
 actionlint	actionlint
-feature-discipline	cargo fetch --locked && python3 .github/scripts/check-feature-discipline.py
+feature-discipline	python3 .github/scripts/check-feature-discipline.py
 self-test:test-check-feature-discipline.py	python3 .github/scripts/test-check-feature-discipline.py --mutations
 self-test:test-check-binary-marker.sh	bash .github/scripts/test-check-binary-marker.sh
 self-test:test-release-checks.sh	bash .github/scripts/test-release-checks.sh
@@ -162,7 +167,7 @@ ci.yml	feature-on-clippy	Install libudev (Linux hidapi)	installs Linux system he
 ci.yml	feature-on-doc	Install libudev (Linux hidapi)	installs Linux system headers on the runner
 ci.yml	feature-on-test	Free disk space	reclaims runner disk space
 ci.yml	feature-on-test	Install libudev (Linux hidapi)	installs Linux system headers on the runner
-ci.yml	feature-discipline	Fetch the locked graph	preflight includes fetch in the discipline row
+ci.yml	feature-discipline	Fetch the locked graph	CI prepares the cache; local preflight uses cached locked dependencies
 changelog.yml	changelog	Fetch main for changelog protection	CI supplies the remote ancestry
 changelog.yml	changelog	Protect integration changelog	CI checks the pull request event SHAs
 ci.yml	release-shape	Install libudev (Linux hidapi)	the row requires libudev instead of installing it
@@ -181,7 +186,7 @@ coverage.yml	coverage	Check both measurements	reads the results of the two measu
 coverage.yml	coverage	Reject a cancelled run before the floors	fails a cancelled CI run
 coverage.yml	coverage	Reject a cancelled run after the floors	fails a cancelled CI run
 install-surface.yml	install-surface	Self-test Python checks on Python 3.11	repeats the Python self-tests on a second interpreter
-install-surface.yml	install-surface	Select self-tests	CI event selection; local preflight retains its self-tests
+install-surface.yml	install-surface	Select self-tests	CI event selection; local preflight retains its self-tests outside --quick
 install-surface.yml	install-surface	Install actionlint	installs a gate tool on the runner
 vendored-wasm.yml	check	Decide whether the change needs a rebuild	decides whether the CI rebuild jobs run
 EOF
@@ -283,9 +288,10 @@ PY
 # Sets the paths of case $1: CASE_DIR, the fixture copy; STATE, the call log
 # and status file of its shims; BIN, its controlled PATH directory.
 set_case_paths() {
-  CASE_DIR="$TMP/cases/$1"
-  STATE="$TMP/cases/$1.state"
-  BIN="$TMP/cases/$1.bin"
+  local root=${MUTATION_CASE_ROOT:-$TMP/cases}
+  CASE_DIR="$root/$1"
+  STATE="$root/$1.state"
+  BIN="$root/$1.bin"
 }
 
 # Copies fixture $1 to the case directory and enters it.
@@ -340,6 +346,8 @@ expect_list() {
   fi
   local extra=() argument
   case "$CASE_NAME" in
+    build-path | build-workspace | build-renamed | target-build-path | target-build-workspace | target-build-renamed)
+      extra+=(feature-discipline self-test:test-check-feature-discipline.py) ;;
     deleted-install-surface-doc | welcome-workflow | release-workflow | release-rehearsal-workflow | vendored-wasm-workflow | triage-workflow | triage-review-workflow | triage-sweep-workflow | ci-yml-only | python-check-script | run-evidence-script | proof-matrix-only | shell-check-script | one-crate | sep43-through-mcp | two-owners | target-specific-edge | dev-dependency-edge | optional-dependency-edge | root-manifest | lockfile | wallet-manifest | removed-member | untracked-test-file | crate-sources-select-proof-matrix | staged-rename-record | spaces-and-an-apostrophe | action-script | invariants-helper | release-build-scripts | duplicate-triggers | changed-self-test | deleted-shell-script | deleted-self-test | the-preflight-itself)
       extra+=(feature-discipline self-test:test-check-feature-discipline.py)
       ;;
@@ -388,9 +396,9 @@ for directory in workspace["members"]:
 
 
 def uses(directory, manifest):
-    tables = [manifest.get("dependencies", {}), manifest.get("dev-dependencies", {})]
+    tables = [manifest.get(kind, {}) for kind in ("dependencies", "dev-dependencies", "build-dependencies")]
     for target in manifest.get("target", {}).values():
-        tables += [target.get("dependencies", {}), target.get("dev-dependencies", {})]
+        tables += [target.get(kind, {}) for kind in ("dependencies", "dev-dependencies", "build-dependencies")]
     found = set()
     for table in tables:
         for key, spec in table.items():
@@ -501,7 +509,7 @@ registry_scripts() {
 write_shim() {
   local file=$1 name=$2 kind=$3 gates=""
   case "$kind" in
-    python) gates=$(registry_scripts python3; echo .github/scripts/check-feature-discipline.py) ;;
+    python) gates=$(registry_scripts python3) ;;
     bash) gates=$(registry_scripts bash) ;;
   esac
   {
@@ -633,8 +641,12 @@ start_run_case() {
 # Runs preflight.sh in the case directory on the controlled PATH. The
 # combined output goes to $CASE_DIR.out and the exit code to RUN_RC.
 run_preflight() {
+  local base=(--base main)
+  if [ "${1:-}" = --quick ]; then
+    base=()
+  fi
   RUN_RC=0
-  PATH="$BIN" "$REAL_BASH" "$SCRIPT_REL" --base main "$@" >"$CASE_DIR.out" 2>&1 || RUN_RC=$?
+  PATH="$BIN" "$REAL_BASH" "$SCRIPT_REL" ${base[@]+"${base[@]}"} "$@" >"$CASE_DIR.out" 2>&1 || RUN_RC=$?
 }
 
 # A call record is the JSON array of a call's name and arguments, on one
@@ -735,7 +747,6 @@ assert_clean_calls() {
         fi
         printf '%s\n' "$command"
       done <<<"$EXPECTED_REGISTRY"
-      printf '%s\n' "cargo fetch --locked" "python3 .github/scripts/check-feature-discipline.py"
       printf '%s\n' "cargo llvm-cov --version" "cargo machete --version" "cargo deny --version"
     } | command_records
     if [ "$#" -gt 0 ]; then
@@ -1321,6 +1332,161 @@ case_bridge_web() {
   expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on inbox-js
 }
 
+# Remote web paths select the inbox row once, alongside their Rust gates.
+remote_web_case() {
+  local path=$1 inbox=()
+  start_case
+  mkdir -p "$(dirname "$path")"
+  edit "$path"
+  if [ "$CASE_NAME" = remote-web-deleted ]; then
+    git add "$path"
+    git commit -q -m "web fixture"
+    git branch -f main HEAD
+    python3 - "$path" <<'PY'
+import pathlib, sys
+pathlib.Path(sys.argv[1]).unlink()
+PY
+    assert_changed "$path"
+  elif [ "$CASE_NAME" = remote-web ]; then
+    edit "$path.other.js"
+  fi
+  if [ "$CASE_NAME" != remote-non-web ]; then
+    inbox=(inbox-js)
+  fi
+  pin_packages "stellar-agent-approval-remote stellar-agent-cli" test-helpers "$path"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on ${inbox[@]+"${inbox[@]}"}
+}
+
+case_remote_web() { remote_web_case crates/stellar-agent-approval-remote/src/web/signed-login.js; }
+case_remote_web_deleted() { remote_web_case crates/stellar-agent-approval-remote/src/web/signed-login.js; }
+case_remote_non_web() { remote_web_case crates/stellar-agent-approval-remote/src/web-neighbor/helper.js; }
+
+# Build-only edges isolate each table and inheritance form. Two direct
+# dependents pin sorting; a repeated edge pins deduplication. The fourth
+# member depends only on a dependent and must stay out of the package list.
+# Renamed edges give each dependent one lookup form, so each lookup is required.
+build_edge_case() {
+  start_case
+  python3 - "$CASE_NAME" <<'PY'
+import pathlib, sys
+mode = sys.argv[1]
+names = ("probe-owner", "z-direct", "b-direct", "transitive-only")
+members = [f"crates/{name}" for name in names]
+root = '[workspace]\nmembers = ' + repr(members).replace("'", '"') + '\n'
+root += '[workspace.dependencies]\nprobe-owner = { path = "crates/probe-owner" }\n'
+root += 'alias = { package = "probe-owner", path = "crates/probe-owner" }\n'
+pathlib.Path("Cargo.toml").write_text(root)
+table = 'target.\'cfg(unix)\'.build-dependencies' if mode.startswith("target-") else "build-dependencies"
+if mode.endswith("workspace"):
+    edge = 'probe-owner = { workspace = true }\n'
+elif mode.endswith("renamed"):
+    edge = 'alias = { workspace = true }\n'
+else:
+    edge = 'probe-owner = { path = "../probe-owner" }\n'
+for name, member in zip(names, members):
+    directory = pathlib.Path(member)
+    (directory / "src").mkdir(parents=True)
+    (directory / "src/lib.rs").write_text("")
+    manifest = f'[package]\nname = "{name}"\nversion = "0.0.0"\n'
+    if name in ("z-direct", "b-direct"):
+        if mode.endswith("renamed") and name == "z-direct":
+            direct = 'other = { package = "probe-owner", path = "../probe-owner" }\n'
+            direct += 'other2 = { package = "probe-owner", path = "../probe-owner" }\n'
+            manifest += f'[{table}]\n' + direct
+        else:
+            manifest += f'[{table}]\n' + edge
+    elif name == "transitive-only":
+        manifest += '[build-dependencies]\nz-direct = { path = "../z-direct" }\n'
+    (directory / "Cargo.toml").write_text(manifest)
+PY
+  git add -A
+  git commit -q -m "build-only fixture"
+  git branch -f main HEAD
+  edit crates/probe-owner/src/lib.rs
+  pin_packages "probe-owner b-direct z-direct" "" crates/probe-owner/src/lib.rs
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" proof-matrix proof-matrix:feature-on
+}
+
+case_build_path() { build_edge_case; }
+case_build_workspace() { build_edge_case; }
+case_build_renamed() { build_edge_case; }
+case_target_build_path() { build_edge_case; }
+case_target_build_workspace() { build_edge_case; }
+case_target_build_renamed() { build_edge_case; }
+
+# The fixture has no next ref. Quick mode needs neither that ref nor a diff.
+expect_quick_list() {
+  local rc=0
+  expected_rows "${QUICK[@]}" >"$CASE_DIR.expected"
+  "$REAL_BASH" "$SCRIPT_REL" --quick --list >"$CASE_DIR.actual" 2>"$CASE_DIR.stderr" || rc=$?
+  if [ "$rc" -ne 0 ] || [ -s "$CASE_DIR.stderr" ]; then
+    cat "$CASE_DIR.stderr" >&2
+    fail "quick list exited $rc"
+  fi
+  diff -u "$CASE_DIR.expected" "$CASE_DIR.actual" || fail "quick rows differ"
+}
+
+case_quick_clean() {
+  start_case
+  expect_quick_list
+}
+
+case_quick_dirty() {
+  start_case
+  edit crates/stellar-agent-sep7/src/lib.rs .github/scripts/preflight.sh CONTRIBUTING.md
+  expect_quick_list
+}
+
+case_quick_list() {
+  start_run_case
+  run_preflight --quick --list
+  [ "$RUN_RC" -eq 0 ] || fail "quick list exited $RUN_RC"
+  expected_rows "${QUICK[@]}" >"$CASE_DIR.expected"
+  diff -u "$CASE_DIR.expected" "$CASE_DIR.out" || fail "quick rows differ"
+  record_gate_calls
+  [ ! -s "$CASE_DIR.calls" ] || fail "quick list ran gates"
+  assert_clean_calls
+}
+
+quick_conflict() {
+  local rc=0
+  start_run_case
+  PATH="$BIN" "$REAL_BASH" "$SCRIPT_REL" "$@" >"$CASE_DIR.out" 2>&1 || rc=$?
+  if [ "$rc" -ne 2 ] || ! grep -q '^usage: preflight.sh .*--quick' "$CASE_DIR.out"; then
+    fail "quick conflict did not print usage and exit 2"
+  fi
+}
+
+case_quick_full_conflict() { quick_conflict --quick --full; }
+case_quick_base_conflict() { quick_conflict --base "" --quick; }
+case_quick_base_main_conflict() { quick_conflict --quick --base main; }
+case_quick_full_first_conflict() { quick_conflict --full --quick; }
+
+# A failing fetch shim proves the checker runs independently of preparation.
+# Exact calls pin all ten workspace commands and the absence of a fetch.
+feature_discipline_run() {
+  local status=$1 id command commands=()
+  start_run_case
+  write_shim "$BIN/cargo" cargo cargo
+  printf '%s\n' 'cargo fetch=93' ".github/scripts/check-feature-discipline.py=$status" >>"$STATE/status"
+  run_preflight --quick
+  expect_line "- \`python3 .github/scripts/check-feature-discipline.py\`: exit $status"
+  if [ "$status" -eq 0 ]; then
+    expect_end 0 "preflight: 10 gates run, 0 failed, 0 unavailable"
+  else
+    expect_end 1 "preflight: 10 gates run, 1 failed, 0 unavailable"
+  fi
+  for id in "${QUICK[@]}"; do
+    command=$(registry_row "$id" | cut -f 2)
+    commands+=("${command#"$RUSTDOC_PREFIX"}")
+  done
+  expect_calls "${commands[@]}"
+  assert_clean_calls
+}
+
+case_feature_discipline_success() { feature_discipline_run 0; }
+case_feature_discipline_failure() { feature_discipline_run 7; }
+
 # The MCP manifest inherits stellar-agent-sep7 from [workspace.dependencies].
 case_one_crate() {
   start_case
@@ -1763,7 +1929,7 @@ case_table() {
       "- \`bash .github/scripts/check-gate-tool-versions.sh\`: exit 0" \
       "- \`python3 .github/scripts/check-docs-reads.py\`: exit 0" \
       "- \`actionlint\`: exit 3" \
-      "- \`cargo fetch --locked && python3 .github/scripts/check-feature-discipline.py\`: unavailable (cargo: install Rust with rustup from https://rustup.rs)" \
+      "- \`python3 .github/scripts/check-feature-discipline.py\`: unavailable (cargo: install Rust with rustup from https://rustup.rs)" \
       "- \`python3 .github/scripts/test-check-feature-discipline.py --mutations\`: unavailable (cargo: install Rust with rustup from https://rustup.rs)" \
       "- \`python3 .github/scripts/check-workflow-invariants.py\`: exit 0" \
       "- \`python3 .github/scripts/test-check-docs-style.py\`: exit 0" \
@@ -2110,6 +2276,8 @@ case_coverage_on_only_fails() {
 }
 
 MUTATION_CONTROLS="changelog-fragments changelog-workflow changelog-registry rename-source untracked-paths dev-dependencies target-dependencies unique-gates failed-gate unavailable-gate fresh-coverage next-before-main-base local-next-base missing-next-upstream-hint publish-evidence-workflow publish-evidence-provenance publish-evidence-sums publish-evidence-fixture publish-evidence-jq"
+MUTATION_CONTROLS+=" remote-web remote-web-deleted remote-non-web build-path build-workspace build-renamed target-build-path target-build-workspace target-build-renamed quick-selection quick-return quick-order quick-base quick-changed quick-full-conflict quick-base-conflict feature-discipline-fetch"
+MUTATION_CONTROLS+=" build-renamed-direct build-renamed-inherited target-build-renamed-direct target-build-renamed-inherited quick-stderr quick-base-main-conflict quick-full-first-conflict"
 
 # Prints the existing case that pins mutation control $1, then the message of
 # the assertion that must end the case log on the mutant.
@@ -2118,6 +2286,19 @@ mutation_case() {
   local end="the run exited 0, expected 1 with the last line 'preflight:" floors
   local end1="the run exited 1, expected 1 with the last line 'preflight:"
   case "$1" in
+    remote-web | remote-web-deleted | remote-non-web | build-path | build-workspace | build-renamed | target-build-path | target-build-workspace | target-build-renamed)
+      echo "$1 $differs" ;;
+    build-renamed-direct | build-renamed-inherited) echo "build-renamed $differs" ;;
+    target-build-renamed-direct | target-build-renamed-inherited) echo "target-build-renamed $differs" ;;
+    quick-selection | quick-return) echo "quick-dirty quick rows differ" ;;
+    quick-stderr) echo "quick-clean quick list exited 0" ;;
+    quick-order) echo "quick-clean quick rows differ" ;;
+    quick-base | quick-changed) echo "quick-clean quick list exited 2" ;;
+    quick-full-conflict | quick-base-conflict | quick-base-main-conflict | quick-full-first-conflict)
+      echo "$1 quick conflict did not print usage and exit 2" ;;
+    feature-discipline-fetch)
+      # shellcheck disable=SC2016 # The backticks are literal table characters.
+      echo 'feature-discipline-success the run printed no line '\''- `python3 .github/scripts/check-feature-discipline.py`: exit 0'\''' ;;
     next-before-main-base) echo "next-before-main-base the default base is upstream/main, expected upstream/next" ;;
     local-next-base) echo "local-next-base the default base is main, expected next" ;;
     missing-next-upstream-hint) echo "missing-next-upstream-hint a missing default base with upstream exited 2" ;;
@@ -2147,6 +2328,43 @@ mutation_case() {
 apply_mutation() {
   local file=$2
   case "$1" in
+    remote-web | remote-web-deleted)
+      replace_line "$file" '    crates/stellar-agent-webauthn-bridge/src/web/* | crates/stellar-agent-approval-remote/src/web/*)' \
+        '    crates/stellar-agent-webauthn-bridge/src/web/*)' ;;
+    remote-non-web)
+      replace_line "$file" '    crates/stellar-agent-webauthn-bridge/src/web/* | crates/stellar-agent-approval-remote/src/web/*)' \
+        '    crates/stellar-agent-webauthn-bridge/src/web/* | crates/stellar-agent-approval-remote/src/*)' ;;
+    build-path | build-workspace | build-renamed)
+      replace_line "$file" '    yield manifest.get("build-dependencies", {})' ;;
+    target-build-path | target-build-workspace | target-build-renamed)
+      replace_line "$file" '        yield platform.get("build-dependencies", {})' ;;
+    build-renamed-direct | target-build-renamed-direct)
+      replace_line "$file" '        return names.get(posixpath.normpath(posixpath.join(member, entry["path"])))' \
+        '        return None' ;;
+    build-renamed-inherited | target-build-renamed-inherited)
+      replace_line "$file" '        return names.get(posixpath.normpath(inherited["path"]))' \
+        '        return None' ;;
+    quick-selection)
+      replace_line "$file" '  if [ "$quick" -eq 1 ]; then' '  BASE=main; collect_changed_set; if false; then' ;;
+    quick-return)
+      replace_line "$file" '    return' '    BASE=main; collect_changed_set' ;;
+    quick-stderr)
+      replace_line "$file" '  load_registry' '  echo "quick stderr mutation" >&2; load_registry' ;;
+    quick-order)
+      replace_line "$file" '    SELECTED_POSITIONS=$(printf '\''%s'\'' "$SELECTED" | sort -nu)' \
+        '    SELECTED_POSITIONS=$(printf '\''%s'\'' "$SELECTED" | sort -rnu)' ;;
+    quick-base)
+      replace_line "$file" '  load_registry' '  resolve_base; load_registry' ;;
+    quick-changed)
+      replace_line "$file" '  load_registry' '  collect_changed_set; load_registry' ;;
+    quick-full-conflict | quick-full-first-conflict)
+      replace_line "$file" '  if [ "$quick" -eq 1 ] && { [ "$full" -eq 1 ] || [ "$base_given" -eq 1 ]; }; then' \
+        '  if [ "$quick" -eq 1 ] && [ "$base_given" -eq 1 ]; then' ;;
+    quick-base-conflict | quick-base-main-conflict)
+      replace_line "$file" '        base_given=1' '        base_given=0' ;;
+    feature-discipline-fetch)
+      replace_line "$file" $'feature-discipline\tpython3 .github/scripts/check-feature-discipline.py\tcargo,yaml\tci.yml\tfeature-discipline\tCheck feature discipline and assertions' \
+        $'feature-discipline\tcargo fetch --locked && python3 .github/scripts/check-feature-discipline.py\tcargo,yaml\tci.yml\tfeature-discipline\tCheck feature discipline and assertions' ;;
     next-before-main-base)
       replace_line "$file" '      BASE=upstream/next' '      BASE=upstream/main' ;;
     local-next-base)
@@ -2187,7 +2405,8 @@ apply_mutation() {
     target-dependencies)
       replace_line "$file" '    for platform in manifest.get("target", {}).values():'
       replace_line "$file" '        yield platform.get("dependencies", {})'
-      replace_line "$file" '        yield platform.get("dev-dependencies", {})' ;;
+      replace_line "$file" '        yield platform.get("dev-dependencies", {})'
+      replace_line "$file" '        yield platform.get("build-dependencies", {})' ;;
     unique-gates)
       replace_line "$file" '  SELECTED_POSITIONS=$(printf '"'"'%s'"'"' "$SELECTED" | sort -n | uniq)' \
         '  SELECTED_POSITIONS=$(printf '"'"'%s'"'"' "$SELECTED" | sort -n)' ;;
@@ -2229,7 +2448,11 @@ check_mutant_calls() {
   local floors
   set_case_paths "$1"
   if [ -d "$STATE" ]; then
-    assert_clean_calls
+    if [ "$2" = feature-discipline-fetch ]; then
+      assert_clean_calls "$(argv_record cargo fetch --locked)"
+    else
+      assert_clean_calls
+    fi
   fi
   if [ "$2" = fresh-coverage ]; then
     record_gate_calls
@@ -2242,7 +2465,7 @@ check_mutant_calls() {
 # fixture. On a fresh fixture that carries the mutation, it ends with the
 # control's assertion message. An execution case also leaves a clean call log.
 run_mutations() {
-  local control name message log passed=0 total=0 failures=""
+  local control name message log passed=0 total=0 failures="" MUTATION_CASE_ROOT
   mkdir -p "$TMP/cases" "$TMP/logs" "$TMP/xdg"
   build_fixture "$TMP/fixture"
   assert_fixture_complete "$TMP/fixture"
@@ -2251,13 +2474,15 @@ run_mutations() {
     read -r name message <<<"$(mutation_case "$control")"
     log="$TMP/logs/$control"
     FIXTURE="$TMP/fixture"
+    MUTATION_CASE_ROOT="$TMP/cases/$control/clean"
+    mkdir -p "$MUTATION_CASE_ROOT"
     run_logged "$log.clean.log" run_case "$name"
     if [ "$STEP_RC" -ne 0 ]; then
       failures="$failures $control"
       continue
     fi
-    rm -rf "$TMP/cases"
-    mkdir -p "$TMP/cases"
+    MUTATION_CASE_ROOT="$TMP/cases/$control/mutant"
+    mkdir -p "$MUTATION_CASE_ROOT"
     FIXTURE="$TMP/mutant-$control"
     run_logged "$log.fixture.log" build_fixture "$FIXTURE" "$control"
     if [ "$STEP_RC" -ne 0 ]; then
