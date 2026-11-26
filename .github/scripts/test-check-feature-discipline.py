@@ -106,7 +106,8 @@ LIVE = {}
 def load(path):
     spec = importlib.util.spec_from_file_location('feature_discipline', path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Mutation and control loads use current source even when cached timestamps match.
+    exec(compile(path.read_bytes(), str(path), 'exec'), module.__dict__)
     return module
 
 
@@ -515,6 +516,69 @@ for _family, _edges in {'build': 'normal,build', 'check': 'normal,build',
                         'test': 'normal,build,dev', 'clippy': 'normal,build,dev',
                         'doc': 'normal,build,dev', 'llvm-cov': 'normal,build,dev'}.items():
     UNITS['translation-' + _family] = translation_case(_family, _edges)
+
+
+@unit('translation-nextest')
+def translation_nextest(m, tmp, checker):
+    for mode, flags in (('list', '--message-format json'), ('run', '--profile ci')):
+        for shard in (1, 2, 3):
+            try:
+                row = m.translate(f'cargo nextest {mode} --workspace --features mainnet-write --partition count:{shard}/3 {flags}')
+            except ValueError as error:
+                raise AssertionError(f'nextest translation: {error}') from error
+            assert row == {'selection': ['--workspace'], 'features': ['--features', 'mainnet-write'],
+                           'edges': 'normal,build,dev', 'target': None, 'bins': None}, 'nextest translation'
+    try:
+        row = m.translate("cargo nextest run --workspace --partition=count:2/3 --profile=ci")
+    except ValueError as error:
+        raise AssertionError(f"nextest equal flags: {error}") from error
+    assert row["edges"] == "normal,build,dev", "nextest equal flags"
+    for suffix in ('', 'bench', 'run --unknown', 'run --partition', 'run --partition count:4/3',
+                   'run --profile dev', 'list --message-format xml', 'list --profile ci',
+                   'run --message-format json', 'run -- --ignored', 'run --release',
+                   'run --partition count:1/3junk'):
+        try:
+            m.translate('cargo nextest ' + suffix)
+        except ValueError:
+            continue
+        except Exception as error:
+            raise AssertionError(f'nextest rejection: {suffix}: {error}') from error
+        raise AssertionError('accepted nextest ' + suffix)
+
+
+@unit('translation-nextest-scope')
+def translation_nextest_scope(m, tmp, checker):
+    assert m.translate('cargo test --workspace --message-format json')['edges'] == 'normal,build,dev'
+    for command in ('cargo test --profile ci', 'cargo test --partition count:1/3'):
+        try:
+            m.translate(command)
+        except ValueError:
+            continue
+        raise AssertionError('nextest flag leaked into ' + command)
+
+
+@unit('nextest-job-allowlist')
+def nextest_job_allowlist(m, tmp, checker):
+    for job in ('feature-on-test', 'feature-on-test-shadow', 'feature-on-test-extra',
+                'feature-on-test-compare', 'feature-on-test-other'):
+        instance = object.__new__(m.Checker)
+        instance.root, instance.errors, instance.scripts = tmp, [], {}
+        instance.workflows = {'ci.yml': {'jobs': {job: {'steps': [
+            {'run': 'cargo nextest run --workspace --features mainnet-write --partition count:1/3 --profile ci'}]}}}}
+        instance.D9()
+        assert bool(instance.errors) == (job in ('feature-on-test-compare', 'feature-on-test-other')), job
+
+
+@unit('nextest-inventory')
+def nextest_inventory(m, tmp, checker):
+    workflows, scripts = m.workflow_inputs(ROOT)
+    actual = m.inventory(ROOT, workflows, scripts)
+    from collections import Counter
+    encode = lambda rows: Counter(json.dumps(row, sort_keys=True) for row in rows)
+    assert encode(actual) == encode(m.INVOCATIONS), 'reviewed inventory differs'
+    rows = [row for row in actual if row['job'] == 'feature-on-test']
+    assert len(rows) == 6, 'three list/run partitions'
+    assert {row['edges'] for row in rows} == {'normal,build,dev'}, 'nextest dev dependencies'
 
 
 @unit('translation-doctests')
@@ -2258,6 +2322,81 @@ MUTATIONS.update({
     "fold-lexical-boundaries": ("d15_keeps_fixture_and_lexical_boundaries", "|dbus)\\b", "|unused_dbus)\\b", "D15 accepts storage escape: fn test() { dbus::Connection::new_session(); }"),
 })
 
+MUTATIONS.update({
+    'nextest-edges': ('translation-nextest',
+        "'nextest': 'normal,build,dev'",
+        "'nextest': 'normal,build'", 'nextest translation'),
+    'nextest-subcommand': ('translation-nextest',
+        "words[i] not in ('run', 'list')",
+        "words[i] not in ('run', 'list', 'bench')", 'accepted nextest bench'),
+    'nextest-separator': ('translation-nextest',
+        "if word == '--' and nextest_mode is None:",
+        "if word == '--':", 'accepted nextest run -- --ignored'),
+    'nextest-list-flags': ('translation-nextest',
+        "'--message-format' if nextest_mode == 'list' else '--profile'",
+        "'--message-format', '--profile'", 'accepted nextest list --profile ci'),
+    'nextest-profile': ('translation-nextest',
+        "value == ('ci' if flag == '--profile' else 'json')",
+        "value in ('ci', 'dev', 'json')", 'accepted nextest run --profile dev'),
+    'nextest-format': ('translation-nextest',
+        "else 'json'))",
+        "else 'xml'))", 'nextest translation'),
+    'nextest-partition': ('translation-nextest',
+        "r'count:[123]/3'",
+        "r'count:[1234]/3'", 'accepted nextest run --partition count:4/3'),
+    'nextest-validity': ('translation-nextest',
+        'if not valid:',
+        'if False:', 'accepted nextest run --partition count:4/3'),
+    'nextest-scope': ('translation-nextest-scope',
+        "if nextest_mode is not None and flag in ('--partition', '--profile', '--message-format'):",
+        "if flag in ('--partition', '--profile', '--message-format'):", 'nextest flag leaked into cargo test --profile ci'),
+    'nextest-shadow-job': ('nextest-job-allowlist',
+        "'feature-on-test-shadow', 'feature-on-test-extra')",
+        "'feature-on-test-extra',)", 'feature-on-test-shadow'),
+    'nextest-extra-job': ('nextest-job-allowlist',
+        "'feature-on-test-shadow', 'feature-on-test-extra')",
+        "'feature-on-test-shadow',)", 'feature-on-test-extra'),
+    'nextest-missing-mode': ('translation-nextest',
+        "if i == len(words) or words[i] not in ('run', 'list'):",
+        "if i == len(words):\n            return {}\n        if words[i] not in ('run', 'list'):", 'accepted nextest '),
+    'nextest-allowed': ('translation-nextest',
+        'if flag not in allowed:',
+        'if False:', 'accepted nextest list --profile ci'),
+    'nextest-missing-value': ('translation-nextest',
+        "if i == len(words):\n                    raise ValueError(f'missing value for {flag}')\n                value = words[i]\n            valid =",
+        "if False:\n                    raise ValueError(f'missing value for {flag}')\n                value = words[i]\n            valid =", 'nextest rejection: run --partition'),
+    'nextest-mode-advance': ('translation-nextest',
+        'nextest_mode = words[i]\n        i += 1',
+        'nextest_mode = words[i]\n        i += 0', 'nextest translation'),
+    'nextest-value-advance': ('translation-nextest',
+        '            i += 1\n            continue\n        if flag == ALL_FEATURES:',
+        '            i += 0\n            continue\n        if flag == ALL_FEATURES:', 'nextest translation'),
+    'nextest-equals': ('translation-nextest',
+        "if not equal:\n                i += 1\n                if i == len(words):\n                    raise ValueError(f'missing value for {flag}')\n                value = words[i]\n            valid =",
+        "if True:\n                i += 1\n                if i == len(words):\n                    raise ValueError(f'missing value for {flag}')\n                value = words[i]\n            valid =", 'nextest equal flags'),
+    'nextest-matrix': ('nextest-inventory',
+        "for cell in matrix['include']]",
+        "for cell in matrix['include'][:1]]", 'reviewed inventory differs'),
+    'nextest-family': ('translation-nextest',
+        "if family == 'nextest':",
+        'if False:', 'nextest translation'),
+    'nextest-option': ('translation-nextest',
+        "if nextest_mode is not None and flag in ('--partition', '--profile', '--message-format'):",
+        'if False:', 'nextest translation'),
+})
+
+MUTATIONS.update({
+    'nextest-partition-anchor': ('translation-nextest',
+        "re.fullmatch(r'count:[123]/3', value)",
+        "re.match(r'count:[123]/3', value)", 'accepted nextest run --partition count:1/3junk'),
+    'nextest-mode': ('translation-nextest',
+        'nextest_mode = words[i]',
+        "nextest_mode = 'run'", 'nextest translation'),
+    'nextest-job-scope': ('nextest-job-allowlist',
+        "'feature-on-test-shadow', 'feature-on-test-extra')",
+        "'feature-on-test-shadow', 'feature-on-test-extra', 'feature-on-test-compare')", 'feature-on-test-compare'),
+})
+
 def named_mutations(checker, directory, selected=None):
     source = checker.read_text()
     for name, (case, needle, replacement, diagnostic) in MUTATIONS.items():
@@ -2506,9 +2645,8 @@ def main():
         print(f'FAIL unknown case {args.case}', file=sys.stderr)
         return 2
     m = load(args.checker)
-    (ROOT / 'target/tmp').mkdir(parents=True, exist_ok=True)
     try:
-        with tempfile.TemporaryDirectory(dir=ROOT / 'target/tmp') as scratch:
+        with tempfile.TemporaryDirectory() as scratch:
             tmp = pathlib.Path(scratch)
             for name, case in UNITS.items():
                 if not args.case or args.case in (name, 'units'):

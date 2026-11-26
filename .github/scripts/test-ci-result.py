@@ -29,11 +29,16 @@ def dispatch_docs_only():
 
 
 def main():
+    pilot = {"feature-on-test-shadow", "feature-on-test-extra", "feature-on-test-compare"}
+    assert pilot <= module.EXPECTED_JOBS, "pilot jobs missing from aggregate"
     full = {job: {"result": "skipped" if job == "docs-tests" else "success"}
             for job in module.EXPECTED_JOBS}
     docs = {job: {"result": "success" if job in DOCS_REQUIRED else "skipped"}
             for job in module.EXPECTED_JOBS}
     cases = [("docs-only success", docs, "true", 0), ("full success", full, "false", 0)]
+    for job in sorted(pilot):
+        for result in ("failure", "cancelled", "skipped"):
+            cases.append((f"pilot {job} {result}", dict(full, **{job: {"result": result}}), "false", 1))
     for job in sorted(DOCS_REQUIRED):
         cases.append((f"docs required {job} skipped", dict(docs, **{job: {"result": "skipped"}}), "true", 1))
     for label, base, mode, job, result in [

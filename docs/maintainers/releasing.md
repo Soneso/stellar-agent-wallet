@@ -223,9 +223,10 @@ verification jobs hold no publishing or signing credential, their token has
 `contents: read`, and they download the run's artifacts and the registry
 dependencies. The archive checks run on a runner of each release target, and
 the rehearsal packages with the toolchain that `publish.yml` packages with.
-In `ci.yml`, `feature-discipline` runs unconditionally. The other feature jobs
-skip only a documentation-only pull request into `next`, where
-`docs-tests` runs instead. Each job runs its defining commands unconditionally.
+In `ci.yml`, `feature-discipline` runs unless cancelled. The other feature jobs
+also skip documentation-only pull requests and pushes into `next`, where
+`docs-tests` runs instead. Each job runs its defining commands unconditionally;
+pilot evidence uploads run under `always()`.
 
 The `release-cache` rule refuses cache actions in the release and rehearsal.
 Both build cold from locked sources. The `release-toolchain` rule requires
@@ -572,14 +573,19 @@ It holds no publishing credential.
 Package and install inventory rows use these marker checks as their evidence.
 They require no graph claim about registry sources.
 
-The checks that the ruleset of `main` requires include the five feature jobs
-of `ci.yml`: `feature-on-clippy`, `feature-on-test`, `feature-on-doc`,
-`feature-discipline`, and `release-shape`. The `coverage` required check
+The `ci-result` aggregate requires `feature-on-clippy`, `feature-on-doc`,
+`feature-discipline`, and `release-shape`, along with the feature-on pilot:
+`feature-on-test` shards, `feature-on-test-shadow`, `feature-on-test-extra`,
+and `feature-on-test-compare`. The `coverage` required check
 needs both coverage measurement jobs and enforces the floors of both feature
-configurations when measurement is required. Coverage measures automatically on
-eligible events for every pull request into `main` and code pull requests into
-`next`; the label also measures docs-only ones. The required `coverage` job runs
-on every eligible event and passes docs-only changes into `next` without
-measuring when no pull-request coverage label requires it.
+configurations when measurement is required.
+Opening, pushing to, or reopening a pull request evaluates coverage.
+Coverage measures every pull request into `main` and code pull request into
+`next`.
+The required `coverage` job runs on every triggered event.
+It passes docs-only changes into `next` without measuring unless the pull request
+carries the `coverage` label.
+The `coverage` label requires measurement on the next push or reopen.
+Editing or labeling a pull request starts no Coverage run.
 A red coverage push on `next` blocks integration through the coverage run on
 the pull request into `main`, which measures the tree it brings.

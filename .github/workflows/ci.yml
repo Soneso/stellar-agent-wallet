@@ -40,7 +40,7 @@ env:
 jobs:
   ci-result:
     name: ci-result (${{ github.base_ref || github.ref_name }})
-    needs: [changes, fmt, clippy, doc, test, feature-on-clippy, feature-on-doc, feature-on-test, docs-tests, feature-discipline, release-shape, inbox-js, mpp-interop, sdk-v17-interop, release-contracts, windows-storage, platform-keyring, deploy-scripts, machete, deny]
+    needs: [changes, fmt, clippy, doc, test, feature-on-clippy, feature-on-doc, feature-on-test, feature-on-test-shadow, feature-on-test-extra, feature-on-test-compare, docs-tests, feature-discipline, release-shape, inbox-js, mpp-interop, sdk-v17-interop, release-contracts, windows-storage, platform-keyring, deploy-scripts, machete, deny]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -251,7 +251,8 @@ jobs:
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.event_name == 'push' }}
+          shared-key: feature-on
+          save-if: false
       # The explicit feature list compile-checks the code behind
       # the testnet-acceptance features, without executing any test. The
       # workspace lints declared in the root Cargo.toml deny warnings; -D
@@ -278,12 +279,20 @@ jobs:
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.event_name == 'push' }}
+          shared-key: feature-on
+          save-if: false
       - name: Build the rustdoc
         run: cargo doc --workspace --no-deps --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE"
 
   feature-on-test:
-    name: feature-on-test
+    name: feature-on-test (${{ matrix.shard }}/3)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: 1
+          - shard: 2
+          - shard: 3
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
@@ -313,22 +322,139 @@ jobs:
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.event_name == 'push' }}
-      # Offline tier only. The enabled features expose the test-only helpers
-      # and fixtures the integration suites depend on; none of them pulls the
-      # live testnet client helpers. The testnet-acceptance and
-      # testnet-integration features stay off and the heavy submit flows are
-      # ignored tests, so no test reaches the network. The live tiers stay
-      # disabled.
+          shared-key: feature-on
+          save-if: ${{ github.event_name == 'push' && matrix.shard == 1 }}
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
+        with:
+          tool: cargo-nextest@0.9.152
+      - name: List the shard tests
+        run: cargo nextest list --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --partition count:${{ matrix.shard }}/3 --message-format json > partition.json
+      - name: Run the shard tests
+        run: cargo nextest run --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --partition count:${{ matrix.shard }}/3 --profile ci
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: feature-on-shard-${{ matrix.shard }}
+          overwrite: true
+          if-no-files-found: error
+          path: |
+            partition.json
+            target/nextest/ci/junit.xml
+
+  feature-on-test-shadow:
+    name: feature-on-test-shadow
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # Dropping test-profile debuginfo roughly halves target/ size and link
+    # time, keeping the build closure within the runner's free disk.
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The smart-account dependency closure (Arkworks, wasmi,
+      # soroban-env-host) plus every compiled test binary is large; reclaim
+      # space the build does not need.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.100.0"
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: feature-on
+          save-if: false
       - name: Run the offline tests
         run: cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry
+      - name: Capture test executables
+        run: cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --no-run --message-format json > cargo-tests.jsonl
+      - name: List the shadow tests
+        run: python3 .github/scripts/compare-test-runs.py --capture cargo-tests.jsonl shadow.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: feature-on-shadow
+          overwrite: true
+          if-no-files-found: error
+          path: |
+            cargo-tests.jsonl
+            shadow.json
+
+  feature-on-test-extra:
+    name: feature-on-test-extra
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # Dropping test-profile debuginfo roughly halves target/ size and link
+    # time, keeping the build closure within the runner's free disk.
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The smart-account dependency closure (Arkworks, wasmi,
+      # soroban-env-host) plus every compiled test binary is large; reclaim
+      # space the build does not need.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.100.0"
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: feature-on
+          save-if: false
+      - name: Run the feature-on doctests
+        run: cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --doc
       - name: Check network feature forwarding in isolation
         run: cargo check -p stellar-agent-network --features mainnet-write
       - name: Check the proof matrix
         run: python3 .github/scripts/check-proof-matrix.py --configuration feature-on --workspace
 
+  feature-on-test-compare:
+    name: feature-on-test-compare
+    needs: [changes, feature-on-test, feature-on-test-shadow]
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require successful producers
+        env:
+          SHARDS_RESULT: ${{ needs.feature-on-test.result }}
+          SHADOW_RESULT: ${{ needs.feature-on-test-shadow.result }}
+        run: test "$SHARDS_RESULT" = success && test "$SHADOW_RESULT" = success
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: feature-on-*
+          path: test-runs
+      - name: Compare the test runs
+        run: python3 .github/scripts/compare-test-runs.py test-runs
+
   # Runs on a docs-only pull request or push into next, where clippy,
-  # test, feature-on-clippy, feature-on-test, and windows-storage skip. It
+  # test, feature-on-clippy, feature-on-test, feature-on-test-shadow,
+  # feature-on-test-extra, feature-on-test-compare, and windows-storage skip. It
   # builds and runs the tests that .github/docs-tests.tsv lists, the tests
   # that read a documentation path, in both feature states of the test jobs.
   # cargo check --all-targets of each listed package fails on a renamed or
@@ -533,6 +659,9 @@ jobs:
       - name: Self-test the self-test classifier
         if: needs.changes.outputs.selftest_scripts != 'false'
         run: python3 .github/scripts/test-classify-self-tests.py
+      - name: Self-test the test-run comparison
+        if: needs.changes.outputs.selftest_scripts != 'false'
+        run: python3 .github/scripts/test-compare-test-runs.py
       - name: Self-test the CI result gate
         if: needs.changes.outputs.selftest_scripts != 'false'
         run: python3 .github/scripts/test-ci-result.py
@@ -647,25 +776,25 @@ jobs:
         run: cargo test -p stellar-agent-core -p stellar-agent-mpp -p stellar-agent-smart-account -p stellar-agent-mcp -p stellar-agent-headless-keyring -p stellar-agent-windows-identity -p stellar-agent-network --no-default-features --lib --no-run
       - name: Headless keyring and Windows identity suites
         shell: bash
-        run: "timeout 600 cargo test -p stellar-agent-headless-keyring -p stellar-agent-windows-identity --lib"
+        run: "timeout 600 cargo test -p stellar-agent-headless-keyring -p stellar-agent-windows-identity --no-default-features --lib"
       - name: DPAPI protect failure regression
         shell: bash
         run: |
           set -o pipefail
-          timeout 600 cargo test -p stellar-agent-network --lib keyring::tests::dpapi_protect_failure_reaches_wallet_error -- --exact 2>&1 | tee dpapi-regression.log
+          timeout 600 cargo test -p stellar-agent-network --no-default-features --lib keyring::tests::dpapi_protect_failure_reaches_wallet_error -- --exact 2>&1 | tee dpapi-regression.log
           grep -q 'test result: ok. 1 passed' dpapi-regression.log
       - name: Audit-log regression (stellar-agent-core)
         shell: bash
-        run: "timeout 600 cargo test -p stellar-agent-core --lib audit_log::"
+        run: "timeout 600 cargo test -p stellar-agent-core --no-default-features --lib audit_log::"
       - name: Approval + toolset-grant store persist regression (stellar-agent-core)
         shell: bash
-        run: "timeout 600 cargo test -p stellar-agent-core --lib -- approval::store::tests::persist approval::toolset_grant::tests::persist"
+        run: "timeout 600 cargo test -p stellar-agent-core --no-default-features --lib -- approval::store::tests::persist approval::toolset_grant::tests::persist"
       - name: MPP authorization-store regression
         shell: bash
-        run: "timeout 600 cargo test -p stellar-agent-mpp --lib store::tests::"
+        run: "timeout 600 cargo test -p stellar-agent-mpp --no-default-features --lib store::tests::"
       - name: Smart-account wire-code suite
         shell: bash
-        run: "timeout 600 cargo test -p stellar-agent-smart-account --lib"
+        run: "timeout 600 cargo test -p stellar-agent-smart-account --no-default-features --lib"
       - name: MCP rule-tool suite (audit path end-to-end)
         shell: bash
         run: "timeout 600 cargo test -p stellar-agent-mcp --no-default-features --lib -- tools::rules:: tools::rule_create::"

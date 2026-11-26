@@ -29,7 +29,7 @@ LABELS = [
     ("area: mpp", "fbca04", "Agent payments with MPP"),
     ("area: build", "bfd4f2", "Cargo profiles, test targets, and the build footprint"),
     ("security-sensitive", "b60205", "Signing, key handling, or serialized state; second review pass"),
-    ("coverage", "c5def5", "CI runs the coverage gate on this pull request"),
+    ("coverage", "c5def5", "Measure a docs-only next pull request on its next push or reopen"),
     ("waiting on author", "fef2c0", "The next step is the contributor's"),
     ("waiting on maintainer", "d4c5f9", "The next step is ours"),
     ("stale", "ededed", "Pull request waiting on its author, idle 14 days; closes after 21; drafts and issues exempt"),

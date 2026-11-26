@@ -83,21 +83,17 @@ The check fails when any of these holds:
   ``publish.yml`` job passes the script the dispatch commit (``GITHUB_SHA``).
 - ``coverage-trigger``: ``coverage.yml`` has no ``pull_request`` trigger, a
   ``paths`` or ``paths-ignore`` filter, no ``types`` list, or a list missing
-  an event in ``COVERAGE_EVENTS``, or includes ``unlabeled``.
-  The rule reports every missing event.
+  an event in ``COVERAGE_EVENTS``, or includes an extra or duplicate event.
+  The rule reports every missing event and rejects extra or duplicate types.
 - ``coverage-condition``: ``coverage.yml`` lacks a job of ``COVERAGE_PARTS``
   or the gate job ``coverage``. A part's ``if`` is not a string equal to
   ``COVERAGE_CONDITION``, or the gate's ``if`` is not a string equal to
   ``COVERAGE_GATE_CONDITION``, after the check strips the surrounding
-  whitespace and one enclosing ``${{ }}``. The gate runs on always() plus
-  canonical eligibility only. Its first step must be ``decision`` and pass
+  whitespace and one enclosing ``${{ }}``. The gate runs on always() only. Its first step must be ``decision`` and pass
   ``MEASURE`` the label and push docs-only clauses of the measuring jobs,
   with the same expression unwrapping. Every gate checkout, download and floor
   step must use the measured output guard, optionally enclosed in ``${{ }}``.
-- ``coverage-eligibility``: job conditions or concurrency do not use the canonical
-  event eligibility expression.
-- ``coverage-names``: a job lacks the ignored-event suffix, allowing an ineligible
-  event to replace a required check.
+- ``coverage-names``: a job name is not its required plain constant.
 - ``selftest-selection``: a self-test has an unknown group, the wrong condition,
   or a changed command inventory, or its CI job fails to run after changes fails.
 - ``selftest-checks``: a check or setup step can be skipped or allowed to fail.
@@ -135,6 +131,8 @@ The check fails when any of these holds:
   any ``*.yml`` or ``*.yaml`` workflow that ``pull_request`` or
   ``pull_request_target`` triggers lacks ``save-if`` equal to
   ``CACHE_SAVE_CONDITION`` after the check strips one enclosing ``${{ }}``, or boolean ``false``.
+  Only ci.yml's feature-on-test accepts the additional matrix.shard == 1 condition.
+  Feature-on clippy and rustdoc jobs must only restore the shared feature-on cache.
 - ``ci-result``: the aggregate lacks its base-specific name, complete dependencies,
   matching script job set, cancellation guard, always-run result check, or exact environment.
 - ``docs-classifier``: CI or coverage filters push paths, changes its classifier
@@ -283,7 +281,9 @@ runs the function.
   a workflow or local action installs another toolchain, or a release workflow
   does not use its matching ``RELEASE_TOOLCHAIN`` value. Toolchain overrides
   are forbidden except in ``vendored-wasm.yml`` and the release pin line.
-- ``ci-feature-jobs``: a job of ``CI_FEATURE_JOBS`` is missing, it or one of
+- ``ci-feature-jobs``: a pilot job differs from FEATURE_PILOT_JOBS, including
+  shard membership, setup, producer success guards, and always-run evidence uploads.
+  Or a job of ``CI_FEATURE_JOBS`` is missing, it or one of
   its steps has an unsupported condition or sets ``continue-on-error``, or
   it does not run each of its commands. The ``feature-discipline`` job needs
   changes, runs unless cancelled, and selects its self-tests by their inputs.
@@ -441,24 +441,20 @@ REUSABLE_NEEDS_ALLOWED = {
     ("release.yml", "provenance", "provenance-name"): "needs.preflight.outputs.version",
 }
 ANCESTRY_JOBS = {("release.yml", "preflight"), ("publish.yml", "verify"), ("publish.yml", "publish")}
-# Eligible events measure every main pull request and code changes into next.
-# Ignored labels and edits must not replace required checks or cancel measurements.
+# Opening, pushing to, or reopening a pull request evaluates coverage.
+# Editing or labeling a pull request starts no Coverage run.
 COVERAGE_WORKFLOW = "coverage.yml"
-COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled", "edited")
-COVERAGE_ELIGIBILITY = "github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)"
+COVERAGE_EVENTS = ("opened", "synchronize", "reopened")
 COVERAGE_LABEL = "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')"
 COVERAGE_DOCS_SKIP = ("github.event_name == 'push' && needs.changes.result == 'success' && "
                       "needs.changes.outputs.docs_only == 'true'")
-COVERAGE_CONDITION = f"!cancelled() && ({COVERAGE_ELIGIBILITY}) && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
-# The gate reports on every eligible event, including docs-only changes.
-COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_ELIGIBILITY})"
+COVERAGE_CONDITION = f"!cancelled() && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
+# The gate reports on every triggered event, including docs-only changes.
+COVERAGE_GATE_CONDITION = "always()"
 COVERAGE_MEASURE = "${{ (" + COVERAGE_LABEL + ") && !(" + COVERAGE_DOCS_SKIP + ") }}"
 COVERAGE_MEASURED = "steps.decision.outputs.measured == 'true'"
-COVERAGE_SUFFIX = "${{ !(" + COVERAGE_ELIGIBILITY + ") && ' (ignored event)' || '' }}"
 COVERAGE_NAMES = {"changes": "changes", "coverage-off": "coverage (feature-off)",
                   "coverage-on": "coverage (feature-on)", "coverage": "coverage"}
-COVERAGE_GROUP = ("${{ github.workflow }}-${{ github.event_name == 'pull_request' && ("
-                  + COVERAGE_ELIGIBILITY + ") && github.ref || github.run_id }}")
 COVERAGE_PARTS = ("coverage-off", "coverage-on")
 COVERAGE_GATE = "coverage"
 # Pushes to these branches seed the coverage caches, except docs-only pushes to next.
@@ -765,6 +761,7 @@ SELFTESTS = {
         "python3 .github/scripts/test-classify-docs-only.py": "scripts",
         "python3 .github/scripts/test-classify-self-tests.py": "scripts",
         "python3 .github/scripts/test-ci-result.py": "scripts",
+        "python3 .github/scripts/test-compare-test-runs.py": "scripts",
         "python3 .github/scripts/test-check-run-evidence.py --mutations": "scripts",
         "python3 .github/scripts/test-check-docs-reads.py": "scripts",
         "python3 .github/scripts/test-validate-unsigned-archive.py": "scripts",
@@ -784,6 +781,136 @@ SELFTESTS = {
     },
 }
 
+# Reviewed pilot jobs: names, setup, partitions, evidence and producer guards.
+FEATURE_PILOT_JOBS = {'feature-on-test': {'name': 'feature-on-test (${{ matrix.shard }}/3)',
+                     'strategy': {'fail-fast': False,
+                                  'matrix': {'include': [{'shard': 1}, {'shard': 2}, {'shard': 3}]}},
+                     'needs': 'changes',
+                     'if': "${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}",
+                     'runs-on': 'ubuntu-24.04',
+                     'timeout-minutes': 90,
+                     'env': {'CARGO_PROFILE_TEST_DEBUG': '0'},
+                     'steps': [{'uses': 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+                                'with': {'persist-credentials': False}},
+                               {'name': 'Free disk space',
+                                'run': 'sudo rm -rf /usr/share/dotnet\n'
+                                       'sudo rm -rf /usr/local/lib/android\n'
+                                       'sudo rm -rf /opt/ghc\n'
+                                       'sudo rm -rf /opt/hostedtoolcache/CodeQL\n'
+                                       'sudo docker image prune --all --force >/dev/null 2>&1 || true\n'},
+                               {'uses': 'dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8',
+                                'with': {'toolchain': '1.100.0'}},
+                               {'name': 'Install libudev (Linux hidapi)',
+                                'run': 'sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o '
+                                       'Acquire::Retries=3 install -y libudev-dev pkg-config'},
+                               {'uses': 'Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0',
+                                'with': {'shared-key': 'feature-on',
+                                         'save-if': "${{ github.event_name == 'push' && matrix.shard == 1 "
+                                                    '}}'}},
+                               {'uses': 'taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c',
+                                'with': {'tool': 'cargo-nextest@0.9.152'}},
+                               {'name': 'List the shard tests',
+                                'run': 'cargo nextest list --workspace --features '
+                                       'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry '
+                                       '--partition count:${{ matrix.shard }}/3 --message-format json > '
+                                       'partition.json'},
+                               {'name': 'Run the shard tests',
+                                'run': 'cargo nextest run --workspace --features '
+                                       'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry '
+                                       '--partition count:${{ matrix.shard }}/3 --profile ci'},
+                               {'uses': 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9',
+                                'if': 'always()',
+                                'with': {'name': 'feature-on-shard-${{ matrix.shard }}',
+                                         'overwrite': True,
+                                         'if-no-files-found': 'error',
+                                         'path': 'partition.json\ntarget/nextest/ci/junit.xml\n'}}]},
+ 'feature-on-test-shadow': {'name': 'feature-on-test-shadow',
+                            'needs': 'changes',
+                            'if': "${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}",
+                            'runs-on': 'ubuntu-24.04',
+                            'timeout-minutes': 90,
+                            'env': {'CARGO_PROFILE_TEST_DEBUG': '0'},
+                            'steps': [{'uses': 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+                                       'with': {'persist-credentials': False}},
+                                      {'name': 'Free disk space',
+                                       'run': 'sudo rm -rf /usr/share/dotnet\n'
+                                              'sudo rm -rf /usr/local/lib/android\n'
+                                              'sudo rm -rf /opt/ghc\n'
+                                              'sudo rm -rf /opt/hostedtoolcache/CodeQL\n'
+                                              'sudo docker image prune --all --force >/dev/null 2>&1 || '
+                                              'true\n'},
+                                      {'uses': 'dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8',
+                                       'with': {'toolchain': '1.100.0'}},
+                                      {'name': 'Install libudev (Linux hidapi)',
+                                       'run': 'sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o '
+                                              'Acquire::Retries=3 install -y libudev-dev pkg-config'},
+                                      {'uses': 'Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0',
+                                       'with': {'shared-key': 'feature-on', 'save-if': False}},
+                                      {'name': 'Run the offline tests',
+                                       'run': 'cargo test --workspace --features '
+                                              'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry'},
+                                      {'name': 'Capture test executables',
+                                       'run': 'cargo test --workspace --features '
+                                              'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry '
+                                              '--no-run --message-format json > cargo-tests.jsonl'},
+                                      {'name': 'List the shadow tests',
+                                       'run': 'python3 .github/scripts/compare-test-runs.py --capture '
+                                              'cargo-tests.jsonl shadow.json'},
+                                      {'uses': 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9',
+                                       'if': 'always()',
+                                       'with': {'name': 'feature-on-shadow',
+                                                'overwrite': True,
+                                                'if-no-files-found': 'error',
+                                                'path': 'cargo-tests.jsonl\nshadow.json\n'}}]},
+ 'feature-on-test-extra': {'name': 'feature-on-test-extra',
+                           'needs': 'changes',
+                           'if': "${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}",
+                           'runs-on': 'ubuntu-24.04',
+                           'timeout-minutes': 90,
+                           'env': {'CARGO_PROFILE_TEST_DEBUG': '0'},
+                           'steps': [{'uses': 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+                                      'with': {'persist-credentials': False}},
+                                     {'name': 'Free disk space',
+                                      'run': 'sudo rm -rf /usr/share/dotnet\n'
+                                             'sudo rm -rf /usr/local/lib/android\n'
+                                             'sudo rm -rf /opt/ghc\n'
+                                             'sudo rm -rf /opt/hostedtoolcache/CodeQL\n'
+                                             'sudo docker image prune --all --force >/dev/null 2>&1 || '
+                                             'true\n'},
+                                     {'uses': 'dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8',
+                                      'with': {'toolchain': '1.100.0'}},
+                                     {'name': 'Install libudev (Linux hidapi)',
+                                      'run': 'sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o '
+                                             'Acquire::Retries=3 install -y libudev-dev pkg-config'},
+                                     {'uses': 'Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0',
+                                      'with': {'shared-key': 'feature-on', 'save-if': False}},
+                                     {'name': 'Run the feature-on doctests',
+                                      'run': 'cargo test --workspace --features '
+                                             'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry '
+                                             '--doc'},
+                                     {'name': 'Check network feature forwarding in isolation',
+                                      'run': 'cargo check -p stellar-agent-network --features mainnet-write'},
+                                     {'name': 'Check the proof matrix',
+                                      'run': 'python3 .github/scripts/check-proof-matrix.py --configuration '
+                                             'feature-on --workspace'}]},
+ 'feature-on-test-compare': {'name': 'feature-on-test-compare',
+                             'needs': ['changes', 'feature-on-test', 'feature-on-test-shadow'],
+                             'if': "${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}",
+                             'runs-on': 'ubuntu-24.04',
+                             'timeout-minutes': 10,
+                             'steps': [{'uses': 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+                                        'with': {'persist-credentials': False}},
+                                       {'name': 'Require successful producers',
+                                        'env': {'SHARDS_RESULT': '${{ needs.feature-on-test.result }}',
+                                                'SHADOW_RESULT': '${{ needs.feature-on-test-shadow.result '
+                                                                 '}}'},
+                                        'run': 'test "$SHARDS_RESULT" = success && test "$SHADOW_RESULT" = '
+                                               'success'},
+                                       {'uses': 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333',
+                                        'with': {'pattern': 'feature-on-*', 'path': 'test-runs'}},
+                                       {'name': 'Compare the test runs',
+                                        'run': 'python3 .github/scripts/compare-test-runs.py test-runs'}]}}
+
 CI_FEATURE_JOBS = {
     "clippy": (
         'cargo clippy --workspace --all-targets --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE" '
@@ -795,9 +922,6 @@ CI_FEATURE_JOBS = {
         'cargo clippy --workspace --all-targets --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE" '
         '-- -D warnings',),
     "feature-on-doc": ('cargo doc --workspace --no-deps --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE"',),
-    "feature-on-test": (
-        "cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry",
-        "cargo check -p stellar-agent-network --features mainnet-write"),
     "feature-discipline": (
         "cargo fetch --locked",
         '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/check-feature-discipline.py',
@@ -812,8 +936,8 @@ CI_FEATURE_JOBS = {
 # DOCS_ONLY_CONDITION. On such a pull request the docs-tests job runs under
 # DOCS_TESTS_CONDITION instead and runs DOCS_TESTS_COMMANDS: the documentation
 # read check and the registry tests in the feature states of test and
-# feature-on-test.
-DOCS_ONLY_SKIPPED_JOBS = ("clippy", "doc", "test", "feature-on-clippy", "feature-on-doc", "feature-on-test",
+# feature-on-test-shadow.
+DOCS_ONLY_SKIPPED_JOBS = ("clippy", "doc", "test", "feature-on-clippy", "feature-on-doc",
                           "release-shape")
 DOCS_ONLY_CONDITION = "!cancelled() && needs.changes.outputs.docs_only != 'true'"
 DOCS_TESTS_JOB = "docs-tests"
@@ -1261,8 +1385,8 @@ class Checker:
         if not isinstance(types, list):
             self.report(workflow, "coverage-trigger", "pull_request types are absent")
             return
-        if "unlabeled" in types:
-            self.report(workflow, "coverage-trigger", "pull_request types must not include unlabeled")
+        if any(event not in COVERAGE_EVENTS for event in types) or len(types) != len(set(map(str, types))):
+            self.report(workflow, "coverage-trigger", "pull_request types include extra or duplicate events")
         for event in COVERAGE_EVENTS:
             if event not in types:
                 self.report(workflow, "coverage-trigger", f"pull_request types lack {event}")
@@ -1288,7 +1412,7 @@ class Checker:
         if isinstance(gate_condition, str):
             gate_condition = self.unwrap_expression(gate_condition)
         if gate_condition != COVERAGE_GATE_CONDITION:
-            self.report(workflow, "coverage-condition", "coverage gate must run on always() and canonical eligibility only")
+            self.report(workflow, "coverage-condition", "coverage gate must run on always() only")
         steps = gate.get("steps", []) or []
         first = steps[0] if steps else {}
         if (first.get("id") != "decision"
@@ -1304,17 +1428,11 @@ class Checker:
                 or any(command in self.normalized(self.run_text(step))
                        for command in (COVERAGE_OFF_FLOORS, COVERAGE_ON_FLOORS)))
 
-    def check_coverage_eligibility(self, workflow, doc, jobs):
-        if (doc.get("concurrency") or {}).get("group") != COVERAGE_GROUP:
-            self.report(workflow, "coverage-eligibility", "concurrency must isolate ineligible events")
+    def check_coverage_names(self, workflow, jobs):
         for name, title in COVERAGE_NAMES.items():
             job = jobs.get(name) or {}
-            condition = self.unwrap_expression(str(job.get("if", "")))
-            expected = COVERAGE_ELIGIBILITY if name == "changes" else f"({COVERAGE_ELIGIBILITY})"
-            if (condition != expected if name == "changes" else condition.count(expected) != 1):
-                self.report(workflow, "coverage-eligibility", f"{name} must use canonical eligibility")
-            if job.get("name") != title + COVERAGE_SUFFIX:
-                self.report(workflow, "coverage-names", f"{name} must suffix ignored events")
+            if job.get("name") != title:
+                self.report(workflow, "coverage-names", f"{name} must have plain name {title}")
 
     def check_coverage_split(self, workflow, jobs):
         """Each measurement and floor command runs once, in its own job, and
@@ -1496,9 +1614,16 @@ class Checker:
                     if not RUST_CACHE_ACTION.match(str(step.get("uses") or "")):
                         continue
                     value = (step.get("with") or {}).get("save-if")
+                    if source.name == "ci.yml" and name in ("feature-on-clippy", "feature-on-doc"):
+                        if (step.get("with") or {}).get("shared-key") != "feature-on" or value is not False:
+                            self.report(f"{source.name}:{name}", "cache-save-if",
+                                        "feature-on lint and doc jobs must only restore the shared cache")
                     if value is False:
                         continue
-                    if not isinstance(value, str) or self.unwrap_expression(value) != CACHE_SAVE_CONDITION:
+                    expected = (CACHE_SAVE_CONDITION + " && matrix.shard == 1"
+                                if source.name == "ci.yml" and name == "feature-on-test"
+                                else CACHE_SAVE_CONDITION)
+                    if not isinstance(value, str) or self.unwrap_expression(value) != expected:
                         self.report(f"{source.name}:{name} step {index + 1}", "cache-save-if",
                                     "rust-cache saves on pull request runs")
 
@@ -2287,6 +2412,17 @@ class Checker:
         self.check_credential_expressions(f"{workflow}:preflight", {"preflight": scanned, **inherited}, rule)
 
     def check_ci_feature_jobs(self):
+        for name in ("feature-on-clippy", "feature-on-doc"):
+            cache_job = self.job("ci.yml", name) or {}
+            caches = [step for step in cache_job.get("steps", [])
+                      if RUST_CACHE_ACTION.match(str(step.get("uses") or ""))]
+            if len(caches) != 1:
+                self.report("ci.yml", "cache-save-if", f"{name} must have one shared cache restore")
+        for name, expected in FEATURE_PILOT_JOBS.items():
+            actual = yaml.safe_dump(self.job("ci.yml", name), sort_keys=True)
+            expected = yaml.safe_dump(expected, sort_keys=True)
+            if actual != expected:
+                self.report("ci.yml", "ci-feature-jobs", f"pilot layout differs: {name}")
         for name, commands in CI_FEATURE_JOBS.items():
             job = self.job("ci.yml", name)
             if job is None:
@@ -2479,7 +2615,6 @@ class Checker:
             classifiers = [step for step in steps if step.get("id") == "classify"]
             command = 'python3 .github/scripts/classify-docs-only.py >> "$GITHUB_OUTPUT"'
             outputs = {"docs_only": "${{ steps.classify.outputs.docs_only }}"}
-            condition = COVERAGE_ELIGIBILITY if workflow == "coverage.yml" else ""
             if workflow == "ci.yml":
                 command += '\npython3 .github/scripts/classify-self-tests.py >> "$GITHUB_OUTPUT"'
                 outputs.update({f"selftest_{group}": "${{ steps.classify.outputs.selftest_" + group + " }}"
@@ -2487,7 +2622,7 @@ class Checker:
             if (len(classifiers) != 1 or classifiers[0].get("env") != env
                     or self.run_text(classifiers[0]).strip() != command
                     or self.may_skip(classifiers[0])
-                    or self.unwrap_expression(str(job.get("if", ""))) != condition or "needs" in job
+                    or "if" in job or "needs" in job
                     or "continue-on-error" in job
                     or job.get("outputs") != outputs):
                 self.report(workflow, "docs-classifier", "changes must call the classifier with the shared environment")
@@ -2560,7 +2695,7 @@ class Checker:
         for workflow in ("ci.yml", "coverage.yml", "install-surface.yml"):
             concurrency = self.docs.get(workflow, {}).get("concurrency")
             concurrency = concurrency if isinstance(concurrency, dict) else {}
-            group = COVERAGE_GROUP if workflow == "coverage.yml" else "${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}"
+            group = "${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}"
             if (concurrency.get("group") != group
                     or self.unwrap_expression(str(concurrency.get("cancel-in-progress", ""))) != "github.event_name == 'pull_request'"):
                 self.report(workflow, "push-concurrency", "only pull request runs may share a group or cancel predecessors")
@@ -2618,7 +2753,7 @@ class Checker:
         if workflow == COVERAGE_WORKFLOW:
             self.check_coverage_trigger(workflow, doc)
             self.check_coverage_condition(workflow, jobs)
-            self.check_coverage_eligibility(workflow, doc, jobs)
+            self.check_coverage_names(workflow, jobs)
             self.check_coverage_split(workflow, jobs)
             self.check_coverage_gate(workflow, jobs)
             self.check_coverage_seed(workflow, doc)

@@ -50,17 +50,18 @@ The workspace targets Rust edition 2024.
 
 ### Gate tools
 
-The gate suite uses three auxiliary Cargo subcommands. Install them with:
+The gate suite uses four auxiliary Cargo subcommands. Install them with:
 
 ```bash
 cargo install --locked cargo-llvm-cov --version 0.8.7
 cargo install --locked cargo-machete --version 0.9.2
 cargo install --locked cargo-deny --version 0.19.9
+cargo install --locked cargo-nextest --version 0.9.152
 ```
 
 `cargo-llvm-cov` uses the reference pins in `.github/workflows/coverage.yml`,
 one for each coverage measurement job.
-`cargo-machete` and `cargo-deny` use the reference pins in
+`cargo-machete`, `cargo-deny`, and `cargo-nextest` use the reference pins in
 `.github/workflows/ci.yml`. The `Install surface` workflow checks this guide
 against those pins with `.github/scripts/check-gate-tool-versions.sh`.
 
@@ -247,12 +248,15 @@ runs the complete local registry, including coverage.
 `bash .github/scripts/preflight.sh --quick` runs ten workspace checks without
 resolving a merge base or selecting changed paths.
 
-CI runs the offline gates on every pull request to `main` or
-`next`. Pull-request
-coverage measures automatically on eligible events for every pull request into
-`main` and every code pull request into `next`. The required `coverage` job runs
-on every eligible event and passes docs-only changes into `next` without
-measuring; the `coverage` label requires measurement on a docs-only pull request.
+CI runs the offline gates on every pull request to `main` or `next`.
+Opening, pushing to, or reopening a pull request evaluates coverage.
+Coverage measures every pull request into `main`.
+It measures every code pull request into `next`.
+The required `coverage` job runs on every triggered event.
+It passes docs-only changes into `next` without measuring unless the pull request
+carries the `coverage` label.
+The `coverage` label requires measurement on a docs-only pull request.
+Label changes take effect on the next push or reopen.
 Live acceptance uses its separate workflow. A pull request into `next` that changes only documentation,
 as `.github/scripts/classify-docs-only.py` decides, skips the `ci.yml` build
 and test jobs and runs `docs-tests`: the tests that `.github/docs-tests.tsv`
@@ -281,9 +285,10 @@ full build and test jobs and coverage measurement only for a proven
 documentation-only change; CI still runs the documentation tests and the
 required `coverage` job passes without measuring. Failed or uncertain coverage
 classification measures the change.
-A pull request retargeted to `main` runs coverage immediately. The full CI set
-and install surface rerun after a new push or a reopen, producing the required
-`ci-result (main)` check.
+After retargeting a pull request, push or reopen it so CI and coverage run for
+the new base.
+For `main`, this runs the full CI set and install surface.
+It also produces the required `ci-result (main)` check.
 
 `ci.yml` also runs on `workflow_dispatch`, which takes no inputs. A dispatched
 run is a full run. For any event other than a pull request or a push into
@@ -305,7 +310,8 @@ On pull requests into or pushes to `next`,
 and any uncertain diff selects all groups. Missing outputs also run the steps.
 All groups include `.github/**`, every `Cargo.toml` and `Cargo.lock`, the root
 `rust-toolchain.toml`, `Cross.toml`, `deny.toml`, `scripts/**`, and `contracts/**`.
-The `scripts` group also includes any deletion or rename source for CODEOWNERS.
+The `scripts` group also includes `.config/nextest.toml` and any deletion or
+rename source for CODEOWNERS.
 The `rust` group includes `crates/**`, every `build.rs`, and this building guide.
 The `docs` group includes every Markdown file, `skills/**`, and `.claude-plugin/**`. The
 `preflight` group includes changelog files, `CONTRIBUTING.md`, this guide,
@@ -488,6 +494,7 @@ gate except `shellcheck-changed`, which needs a changed shell script.
      `docs_paths.py`
    - `test-classify-self-tests.py`: `classify-self-tests.py` or `changed_paths.py`
    - `test-compare-crate-sums.py`: `compare-crate-sums.py`
+   - `test-compare-test-runs.py`: `compare-test-runs.py` or `.config/nextest.toml`
    - `test-preflight.sh`: `preflight.sh`
    - `test-publish-crates-check.sh`: `publish-crates.sh`
    - `test-publish-crates-verify.sh`: `publish-crates.sh`
@@ -551,6 +558,9 @@ the `.venv` virtual environment of the PyYAML install command.
 The preflight does not carry these CI checks: the `windows-storage` and
 `platform-keyring` jobs, the `stellar-agent-test-support` feature matrix of the
 `test` job, the setup steps, and the virtual environment of the workflow checks.
+The feature-on pilot's nextest shards, evidence capture and comparison, and
+extra doctest invocation run in CI. The local feature-on test row runs
+the shadow Cargo command, which includes doctests.
 It also omits the integration changelog guard of `changelog.yml`, which
 protects `CHANGELOG.md`, existing unreleased fragments, and the fragment README.
 Other omissions include the
@@ -616,6 +626,34 @@ cargo check -p stellar-agent-network --features mainnet-write
 This runs the offline unit, integration, and doc-tests. Live acceptance uses
 its separate workflow and feature selections; see [Test tiers](#test-tiers).
 
+The `feature-on-test` job partitions the workspace into three nextest shards.
+`feature-on-test-shadow` runs the Cargo test command above, including doctests,
+and records each executable's test and ignored lists. `feature-on-test-extra`
+runs doctests, the isolated network check, and the feature-on proof matrix.
+`feature-on-test-compare` requires successful shard and shadow jobs and checks
+disjoint matched partitions whose union equals the shadow list minus ignored
+tests. Every shard lists the shadow's full test universe, including ignored tests,
+and the shadow's ignored set. Ignored tests have only an ignored filter mismatch;
+non-ignored tests either match or have a partition filter mismatch.
+Each shard has matched tests and a nonempty, passing JUnit report covering every
+non-ignored match. Evidence uploads replace artifacts from earlier attempts
+under the same names.
+All feature-on build jobs share one cache; only shard 1 saves it, on pushes.
+The feature-on clippy and rustdoc jobs, shadow, and extra job only restore it.
+
+Reproduce shard 1 locally (use 2 or 3 for the other shards):
+
+```bash
+cargo nextest list --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --partition count:1/3 --message-format json
+cargo nextest run --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --partition count:1/3 --profile ci
+```
+
+The CI profile disables fail-fast and retries and writes JUnit output to
+`target/nextest/ci/junit.xml`. The job timeout is the only timeout. Tests that
+share a file path or a port across processes must join a test group with
+`max-threads = 1`; the maintainer adds members after a measured pilot run.
+The local preflight runs the shadow Cargo command and runs no nextest.
+
 #### Coverage
 
 ```bash
@@ -642,27 +680,31 @@ data, writes a separate report and uses the selected configuration's floors.
 Live tiers that attempt RPC and
 Friendbot access remain disabled.
 
-CI runs the required `coverage` job on every eligible event. A job skipped by
-its `if` reports under its unevaluated name, so the required job must run to
-report as `coverage`. A proven docs-only pull request into `next` passes without
-measuring unless it carries the `coverage` label. The decision requires
-successful classification and both measuring jobs skipped; only a measured run
-checks out source, downloads reports and enforces floors. Pushes to `main`
-always measure; pushes to `next` skip measurement only for proven docs-only
-changes and pass `coverage` without measuring. Measuring
-pushes seed the coverage caches. The gate also runs weekly on main and on demand
-through `workflow_dispatch`. A failed, canceled, or unexpectedly skipped
-measurement fails `coverage`. A red coverage push on `next` blocks integration through the required
-coverage run on the pull request into `main`, which measures the tree it brings.
+CI runs the required `coverage` job on every triggered event.
+All Coverage jobs have constant names.
+A proven docs-only pull request into `next` passes without measuring unless it
+carries the `coverage` label.
+The decision requires successful classification and both measuring jobs
+skipped.
+Only a measured run checks out source, downloads reports and enforces floors.
+Pushes to `main` always measure.
+Pushes to `next` skip measurement only for proven docs-only changes.
+Those docs-only pushes pass `coverage` without measuring.
+Measuring pushes seed the coverage caches.
+The gate also runs weekly on main and on demand through `workflow_dispatch`.
+A failed, canceled, or unexpectedly skipped measurement fails `coverage`.
+A red coverage push on `next` blocks integration through the required coverage
+run on the pull request into `main`, which measures the tree it brings.
 Local reproduction is optional.
 
-Opening, pushing to, or reopening a pull request evaluates coverage. Adding the
-`coverage` label or changing the base also evaluates it. Removing a label starts
-no run. Other label additions and edits measure nothing, use their own
-concurrency group, and skip all jobs under their unevaluated name templates,
-which match no required check. The name expressions select ` (ignored event)`
-for those events. Eligible pull request runs cancel their
-predecessors; push, schedule, and dispatch runs each have their own group.
+Opening, pushing to, or reopening a pull request evaluates coverage.
+The `coverage` label takes effect on the next push or reopen.
+After retargeting a pull request, push or reopen it so CI and coverage run for
+the new base.
+Editing or labeling a pull request starts no Coverage run.
+Removing a label starts no Coverage run.
+Pull request runs cancel their predecessors.
+Push, schedule, and dispatch runs each have their own group.
 
 Each report artifact carries the run attempt in its name, so a measuring
 `coverage` run reads only the reports of its own attempt. When measurement is
@@ -715,7 +757,7 @@ later.
 The gate tool check compares the versions in [Gate tools](#gate-tools), in the
 other workflows, and in the composite actions with each tool's reference
 workflow pin: `coverage.yml` for `cargo-llvm-cov`, `ci.yml` for
-`cargo-machete` and `cargo-deny`. `coverage.yml` holds two `cargo-llvm-cov`
+`cargo-machete`, `cargo-deny`, and `cargo-nextest`. `coverage.yml` holds two `cargo-llvm-cov`
 pins at one version; the first is the reference pin. Its header defines the
 accepted line shapes, and its self-test runs it on fixture trees with one drift
 form per case.
@@ -732,7 +774,11 @@ identity, DPAPI, the MPP store, the smart-account crate, the MCP rule tools,
 and the MCP console events with the feature off and on. There is no local
 equivalent off Windows; changes to
 `audit_log`, the approval store, or file-locking behavior should expect this
-job to be the deciding signal.
+job to be the deciding signal. Each execution uses the feature flags of its
+compile step: the storage library suites pass `--no-default-features`, and the
+console-event suites use paired feature-off and feature-on builds.
+The log checks require one DPAPI pass, three shutdown passes, and four
+driver passes.
 
 ### Platform keyring and deployment scripts (CI-only)
 
@@ -1536,6 +1582,10 @@ Each error message names its rule:
   closure. The paired CLI and MCP prebuild and the isolated CLI build of the
   testnet driver each have one reviewed record per share and feature state.
   The isolated build's function, call count, and feature lists are pinned.
+  Nextest `run` and `list` resolve dev-dependencies; the shard matrix expands
+  into three invocations of each. Their accepted flags are `--workspace`,
+  `--features`, `--partition count:1/3` (or 2/3 or 3/3), and either
+  `--message-format json` for list or `--profile ci` for run. Unknown flags fail.
   A record relies on the
   feature when its feature list names `mainnet-write`, or when it keeps the
   default features and selects the workspace, the CLI package, or the MCP
@@ -1613,8 +1663,9 @@ Each error message names its rule:
   Rustflags and rustdocflags inputs that contain `--cfg` also fail.
   The invocation inventory refuses a compiler argument that passes `--cfg`.
 - D8: no workflow, named script, or this guide enables every feature.
-- D9: CI feature-on jobs and the feature-on coverage job may name
-  `mainnet-write` in feature lists. The testnet driver's resolved suite lists
+- D9: `feature-on-clippy`, `feature-on-doc`, `feature-on-test`,
+  `feature-on-test-shadow`, and `feature-on-test-extra` in CI, and
+  `coverage-on` in coverage, may name `mainnet-write` in feature lists. The testnet driver's resolved suite lists
   and exact isolated on-state build are allowed only in its two acceptance jobs.
   Release-shaped builds activate the feature through the binary defaults.
 - D10: the feature list of `ci.yml` and the list in this guide equal the

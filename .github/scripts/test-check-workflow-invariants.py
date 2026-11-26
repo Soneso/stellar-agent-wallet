@@ -225,18 +225,14 @@ PUBLISH_SCRIPT = ".github/scripts/publish-crates.sh"
 # A full-length commit pin for the actions a case adds; the check matches the
 # action name and ignores the revision.
 PLACEHOLDER_REVISION = "0" * 40
-COVERAGE_ELIGIBILITY = "github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)"
-COVERAGE_SUFFIX = "${{ !(" + COVERAGE_ELIGIBILITY + ") && ' (ignored event)' || '' }}"
-COVERAGE_GROUP = ("${{ github.workflow }}-${{ github.event_name == 'pull_request' && ("
-                  + COVERAGE_ELIGIBILITY + ") && github.ref || github.run_id }}")
 COVERAGE_LABEL = "github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')"
 COVERAGE_DOCS_SKIP = ("github.event_name == 'push' && needs.changes.result == 'success' && "
                       "needs.changes.outputs.docs_only == 'true'")
-COVERAGE_CONDITION = f"!cancelled() && ({COVERAGE_ELIGIBILITY}) && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
+COVERAGE_CONDITION = f"!cancelled() && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})"
 COVERAGE_IF_LINE = f"    if: ${{{{ {COVERAGE_CONDITION} }}}}\n"
 COVERAGE_IF_UNWRAPPED_LINE = f'    if: "{COVERAGE_CONDITION}"\n'
 COVERAGE_IF_SPACED_LINE = f'    if: "  ${{{{ {COVERAGE_CONDITION} }}}}  "\n'
-COVERAGE_TYPES_LINE = "    types: [opened, synchronize, reopened, labeled, edited]\n"
+COVERAGE_TYPES_LINE = "    types: [opened, synchronize, reopened]\n"
 COVERAGE_PUSH_BLOCK = "  push:\n    branches: [next, main]\n"
 COVERAGE_ON_BLOCK = (
     "on:\n"
@@ -251,22 +247,21 @@ COVERAGE_ON_BLOCK = (
 )
 COVERAGE_CANCEL_LINE = "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n"
 COVERAGE_LABEL_COMMENT = (
-    "    # Eligible pull requests measure main, code or uncertain diffs, and the\n"
-    "    # coverage label. Label additions evaluate only coverage; edits evaluate only\n"
-    "    # base changes. GITHUB_TOKEN label changes start no workflow.\n"
+    '    # Pull requests measure main, code or uncertain diffs, and the coverage label.\n'
+    '    # Label changes take effect on the next push or reopen.\n'
 )
-COVERAGE_OFF_HEADER = "  coverage-off:\n    name: coverage (feature-off)" + COVERAGE_SUFFIX + "\n    needs: changes\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
-COVERAGE_ON_HEADER = "  coverage-on:\n    name: coverage (feature-on)" + COVERAGE_SUFFIX + "\n    needs: changes\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
-COVERAGE_GATE_CONDITION = f"always() && ({COVERAGE_ELIGIBILITY})"
+COVERAGE_OFF_HEADER = "  coverage-off:\n    name: coverage (feature-off)\n    needs: changes\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
+COVERAGE_ON_HEADER = "  coverage-on:\n    name: coverage (feature-on)\n    needs: changes\n" + COVERAGE_LABEL_COMMENT + COVERAGE_IF_LINE
+COVERAGE_GATE_CONDITION = "always()"
 COVERAGE_MEASURE = "${{ (" + COVERAGE_LABEL + ") && !(" + COVERAGE_DOCS_SKIP + ") }}"
 COVERAGE_MEASURED_LINE = "        if: steps.decision.outputs.measured == 'true'\n"
-COVERAGE_GATE_START = "  coverage:\n    name: coverage" + COVERAGE_SUFFIX + "\n"
+COVERAGE_GATE_START = "  coverage:\n    name: coverage\n"
 COVERAGE_GATE_NEEDS = "    needs: [changes, coverage-off, coverage-on]\n"
 COVERAGE_GATE_COMMENT = (
-    "    # A job skipped by its if reports under its unevaluated name. Run on every\n"
-    "    # eligible event so coverage passes docs-only next changes without measuring,\n"
-    "    # unless a pull request carries the coverage label. Step 1 checks the results;\n"
-    "    # steps 2 and 8 reject cancellation before and after the measured floors.\n"
+    '    # Run on every triggered event so coverage passes docs-only next changes\n'
+    '    # without measuring, unless a pull request carries the coverage label.\n'
+    '    # Step 1 checks the results; steps 2 and 8 reject cancellation before and\n'
+    '    # after the measured floors.\n'
 )
 COVERAGE_GATE_IF_LINE = f"    if: {COVERAGE_GATE_CONDITION}\n"
 COVERAGE_GATE_HEADER = COVERAGE_GATE_START + COVERAGE_GATE_NEEDS + COVERAGE_GATE_COMMENT + COVERAGE_GATE_IF_LINE
@@ -509,7 +504,6 @@ REHEARSAL_MARKER_RUN = ('        run: bash .github/scripts/check-packaged-marker
 CI_FEATURE_JOBS = {
     "feature-on-clippy": 'cargo clippy --workspace --all-targets --features "mainnet-write,',
     "feature-on-doc": 'cargo doc --workspace --no-deps --features "mainnet-write,',
-    "feature-on-test": "cargo check -p stellar-agent-network --features mainnet-write",
     "feature-discipline": "cargo fetch --locked",
     "release-shape": "bash .github/scripts/release/check-host.sh",
 }
@@ -527,7 +521,7 @@ CI_OFF_JOBS = {
 # pull request into next.
 DOCS_ONLY_JOB = ("    needs: changes\n"
                  "    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}\n")
-DOCS_ONLY_FEATURE_JOBS = ("clippy", "doc", "test", "feature-on-clippy", "feature-on-doc", "feature-on-test",
+DOCS_ONLY_FEATURE_JOBS = ("clippy", "doc", "test", "feature-on-clippy", "feature-on-doc",
                           "release-shape")
 DOCS_TESTS_HEADER = ("  docs-tests:\n    name: docs-tests\n    needs: changes\n"
                      "    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}\n")
@@ -847,7 +841,7 @@ COVERAGE_OFF_JOB = live_text(COVERAGE, re.compile(r"^  coverage-off:\n.*?(?=^  c
 COVERAGE_ON_CACHE = live_text(COVERAGE, re.compile(r"^  coverage-on" + JOB_CACHE, re.DOTALL | re.MULTILINE),
                               "feature-on coverage cache")
 CI_TEST_CACHE = live_text(CI, re.compile(r"^  test" + JOB_CACHE, re.DOTALL | re.MULTILINE), "test job cache")
-CI_FEATURE_ON_TEST_CACHE = live_text(CI, re.compile(r"^  feature-on-test" + JOB_CACHE, re.DOTALL | re.MULTILINE),
+CI_FEATURE_ON_TEST_CACHE = live_text(CI, re.compile(r"^  feature-on-test" + JOB_CACHE.replace(" == 'push' ", " == 'push' && matrix.shard == 1 "), re.DOTALL | re.MULTILINE),
                                      "feature-on test job cache")
 
 
@@ -908,9 +902,9 @@ PASSING = [
     ("coverage seed branches in another order pass", [
         (COVERAGE, COVERAGE_PUSH_BLOCK, "  push:\n    branches: [main, next]\n", 1)]),
     ("save-if as a quoted expression passes", [
-        (CI, CACHE_SAVE_LINE, "          save-if: \"${{ github.event_name == 'push' }}\"\n", 8)]),
+        (CI, CACHE_SAVE_LINE, "          save-if: \"${{ github.event_name == 'push' }}\"\n", 5)]),
     ("save-if with inner spaces passes", [
-        (CI, CACHE_SAVE_LINE, "          save-if: ${{  github.event_name == 'push'  }}\n", 8)]),
+        (CI, CACHE_SAVE_LINE, "          save-if: ${{  github.event_name == 'push'  }}\n", 5)]),
     ("cancel-in-progress with inner spaces passes", [
         (COVERAGE, COVERAGE_CANCEL_LINE, "  cancel-in-progress: ${{  github.event_name == 'pull_request'  }}\n", 1)]),
     ("Wasm save guard wrapped in ${{ }} passes", [
@@ -1590,8 +1584,14 @@ CASES = [
     ("coverage pull_request trigger with a paths-ignore filter", "coverage-trigger", "paths-ignore filter", [
         (COVERAGE, "    branches: [main, next]\n" + COVERAGE_TYPES_LINE,
          "    branches: [main, next]\n    paths-ignore: ['**.md']\n" + COVERAGE_TYPES_LINE, 1)]),
-    ("coverage pull_request trigger without edited", "coverage-trigger", "lack edited", [
-        (COVERAGE, "labeled, edited]", "labeled]", 1)]),
+    ("coverage pull_request trigger without reopened", "coverage-trigger", "lack reopened", [
+        (COVERAGE, COVERAGE_TYPES_LINE, "    types: [opened, synchronize]\n", 1)]),
+    ("coverage edited added", "coverage-trigger", "extra or duplicate events", [
+        (COVERAGE, COVERAGE_TYPES_LINE, "    types: [opened, synchronize, reopened, edited]\n", 1)]),
+    ("coverage labeled added", "coverage-trigger", "extra or duplicate events", [
+        (COVERAGE, COVERAGE_TYPES_LINE, "    types: [opened, synchronize, reopened, labeled]\n", 1)]),
+    ("coverage duplicate event", "coverage-trigger", "extra or duplicate events", [
+        (COVERAGE, COVERAGE_TYPES_LINE, "    types: [opened, synchronize, reopened, opened]\n", 1)]),
     ("coverage workflow without a pull_request trigger", "coverage-trigger", "trigger is absent", [
         (COVERAGE, "  pull_request:\n    branches: [main, next]\n" + COVERAGE_TYPES_LINE, "", 1)]),
     ("coverage job without the measure condition", "coverage-condition", "coverage-off job runs without the measure condition", [
@@ -1620,25 +1620,22 @@ CASES = [
     ("coverage pull_request types as a string", "coverage-trigger",
      "coverage.yml: coverage-trigger: pull_request types are absent", [
         (COVERAGE, COVERAGE_TYPES_LINE, "    types: labeled\n", 1)]),
-    ("coverage pull_request types as an empty list", ("coverage-trigger",) * 5, (
+    ("coverage pull_request types as an empty list", ("coverage-trigger",) * 3, (
         "coverage.yml: coverage-trigger: pull_request types lack opened",
         "coverage.yml: coverage-trigger: pull_request types lack synchronize",
-        "coverage.yml: coverage-trigger: pull_request types lack reopened",
-        "coverage.yml: coverage-trigger: pull_request types lack labeled",
-        "coverage.yml: coverage-trigger: pull_request types lack edited"), [
+        "coverage.yml: coverage-trigger: pull_request types lack reopened"), [
         (COVERAGE, COVERAGE_TYPES_LINE, "    types: []\n", 1)]),
-    ("coverage pull_request types missing three events", ("coverage-trigger",) * 3, (
+    ("coverage pull_request types missing two events", ("coverage-trigger",) * 2, (
         "coverage.yml: coverage-trigger: pull_request types lack synchronize",
-        "coverage.yml: coverage-trigger: pull_request types lack reopened",
-        "coverage.yml: coverage-trigger: pull_request types lack edited"), [
-        (COVERAGE, COVERAGE_TYPES_LINE, "    types: [opened, labeled]\n", 1)]),
+        "coverage.yml: coverage-trigger: pull_request types lack reopened"), [
+        (COVERAGE, COVERAGE_TYPES_LINE, "    types: [opened]\n", 1)]),
     ("coverage paths filter and a missing condition", ("coverage-trigger", "coverage-condition"), (
         "coverage.yml: coverage-trigger: pull_request trigger has a paths filter",
         "coverage.yml: coverage-condition: coverage-off job runs without the measure condition"), [
         (COVERAGE, "    branches: [main, next]\n" + COVERAGE_TYPES_LINE,
          "    branches: [main, next]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1),
         (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, ""), 1)]),
-    ("coverage gate retains docs-only clause", "coverage-condition", "canonical eligibility only", [
+    ("coverage gate retains docs-only clause", "coverage-condition", "always() only", [
         (COVERAGE, COVERAGE_GATE_IF_LINE, COVERAGE_GATE_IF_LINE.rstrip()
          + f" && ({COVERAGE_LABEL}) && !({COVERAGE_DOCS_SKIP})\n", 1)]),
     ("coverage decision without label", "coverage-condition", "decision must use the measure expression", [
@@ -1651,18 +1648,20 @@ CASES = [
      ("decision must use the measure expression", "decision must match the literal template"), [
         (COVERAGE, "        id: decision\n", "", 1)]),
     ("coverage gate without always()", ("coverage-condition", "ci-feature-jobs"),
-     ("coverage gate must run on always() and canonical eligibility only", "coverage.yml: ci-feature-jobs: coverage can be bypassed"), [
+     ("coverage gate must run on always() only", "coverage.yml: ci-feature-jobs: coverage can be bypassed"), [
         (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
-            COVERAGE_GATE_IF_LINE, f"    if: {COVERAGE_ELIGIBILITY}\n"), 1)]),
-    ("coverage gate bypasses eligibility", "coverage-condition", "coverage gate must run on always() and canonical eligibility only", [
+            COVERAGE_GATE_IF_LINE, "    if: success()\n"), 1)]),
+    ("coverage gate without if", "coverage-condition", "coverage gate must run on always() only", [
+        (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(COVERAGE_GATE_IF_LINE, ""), 1)]),
+    ("coverage gate adds event condition", "coverage-condition", "coverage gate must run on always() only", [
         (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
-            COVERAGE_GATE_IF_LINE, f"    if: always() || ({COVERAGE_ELIGIBILITY})\n"), 1)]),
-    ("coverage gate skipped on cancellation", "coverage-condition", "coverage gate must run on always() and canonical eligibility only", [
+            COVERAGE_GATE_IF_LINE, "    if: always() && github.event.action == 'opened'\n"), 1)]),
+    ("coverage gate skipped on cancellation", "coverage-condition", "coverage gate must run on always() only", [
         (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
-            COVERAGE_GATE_IF_LINE, f"    if: ${{{{ !cancelled() && ({COVERAGE_ELIGIBILITY}) }}}}\n"), 1)]),
+            COVERAGE_GATE_IF_LINE, "    if: ${{ !cancelled() }}\n"), 1)]),
     ("coverage-on without the measure condition", "coverage-condition", "coverage-on job runs without the measure condition", [
         (COVERAGE, COVERAGE_ON_HEADER, COVERAGE_ON_HEADER.replace(COVERAGE_IF_LINE, ""), 1)]),
-    ("coverage gate renamed", "coverage-names", "coverage must suffix ignored events", [
+    ("coverage gate renamed", "coverage-names", "coverage must have plain name coverage", [
         (COVERAGE, COVERAGE_GATE_START, "  coverage:\n    name: coverage (gate)\n", 1)]),
     ("coverage-off job removed", ("coverage-condition", "ci-feature-jobs"),
      ("job coverage-off not found", "coverage.yml: ci-feature-jobs: missing coverage-off"), [
@@ -1772,7 +1771,7 @@ CASES = [
     ("ci test cache saves on pull requests", "cache-save-if", "ci.yml:test step 5: cache-save-if: rust-cache saves on pull request runs", [
         (CI, CI_TEST_CACHE, CI_TEST_CACHE.replace("        with:\n" + CACHE_SAVE_LINE, ""), 1)]),
     ("ci cache save-if always true", "cache-save-if", "ci.yml:feature-on-test step", [
-        (CI, CI_FEATURE_ON_TEST_CACHE, CI_FEATURE_ON_TEST_CACHE.replace(CACHE_SAVE_LINE, "          save-if: true\n"), 1)]),
+        (CI, CI_FEATURE_ON_TEST_CACHE, CI_FEATURE_ON_TEST_CACHE.replace(CACHE_SAVE_LINE.replace(" == 'push' ", " == 'push' && matrix.shard == 1 "), "          save-if: true\n"), 1)]),
     ("coverage-on cache saves on pull requests", "cache-save-if", "coverage.yml:coverage-on step", [
         (COVERAGE, COVERAGE_ON_CACHE, COVERAGE_ON_CACHE.replace(CACHE_SAVE_LINE, ""), 1)]),
     ("rust-cache in another pull request workflow", "cache-save-if", "install-surface.yml:install-surface step", [
@@ -1785,8 +1784,8 @@ CASES = [
         (CACHE_FIXTURE, CACHE_FIXTURE_TEXT, cache_fixture("[pull_request]"), 1)]),
     ("rust-cache in scalar pull_request workflow", "cache-save-if", "cache-fixture.yaml:fixture step 1", [
         (CACHE_FIXTURE, CACHE_FIXTURE_TEXT, cache_fixture("pull_request"), 1)]),
-    ("rust-cache in upper case", "cache-save-if", "ci.yml:clippy step", [
-        (CI, RUST_CACHE_PLAIN, RUST_CACHE_USES.replace("Swatinem/rust-cache", "swatinem/RUST-CACHE"), 6)]),
+    ("rust-cache in upper case", "cache-save-if", "ci.yml:test step", [
+        (CI, RUST_CACHE_PLAIN, RUST_CACHE_USES.replace("Swatinem/rust-cache", "swatinem/RUST-CACHE"), 3)]),
     ("rehearsal job with id-token: write", "rehearsal-credentials",
      "release-rehearsal.yml:build: rehearsal-credentials: the job holds id-token: write", [
         (REHEARSAL, REHEARSAL_JOB_PERMISSIONS,
@@ -2122,7 +2121,7 @@ CASES = [
     ("release-shape that continues on error", "ci-feature-jobs", "ci.yml: ci-feature-jobs: release-shape can be bypassed", [
         (CI, "  release-shape:\n    name: release-shape\n",
          "  release-shape:\n    name: release-shape\n    continue-on-error: true\n", 1)]),
-    ("conditional network forwarding check", "ci-feature-jobs", "feature-on-test step can be bypassed", [
+    ("conditional network forwarding check", "ci-feature-jobs", "pilot layout differs: feature-on-test-extra", [
         (CI, "        run: cargo check -p stellar-agent-network", "        if: false\n        run: cargo check -p stellar-agent-network", 1)]),
     ("feature-on clippy without mainnet-write", "ci-feature-jobs",
      "ci.yml: ci-feature-jobs: feature-on-clippy does not run unconditionally", [
@@ -2218,7 +2217,7 @@ CASES = [
     ("coverage job under another condition", ("coverage-condition", "ci-feature-jobs"), (
         "coverage.yml: coverage-condition: coverage-off job runs without the measure condition",
         "coverage.yml: ci-feature-jobs: coverage-off can be bypassed"), [
-        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, "    if: false\n"), 1)], 3),
+        (COVERAGE, COVERAGE_OFF_HEADER, COVERAGE_OFF_HEADER.replace(COVERAGE_IF_LINE, "    if: false\n"), 1)], 2),
     ("coverage workflow without its coverage job for the feature pin",
      ("coverage-condition", "coverage-split", "coverage-split", "ci-feature-jobs"), (
         "coverage.yml: coverage-condition: job coverage not found",
@@ -2227,7 +2226,7 @@ CASES = [
         "coverage.yml: coverage-split: python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration "
         "feature-on runs in measure, expected coverage",
         "coverage.yml: ci-feature-jobs: missing coverage"), [
-        (COVERAGE, COVERAGE_GATE_START, "  measure:\n    name: coverage\n", 1)], 6),
+        (COVERAGE, COVERAGE_GATE_START, "  measure:\n    name: coverage\n", 1)], 5),
 ] + [
     (f"vars context in {where}", "release-vars",
      f"{path}: release-vars: an expression reads the vars context: vars.SAMPLE", [
@@ -2247,7 +2246,7 @@ CASES.extend((label, changelog_rule(label), CHANGELOG_MESSAGES[label], []) for l
 CI_RESULT_SCRIPT = ".github/scripts/ci-result.py"
 CI_RESULT_NAME = "    name: ci-result (${{ github.base_ref || github.ref_name }})\n"
 CI_RESULT_NEEDS = ("    needs: [changes, fmt, clippy, doc, test, feature-on-clippy, feature-on-doc, "
-                   "feature-on-test, docs-tests, feature-discipline, release-shape, inbox-js, mpp-interop, "
+                   "feature-on-test, feature-on-test-shadow, feature-on-test-extra, feature-on-test-compare, docs-tests, feature-discipline, release-shape, inbox-js, mpp-interop, "
                    "sdk-v17-interop, release-contracts, windows-storage, platform-keyring, deploy-scripts, machete, deny]\n")
 CI_RESULT_CHECK = "      - name: Check every CI result\n        if: always()\n"
 CI_RESULT_FIRST_CANCEL = ("      - name: Reject a cancelled run\n"
@@ -2304,7 +2303,7 @@ CASES.extend([
     ("classifier shallow checkout", "docs-classifier", "full history", [
         (COVERAGE, "          fetch-depth: 0\n", "          fetch-depth: 1\n", 1)]),
     ("docs-tests cache saves", "docs-classifier", "never save", [
-        (CI, "          save-if: false\n", CACHE_SAVE_LINE, 1)]),
+        (CI, "          shared-key: test\n          save-if: false\n", "          shared-key: test\n" + CACHE_SAVE_LINE, 1)]),
     ("coverage changes failure ignored", "coverage-gate", "reject failed changes", [
         (COVERAGE, '          test "$CHANGES" = success\n', "", 1)]),
     ("coverage measurement missing changes", "coverage-condition", "must need changes", [
@@ -2322,7 +2321,7 @@ for workflow in (CI, COVERAGE):
             (workflow, "  push:\n", f"  push:\n    {key}: ['**/*.rs']\n", 1)]))
 for workflow in (CI, COVERAGE, ".github/workflows/install-surface.yml"):
     CASES.append((f"{workflow} shared push group", "push-concurrency", "only pull request", [
-        (workflow, "  group: " + COVERAGE_GROUP + "\n" if workflow == COVERAGE else PUSH_GROUP, "  group: ${{ github.workflow }}-${{ github.ref }}\n", 1)]))
+        (workflow, PUSH_GROUP, "  group: ${{ github.workflow }}-${{ github.ref }}\n", 1)]))
     CASES.append((f"{workflow} cancels push runs", "push-concurrency", "only pull request", [
         (workflow, COVERAGE_CANCEL_LINE, "  cancel-in-progress: true\n", 1)]))
 for event in ("push", "pull_request"):
@@ -2408,28 +2407,18 @@ CASES.extend((label, "wallet-toolchain", message, edits, 1 if label == "reposito
              for label, message, edits in WALLET_TOOLCHAIN_CASES)
 PASSING.append(("vendored Wasm keeps compiler pins", []))
 
+for job, title in (("changes", "changes"), ("coverage-off", "coverage (feature-off)"),
+                   ("coverage-on", "coverage (feature-on)"), ("coverage", "coverage")):
+    CASES.append((f"coverage name expression {job}", "coverage-names", "must have plain name", [
+        (COVERAGE, f"    name: {title}\n", "    name: ${{ '" + title + "' }}\n", 1)]))
+
+
 CASES.extend([
-    ("S01 unlabeled is forbidden", "coverage-trigger", "must not include unlabeled", [
-        (".github/workflows/coverage.yml", "labeled, edited]", "labeled, edited, unlabeled]", 1)]),
-    ("S02 eligibility concurrency", "coverage-eligibility", "concurrency", [
-        (".github/workflows/coverage.yml", "  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && (github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && github.ref || github.run_id }}", "  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}", 1)]),
-    ("S03 eligibility changes", "coverage-eligibility", "canonical eligibility", [
-        (".github/workflows/coverage.yml", "  changes:\n    if: ${{ github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null) }}\n    name: changes${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", "  changes:\n    if: ${{ github.event_name != 'pull_request' || false || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null) }}\n    name: changes${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", 1)]),
-    ("S04 ignored name changes", "coverage-names", "suffix ignored events", [
-        (".github/workflows/coverage.yml", "    name: changes${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", "    name: changes\n", 1)]),
-    ("S03 eligibility coverage-off", "coverage-eligibility", "canonical eligibility", [
-        (".github/workflows/coverage.yml", "  coverage-off:\n    name: coverage (feature-off)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n    needs: changes\n    # Eligible pull requests measure main, code or uncertain diffs, and the\n    # coverage label. Label additions evaluate only coverage; edits evaluate only\n    # base changes. GITHUB_TOKEN label changes start no workflow.\n    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}\n", "  coverage-off:\n    name: coverage (feature-off)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n    needs: changes\n    # Eligible pull requests measure main, code or uncertain diffs, and the\n    # coverage label. Label additions evaluate only coverage; edits evaluate only\n    # base changes. GITHUB_TOKEN label changes start no workflow.\n    if: ${{ !cancelled() && (github.event_name != 'pull_request' || false || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}\n", 1)]),
-    ("S04 ignored name coverage-off", "coverage-names", "suffix ignored events", [
-        (".github/workflows/coverage.yml", "    name: coverage (feature-off)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", "    name: coverage (feature-off)\n", 1)]),
-    ("S03 eligibility coverage-on", "coverage-eligibility", "canonical eligibility", [
-        (".github/workflows/coverage.yml", "  coverage-on:\n    name: coverage (feature-on)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n    needs: changes\n    # Eligible pull requests measure main, code or uncertain diffs, and the\n    # coverage label. Label additions evaluate only coverage; edits evaluate only\n    # base changes. GITHUB_TOKEN label changes start no workflow.\n    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}\n", "  coverage-on:\n    name: coverage (feature-on)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n    needs: changes\n    # Eligible pull requests measure main, code or uncertain diffs, and the\n    # coverage label. Label additions evaluate only coverage; edits evaluate only\n    # base changes. GITHUB_TOKEN label changes start no workflow.\n    if: ${{ !cancelled() && (github.event_name != 'pull_request' || false || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && (github.event_name != 'pull_request' || github.base_ref == 'main' || !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') || contains(github.event.pull_request.labels.*.name, 'coverage')) && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}\n", 1)]),
-    ("S04 ignored name coverage-on", "coverage-names", "suffix ignored events", [
-        (".github/workflows/coverage.yml", "    name: coverage (feature-on)${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", "    name: coverage (feature-on)\n", 1)]),
-    ("S03 eligibility coverage", "coverage-eligibility", "canonical eligibility", [
-        (COVERAGE, COVERAGE_GATE_HEADER, COVERAGE_GATE_HEADER.replace(
-            COVERAGE_GATE_IF_LINE, COVERAGE_GATE_IF_LINE.replace("github.event.action == 'opened'", "false")), 1)]),
-    ("S04 ignored name coverage", "coverage-names", "suffix ignored events", [
-        (".github/workflows/coverage.yml", "    name: coverage${{ !(github.event_name != 'pull_request' || github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || (github.event.action == 'labeled' && github.event.label.name == 'coverage') || (github.event.action == 'edited' && github.event.changes.base != null)) && ' (ignored event)' || '' }}\n", "    name: coverage\n", 1)]),
+    ("coverage concurrency with event condition", "push-concurrency", "only pull request runs", [
+        (COVERAGE, PUSH_GROUP, PUSH_GROUP.replace(
+            "&& github.ref", "&& github.event.action == 'opened' && github.ref"), 1)]),
+    ("coverage changes with event condition", "docs-classifier", "changes must call the classifier", [
+        (COVERAGE, "  changes:\n", "  changes:\n    if: github.event.action == 'opened'\n", 1)]),
     ("S05 measure main", ("coverage-condition",) * 3,
      ("coverage-off job runs without the measure condition",
       "coverage-on job runs without the measure condition",
@@ -2657,7 +2646,10 @@ MUTATIONS = {
     'optimized-name-match': ('if step.get("name") == REHEARSAL_PROBE_NAME', 'if False', ['optimized probes command absent']),
     'optimized-command-match': (r'or any(re.search(r"(?:^|[;&|] *)cargo test [^#;&|]*\bvendored_wasm_release_cfg\b", line)', 'or any(False', ['optimized probes duplicate renamed']),
     'optimized-position': ('if builds != [index - 1]:', 'if False:', ['optimized probes before build', 'optimized probes separated', 'optimized probes build renamed']),
-    'optimized-shape': ('if actual != expected:', 'if False:', ['optimized probes guard changed', 'optimized probes filter dropped', 'optimized probes features changed', 'optimized probes release dropped', 'optimized probes no-run added', 'optimized probes continue-on-error', 'optimized probes failure swallowed', 'optimized probes jobs prefix', 'optimized probes jobs step env', 'optimized probes name changed', 'optimized probes command absent']),
+    'optimized-shape': (
+        'if actual != expected:\n            self.report(workflow, rule, "probe step differs from the required guard and command")',
+        'if False:\n            self.report(workflow, rule, "probe step differs from the required guard and command")',
+        ['optimized probes guard changed', 'optimized probes filter dropped', 'optimized probes features changed', 'optimized probes release dropped', 'optimized probes no-run added', 'optimized probes continue-on-error', 'optimized probes failure swallowed', 'optimized probes jobs prefix', 'optimized probes jobs step env', 'optimized probes name changed', 'optimized probes command absent']),
     'optimized-job-suppression': ('if "continue-on-error" in job:\n            self.report(workflow, rule, "probe job must not suppress failures")', 'if False:\n            self.report(workflow, rule, "probe job must not suppress failures")', ['optimized probes job suppression']),
     'optimized-dispatch': ('        self.check_rehearsal_security_probes()', '        pass', ['optimized probes missing']),
 
@@ -2923,19 +2915,29 @@ MUTATIONS = {
         'self.report(str(relative), rule, f"local reference {reference} names no file")', "pass",
         ["unresolved local reference in the called vendored-wasm workflow"]),
     "coverage-gate-condition": (
-        "if gate_condition != COVERAGE_GATE_CONDITION:", "if False:", ["coverage gate without always()"]),
+        "if gate_condition != COVERAGE_GATE_CONDITION:", "if False:",
+        ["coverage gate without always()", "coverage gate without if"]),
+    "coverage-gate-missing-if": (
+        'gate_condition = gate.get("if")', 'gate_condition = gate.get("if", "always()")',
+        ["coverage gate without if"]),
+    "coverage-changes-condition": (
+        'or "if" in job or "needs" in job', 'or "needs" in job',
+        ["coverage changes with event condition"]),
+    "coverage-concurrency-group": (
+        'if (concurrency.get("group") != group', 'if (False',
+        ["coverage concurrency with event condition", ".github/workflows/coverage.yml shared push group"]),
     "coverage-gate-label": (
         "if gate_condition != COVERAGE_GATE_CONDITION:", 'if not str(gate_condition).startswith("always()"):',
-        ["coverage gate bypasses eligibility"]),
+        ["coverage gate adds event condition"]),
     "coverage-gate-not-cancelled": (
         "if gate_condition != COVERAGE_GATE_CONDITION:",
-        'if gate_condition not in (COVERAGE_GATE_CONDITION, f"!cancelled() && ({COVERAGE_ELIGIBILITY})"):',
+        'if gate_condition not in (COVERAGE_GATE_CONDITION, "!cancelled()"):',
         ["coverage gate skipped on cancellation"]),
     "coverage-gate-unwrap": (
         "gate_condition = self.unwrap_expression(gate_condition)", "gate_condition = gate_condition",
         ["coverage gate condition wrapped in ${{ }} passes"]),
-    "coverage-gate-name": ('if job.get("name") != title + COVERAGE_SUFFIX:', "if False:",
-                           ["coverage gate renamed"] + [f"S04 ignored name {job}"
+    "coverage-gate-name": ('if job.get("name") != title:', "if False:",
+                           ["coverage gate renamed"] + [f"coverage name expression {job}"
                             for job in ("changes", "coverage-off", "coverage-on", "coverage")]),
     "coverage-part-condition": (
         "if condition != COVERAGE_CONDITION:", "if False:", ["coverage-on without the measure condition"]),
@@ -3033,11 +3035,11 @@ MUTATIONS = {
         'str(cancel).removeprefix("${{ ").removesuffix(" }}") != COVERAGE_SEED_CANCEL',
         ["cancel-in-progress with inner spaces passes"]),
     "cache-save-if-value": (
-        "if not isinstance(value, str) or self.unwrap_expression(value) != CACHE_SAVE_CONDITION:", "if False:",
+        "if not isinstance(value, str) or self.unwrap_expression(value) != expected:", "if False:",
         ["ci test cache saves on pull requests"]),
     "cache-save-if-boolean": (
-        "if not isinstance(value, str) or self.unwrap_expression(value) != CACHE_SAVE_CONDITION:",
-        "if value is not True and (not isinstance(value, str) or self.unwrap_expression(value) != CACHE_SAVE_CONDITION):",
+        "if not isinstance(value, str) or self.unwrap_expression(value) != expected:",
+        "if value is not True and (not isinstance(value, str) or self.unwrap_expression(value) != expected):",
         ["ci cache save-if always true"]),
     "cache-save-if-coverage": (
         'for source in sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")]):',
@@ -3060,16 +3062,20 @@ MUTATIONS = {
         'RUST_CACHE_ACTION = re.compile(r"Swatinem/rust-cache(/[\\w.-]+)*@", re.IGNORECASE)',
         'RUST_CACHE_ACTION = re.compile(r"Swatinem/rust-cache(/[\\w.-]+)*@")', ["rust-cache in upper case"]),
     "cache-save-if-unwrap": (
-        "self.unwrap_expression(value) != CACHE_SAVE_CONDITION",
-        'str(value).removeprefix("${{ ").removesuffix(" }}") != CACHE_SAVE_CONDITION',
+        "self.unwrap_expression(value) != expected",
+        'str(value).removeprefix("${{ ").removesuffix(" }}") != expected',
         ["save-if with inner spaces passes"]),
     "coverage-feature-on-pin": (
         '    (COVERAGE_WORKFLOW, "coverage-on"): (COVERAGE_CONDITION, (COVERAGE_ON_COMMAND,)),\n', "",
         ["feature-on measurement without mainnet-write"]),
-    "coverage-trigger-edited": (
-        'COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled", "edited")',
-        'COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled")',
-        ["coverage pull_request trigger without edited"]),
+    "coverage-trigger-reopened": (
+        'COVERAGE_EVENTS = ("opened", "synchronize", "reopened")',
+        'COVERAGE_EVENTS = ("opened", "synchronize")',
+        ["coverage pull_request trigger without reopened"]),
+    "coverage-trigger-extras": (
+        "if any(event not in COVERAGE_EVENTS for event in types) or len(types) != len(set(map(str, types))):",
+        "if False:",
+        ["coverage edited added", "coverage labeled added", "coverage duplicate event"]),
     "coverage-attempt-name": (
         'if inputs.get("name") not in names:', "if False:",
         ["coverage upload with a fixed name", "coverage download with a fixed name",
@@ -3118,15 +3124,6 @@ COUNT_CASES = [
 
 
 MUTATIONS.update({
-    "S-unlabeled": (
-        "if \"unlabeled\" in types:", "if False:",
-        ["S01 unlabeled is forbidden"]),
-    "S-eligibility-concurrency": (
-        "if (doc.get(\"concurrency\") or {}).get(\"group\") != COVERAGE_GROUP:", "if False:",
-        ["S02 eligibility concurrency"]),
-    "S-eligibility-conditions": (
-        "if (condition != expected if name == \"changes\" else condition.count(expected) != 1):", "if False:",
-        ["S03 eligibility changes","S03 eligibility coverage-off","S03 eligibility coverage-on","S03 eligibility coverage"]),
     "S-selection-jobs": (
         "self.report(workflow, \"selftest-selection\", f\"{name} must run after changes even on failure\")", "pass",
         ["S08 job feature-discipline needs","S08 job release-contracts failure","S08 job release-contracts errors"]),
@@ -4049,36 +4046,38 @@ def coverage_behavior():
     def render(template, values, cancelled):
         return re.sub(r"\$\{\{(.*?)\}\}", lambda match: str(evaluate(match.group(1), values, cancelled)), template)
 
-    for event, action, base, docs, result, event_label, pr_labels, changed, cancelled in itertools.product(
+    for event, action, base, docs, result, pr_labels, cancelled in itertools.product(
             ("pull_request", "push", "schedule", "workflow_dispatch"),
-            ("opened", "synchronize", "reopened", "labeled", "edited", "unlabeled"),
+            ("opened", "synchronize", "reopened"),
             ("main", "next"), ("true", "false", ""), ("success", "failure", "skipped"),
-            ("coverage", "other"), ((), ("other",), ("coverage",), ("other", "coverage")),
-            (False, True), (False, True)):
+            ((), ("other",), ("coverage",), ("other", "coverage")), (False, True)):
         if event != "pull_request" and base == "main" and docs == "true":
             continue  # The classifier cannot prove main docs-only.
-        eligible = (event != "pull_request" or action in ("opened", "synchronize", "reopened")
-                    or (action == "labeled" and event_label == "coverage") or (action == "edited" and changed))
         proven = result == "success" and docs == "true"
-        measure = eligible and (event != "pull_request" or base == "main" or not proven or "coverage" in pr_labels)
+        measure = (event != "pull_request" or base == "main" or not proven or "coverage" in pr_labels)
         measure = measure and not (event == "push" and proven)
         values = {"github.event_name": event, "github.event.action": action, "github.base_ref": base,
-                  "github.event.label.name": event_label, "github.event.changes.base": {} if changed else None,
                   "github.event.pull_request.labels.*.name": pr_labels, "needs.changes.result": result,
                   "needs.changes.outputs.docs_only": docs, "github.workflow": "Coverage",
                   "github.ref": "refs/pull/1/merge", "github.run_id": 123}
         for job_id, title in (("changes", "changes"), ("coverage-off", "coverage (feature-off)"),
                               ("coverage-on", "coverage (feature-on)"), ("coverage", "coverage")):
             job = doc["jobs"][job_id]
-            expected = eligible if job_id in ("changes", "coverage") else measure and not cancelled
-            if bool(evaluate(job["if"], values, cancelled)) != expected:
-                problems.append(f"{job_id}: eligibility/measurement differs: {values}, cancelled={cancelled}")
-            if render(job["name"], values, cancelled) != title + ("" if eligible else " (ignored event)"):
-                problems.append(f"{job_id}: ignored name differs: {values}")
+            expected = True if job_id in ("changes", "coverage") else measure and not cancelled
+            if job_id == "changes":
+                if "if" in job:
+                    problems.append("changes: must have no if condition")
+                actual = True
+            else:
+                actual = bool(evaluate(job["if"], values, cancelled))
+            if actual != expected:
+                problems.append(f"{job_id}: measurement condition differs: {values}, cancelled={cancelled}")
+            if job["name"] != title:
+                problems.append(f"{job_id}: plain name differs: {values}")
         decision = doc["jobs"]["coverage"]["steps"][0]
-        if eligible and bool(evaluate(decision["env"]["MEASURE"], values, cancelled)) != measure:
+        if bool(evaluate(decision["env"]["MEASURE"], values, cancelled)) != measure:
             problems.append(f"coverage decision measurement differs: {values}")
-        group = "refs/pull/1/merge" if event == "pull_request" and eligible else "123"
+        group = "refs/pull/1/merge" if event == "pull_request" else "123"
         if render(doc["concurrency"]["group"], values, cancelled) != "Coverage-" + group:
             problems.append(f"coverage concurrency differs: {values}")
     return problems
@@ -4111,6 +4110,133 @@ def coverage_decision(case=None):
             elif measured_output:
                 problems.append(f"{identity}: failed decision emitted measured output")
     return problems
+
+
+# The baseline and these single-field edits pin each pilot contract.
+PILOT_BLOCKS = {
+    name: live_text(CI, re.compile(r"^  " + name + r":\n.*?(?=^  (?:[a-z#])|\Z)",
+                                  re.DOTALL | re.MULTILINE), name)
+    for name in ("feature-on-test", "feature-on-test-shadow", "feature-on-test-extra", "feature-on-test-compare")
+}
+PASSING.append(("pilot baseline", []))
+for job, block in PILOT_BLOCKS.items():
+    edits = {
+        "name": block.replace("    name: " + job, "    name: renamed", 1),
+        "needs": block.replace("    needs: ", "    needs: other # ", 1),
+        "condition": block.replace("!cancelled()", "success()", 1),
+        "runner": block.replace("runs-on: ubuntu-24.04", "runs-on: ubuntu-22.04", 1),
+        "timeout": block.replace("timeout-minutes: ", "timeout-minutes: 1 # ", 1),
+        "continue": block.replace("    steps:", "    continue-on-error: true\n    steps:", 1),
+    }
+    if job == "feature-on-test":
+        edits.update({
+            "matrix": block.replace("- shard: 3", "- shard: 4"),
+            "matrix-type": block.replace("- shard: 1", "- shard: true"),
+            "fail-fast-type": block.replace("fail-fast: false", "fail-fast: 0"),
+            "fail-fast": block.replace("fail-fast: false", "fail-fast: true"),
+            "pin": block.replace("cargo-nextest@0.9.152", "cargo-nextest@0.9.151"),
+            "list": block.replace("cargo nextest list", "echo nextest list"),
+            "run": block.replace("--profile ci", "--profile default"),
+            "cache": block.replace(" && matrix.shard == 1", ""),
+            "cache-key": block.replace("shared-key: feature-on", "shared-key: other"),
+        })
+    if job in ("feature-on-test", "feature-on-test-shadow"):
+        edits.update({
+            "upload": block.replace("if: always()", "if: success()"),
+            "artifact-name": block.replace("name: feature-on-sh", "name: other-sh"),
+            "artifact-path": block.replace("partition.json\n", "wrong.json\n") if job == "feature-on-test"
+                             else block.replace("            shadow.json", "            wrong.json"),
+            "artifact-overwrite": block.replace("overwrite: true", "overwrite: false"),
+            "artifact-missing": block.replace("if-no-files-found: error", "if-no-files-found: warn"),
+        })
+    if job in ("feature-on-test-shadow", "feature-on-test-extra"):
+        edits["restore-only"] = block.replace("save-if: false", "save-if: true")
+        edits["command"] = block.replace("run: cargo test", "run: echo cargo test", 1)
+    if job == "feature-on-test-shadow":
+        edits["capture"] = block.replace("--no-run --message-format json", "--no-run")
+        edits["lists"] = block.replace("--capture cargo-tests.jsonl shadow.json", "--capture other.jsonl shadow.json")
+    if job == "feature-on-test-extra":
+        edits["network"] = block.replace("cargo check", "echo cargo check")
+        edits["proof"] = block.replace("--configuration feature-on", "--configuration feature-off")
+    if job == "feature-on-test-compare":
+        edits["guard"] = block.replace('test "$SHARDS_RESULT" = success', "true")
+        edits["guard-env"] = block.replace("needs.feature-on-test-shadow.result", "needs.feature-on-test.result")
+        edits["download"] = block.replace("pattern: feature-on-*", "pattern: other-*")
+        edits["compare"] = block.replace("compare-test-runs.py test-runs", "compare-test-runs.py other")
+    for rule, edited in edits.items():
+        assert edited != block, (job, rule)
+        CASES.append((f"pilot {job} {rule}", "ci-feature-jobs", f"pilot layout differs: {job}",
+                      [(CI, block, edited, 1)]))
+MUTATIONS["pilot-layout"] = (
+    'if actual != expected:\n                self.report("ci.yml", "ci-feature-jobs", f"pilot layout differs: {name}")',
+    'if False:\n                self.report("ci.yml", "ci-feature-jobs", f"pilot layout differs: {name}")',
+    [case[0] for case in CASES if case[0].startswith("pilot ")])
+MUTATIONS["pilot-baseline"] = (
+    'if actual != expected:\n                self.report("ci.yml", "ci-feature-jobs", f"pilot layout differs: {name}")',
+    'if True:\n                self.report("ci.yml", "ci-feature-jobs", f"pilot layout differs: {name}")',
+    ["pilot baseline"])
+MUTATIONS["pilot-scalar-types"] = (
+    'actual = yaml.safe_dump(self.job("ci.yml", name), sort_keys=True)\n            expected = yaml.safe_dump(expected, sort_keys=True)',
+    'actual = self.job("ci.yml", name)',
+    ["pilot feature-on-test matrix-type", "pilot feature-on-test fail-fast-type"])
+
+
+SHARD_SAVE_LINE = CACHE_SAVE_LINE.replace(" == 'push' ", " == 'push' && matrix.shard == 1 ")
+CASES.append(("pilot cache other workflow", "cache-save-if", "rust-cache saves on pull request runs", [
+    (CACHE_FIXTURE, CACHE_FIXTURE_TEXT,
+     cache_fixture("[pull_request]").replace("  fixture:", "  feature-on-test:").replace(
+         UNGUARDED_CACHE_STEP, UNGUARDED_CACHE_STEP + "        with:\n" + SHARD_SAVE_LINE), 1)]))
+CASES.append(("pilot cache other job", "cache-save-if", "ci.yml:test step", [
+    (CI, CI_TEST_CACHE, CI_TEST_CACHE.replace(CACHE_SAVE_LINE, SHARD_SAVE_LINE), 1)]))
+MUTATIONS["pilot-cache-workflow"] = (
+    'if source.name == "ci.yml" and name == "feature-on-test"',
+    'if name == "feature-on-test"', ["pilot cache other workflow"])
+MUTATIONS["pilot-cache-job"] = (
+    'if source.name == "ci.yml" and name == "feature-on-test"',
+    'if source.name == "ci.yml"', ["pilot cache other job"])
+MUTATIONS["pilot-cache-value"] = (
+    'CACHE_SAVE_CONDITION + " && matrix.shard == 1"', 'CACHE_SAVE_CONDITION', ["pilot baseline"])
+
+
+for name in ("feature-on-clippy", "feature-on-doc"):
+    block = live_text(CI, re.compile(r"^  " + name + r":\n.*?(?=^  [a-z])", re.M | re.S), name)
+    for label, changed in (
+            ("key", block.replace("shared-key: feature-on", "shared-key: other")),
+            ("writer", block.replace("save-if: false", "save-if: ${{ github.event_name == 'push' }}"))):
+        CASES.append((f"pilot {name} cache {label}", "cache-save-if", "must only restore the shared cache",
+                      [(CI, block, changed, 1)]))
+MUTATIONS["pilot-lint-doc-cache"] = (
+    'if (step.get("with") or {}).get("shared-key") != "feature-on" or value is not False:',
+    'if False:', [f"pilot {name} cache {label}" for name in ("feature-on-clippy", "feature-on-doc")
+                  for label in ("key", "writer")])
+
+
+PASSING.append(("pilot lint cache other workflow", [
+    (CACHE_FIXTURE, CACHE_FIXTURE_TEXT,
+     cache_fixture("[pull_request]").replace("  fixture:", "  feature-on-doc:").replace(
+         UNGUARDED_CACHE_STEP, UNGUARDED_CACHE_STEP + "        with:\n          save-if: false\n"), 1)]))
+MUTATIONS["pilot-lint-cache-scope"] = (
+    'if source.name == "ci.yml" and name in ("feature-on-clippy", "feature-on-doc"):',
+    'if name in ("feature-on-clippy", "feature-on-doc"):', ["pilot lint cache other workflow"])
+MUTATIONS["pilot-lint-cache-key"] = (
+    'if (step.get("with") or {}).get("shared-key") != "feature-on" or value is not False:',
+    'if value is not False:', ["pilot feature-on-clippy cache key"])
+MUTATIONS["pilot-lint-cache-writer"] = (
+    'if (step.get("with") or {}).get("shared-key") != "feature-on" or value is not False:',
+    'if (step.get("with") or {}).get("shared-key") != "feature-on":', ["pilot feature-on-doc cache writer"])
+
+
+for name in ("feature-on-clippy", "feature-on-doc"):
+    block = live_text(CI, re.compile(r"^  " + name + r":\n.*?(?=^  [a-z])", re.M | re.S), name)
+    cache = live_text(CI, re.compile(r"^  " + name + r":\n.*?(?=^  [a-z])", re.M | re.S), name)
+    cache = re.search(r"      - uses: Swatinem/rust-cache@.*?          save-if: false\n", cache, re.S)[0]
+    for label, value in (("missing", ""), ("duplicate", cache + cache)):
+        CASES.append((f"pilot {name} cache {label}", "cache-save-if", "must have one shared cache restore",
+                      [(CI, block, block.replace(cache, value), 1)]))
+MUTATIONS["pilot-lint-cache-count"] = (
+    "if len(caches) != 1:", "if False:",
+    [f"pilot {name} cache {label}" for name in ("feature-on-clippy", "feature-on-doc")
+     for label in ("missing", "duplicate")])
 
 
 def main():

@@ -35,11 +35,14 @@ the review approves with no blocking findings.
 
 ### 3. Tests and coverage
 
-- Coverage measures automatically on eligible events for code pull requests and
-  every pull request into `main`; the `coverage` check on the head is green.
-  The required job runs on every eligible event and passes docs-only changes
-  into `next` without measuring. The `coverage` label requires measurement on a
-  documentation-only pull request into `next`.
+- Opening, pushing to, or reopening a pull request evaluates coverage.
+  Coverage measures code pull requests and every pull request into `main`.
+  The `coverage` check on the head is green.
+  The required job runs on every triggered event.
+  It passes docs-only changes into `next` without measuring unless the pull
+  request carries the `coverage` label.
+  The `coverage` label requires measurement on the next push or reopen.
+  Editing or labeling a pull request starts no Coverage run.
 - Line coverage clears the per-crate floors enforced by
   `.github/scripts/check-coverage.py` (a regression ratchet set a few points
   below current offline coverage); 90% per crate is the aspirational target,

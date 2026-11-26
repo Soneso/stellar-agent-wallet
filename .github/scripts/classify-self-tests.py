@@ -10,7 +10,7 @@ from changed_paths import collect
 BASE = (".github/**", "Cargo.toml", "**/Cargo.toml", "Cargo.lock", "**/Cargo.lock",
         "rust-toolchain.toml", "Cross.toml", "deny.toml", "scripts/**", "contracts/**")
 GROUPS = {
-    "scripts": (),  # Any deletion (including a rename source) checks CODEOWNERS.
+    "scripts": (".config/nextest.toml",),  # Any deletion (including a rename source) checks CODEOWNERS.
     "rust": ("crates/**", "build.rs", "**/build.rs", "docs/maintainers/building.md"),
     "docs": ("*.md", "skills/**", ".claude-plugin/**"),
     "preflight": ("changelog.d/**", "CHANGELOG.md", "CONTRIBUTING.md",
