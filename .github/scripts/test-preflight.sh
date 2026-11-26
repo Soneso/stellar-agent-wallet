@@ -54,7 +54,7 @@ FIXTURE="$TMP/fixture"
 CASES="changelog-fragments changelog-selection changelog-registry docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
 release-rehearsal-workflow vendored-wasm-workflow unlisted-workflow yaml-workflow
 triage-workflow triage-review-workflow triage-sweep-workflow
-ci-yml-only python-check-script proof-matrix-only shell-check-script testnet-driver-script deploy-scripts deploy-scripts-run skill inbox-web enroll-web bridge-web one-crate sep43-through-mcp two-owners
+ci-yml-only python-check-script proof-matrix-only shell-check-script testnet-driver-script payment-evidence-script deploy-scripts deploy-scripts-run skill inbox-web enroll-web bridge-web one-crate sep43-through-mcp two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
 unowned-rust-path
 wallet-manifest removed-member untracked-test-file fixture-markdown crate-sources-select-proof-matrix
@@ -1207,6 +1207,15 @@ case_testnet_driver_script() {
     feature-discipline self-test:test-check-feature-discipline.py \
     self-test:test-run-testnet-acceptance.sh \
     "shellcheck-changed=shellcheck -s bash .github/scripts/run-testnet-acceptance.sh"
+}
+
+# The payment evidence checker selects the testnet acceptance driver's self-test.
+case_payment_evidence_script() {
+  start_case
+  edit .github/scripts/check-payment-evidence.py
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+    feature-discipline self-test:test-check-feature-discipline.py \
+    self-test:test-run-testnet-acceptance.sh
 }
 
 # A change below scripts/deploy/ selects the shellcheck of those scripts and
