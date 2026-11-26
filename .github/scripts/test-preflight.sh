@@ -54,7 +54,7 @@ FIXTURE="$TMP/fixture"
 CASES="changelog-fragments changelog-selection changelog-registry docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
 release-rehearsal-workflow vendored-wasm-workflow unlisted-workflow yaml-workflow
 triage-workflow triage-review-workflow triage-sweep-workflow
-ci-yml-only python-check-script proof-matrix-only shell-check-script testnet-driver-script deploy-scripts deploy-scripts-run skill inbox-web enroll-web bridge-web one-crate sep43-through-mcp two-owners
+ci-yml-only python-check-script run-evidence-script proof-matrix-only shell-check-script testnet-driver-script deploy-scripts deploy-scripts-run skill inbox-web enroll-web bridge-web one-crate sep43-through-mcp two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
 unowned-rust-path
 wallet-manifest removed-member untracked-test-file fixture-markdown crate-sources-select-proof-matrix
@@ -102,6 +102,7 @@ self-test:test-check-install-surface.py	python3 .github/scripts/test-check-insta
 self-test:test-check-no-direct-sasignersetbaselined-emit.sh	bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh
 self-test:test-check-proof-matrix.py	python3 .github/scripts/test-check-proof-matrix.py
 self-test:test-check-ref-on-main.sh	bash .github/scripts/test-check-ref-on-main.sh
+self-test:test-check-run-evidence.py	python3 .github/scripts/test-check-run-evidence.py --mutations
 self-test:test-check-workflow-invariants.py	python3 .github/scripts/test-check-workflow-invariants.py
 self-test:test-classify-docs-only.py	python3 .github/scripts/test-classify-docs-only.py
 self-test:test-classify-self-tests.py	python3 .github/scripts/test-classify-self-tests.py
@@ -337,7 +338,7 @@ expect_list() {
   fi
   local extra=() argument
   case "$CASE_NAME" in
-    deleted-install-surface-doc | welcome-workflow | release-workflow | release-rehearsal-workflow | vendored-wasm-workflow | triage-workflow | triage-review-workflow | triage-sweep-workflow | ci-yml-only | python-check-script | proof-matrix-only | shell-check-script | one-crate | sep43-through-mcp | two-owners | target-specific-edge | dev-dependency-edge | optional-dependency-edge | root-manifest | lockfile | wallet-manifest | removed-member | untracked-test-file | crate-sources-select-proof-matrix | staged-rename-record | spaces-and-an-apostrophe | action-script | invariants-helper | release-build-scripts | duplicate-triggers | changed-self-test | deleted-shell-script | deleted-self-test | the-preflight-itself)
+    deleted-install-surface-doc | welcome-workflow | release-workflow | release-rehearsal-workflow | vendored-wasm-workflow | triage-workflow | triage-review-workflow | triage-sweep-workflow | ci-yml-only | python-check-script | run-evidence-script | proof-matrix-only | shell-check-script | one-crate | sep43-through-mcp | two-owners | target-specific-edge | dev-dependency-edge | optional-dependency-edge | root-manifest | lockfile | wallet-manifest | removed-member | untracked-test-file | crate-sources-select-proof-matrix | staged-rename-record | spaces-and-an-apostrophe | action-script | invariants-helper | release-build-scripts | duplicate-triggers | changed-self-test | deleted-shell-script | deleted-self-test | the-preflight-itself)
       extra+=(feature-discipline self-test:test-check-feature-discipline.py)
       ;;
   esac
@@ -1182,6 +1183,14 @@ case_python_check_script() {
     self-test:test-check-docs-style.py
 }
 
+# release.yml names the run evidence check, which selects its own self-test.
+case_run_evidence_script() {
+  start_case
+  edit .github/scripts/check-run-evidence.py
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-check-run-evidence.py
+}
+
 # A change to the proof matrix alone selects both matrix checks.
 case_proof_matrix_only() {
   start_case
@@ -1473,8 +1482,8 @@ case_full() {
       *) original=$((original + 1)) ;;
     esac
   done
-  if [ "$original" -ne 65 ] || [ "$added" -ne 3 ]; then
-    fail "the expected registry requires 65 original rows, 2 changelog rows, and 1 classifier row"
+  if [ "$original" -ne 66 ] || [ "$added" -ne 3 ]; then
+    fail "the expected registry requires 66 original rows, 2 changelog rows, and 1 classifier row"
   fi
   expect_list --full "${ids[@]}"
 }
