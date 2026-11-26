@@ -6,8 +6,8 @@
 # Friendbot and RPC load balancer, and back-to-back fund/deploy bursts trip
 # rate limits and eventual-consistency windows that have nothing to do with
 # the code under test. For the same reason a failing suite is retried once
-# after a cooldown; a pass on retry is reported as "pass (retry)" so
-# environmental flakiness stays visible instead of disappearing into green.
+# after a cooldown. The first failure remains a failure; every attempt has
+# a retained log and exit status, including a successful diagnostic retry.
 #
 # A suite that executes zero tests fails the run: several test files are
 # compiled empty when their feature flag is missing, so an empty test binary
@@ -37,9 +37,10 @@
 #                   the first suite.
 #   PACE            seconds to sleep between suites (default 30)
 #   RETRY_COOLDOWN  seconds to sleep before the single retry (default 60)
+#   TESTNET_ATTEMPT_DIR  retained attempt logs and statuses (default target/tmp/testnet-attempts)
 #
 # Each result line, the summary, and the step summary carry the wall seconds
-# of the attempt that produced the result, and for a retried suite the
+# of the last attempt, and for a retried suite the
 # seconds of all its attempts; the summary closes with the leg's wall time.
 #
 # The WebAuthn suite (smart_account_rules_webauthn_testnet_acceptance), the
@@ -444,6 +445,52 @@ in_share() {
   fi
 }
 
+# Builds the isolated CLI once per share in the selected feature state.
+build_acceptance_binary() {
+  if [ "$MAINNET_WRITE" = on ]; then
+    cargo build --locked --release -p stellar-agent-cli --bin stellar-agent --no-default-features --features mainnet-write,test-helpers --features stellar-agent-network/test-helpers
+  else
+    cargo build --locked --release -p stellar-agent-cli --bin stellar-agent --no-default-features --features test-helpers --features stellar-agent-network/test-helpers
+  fi
+}
+
+# Streams and records each attempt without replacing earlier records.
+# Returns 3 with RECORD_ERROR when the directory or record reservation fails.
+record_attempt() {
+  local crate="$1" feature="$2" target="$3" number=1 log status metrics
+  local directory="${TESTNET_ATTEMPT_DIR:-target/tmp/testnet-attempts}"
+  LAST_SECONDS=0
+  LAST_SKIPS=0
+  RECORD_ERROR=""
+  if ! mkdir -p "$directory"; then
+    RECORD_ERROR="attempt directory setup failed: $directory"
+    echo "error: $RECORD_ERROR" >&2
+    return 3
+  fi
+  while [ -e "$directory/$target.attempt-$number.log" ] || [ -e "$directory/$target.attempt-$number.status" ] || [ -e "$directory/$target.attempt-$number.metrics" ]; do
+    number=$((number + 1))
+  done
+  log="$directory/$target.attempt-$number.log"
+  status="$directory/$target.attempt-$number.status"
+  metrics="$directory/$target.attempt-$number.metrics"
+  # Noclobber also refuses a collision with another writer.
+  if ! (set -C; : > "$log" && : > "$status" && : > "$metrics"); then
+    RECORD_ERROR="attempt record reservation failed: $log, $status or $metrics"
+    echo "error: $RECORD_ERROR" >&2
+    return 3
+  fi
+  # The pipeline streams output; the sidecar carries its subshell's measurements.
+  {
+    run_suite "$crate" "$feature" "$target"
+    printf '%s\n' "$?" >> "$status"
+    printf '%s %s\n' "$LAST_SECONDS" "$LAST_SKIPS" >> "$metrics"
+  } 2>&1 | tee "$log"
+  read -r LAST_STATUS < "$status"
+  read -r LAST_SECONDS LAST_SKIPS < "$metrics"
+  ATTEMPT_STATUSES="${ATTEMPT_STATUSES:+$ATTEMPT_STATUSES, }attempt $number: $LAST_STATUS"
+  return "$LAST_STATUS"
+}
+
 # Runs one suite; prints the cargo output as it streams. Returns 0 on a real
 # pass (at least one test executed), 1 on test failure, 2 on a vacuous pass
 # (the binary ran zero tests, which means the feature gating is broken), 3 on
@@ -453,7 +500,7 @@ in_share() {
 # Sets LAST_SKIPS to the number of self-skip markers the suite printed. Tests
 # that need an unavailable precondition print a SKIP line and return without
 # failing; surfacing the count in the summary keeps a green run honest about
-# what did not execute. Sets LAST_SECONDS to the wall seconds of the attempt.
+# what did not execute. Sets LAST_SECONDS to the wall seconds of the last attempt.
 #
 # Every suite builds with --no-default-features and the list suite_features
 # prints, so mainnet-write is on only under MAINNET_WRITE=on and only for a
@@ -492,7 +539,7 @@ run_suite() {
       return 3
     fi
   fi
-  env "${trust_env[@]}" cargo test -p "$crate" --no-default-features --features "$features" --test "$target" \
+  env ${trust_env[@]+"${trust_env[@]}"} cargo test -p "$crate" --no-default-features --features "$features" --test "$target" \
     -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$log"
   status=${PIPESTATUS[0]}
   LAST_SECONDS=$((SECONDS - start))
@@ -521,8 +568,8 @@ run_suite() {
 }
 
 # Prints a suite result: the outcome, then in parentheses its notes, the wall
-# seconds of the attempt that produced it, and for a retried suite the wall
-# seconds of all attempts, as in "pass (retry, 412 s, 830 s total)".
+# seconds of the last attempt, and for a retried suite the wall
+# seconds of all attempts. A first failure retains every attempt status.
 format_result() {
   local outcome="$1" notes="$2" attempts="$3" last="$4" total="$5" detail
   detail="${notes:+$notes, }${last} s"
@@ -533,7 +580,7 @@ format_result() {
 }
 
 main() {
-  local line crate feature target suite rc attempts suite_seconds outcome notes result leg_start leg_seconds i
+  local line crate feature target suite rc first_rc attempts suite_seconds outcome notes result leg_start leg_seconds i
   check_mainnet_write || exit 2
   check_test_keyring || exit 2
   check_share || exit 2
@@ -549,6 +596,8 @@ main() {
     echo "error: no suite matched FILTER='$FILTER'" >&2
     exit 2
   fi
+
+  build_acceptance_binary || exit 3
 
   report_status=()
   report_suite=()
@@ -572,8 +621,10 @@ main() {
     fi
     ran=$((ran + 1))
     echo "::group::$suite [storage=$(suite_storage "$crate" "$target")]"
-    run_suite "$crate" "$feature" "$target"
+    ATTEMPT_STATUSES=""
+    record_attempt "$crate" "$feature" "$target"
     rc=$?
+    first_rc=$rc
     attempts=1
     suite_seconds=$LAST_SECONDS
     # A vacuous pass (2) and a compile, unknown-target, or unknown-feature
@@ -582,40 +633,41 @@ main() {
     if [ "$rc" -eq 1 ]; then
       echo "suite $suite failed; retrying once after ${RETRY_COOLDOWN}s cooldown"
       sleep "$RETRY_COOLDOWN"
-      run_suite "$crate" "$feature" "$target"
+      record_attempt "$crate" "$feature" "$target"
       rc=$?
       attempts=2
       suite_seconds=$((suite_seconds + LAST_SECONDS))
-      if [ "$rc" -ne 0 ] && is_browser_suite "$target"; then
+      if [ "$rc" -eq 1 ] && is_browser_suite "$target"; then
         # Headless-Chromium page-load failures are a distinct environmental
         # flake from the rest of this suite's dependencies; browser suites
         # get one additional retry beyond the universal retry-once default.
         echo "browser suite $suite failed twice; retrying once more after \
 ${BROWSER_RETRY_COOLDOWN}s cooldown"
         sleep "$BROWSER_RETRY_COOLDOWN"
-        run_suite "$crate" "$feature" "$target"
+        record_attempt "$crate" "$feature" "$target"
         rc=$?
         attempts=3
         suite_seconds=$((suite_seconds + LAST_SECONDS))
       fi
     fi
     notes=""
-    if [ "$rc" -eq 0 ]; then
+    if [ "$first_rc" -eq 0 ]; then
       outcome="pass"
-      case "$attempts" in
-        2) notes="retry" ;;
-        3) notes="retry 2" ;;
-      esac
       if [ "${LAST_SKIPS:-0}" -gt 0 ]; then
         notes="${notes:+$notes, }${LAST_SKIPS} skip marker(s)"
       fi
     else
       outcome="FAIL"
       failures=$((failures + 1))
-      if [ "$attempts" -eq 1 ] && [ "$rc" -eq 2 ]; then
+      if [ -n "$RECORD_ERROR" ]; then
+        notes="$RECORD_ERROR"
+      elif [ "$attempts" -eq 1 ] && [ "$rc" -eq 2 ]; then
         notes="vacuous: zero tests executed"
       elif [ "$attempts" -eq 1 ] && [ "$rc" -eq 3 ]; then
         notes="build or target error"
+      fi
+      if [ -n "$ATTEMPT_STATUSES" ]; then
+        notes="${notes:+$notes, }$ATTEMPT_STATUSES"
       fi
     fi
     result=$(format_result "$outcome" "$notes" "$attempts" "$LAST_SECONDS" "$suite_seconds")

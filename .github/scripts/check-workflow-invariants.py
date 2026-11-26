@@ -279,8 +279,25 @@ runs the function.
   Its effective shell must be unset or ``bash``.
 - ``apt-retries``: an ``apt-get`` call in any workflow's ``run:`` block lacks
   ``-o Acquire::Retries=3``. Each call is checked separately; comments are ignored.
-- ``ci-triggers``: ``ci.yml`` lacks ``push`` or a ``pull_request`` branch list
-  containing ``main``, or adds an event that requires re-evaluating the archive condition.
+- ``ci-triggers``: ``ci.yml`` lacks ``push``, a ``pull_request`` branch list
+  containing ``main``, or ``workflow_dispatch`` without inputs, or adds an
+  event that requires re-evaluating the archive condition.
+- ``release-ci-evidence``: the ``release.yml`` preflight's permissions are not
+  exactly ``RELEASE_EVIDENCE_PERMISSIONS``, the job sets ``if`` or
+  ``continue-on-error``, or the workflow or another release job holds an
+  ``actions`` scope or a string permission. Only the SLSA ``provenance``
+  job, with exactly ``RELEASE_PROVENANCE_PERMISSIONS``, which the generator
+  needs, the ``uses:`` of ``RELEASE_PROVENANCE_USES``, and no ``steps:``,
+  keeps ``actions: read``. The preflight lacks exactly one
+  ``RELEASE_EVIDENCE_STEP`` directly after the ancestry step, the step sets
+  ``if`` or ``continue-on-error``, its effective shell is not the default
+  bash, its command differs from ``RELEASE_EVIDENCE_COMMAND``, or its
+  ``env`` differs from ``RELEASE_EVIDENCE_ENV``. The workflow ``env``, the
+  job ``env``, or another step sets ``GH_TOKEN`` or ``GITHUB_TOKEN``, in any
+  letter case. Any other expression of the preflight, or of the workflow
+  ``env`` and ``defaults``, reads the ``secrets`` context, the workflow
+  token, or the ``github`` context other than by a named property, read as
+  for ``rehearsal-credentials``.
 - ``changelog-check``: fragment validation or tests can be bypassed, or checkout lacks full history and the main ref.
 - ``changelog-guard``: integration changelog protection differs from its condition, event SHAs, shell, or command.
 - ``release-fragments``: preflight lacks the read-only pending-fragment check immediately after the version header check.
@@ -580,6 +597,18 @@ VERIFY_JOBS = (("release.yml", "verify-packaged"), ("release.yml", "verify-prove
                ("publish.yml", "verify"), ("publish.yml", "verify-install"),
                ("release-rehearsal.yml", "verify-packaged"), ("release-rehearsal.yml", "verify-crates"))
 TOKEN_ENV = {"GH_TOKEN", "GITHUB_TOKEN"}
+# The release preflight's run evidence check, the only preflight step that
+# holds the workflow token. The preflight and the SLSA provenance call are
+# the only release jobs with actions: read.
+RELEASE_EVIDENCE_PERMISSIONS = {"contents": "read", "actions": "read"}
+RELEASE_EVIDENCE_STEP = "Require the push CI evidence of the tag commit"
+RELEASE_EVIDENCE_COMMAND = ('python3 .github/scripts/check-run-evidence.py --repository "$GITHUB_REPOSITORY" '
+                            '--sha "$GITHUB_SHA" --tag "$GITHUB_REF_NAME" --wait-minutes 80 --poll-seconds 60')
+RELEASE_EVIDENCE_ENV = {"GH_TOKEN": "${{ github.token }}"}
+# The SLSA generator call reads its own run, so the provenance job keeps
+# exactly these permissions, this call, and no steps of its own.
+RELEASE_PROVENANCE_PERMISSIONS = {"actions": "read", "id-token": "write", "contents": "write"}
+RELEASE_PROVENANCE_USES = "slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0"
 SKILL_ARCHIVE_CONDITION = "github.base_ref != 'next' && github.ref != 'refs/heads/next'"
 # The feature jobs of ci.yml and the commands that define each of them. The
 # off jobs pass --no-default-features, which keeps mainnet-write off; the
@@ -605,6 +634,7 @@ SELFTESTS = {
         "python3 .github/scripts/test-classify-docs-only.py": "scripts",
         "python3 .github/scripts/test-classify-self-tests.py": "scripts",
         "python3 .github/scripts/test-ci-result.py": "scripts",
+        "python3 .github/scripts/test-check-run-evidence.py --mutations": "scripts",
         "python3 .github/scripts/test-check-docs-reads.py": "scripts",
         "python3 .github/scripts/test-validate-unsigned-archive.py": "scripts",
         "\"$RUNNER_TEMP/workflow-check/bin/python\" .github/scripts/test-check-workflow-invariants.py": "scripts",
@@ -1990,6 +2020,45 @@ class Checker:
                 or self.run_text(pending[0][1]).strip() != PENDING_FRAGMENTS):
             self.report(workflow, rule, "pending fragments step must follow the version header check without bypasses")
 
+    def check_release_ci_evidence(self):
+        workflow, rule = "release.yml", "release-ci-evidence"
+        doc = self.docs.get(workflow, {})
+        job = self.job(workflow, "preflight") or {}
+        if job.get("permissions") != RELEASE_EVIDENCE_PERMISSIONS or self.may_skip(job):
+            self.report(workflow, rule, "preflight must hold exactly contents: read and actions: read, unconditionally")
+        for owner, node in [("the workflow", doc),
+                            *((name, other) for name, other in (doc.get("jobs") or {}).items()
+                              if name != "preflight" and isinstance(other, dict))]:
+            permissions = node.get("permissions")
+            if (owner == "provenance" and permissions == RELEASE_PROVENANCE_PERMISSIONS
+                    and node.get("uses") == RELEASE_PROVENANCE_USES and "steps" not in node):
+                continue
+            if isinstance(permissions, str) or (isinstance(permissions, dict) and "actions" in permissions):
+                self.report(workflow, rule, f"{owner} must hold no actions scope")
+        steps = job.get("steps", [])
+        evidence = [i for i, step in enumerate(steps) if step.get("name") == RELEASE_EVIDENCE_STEP]
+        ancestry = [i for i, step in enumerate(steps)
+                    if any(ANCESTRY_CALL.match(line) for line in self.logical_lines(step.get("run")))]
+        if len(evidence) != 1 or len(ancestry) != 1 or evidence[0] != ancestry[0] + 1:
+            self.report(workflow, rule, "the evidence step must directly follow the ancestry step")
+        for index in evidence:
+            step = steps[index]
+            if self.may_skip(step) or self.effective_shell(workflow, "preflight", step) not in (None, "bash") \
+                    or self.run_text(step).strip() != RELEASE_EVIDENCE_COMMAND \
+                    or step.get("env") != RELEASE_EVIDENCE_ENV:
+                self.report(workflow, rule,
+                            "the evidence step must run its command unconditionally in bash with only the token")
+        for owner, env in [("workflow env", doc.get("env")), ("job env", job.get("env")),
+                           *((f"step {i + 1}", step.get("env")) for i, step in enumerate(steps) if i not in evidence)]:
+            if isinstance(env, dict) and {str(key).upper() for key in env} & TOKEN_ENV:
+                self.report(workflow, rule, f"{owner} sets a token variable")
+        # Every other expression of the preflight, and of the env and defaults
+        # it inherits, reads neither secrets nor the token.
+        scanned = dict(job, steps=[{key: value for key, value in step.items() if not (i in evidence and key == "env")}
+                                   for i, step in enumerate(steps)])
+        inherited = {key: doc[key] for key in ("env", "defaults") if key in doc}
+        self.check_credential_expressions(f"{workflow}:preflight", {"preflight": scanned, **inherited}, rule)
+
     def check_ci_feature_jobs(self):
         for name, commands in CI_FEATURE_JOBS.items():
             job = self.job("ci.yml", name)
@@ -2085,11 +2154,14 @@ class Checker:
         if not isinstance(triggers, dict):
             self.report("ci.yml", "ci-triggers", "expected push and pull_request triggers with branch filters")
             return
-        for event in sorted(set(triggers) - {"push", "pull_request"}):
+        for event in sorted(set(triggers) - {"push", "pull_request", "workflow_dispatch"}):
             self.report("ci.yml", "ci-triggers",
                         f"archive condition must be re-evaluated for the new event: {event}")
         if "push" not in triggers:
             self.report("ci.yml", "ci-triggers", "push trigger is absent")
+        # The release preflight accepts a dispatched run as evidence; it takes no inputs.
+        if "workflow_dispatch" not in triggers or triggers["workflow_dispatch"] not in (None, {}):
+            self.report("ci.yml", "ci-triggers", "workflow_dispatch must be a trigger without inputs")
         pull_request = triggers.get("pull_request")
         branches = pull_request.get("branches") if isinstance(pull_request, dict) else None
         if not isinstance(branches, list) or "main" not in branches:
@@ -2411,6 +2483,7 @@ class Checker:
         self.check_release_vars()
         self.check_changelog_workflow()
         self.check_release_fragments()
+        self.check_release_ci_evidence()
         self.check_ci_result()
         self.check_docs_classifier()
         self.check_push_concurrency()

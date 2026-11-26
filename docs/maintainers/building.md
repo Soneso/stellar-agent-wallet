@@ -276,6 +276,19 @@ A pull request retargeted to `main` runs coverage immediately. The full CI set
 and install surface rerun after a new push or a reopen, producing the required
 `ci-result (main)` check.
 
+`ci.yml` also runs on `workflow_dispatch`, which takes no inputs. A dispatched
+run is a full run. For any event other than a pull request or a push into
+`next`, `classify-docs-only.py` prints `docs_only=false` and
+`classify-self-tests.py` selects every self-test group. Every job then runs
+except `docs-tests`, which runs only for a docs-only change. A dispatch on `main` or
+on a tag also checks the skill archive, as a push to `main` does. Its result
+check is `ci-result (<ref name>)`.
+The `ci-triggers` rule of `check-workflow-invariants.py` requires this trigger
+and refuses every other new event. The release preflight accepts a successful
+dispatched run on `main` or on the tag in place of a missing or failed `ci.yml`
+push run of the tagged commit; the `release-ci-evidence` rule pins that check.
+See [What the release preflight refuses](releasing.md#what-the-release-preflight-refuses).
+
 The `feature-discipline`, `release-contracts`, and `install-surface` jobs keep
 checks unconditional, with the skill archive exception below.
 On pull requests into or pushes to `next`,
@@ -310,8 +323,8 @@ bash .github/scripts/preflight.sh
 ```
 
 - `--base <ref>` compares the branch with its merge base with `<ref>`. The
-  default is `upstream/main`, or `origin/main` when `upstream/main` is missing
-  or an ancestor of `origin/main`, or `main` when neither exists.
+  default is `upstream/next`, or `origin/next` when `upstream/next` is missing
+  or an ancestor of `origin/next`, or `next` when neither exists.
 - `--full` runs every gate in the registry, with workspace Cargo commands.
   It includes coverage and its floor check.
 - `--list` prints the selected gates, one `<id><TAB><command>` line each in
@@ -449,6 +462,7 @@ gate except `shellcheck-changed`, which needs a changed shell script.
      `check-no-direct-sasignersetbaselined-emit.sh`
    - `test-check-proof-matrix.py`: `check-proof-matrix.py`
    - `test-check-ref-on-main.sh`: `check-ref-on-main.sh`
+   - `test-check-run-evidence.py`: `check-run-evidence.py`
    - `test-check-workflow-invariants.py`: `check-workflow-invariants.py`, or
      any change that selects `workflow-invariants`, because the self-test
      runs that check on copies of the same files
@@ -460,7 +474,8 @@ gate except `shellcheck-changed`, which needs a changed shell script.
    - `test-publish-crates-check.sh`: `publish-crates.sh`
    - `test-publish-crates-verify.sh`: `publish-crates.sh`
    - `test-rebuild-vendored-wasm.sh`: `rebuild-vendored-wasm.sh`
-   - `test-run-testnet-acceptance.sh`: `run-testnet-acceptance.sh`
+   - `test-run-testnet-acceptance.sh`: `run-testnet-acceptance.sh` or
+     `check-payment-evidence.py`
    - `test-sync-labels.py`: `sync-labels.py`, `.github/labels.yml`, or
      `.github/workflows/labels.yml`
    - `test-take-workflow.py`: `.github/workflows/take.yml`
@@ -504,8 +519,8 @@ gate except `shellcheck-changed`, which needs a changed shell script.
     also runs on a change under `crates/stellar-agent-webauthn-bridge/src/web/`.
 20. `interop:mpp` and `interop:sdk-v17`: `--full` only.
 
-`package-skill.sh`, `release-preflight-version-check.sh`, `run-docs-tests.py`,
-and `check-payment-evidence.py` have no self-test.
+`package-skill.sh`, `release-preflight-version-check.sh`, and
+`run-docs-tests.py` have no self-test.
 The preflight runs the workflow checks with `python3`, which needs PyYAML importable, for example from
 the `.venv` virtual environment of the PyYAML install command.
 
@@ -845,9 +860,10 @@ crates, so a test build of `stellar-agent-smart-account` alone compiles none
 of them.
 
 These tests require network reachability to testnet RPC and Friendbot. Testnet is
-the default network; Friendbot funding is testnet-only. Live acceptance runs
-with `mainnet-write` off by default: the runner passes `--no-default-features`
-to every suite. With `MAINNET_WRITE=on`, each suite of a crate that declares a
+the default network; Friendbot funding is testnet-only. The local driver defaults
+to `MAINNET_WRITE=off`; workflow dispatch defaults to `mainnet_write=true`.
+The driver passes `--no-default-features` to every suite.
+With `MAINNET_WRITE=on`, each suite of a crate that declares a
 `mainnet-write` feature also enables that feature, which is the build the
 binaries ship by default. A crate without the feature builds as with
 `MAINNET_WRITE=off`. Any other value fails the run before the first suite.
@@ -902,9 +918,39 @@ job runs it with a 30-minute job timeout. The budget covers the signer-set
 baseline self-test, workflow invariant cases and mutation controls, and the
 other release contract checks.
 
-Each result line carries the wall seconds of the attempt that produced the
-result. A retried suite also carries the seconds of all its attempts, as in
-`pass (retry, 412 s, 830 s total)`. Console and workflow summary headers name
+Before the first suite, each share builds the isolated CLI, even when its
+selection contains no smart-account CLI test. A failed build stops the share
+before any suite. The feature-off command is:
+
+```bash
+cargo build --locked --release -p stellar-agent-cli --bin stellar-agent \
+  --no-default-features --features test-helpers \
+  --features stellar-agent-network/test-helpers
+```
+
+The on state replaces `test-helpers` in the first feature argument with
+`mainnet-write,test-helpers`. Dependency helpers isolate keyring and storage
+paths as in the CLI child tests. Product features and release builds keep
+their definitions. The five caps, list-rules, and horizon CLI tests fail
+before network access if the binary is missing, unreadable, or lacks isolation.
+Each child uses a marked `StateSandbox` through `cli_child::cli_command`.
+
+A first failed attempt keeps the suite and share failed. Ordinary test
+failures get one diagnostic retry after 60 seconds; browser suites can get
+a third attempt after 90 seconds. A build error, zero-test pass, or record setup
+failure gets no retry.
+Each attempt retains `<suite>.attempt-<n>.log` and
+`<suite>.attempt-<n>.status` under `target/tmp/testnet-attempts/`.
+Output streams live to the job log. A `.metrics` sidecar retains elapsed seconds
+and the skip count across the logging pipeline. A directory or record reservation
+failure fails the share with its own note in the summary.
+`TESTNET_ATTEMPT_DIR` overrides that directory. Existing records are never
+replaced or deleted; another invocation continues the numbering.
+The summary lists every attempt status for each suite whose first attempt failed.
+
+Each result line carries the wall seconds of the last attempt.
+A retried suite also carries the seconds of all its attempts.
+Console and workflow summary headers name
 the share, selected suite count and build, `mainnet-write off` or `mainnet-write on`.
 The summary closes with the leg's wall time. In a workflow run the step summary table has a `seconds`
 column with each suite's seconds across its attempts.
@@ -913,18 +959,33 @@ The same script backs the `Testnet acceptance` workflow
 (`.github/workflows/testnet.yml`), which runs on manual dispatch and on a
 weekly schedule; it is deliberately not part of per-push CI. A dispatch takes
 an optional suite filter input, a `keyring` choice of `headless` (the default)
-or `platform` for native-capable suites, and the boolean `mainnet_write` input, which
-runs every suite against the build with `mainnet-write` on. A scheduled run
-builds with `mainnet-write` off.
+or `platform` for native-capable suites, and the boolean `mainnet_write` input,
+which defaults to `true`. The boolean `full_run` defaults to `false` and controls
+continuation after failure; it never changes the selection.
+
+The checkout-free `config` job chooses the feature state once.
+A schedule computes `floor((epoch_seconds - 345600) / 604800)` at job start:
+even weeks use on, odd weeks use off. Weeks begin Monday at 00:00 UTC.
+Rerunning failed jobs retains the config output; a full rerun within the same
+Monday-to-Sunday week computes the same state.
 
 The workflow chains `acceptance-1` with `SHARE=1/2` and `acceptance-2` with
 `SHARE=2/2`. Each job has a 360-minute limit. The second job waits for the first
-and runs after failure unless the workflow is canceled. Both jobs honor
-`TESTNET_SCHEDULE=off` on scheduled events. Workflow concurrency serializes runs,
+and requires successful config and either successful share 1, or failed share 1
+with `full_run=true`. A canceled workflow never starts share 2.
+Scheduled jobs require `refs/heads/main` and honor `TESTNET_SCHEDULE=off`.
+Manual dispatch bypasses the schedule switch. Workflow concurrency serializes runs,
 and each driver serializes its selected suites. Both jobs use the filter,
 build selection, browser setup, and secondary RPC environment. Each job then
-checks its payment evidence with `check-payment-evidence.py` and uploads it as
-an artifact, also after a failed run.
+checks its payment evidence with `check-payment-evidence.py`.
+Both jobs explicitly check out `github.sha` and verify HEAD before the driver.
+Every evidence row must match that revision and the config feature state.
+The checker requires all selected payment tests, including the full filtered
+registry when live execution has no share. Local fixture selection stays separate.
+Every outcome uploads evidence and attempt records; artifact names include
+the feature state and `github.run_attempt`.
+Both shares keep the cache prefix `testnet` and share `testnet-on` or
+`testnet-off` through the config output. No artifacts transfer between shares.
 
 The browser suites need a Chromium binary on `PATH` (or the `CHROME` env var).
 Among them, the mainnet consent browser suite
@@ -1393,8 +1454,10 @@ Each error message names its rule:
   `mainnet-write` in the state its record relies on. The only executable
   target of the queried packages is `stellar-agent` of the CLI package, and
   the metadata must list exactly that one; its graph view includes the MCP
-  closure. The paired CLI and MCP prebuild of the testnet driver has one
-  reviewed record per job and feature state. A record relies on the
+  closure. The paired CLI and MCP prebuild and the isolated CLI build of the
+  testnet driver each have one reviewed record per share and feature state.
+  The isolated build's function, call count, and feature lists are pinned.
+  A record relies on the
   feature when its feature list names `mainnet-write`, or when it keeps the
   default features and selects the workspace, the CLI package, or the MCP
   package. A
@@ -1470,9 +1533,10 @@ Each error message names its rule:
   Rustflags and rustdocflags inputs that contain `--cfg` also fail.
   The invocation inventory refuses a compiler argument that passes `--cfg`.
 - D8: no workflow, named script, or this guide enables every feature.
-- D9: only the CI feature-on jobs and the feature-on coverage job name
-  `mainnet-write` in a feature list; release-shaped builds activate it through the binary
-  defaults.
+- D9: CI feature-on jobs and the feature-on coverage job may name
+  `mainnet-write` in feature lists. The testnet driver's resolved suite lists
+  and exact isolated on-state build are allowed only in its two acceptance jobs.
+  Release-shaped builds activate the feature through the binary defaults.
 - D10: the feature list of `ci.yml` and the list in this guide equal the
   declared features except `default` and `mainnet-write`.
 - D11: the release, publish, and rehearsal workflows expect the marker on.
@@ -1519,6 +1583,7 @@ It installs nothing, and it stops in these cases:
 The release rehearsal checks both executable names from every packed archive on a
 native runner, including Rosetta for the Intel macOS archive. Its crate job
 packages with the publish toolchain and checks fresh package-verification
-outputs. Live acceptance builds with `mainnet-write` off by default: the runner
-passes `--no-default-features` to every suite. `MAINNET_WRITE=on` adds the
+outputs. Dispatch acceptance defaults to `mainnet_write=true`; the local driver
+defaults to off, and schedules alternate at Monday 00:00 UTC.
+The driver passes `--no-default-features` to every suite. `MAINNET_WRITE=on` adds the
 feature to each suite whose crate declares it.

@@ -31,11 +31,18 @@ def main():
     parser.add_argument("--execution", choices=["live-testnet", "local-fixture"], required=True)
     parser.add_argument("--share", help="driver share k/N; only selected payment suites are required")
     parser.add_argument("--filter", default="", help="the driver's suite substring filter")
+    parser.add_argument("--expected-revision", required=True)
+    parser.add_argument("--expected-feature-state", choices=["on", "off"], required=True)
     args = parser.parse_args()
+    if not re.fullmatch(r"[0-9a-f]{40}", args.expected_revision):
+        parser.error("--expected-revision must be 40 lowercase hex characters")
     expected_tests = set()
-    if args.share:
-        share, total_shares = map(int, args.share.split("/"))
-        assert 1 <= share <= total_shares
+    if args.share or args.execution == "live-testnet":
+        if args.share and not re.fullmatch(r"[1-9][0-9]*/[1-9][0-9]*", args.share):
+            parser.error("--share must be k/N with 1 <= k <= N")
+        share, total_shares = map(int, (args.share or "1/1").split("/"))
+        if share > total_shares:
+            parser.error("--share must be k/N with 1 <= k <= N")
         driver = Path(__file__).with_name("run-testnet-acceptance.sh").read_text()
         registry = re.search(r"^SUITES=\(\n(.*?)^\)", driver, re.M | re.S)
         assert registry, "the acceptance driver registry is missing"
@@ -59,12 +66,14 @@ def main():
         cases = set()
         test = rows[0]["test"]
         observed_tests.add(test)
-        for row in rows:
+        for row_number, row in enumerate(rows, 1):
             assert row["schema"] == 1
             assert row["test"] == test
             assert row["execution"] == args.execution
-            assert re.fullmatch(r"[0-9a-f]{40}", row["revision"])
-            assert row["feature_state"] in {"off", "on"}
+            if row["revision"] != args.expected_revision:
+                raise ValueError(f"{path.name}: row {row_number}: revision differs: expected {args.expected_revision!r}, found {row['revision']!r}")
+            if row["feature_state"] != args.expected_feature_state:
+                raise ValueError(f"{path.name}: row {row_number}: feature state differs: expected {args.expected_feature_state!r}, found {row['feature_state']!r}")
             for key in ["envelope_hash", "transaction_hash", "audit_destination_sha256"]:
                 assert re.fullmatch(r"[0-9a-f]{64}", row[key]), key
             assert row["ledger"] > 0

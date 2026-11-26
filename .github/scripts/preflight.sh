@@ -5,8 +5,8 @@
 # Usage: preflight.sh [--base <ref>] [--full] [--list]
 #
 #   --base <ref>  Compares the branch with its merge base with <ref>. The
-#                 default is upstream/main, or origin/main when upstream/main
-#                 is missing or an ancestor of origin/main, or main when
+#                 default is upstream/next, or origin/next when upstream/next
+#                 is missing or an ancestor of origin/next, or next when
 #                 neither exists.
 #   --full        Selects every gate, with workspace Cargo commands.
 #   --list        Prints the selected gates as <id><TAB><command>, one per
@@ -137,6 +137,7 @@ self-test:test-check-install-surface.py	python3 .github/scripts/test-check-insta
 self-test:test-check-no-direct-sasignersetbaselined-emit.sh	bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh	-	ci.yml	release-contracts	Self-test the signer-set baseline gate
 self-test:test-check-proof-matrix.py	python3 .github/scripts/test-check-proof-matrix.py	-	ci.yml	release-contracts	Self-test the proof matrix check
 self-test:test-check-ref-on-main.sh	bash .github/scripts/test-check-ref-on-main.sh	-	ci.yml	release-contracts	Self-test the ref-on-main check
+self-test:test-check-run-evidence.py	python3 .github/scripts/test-check-run-evidence.py --mutations	-	ci.yml	release-contracts	Self-test the run evidence check
 self-test:test-check-workflow-invariants.py	python3 .github/scripts/test-check-workflow-invariants.py	yaml	ci.yml	release-contracts	Self-test the workflow structure and the label sync
 self-test:test-classify-docs-only.py	python3 .github/scripts/test-classify-docs-only.py	-	ci.yml	release-contracts	Self-test the docs-only classifier
 self-test:test-classify-self-tests.py	python3 .github/scripts/test-classify-self-tests.py	-	ci.yml	release-contracts	Self-test the self-test classifier
@@ -247,26 +248,28 @@ check_prerequisites() {
 # Sets BASE to the ref that the branch is diffed against, and exits 2 unless
 # BASE names a commit that shares a merge base with HEAD.
 resolve_base() {
-  local fetch_remote=origin
+  local fetch_remote=origin requested_base=$BASE
   if [ -z "$BASE" ]; then
-    BASE=main
-    if git rev-parse --verify --quiet 'origin/main^{commit}' >/dev/null; then
-      BASE=origin/main
+    BASE=next
+    if git rev-parse --verify --quiet 'origin/next^{commit}' >/dev/null; then
+      BASE=origin/next
     fi
-    # origin/main stays the base when it contains upstream/main, which holds
+    # origin/next stays the base when it contains upstream/next, which holds
     # after a fork sync that did not fetch upstream.
-    if git rev-parse --verify --quiet 'upstream/main^{commit}' >/dev/null &&
-      ! { [ "$BASE" = origin/main ] &&
-        git merge-base --is-ancestor upstream/main origin/main; }; then
-      BASE=upstream/main
+    if git rev-parse --verify --quiet 'upstream/next^{commit}' >/dev/null &&
+      ! { [ "$BASE" = origin/next ] &&
+        git merge-base --is-ancestor upstream/next origin/next; }; then
+      BASE=upstream/next
     fi
   fi
   if ! git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null ||
     ! git merge-base HEAD "$BASE" >/dev/null 2>&1; then
-    if [ "$BASE" = upstream/main ]; then
+    if [ "$BASE" = upstream/next ] ||
+      { [ -z "$requested_base" ] && [ "$BASE" = next ] &&
+        git remote get-url upstream >/dev/null 2>&1; }; then
       fetch_remote=upstream
     fi
-    die "cannot find a merge base with $BASE; run git fetch $fetch_remote main or pass --base <ref>"
+    die "cannot find a merge base with $BASE; run git fetch $fetch_remote next or pass --base <ref>"
   fi
 }
 
@@ -344,6 +347,7 @@ select_self_tests() {
       ;;
     .github/scripts/check-proof-matrix.py) select_gate self-test:test-check-proof-matrix.py ;;
     .github/scripts/check-ref-on-main.sh) select_gate self-test:test-check-ref-on-main.sh ;;
+    .github/scripts/check-run-evidence.py) select_gate self-test:test-check-run-evidence.py ;;
     .github/scripts/classify-docs-only.py) select_gate self-test:test-classify-docs-only.py ;;
     .github/scripts/classify-self-tests.py) select_gate self-test:test-classify-self-tests.py ;;
     .github/scripts/changed_paths.py)
@@ -361,7 +365,7 @@ select_self_tests() {
       select_gate self-test:test-publish-crates-verify.sh
       ;;
     .github/scripts/rebuild-vendored-wasm.sh) select_gate self-test:test-rebuild-vendored-wasm.sh ;;
-    .github/scripts/run-testnet-acceptance.sh) select_gate self-test:test-run-testnet-acceptance.sh ;;
+    .github/scripts/run-testnet-acceptance.sh | .github/scripts/check-payment-evidence.py) select_gate self-test:test-run-testnet-acceptance.sh ;;
     .github/scripts/sync-labels.py | .github/labels.yml | .github/workflows/labels.yml)
       select_gate self-test:test-sync-labels.py
       ;;
