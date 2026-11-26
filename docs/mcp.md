@@ -34,8 +34,11 @@ submission checks. See
 - Transport: MCP JSON-RPC over stdio. The client spawns the binary as a
   subprocess and exchanges newline-delimited JSON-RPC on the subprocess
   stdin/stdout.
-- Protocol version: `2024-11-05`. Declared capabilities: `tools` and
-  `resources`.
+- Protocol version: the server answers `initialize` with the requested version
+  when it is `2024-11-05`, `2025-03-26`, `2025-06-18`, or `2025-11-25`.
+  For a version it does not know, it answers with `2024-11-05`.
+  The `2026-07-28` revision is not supported. Declared capabilities: `tools`
+  and `resources`.
 - Server identity reported at initialize: name `stellar-agent-mcp`, version
   equal to the crate's package version.
 
@@ -349,6 +352,10 @@ not know. A line before it that is not a JSON-RPC message, or one over the line
 limit, gets its `-32700` answer, and the server keeps waiting for
 `initialize`. A line before it that is not a JSON-RPC message and holds a
 `method` the server does not know and no `id` is skipped without an answer.
+
+A first request other than `initialize` or `ping`, such as `server/discover`
+from the `2026-07-28` specification, gets no answer; restart the server and
+open the session with `initialize`.
 
 List the tools and the resources, and read one resource:
 
