@@ -320,13 +320,14 @@ async fn read_error_body(mut response: reqwest::Response) -> String {
     String::from_utf8_lossy(&body).into_owned()
 }
 
-/// Whether a Friendbot error body reports that the account is already
-/// funded, compared without regard to ASCII case.
+/// Whether the body contains `already funded` or `createAccountAlreadyExist`,
+/// compared without regard to ASCII case.
 ///
 /// Its twin is `reports_already_funded` in the test-support testnet helpers,
 /// which test funding uses; both keep one rule.
 fn reports_already_funded(body: &str) -> bool {
-    body.to_ascii_lowercase().contains("already funded")
+    let body = body.to_ascii_lowercase();
+    body.contains("already funded") || body.contains("createaccountalreadyexist")
 }
 
 /// Upper bound on the number of `fetch_account` polls after a successful
@@ -443,8 +444,8 @@ async fn verify_funding_landed_with(
 ///   if `network_passphrase` matches the Stellar mainnet passphrase.
 /// - [`WalletError::Network`] wrapping
 ///   [`NetworkError::FriendbotAccountAlreadyFunded`] if Friendbot answers
-///   HTTP 400 with an "already funded" detail in the first 64 KiB of the
-///   body.
+///   HTTP 400 with `already funded` or `createAccountAlreadyExist` in the
+///   first 64 KiB of the body, compared without regard to ASCII case.
 /// - [`WalletError::Network`] wrapping [`NetworkError::RpcUnreachable`] if
 ///   the Friendbot HTTP endpoint is unreachable or returns any other error
 ///   status.
@@ -820,6 +821,40 @@ mod tests {
         assert!(error.message().contains(FUNDED_ACCOUNT), "{error}");
     }
 
+    /// An account created by an earlier attempt carries the same funding code.
+    #[tokio::test]
+    async fn an_existing_account_reports_the_already_funded_code() {
+        for detail in [
+            "createAccountAlreadyExist (AAAAAAAAAGT/////AAAAAQAAAAAAAAAA/////AAAAAA==)",
+            "CREATEACCOUNTALREADYEXIST",
+            "createaccountalreadyexist",
+        ] {
+            let error = fund_against(
+                400,
+                serde_json::json!({
+                    "type": "https://stellar.org/horizon-errors/bad_request",
+                    "title": "Bad Request",
+                    "status": 400,
+                    "detail": detail,
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(
+                error.code(),
+                "network.friendbot_account_already_funded",
+                "{detail}"
+            );
+            let WalletError::Network(NetworkError::FriendbotAccountAlreadyFunded { account_id }) =
+                &error
+            else {
+                unreachable!("expected an existing account: {error:?}");
+            };
+            assert_eq!(account_id, FUNDED_ACCOUNT);
+            assert!(error.message().contains(FUNDED_ACCOUNT), "{error}");
+        }
+    }
+
     /// Only a 400 whose body carries the detail is the already-funded
     /// refusal; every other error status keeps the unreachable code.
     #[tokio::test]
@@ -827,6 +862,8 @@ mod tests {
         for (status, body) in [
             (400, r#"{"detail":"invalid address"}"#.to_owned()),
             (500, r#"{"detail":"account already funded"}"#.to_owned()),
+            (404, r#"{"detail":"createAccountAlreadyExist"}"#.to_owned()),
+            (500, r#"{"detail":"CREATEACCOUNTALREADYEXIST"}"#.to_owned()),
         ] {
             let error = fund_against(status, body).await;
             assert_eq!(error.code(), "network.rpc_unreachable", "HTTP {status}");
