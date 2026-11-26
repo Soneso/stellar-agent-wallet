@@ -1,0 +1,1 @@
+- Name getTransaction once in timelock event confirmation errors while preserving the endpoint role and sanitized diagnostic.
