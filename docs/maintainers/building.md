@@ -1151,9 +1151,9 @@ publication calls it for the verified commit of the tag.
   tree check holds its bytes at one frozen digest.
 
 The `vendored-wasm` job reads every job result. On a tag or crate publication
-run it passes only after a rebuild. Release signing, provenance, and
-publication wait for the rebuild of the tagged commit, and crate publication
-waits for the rebuild of the verified commit.
+run it passes only after a rebuild. Apple signing and notarization, hashing,
+cosign signing, provenance, and publication wait for the rebuild of the tagged
+commit. Crate publication waits for the rebuild of the verified commit.
 
 Run the identity and deployment gates locally with:
 
@@ -1300,8 +1300,9 @@ and every constant and allowlist entry that pins it in the same change.
   the scripts.
 - Cache saves serve future runs that restore the cache. The current rebuild
   consumes the install-root artifacts produced by its own stellar-cli jobs.
-  Tag and crate publication runs build both binaries from source and gate
-  release signing, provenance, and publication.
+  Tag and crate publication runs build both binaries from source. They gate
+  Apple signing and notarization, hashing, cosign signing, provenance, and
+  release and crate publication.
 - Pull-request CI does not run the release-profile tests. The deploy's digest
   check runs in every profile; review and the release-profile test run keep it
   out of a `debug_assertions` gate. The local release gate also checks the
