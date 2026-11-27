@@ -232,29 +232,36 @@ mod tests {
 
     use super::*;
 
+    /// Classifies private, loopback, reserved, IPv4-mapped IPv6, and public hosts
+    /// for callback preview warnings.
     #[test]
-    fn private_ip_192_168_flagged() {
-        assert!(is_private_or_loopback_host("192.168.1.1"));
-    }
+    fn is_private_or_loopback_host_classifies_hosts() {
+        let cases = [
+            ("private_ip_192_168", "192.168.1.1", true),
+            ("loopback_127", "127.0.0.1", true),
+            ("localhost", "localhost", true),
+            ("public_ip", "8.8.8.8", false),
+            ("public_domain", "example.com", false),
+            ("ipv6_loopback", "::1", true),
+            ("ipv6_unspecified", "::", true),
+            ("ipv6_multicast", "ff02::1", true),
+            ("ipv6_mapped_private_ipv4", "::ffff:192.168.1.1", true),
+            ("ipv4_broadcast", "255.255.255.255", true),
+            ("ipv4_documentation_range", "192.0.2.1", true),
+            ("ipv4_multicast", "224.0.0.1", true),
+            ("ipv4_link_local", "169.254.1.1", true),
+            ("ipv4_unspecified", "0.0.0.0", true),
+            ("localhost_localdomain", "localhost.localdomain", true),
+            ("ipv6_global_unicast", "2001:db8::1", false),
+        ];
 
-    #[test]
-    fn loopback_127_flagged() {
-        assert!(is_private_or_loopback_host("127.0.0.1"));
-    }
-
-    #[test]
-    fn localhost_flagged() {
-        assert!(is_private_or_loopback_host("localhost"));
-    }
-
-    #[test]
-    fn public_ip_not_flagged() {
-        assert!(!is_private_or_loopback_host("8.8.8.8"));
-    }
-
-    #[test]
-    fn public_domain_not_flagged() {
-        assert!(!is_private_or_loopback_host("example.com"));
+        for (case, host, expected) in cases {
+            assert_eq!(
+                is_private_or_loopback_host(host),
+                expected,
+                "case {case}: host {host:?}"
+            );
+        }
     }
 
     #[test]
@@ -444,64 +451,6 @@ mod tests {
         assert_eq!(pay_preview["operation"], "pay");
     }
 
-    // ── IPv6 mapped / loopback edge cases ────────────────────────────────────
-
-    #[test]
-    fn ipv6_loopback_flagged() {
-        // ::1 is the IPv6 loopback address.
-        assert!(is_private_or_loopback_host("::1"));
-    }
-
-    #[test]
-    fn ipv6_unspecified_flagged() {
-        assert!(is_private_or_loopback_host("::"));
-    }
-
-    #[test]
-    fn ipv6_multicast_flagged() {
-        // ff02::1 is a well-known multicast address.
-        assert!(is_private_or_loopback_host("ff02::1"));
-    }
-
-    #[test]
-    fn ipv6_mapped_private_ipv4_flagged() {
-        // ::ffff:192.168.1.1 maps to the private IPv4 range.
-        assert!(is_private_or_loopback_host("::ffff:192.168.1.1"));
-    }
-
-    #[test]
-    fn ipv4_broadcast_flagged() {
-        assert!(is_private_or_loopback_host("255.255.255.255"));
-    }
-
-    #[test]
-    fn ipv4_documentation_range_flagged() {
-        // 192.0.2.0/24 is reserved for documentation (RFC 5737).
-        assert!(is_private_or_loopback_host("192.0.2.1"));
-    }
-
-    #[test]
-    fn ipv4_multicast_flagged() {
-        // 224.0.0.1 is a multicast address.
-        assert!(is_private_or_loopback_host("224.0.0.1"));
-    }
-
-    #[test]
-    fn ipv4_link_local_flagged() {
-        // 169.254.x.x is link-local.
-        assert!(is_private_or_loopback_host("169.254.1.1"));
-    }
-
-    #[test]
-    fn ipv4_unspecified_flagged() {
-        assert!(is_private_or_loopback_host("0.0.0.0"));
-    }
-
-    #[test]
-    fn localhost_localdomain_flagged() {
-        assert!(is_private_or_loopback_host("localhost.localdomain"));
-    }
-
     #[test]
     fn callback_without_url_prefix_returns_none() {
         // inspect_callback returns None when the `url:` prefix is absent.
@@ -513,13 +462,5 @@ mod tests {
     fn callback_with_port_shows_port_in_authority() {
         let info = inspect_callback(Some("url:https://example.com:8443/cb")).unwrap();
         assert_eq!(info.authority, "example.com:8443");
-    }
-
-    #[test]
-    fn ipv6_global_unicast_not_flagged() {
-        // 2001:db8::1 is a global unicast (documentation range) IPv6 address —
-        // not loopback, not unspecified, not multicast, not IPv4-mapped, not unique-local,
-        // not link-local. Exercises the `false` return at line 124.
-        assert!(!is_private_or_loopback_host("2001:db8::1"));
     }
 }

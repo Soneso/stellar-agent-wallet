@@ -7288,450 +7288,346 @@ mod tests {
         serde_json::from_value(v).expect("synthetic sim deserialise")
     }
 
-    /// `sa_error_to_invocation_result` maps DeploymentFailed phases correctly:
-    /// pre-submission phases → PreSubmissionRefused; on-chain phases →
-    /// OnChainRejected. Mirrors the deploy.rs phase-classifier discipline.
+    /// Classifies `SaError` variants, deployment phases, transaction-hash states,
+    /// install rule-ID forms, and timelock failure reasons into `SaInvocationResult`.
     #[test]
-    fn sa_error_to_invocation_result_pre_submission_phases() {
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        for phase in &["build", "simulate", "constructor"] {
-            let err = SaError::DeploymentFailed {
-                phase,
-                redacted_reason: "test".to_owned(),
-            };
-            assert!(
-                matches!(
-                    sa_error_to_invocation_result(&err),
-                    SaInvocationResult::PreSubmissionRefused
-                ),
-                "phase {phase} must map to PreSubmissionRefused"
-            );
-        }
-    }
-
-    #[test]
-    fn sa_error_to_invocation_result_on_chain_phases() {
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        for phase in &["upload", "deploy", "submit", "post_deploy_verification"] {
-            let err = SaError::DeploymentFailed {
-                phase,
-                redacted_reason: "test".to_owned(),
-            };
-            assert!(
-                matches!(
-                    sa_error_to_invocation_result(&err),
-                    SaInvocationResult::OnChainRejected
-                ),
-                "phase {phase} must map to OnChainRejected"
-            );
-        }
-    }
-
-    #[test]
-    fn sa_error_to_invocation_result_pre_submission_for_typed_errors() {
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        let typed = [
-            SaError::AuthEntryConstructionFailed {
-                stage: "auth_payload",
-                redacted_reason: "test".to_owned(),
-            },
-            SaError::RuleIdMismatch {
-                expected_len: 1,
-                observed_len: 0,
-            },
-            SaError::SimulationDivergence {
-                sub_code: crate::error::SimulationDivergenceSubCode::Network,
-                redacted_reason: "test".to_owned(),
-            },
-            SaError::PinCheckUnavailable {
-                rule_id: 4,
-                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                reason: "sa.deployment_failed: rpc unreachable".to_owned(),
-                request_id: "req".to_owned(),
-            },
-        ];
-        for err in &typed {
-            assert!(matches!(
-                sa_error_to_invocation_result(err),
-                SaInvocationResult::PreSubmissionRefused
-            ));
-        }
-    }
-
-    #[test]
-    fn sa_error_to_invocation_result_mainnet_refusal_is_pre_submission() {
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        assert!(matches!(
-            sa_error_to_invocation_result(&SaError::MainnetWriteForbidden),
-            SaInvocationResult::PreSubmissionRefused
-        ));
-    }
-
-    #[test]
-    fn intent_total_epoch_refusals_precede_submission() {
-        for error in [
-            SaError::TotalEpochUnavailable {
-                detail: "検証-é".into(),
-            },
-            SaError::TotalEpochStale,
-            SaError::TotalEpochRetired,
-        ] {
-            assert!(matches!(
-                sa_error_to_invocation_result(&error),
-                stellar_agent_core::audit_log::schema::SaInvocationResult::PreSubmissionRefused
-            ));
-        }
-    }
-
-    #[test]
-    fn sa_error_to_invocation_result_auth_entry_binding_mismatch_is_pre_submission() {
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        assert!(matches!(
-            sa_error_to_invocation_result(&SaError::AuthEntryBindingMismatch {
-                field: "network_id"
-            }),
-            SaInvocationResult::PreSubmissionRefused
-        ));
-    }
-
-    #[test]
-    fn sa_error_to_invocation_result_classifies_signer_set_diverged_by_its_transaction() {
+    fn sa_error_to_invocation_result_classifies_every_case() {
+        use crate::error::{
+            SimulationDivergenceSubCode, TimelockCancelFailureReason, TimelockExecuteFailureReason,
+            TimelockScheduleFailureReason,
+        };
         use stellar_agent_core::audit_log::schema::SaInvocationResult;
         use stellar_agent_core::audit_log::signer_set::{SignerSetSnapshotV2, SignerSetView};
 
+        let redacted = || RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ");
+        let empty_view = || {
+            SignerSetView::V2(SignerSetSnapshotV2 {
+                signers: vec![],
+                threshold: None,
+            })
+        };
         let diverged = |tx_hash: Option<String>| SaError::SignerSetDiverged {
             rule_id: 1,
-            expected: SignerSetView::V2(SignerSetSnapshotV2 {
-                signers: vec![],
-                threshold: None,
-            }),
-            observed: SignerSetView::V2(SignerSetSnapshotV2 {
-                signers: vec![],
-                threshold: None,
-            }),
+            expected: empty_view(),
+            observed: empty_view(),
             tx_hash,
-            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            smart_account_redacted: redacted(),
             request_id: "req".to_owned(),
         };
-        assert!(
-            matches!(
-                sa_error_to_invocation_result(&diverged(None)),
-                SaInvocationResult::PreSubmissionRefused
-            ),
-            "a comparison refusal sent nothing"
-        );
-        assert!(
-            matches!(
-                sa_error_to_invocation_result(&diverged(Some("ab".repeat(32)))),
-                SaInvocationResult::PostSubmitVerificationFailed
-            ),
-            "a confirmed transaction whose result is not the intended change"
-        );
-    }
-
-    #[test]
-    fn sa_error_to_invocation_result_classifies_a_legacy_baseline_as_refused() {
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        let legacy = SaError::SignerSetBaselineLegacy {
+        let baseline_write_failed = |tx_hash: Option<String>| SaError::BaselineWriteFailed {
             rule_id: 1,
-            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-            request_id: "req".to_owned(),
-        };
-        assert!(matches!(
-            sa_error_to_invocation_result(&legacy),
-            SaInvocationResult::PreSubmissionRefused
-        ));
-    }
-
-    /// An install that confirmed and was not baselined is a post-submit
-    /// verification failure in both rule-id forms.
-    #[test]
-    fn sa_error_to_invocation_result_classifies_install_state_mismatch_after_submission() {
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        for rule_id in [None, Some(3)] {
-            let err = SaError::InstallStateMismatch {
-                rule_id,
-                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
-                tx_hash: "ab".repeat(32),
-                request_id: "req".to_owned(),
-            };
-            assert!(
-                matches!(
-                    sa_error_to_invocation_result(&err),
-                    SaInvocationResult::PostSubmitVerificationFailed
-                ),
-                "{rule_id:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn sa_error_to_invocation_result_classifies_baseline_write_failed_by_its_transaction() {
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        let write_failed = |tx_hash: Option<String>| SaError::BaselineWriteFailed {
-            rule_id: 1,
-            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            smart_account_redacted: redacted(),
             tx_hash,
             stage: crate::error::BASELINE_WRITE_STAGE_WRITE,
             reason: "audit writer poisoned".to_owned(),
             request_id: "req".to_owned(),
         };
-        assert!(
-            matches!(
-                sa_error_to_invocation_result(&write_failed(None)),
-                SaInvocationResult::PreSubmissionRefused
-            ),
-            "a list or refresh whose baseline row was not written sent nothing"
-        );
-        assert!(
-            matches!(
-                sa_error_to_invocation_result(&write_failed(Some("cd".repeat(32)))),
-                SaInvocationResult::PostSubmitVerificationFailed
-            ),
-            "a confirmed signer mutation whose state row was not written"
-        );
-    }
-
-    // ── Timelock failure_reason classifier ───────────────────────────────────
-    //
-    // Covers sa_error_to_invocation_result for all three Timelock*Failed variants
-    // × all named failure_reason discriminants.  Verifies the 3-way taxonomy:
-    //   PreSubmissionRefused / PostSubmitVerificationFailed / OnChainRejected.
-
-    /// `TimelockScheduleFailed` with `SimulationFailed` or `AuditWriterPoisoned` →
-    /// `PreSubmissionRefused` (no tx sent).
-    #[test]
-    fn sa_error_to_invocation_result_timelock_schedule_pre_submission() {
-        use crate::error::TimelockScheduleFailureReason as R;
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        for reason in [R::SimulationFailed, R::AuditWriterPoisoned] {
-            let err = SaError::TimelockScheduleFailed {
-                failure_reason: reason.clone(),
+        let schedule_failed =
+            |failure_reason: TimelockScheduleFailureReason| SaError::TimelockScheduleFailed {
+                failure_reason,
                 redacted_reason: "test".to_owned(),
                 request_id: "req-test".to_owned(),
             };
-            assert!(
-                matches!(
-                    sa_error_to_invocation_result(&err),
-                    SaInvocationResult::PreSubmissionRefused
-                ),
-                "TimelockScheduleFailed {{ reason: {reason:?} }} must map to PreSubmissionRefused"
-            );
-        }
-    }
+        let cancel_failed =
+            |failure_reason: TimelockCancelFailureReason| SaError::TimelockCancelFailed {
+                failure_reason,
+                redacted_reason: "test".to_owned(),
+                request_id: "req-test".to_owned(),
+            };
+        let execute_failed =
+            |failure_reason: TimelockExecuteFailureReason| SaError::TimelockExecuteFailed {
+                failure_reason,
+                redacted_reason: "test".to_owned(),
+                request_id: "req-test".to_owned(),
+            };
 
-    /// `TimelockScheduleFailed` with `EventConfirmationMissing` →
-    /// `PostSubmitVerificationFailed` (tx confirmed; event absent).
-    #[test]
-    fn sa_error_to_invocation_result_timelock_schedule_post_submit_verification_failed() {
-        use crate::error::TimelockScheduleFailureReason as R;
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        let err = SaError::TimelockScheduleFailed {
-            failure_reason: R::EventConfirmationMissing,
-            redacted_reason: "test".to_owned(),
-            request_id: "req-test".to_owned(),
-        };
-        assert!(
-            matches!(
-                sa_error_to_invocation_result(&err),
-                SaInvocationResult::PostSubmitVerificationFailed
+        let cases = [
+            (
+                "deployment_failed_build",
+                SaError::DeploymentFailed {
+                    phase: "build",
+                    redacted_reason: "test".to_owned(),
+                },
+                SaInvocationResult::PreSubmissionRefused,
             ),
-            "TimelockScheduleFailed {{ reason: EventConfirmationMissing }} must map to \
-             PostSubmitVerificationFailed"
-        );
-    }
-
-    /// `TimelockScheduleFailed` with `Unauthorized`, `OperationAlreadyScheduled`,
-    /// `InsufficientDelay`, or `Other` → `OnChainRejected`.
-    #[test]
-    fn sa_error_to_invocation_result_timelock_schedule_on_chain_rejected() {
-        use crate::error::TimelockScheduleFailureReason as R;
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        for reason in [
-            R::Unauthorized,
-            R::OperationAlreadyScheduled,
-            R::InsufficientDelay,
-            R::Other,
-        ] {
-            let err = SaError::TimelockScheduleFailed {
-                failure_reason: reason.clone(),
-                redacted_reason: "test".to_owned(),
-                request_id: "req-test".to_owned(),
-            };
-            assert!(
-                matches!(
-                    sa_error_to_invocation_result(&err),
-                    SaInvocationResult::OnChainRejected
-                ),
-                "TimelockScheduleFailed {{ reason: {reason:?} }} must map to OnChainRejected"
-            );
-        }
-    }
-
-    /// `TimelockCancelFailed` with `SimulationFailed` or `AuditWriterPoisoned` →
-    /// `PreSubmissionRefused` (no tx sent).
-    #[test]
-    fn sa_error_to_invocation_result_timelock_cancel_pre_submission() {
-        use crate::error::TimelockCancelFailureReason as R;
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        for reason in [R::SimulationFailed, R::AuditWriterPoisoned] {
-            let err = SaError::TimelockCancelFailed {
-                failure_reason: reason.clone(),
-                redacted_reason: "test".to_owned(),
-                request_id: "req-test".to_owned(),
-            };
-            assert!(
-                matches!(
-                    sa_error_to_invocation_result(&err),
-                    SaInvocationResult::PreSubmissionRefused
-                ),
-                "TimelockCancelFailed {{ reason: {reason:?} }} must map to PreSubmissionRefused"
-            );
-        }
-    }
-
-    /// `TimelockCancelFailed` with `EventConfirmationMissing` →
-    /// `PostSubmitVerificationFailed`.
-    #[test]
-    fn sa_error_to_invocation_result_timelock_cancel_post_submit_verification_failed() {
-        use crate::error::TimelockCancelFailureReason as R;
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        let err = SaError::TimelockCancelFailed {
-            failure_reason: R::EventConfirmationMissing,
-            redacted_reason: "test".to_owned(),
-            request_id: "req-test".to_owned(),
-        };
-        assert!(
-            matches!(
-                sa_error_to_invocation_result(&err),
-                SaInvocationResult::PostSubmitVerificationFailed
+            (
+                "deployment_failed_simulate",
+                SaError::DeploymentFailed {
+                    phase: "simulate",
+                    redacted_reason: "test".to_owned(),
+                },
+                SaInvocationResult::PreSubmissionRefused,
             ),
-            "TimelockCancelFailed {{ reason: EventConfirmationMissing }} must map to \
-             PostSubmitVerificationFailed"
-        );
-    }
-
-    /// `TimelockCancelFailed` with `Unauthorized`, `InvalidOperationState`,
-    /// `OperationNotScheduled`, or `Other` → `OnChainRejected`.
-    #[test]
-    fn sa_error_to_invocation_result_timelock_cancel_on_chain_rejected() {
-        use crate::error::TimelockCancelFailureReason as R;
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        for reason in [
-            R::Unauthorized,
-            R::InvalidOperationState,
-            R::OperationNotScheduled,
-            R::Other,
-        ] {
-            let err = SaError::TimelockCancelFailed {
-                failure_reason: reason.clone(),
-                redacted_reason: "test".to_owned(),
-                request_id: "req-test".to_owned(),
-            };
-            assert!(
-                matches!(
-                    sa_error_to_invocation_result(&err),
-                    SaInvocationResult::OnChainRejected
-                ),
-                "TimelockCancelFailed {{ reason: {reason:?} }} must map to OnChainRejected"
-            );
-        }
-    }
-
-    /// `TimelockExecuteFailed` with `SimulationFailed`, `AuditWriterPoisoned`,
-    /// `OperationNotReady`, or `OperationIdMismatch` → `PreSubmissionRefused`
-    /// (all fire before any tx is signed or sent).
-    #[test]
-    fn sa_error_to_invocation_result_timelock_execute_pre_submission() {
-        use crate::error::TimelockExecuteFailureReason as R;
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        let reasons = [
-            R::SimulationFailed,
-            R::AuditWriterPoisoned,
-            R::OperationNotReady {
-                observed_state: "Waiting".to_owned(),
-                current_ledger: Some(100),
-                ready_ledger: 200,
-            },
-            R::OperationIdMismatch,
+            (
+                "deployment_failed_constructor",
+                SaError::DeploymentFailed {
+                    phase: "constructor",
+                    redacted_reason: "test".to_owned(),
+                },
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "deployment_failed_upload",
+                SaError::DeploymentFailed {
+                    phase: "upload",
+                    redacted_reason: "test".to_owned(),
+                },
+                SaInvocationResult::OnChainRejected,
+            ),
+            (
+                "deployment_failed_deploy",
+                SaError::DeploymentFailed {
+                    phase: "deploy",
+                    redacted_reason: "test".to_owned(),
+                },
+                SaInvocationResult::OnChainRejected,
+            ),
+            (
+                "deployment_failed_submit",
+                SaError::DeploymentFailed {
+                    phase: "submit",
+                    redacted_reason: "test".to_owned(),
+                },
+                SaInvocationResult::OnChainRejected,
+            ),
+            (
+                "deployment_failed_post_deploy_verification",
+                SaError::DeploymentFailed {
+                    phase: "post_deploy_verification",
+                    redacted_reason: "test".to_owned(),
+                },
+                SaInvocationResult::OnChainRejected,
+            ),
+            (
+                "auth_entry_construction_failed_auth_payload",
+                SaError::AuthEntryConstructionFailed {
+                    stage: "auth_payload",
+                    redacted_reason: "test".to_owned(),
+                },
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "rule_id_mismatch",
+                SaError::RuleIdMismatch {
+                    expected_len: 1,
+                    observed_len: 0,
+                },
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "simulation_divergence_network",
+                SaError::SimulationDivergence {
+                    sub_code: SimulationDivergenceSubCode::Network,
+                    redacted_reason: "test".to_owned(),
+                },
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "pin_check_unavailable",
+                SaError::PinCheckUnavailable {
+                    rule_id: 4,
+                    smart_account_redacted: redacted(),
+                    reason: "sa.deployment_failed: rpc unreachable".to_owned(),
+                    request_id: "req".to_owned(),
+                },
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "mainnet_write_forbidden",
+                SaError::MainnetWriteForbidden,
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "total_epoch_unavailable",
+                SaError::TotalEpochUnavailable {
+                    detail: "検証-é".into(),
+                },
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "total_epoch_stale",
+                SaError::TotalEpochStale,
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "total_epoch_retired",
+                SaError::TotalEpochRetired,
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "auth_entry_binding_mismatch_network_id",
+                SaError::AuthEntryBindingMismatch {
+                    field: "network_id",
+                },
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "signer_set_diverged_no_tx_hash",
+                diverged(None),
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "signer_set_diverged_with_tx_hash",
+                diverged(Some("ab".repeat(32))),
+                SaInvocationResult::PostSubmitVerificationFailed,
+            ),
+            (
+                "signer_set_baseline_legacy",
+                SaError::SignerSetBaselineLegacy {
+                    rule_id: 1,
+                    smart_account_redacted: redacted(),
+                    request_id: "req".to_owned(),
+                },
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "install_state_mismatch_no_rule_id",
+                SaError::InstallStateMismatch {
+                    rule_id: None,
+                    smart_account_redacted: redacted(),
+                    tx_hash: "ab".repeat(32),
+                    request_id: "req".to_owned(),
+                },
+                SaInvocationResult::PostSubmitVerificationFailed,
+            ),
+            (
+                "install_state_mismatch_some_rule_id",
+                SaError::InstallStateMismatch {
+                    rule_id: Some(3),
+                    smart_account_redacted: redacted(),
+                    tx_hash: "ab".repeat(32),
+                    request_id: "req".to_owned(),
+                },
+                SaInvocationResult::PostSubmitVerificationFailed,
+            ),
+            (
+                "baseline_write_failed_no_tx_hash",
+                baseline_write_failed(None),
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "baseline_write_failed_with_tx_hash",
+                baseline_write_failed(Some("cd".repeat(32))),
+                SaInvocationResult::PostSubmitVerificationFailed,
+            ),
+            (
+                "timelock_schedule_simulation_failed",
+                schedule_failed(TimelockScheduleFailureReason::SimulationFailed),
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "timelock_schedule_audit_writer_poisoned",
+                schedule_failed(TimelockScheduleFailureReason::AuditWriterPoisoned),
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "timelock_schedule_event_confirmation_missing",
+                schedule_failed(TimelockScheduleFailureReason::EventConfirmationMissing),
+                SaInvocationResult::PostSubmitVerificationFailed,
+            ),
+            (
+                "timelock_schedule_unauthorized",
+                schedule_failed(TimelockScheduleFailureReason::Unauthorized),
+                SaInvocationResult::OnChainRejected,
+            ),
+            (
+                "timelock_schedule_operation_already_scheduled",
+                schedule_failed(TimelockScheduleFailureReason::OperationAlreadyScheduled),
+                SaInvocationResult::OnChainRejected,
+            ),
+            (
+                "timelock_schedule_insufficient_delay",
+                schedule_failed(TimelockScheduleFailureReason::InsufficientDelay),
+                SaInvocationResult::OnChainRejected,
+            ),
+            (
+                "timelock_schedule_other",
+                schedule_failed(TimelockScheduleFailureReason::Other),
+                SaInvocationResult::OnChainRejected,
+            ),
+            (
+                "timelock_cancel_simulation_failed",
+                cancel_failed(TimelockCancelFailureReason::SimulationFailed),
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "timelock_cancel_audit_writer_poisoned",
+                cancel_failed(TimelockCancelFailureReason::AuditWriterPoisoned),
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "timelock_cancel_event_confirmation_missing",
+                cancel_failed(TimelockCancelFailureReason::EventConfirmationMissing),
+                SaInvocationResult::PostSubmitVerificationFailed,
+            ),
+            (
+                "timelock_cancel_unauthorized",
+                cancel_failed(TimelockCancelFailureReason::Unauthorized),
+                SaInvocationResult::OnChainRejected,
+            ),
+            (
+                "timelock_cancel_invalid_operation_state",
+                cancel_failed(TimelockCancelFailureReason::InvalidOperationState),
+                SaInvocationResult::OnChainRejected,
+            ),
+            (
+                "timelock_cancel_operation_not_scheduled",
+                cancel_failed(TimelockCancelFailureReason::OperationNotScheduled),
+                SaInvocationResult::OnChainRejected,
+            ),
+            (
+                "timelock_cancel_other",
+                cancel_failed(TimelockCancelFailureReason::Other),
+                SaInvocationResult::OnChainRejected,
+            ),
+            (
+                "timelock_execute_simulation_failed",
+                execute_failed(TimelockExecuteFailureReason::SimulationFailed),
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "timelock_execute_audit_writer_poisoned",
+                execute_failed(TimelockExecuteFailureReason::AuditWriterPoisoned),
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "timelock_execute_operation_not_ready",
+                execute_failed(TimelockExecuteFailureReason::OperationNotReady {
+                    observed_state: "Waiting".to_owned(),
+                    current_ledger: Some(100),
+                    ready_ledger: 200,
+                }),
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "timelock_execute_operation_id_mismatch",
+                execute_failed(TimelockExecuteFailureReason::OperationIdMismatch),
+                SaInvocationResult::PreSubmissionRefused,
+            ),
+            (
+                "timelock_execute_event_confirmation_missing",
+                execute_failed(TimelockExecuteFailureReason::EventConfirmationMissing),
+                SaInvocationResult::PostSubmitVerificationFailed,
+            ),
+            (
+                "timelock_execute_invalid_operation_state",
+                execute_failed(TimelockExecuteFailureReason::InvalidOperationState),
+                SaInvocationResult::OnChainRejected,
+            ),
+            (
+                "timelock_execute_unexecuted_predecessor",
+                execute_failed(TimelockExecuteFailureReason::UnexecutedPredecessor),
+                SaInvocationResult::OnChainRejected,
+            ),
+            (
+                "timelock_execute_other",
+                execute_failed(TimelockExecuteFailureReason::Other),
+                SaInvocationResult::OnChainRejected,
+            ),
         ];
-        for reason in &reasons {
-            let err = SaError::TimelockExecuteFailed {
-                failure_reason: reason.clone(),
-                redacted_reason: "test".to_owned(),
-                request_id: "req-test".to_owned(),
-            };
-            assert!(
-                matches!(
-                    sa_error_to_invocation_result(&err),
-                    SaInvocationResult::PreSubmissionRefused
-                ),
-                "TimelockExecuteFailed {{ reason: {reason:?} }} must map to PreSubmissionRefused"
-            );
-        }
-    }
 
-    /// `TimelockExecuteFailed` with `EventConfirmationMissing` →
-    /// `PostSubmitVerificationFailed`.
-    #[test]
-    fn sa_error_to_invocation_result_timelock_execute_post_submit_verification_failed() {
-        use crate::error::TimelockExecuteFailureReason as R;
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        let err = SaError::TimelockExecuteFailed {
-            failure_reason: R::EventConfirmationMissing,
-            redacted_reason: "test".to_owned(),
-            request_id: "req-test".to_owned(),
-        };
-        assert!(
-            matches!(
-                sa_error_to_invocation_result(&err),
-                SaInvocationResult::PostSubmitVerificationFailed
-            ),
-            "TimelockExecuteFailed {{ reason: EventConfirmationMissing }} must map to \
-             PostSubmitVerificationFailed"
-        );
-    }
-
-    /// `TimelockExecuteFailed` with `InvalidOperationState`, `UnexecutedPredecessor`,
-    /// or `Other` → `OnChainRejected`.
-    ///
-    /// Note: `TimelockExecuteFailureReason` has no `Unauthorized` variant; the
-    /// on-chain rejected discriminants are `InvalidOperationState` (code 4002),
-    /// `UnexecutedPredecessor` (code 4003), and `Other` (unrecognised OZ error).
-    #[test]
-    fn sa_error_to_invocation_result_timelock_execute_on_chain_rejected() {
-        use crate::error::TimelockExecuteFailureReason as R;
-        use stellar_agent_core::audit_log::schema::SaInvocationResult;
-
-        for reason in [R::InvalidOperationState, R::UnexecutedPredecessor, R::Other] {
-            let err = SaError::TimelockExecuteFailed {
-                failure_reason: reason.clone(),
-                redacted_reason: "test".to_owned(),
-                request_id: "req-test".to_owned(),
-            };
-            assert!(
-                matches!(
-                    sa_error_to_invocation_result(&err),
-                    SaInvocationResult::OnChainRejected
-                ),
-                "TimelockExecuteFailed {{ reason: {reason:?} }} must map to OnChainRejected"
-            );
+        for (case, err, expected) in cases {
+            assert_eq!(sa_error_to_invocation_result(&err), expected, "case {case}");
         }
     }
 

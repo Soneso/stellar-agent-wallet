@@ -993,6 +993,30 @@ async fn muxed_contract_custom_asset_and_simulation_error_text() {
 }
 
 /// Asserts that `result` is a refusal with wire code `code` and exactly
+/// `expected` as its detail, carrying `case` in every failure message.
+fn assert_refusal_case(
+    case: &str,
+    result: &Result<PaymentPayload, X402Error>,
+    code: &str,
+    expected: &str,
+) {
+    let Err(error) = result else {
+        panic!("case {case}: expected a {code} refusal {expected:?}, got a payment payload");
+    };
+    assert_eq!(
+        error.wire_code(),
+        code,
+        "case {case}: the refusal's wire code: {error}"
+    );
+    let (X402Error::UnexpectedAuthEntries { detail } | X402Error::RpcSimulateFailed { detail }) =
+        error
+    else {
+        panic!("case {case}: expected a refusal carrying a detail, got {error:?}");
+    };
+    assert_eq!(detail, expected, "case {case}: the refusal detail");
+}
+
+/// Asserts that `result` is a refusal with wire code `code` and exactly
 /// `expected` as its detail. The detail is a fixed sentence, so equality also
 /// shows that it carries no value from the answer.
 fn assert_refusal(result: &Result<PaymentPayload, X402Error>, code: &str, expected: &str) {
@@ -1010,21 +1034,26 @@ fn assert_refusal(result: &Result<PaymentPayload, X402Error>, code: &str, expect
 
 /// Asserts that the first simulation was refused before anything was signed,
 /// with exactly `expected` as the detail.
-fn assert_refused_before_signing(outcome: &Outcome, expected: &str) {
-    assert_refusal(&outcome.result, "x402.unexpected_auth_entries", expected);
+fn assert_refused_before_signing(case: &str, outcome: &Outcome, expected: &str) {
+    assert_refusal_case(
+        case,
+        &outcome.result,
+        "x402.unexpected_auth_entries",
+        expected,
+    );
     assert_eq!(
         outcome.signing_calls, 0,
-        "no signing primitive may run on a refused simulation"
+        "case {case}: no signing primitive may run on a refused simulation"
     );
     assert_eq!(
         outcome.gate_calls, 0,
-        "the transmit gate must not run on a refused simulation"
+        "case {case}: the transmit gate must not run on a refused simulation"
     );
     assert_eq!(
         outcome.simulate_requests, 1,
-        "only the unsigned simulation is sent"
+        "case {case}: only the unsigned simulation is sent"
     );
-    assert_eq!(outcome.requests, 2, "no other request is sent");
+    assert_eq!(outcome.requests, 2, "case {case}: no other request is sent");
 }
 
 /// Asserts that the payer signed once, the gate ran once, and both
@@ -1230,159 +1259,190 @@ async fn pre_sign_callback_refusal_signs_nothing() {
 
 // ── (b) Refused first simulations ────────────────────────────────────────────
 
+/// Refuses every malformed first-simulation authorization set before signing,
+/// pinning exact refusal details, zero signing or gate calls, and request counts.
 #[tokio::test]
-async fn a_root_invocation_of_another_contract_is_refused_before_signing() {
-    let entry = honest_entry_with_transfer(|transfer| {
-        transfer.contract_address = contract_address(OTHER_CONTRACT);
-    });
-    let outcome = pay_with_first_auth(&[entry]).await;
-    assert_refused_before_signing(&outcome, OTHER_CONTRACT_DETAIL);
-}
+async fn invalid_first_simulation_auth_entries_refused_before_signing() {
+    struct FirstAuthRefusalCase {
+        name: &'static str,
+        build_entries: fn() -> Vec<SorobanAuthorizationEntry>,
+        expected_detail: &'static str,
+    }
 
-#[tokio::test]
-async fn a_root_invocation_that_is_not_a_contract_call_is_refused_before_signing() {
-    let mut entry = honest_entry();
-    entry.root_invocation.function =
-        SorobanAuthorizedFunction::CreateContractHostFn(CreateContractArgs {
-            contract_id_preimage: ContractIdPreimage::Address(ContractIdPreimageFromAddress {
-                address: account_address(PAYER_SEED),
-                salt: Uint256([0x11; 32]),
-            }),
-            executable: ContractExecutable::StellarAsset,
-        });
-    let outcome = pay_with_first_auth(&[entry]).await;
-    assert_refused_before_signing(&outcome, NOT_A_CONTRACT_CALL_DETAIL);
-}
+    let cases: &[FirstAuthRefusalCase] = &[
+        FirstAuthRefusalCase {
+            name: "other_contract",
+            build_entries: || {
+                vec![honest_entry_with_transfer(|transfer| {
+                    transfer.contract_address = contract_address(OTHER_CONTRACT);
+                })]
+            },
+            expected_detail: OTHER_CONTRACT_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "not_a_contract_call",
+            build_entries: || {
+                let mut entry = honest_entry();
+                entry.root_invocation.function =
+                    SorobanAuthorizedFunction::CreateContractHostFn(CreateContractArgs {
+                        contract_id_preimage: ContractIdPreimage::Address(
+                            ContractIdPreimageFromAddress {
+                                address: account_address(PAYER_SEED),
+                                salt: Uint256([0x11; 32]),
+                            },
+                        ),
+                        executable: ContractExecutable::StellarAsset,
+                    });
+                vec![entry]
+            },
+            expected_detail: NOT_A_CONTRACT_CALL_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "other_function",
+            build_entries: || {
+                vec![honest_entry_with_transfer(|transfer| {
+                    transfer.function_name = ScSymbol(
+                        "approve"
+                            .try_into()
+                            .expect("case other_function: approve symbol"),
+                    );
+                })]
+            },
+            expected_detail: OTHER_FUNCTION_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "from_other_account",
+            build_entries: || {
+                vec![with_root_args(honest_entry(), |args| {
+                    args[0] = ScVal::Address(account_address(OTHER_ACCOUNT_SEED));
+                })]
+            },
+            expected_detail: FROM_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "to_other_recipient",
+            build_entries: || {
+                vec![with_root_args(honest_entry(), |args| {
+                    args[1] = ScVal::Address(account_address(OTHER_ACCOUNT_SEED));
+                })]
+            },
+            expected_detail: TO_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "forged_amount",
+            build_entries: || {
+                vec![with_root_args(honest_entry(), |args| {
+                    args[2] = amount_scval(FORGED_AMOUNT);
+                })]
+            },
+            expected_detail: AMOUNT_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "extra_argument",
+            build_entries: || {
+                vec![with_root_args(honest_entry(), |args| {
+                    args.push(amount_scval(AMOUNT));
+                })]
+            },
+            expected_detail: ARGUMENT_COUNT_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "missing_argument",
+            build_entries: || {
+                vec![with_root_args(honest_entry(), |args| {
+                    args.pop();
+                })]
+            },
+            expected_detail: ARGUMENT_COUNT_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "nested_call",
+            build_entries: || vec![with_sub_invocation(honest_entry())],
+            expected_detail: NESTED_CALLS_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "empty_authorization",
+            build_entries: Vec::new,
+            expected_detail: COUNT_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "sole_foreign_entry",
+            build_entries: || vec![foreign_entry()],
+            expected_detail: OTHER_ACCOUNT_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "foreign_entry_beside_payer",
+            build_entries: || vec![honest_entry(), foreign_entry()],
+            expected_detail: COUNT_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "duplicate_payer_entry",
+            build_entries: || vec![honest_entry(), honest_entry()],
+            expected_detail: COUNT_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "source_account_beside_payer",
+            build_entries: || vec![honest_entry(), source_account_entry()],
+            expected_detail: COUNT_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "sole_source_account_entry",
+            build_entries: || vec![source_account_entry()],
+            expected_detail: SOURCE_ACCOUNT_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "address_v2_credentials",
+            build_entries: || {
+                vec![with_credentials_arm(
+                    honest_entry(),
+                    SorobanCredentials::AddressV2,
+                )]
+            },
+            expected_detail: ADDRESS_V2_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "delegated_credentials",
+            build_entries: || {
+                vec![with_credentials_arm(
+                    honest_entry(),
+                    |address_credentials| {
+                        SorobanCredentials::AddressWithDelegates(
+                            SorobanAddressCredentialsWithDelegates {
+                                address_credentials,
+                                delegates: VecM::default(),
+                            },
+                        )
+                    },
+                )]
+            },
+            expected_detail: DELEGATED_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "non_zero_expiration",
+            build_entries: || {
+                let mut entry = honest_entry();
+                address_credentials(&mut entry).signature_expiration_ledger = 5_000;
+                vec![entry]
+            },
+            expected_detail: EXPIRATION_DETAIL,
+        },
+        FirstAuthRefusalCase {
+            name: "existing_signature",
+            build_entries: || {
+                let mut entry = honest_entry();
+                address_credentials(&mut entry).signature =
+                    ScVal::Vec(Some(ScVec(VecM::default())));
+                vec![entry]
+            },
+            expected_detail: SIGNATURE_DETAIL,
+        },
+    ];
 
-#[tokio::test]
-async fn a_root_invocation_of_another_function_is_refused_before_signing() {
-    let entry = honest_entry_with_transfer(|transfer| {
-        transfer.function_name = ScSymbol("approve".try_into().unwrap());
-    });
-    let outcome = pay_with_first_auth(&[entry]).await;
-    assert_refused_before_signing(&outcome, OTHER_FUNCTION_DETAIL);
-}
-
-#[tokio::test]
-async fn a_transfer_from_another_account_is_refused_before_signing() {
-    let entry = with_root_args(honest_entry(), |args| {
-        args[0] = ScVal::Address(account_address(OTHER_ACCOUNT_SEED));
-    });
-    let outcome = pay_with_first_auth(&[entry]).await;
-    assert_refused_before_signing(&outcome, FROM_DETAIL);
-}
-
-#[tokio::test]
-async fn a_transfer_to_another_recipient_is_refused_before_signing() {
-    let entry = with_root_args(honest_entry(), |args| {
-        args[1] = ScVal::Address(account_address(OTHER_ACCOUNT_SEED));
-    });
-    let outcome = pay_with_first_auth(&[entry]).await;
-    assert_refused_before_signing(&outcome, TO_DETAIL);
-}
-
-#[tokio::test]
-async fn a_transfer_of_another_amount_is_refused_before_signing() {
-    let entry = with_root_args(honest_entry(), |args| {
-        args[2] = amount_scval(FORGED_AMOUNT);
-    });
-    let outcome = pay_with_first_auth(&[entry]).await;
-    assert_refused_before_signing(&outcome, AMOUNT_DETAIL);
-}
-
-#[tokio::test]
-async fn a_transfer_with_an_extra_argument_is_refused_before_signing() {
-    let entry = with_root_args(honest_entry(), |args| {
-        args.push(amount_scval(AMOUNT));
-    });
-    let outcome = pay_with_first_auth(&[entry]).await;
-    assert_refused_before_signing(&outcome, ARGUMENT_COUNT_DETAIL);
-}
-
-#[tokio::test]
-async fn a_transfer_with_a_missing_argument_is_refused_before_signing() {
-    let entry = with_root_args(honest_entry(), |args| {
-        args.pop();
-    });
-    let outcome = pay_with_first_auth(&[entry]).await;
-    assert_refused_before_signing(&outcome, ARGUMENT_COUNT_DETAIL);
-}
-
-#[tokio::test]
-async fn a_root_invocation_with_a_nested_call_is_refused_before_signing() {
-    let outcome = pay_with_first_auth(&[with_sub_invocation(honest_entry())]).await;
-    assert_refused_before_signing(&outcome, NESTED_CALLS_DETAIL);
-}
-
-#[tokio::test]
-async fn an_empty_authorization_is_refused_before_signing() {
-    let outcome = pay_with_first_auth(&[]).await;
-    assert_refused_before_signing(&outcome, COUNT_DETAIL);
-}
-
-#[tokio::test]
-async fn a_sole_entry_for_another_account_is_refused_before_signing() {
-    let outcome = pay_with_first_auth(&[foreign_entry()]).await;
-    assert_refused_before_signing(&outcome, OTHER_ACCOUNT_DETAIL);
-}
-
-#[tokio::test]
-async fn an_entry_for_another_account_beside_the_payers_is_refused_before_signing() {
-    let outcome = pay_with_first_auth(&[honest_entry(), foreign_entry()]).await;
-    assert_refused_before_signing(&outcome, COUNT_DETAIL);
-}
-
-#[tokio::test]
-async fn a_duplicate_payer_entry_is_refused_before_signing() {
-    let outcome = pay_with_first_auth(&[honest_entry(), honest_entry()]).await;
-    assert_refused_before_signing(&outcome, COUNT_DETAIL);
-}
-
-#[tokio::test]
-async fn a_source_account_entry_beside_the_payers_is_refused_before_signing() {
-    let outcome = pay_with_first_auth(&[honest_entry(), source_account_entry()]).await;
-    assert_refused_before_signing(&outcome, COUNT_DETAIL);
-}
-
-#[tokio::test]
-async fn a_sole_source_account_entry_is_refused_before_signing() {
-    let outcome = pay_with_first_auth(&[source_account_entry()]).await;
-    assert_refused_before_signing(&outcome, SOURCE_ACCOUNT_DETAIL);
-}
-
-#[tokio::test]
-async fn a_payer_entry_with_address_v2_credentials_is_refused_before_signing() {
-    let entry = with_credentials_arm(honest_entry(), SorobanCredentials::AddressV2);
-    let outcome = pay_with_first_auth(&[entry]).await;
-    assert_refused_before_signing(&outcome, ADDRESS_V2_DETAIL);
-}
-
-#[tokio::test]
-async fn a_payer_entry_with_delegated_credentials_is_refused_before_signing() {
-    let entry = with_credentials_arm(honest_entry(), |address_credentials| {
-        SorobanCredentials::AddressWithDelegates(SorobanAddressCredentialsWithDelegates {
-            address_credentials,
-            delegates: VecM::default(),
-        })
-    });
-    let outcome = pay_with_first_auth(&[entry]).await;
-    assert_refused_before_signing(&outcome, DELEGATED_DETAIL);
-}
-
-#[tokio::test]
-async fn a_payer_entry_with_a_non_zero_expiration_is_refused_before_signing() {
-    let mut entry = honest_entry();
-    address_credentials(&mut entry).signature_expiration_ledger = 5_000;
-    let outcome = pay_with_first_auth(&[entry]).await;
-    assert_refused_before_signing(&outcome, EXPIRATION_DETAIL);
-}
-
-#[tokio::test]
-async fn a_payer_entry_that_already_carries_a_signature_is_refused_before_signing() {
-    let mut entry = honest_entry();
-    address_credentials(&mut entry).signature = ScVal::Vec(Some(ScVec(VecM::default())));
-    let outcome = pay_with_first_auth(&[entry]).await;
-    assert_refused_before_signing(&outcome, SIGNATURE_DETAIL);
+    for case in cases {
+        let entries = (case.build_entries)();
+        let outcome = pay_with_first_auth(&entries).await;
+        assert_refused_before_signing(case.name, &outcome, case.expected_detail);
+    }
 }
 
 // ── (c) Re-simulation answers ────────────────────────────────────────────────

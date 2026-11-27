@@ -314,23 +314,31 @@ mod tests {
 
     // ── Helper: assert DangerousKey with matched constant ─────────────────────
 
-    fn assert_dangerous_key(result: &Result<(), ToolsetArgsError>, expected_key: &str) {
+    fn assert_dangerous_key_case(
+        case: &str,
+        result: &Result<(), ToolsetArgsError>,
+        expected_key: &str,
+    ) {
         match result {
-            Err(ToolsetArgsError::DangerousKey { matched_key }) => {
+            Err(err @ ToolsetArgsError::DangerousKey { matched_key }) => {
                 assert_eq!(
                     *matched_key, expected_key,
-                    "expected matched_key = {expected_key:?}, got {matched_key:?}"
+                    "case {case}: expected matched_key = {expected_key:?}, got {matched_key:?}"
                 );
                 // Verify Display does NOT contain any attacker-supplied input.
                 // (The error references the &'static str constant only.)
-                let display = result.as_ref().unwrap_err().to_string();
+                let display = err.to_string();
                 assert!(
                     display.contains(expected_key),
-                    "Display must mention the matched constant: {display}"
+                    "case {case}: Display must mention the matched constant: {display}"
                 );
             }
-            other => panic!("expected DangerousKey({expected_key}), got {other:?}"),
+            other => panic!("case {case}: expected DangerousKey({expected_key}), got {other:?}"),
         }
+    }
+
+    fn assert_dangerous_key(result: &Result<(), ToolsetArgsError>, expected_key: &str) {
+        assert_dangerous_key_case(expected_key, result, expected_key);
     }
 
     // ── Benign payloads pass ──────────────────────────────────────────────────
@@ -385,243 +393,183 @@ mod tests {
         validate_toolset_tool_args(&val).unwrap();
     }
 
-    // ── Denylist: each of the 11 keys at top level ────────────────────────────
+    // ── Denylist: all 11 keys across top-level, nested-object, and array shapes ─
 
+    /// Rejects all 11 denylisted keys across top-level, nested-object, and
+    /// nested-array payloads while keeping each payload shape distinct.
     #[test]
-    fn denylist_tojson_top_level() {
-        let val = json!({ "toJSON": "something" });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "toJSON");
-    }
+    fn denylist_keys_rejected_across_shapes() {
+        let cases = [
+            // Top-level object keys
+            (
+                "tojson_top_level",
+                json!({ "toJSON": "something" }),
+                "toJSON",
+            ),
+            ("then_top_level", json!({ "then": "something" }), "then"),
+            (
+                "proto_top_level",
+                json!({ "__proto__": { "isAdmin": true } }),
+                "__proto__",
+            ),
+            (
+                "constructor_top_level",
+                json!({ "constructor": "something" }),
+                "constructor",
+            ),
+            (
+                "prototype_top_level",
+                json!({ "prototype": "something" }),
+                "prototype",
+            ),
+            (
+                "tostring_top_level",
+                json!({ "toString": "something" }),
+                "toString",
+            ),
+            (
+                "valueof_top_level",
+                json!({ "valueOf": "something" }),
+                "valueOf",
+            ),
+            (
+                "define_getter_top_level",
+                json!({ "__defineGetter__": "something" }),
+                "__defineGetter__",
+            ),
+            (
+                "define_setter_top_level",
+                json!({ "__defineSetter__": "something" }),
+                "__defineSetter__",
+            ),
+            (
+                "lookup_getter_top_level",
+                json!({ "__lookupGetter__": "something" }),
+                "__lookupGetter__",
+            ),
+            (
+                "lookup_setter_top_level",
+                json!({ "__lookupSetter__": "something" }),
+                "__lookupSetter__",
+            ),
+            // Nested object keys
+            (
+                "tojson_nested_in_object",
+                json!({ "safe_key": { "toJSON": "evil" } }),
+                "toJSON",
+            ),
+            (
+                "then_nested_in_object",
+                json!({ "outer": { "inner": { "then": "evil" } } }),
+                "then",
+            ),
+            (
+                "proto_nested_in_object",
+                json!({ "metadata": { "__proto__": "evil" } }),
+                "__proto__",
+            ),
+            (
+                "constructor_nested_in_object",
+                json!({ "outer": { "constructor": "evil" } }),
+                "constructor",
+            ),
+            (
+                "prototype_nested_in_object",
+                json!({ "outer": { "prototype": "evil" } }),
+                "prototype",
+            ),
+            (
+                "tostring_nested_in_object",
+                json!({ "outer": { "toString": "evil" } }),
+                "toString",
+            ),
+            (
+                "valueof_nested_in_object",
+                json!({ "outer": { "valueOf": "evil" } }),
+                "valueOf",
+            ),
+            (
+                "define_getter_nested_in_object",
+                json!({ "outer": { "__defineGetter__": "evil" } }),
+                "__defineGetter__",
+            ),
+            (
+                "define_setter_nested_in_object",
+                json!({ "outer": { "__defineSetter__": "evil" } }),
+                "__defineSetter__",
+            ),
+            (
+                "lookup_getter_nested_in_object",
+                json!({ "outer": { "__lookupGetter__": "evil" } }),
+                "__lookupGetter__",
+            ),
+            (
+                "lookup_setter_nested_in_object",
+                json!({ "outer": { "__lookupSetter__": "evil" } }),
+                "__lookupSetter__",
+            ),
+            // Objects nested inside arrays are key-checked
+            (
+                "tojson_nested_in_array",
+                json!([{ "toJSON": "evil" }]),
+                "toJSON",
+            ),
+            (
+                "then_nested_in_array",
+                json!([{ "benign": "value" }, { "then": "evil" }]),
+                "then",
+            ),
+            (
+                "proto_nested_in_array",
+                json!([{ "__proto__": "evil" }]),
+                "__proto__",
+            ),
+            (
+                "constructor_nested_in_array",
+                json!([{ "constructor": "evil" }]),
+                "constructor",
+            ),
+            (
+                "prototype_nested_in_array",
+                json!([{ "prototype": "evil" }]),
+                "prototype",
+            ),
+            (
+                "tostring_nested_in_array",
+                json!([{ "toString": "evil" }]),
+                "toString",
+            ),
+            (
+                "valueof_nested_in_array",
+                json!([{ "valueOf": "evil" }]),
+                "valueOf",
+            ),
+            (
+                "define_getter_nested_in_array",
+                json!([{ "__defineGetter__": "evil" }]),
+                "__defineGetter__",
+            ),
+            (
+                "define_setter_nested_in_array",
+                json!([{ "__defineSetter__": "evil" }]),
+                "__defineSetter__",
+            ),
+            (
+                "lookup_getter_nested_in_array",
+                json!([{ "__lookupGetter__": "evil" }]),
+                "__lookupGetter__",
+            ),
+            (
+                "lookup_setter_nested_in_array",
+                json!([{ "__lookupSetter__": "evil" }]),
+                "__lookupSetter__",
+            ),
+        ];
 
-    #[test]
-    fn denylist_then_top_level() {
-        let val = json!({ "then": "something" });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "then");
-    }
-
-    #[test]
-    fn denylist_proto_top_level() {
-        let val = json!({ "__proto__": { "isAdmin": true } });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__proto__");
-    }
-
-    #[test]
-    fn denylist_constructor_top_level() {
-        let val = json!({ "constructor": "something" });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "constructor");
-    }
-
-    #[test]
-    fn denylist_prototype_top_level() {
-        let val = json!({ "prototype": "something" });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "prototype");
-    }
-
-    #[test]
-    fn denylist_tostring_top_level() {
-        let val = json!({ "toString": "something" });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "toString");
-    }
-
-    #[test]
-    fn denylist_valueof_top_level() {
-        let val = json!({ "valueOf": "something" });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "valueOf");
-    }
-
-    #[test]
-    fn denylist_define_getter_top_level() {
-        let val = json!({ "__defineGetter__": "something" });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__defineGetter__");
-    }
-
-    #[test]
-    fn denylist_define_setter_top_level() {
-        let val = json!({ "__defineSetter__": "something" });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__defineSetter__");
-    }
-
-    #[test]
-    fn denylist_lookup_getter_top_level() {
-        let val = json!({ "__lookupGetter__": "something" });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__lookupGetter__");
-    }
-
-    #[test]
-    fn denylist_lookup_setter_top_level() {
-        let val = json!({ "__lookupSetter__": "something" });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__lookupSetter__");
-    }
-
-    // ── Denylist: each key nested in an object ────────────────────────────────
-
-    #[test]
-    fn denylist_tojson_nested_in_object() {
-        let val = json!({ "safe_key": { "toJSON": "evil" } });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "toJSON");
-    }
-
-    #[test]
-    fn denylist_then_nested_in_object() {
-        let val = json!({ "outer": { "inner": { "then": "evil" } } });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "then");
-    }
-
-    #[test]
-    fn denylist_proto_nested_in_object() {
-        let val = json!({ "metadata": { "__proto__": "evil" } });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__proto__");
-    }
-
-    #[test]
-    fn denylist_constructor_nested_in_object() {
-        let val = json!({ "outer": { "constructor": "evil" } });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "constructor");
-    }
-
-    #[test]
-    fn denylist_prototype_nested_in_object() {
-        let val = json!({ "outer": { "prototype": "evil" } });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "prototype");
-    }
-
-    #[test]
-    fn denylist_tostring_nested_in_object() {
-        let val = json!({ "outer": { "toString": "evil" } });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "toString");
-    }
-
-    #[test]
-    fn denylist_valueof_nested_in_object() {
-        let val = json!({ "outer": { "valueOf": "evil" } });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "valueOf");
-    }
-
-    #[test]
-    fn denylist_define_getter_nested_in_object() {
-        let val = json!({ "outer": { "__defineGetter__": "evil" } });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__defineGetter__");
-    }
-
-    #[test]
-    fn denylist_define_setter_nested_in_object() {
-        let val = json!({ "outer": { "__defineSetter__": "evil" } });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__defineSetter__");
-    }
-
-    #[test]
-    fn denylist_lookup_getter_nested_in_object() {
-        let val = json!({ "outer": { "__lookupGetter__": "evil" } });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__lookupGetter__");
-    }
-
-    #[test]
-    fn denylist_lookup_setter_nested_in_object() {
-        let val = json!({ "outer": { "__lookupSetter__": "evil" } });
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__lookupSetter__");
-    }
-
-    // ── Denylist: each key nested in an array ─────────────────────────────────
-    //
-    // Objects nested inside arrays ARE key-checked.
-
-    #[test]
-    fn denylist_tojson_nested_in_array() {
-        let val = json!([{ "toJSON": "evil" }]);
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "toJSON");
-    }
-
-    #[test]
-    fn denylist_then_nested_in_array() {
-        let val = json!([{ "benign": "value" }, { "then": "evil" }]);
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "then");
-    }
-
-    #[test]
-    fn denylist_proto_nested_in_array() {
-        let val = json!([{ "__proto__": "evil" }]);
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__proto__");
-    }
-
-    #[test]
-    fn denylist_constructor_nested_in_array() {
-        let val = json!([{ "constructor": "evil" }]);
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "constructor");
-    }
-
-    #[test]
-    fn denylist_prototype_nested_in_array() {
-        let val = json!([{ "prototype": "evil" }]);
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "prototype");
-    }
-
-    #[test]
-    fn denylist_tostring_nested_in_array() {
-        let val = json!([{ "toString": "evil" }]);
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "toString");
-    }
-
-    #[test]
-    fn denylist_valueof_nested_in_array() {
-        let val = json!([{ "valueOf": "evil" }]);
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "valueOf");
-    }
-
-    #[test]
-    fn denylist_define_getter_nested_in_array() {
-        let val = json!([{ "__defineGetter__": "evil" }]);
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__defineGetter__");
-    }
-
-    #[test]
-    fn denylist_define_setter_nested_in_array() {
-        let val = json!([{ "__defineSetter__": "evil" }]);
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__defineSetter__");
-    }
-
-    #[test]
-    fn denylist_lookup_getter_nested_in_array() {
-        let val = json!([{ "__lookupGetter__": "evil" }]);
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__lookupGetter__");
-    }
-
-    #[test]
-    fn denylist_lookup_setter_nested_in_array() {
-        let val = json!([{ "__lookupSetter__": "evil" }]);
-        let r = validate_toolset_tool_args(&val);
-        assert_dangerous_key(&r, "__lookupSetter__");
+        for (case, val, expected_key) in cases {
+            let r = validate_toolset_tool_args(&val);
+            assert_dangerous_key_case(case, &r, expected_key);
+        }
     }
 
     // ── Depth bound ───────────────────────────────────────────────────────────
