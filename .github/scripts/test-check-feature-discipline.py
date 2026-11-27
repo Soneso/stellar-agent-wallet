@@ -520,7 +520,7 @@ for _family, _edges in {'build': 'normal,build', 'check': 'normal,build',
 
 @unit('translation-nextest')
 def translation_nextest(m, tmp, checker):
-    for mode, flags in (('list', '--message-format json'), ('run', '--profile ci')):
+    for mode, flags in (('run', '--profile ci'),):
         for shard in (1, 2, 3):
             try:
                 row = m.translate(f'cargo nextest {mode} --workspace --features mainnet-write --partition count:{shard}/3 {flags}')
@@ -533,10 +533,15 @@ def translation_nextest(m, tmp, checker):
     except ValueError as error:
         raise AssertionError(f"nextest equal flags: {error}") from error
     assert row["edges"] == "normal,build,dev", "nextest equal flags"
-    for suffix in ('', 'bench', 'run --unknown', 'run --partition', 'run --partition count:4/3',
-                   'run --profile dev', 'list --message-format xml', 'list --profile ci',
-                   'run --message-format json', 'run -- --ignored', 'run --release',
-                   'run --partition count:1/3junk'):
+    try:
+        row = m.translate('cargo nextest run --workspace --no-default-features --partition count:1/3 --profile ci')
+    except ValueError as error:
+        raise AssertionError(f'nextest offline features: {error}') from error
+    assert row['features'] == ['--no-default-features'], 'nextest offline features'
+    for suffix in ('', 'bench --partition count:1/3 --profile ci', 'bench', 'list', 'list --partition count:1/3 --profile ci', 'run', 'run --partition count:1/3', 'run --profile ci', 'run --unknown', 'run --partition', 'run --partition count:4/3 --profile ci',
+                   'run --profile dev --partition count:1/3',
+                   'run --partition count:1/3 --profile ci --message-format json', 'run --partition count:1/3 --profile ci -- --ignored', 'run --release',
+                   'run --partition count:1/3junk --profile ci'):
         try:
             m.translate('cargo nextest ' + suffix)
         except ValueError:
@@ -544,6 +549,17 @@ def translation_nextest(m, tmp, checker):
         except Exception as error:
             raise AssertionError(f'nextest rejection: {suffix}: {error}') from error
         raise AssertionError('accepted nextest ' + suffix)
+
+
+@unit('nextest-command')
+def nextest_command(m, tmp, checker):
+    for command in ('cross nextest run --partition count:1/3 --profile ci',
+                    'cargo --locked nextest run --partition count:1/3 --profile ci'):
+        try:
+            m.translate(command)
+        except ValueError:
+            continue
+        raise AssertionError('accepted non-CI nextest command')
 
 
 @unit('translation-nextest-scope')
@@ -559,14 +575,14 @@ def translation_nextest_scope(m, tmp, checker):
 
 @unit('nextest-job-allowlist')
 def nextest_job_allowlist(m, tmp, checker):
-    for job in ('feature-on-test', 'feature-on-test-shadow', 'feature-on-test-extra',
-                'feature-on-test-compare', 'feature-on-test-other'):
+    for job in ('feature-on-test', 'feature-on-test-extra', 'feature-on-test-other',
+                'feature-on-test-shadow', 'test', 'test (1/3)', 'test-extra'):
         instance = object.__new__(m.Checker)
         instance.root, instance.errors, instance.scripts = tmp, [], {}
         instance.workflows = {'ci.yml': {'jobs': {job: {'steps': [
             {'run': 'cargo nextest run --workspace --features mainnet-write --partition count:1/3 --profile ci'}]}}}}
         instance.D9()
-        assert bool(instance.errors) == (job in ('feature-on-test-compare', 'feature-on-test-other')), job
+        assert bool(instance.errors) == (job not in ('feature-on-test', 'feature-on-test-extra')), job
 
 
 @unit('nextest-inventory')
@@ -576,9 +592,79 @@ def nextest_inventory(m, tmp, checker):
     from collections import Counter
     encode = lambda rows: Counter(json.dumps(row, sort_keys=True) for row in rows)
     assert encode(actual) == encode(m.INVOCATIONS), 'reviewed inventory differs'
-    rows = [row for row in actual if row['job'] == 'feature-on-test']
-    assert len(rows) == 6, 'three list/run partitions'
-    assert {row['edges'] for row in rows} == {'normal,build,dev'}, 'nextest dev dependencies'
+    for job in ('test', 'feature-on-test'):
+        rows = [row for row in actual if row['job'] == job]
+        assert len(rows) == 3, 'three run partitions'
+        assert {row['edges'] for row in rows} == {'normal,build,dev'}, 'nextest dev dependencies'
+
+
+
+@unit('windows-prebuilds')
+def windows_prebuilds(m, tmp, checker):
+    """Every timed package, feature, host and test-target selection is prebuilt."""
+    import copy
+
+    def targets(command):
+        words = m.shlex.split(command)
+        words = words[:words.index('--')] if '--' in words else words
+        return tuple(sorted(
+            ('--test', word.split('=', 1)[1]) if word.startswith('--test=')
+            else (word, words[index + 1]) if word == '--test' else (word,)
+            for index, word in enumerate(words)
+            if word in ('--lib', '--bins', '--doc', '--test') or word.startswith('--test=')))
+
+    assert targets('cargo test --lib --bins --doc --test first --test second') == (
+        ('--bins',), ('--doc',), ('--lib',), ('--test', 'first'), ('--test', 'second')), 'Windows target selection'
+    assert targets('cargo test --lib -- --test ignored --bins --doc') == (('--lib',),), 'Windows libtest separator'
+    assert targets('cargo test --test=first --test second -- --test=ignored') == (
+        ('--test', 'first'), ('--test', 'second')), 'Windows equals target selection'
+    assert targets('cargo test --no-run') == (), 'Windows unrestricted prebuild'
+
+    def matches(configuration, selection, built):
+        return (configuration, selection) in built or (configuration, ()) in built
+
+    assert matches('config', (('--test', 'mcp'),), {('config', ())}), 'Windows all-target prebuild'
+    assert not matches('config', (('--test', 'other'),), {('config', (('--test', 'mcp'),))}), 'Windows different target'
+    assert not matches('other', (('--lib',),), {('config', ())}), 'Windows different configuration'
+
+    def validate(steps):
+        built, timed = set(), 0
+        for step in steps:
+            for line in step.get('run', '').splitlines():
+                line = line.strip()
+                if not line.startswith(('cargo test ', 'timeout 600 cargo test ')):
+                    continue
+                command = line.removeprefix('timeout 600 ').split(' 2>&1')[0]
+                row = m.translate(command)
+                configuration = (tuple(row['selection']), tuple(row['features']), row['target'])
+                selection = targets(command)
+                assert row['target'] is None, 'Windows uses the host target throughout'
+                if line.startswith('cargo test '):
+                    assert '--no-run' in command, 'Windows prebuild executes tests'
+                    assert (configuration, selection) not in built, 'Windows configuration built twice'
+                    built.add((configuration, selection))
+                else:
+                    timed += 1
+                    assert matches(configuration, selection, built), 'Windows timed configuration lacks an earlier prebuild'
+        assert len(built) == 8 and timed == 11, 'Windows configuration or timed command count differs'
+
+    workflows, _ = m.workflow_inputs(ROOT)
+    steps = workflows['ci.yml']['jobs']['windows-storage']['steps']
+    validate(steps)
+    for old, new, reason in (
+            ('--lib --no-run', '--bins --no-run', 'Windows timed configuration lacks an earlier prebuild'),
+            ('--no-default-features --features test-helpers --no-run',
+             '--no-default-features --features test-helpers --lib --no-run',
+             'Windows timed configuration lacks an earlier prebuild')):
+        mutated = copy.deepcopy(steps)
+        step = next(step for step in mutated if old in step.get('run', ''))
+        step['run'] = step['run'].replace(old, new, 1)
+        try:
+            validate(mutated)
+        except AssertionError as exc:
+            assert str(exc) == reason, (reason, str(exc))
+        else:
+            raise AssertionError('Windows target mutation survived: ' + reason)
 
 
 @unit('translation-doctests')
@@ -2323,45 +2409,43 @@ MUTATIONS.update({
 })
 
 MUTATIONS.update({
+    'nextest-command': ('nextest-command',
+        "if words[:2] != ['cargo', 'nextest']:", "if False:", 'accepted non-CI nextest command'),
+    'nextest-list-rejected': ('translation-nextest',
+        "words[i] != 'run'", "words[i] not in ('run', 'list')", 'accepted nextest list --partition'),
     'nextest-edges': ('translation-nextest',
         "'nextest': 'normal,build,dev'",
         "'nextest': 'normal,build'", 'nextest translation'),
     'nextest-subcommand': ('translation-nextest',
-        "words[i] not in ('run', 'list')",
-        "words[i] not in ('run', 'list', 'bench')", 'accepted nextest bench'),
+        "words[i] != 'run'",
+        "words[i] not in ('run', 'bench')", 'accepted nextest bench'),
     'nextest-separator': ('translation-nextest',
         "if word == '--' and nextest_mode is None:",
-        "if word == '--':", 'accepted nextest run -- --ignored'),
-    'nextest-list-flags': ('translation-nextest',
-        "'--message-format' if nextest_mode == 'list' else '--profile'",
-        "'--message-format', '--profile'", 'accepted nextest list --profile ci'),
+        "if word == '--':", 'accepted nextest run --partition count:1/3 --profile ci -- --ignored'),
     'nextest-profile': ('translation-nextest',
-        "value == ('ci' if flag == '--profile' else 'json')",
-        "value in ('ci', 'dev', 'json')", 'accepted nextest run --profile dev'),
-    'nextest-format': ('translation-nextest',
-        "else 'json'))",
-        "else 'xml'))", 'nextest translation'),
+        "value == 'ci'",
+        "value in ('ci', 'dev', 'json')", 'accepted nextest run --profile dev --partition count:1/3'),
     'nextest-partition': ('translation-nextest',
         "r'count:[123]/3'",
-        "r'count:[1234]/3'", 'accepted nextest run --partition count:4/3'),
+        "r'count:[1234]/3'", 'accepted nextest run --partition count:4/3 --profile ci'),
     'nextest-validity': ('translation-nextest',
         'if not valid:',
-        'if False:', 'accepted nextest run --partition count:4/3'),
+        'if False:', 'accepted nextest run --partition count:4/3 --profile ci'),
     'nextest-scope': ('translation-nextest-scope',
-        "if nextest_mode is not None and flag in ('--partition', '--profile', '--message-format'):",
-        "if flag in ('--partition', '--profile', '--message-format'):", 'nextest flag leaked into cargo test --profile ci'),
-    'nextest-shadow-job': ('nextest-job-allowlist',
-        "'feature-on-test-shadow', 'feature-on-test-extra')",
-        "'feature-on-test-extra',)", 'feature-on-test-shadow'),
+        "if nextest_mode is not None and flag in ('--partition', '--profile'):",
+        "if flag in ('--partition', '--profile'):", 'nextest flag leaked into cargo test --profile ci'),
     'nextest-extra-job': ('nextest-job-allowlist',
-        "'feature-on-test-shadow', 'feature-on-test-extra')",
-        "'feature-on-test-shadow',)", 'feature-on-test-extra'),
+        "'feature-on-test-extra')", "'unapproved-extra')", 'feature-on-test-extra'),
+    'nextest-shadow-job': ('nextest-job-allowlist',
+        "'feature-on-test-extra')", "'feature-on-test-extra', 'feature-on-test-shadow')", 'feature-on-test-shadow'),
+    'nextest-job-scope': ('nextest-job-allowlist',
+        "'feature-on-test-extra')", "'feature-on-test-extra', 'feature-on-test-other')", 'feature-on-test-other'),
     'nextest-missing-mode': ('translation-nextest',
-        "if i == len(words) or words[i] not in ('run', 'list'):",
-        "if i == len(words):\n            return {}\n        if words[i] not in ('run', 'list'):", 'accepted nextest '),
+        "if i == len(words) or words[i] != 'run':",
+        "if i == len(words):\n            return {}\n        if words[i] != 'run':", 'accepted nextest '),
     'nextest-allowed': ('translation-nextest',
         'if flag not in allowed:',
-        'if False:', 'accepted nextest list --profile ci'),
+        'if False:', 'accepted nextest run --partition count:1/3 --profile ci --message-format json'),
     'nextest-missing-value': ('translation-nextest',
         "if i == len(words):\n                    raise ValueError(f'missing value for {flag}')\n                value = words[i]\n            valid =",
         "if False:\n                    raise ValueError(f'missing value for {flag}')\n                value = words[i]\n            valid =", 'nextest rejection: run --partition'),
@@ -2381,20 +2465,22 @@ MUTATIONS.update({
         "if family == 'nextest':",
         'if False:', 'nextest translation'),
     'nextest-option': ('translation-nextest',
-        "if nextest_mode is not None and flag in ('--partition', '--profile', '--message-format'):",
+        "if nextest_mode is not None and flag in ('--partition', '--profile'):",
         'if False:', 'nextest translation'),
 })
 
 MUTATIONS.update({
     'nextest-partition-anchor': ('translation-nextest',
         "re.fullmatch(r'count:[123]/3', value)",
-        "re.match(r'count:[123]/3', value)", 'accepted nextest run --partition count:1/3junk'),
-    'nextest-mode': ('translation-nextest',
-        'nextest_mode = words[i]',
-        "nextest_mode = 'run'", 'nextest translation'),
-    'nextest-job-scope': ('nextest-job-allowlist',
-        "'feature-on-test-shadow', 'feature-on-test-extra')",
-        "'feature-on-test-shadow', 'feature-on-test-extra', 'feature-on-test-compare')", 'feature-on-test-compare'),
+        "re.match(r'count:[123]/3', value)", 'accepted nextest run --partition count:1/3junk --profile ci'),
+    'nextest-required': ('translation-nextest',
+        "if nextest_mode is not None and nextest_options != {'--partition', '--profile'}:",
+        "if False:", 'accepted nextest run'),
+    'nextest-options': ('translation-nextest',
+        'nextest_options.add(flag)', 'nextest_options.add("--partition")', 'nextest translation'),
+    'nextest-offline': ('translation-nextest',
+        "allowed = {'--workspace', '--no-default-features', '--features', '--partition', '--profile'}",
+        "allowed = {'--workspace', '--features', '--partition', '--profile'}", 'nextest'),
 })
 
 def named_mutations(checker, directory, selected=None):

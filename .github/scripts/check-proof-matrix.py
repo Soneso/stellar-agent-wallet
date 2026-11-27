@@ -16,7 +16,7 @@ each executable with ``--list --format terse``, then again with
 ``--ignored``, under the dynamic library search path cargo gives a test it
 runs. The selection is ``--workspace`` with that flag, else one
 ``-p`` per package the refs name, with the features those packages declare.
-The features of each configuration equal the offline test steps of the CI
+The features of each configuration equal the shard test steps of the CI
 workflow, so the build compiles nothing the test step did not.
 ``--listing-file`` names a JSON listing instead: an array of objects with
 ``package``, ``kind`` (the target kinds cargo reports), ``name``, ``list`` and
@@ -69,7 +69,7 @@ import tomllib
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MATRIX = pathlib.Path(__file__).resolve().with_name("proof-matrix.toml")
 
-# The cargo feature arguments of each configuration, equal to the offline test
+# The cargo feature arguments of each configuration, equal to the shard test
 # steps of the CI workflow.
 NO_DEFAULT_FEATURES = {"feature-off": True, "feature-on": False}
 FEATURES = {

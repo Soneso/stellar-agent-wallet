@@ -6,12 +6,12 @@ import os
 import sys
 
 EXPECTED_JOBS = {
-    "changes", "fmt", "clippy", "doc", "test", "feature-on-clippy",
+    "changes", "fmt", "clippy", "doc", "test", "test-extra", "feature-on-clippy",
     "feature-on-doc", "feature-on-test", "docs-tests", "feature-discipline",
     "release-shape", "inbox-js", "mpp-interop", "sdk-v17-interop",
     "release-contracts", "windows-storage", "platform-keyring", "deploy-scripts",
     "machete", "deny",
-    "feature-on-test-shadow", "feature-on-test-extra", "feature-on-test-compare",
+    "feature-on-test-extra",
 }
 DOCS_REQUIRED = {"changes", "docs-tests", "feature-discipline", "release-contracts"}
 

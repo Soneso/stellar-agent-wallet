@@ -148,7 +148,6 @@ self-test:test-classify-docs-only.py	python3 .github/scripts/test-classify-docs-
 self-test:test-classify-self-tests.py	python3 .github/scripts/test-classify-self-tests.py	-	ci.yml	release-contracts	Self-test the self-test classifier
 self-test:test-ci-result.py	python3 .github/scripts/test-ci-result.py	-	ci.yml	release-contracts	Self-test the CI result gate
 self-test:test-compare-crate-sums.py	python3 .github/scripts/test-compare-crate-sums.py	-	ci.yml	release-contracts	Self-test the crate checksum comparison
-self-test:test-compare-test-runs.py	python3 .github/scripts/test-compare-test-runs.py	-	ci.yml	release-contracts	Self-test the test-run comparison
 self-test:test-preflight.sh	bash .github/scripts/test-preflight.sh	-	install-surface.yml	install-surface	Self-test the preflight
 self-test:test-publish-crates-check.sh	.github/scripts/test-publish-crates-check.sh	cargo	ci.yml	release-contracts	Self-test the publish tier check
 self-test:test-publish-crates-verify.sh	bash .github/scripts/test-publish-crates-verify.sh	cargo	ci.yml	release-contracts	Self-test the publish verification
@@ -171,17 +170,17 @@ baseline-gate	bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh	
 fmt	cargo fmt --all -- --check	cargo	ci.yml	fmt	Check formatting
 clippy	cargo clippy --workspace --all-targets --no-default-features --features $FEATURES_EXCEPT_MAINNET_WRITE -- -D warnings	cargo	ci.yml	clippy	Run clippy
 rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --no-default-features --features $FEATURES_EXCEPT_MAINNET_WRITE	cargo	ci.yml	doc	Build the rustdoc
-test	cargo test --workspace --no-default-features --features $OFFLINE_FEATURES	cargo	ci.yml	test	Run the offline tests
-proof-matrix	python3 .github/scripts/check-proof-matrix.py --configuration feature-off --workspace	cargo	ci.yml	test	Check the proof matrix
+test	cargo test --workspace --no-default-features --features $OFFLINE_FEATURES	cargo	ci.yml	test	Run the shard tests
+proof-matrix	python3 .github/scripts/check-proof-matrix.py --configuration feature-off --workspace	cargo	ci.yml	test-extra	Check the proof matrix
 feature-on:clippy	cargo clippy --workspace --all-targets --features mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE -- -D warnings	cargo	ci.yml	feature-on-clippy	Run clippy
 feature-on:doc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE	cargo	ci.yml	feature-on-doc	Build the rustdoc
-feature-on:test	cargo test --workspace --features mainnet-write,$OFFLINE_FEATURES	cargo	ci.yml	feature-on-test-shadow	Run the offline tests
+feature-on:test	cargo test --workspace --features mainnet-write,$OFFLINE_FEATURES	cargo	ci.yml	feature-on-test	Run the shard tests
 feature-on:network	cargo check -p stellar-agent-network --features mainnet-write	cargo	ci.yml	feature-on-test-extra	Check network feature forwarding in isolation
 proof-matrix:feature-on	python3 .github/scripts/check-proof-matrix.py --configuration feature-on --workspace	cargo	ci.yml	feature-on-test-extra	Check the proof matrix
 release-shape	bash .github/scripts/release/check-host.sh	cargo,libudev	ci.yml	release-shape	Build and check the release binaries
-test-support-friendbot	cargo test -p $TEST_SUPPORT_CRATE --no-default-features --features testnet-helpers --lib	cargo	ci.yml	test	Run the test-support Friendbot unit tests
-test-vendored-release-cfg	cargo test -p $VENDORED_CRATE --test vendored_wasm_release_cfg	cargo	ci.yml	test	Test the vendored Wasm release configuration
-test-policy-pin-release-cfg	cargo test -p $POLICY_PIN_CRATE --doc policy::pin	cargo	ci.yml	test	Test the policy pin release configuration
+test-support-friendbot	cargo test -p $TEST_SUPPORT_CRATE --no-default-features --features testnet-helpers --lib	cargo	ci.yml	test-extra	Run the test-support Friendbot unit tests
+test-vendored-release-cfg	cargo test -p $VENDORED_CRATE --test vendored_wasm_release_cfg	cargo	ci.yml	test-extra	Test the vendored Wasm release configuration
+test-policy-pin-release-cfg	cargo test -p $POLICY_PIN_CRATE --doc policy::pin	cargo	ci.yml	test-extra	Test the policy pin release configuration
 machete	cargo machete	cargo,cargo-machete	ci.yml	machete	Check for unused dependencies
 deny	cargo deny check	cargo,cargo-deny	ci.yml	deny	Check licenses and advisories
 coverage	cargo llvm-cov --workspace --no-default-features --features $OFFLINE_FEATURES --json --output-path cov-feature-off.json	cargo,cargo-llvm-cov	coverage.yml	coverage-off	Measure offline line coverage
@@ -365,7 +364,6 @@ select_self_tests() {
       select_gate self-test:test-classify-docs-only.py
       select_gate self-test:test-check-docs-reads.py ;;
     .github/scripts/check-workflow-invariants.py) select_gate self-test:test-check-workflow-invariants.py ;;
-    .config/nextest.toml | .github/scripts/compare-test-runs.py) select_gate self-test:test-compare-test-runs.py ;;
     .github/scripts/compare-crate-sums.py) select_gate self-test:test-compare-crate-sums.py ;;
     .github/scripts/preflight.sh) select_gate self-test:test-preflight.sh ;;
     .github/scripts/publish-crates.sh)
@@ -394,8 +392,8 @@ select_self_tests() {
 
 # Selects workflow-invariants and the self-test of the check it runs. The
 # self-test runs check-workflow-invariants.py on copies of rust-toolchain.toml,
-# the workflows, action files, and scripts that the check reads. A change to
-# any of them can break the self-test.
+# .config/nextest.toml, the workflows, action files, and scripts that the check
+# reads. A change to any of them can break the self-test.
 select_invariant_gates() {
   select_gate workflow-invariants
   select_gate self-test:test-check-workflow-invariants.py
@@ -428,7 +426,7 @@ select_for_path() {
     .github/workflows/*.yml | .github/workflows/*.yaml | .github/actions/* | .github/labels.yml) select_gate actionlint ;;
   esac
   case "$path" in
-    rust-toolchain.toml | .github/actions/* | .github/workflows/*.yml | .github/workflows/*.yaml) select_invariant_gates ;;
+    rust-toolchain.toml | .config/nextest.toml | .github/actions/* | .github/workflows/*.yml | .github/workflows/*.yaml) select_invariant_gates ;;
     .github/scripts/*)
       if is_invariant_script "$path"; then
         select_invariant_gates

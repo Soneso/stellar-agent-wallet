@@ -31,6 +31,11 @@ jobs:
       - uses: taiki-e/install-action@pinned
         with:
           tool: cargo-nextest@0.9.152
+  nextest-off:
+    steps:
+      - uses: taiki-e/install-action@pinned
+        with:
+          tool: cargo-nextest@0.9.152
 EOF
   cat >"$dir/.github/workflows/coverage.yml" <<'EOF'
 jobs:
@@ -155,7 +160,7 @@ printf '  coverage:\n    steps:\n      - uses: taiki-e/install-action@pinned\n  
   >>"$TMP/llvm-cov-in-ci/.github/workflows/ci.yml"
 expect_exact_fail "$TMP/llvm-cov-in-ci" "error: cargo-llvm-cov version mismatch:
   .github/workflows/coverage.yml:6 pins 0.8.7
-  .github/workflows/ci.yml:21 pins 0.8.6"
+  .github/workflows/ci.yml:26 pins 0.8.6"
 
 # The check reads a workflow and an action with the .yaml extension too.
 make_fixture "$TMP/mismatch-yaml"
@@ -292,8 +297,8 @@ expect_fail "$TMP/prose-doc" \
 make_fixture "$TMP/stray-ci"
 printf '      - run: cargo install --locked cargo-deny --version 0.19.9\n' >>"$TMP/stray-ci/.github/workflows/ci.yml"
 expect_fail "$TMP/stray-ci" \
-  ".github/workflows/ci.yml:17 names cargo-deny with a version outside the 'tool: cargo-deny@<version>' form"
-if [ "$(grep -c 'ci.yml:17 names' "$TMP/stray-ci.out")" -ne 1 ]; then
+  ".github/workflows/ci.yml:22 names cargo-deny with a version outside the 'tool: cargo-deny@<version>' form"
+if [ "$(grep -c 'ci.yml:22 names' "$TMP/stray-ci.out")" -ne 1 ]; then
   echo "stray-ci reported the line more than once:" >&2
   cat "$TMP/stray-ci.out" >&2
   exit 1
@@ -350,12 +355,24 @@ sed -i.bak 's/cargo-machete --version 0.9.2/cargo-machete --version 0.9.1/' "$TM
 sed -i.bak 's/cargo-deny@0.19.9/cargo-deny@0.19.10/' "$TMP/all-problems/.github/workflows/release.yml"
 expect_fail "$TMP/all-problems" "cargo-machete version mismatch" "cargo-deny version mismatch"
 
-# Nextest's single CI pin and documented install are part of the registry.
+# Nextest's two CI pins and documented install are part of the registry.
 make_fixture "$TMP/nextest-missing"
 sed -i.bak '/tool: cargo-nextest/d' "$TMP/nextest-missing/.github/workflows/ci.yml"
 expect_fail "$TMP/nextest-missing" "no 'tool: cargo-nextest@<version>' pin found"
 make_fixture "$TMP/nextest-mismatch"
 sed -i.bak 's/cargo-nextest --version 0.9.152/cargo-nextest --version 0.9.151/' "$TMP/nextest-mismatch/docs/maintainers/building.md"
 expect_fail "$TMP/nextest-mismatch" "cargo-nextest version mismatch"
+
+# Each feature state pins nextest once, at the same version.
+make_fixture "$TMP/nextest-single"
+sed -i.bak '17,$d' "$TMP/nextest-single/.github/workflows/ci.yml"
+expect_fail "$TMP/nextest-single" "1 'tool: cargo-nextest@<version>' pin found" "expected two"
+make_fixture "$TMP/nextest-third"
+printf '  extra:\n    steps:\n      - uses: taiki-e/install-action@pinned\n        with:\n          tool: cargo-nextest@0.9.152\n' \
+  >>"$TMP/nextest-third/.github/workflows/ci.yml"
+expect_fail "$TMP/nextest-third" "3 'tool: cargo-nextest@<version>' pins found"
+make_fixture "$TMP/nextest-second-version"
+sed -i.bak '21s/0.9.152/0.9.151/' "$TMP/nextest-second-version/.github/workflows/ci.yml"
+expect_fail "$TMP/nextest-second-version" "cargo-nextest version mismatch"
 
 echo "gate tool version check tests passed"

@@ -4,7 +4,7 @@
 Each case copies the checker into a scratch tree under TMPDIR, writes a
 fixture matrix beside it and the row source files it names, runs it on a
 fixture listing file, and checks the exit status and the message. One case
-compares the checker's feature lists with the offline test steps of the CI
+compares the checker's feature lists with the shard test steps of the CI
 workflow.
 """
 
@@ -414,12 +414,13 @@ def check_usage(failures):
 
 
 def check_ci_features(failures):
-    """The checker's feature lists equal the offline test steps of ci.yml."""
+    """The checker's feature lists equal the shard test steps of ci.yml."""
     spec = importlib.util.spec_from_file_location("check_proof_matrix", SCRIPT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     text = WORKFLOW.read_text()
-    steps = re.findall(r"^\s*run: cargo test --workspace( --no-default-features)? --features (\S+)\s*$",
+    steps = re.findall(r"^\s*run: cargo nextest run --workspace( --no-default-features)? --features (\S+)"
+                       r" --partition count:\$\{\{ matrix\.shard \}\}/3 --profile ci\s*$",
                        text, re.MULTILINE)
     workflow = {
         ("feature-off" if no_default else "feature-on"): (bool(no_default), tuple(features.split(",")))
@@ -432,7 +433,7 @@ def check_ci_features(failures):
     if len(steps) != 2 or workflow != checker:
         failures.append(f"the checker's features {checker} differ from ci.yml {workflow}")
     else:
-        print("ok   the feature lists equal the offline test steps of ci.yml")
+        print("ok   the feature lists equal the shard test steps of ci.yml")
 
 
 def main():

@@ -62,7 +62,8 @@ cargo install --locked cargo-nextest --version 0.9.152
 `cargo-llvm-cov` uses the reference pins in `.github/workflows/coverage.yml`,
 one for each coverage measurement job.
 `cargo-machete`, `cargo-deny`, and `cargo-nextest` use the reference pins in
-`.github/workflows/ci.yml`. The `Install surface` workflow checks this guide
+`.github/workflows/ci.yml`. Both test matrices pin `cargo-nextest` at the same
+version. The `Install surface` workflow checks this guide
 against those pins with `.github/scripts/check-gate-tool-versions.sh`.
 
 `cargo-llvm-cov` also needs the `llvm-tools-preview` rustup component:
@@ -310,8 +311,8 @@ On pull requests into or pushes to `next`,
 and any uncertain diff selects all groups. Missing outputs also run the steps.
 All groups include `.github/**`, every `Cargo.toml` and `Cargo.lock`, the root
 `rust-toolchain.toml`, `Cross.toml`, `deny.toml`, `scripts/**`, and `contracts/**`.
-The `scripts` group also includes `.config/nextest.toml` and any deletion or
-rename source for CODEOWNERS.
+The `scripts` group also includes `.config/nextest.toml` for the workflow
+invariant self-test, and any deletion or rename source for CODEOWNERS.
 The `rust` group includes `crates/**`, every `build.rs`, and this building guide.
 The `docs` group includes every Markdown file, `skills/**`, and `.claude-plugin/**`. The
 `preflight` group includes changelog files, `CONTRIBUTING.md`, this guide,
@@ -380,7 +381,7 @@ matches:
   `changelog` and `self-test:test-changelog.py`.
 - Any `.yml` or `.yaml` workflow under `.github/workflows/`, or a file under
   `.github/actions/`, selects `actionlint` and both workflow invariant gates.
-  `rust-toolchain.toml` also selects both workflow invariant gates;
+  `rust-toolchain.toml` and `.config/nextest.toml` also select both workflow invariant gates;
   `.github/labels.yml` also selects `actionlint`.
 - A file under `.github/scripts/` selects the self-test of the script it
   changes, and a changed shell script also selects shellcheck.
@@ -465,7 +466,7 @@ gate except `shellcheck-changed`, which needs a changed shell script.
      or `release/sodium.sh`. It also tests `derive-alias.sh`; a change to
      that script selects it only under `--full`.
    - `test-check-provenance.py`: `check-provenance.py` or a provenance fixture
-5. `workflow-invariants`: a change to `rust-toolchain.toml`,
+5. `workflow-invariants`: a change to `rust-toolchain.toml` or `.config/nextest.toml`,
    any `.yml` or `.yaml` file under `.github/workflows/`, or any file under
    `.github/actions/`. A file under `.github/scripts/` also selects this gate
    when a workflow in `preflight.sh`'s `INVARIANT_WORKFLOWS` list or a file under
@@ -487,14 +488,14 @@ gate except `shellcheck-changed`, which needs a changed shell script.
    - `test-check-proof-matrix.py`: `check-proof-matrix.py`
    - `test-check-ref-on-main.sh`: `check-ref-on-main.sh`
    - `test-check-run-evidence.py`: `check-run-evidence.py`
-   - `test-check-workflow-invariants.py`: `check-workflow-invariants.py`, or
-     any change that selects `workflow-invariants`, because the self-test
+   - `test-check-workflow-invariants.py`: `check-workflow-invariants.py`,
+     `rust-toolchain.toml`, `.config/nextest.toml`, or any other change that
+     selects `workflow-invariants`, because the self-test
      runs that check on copies of the same files
    - `test-classify-docs-only.py`: `classify-docs-only.py`, `changed_paths.py`, or
      `docs_paths.py`
    - `test-classify-self-tests.py`: `classify-self-tests.py` or `changed_paths.py`
    - `test-compare-crate-sums.py`: `compare-crate-sums.py`
-   - `test-compare-test-runs.py`: `compare-test-runs.py` or `.config/nextest.toml`
    - `test-preflight.sh`: `preflight.sh`
    - `test-publish-crates-check.sh`: `publish-crates.sh`
    - `test-publish-crates-verify.sh`: `publish-crates.sh`
@@ -557,10 +558,9 @@ the `.venv` virtual environment of the PyYAML install command.
 
 The preflight does not carry these CI checks: the `windows-storage` and
 `platform-keyring` jobs, the `stellar-agent-test-support` feature matrix of the
-`test` job, the setup steps, and the virtual environment of the workflow checks.
-The feature-on pilot's nextest shards, evidence capture and comparison, and
-extra doctest invocation run in CI. The local feature-on test row runs
-the shadow Cargo command, which includes doctests.
+`test-extra` job, the setup steps, and the virtual environment of the workflow checks.
+The nextest shards and separate doctest invocations run in CI. Both local test
+rows run unsharded Cargo commands, which include doctests and need no nextest.
 It also omits the integration changelog guard of `changelog.yml`, which
 protects `CHANGELOG.md`, existing unreleased fragments, and the fragment README.
 Other omissions include the
@@ -626,33 +626,30 @@ cargo check -p stellar-agent-network --features mainnet-write
 This runs the offline unit, integration, and doc-tests. Live acceptance uses
 its separate workflow and feature selections; see [Test tiers](#test-tiers).
 
-The `feature-on-test` job partitions the workspace into three nextest shards.
-`feature-on-test-shadow` runs the Cargo test command above, including doctests,
-and records each executable's test and ignored lists. `feature-on-test-extra`
-runs doctests, the isolated network check, and the feature-on proof matrix.
-`feature-on-test-compare` requires successful shard and shadow jobs and checks
-disjoint matched partitions whose union equals the shadow list minus ignored
-tests. Every shard lists the shadow's full test universe, including ignored tests,
-and the shadow's ignored set. Ignored tests have only an ignored filter mismatch;
-non-ignored tests either match or have a partition filter mismatch.
-Each shard has matched tests and a nonempty, passing JUnit report covering every
-non-ignored match. Evidence uploads replace artifacts from earlier attempts
-under the same names.
-All feature-on build jobs share one cache; only shard 1 saves it, on pushes.
-The feature-on clippy and rustdoc jobs, shadow, and extra job only restore it.
+The `test` and `feature-on-test` jobs each partition the workspace into three
+nextest shards, with matrix fail-fast disabled. The offline shards disable
+default features; the feature-on shards enable `mainnet-write`.
+`test-extra` runs offline doctests, the feature-off proof matrix, Friendbot
+unit tests, the vendored Wasm and policy pin release configurations, and the
+test-support feature sets. `feature-on-test-extra` runs feature-on doctests,
+the isolated network check, and the feature-on proof matrix.
 
-Reproduce shard 1 locally (use 2 or 3 for the other shards):
+The offline shards and `test-extra` share the `test` cache that `docs-tests`
+restores. Only offline shard 1 saves it, on pushes; `test-extra` only restores.
+All feature-on build jobs share the `feature-on` cache. Only feature-on shard 1
+saves it, on pushes; the feature-on clippy, rustdoc, and extra jobs only restore.
+
+Reproduce shard 1 locally in either feature state (use 2 or 3 for the other shards):
 
 ```bash
-cargo nextest list --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --partition count:1/3 --message-format json
+cargo nextest run --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry --partition count:1/3 --profile ci
 cargo nextest run --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --partition count:1/3 --profile ci
 ```
 
-The CI profile disables fail-fast and retries and writes JUnit output to
-`target/nextest/ci/junit.xml`. The job timeout is the only timeout. Tests that
-share a file path or a port across processes must join a test group with
-`max-threads = 1`; the maintainer adds members after a measured pilot run.
-The local preflight runs the shadow Cargo command and runs no nextest.
+The CI profile disables fail-fast and retries. The job timeout is the only
+timeout. The empty `test-groups` table retains the comment explaining how tests
+that share a file path or port join a group with `max-threads = 1`.
+The local preflight runs the unsharded Cargo commands above and needs no nextest.
 
 #### Coverage
 
@@ -758,7 +755,8 @@ The gate tool check compares the versions in [Gate tools](#gate-tools), in the
 other workflows, and in the composite actions with each tool's reference
 workflow pin: `coverage.yml` for `cargo-llvm-cov`, `ci.yml` for
 `cargo-machete`, `cargo-deny`, and `cargo-nextest`. `coverage.yml` holds two `cargo-llvm-cov`
-pins at one version; the first is the reference pin. Its header defines the
+pins at one version; `ci.yml` holds two `cargo-nextest` pins at one version.
+The first pin of each tool is its reference pin. The check's header defines the
 accepted line shapes, and its self-test runs it on fixture trees with one drift
 form per case.
 
@@ -774,8 +772,10 @@ identity, DPAPI, the MPP store, the smart-account crate, the MCP rule tools,
 and the MCP console events with the feature off and on. There is no local
 equivalent off Windows; changes to
 `audit_log`, the approval store, or file-locking behavior should expect this
-job to be the deciding signal. Each execution uses the feature flags of its
-compile step: the storage library suites pass `--no-default-features`, and the
+job to be the deciding signal. Each execution uses the package selection,
+features, and host target of its preceding prebuild. The two core regression
+steps share one prebuild; the other package selections each have their own.
+The storage library suites pass `--no-default-features`, and the
 console-event suites use paired feature-off and feature-on builds.
 The log checks require one DPAPI pass, three shutdown passes, and four
 driver passes.
@@ -849,7 +849,7 @@ declared on individual crates (and on `stellar-agent-test-support`), are:
 - `wiremock-helpers`: `wiremock`-based HTTP doubles in
   `stellar-agent-test-support`.
 
-The CI `test (offline)` job and the Coverage workflow run the offline tier
+The CI `test` shards and `test-extra` job and the Coverage workflow run the offline tier
 with `--features test-helpers,test-hooks,test-loopback,verifier-registry`.
 
 MPP changes can reproduce their focused protocol and security checks and
@@ -1271,7 +1271,7 @@ publication verifies that Release run's evidence for the tag and commit.
   The integration target links the library compiled without `cfg(test)`.
   Its `test-helpers` and `deploy-cli` assertions run when those features are
   enabled. Its fixture-exclusion test runs without `test-helpers`.
-  The ordinary `ci.yml` test job runs both feature selections.
+  The `ci.yml` test shards and extra jobs run both feature selections.
 - The exception list is empty, so the `rebuild` job rebuilds every vendored
   file. An exception is a vendored file that no pinned source rebuilds; the
   tree check holds its bytes at one frozen digest.
@@ -1422,8 +1422,8 @@ and every constant and allowlist entry that pins it in the same change.
 ### Limits and maintainer actions
 
 - The `vendored-wasm` job blocks a merge only when it is a required check, and
-  the identity tests block only when the `ci.yml` test job is required. With a
-  merge queue, the workflow needs a `merge_group` trigger.
+  the identity tests block only when the `ci.yml` test shards and the `test-extra` job are required.
+  With a merge queue, the workflow needs a `merge_group` trigger.
 - A pull request that changes the script or the workflow together with the
   bytes passes. So does one that points an embedded constant at another
   vendored file and edits both identity-test mappings to match. Review of
@@ -1582,10 +1582,10 @@ Each error message names its rule:
   closure. The paired CLI and MCP prebuild and the isolated CLI build of the
   testnet driver each have one reviewed record per share and feature state.
   The isolated build's function, call count, and feature lists are pinned.
-  Nextest `run` and `list` resolve dev-dependencies; the shard matrix expands
-  into three invocations of each. Their accepted flags are `--workspace`,
-  `--features`, `--partition count:1/3` (or 2/3 or 3/3), and either
-  `--message-format json` for list or `--profile ci` for run. Unknown flags fail.
+  Nextest `run` resolves dev-dependencies; each shard matrix expands into three
+  invocations. Accepted flags are `--workspace`, `--no-default-features`,
+  `--features`, `--partition count:1/3` (or 2/3 or 3/3), and `--profile ci`.
+  Both partition and profile are required. Other modes and unknown flags fail.
   A record relies on the
   feature when its feature list names `mainnet-write`, or when it keeps the
   default features and selects the workspace, the CLI package, or the MCP
@@ -1664,7 +1664,7 @@ Each error message names its rule:
   The invocation inventory refuses a compiler argument that passes `--cfg`.
 - D8: no workflow, named script, or this guide enables every feature.
 - D9: `feature-on-clippy`, `feature-on-doc`, `feature-on-test`,
-  `feature-on-test-shadow`, and `feature-on-test-extra` in CI, and
+  and `feature-on-test-extra` in CI, and
   `coverage-on` in coverage, may name `mainnet-write` in feature lists. The testnet driver's resolved suite lists
   and exact isolated on-state build are allowed only in its two acceptance jobs.
   Release-shaped builds activate the feature through the binary defaults.
