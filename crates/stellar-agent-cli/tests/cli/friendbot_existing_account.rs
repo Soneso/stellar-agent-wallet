@@ -17,7 +17,7 @@ async fn assert_existing_account(args: &[&str]) {
             "type": "https://stellar.org/horizon-errors/bad_request",
             "title": "Bad Request",
             "status": 400,
-            "detail": "createAccountAlreadyExist (AAAAAAAAAGT/////AAAAAQAAAAAAAAAA/////AAAAAA==)",
+            "detail": "createAccountAlreadyExist (AAAAAAAAAGT/////AAAAAQAAAAAAAAAA/////AAAAAA=)",
         })))
         .expect(1)
         .mount(&mock)

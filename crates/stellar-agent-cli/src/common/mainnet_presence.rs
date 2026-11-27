@@ -1150,6 +1150,7 @@ mod tests {
         let fixture = MainnetConsentFixture::new("main");
         let entry = fixture.payment(60_000);
         let handle = presence_handle(&fixture, &entry).await;
+        let listener_tasks = handle.listener_tasks().unwrap();
         let url = handle.bootstrap_url().to_owned();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let browser = async {
@@ -1171,6 +1172,7 @@ mod tests {
         );
         let result = drive_call(ceremony, |_| browser).await;
         assert_eq!(result.unwrap_err().code(), "approval.presence_canceled");
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
         crate::commands::approve::credential::tests::operator_mismatch_and_cancellation().await;
         // The expiry case runs last: advancing Tokio time leaves its clock
         // ahead of later wall-clock deadlines.
@@ -1236,6 +1238,7 @@ mod tests {
         let handle = stellar_agent_approval_ui::start_mainnet_presence(config)
             .await
             .unwrap();
+        let listener_tasks = handle.listener_tasks().unwrap();
         let error = presence_until_done(
             handle,
             OpenMode::Private,
@@ -1256,6 +1259,7 @@ mod tests {
                 .is_none()
         );
         assert!(!fixture.audit_path().exists());
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
         drop(store);
         let handle = stellar_agent_approval_ui::start_mainnet_presence(
             stellar_agent_approval_ui::MainnetPresenceConfig {

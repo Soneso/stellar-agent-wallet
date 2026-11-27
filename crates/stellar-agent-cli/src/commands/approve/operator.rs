@@ -907,6 +907,7 @@ mod tests {
 
         let (handle, url, token) = start_test_enrollment(&dir).await;
         let probe = HandoffProbe::default();
+        let listener_tasks = handle.listener_tasks();
         let end = tokio::time::timeout(
             bound,
             enroll_until_done(
@@ -923,8 +924,10 @@ mod tests {
         .expect("the interrupt ends the enrollment wait");
         assert!(matches!(end, EnrollmentEnd::Interrupted), "{end:?}");
         probe.assert_failed_open_left_nothing(&token);
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
 
         let (handle, url, _token) = start_test_enrollment(&dir).await;
+        let listener_tasks = handle.listener_tasks();
         let probe = HandoffProbe::default();
         let end = tokio::time::timeout(
             bound,
@@ -942,6 +945,7 @@ mod tests {
         .expect("the interrupt ends the enrollment wait");
         assert!(matches!(end, EnrollmentEnd::Interrupted), "{end:?}");
         assert!(probe.launched().is_empty());
+        crate::common::test_support::assert_listeners_stopped(&listener_tasks, 2);
     }
 
     /// A code reader the test never answers.

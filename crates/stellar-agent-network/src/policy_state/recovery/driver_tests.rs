@@ -1619,12 +1619,169 @@ struct ProxyCredential {
     user: String,
 }
 
-fn proxy(address: &str, request: &Value) -> Value {
+/// The read bound for a bridge request the parent answers at once.
+const BRIDGE_REPLY: Duration = Duration::from_secs(15);
+
+/// The bound for a wait on the other child process: its process start under
+/// an instrumented build can take longer than [`BRIDGE_REPLY`].
+const PEER_WAIT: Duration = Duration::from_secs(120);
+
+/// The real-time bound for both child processes together from the spawn of the
+/// first child.
+const CHILDREN_WAIT: Duration = Duration::from_secs(300);
+
+struct ChildGuard {
+    child: std::process::Child,
+    status: Option<std::process::ExitStatus>,
+    cleaned_up: bool,
+}
+
+impl ChildGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self {
+            child,
+            status: None,
+            cleaned_up: false,
+        }
+    }
+
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    fn status(&self) -> Option<std::process::ExitStatus> {
+        self.status
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if self.status.is_none() {
+            self.status = self.child.try_wait()?;
+        }
+        Ok(self.status)
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        if self.status.is_some() || self.cleaned_up {
+            return Ok(());
+        }
+        self.child.kill()
+    }
+
+    fn wait_for_cleanup(&mut self) {
+        if self.status.is_none() && !self.cleaned_up {
+            if let Ok(status) = self.child.wait() {
+                self.status = Some(status);
+            }
+            self.cleaned_up = true;
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.status.is_none() && !self.cleaned_up {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.cleaned_up = true;
+        }
+    }
+}
+
+struct SpawnedChild {
+    child: ChildGuard,
+    stdout: std::thread::JoinHandle<Vec<u8>>,
+    stderr: std::thread::JoinHandle<Vec<u8>>,
+}
+
+fn spawn_pipe_reader(
+    mut pipe: impl std::io::Read + Send + 'static,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes).unwrap();
+        bytes
+    })
+}
+
+fn wait_children_bounded(
+    mut children: Vec<SpawnedChild>,
+    deadline: std::time::Instant,
+) -> (bool, Vec<std::process::Output>) {
+    let mut timed_out = false;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+        let mut all_exited = true;
+        for entry in &mut children {
+            if entry.child.status().is_none() && entry.child.try_wait().unwrap().is_none() {
+                all_exited = false;
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            timed_out = true;
+            break;
+        }
+        if all_exited {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
+    if timed_out {
+        for entry in &mut children {
+            let _ = entry.child.kill();
+        }
+        for entry in &mut children {
+            entry.child.wait_for_cleanup();
+        }
+        for entry in children {
+            let SpawnedChild {
+                child,
+                stdout,
+                stderr,
+            } = entry;
+            drop(child);
+            let _ = stdout.join();
+            let _ = stderr.join();
+        }
+        return (true, Vec::new());
+    }
+    let outputs = children
+        .into_iter()
+        .map(|entry| std::process::Output {
+            status: entry.child.status().unwrap(),
+            stdout: entry.stdout.join().unwrap(),
+            stderr: entry.stderr.join().unwrap(),
+        })
+        .collect();
+    (false, outputs)
+}
+
+fn try_proxy(address: &str, request: &Value, read_timeout: Duration) -> Result<Value, String> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut stream = std::net::TcpStream::connect(address).map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(read_timeout))
+        .map_err(|error| error.to_string())?;
+    writeln!(stream, "{request}").map_err(|error| error.to_string())?;
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|error| error.to_string())?;
+    serde_json::from_str(&line).map_err(|error| error.to_string())
+}
+
+fn proxy(address: &str, request: &Value, read_timeout: Duration) -> Value {
     use std::io::{BufRead, BufReader, Write};
     let mut stream = std::net::TcpStream::connect(address).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(15)))
-        .unwrap();
+    stream.set_read_timeout(Some(read_timeout)).unwrap();
     writeln!(stream, "{request}").unwrap();
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).unwrap();
@@ -1662,7 +1819,8 @@ impl keyring_core::api::CredentialApi for ProxyCredential {
         assert_eq!(
             proxy(
                 &self.address,
-                &json!({"op":"set","service":self.service,"user":self.user,"secret":secret})
+                &json!({"op":"set","service":self.service,"user":self.user,"secret":secret}),
+                BRIDGE_REPLY,
             ),
             true
         );
@@ -1672,6 +1830,7 @@ impl keyring_core::api::CredentialApi for ProxyCredential {
         let result = proxy(
             &self.address,
             &json!({"op":"get","service":self.service,"user":self.user}),
+            BRIDGE_REPLY,
         );
         if result.is_null() {
             Err(keyring_core::Error::NoEntry)
@@ -1683,6 +1842,7 @@ impl keyring_core::api::CredentialApi for ProxyCredential {
         let result = proxy(
             &self.address,
             &json!({"op":"delete","service":self.service,"user":self.user}),
+            BRIDGE_REPLY,
         );
         if result == true {
             Ok(())
@@ -1725,13 +1885,19 @@ async fn driver_process_child() {
     WRITE_HOOK.with_borrow_mut(|hook| {
         *hook = Some(Box::new(move |stage| {
             if stage == 1 {
-                assert_eq!(proxy(&bridge, &json!({"op":"ready"})), true);
+                // The parent answers only when both children are ready.
+                assert_eq!(proxy(&bridge, &json!({"op":"ready"}), PEER_WAIT), true);
             }
         }))
     });
     let hook = Hook;
     let left = StellarRpcClient::new(config["primary"].as_str().unwrap()).unwrap();
     let right = StellarRpcClient::new(config["oracle"].as_str().unwrap()).unwrap();
+    // The driver ages its shared observations (5 s) and pass deadline (20 s) on
+    // the Tokio clock. Keep the paused clock still across real loopback I/O and
+    // the peer barrier so host load cannot expire the prefix before stage 1.
+    tokio::time::pause();
+    let clock_hold = stellar_agent_test_support::timing::ClockHold::new();
     let result = recover_outcomes(
         &store,
         &profile,
@@ -1740,19 +1906,36 @@ async fn driver_process_child() {
         None,
     )
     .await;
+    drop(clock_hold);
+    tokio::time::resume();
     drop(hook);
-    let success = result.is_ok();
-    if let Err(error) = result {
-        assert_eq!(error.code(), "submission.record_unavailable");
-        assert!(
-            losing_refusal(&error).is_some(),
-            "the loser refuses safely: {error:?}"
-        );
-    }
     assert_eq!(
-        proxy(&address, &json!({"op":"done","success":success})),
+        proxy(
+            &address,
+            &json!({"op":"done","success":result.is_ok()}),
+            BRIDGE_REPLY
+        ),
         true
     );
+    match result {
+        Ok(report) => {
+            assert_eq!(
+                report.evaluated, 1,
+                "the winner evaluates the attempt: {report:?}"
+            );
+            assert!(
+                report.missing.is_none(),
+                "the winner finishes without missing evidence: {report:?}"
+            );
+        }
+        Err(error) => {
+            assert_eq!(error.code(), "submission.record_unavailable");
+            assert!(
+                losing_refusal(&error).is_some(),
+                "the loser refuses safely: {error:?}"
+            );
+        }
+    }
 }
 
 /// The safe refusal of a driver that loses the reservation race, named by
@@ -1835,7 +2018,7 @@ async fn driver_two_processes_race_reservation() {
         .respond_with(move |request: &wiremock::Request| {
             let (lock, condition) = &*signal;
             let (seen, timeout) = condition
-                .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(10), |seen| !*seen)
+                .wait_timeout_while(lock.lock().unwrap(), PEER_WAIT, |seen| !*seen)
                 .unwrap();
             if !*seen || timeout.timed_out() {
                 return wiremock::ResponseTemplate::new(503);
@@ -1849,25 +2032,38 @@ async fn driver_two_processes_race_reservation() {
     let address = listener.local_addr().unwrap().to_string();
     let credentials = keyring_core::get_default_store().unwrap();
     let server = std::thread::spawn(move || {
-        let mut ready = Vec::new();
+        let mut ready: Vec<std::net::TcpStream> = Vec::new();
         let mut results = Vec::new();
         for stream in listener.incoming() {
             let mut stream = stream.unwrap();
             let mut line = String::new();
-            BufReader::new(stream.try_clone().unwrap())
+            if BufReader::new(stream.try_clone().unwrap())
                 .read_line(&mut line)
-                .unwrap();
+                .is_err()
+                || !line.ends_with('\n')
+            {
+                continue;
+            }
             let request: Value = serde_json::from_str(&line).unwrap();
             let op = request["op"].as_str().unwrap();
             if op == "shutdown" {
-                writeln!(stream, "true").unwrap();
+                for mut waiter in ready.drain(..) {
+                    let _ = writeln!(waiter, "false");
+                }
+                *stale_done.0.lock().unwrap() = true;
+                stale_done.1.notify_all();
+                let _ = writeln!(stream, "true");
                 break;
             }
             if op == "ready" {
-                ready.push(stream);
-                if ready.len() == 2 {
-                    for mut stream in ready.drain(..) {
-                        writeln!(stream, "true").unwrap();
+                if !results.is_empty() {
+                    let _ = writeln!(stream, "false");
+                } else {
+                    ready.push(stream);
+                    if ready.len() == 2 {
+                        for mut stream in ready.drain(..) {
+                            let _ = writeln!(stream, "true");
+                        }
                     }
                 }
                 continue;
@@ -1875,11 +2071,14 @@ async fn driver_two_processes_race_reservation() {
             if op == "done" {
                 let success = request["success"].as_bool().unwrap();
                 results.push(success);
+                for mut stream in ready.drain(..) {
+                    let _ = writeln!(stream, "false");
+                }
                 if !success {
                     *stale_done.0.lock().unwrap() = true;
                     stale_done.1.notify_all();
                 }
-                writeln!(stream, "true").unwrap();
+                let _ = writeln!(stream, "true");
                 continue;
             }
             let entry = credentials
@@ -1904,14 +2103,15 @@ async fn driver_two_processes_race_reservation() {
                 "delete" => json!(entry.delete_credential().is_ok()),
                 _ => panic!("unknown bridge operation"),
             };
-            writeln!(stream, "{response}").unwrap();
+            let _ = writeln!(stream, "{response}");
         }
         results
     });
     let mut children = Vec::new();
+    let mut deadline = None;
     for index in 0..2 {
         let config = json!({"bridge":address, "profile":fx.fx.profile, "window":fx.fx.store.path(), "primary":pair[0].uri(), "oracle":pair[1].uri(), "audit":format!("child-{index}.jsonl")}).to_string();
-        children.push(
+        let mut child = ChildGuard::new(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -1924,24 +2124,45 @@ async fn driver_two_processes_race_reservation() {
                 .spawn()
                 .unwrap(),
         );
+        deadline.get_or_insert_with(|| std::time::Instant::now() + CHILDREN_WAIT);
+        let stdout = spawn_pipe_reader(child.take_stdout().unwrap());
+        let stderr = spawn_pipe_reader(child.take_stderr().unwrap());
+        children.push(SpawnedChild {
+            child,
+            stdout,
+            stderr,
+        });
     }
-    let output = tokio::task::spawn_blocking(move || {
-        children
-            .into_iter()
-            .map(|child| child.wait_with_output().unwrap())
-            .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap();
-    assert_eq!(proxy(&address, &json!({"op":"shutdown"})), true);
-    for output in output {
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let mut results = server.join().unwrap();
+    let deadline = deadline.unwrap();
+    let (timed_out, output) =
+        tokio::task::spawn_blocking(move || wait_children_bounded(children, deadline))
+            .await
+            .unwrap();
+    let shutdown_reply = try_proxy(&address, &json!({"op":"shutdown"}), BRIDGE_REPLY);
+    let server_result = shutdown_reply
+        .as_ref()
+        .is_ok_and(|reply| reply.as_bool() == Some(true))
+        .then(|| server.join());
+    assert!(
+        !timed_out,
+        "race children did not finish within the {}s real-time bound",
+        CHILDREN_WAIT.as_secs()
+    );
+    let failures: Vec<_> = output
+        .iter()
+        .enumerate()
+        .filter(|(_, output)| !output.status.success())
+        .map(|(index, output)| {
+            format!(
+                "child {index} ({}):\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_eq!(shutdown_reply.unwrap(), true);
+    let mut results = server_result.unwrap().unwrap();
     results.sort();
     assert_eq!(results, [false, true]);
     assert_eq!(fx.run_record(0).automatic_runs, 1);

@@ -215,7 +215,7 @@ def module(source):
     ast.parse(source)
     mod = types.ModuleType("changelog_under_test")
     mod.__file__ = str(SCRIPT)
-    exec(compile(source, str(SCRIPT), "exec"), mod.__dict__)
+    exec(compile(source, str(SCRIPT), "exec", dont_inherit=True), mod.__dict__)
     return mod
 
 

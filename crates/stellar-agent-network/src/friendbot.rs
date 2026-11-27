@@ -825,7 +825,7 @@ mod tests {
     #[tokio::test]
     async fn an_existing_account_reports_the_already_funded_code() {
         for detail in [
-            "createAccountAlreadyExist (AAAAAAAAAGT/////AAAAAQAAAAAAAAAA/////AAAAAA==)",
+            "createAccountAlreadyExist (AAAAAAAAAGT/////AAAAAQAAAAAAAAAA/////AAAAAA=)",
             "CREATEACCOUNTALREADYEXIST",
             "createaccountalreadyexist",
         ] {

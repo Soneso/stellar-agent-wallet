@@ -1642,6 +1642,9 @@ CASES = [
     ("coverage decision without push exclusion", "coverage-condition", "decision must use the measure expression", [
         (COVERAGE, "          MEASURE: " + COVERAGE_MEASURE,
          "          MEASURE: ${{ (" + COVERAGE_LABEL + ") }}", 1)]),
+    ("coverage decision bare measure expression", "coverage-condition", "decision must use the measure expression", [
+        (COVERAGE, "          MEASURE: " + COVERAGE_MEASURE,
+         "          MEASURE: " + COVERAGE_MEASURE.removeprefix("${{ ").removesuffix(" }}"), 1)]),
     ("coverage decision without id", ("coverage-condition", "coverage-gate"),
      ("decision must use the measure expression", "decision must match the literal template"), [
         (COVERAGE, "        id: decision\n", "", 1)]),
@@ -2631,7 +2634,7 @@ MUTATIONS = {
     "coverage-decision-id": (
         'first.get("id") != "decision"\n                or ', '', ["coverage decision without id"]),
     "coverage-decision-expression": (
-        'self.unwrap_expression(str((first.get("env") or {}).get("MEASURE", ""))) != self.unwrap_expression(COVERAGE_MEASURE)', 'False',
+        '(first.get("env") or {}).get("MEASURE", "") != COVERAGE_MEASURE', 'False',
         ["coverage decision without label", "coverage decision without push exclusion"]),
     'optimized-job-fallback': ('        workflow = "release-rehearsal.yml"\n        job = self.job(workflow, "build") or {}', '        workflow = "release-rehearsal.yml"\n        job = self.job(workflow, "build")', ['optimized probes job absent']),
     'optimized-workflow': ('workflow = "release-rehearsal.yml"\n        job = self.job(workflow, "build") or {}', 'workflow = "release.yml"\n        job = self.job(workflow, "build") or {}', ['optimized probes pass']),
@@ -3526,7 +3529,7 @@ def evidence_inherited_problems(script, label):
     """Check this rule alone because other jobs also reject inherited credentials."""
     import types
     checker = types.ModuleType("workflow_checker")
-    exec(compile(script.read_text(), str(script), "exec"), checker.__dict__)
+    exec(compile(script.read_text(), str(script), "exec", dont_inherit=True), checker.__dict__)
     instance = checker.Checker(ROOT)
     instance.docs["publish.yml"] = yaml.safe_load((ROOT / PUBLISH).read_text())
     instance.docs["publish.yml"].update(EVIDENCE_INHERITED[label][0])
@@ -3539,7 +3542,7 @@ def registry_group_problems(script):
     """A registry typo must fail even when the step selects the same unknown group."""
     import types
     checker = types.ModuleType("workflow_checker")
-    exec(compile(script.read_text(), str(script), "exec"), checker.__dict__)
+    exec(compile(script.read_text(), str(script), "exec", dont_inherit=True), checker.__dict__)
     instance = checker.Checker(ROOT)
     for workflow in ("ci.yml", "install-surface.yml"):
         instance.docs[workflow] = instance.load(pathlib.Path(".github/workflows") / workflow)
@@ -3620,6 +3623,10 @@ MUTATIONS.update({
     "coverage-template-id": (
         'first.get("id") != "decision" or first.get("run") != COVERAGE_DECISION_RUN',
         'first.get("run") != COVERAGE_DECISION_RUN', ["coverage decision without id"]),
+    "coverage-measure-wrapper": (
+        '(first.get("env") or {}).get("MEASURE", "") != COVERAGE_MEASURE',
+        'self.unwrap_expression(str((first.get("env") or {}).get("MEASURE", ""))) != self.unwrap_expression(COVERAGE_MEASURE)',
+        ["coverage decision bare measure expression"]),
     "coverage-template-run": (
         'first.get("run") != COVERAGE_DECISION_RUN', 'False',
         ["coverage decision without measured true output", "coverage decision without measured false output",
@@ -3656,10 +3663,11 @@ MUTATIONS.update({
         'or (self.coverage_measured_step(step) and self.unwrap_expression(str(step["if"])) == COVERAGE_MEASURED))):',
         'or self.coverage_measured_step(step))):', ["coverage checkout with wrong guard"]),
     "coverage-measure-unwrap": (
-        'self.unwrap_expression(str((first.get("env") or {}).get("MEASURE", "")))',
-        'str((first.get("env") or {}).get("MEASURE", ""))', ["coverage measure expression as written passes"]),
+        '(first.get("env") or {}).get("MEASURE", "") != COVERAGE_MEASURE',
+        'self.unwrap_expression(str((first.get("env") or {}).get("MEASURE", ""))) != COVERAGE_MEASURE',
+        ["coverage measure expression as written passes"]),
     "coverage-measure-expected-unwrap": (
-        '!= self.unwrap_expression(COVERAGE_MEASURE)', '!= COVERAGE_MEASURE',
+        '!= COVERAGE_MEASURE):', '!= self.unwrap_expression(COVERAGE_MEASURE)):',
         ["coverage measure expression as written passes"]),
     "coverage-old-gate": (
         'if gate_condition != COVERAGE_GATE_CONDITION:',
@@ -3876,7 +3884,7 @@ def changelog_group(label, script):
     source = script.read_text()
     ast.parse(source)
     checker = types.ModuleType("workflow_checker")
-    exec(compile(source, str(script), "exec"), checker.__dict__)
+    exec(compile(source, str(script), "exec", dont_inherit=True), checker.__dict__)
     original = pathlib.Path.read_text
     dump = yaml.safe_dump
 
